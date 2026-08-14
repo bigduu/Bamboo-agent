@@ -3,30 +3,30 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
 
 use crate::api::types::SessionSummary;
 use crate::app::App;
+use crate::text;
 use crate::theme::colors;
 
 pub fn render(f: &mut Frame, area: Rect, app: &App) {
     if app.sessions.loading && app.sessions.sessions.is_empty() {
         let loading =
-            Paragraph::new("Loading sessions...").style(Style::default().fg(colors::INACTIVE));
+            Paragraph::new("Loading sessions...").style(Style::default().fg(colors::inactive()));
         f.render_widget(loading, area);
         return;
     }
 
     if let Some(err) = &app.sessions.error {
         let error =
-            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::ERROR));
+            Paragraph::new(format!("Error: {}", err)).style(Style::default().fg(colors::error()));
         f.render_widget(error, area);
         return;
     }
 
     if app.sessions.sessions.is_empty() {
         let empty = Paragraph::new("No sessions found.\n\nPress 'r' to refresh.")
-            .style(Style::default().fg(colors::INACTIVE));
+            .style(Style::default().fg(colors::inactive()));
         f.render_widget(empty, area);
         return;
     }
@@ -42,32 +42,51 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .split(area);
 
     // Header
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " Sessions",
+    let header = if area.width < 80 {
+        Line::from(Span::styled(
+            format!(" Sessions · {} total", app.sessions.total),
             Style::default()
-                .fg(colors::BRAND)
+                .fg(colors::brand())
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled("[r] Refresh", Style::default().fg(colors::INACTIVE)),
-        Span::raw("  "),
-        Span::styled("[d] Delete", Style::default().fg(colors::INACTIVE)),
-        Span::raw("  "),
-        Span::styled("[Enter] Open", Style::default().fg(colors::INACTIVE)),
-    ]));
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(
+                " Sessions",
+                Style::default()
+                    .fg(colors::brand())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("[r] Refresh", Style::default().fg(colors::inactive())),
+            Span::raw("  "),
+            Span::styled("[d] Delete", Style::default().fg(colors::inactive())),
+            Span::raw("  "),
+            Span::styled("[Enter] Open", Style::default().fg(colors::inactive())),
+        ])
+    };
+    let header = Paragraph::new(header);
     f.render_widget(header, chunks[0]);
 
     // Session list
     let mut lines: Vec<Line> = Vec::new();
     lines.push(session_header(chunks[1].width));
 
-    for (i, session) in app.sessions.sessions.iter().enumerate() {
-        lines.push(session_row_line(
-            session,
-            i == app.sessions.selected,
-            chunks[1].width,
-        ));
+    let selected = app
+        .sessions
+        .selected
+        .min(app.sessions.sessions.len().saturating_sub(1));
+    let capacity = chunks[1].height.saturating_sub(1) as usize;
+    let visible = visible_window(app.sessions.sessions.len(), selected, capacity);
+    for (i, session) in app
+        .sessions
+        .sessions
+        .iter()
+        .enumerate()
+        .take(visible.end)
+        .skip(visible.start)
+    {
+        lines.push(session_row_line(session, i == selected, chunks[1].width));
     }
 
     let list = Paragraph::new(lines);
@@ -81,13 +100,39 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         " page {}/{} · total {} · [ ] to page",
         page, pages, app.sessions.total
     ))
-    .style(Style::default().fg(colors::SUBTLE));
+    .style(Style::default().fg(colors::subtle()));
     f.render_widget(page_info, chunks[2]);
 
     // Footer
-    let footer = Paragraph::new(" [Enter] Open in Chat · [d] Delete · [r] Refresh")
-        .style(Style::default().fg(colors::INACTIVE));
+    let footer_text = if area.width < 80 {
+        " Enter open · d delete · r refresh"
+    } else {
+        " [Enter] Open in Chat · [d] Delete · [r] Refresh"
+    };
+    let footer = Paragraph::new(footer_text).style(Style::default().fg(colors::inactive()));
     f.render_widget(footer, chunks[3]);
+}
+
+/// Select the contiguous list window that keeps `selected` visible.
+///
+/// Lists use this after reserving one line for their column header. Keeping the
+/// selected item at the bottom while moving forward is predictable and leaves
+/// the maximum amount of preceding context at compact terminal heights.
+pub(crate) fn visible_window(
+    item_count: usize,
+    selected: usize,
+    capacity: usize,
+) -> std::ops::Range<usize> {
+    if item_count == 0 || capacity == 0 {
+        return 0..0;
+    }
+    let selected = selected.min(item_count - 1);
+    let capacity = capacity.min(item_count);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(capacity)
+        .min(item_count - capacity);
+    start..start + capacity
 }
 
 /// Status glyph + color for a session row, in priority order: a running run
@@ -95,13 +140,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 /// run — a session can usefully show only one at a time.
 pub(crate) fn status_glyph(session: &SessionSummary) -> (&'static str, Color) {
     if session.is_running {
-        ("▶", colors::SUCCESS)
+        ("▶", colors::success())
     } else if session.has_pending_question {
-        ("?", colors::WARNING)
+        ("?", colors::warning())
     } else if is_error_status(session.last_run_status.as_deref()) {
-        ("✗", colors::ERROR)
+        ("✗", colors::error())
     } else {
-        (" ", colors::INACTIVE)
+        (" ", colors::inactive())
     }
 }
 
@@ -138,7 +183,7 @@ fn session_header(width: u16) -> Line<'static> {
     };
     Line::from(Span::styled(
         label.to_string(),
-        Style::default().fg(colors::SUBTLE),
+        Style::default().fg(colors::subtle()),
     ))
 }
 
@@ -152,10 +197,10 @@ pub(crate) fn session_row_line(
 ) -> Line<'static> {
     let row_style = if selected {
         Style::default()
-            .fg(colors::BRAND)
+            .fg(colors::brand())
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(colors::INACTIVE)
+        Style::default().fg(colors::inactive())
     };
     let title = if session.title.trim().is_empty() {
         "(untitled)"
@@ -214,36 +259,7 @@ pub(crate) fn session_row_line(
 }
 
 pub(crate) fn truncate_cells(value: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let width = value
-        .chars()
-        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
-        .sum::<usize>();
-    if width <= max_width {
-        let mut output = value.to_string();
-        output.extend(std::iter::repeat_n(' ', max_width - width));
-        return output;
-    }
-
-    let target = max_width.saturating_sub(1);
-    let mut output = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > target {
-            break;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output.push('…');
-    while used + 1 < max_width {
-        output.push(' ');
-        used += 1;
-    }
-    output
+    text::truncate_cells(value, max_width)
 }
 
 #[cfg(test)]
@@ -314,6 +330,57 @@ mod tests {
                 line.width()
             );
         }
+    }
+
+    #[test]
+    fn visible_window_keeps_a_deep_selection_on_screen() {
+        assert_eq!(visible_window(20, 0, 5), 0..5);
+        assert_eq!(visible_window(20, 11, 5), 7..12);
+        assert_eq!(visible_window(3, 99, 5), 0..3);
+        assert_eq!(visible_window(20, 11, 0), 0..0);
+    }
+
+    #[test]
+    fn compact_unicode_session_keeps_selection_status_and_actions_visible() {
+        use crate::api::BambooClient;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = crate::app::Tab::Sessions;
+        app.sessions.sessions = (0..30)
+            .map(|index| {
+                let mut value = session(&format!("session-{index:02}"));
+                value.title = format!("普通会话 {index}");
+                value.model = "provider/模型-alpha".to_string();
+                value
+            })
+            .collect();
+        app.sessions.selected = 24;
+        app.sessions.sessions[24].title = "selected-会话🧭e\u{301}".to_string();
+        app.sessions.sessions[24].is_running = true;
+        app.sessions.total = 30;
+        app.sessions.page_limit = 30;
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("selected-"), "selected row missing:\n{text}");
+        assert!(text.contains('🧭'), "Unicode fixture missing:\n{text}");
+        assert!(text.contains("running"), "text status missing:\n{text}");
+        assert!(
+            text.contains("Enter open"),
+            "compact action footer missing:\n{text}"
+        );
+        assert!(text.contains('›'), "selected-row glyph missing:\n{text}");
     }
 
     /// Smoke test: the table renders with the new columns and page info without

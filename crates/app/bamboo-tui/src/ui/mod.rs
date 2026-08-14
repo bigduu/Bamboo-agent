@@ -10,7 +10,19 @@ use ratatui::Frame;
 
 use crate::app::App;
 
+pub const MIN_TERMINAL_WIDTH: u16 = 60;
+pub const MIN_TERMINAL_HEIGHT: u16 = 20;
+
 pub fn render(f: &mut Frame, app: &App) {
+    crate::theme::with_palette(app.theme, || render_with_palette(f, app));
+}
+
+fn render_with_palette(f: &mut Frame, app: &App) {
+    if f.area().width < MIN_TERMINAL_WIDTH || f.area().height < MIN_TERMINAL_HEIGHT {
+        layout::render_terminal_too_small(f);
+        return;
+    }
+
     let chunks = layout::app_layout(f.area(), app);
 
     // Content area
@@ -29,12 +41,7 @@ pub fn render(f: &mut Frame, app: &App) {
 
     // Help overlay
     if app.help_visible {
-        layout::render_help(f);
-    }
-
-    // Notification-log overlay
-    if app.notifications_visible {
-        layout::render_notifications(f, app);
+        layout::render_help(f, app);
     }
 
     // A clarification can arrive asynchronously while a local editor or
@@ -61,7 +68,7 @@ pub fn render(f: &mut Frame, app: &App) {
         layout::render_session_picker(f, app);
     }
 
-    if app.pending_delete.is_some() {
+    if app.pending_delete.is_some() || app.pending_schedule_delete.is_some() {
         layout::render_delete_confirm(f, app);
     }
 
@@ -71,5 +78,12 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if app.serve_offer.is_some() {
         layout::render_serve_offer(f, app);
+    }
+
+    // The full-value log is deliberately last: Ctrl+L remains available over
+    // every modal so clipped session/model/error text can always be inspected
+    // without discarding the underlying draft or confirmation.
+    if app.notifications_visible {
+        layout::render_notifications(f, app);
     }
 }

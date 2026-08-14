@@ -1616,6 +1616,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tui-textarea-2",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

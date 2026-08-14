@@ -14,6 +14,23 @@ use crate::app::{
 use crate::theme::{self, colors};
 use crate::ui::sessions::{session_row_line, truncate_cells};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Compact,
+    Regular,
+    Wide,
+}
+
+pub fn layout_mode(area: Rect) -> LayoutMode {
+    if area.width < 80 || area.height < 24 {
+        LayoutMode::Compact
+    } else if area.width < 120 || area.height < 40 {
+        LayoutMode::Regular
+    } else {
+        LayoutMode::Wide
+    }
+}
+
 pub struct AppLayout {
     pub content: Rect,
     pub input: Rect,
@@ -24,18 +41,23 @@ pub struct AppLayout {
 pub fn app_layout(area: Rect, app: &App) -> AppLayout {
     let show_input = app.tab == Tab::Chat;
 
+    let input_height = match layout_mode(area) {
+        LayoutMode::Compact => 2,
+        LayoutMode::Regular | LayoutMode::Wide => 3,
+    };
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if show_input {
             vec![
-                Constraint::Min(10),   // content
-                Constraint::Length(3), // input
+                Constraint::Min(1),
+                Constraint::Length(input_height),
                 Constraint::Length(1), // status info
                 Constraint::Length(1), // status tabs
             ]
         } else {
             vec![
-                Constraint::Min(10),   // content
+                Constraint::Min(1),
                 Constraint::Length(1), // status info
                 Constraint::Length(1), // status tabs
             ]
@@ -59,128 +81,196 @@ pub fn app_layout(area: Rect, app: &App) -> AppLayout {
     }
 }
 
-pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![];
+pub fn render_terminal_too_small(f: &mut Frame) {
+    let area = f.area();
+    let lines = vec![
+        Line::from(Span::styled(
+            "Terminal too small",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(format!(
+            "Current: {}x{} · minimum: {}x{}",
+            area.width,
+            area.height,
+            crate::ui::MIN_TERMINAL_WIDTH,
+            crate::ui::MIN_TERMINAL_HEIGHT
+        )),
+        Line::raw("Resize the terminal to continue · Ctrl+C quits"),
+    ];
+    let width = area.width.min(48);
+    let height = area.height.min(5);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
 
-    // Streaming indicator
+pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
+    let available = area.width as usize;
+    if available == 0 {
+        return;
+    }
+    let mut items: Vec<(String, Style)> = Vec::new();
+
+    // Urgent run/question/error state comes first. Lower-priority model,
+    // tokens and session metadata are appended only while cells remain.
     if app.chat.streaming {
         let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
         let spinner = theme::BRAILLE_SPINNER[tick];
-        spans.push(Span::styled(
-            format!(" {} Streaming {}", spinner, spinner),
-            Style::default().fg(colors::TOOL_RUNNING),
+        items.push((
+            format!("{spinner} RUNNING"),
+            Style::default().fg(colors::tool_running()),
         ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
-        spans.push(Span::styled(
-            " draft editable; Enter sends after run ",
-            Style::default().fg(colors::INACTIVE),
+        items.push((
+            "draft editable; Enter sends after run".to_string(),
+            Style::default().fg(colors::inactive()),
         ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
+    } else if app.pending_question.is_some() || app.dismissed_question.is_some() {
+        items.push((
+            "? QUESTION".to_string(),
+            Style::default()
+                .fg(colors::warning())
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
     if app.chat.unseen_updates > 0 {
-        spans.push(Span::styled(
-            format!(" ↓ {} new · Ctrl+G jump ", app.chat.unseen_updates),
+        items.push((
+            format!("↓ {} NEW", app.chat.unseen_updates),
             Style::default()
-                .fg(colors::WARNING)
+                .fg(colors::warning())
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
-    // Model
-    if !app.chat.model.is_empty() {
-        spans.push(Span::styled(
-            format!(" {}", app.chat.model),
-            Style::default().fg(colors::INACTIVE),
-        ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
-    }
-
-    // Token usage
-    if let Some(usage) = &app.chat.token_usage {
-        spans.push(Span::styled(
-            format!(" {}/{}", usage.completion_tokens, usage.total_tokens),
-            Style::default().fg(colors::INACTIVE),
-        ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
-    }
-
-    // Session
-    if let Some(sid) = &app.chat.session_id {
-        let short: String = sid.chars().take(8).collect();
-        spans.push(Span::styled(
-            format!(" {}...", short),
-            Style::default().fg(colors::INACTIVE),
-        ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
-    }
-
-    // Plan mode indicator
     if app.chat.plan_mode {
-        spans.push(Span::styled(
-            " PLAN ",
+        items.push((
+            "PLAN".to_string(),
             Style::default()
-                .fg(colors::WARNING)
+                .fg(colors::warning())
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
-    // Unseen warning/error badge (Ctrl+L to view the log).
     if app.unseen_alerts > 0 {
-        spans.push(Span::styled(
-            format!(" ⚠ {} ", app.unseen_alerts),
+        items.push((
+            format!("! {} ALERTS", app.unseen_alerts),
             Style::default()
-                .fg(colors::WARNING)
+                .fg(colors::warning())
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(" · ", Style::default().fg(colors::SUBTLE)));
     }
 
-    // Connection indicator
-    if app.connected {
-        spans.push(Span::styled(" ● ", Style::default().fg(colors::SUCCESS)));
+    let (connection, connection_style) = if app.connected {
+        ("● ONLINE", Style::default().fg(colors::success()))
     } else {
-        spans.push(Span::styled(" ○ ", Style::default().fg(colors::ERROR)));
-    }
+        ("○ OFFLINE", Style::default().fg(colors::error()))
+    };
+    items.push((connection.to_string(), connection_style));
 
-    // Status message (right-aligned as remaining text)
     if !app.status_message.is_empty() {
-        spans.push(Span::styled(
-            format!(" {}", app.status_message),
-            Style::default().fg(colors::INACTIVE),
+        items.push((
+            app.status_message.clone(),
+            Style::default().fg(colors::inactive()),
         ));
     }
 
-    let line = Line::from(spans);
-    let status = Paragraph::new(line);
-    f.render_widget(status, area);
+    if !app.chat.model.is_empty() {
+        items.push((
+            format!("model {}", app.chat.model),
+            Style::default().fg(colors::inactive()),
+        ));
+    }
+    if let Some(usage) = &app.chat.token_usage {
+        items.push((
+            format!("tokens {}/{}", usage.completion_tokens, usage.total_tokens),
+            Style::default().fg(colors::inactive()),
+        ));
+    }
+    if let Some(sid) = &app.chat.session_id {
+        items.push((
+            format!("session {}", sid.chars().take(8).collect::<String>()),
+            Style::default().fg(colors::inactive()),
+        ));
+    }
+
+    let mut spans = Vec::new();
+    let mut used = 1_usize;
+    spans.push(Span::raw(" "));
+    for (index, (text, style)) in items.into_iter().enumerate() {
+        let separator = usize::from(index > 0) * 3;
+        if used + separator >= available {
+            break;
+        }
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(colors::subtle())));
+            used += 3;
+        }
+        let remaining = available.saturating_sub(used);
+        let clipped = clip_cells(&text, remaining);
+        used += display_width(&clipped);
+        spans.push(Span::styled(clipped, style));
+        if used >= available {
+            break;
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 pub fn render_tab_bar(f: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<Span> = Tab::ALL
+    let mode = layout_mode(area);
+    let full_width = Tab::ALL
         .iter()
         .enumerate()
-        .flat_map(|(i, tab)| {
-            let style = if *tab == app.tab {
-                Style::default()
-                    .fg(colors::BRAND)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(colors::INACTIVE)
-            };
-            let mut spans = vec![Span::styled(format!(" [{}]{} ", i + 1, tab.title()), style)];
+        .map(|(i, tab)| display_width(&format!(" [{}]{} ", i + 1, tab.title())))
+        .sum::<usize>()
+        + Tab::ALL.len().saturating_sub(1);
+    let use_full = mode != LayoutMode::Compact && full_width <= area.width as usize;
+    let mut spans = Vec::new();
+
+    if use_full {
+        for (i, tab) in Tab::ALL.iter().enumerate() {
+            let style = tab_style(*tab == app.tab);
+            spans.push(Span::styled(format!(" [{}]{} ", i + 1, tab.title()), style));
             if i < Tab::ALL.len() - 1 {
                 spans.push(Span::raw(" "));
             }
-            spans
-        })
-        .collect();
+        }
+    } else {
+        let active_index = Tab::ALL.iter().position(|tab| *tab == app.tab).unwrap_or(0);
+        let active = format!(" [{}] {} ", active_index + 1, app.tab.title());
+        let hint = " · Tab/Shift+Tab views · F1 help";
+        let active_width = display_width(&active);
+        let remaining = area.width.saturating_sub(active_width as u16) as usize;
+        spans.push(Span::styled(active, tab_style(true)));
+        if remaining > 0 {
+            spans.push(Span::styled(
+                clip_cells(hint, remaining),
+                Style::default().fg(colors::inactive()),
+            ));
+        }
+    }
 
-    let line = Line::from(titles);
-    let tabs = Paragraph::new(line);
-    f.render_widget(tabs, area);
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn tab_style(active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(colors::brand())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(colors::inactive())
+    }
 }
 
 /// Every binding `App::handle_key`/the per-tab handlers respond to, paired
@@ -210,7 +300,7 @@ const HELP_RIGHT: &[(&str, &str)] = &[
     ("Ctrl+C", "Quit / stop streaming"),
     ("Ctrl+S", "Stop agent execution"),
     ("Ctrl+X", "Focused detail / new-block default"),
-    ("Ctrl+L", "Notification log"),
+    ("Ctrl+L", "Full values / notification log"),
     ("] / [", "Next / previous page (Sessions)"),
     ("d", "Delete, with confirm (Sessions/Schedules)"),
     ("n / e", "New schedule / edit config"),
@@ -218,85 +308,292 @@ const HELP_RIGHT: &[(&str, &str)] = &[
     ("F1 / ?", "Toggle this help (? not on Chat)"),
 ];
 
-pub fn render_help(f: &mut Frame) {
+pub fn render_help(f: &mut Frame, app: &App) {
     let screen = f.area();
     const KEY_COL: usize = 17;
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            " Keybindings",
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-    let rows = HELP_LEFT.len().max(HELP_RIGHT.len());
-    for i in 0..rows {
-        let (lk, ld) = HELP_LEFT.get(i).copied().unwrap_or(("", ""));
-        let (rk, rd) = HELP_RIGHT.get(i).copied().unwrap_or(("", ""));
-        lines.push(Line::raw(format!(
-            "  {lk:<KEY_COL$}{ld:<34}{rk:<KEY_COL$}{rd}"
-        )));
+    let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
+    let content_width = popup_width.saturating_sub(4) as usize;
+    let two_columns = content_width >= 96;
+    let mut entries = Vec::new();
+    if two_columns {
+        for i in 0..HELP_LEFT.len().max(HELP_RIGHT.len()) {
+            let (lk, ld) = HELP_LEFT.get(i).copied().unwrap_or(("", ""));
+            let (rk, rd) = HELP_RIGHT.get(i).copied().unwrap_or(("", ""));
+            entries.push(format!("  {lk:<KEY_COL$}{ld:<31}{rk:<KEY_COL$}{rd}"));
+        }
+    } else {
+        for (key, description) in HELP_LEFT.iter().chain(HELP_RIGHT.iter()) {
+            entries.push(format!("  {key:<KEY_COL$}{description}"));
+        }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::raw("  Press any key to close"));
 
-    let height = (lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(90, height, screen);
+    let height = screen.height.min(26);
+    // The popup, not the terminal, is the limiting viewport. Reserve its two
+    // border rows plus header/footer and both possible overflow indicators so
+    // the close/scroll actions can never be pushed out on a tall narrow PTY.
+    let inner_height = height.saturating_sub(2) as usize;
+    let viewport = inner_height.saturating_sub(4).max(1);
+    let max_scroll = entries.len().saturating_sub(viewport);
+    let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    app.help_max_scroll.set(max_scroll);
+    let start = app.help_scroll.min(max_scroll) as usize;
+    let end = (start + viewport).min(entries.len());
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            " Keybindings · rows {}-{} of {}",
+            if entries.is_empty() { 0 } else { start + 1 },
+            end,
+            entries.len()
+        ),
+        Style::default()
+            .fg(colors::brand())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if start > 0 {
+        lines.push(Line::raw(format!("  ↑ {start} earlier")));
+    }
+    lines.extend(
+        entries[start..end]
+            .iter()
+            .map(|line| Line::raw(clip_cells(line, content_width))),
+    );
+    if end < entries.len() {
+        lines.push(Line::raw(format!("  ↓ {} later", entries.len() - end)));
+    }
+    lines.push(Line::raw("  ↑/↓/PgUp/PgDn · Home/End · Esc/q close"));
+
+    let area = centered_rect(94, height, screen);
     f.render_widget(Clear, area);
     let help = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(colors::BRAND)),
+            .border_style(Style::default().fg(colors::brand())),
     );
     f.render_widget(help, area);
 }
 
 /// Notification-log overlay (`Ctrl+L`): recent status messages newest-first,
 /// colored by level, so errors/warnings aren't lost when the status line is
-/// overwritten. Dismissed by any key.
+/// overwritten. Esc/q closes it; navigation keys scroll internally.
 pub fn render_notifications(f: &mut Frame, app: &App) {
     let screen = f.area();
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            " Notifications",
-            Style::default()
-                .fg(colors::BRAND)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
-
-    if app.notifications.is_empty() {
-        lines.push(Line::raw("  (nothing yet)"));
-    } else {
-        // Newest first; cap to what a reasonably tall modal can show.
-        let max_rows = (screen.height.saturating_sub(6)).min(30) as usize;
-        for n in app.notifications.iter().rev().take(max_rows) {
-            let (tag, color) = match n.level {
-                NoticeLevel::Info => ("info", colors::INACTIVE),
-                NoticeLevel::Warn => ("warn", colors::WARNING),
-                NoticeLevel::Error => ("err ", colors::ERROR),
-            };
-            lines.push(Line::from(vec![
+    let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
+    let content_width = popup_width.saturating_sub(4) as usize;
+    let mut entries: Vec<Line> = Vec::new();
+    {
+        let mut push_full_value = |label: &str, value: &str, color| {
+            if value.is_empty() {
+                return;
+            }
+            let prefix = format!("  {label}: ");
+            let continuation = " ".repeat(display_width(&prefix));
+            let text_width = content_width.saturating_sub(display_width(&prefix)).max(1);
+            let wrapped = crate::text::wrapped_lines(value, text_width);
+            entries.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(colors::subtle())),
                 Span::styled(
-                    format!("  {} ", n.at.format("%H:%M:%S")),
-                    Style::default().fg(colors::SUBTLE),
+                    wrapped.first().cloned().unwrap_or_default(),
+                    Style::default().fg(color),
                 ),
-                Span::styled(format!("{tag}  "), Style::default().fg(color)),
-                Span::styled(n.text.clone(), Style::default().fg(color)),
             ]));
+            entries.extend(wrapped.into_iter().skip(1).map(|line| {
+                Line::from(vec![
+                    Span::raw(continuation.clone()),
+                    Span::styled(line, Style::default().fg(color)),
+                ])
+            }));
+        };
+
+        push_full_value(
+            "session",
+            app.chat.session_id.as_deref().unwrap_or(""),
+            colors::inactive(),
+        );
+        push_full_value("model", &app.chat.model, colors::inactive());
+        if let Some(provider) = app.chat.provider.as_deref() {
+            push_full_value("model provider", provider, colors::inactive());
+        }
+        push_full_value("status", &app.status_message, colors::inactive());
+        if let Some((id, title)) = &app.pending_delete {
+            push_full_value("delete session id", id, colors::error());
+            push_full_value("delete session title", title, colors::error());
+        }
+        if let Some((id, name)) = &app.pending_schedule_delete {
+            push_full_value("delete schedule id", id, colors::error());
+            push_full_value("delete schedule name", name, colors::error());
+        }
+        if let Some(offer) = &app.serve_offer {
+            push_full_value("server URL", &offer.url, colors::warning());
+        }
+        if let Some(session) = app
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.selected_session())
+        {
+            push_full_value("selected session id", &session.id, colors::inactive());
+            push_full_value("selected session title", &session.title, colors::inactive());
+            push_full_value("selected session model", &session.model, colors::inactive());
+        }
+        if let Some(model) = app
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.selected_model())
+        {
+            push_full_value(
+                "selected model name",
+                &model.display_name,
+                colors::inactive(),
+            );
+            push_full_value(
+                "selected model provider",
+                &model.provider_display_name,
+                colors::inactive(),
+            );
+            push_full_value(
+                "selected model id",
+                &format!("{}/{}", model.reference.provider, model.reference.model),
+                colors::inactive(),
+            );
+        }
+        let current_error = match app.tab {
+            Tab::Chat => None,
+            Tab::Sessions => app.sessions.error.as_deref(),
+            Tab::Mcp => app.mcp.error.as_deref(),
+            Tab::Schedules => app.schedules.error.as_deref(),
+            Tab::Skills => app.skills.error.as_deref(),
+            Tab::Config => app.config.error.as_deref(),
+        };
+        if let Some(error) = current_error {
+            push_full_value("view error", error, colors::error());
+        }
+        if let Some(error) = app
+            .pending_question
+            .as_ref()
+            .and_then(|question| question.error.as_deref())
+        {
+            push_full_value("question error", error, colors::error());
+        }
+        if let Some(error) = app
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.error.as_deref())
+        {
+            push_full_value("model error", error, colors::error());
+        }
+        if let Some(error) = app
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.error.as_deref())
+        {
+            push_full_value("session error", error, colors::error());
+        }
+        if let Some(picker) = &app.session_picker {
+            let mutation_error = match &picker.mode {
+                SessionPickerMode::Rename { error, .. }
+                | SessionPickerMode::Pinning { error, .. } => error.as_deref(),
+                SessionPickerMode::Browse => None,
+            };
+            if let Some(error) = mutation_error {
+                push_full_value("session mutation error", error, colors::error());
+            }
+        }
+        if let Some(error) = app
+            .command_palette
+            .as_ref()
+            .and_then(|palette| palette.error.as_deref())
+        {
+            push_full_value("command error", error, colors::error());
+        }
+        if let Some(error) = app
+            .config_editor
+            .as_ref()
+            .and_then(|editor| editor.error.as_deref())
+        {
+            push_full_value("editor error", error, colors::error());
+        }
+        if let Some(error) = app
+            .schedule_form
+            .as_ref()
+            .and_then(|form| form.error.as_deref())
+        {
+            push_full_value("form error", error, colors::error());
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::raw("  Press any key to close"));
 
-    let height = (lines.len() as u16 + 2).min(screen.height);
-    let area = centered_rect(70, height, screen);
+    if !entries.is_empty() && !app.notifications.is_empty() {
+        entries.push(Line::raw(""));
+    }
+    if app.notifications.is_empty() && entries.is_empty() {
+        entries.push(Line::raw("  (nothing yet)"));
+    } else {
+        for n in app.notifications.iter().rev() {
+            let (tag, color) = match n.level {
+                NoticeLevel::Info => ("info", colors::inactive()),
+                NoticeLevel::Warn => ("warn", colors::warning()),
+                NoticeLevel::Error => ("err ", colors::error()),
+            };
+            let marker = match n.level {
+                NoticeLevel::Info => "i",
+                NoticeLevel::Warn => "!",
+                NoticeLevel::Error => "x",
+            };
+            let prefix = format!("  {} {marker} {tag}  ", n.at.format("%H:%M:%S"));
+            let continuation = " ".repeat(display_width(&prefix));
+            let text_width = content_width.saturating_sub(display_width(&prefix)).max(1);
+            let wrapped = crate::text::wrapped_lines(&n.text, text_width);
+            entries.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(colors::subtle())),
+                Span::styled(
+                    wrapped.first().cloned().unwrap_or_default(),
+                    Style::default().fg(color),
+                ),
+            ]));
+            entries.extend(wrapped.into_iter().skip(1).map(|line| {
+                Line::from(vec![
+                    Span::raw(continuation.clone()),
+                    Span::styled(line, Style::default().fg(color)),
+                ])
+            }));
+        }
+    }
+
+    let height = screen.height.min(32);
+    let inner_height = height.saturating_sub(2) as usize;
+    // Header, fixed action footer and both optional overflow indicators.
+    let viewport_rows = inner_height.saturating_sub(4).max(1);
+    let max_scroll = entries.len().saturating_sub(viewport_rows);
+    let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    app.notification_max_scroll.set(max_scroll);
+    let start = app.notification_scroll.min(max_scroll) as usize;
+    let end = (start + viewport_rows).min(entries.len());
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            " Notifications · rows {}-{} of {}",
+            if entries.is_empty() { 0 } else { start + 1 },
+            end,
+            entries.len()
+        ),
+        Style::default()
+            .fg(colors::brand())
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if start > 0 {
+        lines.push(Line::raw(format!("  ↑ {start} newer lines")));
+    }
+    lines.extend(entries[start..end].iter().cloned());
+    if end < entries.len() {
+        lines.push(Line::raw(format!(
+            "  ↓ {} older lines",
+            entries.len() - end
+        )));
+    }
+    lines.push(Line::raw("  ↑/↓/PgUp/PgDn scroll · Home/End · Esc/q close"));
+
+    let area = centered_rect(94, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BRAND))
+        .border_style(Style::default().fg(colors::brand()))
         .title(" Log ");
     f.render_widget(
         Paragraph::new(lines)
@@ -317,27 +614,34 @@ pub fn render_serve_offer(f: &mut Frame, app: &App) {
         return;
     };
 
+    let popup_width = ((f.area().width as u32 * 90 / 100) as u16).max(1);
+    let value_width = popup_width.saturating_sub(6) as usize;
     let lines = vec![
         Line::from(Span::styled(
             " Local server not reachable",
             Style::default()
-                .fg(colors::WARNING)
+                .fg(colors::warning())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        Line::raw(format!("  {}", offer.url)),
+        Line::raw(format!(
+            "  {}",
+            crate::text::clip_cells(&offer.url, value_width)
+        )),
+        Line::raw("  Ctrl+L inspect full URL"),
         Line::raw(""),
         Line::raw("  Start a local `bamboo serve`?"),
         Line::raw(""),
-        Line::raw("  y / Enter start  ·  n / Esc skip"),
+        Line::raw("  y / Enter start"),
+        Line::raw("  n / Esc skip"),
     ];
 
     let height = (lines.len() as u16 + 2).min(f.area().height);
-    let area = centered_rect(56, height, f.area());
+    let area = centered_rect(90, height, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::WARNING))
+        .border_style(Style::default().fg(colors::warning()))
         .title(" Auto-serve ");
     f.render_widget(
         Paragraph::new(lines)
@@ -353,79 +657,29 @@ pub fn render_serve_offer(f: &mut Frame, app: &App) {
 fn submitting_hint() -> Line<'static> {
     Line::from(Span::styled(
         "  Submitting answer\u{2026}",
-        Style::default().fg(colors::WARNING),
+        Style::default().fg(colors::warning()),
     ))
 }
 
 fn identity_syncing_hint() -> Line<'static> {
     Line::from(Span::styled(
         "  Synchronizing exact question identity\u{2026}",
-        Style::default().fg(colors::WARNING),
+        Style::default().fg(colors::warning()),
     ))
 }
 
 fn hard_wrap_preview(value: &str, width: usize, max_lines: usize) -> (Vec<String>, bool) {
-    let width = width.max(1);
     if max_lines == 0 {
         return (Vec::new(), !value.is_empty());
     }
-    let mut output = Vec::new();
-    let mut logical_lines = value.split('\n').peekable();
-    while let Some(logical) = logical_lines.next() {
-        let mut current = String::new();
-        let mut current_width = 0;
-        for ch in logical.chars() {
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if !current.is_empty() && current_width + char_width > width {
-                output.push(std::mem::take(&mut current));
-                if output.len() == max_lines {
-                    return (output, true);
-                }
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += char_width;
-        }
-        output.push(current);
-        if output.len() == max_lines {
-            return (output, logical_lines.peek().is_some());
-        }
-    }
-    if output.is_empty() {
-        output.push(String::new());
-    }
-    (output, false)
+    let mut output = crate::text::hard_wrap(value, width);
+    let truncated = output.len() > max_lines;
+    output.truncate(max_lines);
+    (output, truncated)
 }
 
 fn ellipsize(value: &str, width: usize) -> String {
-    let width = width.max(1);
-    let prefix_width_limit = width.saturating_sub(1);
-    let mut prefix = String::new();
-    let mut prefix_width = 0;
-    let mut total_width = 0;
-    let mut truncated = false;
-    for ch in value.chars() {
-        if ch == '\n' {
-            truncated = true;
-            break;
-        }
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if total_width + char_width > width {
-            truncated = true;
-            break;
-        }
-        total_width += char_width;
-        if prefix_width + char_width <= prefix_width_limit {
-            prefix.push(ch);
-            prefix_width += char_width;
-        }
-    }
-    if truncated {
-        prefix.push('…');
-        prefix
-    } else {
-        value.to_string()
-    }
+    crate::text::clip_cells(value, width.max(1))
 }
 
 /// Typed clarification modal. The compact view never changes an option's
@@ -444,7 +698,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
         f.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(colors::BRAND))
+            .border_style(Style::default().fg(colors::brand()))
             .title(" Clarification text inspector ");
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -474,7 +728,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
                 Line::from(Span::styled(
                     format!(" {label}"),
                     Style::default()
-                        .fg(colors::BRAND)
+                        .fg(colors::brand())
                         .add_modifier(Modifier::BOLD),
                 )),
                 Line::raw(format!(" {context}")),
@@ -512,7 +766,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
     let mut header = vec![Line::from(Span::styled(
         " Clarification needed",
         Style::default()
-            .fg(colors::BRAND)
+            .fg(colors::brand())
             .add_modifier(Modifier::BOLD),
     ))];
     if q.tool_name.is_some() || q.source.is_some() {
@@ -545,8 +799,11 @@ pub fn render_question(f: &mut Frame, app: &App) {
     } else if let Some(buf) = &q.custom {
         body.push(Line::raw("  Custom answer:"));
         body.push(Line::from(Span::styled(
-            format!("  > {}▏", ellipsize(buf, text_width.saturating_sub(2))),
-            Style::default().fg(colors::BRAND),
+            format!(
+                "  > {}▏",
+                crate::text::clip_tail_cells(buf, text_width.saturating_sub(1))
+            ),
+            Style::default().fg(colors::brand()),
         )));
         body.push(Line::raw(""));
         if q.identity_syncing {
@@ -563,7 +820,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
     } else if q.options.is_empty() {
         body.push(Line::from(Span::styled(
             "  No selectable answers were supplied and custom input is disabled.",
-            Style::default().fg(colors::WARNING),
+            Style::default().fg(colors::warning()),
         )));
         body.push(Line::raw(""));
         body.push(Line::raw("  v inspect/copy question  ·  Esc dismiss"));
@@ -589,7 +846,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
             let marker = if selected { "›" } else { " " };
             let style = if selected {
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(colors::brand())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -625,7 +882,7 @@ pub fn render_question(f: &mut Frame, app: &App) {
                 "  Error: {}",
                 ellipsize(error, text_width.saturating_sub(7))
             ),
-            Style::default().fg(colors::ERROR),
+            Style::default().fg(colors::error()),
         )));
     }
     let header_len = header.len();
@@ -655,16 +912,20 @@ pub fn render_question(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BRAND))
+        .border_style(Style::default().fg(colors::brand()))
         .title(" Clarification ");
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Modal confirming a session delete (`d` on the Sessions tab). Mirrors the
-/// question modal's key rationale: a destructive action must not fire on a
-/// single stray keystroke, so it stops here until `y`/Enter or `n`/Esc.
+/// Modal confirming a destructive delete from the Sessions or Schedules tab.
+/// A destructive action must not fire on a single stray keystroke, so it
+/// stops here until `y`/Enter or `n`/Esc.
 pub fn render_delete_confirm(f: &mut Frame, app: &App) {
-    let Some((_, title)) = &app.pending_delete else {
+    let (kind, title) = if let Some((_, title)) = &app.pending_delete {
+        ("session", title)
+    } else if let Some((_, name)) = &app.pending_schedule_delete {
+        ("schedule", name)
+    } else {
         return;
     };
     let display_title: &str = if title.is_empty() {
@@ -673,27 +934,38 @@ pub fn render_delete_confirm(f: &mut Frame, app: &App) {
         title
     };
 
-    let lines = vec![
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let text_width = popup_width.saturating_sub(6) as usize;
+    let (title_lines, title_truncated) = hard_wrap_preview(display_title, text_width, 4);
+    let mut lines = vec![
         Line::from(Span::styled(
-            " Delete session?",
+            format!(" Delete {kind}?"),
             Style::default()
-                .fg(colors::ERROR)
+                .fg(colors::error())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        Line::raw(format!("  \"{}\"", display_title)),
-        Line::raw(""),
-        Line::raw("  This cannot be undone."),
-        Line::raw(""),
-        Line::raw("  y / Enter confirm  ·  n / Esc cancel"),
     ];
+    lines.extend(
+        title_lines
+            .into_iter()
+            .map(|line| Line::raw(format!("  {line}"))),
+    );
+    if title_truncated {
+        lines.push(Line::raw("  … title shortened for this screen"));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("  This cannot be undone."));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("  y / Enter confirm  ·  n / Esc cancel"));
 
-    let height = (lines.len() as u16 + 2).min(f.area().height);
-    let area = centered_rect(50, height, f.area());
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::ERROR))
+        .border_style(Style::default().fg(colors::error()))
         .title(" Confirm ");
     f.render_widget(
         Paragraph::new(lines)
@@ -708,6 +980,9 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
     let Some(form) = &app.schedule_form else {
         return;
     };
+    let screen = f.area();
+    let popup_width = ((screen.width as u32 * 90 / 100) as u16).max(1);
+    let value_width = popup_width.saturating_sub(16) as usize;
     let fields = [
         ("Name", &form.name),
         ("Cron", &form.cron),
@@ -717,7 +992,7 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
         Line::from(Span::styled(
             " New schedule",
             Style::default()
-                .fg(colors::BRAND)
+                .fg(colors::brand())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
@@ -726,29 +1001,49 @@ pub fn render_schedule_form(f: &mut Frame, app: &App) {
         let focused = i == form.field;
         let cursor = if focused { "\u{258f}" } else { "" };
         let style = if focused {
-            Style::default().fg(colors::BRAND)
+            Style::default().fg(colors::brand())
         } else {
-            Style::default().fg(colors::INACTIVE)
+            Style::default().fg(colors::inactive())
         };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {label:<7}: "),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             ),
-            Span::styled(format!("{val}{cursor}"), style),
+            Span::styled(
+                if focused {
+                    format!(
+                        "{}{}",
+                        clip_tail_cells(val, value_width.saturating_sub(1)),
+                        cursor
+                    )
+                } else {
+                    clip_cells(val, value_width)
+                },
+                style,
+            ),
         ]));
+    }
+    if let Some(error) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ! {}",
+                clip_cells(error, popup_width.saturating_sub(6) as usize)
+            ),
+            Style::default().fg(colors::error()),
+        )));
     }
     lines.push(Line::raw(""));
     lines.push(Line::raw(
         "  Tab / \u{2191}\u{2193} field  \u{b7}  Enter create  \u{b7}  Esc cancel",
     ));
 
-    let height = (lines.len() as u16 + 2).min(f.area().height);
-    let area = centered_rect(60, height, f.area());
+    let height = (lines.len() as u16 + 2).min(screen.height);
+    let area = centered_rect(90, height, screen);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BRAND))
+        .border_style(Style::default().fg(colors::brand()))
         .title(" Schedule ");
     f.render_widget(
         Paragraph::new(lines)
@@ -771,7 +1066,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from(Span::styled(
         " Sessions",
         Style::default()
-            .fg(colors::BRAND)
+            .fg(colors::brand())
             .add_modifier(Modifier::BOLD),
     ))];
     // Search owns keyboard focus only in browse mode. Rename has its own
@@ -780,13 +1075,13 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
     // fields even though keystrokes can reach only one of them.
     if matches!(&picker.mode, SessionPickerMode::Browse) {
         lines.push(Line::from(vec![
-            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(" Search: ", Style::default().fg(colors::subtle())),
             Span::styled(
                 format!(
                     "{}▏",
                     clip_tail_cells(&picker.query, row_width.saturating_sub(10).max(1) as usize)
                 ),
-                Style::default().fg(colors::BRAND),
+                Style::default().fg(colors::brand()),
             ),
         ]));
     }
@@ -804,18 +1099,34 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                 };
                 lines.push(Line::raw(message));
             } else {
-                let max_height = screen.height.min(24);
-                let budget = (max_height as usize).saturating_sub(9).max(1);
                 let total = picker.visible.len();
-                let start = if total <= budget {
-                    0
-                } else {
-                    picker
-                        .selected
-                        .saturating_sub(budget / 2)
-                        .min(total.saturating_sub(budget))
-                };
-                let end = (start + budget).min(total);
+                // Reserve the border, header/search/blank, optional error,
+                // loaded count, both fixed action rows, and both possible
+                // above/below indicators before allocating list rows.
+                let fixed_rows = 2 // border
+                    + lines.len()
+                    + usize::from(picker.error.is_some())
+                    + 3; // loaded count + two action rows
+                let remaining = (screen.height as usize).saturating_sub(fixed_rows);
+                let selected = picker.selected.min(total.saturating_sub(1));
+                let mut start = selected;
+                let mut end = selected + 1;
+                loop {
+                    let indicators = usize::from(start > 0) + usize::from(end < total);
+                    let mut expanded = false;
+                    if start > 0 && end - (start - 1) + indicators <= remaining {
+                        start -= 1;
+                        expanded = true;
+                    }
+                    let indicators = usize::from(start > 0) + usize::from(end < total);
+                    if end < total && (end + 1) - start + indicators <= remaining {
+                        end += 1;
+                        expanded = true;
+                    }
+                    if !expanded {
+                        break;
+                    }
+                }
                 if start > 0 {
                     lines.push(Line::raw(format!("  ↑ {start} more")));
                 }
@@ -842,7 +1153,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                         "  {}",
                         clip_cells(error, row_width.saturating_sub(2) as usize)
                     ),
-                    Style::default().fg(colors::ERROR),
+                    Style::default().fg(colors::error()),
                 )));
             }
             let cap = if picker.sessions.len() >= 1_000 && picker.sessions.len() < picker.total {
@@ -858,7 +1169,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                     if picker.loading { " · loading" } else { "" },
                     cap
                 ),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
             if row_width < 70 {
                 lines.push(Line::raw("  ↑/↓/wheel · Enter open · F2 rename · F3 pin"));
@@ -885,11 +1196,11 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
             lines.push(Line::from(Span::styled(
                 " Rename session",
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(colors::brand())
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(vec![
-                Span::styled("  Title: ", Style::default().fg(colors::SUBTLE)),
+                Span::styled("  Title: ", Style::default().fg(colors::subtle())),
                 Span::styled(
                     if *submitting {
                         clip_tail_cells(draft, row_width.saturating_sub(12) as usize)
@@ -899,7 +1210,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                             clip_tail_cells(draft, row_width.saturating_sub(12) as usize)
                         )
                     },
-                    Style::default().fg(colors::BRAND),
+                    Style::default().fg(colors::brand()),
                 ),
             ]));
             if *loading_version {
@@ -913,7 +1224,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                         "  {}",
                         clip_cells(error, row_width.saturating_sub(2) as usize)
                     ),
-                    Style::default().fg(colors::ERROR),
+                    Style::default().fg(colors::error()),
                 )));
             }
             if !*submitting {
@@ -949,7 +1260,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                         "  {}",
                         clip_cells(error, row_width.saturating_sub(2) as usize)
                     ),
-                    Style::default().fg(colors::ERROR),
+                    Style::default().fg(colors::error()),
                 )));
             }
             if !*submitting {
@@ -964,7 +1275,7 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BRAND))
+        .border_style(Style::default().fg(colors::brand()))
         .title(" Session picker ");
     f.render_widget(
         Paragraph::new(lines)
@@ -990,17 +1301,17 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         Line::from(Span::styled(
             " Select a model",
             Style::default()
-                .fg(colors::BRAND)
+                .fg(colors::brand())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(" Search: ", Style::default().fg(colors::subtle())),
             Span::styled(
                 format!(
                     "{}▏",
                     clip_tail_cells(&picker.query, row_width.saturating_sub(10).max(1))
                 ),
-                Style::default().fg(colors::BRAND),
+                Style::default().fg(colors::brand()),
             ),
         ]),
         Line::raw(""),
@@ -1022,11 +1333,19 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             "  No models match this search"
         }));
         body.push(Line::raw(""));
-        body.push(Line::raw(if picker.models.is_empty() {
-            "  Edit search · Ctrl+R retry load · Esc cancel"
+        if row_width < 70 && picker.models.is_empty() {
+            body.push(Line::raw("  Edit search · Ctrl+R retry load"));
+            body.push(Line::raw("  Esc cancel"));
+        } else if row_width < 70 {
+            body.push(Line::raw("  Edit search · Ctrl+U clear"));
+            body.push(Line::raw("  Ctrl+R refresh · Esc cancel"));
         } else {
-            "  Edit search · Ctrl+U clear · Ctrl+R refresh · Esc cancel"
-        }));
+            body.push(Line::raw(if picker.models.is_empty() {
+                "  Edit search · Ctrl+R retry load · Esc cancel"
+            } else {
+                "  Edit search · Ctrl+U clear · Ctrl+R refresh · Esc cancel"
+            }));
+        }
     } else {
         let max_h = screen.height.min(22);
         let total = picker.visible.len();
@@ -1038,11 +1357,12 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             .collect::<Vec<_>>();
 
         // A group heading costs a terminal row too. Grow a balanced window
-        // around the selection using the actual row cost, while reserving two
-        // lines for the possible above/below indicators. This keeps the
-        // highlighted model visible even with 100 providers on a short screen.
+        // around the selection using the actual row cost, while reserving
+        // border, indicators, action footer, and an optional error. This keeps
+        // both the highlighted model and recovery action visible on a short
+        // screen even with 100 providers.
         let line_budget = (max_h as usize)
-            .saturating_sub(2 + header.len() + 2)
+            .saturating_sub(2 + header.len() + 2 + usize::from(picker.error.is_some()))
             .saturating_sub(2)
             .max(2);
         let selected = picker.selected.min(total.saturating_sub(1));
@@ -1089,7 +1409,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
                 body.push(Line::from(Span::styled(
                     clip_cells(&format!("  {group}"), row_width),
                     Style::default()
-                        .fg(colors::SUBTLE)
+                        .fg(colors::subtle())
                         .add_modifier(Modifier::BOLD),
                 )));
                 previous_group = Some(group);
@@ -1098,7 +1418,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             let marker = if selected { "\u{203a}" } else { " " };
             let style = if selected {
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(colors::brand())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -1130,7 +1450,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     if let Some(error) = &picker.error {
         body.push(Line::from(Span::styled(
             clip_cells(&format!("  {error}"), row_width),
-            Style::default().fg(colors::ERROR),
+            Style::default().fg(colors::error()),
         )));
     }
 
@@ -1141,7 +1461,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors::BRAND))
+        .border_style(Style::default().fg(colors::brand()))
         .title(" Model ");
     let para = Paragraph::new(lines)
         .block(block)
@@ -1245,9 +1565,9 @@ fn render_command_palette_view(
         CommandPaletteTrigger::Global => " Command palette ",
     };
     let border_color = if view.resolving {
-        colors::WARNING
+        colors::warning()
     } else {
-        colors::BRAND
+        colors::brand()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1273,19 +1593,19 @@ fn command_palette_lines(
     let search_width = row_width.saturating_sub(10).max(1);
     let search_cursor = if view.resolving { "" } else { "▏" };
     let search_style = if view.resolving {
-        Style::default().fg(colors::INACTIVE)
+        Style::default().fg(colors::inactive())
     } else {
-        Style::default().fg(colors::BRAND)
+        Style::default().fg(colors::brand())
     };
     let mut lines = vec![
         Line::from(Span::styled(
             title,
             Style::default()
-                .fg(colors::BRAND)
+                .fg(colors::brand())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled(" Search: ", Style::default().fg(colors::SUBTLE)),
+            Span::styled(" Search: ", Style::default().fg(colors::subtle())),
             Span::styled(
                 format!(
                     "{}{}{}",
@@ -1302,7 +1622,7 @@ fn command_palette_lines(
     if view.resolving {
         lines.push(Line::from(Span::styled(
             "  Resolving preview…",
-            Style::default().fg(colors::WARNING),
+            Style::default().fg(colors::warning()),
         )));
     } else if view.loading {
         lines.push(Line::from(Span::styled(
@@ -1310,7 +1630,7 @@ fn command_palette_lines(
                 "  Loading session commands… built-ins remain available",
                 row_width,
             ),
-            Style::default().fg(colors::INACTIVE),
+            Style::default().fg(colors::inactive()),
         )));
     }
 
@@ -1336,7 +1656,7 @@ fn command_palette_lines(
             } else {
                 "  No commands match this search"
             },
-            Style::default().fg(colors::INACTIVE),
+            Style::default().fg(colors::inactive()),
         )));
     } else {
         let selected = view.selected.min(total.saturating_sub(1));
@@ -1348,7 +1668,7 @@ fn command_palette_lines(
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  ↑ {start} more"),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
         }
 
@@ -1363,10 +1683,10 @@ fn command_palette_lines(
             let is_selected = !view.resolving && visible_index == selected;
             let marker = if is_selected { "›" } else { " " };
             let name_style = if view.resolving {
-                Style::default().fg(colors::INACTIVE)
+                Style::default().fg(colors::inactive())
             } else if is_selected {
                 Style::default()
-                    .fg(colors::BRAND)
+                    .fg(colors::brand())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -1405,9 +1725,9 @@ fn command_palette_lines(
             lines.push(Line::from(Span::styled(
                 clip_cells(&format!("      {description}"), row_width),
                 if disabled.is_some() {
-                    Style::default().fg(colors::ERROR)
+                    Style::default().fg(colors::error())
                 } else {
-                    Style::default().fg(colors::INACTIVE)
+                    Style::default().fg(colors::inactive())
                 },
             )));
             if !view.resolving {
@@ -1417,7 +1737,7 @@ fn command_palette_lines(
         if end < total {
             lines.push(Line::from(Span::styled(
                 format!("  ↓ {} more", total - end),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
         }
     }
@@ -1425,7 +1745,7 @@ fn command_palette_lines(
     if let Some(error) = view.error {
         lines.push(Line::from(Span::styled(
             clip_cells(&format!("  {error}"), row_width),
-            Style::default().fg(colors::ERROR),
+            Style::default().fg(colors::error()),
         )));
     }
     lines.push(Line::raw(""));
@@ -1449,11 +1769,11 @@ fn command_palette_lines(
 
 fn palette_type_style(command_type: &str) -> Style {
     let color = match command_type {
-        "prompt" => colors::BRAND,
-        "workflow" => colors::SUCCESS,
-        "skill" => colors::WARNING,
-        "mcp" => colors::TOOL_RUNNING,
-        _ => colors::INACTIVE,
+        "prompt" => colors::brand(),
+        "workflow" => colors::success(),
+        "skill" => colors::warning(),
+        "mcp" => colors::tool_running(),
+        _ => colors::inactive(),
     };
     Style::default().fg(color)
 }
@@ -1472,55 +1792,16 @@ fn centered_rect(percent_x: u16, height: u16, r: Rect) -> Rect {
     )
 }
 
+fn display_width(value: &str) -> usize {
+    crate::text::display_width(value)
+}
+
 fn clip_cells(value: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut output = String::new();
-    let mut used = 0;
-    for character in value.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > max_width {
-            while used > max_width.saturating_sub(1) {
-                let Some(removed) = output.pop() else {
-                    break;
-                };
-                used = used.saturating_sub(UnicodeWidthChar::width(removed).unwrap_or(0));
-            }
-            output.push('…');
-            return output;
-        }
-        output.push(character);
-        used += character_width;
-    }
-    output
+    crate::text::clip_cells(value, max_width)
 }
 
 fn clip_tail_cells(value: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let width = value
-        .chars()
-        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
-        .sum::<usize>();
-    if width <= max_width {
-        return value.to_string();
-    }
-
-    let target = max_width.saturating_sub(1);
-    let mut suffix = Vec::new();
-    let mut used = 0;
-    for character in value.chars().rev() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if used + character_width > target {
-            break;
-        }
-        suffix.push(character);
-        used += character_width;
-    }
-    suffix.reverse();
-    format!("…{}", suffix.into_iter().collect::<String>())
+    crate::text::clip_tail_cells(value, max_width)
 }
 
 #[cfg(test)]
@@ -1537,6 +1818,7 @@ mod tests {
         App, BuiltinPaletteAction, CommandPaletteEntry, CommandPaletteHitbox, CommandPaletteTrigger,
     };
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::text::Line;
     use ratatui::Terminal;
     use unicode_width::UnicodeWidthStr;
@@ -1584,37 +1866,212 @@ mod tests {
             .join("\n")
     }
 
-    /// The two-column help overlay must fit a normal-height terminal without
-    /// vertical clipping and must still mention the headline bindings — the
-    /// single-column version it replaced listed 29 lines in a fixed 25-row
-    /// modal and silently clipped the bottom entries on anything but a tall
-    /// terminal.
+    /// Stable FNV-1a digest over every rendered cell (symbol, colours and
+    /// modifiers). Unlike substring smoke assertions, a border shift, clipped
+    /// footer or semantic-style regression changes the checked-in golden.
+    fn buffer_fingerprint(terminal: &Terminal<TestBackend>) -> u64 {
+        let buffer = terminal.backend().buffer();
+        let mut hash = 0xcbf29ce484222325_u64;
+        let mut feed = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        };
+        feed(&buffer.area.width.to_le_bytes());
+        feed(&buffer.area.height.to_le_bytes());
+        for cell in buffer.content() {
+            feed(cell.symbol().as_bytes());
+            feed(&[0]);
+            feed(format!("{:?}|{:?}|{:?}", cell.fg, cell.bg, cell.modifier).as_bytes());
+            feed(&[0xff]);
+        }
+        hash
+    }
+
     #[test]
-    fn help_overlay_fits_one_screen_and_lists_bindings() {
+    fn testbackend_goldens_cover_every_view_across_the_size_matrix() {
+        let sizes = [(50, 15), (60, 20), (80, 24), (120, 40), (200, 60)];
+        // Row-major: size, then `Tab::ALL`. Regenerate deliberately only when
+        // the complete rendered buffers have been reviewed.
+        let expected: [[u64; 6]; 5] = [
+            [
+                6_299_991_410_263_413_121,
+                6_299_991_410_263_413_121,
+                6_299_991_410_263_413_121,
+                6_299_991_410_263_413_121,
+                6_299_991_410_263_413_121,
+                6_299_991_410_263_413_121,
+            ],
+            [
+                13_961_651_686_046_235_677,
+                11_742_776_756_959_909_217,
+                12_352_841_898_830_756_966,
+                4_443_987_425_997_024_917,
+                10_477_181_847_636_759_683,
+                15_082_888_787_617_642_176,
+            ],
+            [
+                918_489_227_128_278_874,
+                12_868_650_456_892_988_142,
+                12_186_984_790_712_334_581,
+                17_105_919_049_885_996_702,
+                10_233_178_872_994_130_974,
+                10_014_260_811_141_985_839,
+            ],
+            [
+                12_989_858_624_620_429_706,
+                2_072_895_420_946_121_702,
+                13_799_275_926_493_068_613,
+                17_299_515_908_042_385_638,
+                14_066_239_811_268_707_862,
+                15_506_557_407_010_776_391,
+            ],
+            [
+                16_362_527_783_164_490_822,
+                10_339_770_751_650_844_978,
+                7_745_323_598_988_951_513,
+                12_921_833_252_336_354_826,
+                5_191_433_621_793_189_186,
+                15_064_146_538_247_429_787,
+            ],
+        ];
+        let mut actual = [[0_u64; 6]; 5];
+        for (size_index, (width, height)) in sizes.into_iter().enumerate() {
+            for (tab_index, tab) in crate::app::Tab::ALL.into_iter().enumerate() {
+                let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+                app.tab = tab;
+                app.connected = true;
+                app.chat.model = "provider/模型🧭e\u{301}".to_string();
+                app.chat.session_id = Some("session-full-identifier".to_string());
+                app.status_message = "deterministic status".to_string();
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &app))
+                    .unwrap();
+                let golden = terminal_text(&terminal);
+                actual[size_index][tab_index] = buffer_fingerprint(&terminal);
+                assert!(!golden.is_empty(), "empty {width}x{height} {tab:?}");
+                if width < crate::ui::MIN_TERMINAL_WIDTH || height < crate::ui::MIN_TERMINAL_HEIGHT
+                {
+                    assert!(golden.contains("Terminal too small"));
+                    assert!(golden.contains("50x15"));
+                } else {
+                    assert!(
+                        golden.contains(tab.title()),
+                        "{width}x{height} {tab:?}:\n{golden}"
+                    );
+                    assert!(golden.contains("ONLINE"));
+                    assert!(golden.contains("F1 help") || golden.contains("[1]Chat"));
+                }
+            }
+        }
+        assert_eq!(actual, expected, "full-buffer size/view golden changed");
+    }
+
+    #[test]
+    fn theme_variant_goldens_preserve_text_and_change_only_semantic_colors() {
+        let mut texts = Vec::new();
+        let mut fingerprints = Vec::new();
+        for palette in [
+            crate::theme::ThemePalette::TrueColor,
+            crate::theme::ThemePalette::System,
+            crate::theme::ThemePalette::NoColor,
+        ] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.set_theme(palette);
+            app.connected = false;
+            app.unseen_alerts = 2;
+            app.status_message = "full state meaning".to_string();
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = terminal_text(&terminal);
+            fingerprints.push(buffer_fingerprint(&terminal));
+            assert!(text.contains("OFFLINE"));
+            assert!(text.contains("2 ALERTS"));
+            match palette {
+                crate::theme::ThemePalette::TrueColor => assert!(buffer
+                    .content()
+                    .iter()
+                    .any(|cell| matches!(cell.fg, Color::Rgb(_, _, _)))),
+                crate::theme::ThemePalette::System => assert!(buffer
+                    .content()
+                    .iter()
+                    .all(|cell| !matches!(cell.fg, Color::Rgb(_, _, _)))),
+                crate::theme::ThemePalette::NoColor => assert!(buffer
+                    .content()
+                    .iter()
+                    .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset)),
+            }
+            texts.push(text);
+        }
+        assert_eq!(texts[0], texts[1]);
+        assert_eq!(texts[1], texts[2]);
+        assert_eq!(
+            fingerprints,
+            [
+                14_548_917_146_417_123_609,
+                8_988_964_665_087_750_412,
+                13_378_690_012_755_700_490,
+            ],
+            "full-buffer theme golden changed"
+        );
+    }
+
+    #[test]
+    fn help_overlay_is_scrollable_and_reaches_every_binding_at_minimum_size() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.help_visible = true;
 
-        let backend = TestBackend::new(100, 24);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let first = terminal_text(&terminal);
+        assert!(first.contains("Alt+Enter"));
+        assert!(first.contains("PgUp/PgDn"));
+        assert!(app.help_max_scroll.get() > 0);
 
-        let buf = terminal.backend().buffer().clone();
-        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        app.help_scroll = app.help_max_scroll.get();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let last = terminal_text(&terminal);
+        let reachable = format!("{first}\n{last}");
         for needle in [
             "Ctrl+K",
-            "Ctrl+N",
-            "Ctrl+O",
             "Ctrl+P",
-            "Ctrl+Q",
             "Ctrl+C",
-            "Ctrl+S",
-            "Ctrl+X",
             "Ctrl+L",
-            "Alt+Enter",
-            "F1",
-            "Press any key to close",
+            "F1 / ?",
+            "Esc/q close",
         ] {
-            assert!(text.contains(needle), "help overlay missing {needle:?}");
+            assert!(
+                reachable.contains(needle),
+                "help overlay never exposes {needle:?}:\n{reachable}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_footer_stays_visible_and_last_binding_reachable_on_tall_narrow_terminals() {
+        for (width, height) in [(60, 40), (80, 40)] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.help_visible = true;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            assert!(app.help_max_scroll.get() > 0);
+            app.help_scroll = app.help_max_scroll.get();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal_text(&terminal);
+            assert!(text.contains("F1 / ?"), "{width}x{height}:\n{text}");
+            assert!(text.contains("Esc/q close"), "{width}x{height}:\n{text}");
         }
     }
 

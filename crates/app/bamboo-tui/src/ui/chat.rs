@@ -39,14 +39,14 @@ fn push_tool_detail(
             for aline in &argument_lines {
                 lines.push(Line::from(Span::styled(
                     format!("   args: {aline}"),
-                    Style::default().fg(colors::SUBTLE),
+                    Style::default().fg(colors::subtle()),
                 )));
             }
             let extra = argument_count.saturating_sub(3);
             if extra > 0 {
                 lines.push(Line::from(Span::styled(
                     format!("   … {extra} more argument lines"),
-                    Style::default().fg(colors::SUBTLE),
+                    Style::default().fg(colors::subtle()),
                 )));
             }
         } else {
@@ -57,7 +57,7 @@ fn push_tool_detail(
             let ellipsis = if argument_count > 1 { "…" } else { "" };
             lines.push(Line::from(Span::styled(
                 format!("   args: {preview}{ellipsis}"),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
         }
     }
@@ -90,13 +90,13 @@ fn push_tool_detail(
         if start > 0 {
             lines.push(Line::from(Span::styled(
                 format!("   ↑ {start} earlier lines"),
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
         }
         for rline in &output_lines {
             lines.push(Line::from(Span::styled(
                 format!("   {rline}"),
-                Style::default().fg(colors::INACTIVE),
+                Style::default().fg(colors::inactive()),
             )));
         }
         let hidden_after = output_count.saturating_sub(start + limit);
@@ -107,7 +107,7 @@ fn push_tool_detail(
                 } else {
                     format!("   … {hidden_after} more — focus then Enter to inspect")
                 },
-                Style::default().fg(colors::SUBTLE),
+                Style::default().fg(colors::subtle()),
             )));
         }
     }
@@ -128,14 +128,14 @@ fn push_tool_detail(
                 } else {
                     format!("          {line}")
                 },
-                Style::default().fg(colors::TOOL_ERROR),
+                Style::default().fg(colors::tool_error()),
             )));
         }
         let extra = error_count.saturating_sub(3);
         if extra > 0 {
             lines.push(Line::from(Span::styled(
                 format!("   … {extra} more error lines · y copies exact text"),
-                Style::default().fg(colors::TOOL_ERROR),
+                Style::default().fg(colors::tool_error()),
             )));
         }
     }
@@ -146,7 +146,7 @@ fn push_tool_detail(
             } else {
                 "   Enter expand · y copy"
             },
-            Style::default().fg(colors::SUBTLE),
+            Style::default().fg(colors::subtle()),
         )));
     }
 }
@@ -208,7 +208,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 lines.push(Line::from(Span::styled(
                     if focused { "▸ user" } else { ">" },
                     Style::default()
-                        .fg(colors::USER_PREFIX)
+                        .fg(colors::user_prefix())
                         .add_modifier(if focused {
                             ratatui::style::Modifier::BOLD
                         } else {
@@ -218,7 +218,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                 for line in content.lines() {
                     lines.push(Line::from(Span::styled(
                         line.to_string(),
-                        Style::default().fg(colors::USER_PREFIX),
+                        Style::default().fg(colors::user_prefix()),
                     )));
                 }
             }
@@ -231,7 +231,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                             "▸ assistant"
                         },
                         Style::default()
-                            .fg(colors::BRAND)
+                            .fg(colors::brand())
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                 }
@@ -253,7 +253,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                         if focused { "▸" } else { "──" },
                         if streaming { " · streaming" } else { "" }
                     ),
-                    Style::default().fg(colors::THINKING),
+                    Style::default().fg(colors::thinking()),
                 )));
                 if state.expanded {
                     let start = state
@@ -269,26 +269,26 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     if start > 0 {
                         lines.push(Line::from(Span::styled(
                             format!(" ↑ {start} earlier lines"),
-                            Style::default().fg(colors::SUBTLE),
+                            Style::default().fg(colors::subtle()),
                         )));
                     }
                     for line in &detail {
                         lines.push(Line::from(Span::styled(
                             format!(" {line}"),
-                            Style::default().fg(colors::SUBTLE),
+                            Style::default().fg(colors::subtle()),
                         )));
                     }
                     let remaining = count.saturating_sub(start + CONVERSATION_DETAIL_VIEWPORT);
                     if remaining > 0 {
                         lines.push(Line::from(Span::styled(
                             format!(" ↓ {remaining} later lines"),
-                            Style::default().fg(colors::SUBTLE),
+                            Style::default().fg(colors::subtle()),
                         )));
                     }
                 } else {
                     lines.push(Line::from(Span::styled(
                         format!(" {count} reasoning lines hidden — focus then Enter to show"),
-                        Style::default().fg(colors::SUBTLE),
+                        Style::default().fg(colors::subtle()),
                     )));
                 }
                 if focused {
@@ -298,20 +298,20 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                         } else {
                             " Enter show · y copy"
                         },
-                        Style::default().fg(colors::SUBTLE),
+                        Style::default().fg(colors::subtle()),
                     )));
                 }
             }
             ConversationBlockKind::ToolCall { tool, streaming } => {
                 let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
                 let (icon, style) = match tool.phase.as_str() {
-                    "complete" => ("✓", Style::default().fg(colors::TOOL_DONE)),
-                    "error" => ("✗", Style::default().fg(colors::TOOL_ERROR)),
+                    "complete" => ("✓", Style::default().fg(colors::tool_done())),
+                    "error" => ("✗", Style::default().fg(colors::tool_error())),
                     _ if streaming => (
                         theme::BRAILLE_SPINNER[tick],
-                        Style::default().fg(colors::TOOL_RUNNING),
+                        Style::default().fg(colors::tool_running()),
                     ),
-                    _ => ("●", Style::default().fg(colors::TOOL_RUNNING)),
+                    _ => ("●", Style::default().fg(colors::tool_running())),
                 };
                 lines.push(Line::from(Span::styled(
                     format!(
@@ -330,12 +330,12 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     "running" | "running_in_background" | "queued" | "starting" | "in_progress" => {
                         (
                             theme::BRAILLE_SPINNER[tick],
-                            Style::default().fg(colors::TOOL_RUNNING),
+                            Style::default().fg(colors::tool_running()),
                         )
                     }
-                    "completed" => ("✓", Style::default().fg(colors::TOOL_DONE)),
-                    "error" | "cancelled" => ("✗", Style::default().fg(colors::TOOL_ERROR)),
-                    _ => ("·", Style::default().fg(colors::INACTIVE)),
+                    "completed" => ("✓", Style::default().fg(colors::tool_done())),
+                    "error" | "cancelled" => ("✗", Style::default().fg(colors::tool_error())),
+                    _ => ("·", Style::default().fg(colors::inactive())),
                 };
                 let label = child.title.as_deref().unwrap_or("sub-agent");
                 lines.push(Line::from(Span::styled(
@@ -351,7 +351,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                     if let Some(error) = &child.error {
                         lines.push(Line::from(Span::styled(
                             format!("   Error: {error}"),
-                            Style::default().fg(colors::TOOL_ERROR),
+                            Style::default().fg(colors::tool_error()),
                         )));
                     }
                 }
@@ -362,7 +362,7 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                         } else {
                             "   Enter open child · Ctrl+X expand/collapse · y copy"
                         },
-                        Style::default().fg(colors::SUBTLE),
+                        Style::default().fg(colors::subtle()),
                     )));
                 }
             }
@@ -392,16 +392,16 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
                         " {} ? {kind} · {status}: {question}",
                         if focused { "▸" } else { " " }
                     ),
-                    Style::default().fg(colors::WARNING),
+                    Style::default().fg(colors::warning()),
                 )));
             }
             ConversationBlockKind::TerminalStatus(status) => {
                 lines.push(Line::from(Span::styled(
                     format!(" {} ─ {status}", if focused { "▸" } else { " " }),
                     Style::default().fg(if status.starts_with("error") {
-                        colors::TOOL_ERROR
+                        colors::tool_error()
                     } else {
-                        colors::INACTIVE
+                        colors::inactive()
                     }),
                 )));
             }
@@ -424,12 +424,12 @@ fn build_conversation_lines(app: &App, width: u16) -> RenderedConversation {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No messages yet. Type a message below to start.",
-            Style::default().fg(colors::INACTIVE),
+            Style::default().fg(colors::inactive()),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Tip: Use --model <name> to set the model.",
-            Style::default().fg(colors::SUBTLE),
+            Style::default().fg(colors::subtle()),
         )));
         visual_line_count = Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })

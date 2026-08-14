@@ -9,11 +9,11 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::{Modifier, Style};
 use ratatui::Terminal;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tui_textarea::{CursorMove, TextArea};
-use unicode_width::UnicodeWidthChar;
 
 use crate::api::sse::{SessionSseEvent, SseStream};
 use crate::api::types::*;
@@ -343,28 +343,7 @@ fn subagent_block_id(turn_id: &str, child_session_id: &str) -> String {
 /// only `str::lines()` would make the supposedly bounded inspector flood the
 /// transcript and leave j/k unable to reach the hidden portions.
 pub(crate) fn inspector_lines(value: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut wrapped = Vec::new();
-    for logical in value.lines() {
-        if logical.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let mut line = String::new();
-        let mut cells = 0usize;
-        for character in logical.chars() {
-            let character_width = character.width().unwrap_or(1);
-            if !line.is_empty() && cells.saturating_add(character_width) > width {
-                wrapped.push(std::mem::take(&mut line));
-                cells = 0;
-            }
-            line.push(character);
-            cells = cells.saturating_add(character_width);
-        }
-        wrapped.push(line);
-    }
-    wrapped
+    crate::text::hard_wrap(value, width)
 }
 
 #[derive(Debug)]
@@ -469,6 +448,7 @@ impl ChatState {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+        apply_textarea_palette(&mut textarea, crate::theme::ThemePalette::TrueColor);
         Self {
             session_id: None,
             project_id: None,
@@ -753,6 +733,20 @@ impl ChatState {
         self.current_turn_id = None;
         self.current_terminal_status = None;
     }
+}
+
+/// Remove `tui-textarea`'s fixed DarkGray/LightBlue defaults and express all
+/// editor state through Bamboo's selected palette.  Reversed/underlined
+/// modifiers remain meaningful in no-colour mode without assuming a terminal
+/// background, while the placeholder follows the semantic inactive role.
+fn apply_textarea_palette(textarea: &mut TextArea<'_>, palette: crate::theme::ThemePalette) {
+    textarea.set_style(Style::default());
+    textarea.set_placeholder_style(
+        Style::default().fg(palette.color(crate::theme::ColorRole::Inactive)),
+    );
+    textarea.set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    textarea.set_selection_style(Style::default().add_modifier(Modifier::REVERSED));
 }
 
 /// Result of a session resume (history + summary + pending question fetched
@@ -1150,6 +1144,7 @@ pub struct ScheduleForm {
     pub prompt: String,
     /// Focused field: 0 = name, 1 = cron, 2 = prompt.
     pub field: usize,
+    pub error: Option<String>,
 }
 
 impl ScheduleForm {
@@ -1167,6 +1162,7 @@ impl ScheduleForm {
 /// it is PATCHed to the server.
 pub struct ConfigEditor {
     pub textarea: TextArea<'static>,
+    pub error: Option<String>,
 }
 
 /// In-progress model picker (`Ctrl+O` on the Chat tab). Opens immediately with
@@ -1184,7 +1180,7 @@ pub struct ModelPicker {
 }
 
 impl ModelPicker {
-    fn selected_model(&self) -> Option<&CatalogModel> {
+    pub(crate) fn selected_model(&self) -> Option<&CatalogModel> {
         self.visible
             .get(self.selected)
             .and_then(|index| self.models.get(*index))
@@ -1286,7 +1282,7 @@ pub struct SessionPicker {
 }
 
 impl SessionPicker {
-    fn selected_session(&self) -> Option<&SessionSummary> {
+    pub(crate) fn selected_session(&self) -> Option<&SessionSummary> {
         self.visible
             .get(self.selected)
             .and_then(|index| self.sessions.get(*index))
@@ -1826,6 +1822,9 @@ pub fn discover_bamboo_bin(
 pub struct App {
     pub running: bool,
     pub tab: Tab,
+    pub theme: crate::theme::ThemePalette,
+    pub terminal_width: u16,
+    pub terminal_height: u16,
     pub client: BambooClient,
     pub chat: ChatState,
     pub sessions: SessionsState,
@@ -1836,6 +1835,8 @@ pub struct App {
     pub status_message: String,
     pub connected: bool,
     pub help_visible: bool,
+    pub help_scroll: u16,
+    pub help_max_scroll: Cell<u16>,
     pub spinner_tick: usize,
     /// Startup-only "start a local server?" y/n offer; see [`ServeOffer`].
     /// Set at most once, by `run`'s initial health check, and cleared by
@@ -1884,15 +1885,24 @@ pub struct App {
     /// session, and the actual DELETE runs off the event loop like every other
     /// mutation.
     pub pending_delete: Option<(String, String)>,
+    /// Pending schedule-delete confirmation (`d` on the Schedules tab):
+    /// `(id, name)` awaiting `y`/Enter confirm or `n`/Esc cancel.
+    pub pending_schedule_delete: Option<(String, String)>,
     /// Session id whose DELETE request is currently in flight. When it is the
     /// active Chat session, submission stays blocked until the result arrives
     /// so a concurrent chat POST cannot recreate the session being deleted.
     deleting_session_id: Option<String>,
+    /// Schedule id whose DELETE request is currently in flight.
+    deleting_schedule_id: Option<String>,
     /// Capped scrollback of past status messages so errors/warnings aren't lost
     /// when the single status line is overwritten. Viewed with `Ctrl+L`.
     pub notifications: Vec<Notification>,
     /// Whether the notification-log overlay is open.
     pub notifications_visible: bool,
+    /// First notification row shown in the log (newest-first). The renderer
+    /// records a bounded maximum so resize and input always stay reachable.
+    pub notification_scroll: u16,
+    pub notification_max_scroll: Cell<u16>,
     /// Count of warn/error notifications since the log was last opened; shown as
     /// a badge in the status bar.
     pub unseen_alerts: usize,
@@ -2002,6 +2012,9 @@ impl App {
         Self {
             running: true,
             tab: Tab::Chat,
+            theme: crate::theme::ThemePalette::TrueColor,
+            terminal_width: u16::MAX,
+            terminal_height: u16::MAX,
             client,
             chat: ChatState::new(),
             sessions: SessionsState::new(),
@@ -2012,6 +2025,8 @@ impl App {
             status_message: String::new(),
             connected: false,
             help_visible: false,
+            help_scroll: 0,
+            help_max_scroll: Cell::new(0),
             spinner_tick: 0,
             serve_offer: None,
             spawned_server: None,
@@ -2023,9 +2038,13 @@ impl App {
             session_picker: None,
             command_palette: None,
             pending_delete: None,
+            pending_schedule_delete: None,
             deleting_session_id: None,
+            deleting_schedule_id: None,
             notifications: Vec::new(),
             notifications_visible: false,
+            notification_scroll: 0,
+            notification_max_scroll: Cell::new(0),
             unseen_alerts: 0,
             answer_epoch: 0,
             answer_task: None,
@@ -2047,6 +2066,16 @@ impl App {
             sse_ready: None,
             stream_disconnected: false,
             pending_answer_run_started: false,
+        }
+    }
+
+    /// Select the semantic palette and apply it to stateful third-party
+    /// widgets whose styles are stored rather than resolved during render.
+    pub fn set_theme(&mut self, palette: crate::theme::ThemePalette) {
+        self.theme = palette;
+        apply_textarea_palette(&mut self.chat.textarea, palette);
+        if let Some(editor) = self.config_editor.as_mut() {
+            apply_textarea_palette(&mut editor.textarea, palette);
         }
     }
 
@@ -2109,7 +2138,9 @@ impl App {
                     Ok(Event::Mouse(mouse)) if tx.send(AppEvent::Mouse(mouse)).is_err() => {
                         break;
                     }
-                    Ok(Event::Resize(_, _)) if tx.send(AppEvent::Resize).is_err() => {
+                    Ok(Event::Resize(width, height))
+                        if tx.send(AppEvent::Resize(width, height)).is_err() =>
+                    {
                         break;
                     }
                     _ => {}
@@ -2127,6 +2158,9 @@ impl App {
 
         // Main event loop.
         while self.running {
+            let size = terminal.size()?;
+            self.terminal_width = size.width;
+            self.terminal_height = size.height;
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             terminal.draw(|f| ui::render(f, self))?;
@@ -2173,17 +2207,102 @@ impl App {
     }
 
     async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
-        if self.help_visible && !self.any_modal_open() {
-            if let AppEvent::Key(_) = &event {
-                self.help_visible = false;
+        if let AppEvent::Resize(width, height) = event {
+            self.terminal_width = width;
+            self.terminal_height = height;
+            return Ok(());
+        }
+
+        let terminal_too_small = self.terminal_width < crate::ui::MIN_TERMINAL_WIDTH
+            || self.terminal_height < crate::ui::MIN_TERMINAL_HEIGHT;
+
+        // Stop/quit is the one global escape hatch that must preempt Help and
+        // the full-value log just as it preempts every interactive modal. At
+        // an unsupported size the only visible contract is "Ctrl+C quits",
+        // so it must quit in one press even when a hidden run is streaming.
+        if matches!(
+            &event,
+            AppEvent::Key(key)
+                if key.modifiers == KeyModifiers::CONTROL
+                    && key.code == KeyCode::Char('c')
+        ) && !terminal_too_small
+            && (self.help_visible || self.notifications_visible)
+        {
+            if self.chat.streaming {
+                self.stop_streaming();
+            } else {
+                self.running = false;
+            }
+            return Ok(());
+        }
+
+        if terminal_too_small {
+            // The compact warning replaces the interactive UI, so hidden
+            // keys and mouse gestures must not mutate it. Background work is
+            // different: SSE, loads, and mutation completions must keep
+            // advancing or a resize could strand the app in a stale state.
+            match &event {
+                AppEvent::Key(key) => {
+                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                        self.running = false;
+                    }
+                    return Ok(());
+                }
+                AppEvent::Mouse(_) => return Ok(()),
+                _ => {}
+            }
+        }
+
+        if self.notifications_visible {
+            if let AppEvent::Key(key) = &event {
+                let max = self.notification_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.notification_scroll = self.notification_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.notification_scroll =
+                            self.notification_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        self.notification_scroll = self.notification_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        self.notification_scroll =
+                            self.notification_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.notification_scroll = 0,
+                    KeyCode::End => self.notification_scroll = max,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
+                        self.notifications_visible = false;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
 
-        // The notification-log overlay is dismissed by any key.
-        if self.notifications_visible && !self.any_modal_open() {
-            if let AppEvent::Key(_) = &event {
-                self.notifications_visible = false;
+        if self.help_visible && !self.any_modal_open() {
+            if let AppEvent::Key(key) = &event {
+                let max = self.help_max_scroll.get();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10).min(max);
+                    }
+                    KeyCode::Home => self.help_scroll = 0,
+                    KeyCode::End => self.help_scroll = max,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
+                        self.help_visible = false;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
@@ -2340,6 +2459,21 @@ impl App {
                     });
                 if reload_origin_picker {
                     self.reload_session_picker();
+                }
+                self.load_tab_data();
+            }
+            AppEvent::ScheduleDeleted {
+                schedule_id,
+                result,
+            } => {
+                if self.deleting_schedule_id.as_deref() == Some(schedule_id.as_str()) {
+                    self.deleting_schedule_id = None;
+                }
+                match result {
+                    Ok(()) => self.notify(NoticeLevel::Info, "Schedule deleted"),
+                    Err(error) => {
+                        self.notify(NoticeLevel::Error, format!("Delete failed: {error}"))
+                    }
                 }
                 self.load_tab_data();
             }
@@ -3214,6 +3348,32 @@ impl App {
     /// dead input.
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.notifications_visible {
+            let max = self.notification_max_scroll.get();
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.notification_scroll = self.notification_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.notification_scroll = self.notification_scroll.saturating_add(3).min(max);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.help_visible && !self.any_modal_open() {
+            let max = self.help_max_scroll.get();
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(3).min(max);
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.pending_question.is_some() {
             let mut submit = None;
             {
@@ -3278,6 +3438,7 @@ impl App {
         // hidden behind it; cancel then returns to the exact prior selection.
         if self.serve_offer.is_some()
             || self.pending_delete.is_some()
+            || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
         {
@@ -3645,11 +3806,12 @@ impl App {
 
     /// Whether an exclusive modal currently owns the keyboard. `F1`/Ctrl+`?`/
     /// Ctrl+L are gated on this so they can't stack a second overlay on top
-    /// of one of these seven — see the precedence comment on `handle_key`.
+    /// of one of these eight — see the precedence comment on `handle_key`.
     fn any_modal_open(&self) -> bool {
         self.serve_offer.is_some()
             || self.pending_question.is_some()
             || self.pending_delete.is_some()
+            || self.pending_schedule_delete.is_some()
             || self.session_picker.is_some()
             || self.model_picker.is_some()
             || self.command_palette.is_some()
@@ -3666,11 +3828,12 @@ impl App {
     ///   0. `serve_offer`      — startup-only "start a local server?" offer
     ///   1. `pending_question` — agent permission/clarification gate
     ///   2. `pending_delete`   — session delete confirmation
-    ///   3. `session_picker`   — Ctrl+P contextual session picker
-    ///   4. `model_picker`     — Ctrl+O provider-catalog picker
-    ///   5. `command_palette`  — Ctrl+K global or slash composer palette
-    ///   6. `schedule_form`    — new-schedule authoring form
-    ///   7. `config_editor`    — raw config JSON editor
+    ///   3. `pending_schedule_delete` — schedule delete confirmation
+    ///   4. `session_picker`   — Ctrl+P contextual session picker
+    ///   5. `model_picker`     — Ctrl+O provider-catalog picker
+    ///   6. `command_palette`  — Ctrl+K global or slash composer palette
+    ///   7. `schedule_form`    — new-schedule authoring form
+    ///   8. `config_editor`    — raw config JSON editor
     ///
     /// Runtime modals can coexist in state because a clarification arrives
     /// asynchronously. The renderer layers them in the reverse order below,
@@ -3709,10 +3872,12 @@ impl App {
                 // F1 opens help on every tab, including Chat, regardless of
                 // modifiers — unlike `?` it never collides with typing.
                 self.help_visible = true;
+                self.help_scroll = 0;
                 return Ok(());
             }
-            (KeyModifiers::CONTROL, KeyCode::Char('l')) if !self.any_modal_open() => {
+            (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.notifications_visible = true;
+                self.notification_scroll = 0;
                 self.unseen_alerts = 0;
                 return Ok(());
             }
@@ -3738,25 +3903,32 @@ impl App {
             return self.handle_delete_confirm_key(key).await;
         }
 
-        // 3. The contextual session picker owns search/navigation/mutations.
+        // 3. Schedule deletion is also destructive and requires a second,
+        // explicit keystroke before the request can be sent.
+        if self.pending_schedule_delete.is_some() {
+            self.handle_schedule_delete_confirm_key(key);
+            return Ok(());
+        }
+
+        // 4. The contextual session picker owns search/navigation/mutations.
         if self.session_picker.is_some() {
             return self.handle_session_picker_key(key).await;
         }
 
-        // 4. The model picker likewise captures all input (navigation/apply)
+        // 5. The model picker likewise captures all input (navigation/apply)
         // before the global bindings below — same pattern as the other
         // modals.
         if self.model_picker.is_some() {
             return self.handle_model_picker_key(key).await;
         }
 
-        // 5. The command palette owns query/argument editing and selection.
+        // 6. The command palette owns query/argument editing and selection.
         if self.command_palette.is_some() {
             self.handle_command_palette_key(key);
             return Ok(());
         }
 
-        // 6. The schedule-authoring modal likewise captures all input: Tab moves
+        // 7. The schedule-authoring modal likewise captures all input: Tab moves
         // between fields and digits belong in cron expressions, so it must run
         // before the global Tab/1-6 tab-switching below (which would otherwise
         // swallow those keys and never reach the form).
@@ -3765,7 +3937,7 @@ impl App {
             return Ok(());
         }
 
-        // 7. The config editor is a full multi-line text buffer, so it must claim
+        // 8. The config editor is a full multi-line text buffer, so it must claim
         // every key (digits, Tab, Enter/newlines) before the global navigation
         // below — same rationale as the schedule form.
         if self.config_editor.is_some() {
@@ -3808,6 +3980,7 @@ impl App {
         // Chat-safe way to reach help.
         if key.code == KeyCode::Char('?') && self.tab != Tab::Chat {
             self.help_visible = true;
+            self.help_scroll = 0;
             return Ok(());
         }
 
@@ -4538,6 +4711,50 @@ impl App {
         Ok(())
     }
 
+    /// Drive the schedule-delete confirmation. The server round-trip is
+    /// spawned off the event loop so redraw and input remain responsive.
+    fn handle_schedule_delete_confirm_key(&mut self, key: KeyEvent) {
+        let Some((id, _name)) = self.pending_schedule_delete.clone() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_schedule_delete = None;
+                if self.deleting_schedule_id.is_some() {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Wait for the current schedule delete to finish",
+                    );
+                    return;
+                }
+                let Some(tx) = self.event_tx.clone() else {
+                    self.notify(
+                        NoticeLevel::Error,
+                        "Schedule delete is not attached to an event loop",
+                    );
+                    return;
+                };
+                self.deleting_schedule_id = Some(id.clone());
+                self.status_message = "Deleting schedule...".to_string();
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .delete_schedule(&id)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(AppEvent::ScheduleDeleted {
+                        schedule_id: id,
+                        result,
+                    });
+                });
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.pending_schedule_delete = None;
+            }
+            _ => {}
+        }
+    }
+
     /// Load the current tab's data WITHOUT blocking the event loop: mark the
     /// tab loading and spawn the fetch, which posts its result back as an
     /// `AppEvent` handled in `handle_event`.
@@ -4702,6 +4919,7 @@ impl App {
                 }
                 self.chat.textarea = TextArea::default();
                 self.chat.textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+                apply_textarea_palette(&mut self.chat.textarea, self.theme);
                 self.send_message(input);
             }
             _ => {
@@ -6142,27 +6360,21 @@ impl App {
                 self.schedules.selected = self.schedules.selected.saturating_sub(1);
             }
             KeyCode::Char('d') => {
-                // Spawned off the event loop like every other mutation here
-                // (see `handle_mcp_key`'s connect/disconnect) — an inline
-                // `.await` on the UI thread would freeze the whole app
-                // (spinner, redraw, SSE receipt) for the round-trip.
-                if let (Some(schedule), Some(tx)) = (
-                    self.schedules.schedules.get(self.schedules.selected),
-                    self.event_tx.clone(),
-                ) {
-                    let id = schedule.id.clone();
-                    let client = self.client.clone();
-                    tokio::spawn(async move {
-                        let outcome = match client.delete_schedule(&id).await {
-                            Ok(()) => Ok("Schedule deleted".to_string()),
-                            Err(e) => Err(format!("Delete failed: {e}")),
-                        };
-                        let _ = tx.send(AppEvent::ActionDone {
-                            outcome,
-                            reload_tab: true,
-                            session_picker_epoch: None,
-                        });
-                    });
+                if self.deleting_schedule_id.is_some() {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Wait for the current schedule delete to finish",
+                    );
+                    return Ok(());
+                }
+                if let Some(schedule) = self.schedules.schedules.get(self.schedules.selected) {
+                    self.pending_schedule_delete = Some((
+                        schedule.id.clone(),
+                        schedule
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "(unnamed)".to_string()),
+                    ));
                 }
             }
             KeyCode::Char('r') => {
@@ -6207,6 +6419,7 @@ impl App {
                 form.field = (form.field + 2) % 3;
             }
             KeyCode::Backspace => {
+                form.error = None;
                 form.current_mut().pop();
             }
             KeyCode::Enter => {
@@ -6214,7 +6427,7 @@ impl App {
                     || form.cron.trim().is_empty()
                     || form.prompt.trim().is_empty()
                 {
-                    self.status_message = "Fill in name, cron, and prompt".to_string();
+                    form.error = Some("Fill in name, cron, and prompt".to_string());
                     return;
                 }
                 let req = CreateScheduleRequest {
@@ -6250,6 +6463,7 @@ impl App {
                 }
             }
             KeyCode::Char(c) => {
+                form.error = None;
                 form.current_mut().push(c);
             }
             _ => {}
@@ -6319,8 +6533,11 @@ impl App {
                         let pretty =
                             serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
                         let lines: Vec<String> = pretty.lines().map(String::from).collect();
+                        let mut textarea = TextArea::new(lines);
+                        apply_textarea_palette(&mut textarea, self.theme);
                         self.config_editor = Some(ConfigEditor {
-                            textarea: TextArea::new(lines),
+                            textarea,
+                            error: None,
                         });
                     }
                     None => {
@@ -6367,12 +6584,15 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.notify(NoticeLevel::Error, format!("Invalid JSON: {e}"));
+                    if let Some(editor) = self.config_editor.as_mut() {
+                        editor.error = Some(format!("Invalid JSON: {e}"));
+                    }
                 }
             }
             return Ok(());
         }
         if let Some(editor) = self.config_editor.as_mut() {
+            editor.error = None;
             editor.textarea.input(key);
         }
         Ok(())
@@ -7194,9 +7414,13 @@ impl App {
                 self.tab = Tab::Chat;
                 self.open_model_picker();
             }
-            BuiltinPaletteAction::Help => self.help_visible = true,
+            BuiltinPaletteAction::Help => {
+                self.help_visible = true;
+                self.help_scroll = 0;
+            }
             BuiltinPaletteAction::Notifications => {
                 self.notifications_visible = true;
+                self.notification_scroll = 0;
                 self.unseen_alerts = 0;
             }
             BuiltinPaletteAction::Stop => self.stop_streaming(),
@@ -7301,6 +7525,7 @@ impl App {
             .min(u16::MAX as usize) as u16;
         let mut textarea = TextArea::from(lines);
         textarea.set_placeholder_text(CHAT_PLACEHOLDER);
+        apply_textarea_palette(&mut textarea, self.theme);
         textarea.move_cursor(CursorMove::Jump(row, column));
         self.chat.textarea = textarea;
     }
@@ -8997,7 +9222,7 @@ mod question_tests {
         use ratatui::Terminal;
 
         let app = app_with_question(vec!["Approve", "Deny"]);
-        let backend = TestBackend::new(60, 24);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
 
@@ -9006,6 +9231,159 @@ mod question_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Run this command?"), "question text missing");
         assert!(text.contains("Approve"), "option label missing");
+        assert!(text.contains("Enter answer"), "question action missing");
+    }
+
+    fn minimum_modal_fingerprint(app: &App) -> u64 {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut hash = 0xcbf29ce484222325_u64;
+        let mut feed = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        };
+        feed(&buffer.area.width.to_le_bytes());
+        feed(&buffer.area.height.to_le_bytes());
+        for cell in buffer.content() {
+            feed(cell.symbol().as_bytes());
+            feed(&[0]);
+            feed(format!("{:?}|{:?}|{:?}", cell.fg, cell.bg, cell.modifier).as_bytes());
+            feed(&[0xff]);
+        }
+        hash
+    }
+
+    #[test]
+    fn every_modal_has_a_fixed_full_buffer_golden_at_minimum_size() {
+        let mut actual = Vec::new();
+
+        let mut help = App::new(BambooClient::new("http://127.0.0.1:0"));
+        help.help_visible = true;
+        actual.push(minimum_modal_fingerprint(&help));
+
+        let mut log = App::new(BambooClient::new("http://127.0.0.1:0"));
+        log.notifications_visible = true;
+        log.status_message = "状态🧭e\u{301}".to_string();
+        actual.push(minimum_modal_fingerprint(&log));
+
+        let mut delete = App::new(BambooClient::new("http://127.0.0.1:0"));
+        delete.pending_delete = Some((
+            "session-full-id".to_string(),
+            "会话🧭e\u{301} long-unbroken-title".repeat(5),
+        ));
+        actual.push(minimum_modal_fingerprint(&delete));
+
+        let mut schedule_delete = App::new(BambooClient::new("http://127.0.0.1:0"));
+        schedule_delete.pending_schedule_delete = Some((
+            "schedule-full-id".to_string(),
+            "计划🧭e\u{301} long-unbroken-name".repeat(5),
+        ));
+        actual.push(minimum_modal_fingerprint(&schedule_delete));
+
+        let mut schedule = App::new(BambooClient::new("http://127.0.0.1:0"));
+        schedule.schedule_form = Some(ScheduleForm {
+            name: "nightly-计划".to_string(),
+            cron: "0 0 * * *".to_string(),
+            prompt: format!("{}TAIL_🧭e\u{301}", "x".repeat(80)),
+            field: 2,
+            error: Some("Prompt cannot be empty".to_string()),
+        });
+        actual.push(minimum_modal_fingerprint(&schedule));
+
+        let mut config = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut textarea = TextArea::new(vec!["{ invalid JSON 配置🧭".to_string()]);
+        apply_textarea_palette(&mut textarea, config.theme);
+        config.config_editor = Some(ConfigEditor {
+            textarea,
+            error: Some("Invalid JSON at line 1".to_string()),
+        });
+        actual.push(minimum_modal_fingerprint(&config));
+
+        let mut question = app_with_question(vec!["批准🧭", "Deny"]);
+        question.pending_question.as_mut().unwrap().error = Some("Retry required".to_string());
+        actual.push(minimum_modal_fingerprint(&question));
+
+        let mut model = App::new(BambooClient::new("http://127.0.0.1:0"));
+        model.model_picker = Some(model_picker(vec![catalog_model(
+            "provider-a",
+            "模型🧭e\u{301}",
+            "Unicode model",
+            "Provider A",
+        )]));
+        actual.push(minimum_modal_fingerprint(&model));
+
+        let mut session = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut summary = bare_session("session-完整-id");
+        summary.title = "会话🧭e\u{301}".to_string();
+        summary.model = "provider/model".to_string();
+        session.session_picker = Some(contextual_session_picker(vec![summary]));
+        actual.push(minimum_modal_fingerprint(&session));
+
+        let mut commands = App::new(BambooClient::new("http://127.0.0.1:0"));
+        commands.open_command_palette(CommandPaletteTrigger::Global);
+        actual.push(minimum_modal_fingerprint(&commands));
+
+        let mut serve = App::new(BambooClient::new("http://127.0.0.1:0"));
+        serve.serve_offer = Some(ServeOffer {
+            url: format!("http://127.0.0.1:9562/{}", "long-path-".repeat(12)),
+        });
+        actual.push(minimum_modal_fingerprint(&serve));
+
+        assert_eq!(
+            actual,
+            vec![
+                3_754_701_473_256_146_053,
+                8_481_293_528_542_647_595,
+                12_575_992_514_826_633_301,
+                13_989_639_618_912_745_774,
+                465_778_487_439_365_817,
+                14_156_803_428_225_062_900,
+                17_914_074_169_692_835_981,
+                13_149_988_112_385_910_257,
+                5_948_328_123_032_448_941,
+                8_759_320_582_986_254_806,
+                4_446_556_145_525_268_495,
+            ],
+            "minimum-size modal golden changed"
+        );
+    }
+
+    #[test]
+    fn long_custom_question_tail_and_actions_are_visible_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_question(vec![]);
+        app.pending_question.as_mut().unwrap().custom = Some(format!(
+            "{}CUSTOM_TAIL_终点🧭e\u{301}",
+            "long-unbroken-".repeat(20)
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("CUSTOM_TAIL_"), "input tail missing:\n{text}");
+        assert!(text.contains('终') && text.contains('点') && text.contains('🧭'));
+        assert!(text.contains('▏'), "input cursor missing:\n{text}");
+        assert!(
+            text.contains("Enter answer"),
+            "question action missing:\n{text}"
+        );
     }
 
     #[tokio::test]
@@ -9017,6 +9395,7 @@ mod question_tests {
         app.chat.session_id = Some("sess-1".to_string());
         app.config_editor = Some(ConfigEditor {
             textarea: tui_textarea::TextArea::new(vec!["CONFIG_EDITOR_SENTINEL".to_string()]),
+            error: None,
         });
         app.handle_sse_event(AgentEvent::NeedClarification {
             question: "VISIBLE_SECURITY_DECISION".to_string(),
@@ -9944,12 +10323,10 @@ mod question_tests {
         );
     }
 
-    /// F1/Ctrl+L must not stack the help/notification overlay on top of an
-    /// already-open modal — `any_modal_open` gates them so the keystroke
-    /// falls through to the modal's own handler instead (a no-op there,
-    /// since neither key means anything to the delete-confirm modal).
+    /// Help stays suppressed over a modal, while Ctrl+L deliberately opens a
+    /// topmost full-value inspector without destroying the underlying state.
     #[tokio::test]
-    async fn f1_and_ctrl_l_are_suppressed_while_a_modal_is_open() {
+    async fn help_is_suppressed_but_full_log_opens_over_a_modal() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.pending_delete = Some(("s1".to_string(), "My session".to_string()));
 
@@ -9963,10 +10340,92 @@ mod question_tests {
             .await
             .unwrap();
         assert!(
-            !app.notifications_visible,
-            "Ctrl+L must not open the log over a modal"
+            app.notifications_visible,
+            "Ctrl+L must expose full clipped values over a modal"
         );
         assert!(app.pending_delete.is_some(), "the modal must stay open");
+
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("delete session id"));
+        assert!(text.contains("s1"));
+        assert!(text.contains("Esc/q close"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc)))
+            .await
+            .unwrap();
+        assert!(!app.notifications_visible);
+        assert!(app.pending_delete.is_some());
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Delete session?"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_preempts_help_and_full_log() {
+        for full_log in [false, true] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.help_visible = !full_log;
+            app.notifications_visible = full_log;
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )))
+            .await
+            .unwrap();
+            assert!(!app.running, "overlay must not trap Ctrl+C");
+        }
+    }
+
+    #[tokio::test]
+    async fn too_small_screen_ctrl_c_quits_once_even_with_hidden_streaming_overlay() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.help_visible = true;
+        app.handle_event(AppEvent::Resize(50, 15)).await.unwrap();
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .await
+        .unwrap();
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn asynchronous_question_owns_mouse_over_hidden_help() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let mut app = app_with_question(vec!["One", "Two", "Three"]);
+        app.help_visible = true;
+        app.help_max_scroll.set(20);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.pending_question.as_ref().unwrap().selected, 2);
+        assert_eq!(app.help_scroll, 0, "hidden help must not consume the wheel");
     }
 
     #[test]
@@ -9990,6 +10449,29 @@ mod question_tests {
         assert!(!app.chat.auto_scroll);
         app.handle_mouse(ev(MouseEventKind::ScrollDown));
         assert_eq!(app.chat.scroll_offset, 10);
+    }
+
+    #[tokio::test]
+    async fn below_minimum_size_blocks_input_but_keeps_background_state_live() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Chat;
+        app.handle_event(AppEvent::Resize(50, 15)).await.unwrap();
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('3'))))
+            .await
+            .unwrap();
+        assert_eq!(app.tab, Tab::Chat);
+        assert_eq!(app.chat.textarea.lines().join("\n"), "");
+
+        app.handle_event(AppEvent::ActionDone {
+            outcome: Err("background failure remains visible".to_string()),
+            reload_tab: false,
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.status_message, "background failure remains visible");
+        assert_eq!(app.notifications.len(), 1);
     }
 
     /// Scrolling down is clamped to `max_scroll` (set by the render function
@@ -10070,6 +10552,140 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn schedule_delete_requires_confirmation_owns_mouse_and_guards_in_flight() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let schedule = |index: usize| Schedule {
+            id: format!("schedule-{index}"),
+            name: Some(format!("计划 {index} 🧭")),
+            cron: Some("0 * * * *".to_string()),
+            enabled: Some(true),
+            prompt: None,
+            last_run: None,
+            next_run: None,
+        };
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.tab = Tab::Schedules;
+        app.schedules.schedules = (0..6).map(schedule).collect();
+        app.schedules.selected = 2;
+
+        app.handle_key(key(KeyCode::Char('d'))).await.unwrap();
+        assert_eq!(
+            app.pending_schedule_delete
+                .as_ref()
+                .map(|target| target.0.as_str()),
+            Some("schedule-2")
+        );
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.schedules.selected, 2, "confirmation must own the wheel");
+        app.handle_key(key(KeyCode::Esc)).await.unwrap();
+        assert!(app.pending_schedule_delete.is_none());
+
+        app.deleting_schedule_id = Some("schedule-1".to_string());
+        app.handle_key(key(KeyCode::Char('d'))).await.unwrap();
+        assert!(app.pending_schedule_delete.is_none());
+        assert!(app.status_message.contains("Wait for the current"));
+    }
+
+    #[test]
+    fn schedule_delete_confirmation_keeps_unicode_target_and_actions_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_schedule_delete = Some((
+            "schedule-full-id".to_string(),
+            "计划🧭e\u{301} very long delete target ".repeat(8),
+        ));
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Delete schedule?"));
+        // Ratatui stores a blank continuation cell after each double-width
+        // glyph; assert the individual glyphs rather than a flat contiguous
+        // byte sequence.
+        assert!(text.contains('计'));
+        assert!(text.contains('划'));
+        assert!(text.contains("y / Enter confirm"));
+        assert!(text.contains("n / Esc cancel"));
+    }
+
+    #[test]
+    fn schedule_form_and_config_editor_keep_inline_errors_actions_and_tail_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.schedule_form = Some(ScheduleForm {
+            name: "name".to_string(),
+            cron: "* * * * *".to_string(),
+            prompt: format!("{}PROMPT_TAIL_🧭e\u{301}", "x".repeat(120)),
+            field: 2,
+            error: Some("Cron is required".to_string()),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for needle in [
+            "PROMPT_TAIL_",
+            "Cron is required",
+            "Enter create",
+            "Esc cancel",
+        ] {
+            assert!(
+                text.contains(needle),
+                "schedule form missing {needle:?}:\n{text}"
+            );
+        }
+
+        app.schedule_form = None;
+        let mut textarea = TextArea::new(vec!["{ invalid JSON CONFIG_TAIL_🧭".to_string()]);
+        apply_textarea_palette(&mut textarea, app.theme);
+        app.config_editor = Some(ConfigEditor {
+            textarea,
+            error: Some("Invalid JSON at line 1".to_string()),
+        });
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for needle in ["CONFIG_TAIL_", "Invalid JSON", "Ctrl+S save", "Esc cancel"] {
+            assert!(
+                text.contains(needle),
+                "config editor missing {needle:?}:\n{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn config_editor_opens_validates_and_cancels() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let plain = |c| KeyEvent::new(c, KeyModifiers::empty());
@@ -10094,7 +10710,13 @@ mod question_tests {
             app.config_editor.is_some(),
             "invalid JSON must keep the editor open"
         );
-        assert!(app.status_message.contains("Invalid JSON"));
+        assert!(
+            app.config_editor
+                .as_ref()
+                .and_then(|editor| editor.error.as_deref())
+                .is_some_and(|error| error.contains("Invalid JSON")),
+            "validation errors must remain visible inside the editor modal"
+        );
 
         // Esc cancels.
         app.handle_key(plain(KeyCode::Esc)).await.unwrap();
@@ -10130,7 +10752,7 @@ mod question_tests {
         assert!(app.notifications_visible);
         assert_eq!(app.unseen_alerts, 0);
 
-        // Any key dismisses the overlay.
+        // Explicit close keys dismiss the overlay; navigation remains inside.
         app.handle_event(AppEvent::Key(KeyEvent::new(
             KeyCode::Char('q'),
             KeyModifiers::empty(),
@@ -10138,6 +10760,67 @@ mod question_tests {
         .await
         .unwrap();
         assert!(!app.notifications_visible);
+    }
+
+    #[test]
+    fn notification_footer_survives_large_terminals_and_deep_scrollback() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for (width, height) in [(120, 40), (200, 60)] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.notifications_visible = true;
+            for index in 0..80 {
+                app.notify(
+                    if index % 2 == 0 {
+                        NoticeLevel::Warn
+                    } else {
+                        NoticeLevel::Info
+                    },
+                    format!("notification-{index}-{}", "long-unbroken".repeat(10)),
+                );
+            }
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for offset in [0, u16::MAX / 2, u16::MAX] {
+                app.notification_scroll = offset;
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &app))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains("Esc/q close"), "{width}x{height}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_value_log_distinguishes_same_model_across_providers() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "shared-model".to_string();
+        app.chat.provider = Some("provider-b".to_string());
+        app.notifications_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("shared-model"));
+        assert!(text.contains("model provider"));
+        assert!(text.contains("provider-b"));
     }
 
     #[test]
@@ -13786,7 +14469,7 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.session_picker = Some(contextual_session_picker(vec![session]));
 
-        let backend = TestBackend::new(60, 24);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| crate::ui::render(frame, &app))
@@ -13803,6 +14486,49 @@ mod question_tests {
         assert!(text.contains("★"));
         assert!(text.contains("F2 rename"));
         assert!(text.contains("Esc cancel"));
+    }
+
+    #[test]
+    fn session_picker_keeps_selection_error_and_both_footers_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let sessions = (0..30)
+            .map(|index| {
+                let mut session = bare_session(&format!("session-{index}"));
+                session.title = format!("会话 {index} 🧭");
+                session
+            })
+            .collect::<Vec<_>>();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.session_picker = Some(contextual_session_picker(sessions));
+        let picker = app.session_picker.as_mut().unwrap();
+        picker.selected = 15;
+        picker.error = Some("load failed; Ctrl+R remains reachable".to_string());
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for needle in [
+            "15 🧭",
+            "load failed",
+            "F2 rename",
+            "Del delete",
+            "Esc cancel",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        assert!(text.contains("more"), "window indicators missing:\n{text}");
     }
 
     #[test]
@@ -14399,7 +15125,7 @@ mod question_tests {
             "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
         )]));
 
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
 
@@ -14409,6 +15135,47 @@ mod question_tests {
         assert!(text.contains("OpenAI"), "provider display name missing");
         assert!(text.contains("openai/gpt-4.1"), "provider/model id missing");
         assert!(text.contains("Esc cancel"), "narrow footer was clipped");
+    }
+
+    #[test]
+    fn model_picker_keeps_no_match_recovery_and_error_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "provider-with-long-id",
+            "model-with-long-id",
+            "Readable model",
+            "Readable provider",
+        )]));
+        let picker = app.model_picker.as_mut().unwrap();
+        picker.query = "no-match".to_string();
+        picker.refresh_filter(None);
+        picker.error = Some("catalog failed but recovery remains available".to_string());
+
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for needle in [
+            "No models match",
+            "Ctrl+U",
+            "Ctrl+R",
+            "Esc cancel",
+            "catalog failed",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
     }
 }
 
@@ -14536,6 +15303,33 @@ mod auto_serve_tests {
         assert!(app.serve_offer.is_none());
         assert!(app.spawned_server.is_none());
         assert!(app.status_message.contains("--auto-serve"));
+    }
+
+    #[test]
+    fn serve_offer_long_url_keeps_both_actions_visible_at_minimum_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_offer();
+        app.serve_offer.as_mut().unwrap().url = format!(
+            "http://127.0.0.1:9562/{}?token={}",
+            "path-segment/".repeat(10),
+            "界🧭e\u{301}".repeat(20)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for needle in ["Ctrl+L inspect", "y / Enter start", "n / Esc skip"] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
     }
 
     #[test]
@@ -14668,7 +15462,7 @@ mod auto_serve_tests {
         use ratatui::Terminal;
 
         let app = app_with_offer();
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
 
@@ -14676,5 +15470,7 @@ mod auto_serve_tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("127.0.0.1:9562"), "offer URL missing");
         assert!(text.contains("Start a local"), "offer prompt missing");
+        assert!(text.contains("y / Enter start"), "start action missing");
+        assert!(text.contains("n / Esc skip"), "skip action missing");
     }
 }
