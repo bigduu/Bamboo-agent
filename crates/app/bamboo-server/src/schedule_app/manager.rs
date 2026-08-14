@@ -406,9 +406,7 @@ async fn run_schedule_job(
     );
     let session_id = session.id.clone();
     if let Some(config) = ctx.permission_config.as_ref() {
-        if let Some(workspace) = session.workspace.as_ref() {
-            config.register_session_workspace(session_id.clone(), workspace.clone());
-        }
+        config.set_session_workspace(session_id.clone(), session.workspace.clone());
         record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
             .map_err(|error| error.to_string())?;
     }

@@ -18,7 +18,7 @@ use tui_textarea::{CursorMove, TextArea};
 use crate::api::sse::{SessionSseEvent, SseStream};
 use crate::api::types::*;
 use crate::api::{BambooClient, RespondFailure};
-use crate::event::AppEvent;
+use crate::event::{AnswerSubmissionOutcome, AppEvent};
 use crate::history::map_history;
 use crate::keymap::{
     text_character, text_widget_input_allowed, ActionAvailability, ActionContext, ActionId,
@@ -583,6 +583,10 @@ pub struct ChatState {
     pub current_turn_id: Option<String>,
     pub current_terminal_status: Option<String>,
     pub model: String,
+    /// Requested/effective permission posture of the open session. These are
+    /// persisted in the header even when no approval modal is visible.
+    pub permission_mode: SessionPermissionMode,
+    pub bypass_permissions: bool,
     /// Provider paired with `model` when the selection has an authoritative
     /// catalog/session identity. Kept across Ctrl+N so a new session does not
     /// silently fall back to another provider for a same-named model.
@@ -667,6 +671,8 @@ impl ChatState {
             current_turn_id: None,
             current_terminal_status: None,
             model: String::new(),
+            permission_mode: SessionPermissionMode::Default,
+            bypass_permissions: false,
             provider: None,
             token_usage: None,
             plan_mode: false,
@@ -960,6 +966,8 @@ pub struct OpenedSession {
     pub model: String,
     pub provider: Option<String>,
     pub project_id: Option<String>,
+    pub permission_mode: SessionPermissionMode,
+    pub bypass_permissions: bool,
     pub is_running: bool,
     pub pending: Option<PendingQuestion>,
     /// The server dropped older messages to stay under its cold-fetch cap.
@@ -1064,8 +1072,44 @@ impl SkillsState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigView {
+    Raw,
+    Permissions,
+}
+
+pub struct PermissionPolicyState {
+    pub snapshot: Option<PermissionPolicyResponse>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub diagnosis: Option<serde_json::Value>,
+}
+
+impl PermissionPolicyState {
+    pub fn new() -> Self {
+        Self {
+            snapshot: None,
+            selected: 0,
+            loading: false,
+            error: None,
+            diagnosis: None,
+        }
+    }
+
+    pub fn selected_rule(&self) -> Option<&DurablePermissionRule> {
+        self.snapshot
+            .as_ref()?
+            .policy
+            .durable_rules
+            .get(self.selected)
+    }
+}
+
 pub struct ConfigState {
     pub config: Option<serde_json::Value>,
+    pub view: ConfigView,
+    pub permissions: PermissionPolicyState,
     pub loading: bool,
     pub error: Option<String>,
     pub scroll_offset: u16,
@@ -1079,6 +1123,8 @@ impl ConfigState {
     pub fn new() -> Self {
         Self {
             config: None,
+            view: ConfigView::Raw,
+            permissions: PermissionPolicyState::new(),
             loading: false,
             error: None,
             scroll_offset: 0,
@@ -1113,6 +1159,16 @@ pub struct Notification {
 pub struct QuestionIdentity {
     pub session_id: String,
     pub tool_call_id: Option<String>,
+    /// Child approval generation. Parent permissions and clarifications leave
+    /// these unset; child approvals require both values so a terminal event or
+    /// late HTTP response from an older attempt cannot close a newer prompt
+    /// that reused the same request id.
+    pub child_session_id: Option<String>,
+    pub child_attempt: Option<u32>,
+    pub child_version: Option<u64>,
+    /// Server-issued generation for parent permission requests whose provider
+    /// tool-call id may be reused in a later round.
+    pub permission_generation: Option<String>,
     /// Fallback discriminator for older/external events that do not carry a
     /// tool-call id. The server-side optimistic guard is available whenever
     /// `tool_call_id` is present; this keeps local replay/draft state separate
@@ -1130,7 +1186,41 @@ impl QuestionIdentity {
         Self {
             session_id,
             tool_call_id,
+            child_session_id: None,
+            child_attempt: None,
+            child_version: None,
+            permission_generation: None,
             question: fallback_question,
+        }
+    }
+
+    fn permission(session_id: String, request_id: String, request_generation: String) -> Self {
+        Self {
+            session_id,
+            tool_call_id: Some(request_id),
+            child_session_id: None,
+            child_attempt: None,
+            child_version: None,
+            permission_generation: Some(request_generation),
+            question: String::new(),
+        }
+    }
+
+    fn child(
+        parent_session_id: String,
+        child_session_id: String,
+        request_id: String,
+        child_attempt: u32,
+        child_version: u64,
+    ) -> Self {
+        Self {
+            session_id: parent_session_id,
+            tool_call_id: Some(request_id),
+            child_session_id: Some(child_session_id),
+            child_attempt: Some(child_attempt),
+            child_version: Some(child_version),
+            permission_generation: None,
+            question: String::new(),
         }
     }
 }
@@ -1173,6 +1263,264 @@ pub struct QuestionOptionHitbox {
     pub index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionStage {
+    Decision,
+    Matcher(PermissionDecisionKind),
+    GlobalConfirm { matcher_index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionInspectTarget {
+    Request,
+    Matcher {
+        decision: PermissionDecisionKind,
+        matcher_index: usize,
+    },
+    GlobalScope {
+        matcher_index: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PermissionQuestion {
+    pub request: PermissionRequest,
+    /// Preformatted once when the authoritative pending contract is hydrated;
+    /// rendering must never repeatedly pretty-print an attacker-sized value.
+    pub tool_arguments_preview: String,
+    pub tool_arguments_truncated: bool,
+    pub stage: PermissionStage,
+    pub matcher_selected: usize,
+    pub inspect_target: Option<PermissionInspectTarget>,
+    pub reviewed_matcher: Option<(PermissionDecisionKind, usize)>,
+    /// Global authorization is never submitted directly from a clipped
+    /// preview. The operator must first enter and leave the exact scope/matcher
+    /// inspector for this confirmation stage.
+    pub global_scope_reviewed: bool,
+}
+
+impl PermissionQuestion {
+    pub fn inspector_title(&self) -> &'static str {
+        match self.inspect_target {
+            Some(PermissionInspectTarget::Request) | None => "Permission request inspector",
+            Some(PermissionInspectTarget::Matcher { .. }) => "Remembered scope inspector",
+            Some(PermissionInspectTarget::GlobalScope { .. }) => "GLOBAL authorization inspector",
+        }
+    }
+
+    pub fn inspector_text(&self) -> String {
+        let request = &self.request;
+        let mut lines = vec![
+            format!("request id: {}", request.request_id),
+            format!("request generation: {}", request.request_generation),
+            format!("session id: {}", request.session_id),
+            format!(
+                "registered workspace: {}",
+                request.workspace_path.as_deref().unwrap_or("<unavailable>")
+            ),
+            format!("tool: {}", request.tool_name),
+            format!("permission type: {}", request.permission_type.label()),
+            format!("operation summary: {}", request.operation_summary),
+            format!("exact resource: {}", request.resource),
+            format!(
+                "tool arguments{}:\n{}",
+                if self.tool_arguments_truncated {
+                    " (server/local bounded and truncated)"
+                } else {
+                    ""
+                },
+                self.tool_arguments_preview
+            ),
+            format!("risk level: {}", request.risk_level.label()),
+            format!("reason code: {}", request.reason_code.label()),
+            format!("effective mode: {}", request.effective_mode.label()),
+            format!("bypass requested: {}", request.bypass_requested),
+            format!("auto approve requested: {}", request.auto_approve_requested),
+            format!("policy revision: {}", request.policy_revision),
+        ];
+
+        match &request.matched_rule {
+            Some(rule) => {
+                lines.push(format!("matched rule id: {}", rule.id));
+                lines.push(format!("matched rule effect: {:?}", rule.effect));
+                lines.push(format!("matched rule scope: {:?}", rule.scope));
+                lines.push(format!("matched rule source: {:?}", rule.source));
+            }
+            None => lines.push("matched rule: <none>".to_string()),
+        }
+
+        let selected = match self.inspect_target {
+            Some(PermissionInspectTarget::Matcher {
+                decision,
+                matcher_index,
+            }) => Some((decision, matcher_index)),
+            Some(PermissionInspectTarget::GlobalScope { matcher_index }) => {
+                Some((PermissionDecisionKind::AllowGlobal, matcher_index))
+            }
+            Some(PermissionInspectTarget::Request) | None => None,
+        };
+        if let Some((decision, matcher_index)) = selected {
+            lines.push(format!("decision: {}", decision.label()));
+            lines.push(match decision {
+                PermissionDecisionKind::AllowSession | PermissionDecisionKind::DenySession => {
+                    format!("remembered scope: session {}", request.session_id)
+                }
+                PermissionDecisionKind::AllowWorkspace => format!(
+                    "remembered scope: registered workspace {} (origin session {})",
+                    request.workspace_path.as_deref().unwrap_or("<unavailable>"),
+                    request.session_id
+                ),
+                PermissionDecisionKind::AllowGlobal => {
+                    "remembered scope: GLOBAL - every session and workspace".to_string()
+                }
+                PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce => {
+                    format!(
+                        "scope: request occurrence {} / {}",
+                        request.request_id, request.request_generation
+                    )
+                }
+            });
+            match request.suggested_matchers.get(matcher_index) {
+                Some(matcher) => {
+                    lines.push(format!("matcher id: {}", matcher.id));
+                    lines.push(format!("matcher kind: {}", matcher.kind.label()));
+                    lines.push(format!("matcher exact value: {}", matcher.value));
+                }
+                None => lines.push("matcher: <missing - submission disabled>".to_string()),
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildApprovalQuestion {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub child_attempt: u32,
+    pub request_id: String,
+    pub version: u64,
+    pub tool_name: String,
+    pub permission: String,
+    pub resource: String,
+    pub exact_reviewed: bool,
+}
+
+impl ChildApprovalQuestion {
+    pub fn inspector_text(&self) -> String {
+        [
+            format!("parent session id: {}", self.parent_session_id),
+            format!("child session id: {}", self.child_session_id),
+            format!("child attempt: {}", self.child_attempt),
+            format!("approval version: {}", self.version),
+            format!("request id: {}", self.request_id),
+            format!("tool: {}", self.tool_name),
+            format!("permission: {}", self.permission),
+            format!("exact resource: {}", self.resource),
+        ]
+        .join("\n")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedChildApproval {
+    record: ChildApprovalRecord,
+    /// `ChildApprovalRequested` predates durable attempt/version fields. It is
+    /// kept as a non-actionable signal until the snapshot (or a durable changed
+    /// event) supplies the exact identity.
+    authoritative: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ActiveQuestionKind {
+    Clarification,
+    Permission(PermissionQuestion),
+    PermissionUnavailable { reason: String },
+    ChildApproval(ChildApprovalQuestion),
+}
+
+#[derive(Debug, Clone)]
+enum QuestionSubmission {
+    Clarification(String),
+    Permission(PermissionDecision),
+    ChildApproval {
+        parent_session_id: String,
+        child_session_id: String,
+        child_attempt: u32,
+        request_id: String,
+        expected_version: u64,
+        approved: bool,
+    },
+}
+
+impl QuestionSubmission {
+    fn label(&self) -> String {
+        match self {
+            Self::Clarification(answer) => answer.clone(),
+            Self::Permission(decision) => decision.decision.label().to_string(),
+            Self::ChildApproval { approved: true, .. } => "Approve child action".to_string(),
+            Self::ChildApproval {
+                approved: false, ..
+            } => "Deny child action".to_string(),
+        }
+    }
+}
+
+fn build_permission_decision(
+    request: &PermissionRequest,
+    decision: PermissionDecisionKind,
+    matcher_index: Option<usize>,
+    confirm_global: bool,
+) -> std::result::Result<PermissionDecision, String> {
+    if !request.allowed_decisions.contains(&decision) {
+        return Err("The server did not allow that permission decision".to_string());
+    }
+    let remembered = decision.remembers();
+    let matcher_id = if remembered {
+        let index = matcher_index.ok_or_else(|| {
+            "A server-supplied exact matcher must be reviewed before remembering".to_string()
+        })?;
+        Some(
+            request
+                .suggested_matchers
+                .get(index)
+                .ok_or_else(|| "The selected matcher is no longer available".to_string())?
+                .id
+                .clone(),
+        )
+    } else {
+        None
+    };
+    if decision == PermissionDecisionKind::AllowGlobal && !confirm_global {
+        return Err("Global permission requires a separate confirmation".to_string());
+    }
+    if decision == PermissionDecisionKind::AllowWorkspace
+        && request
+            .workspace_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .is_none()
+    {
+        return Err(
+            "Workspace permission requires a registered, server-authoritative workspace"
+                .to_string(),
+        );
+    }
+    Ok(PermissionDecision {
+        request_id: request.request_id.clone(),
+        request_generation: request.request_generation.clone(),
+        decision,
+        matcher_id,
+        expected_policy_revision: matches!(
+            decision,
+            PermissionDecisionKind::AllowWorkspace | PermissionDecisionKind::AllowGlobal
+        )
+        .then_some(request.policy_revision),
+        confirm_global: decision == PermissionDecisionKind::AllowGlobal && confirm_global,
+    })
+}
+
 impl QuestionOptionHitbox {
     fn contains(self, column: u16, row: u16) -> bool {
         row == self.y && column >= self.x && column < self.x.saturating_add(self.width)
@@ -1189,6 +1537,7 @@ pub struct ActiveQuestion {
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub source: Option<String>,
+    pub kind: ActiveQuestionKind,
     pub question: String,
     /// Preset choices; empty means free-text only.
     pub options: Vec<String>,
@@ -1241,8 +1590,67 @@ impl ActiveQuestion {
         pending: &PendingQuestion,
         draft: String,
     ) -> Self {
-        let options = pending.options.clone().unwrap_or_default();
-        let custom = if options.is_empty() && pending.allow_custom {
+        let typed_permission = pending.permission_request.clone().filter(|request| {
+            request.session_id == session_id
+                && !request.request_generation.trim().is_empty()
+                && pending.tool_call_id.as_deref() == Some(request.request_id.as_str())
+        });
+        let kind = match (pending.interaction_kind, typed_permission) {
+            (Some(PendingInteractionKind::Permission), Some(request)) => {
+                let mut preview = pending
+                    .tool_arguments
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string_pretty(value).ok())
+                    .unwrap_or_else(|| "not supplied".to_string());
+                const MAX_PREVIEW_CHARS: usize = 16 * 1024;
+                let locally_truncated = preview.chars().count() > MAX_PREVIEW_CHARS;
+                if locally_truncated {
+                    preview = preview.chars().take(MAX_PREVIEW_CHARS).collect();
+                    preview.push('…');
+                }
+                ActiveQuestionKind::Permission(PermissionQuestion {
+                    request,
+                    tool_arguments_preview: preview,
+                    tool_arguments_truncated: pending.tool_arguments_truncated
+                        || locally_truncated,
+                    stage: PermissionStage::Decision,
+                    matcher_selected: 0,
+                    inspect_target: None,
+                    reviewed_matcher: None,
+                    global_scope_reviewed: false,
+                })
+            }
+            (Some(PendingInteractionKind::Clarification), None) => {
+                ActiveQuestionKind::Clarification
+            }
+            (Some(PendingInteractionKind::Permission), None) => {
+                ActiveQuestionKind::PermissionUnavailable {
+                    reason: "The server identified a permission request but could not recover its typed contract. Upgrade/restart the server or retry synchronization; legacy answers are disabled."
+                        .to_string(),
+                }
+            }
+            (Some(PendingInteractionKind::Clarification), Some(_)) => {
+                ActiveQuestionKind::PermissionUnavailable {
+                    reason: "The server returned contradictory clarification and permission contracts. Legacy answers are disabled until the server contract is refreshed."
+                        .to_string(),
+                }
+            }
+            (None, _) => ActiveQuestionKind::PermissionUnavailable {
+                reason: "The server did not explicitly classify this pending interaction. Upgrade the server or retry synchronization; untyped legacy answers are disabled."
+                    .to_string(),
+            },
+        };
+        let is_permission = matches!(
+            &kind,
+            ActiveQuestionKind::Permission(_) | ActiveQuestionKind::PermissionUnavailable { .. }
+        );
+        let options = if is_permission {
+            Vec::new()
+        } else {
+            pending.options.clone().unwrap_or_default()
+        };
+        let allow_custom = !is_permission && pending.allow_custom;
+        let custom = if options.is_empty() && allow_custom {
             Some(draft.clone())
         } else {
             None
@@ -1253,10 +1661,11 @@ impl ActiveQuestion {
             tool_call_id: pending.tool_call_id.clone(),
             tool_name: pending.tool_name.clone(),
             source: pending.source.clone(),
+            kind,
             question: pending.question.clone(),
             options,
             selected: 0,
-            allow_custom: pending.allow_custom,
+            allow_custom,
             custom,
             custom_draft: draft,
             number_entry: None,
@@ -1273,6 +1682,22 @@ impl ActiveQuestion {
     }
 
     fn identity(&self) -> QuestionIdentity {
+        if let ActiveQuestionKind::ChildApproval(child) = &self.kind {
+            return QuestionIdentity::child(
+                child.parent_session_id.clone(),
+                child.child_session_id.clone(),
+                child.request_id.clone(),
+                child.child_attempt,
+                child.version,
+            );
+        }
+        if let ActiveQuestionKind::Permission(permission) = &self.kind {
+            return QuestionIdentity::permission(
+                self.session_id.clone(),
+                permission.request.request_id.clone(),
+                permission.request.request_generation.clone(),
+            );
+        }
         QuestionIdentity::new(
             self.session_id.clone(),
             self.tool_call_id.clone(),
@@ -1281,13 +1706,16 @@ impl ActiveQuestion {
     }
 
     fn draft_key(&self) -> QuestionDraftKey {
-        QuestionDraftKey::new(
-            self.session_id.clone(),
-            self.tool_call_id.clone(),
-            self.question.clone(),
-            self.options.clone(),
-            self.allow_custom,
-        )
+        let legacy = self.tool_call_id.is_none();
+        QuestionDraftKey {
+            identity: self.identity(),
+            fallback_options: if legacy {
+                self.options.clone()
+            } else {
+                Vec::new()
+            },
+            fallback_allow_custom: legacy && self.allow_custom,
+        }
     }
 
     /// A legacy live event can omit the durable tool-call id while exposing
@@ -1297,12 +1725,24 @@ impl ActiveQuestion {
     /// mismatches still replace the modal instead of carrying input onto a
     /// different question.
     fn can_hydrate_identity_from(&self, incoming: &Self) -> bool {
-        self.tool_call_id.is_none()
+        let missing_tool_id = self.tool_call_id.is_none()
             && incoming.tool_call_id.is_some()
             && self.session_id == incoming.session_id
             && self.question == incoming.question
             && self.options == incoming.options
-            && self.allow_custom == incoming.allow_custom
+            && self.allow_custom == incoming.allow_custom;
+        // A generic SSE approval signal carries the provider id but not the
+        // authoritative permission generation. While that placeholder is
+        // explicitly identity-syncing, hydrate the exact pending snapshot in
+        // place so focus and drafts survive. An already-typed question never
+        // takes this path, so a later generation with the same id still
+        // supersedes it instead of inheriting its local answer state.
+        let generic_same_tool_id = self.identity_syncing
+            && self.session_id == incoming.session_id
+            && self.tool_call_id.is_some()
+            && self.tool_call_id == incoming.tool_call_id
+            && !matches!(&self.kind, ActiveQuestionKind::ChildApproval(_));
+        missing_tool_id || generic_same_tool_id
     }
 
     fn refresh_contract(&mut self, incoming: Self) {
@@ -1310,10 +1750,24 @@ impl ActiveQuestion {
         self.tool_call_id = incoming.tool_call_id;
         self.tool_name = incoming.tool_name;
         self.source = incoming.source;
+        self.kind = match (&self.kind, incoming.kind) {
+            (ActiveQuestionKind::Permission(current), ActiveQuestionKind::Permission(mut next))
+                if current.request.request_id == next.request.request_id =>
+            {
+                // A reconnect/conflict refresh can advance the policy revision.
+                // Reset the confirmation stage so the operator sees the new
+                // authoritative scope/matcher before retrying.
+                next.stage = PermissionStage::Decision;
+                ActiveQuestionKind::Permission(next)
+            }
+            (_, next) => next,
+        };
         self.question = incoming.question;
         self.options = incoming.options;
         self.option_hitboxes.borrow_mut().clear();
         self.mouse_pressed_option = None;
+        self.inspecting = false;
+        self.inspect_scroll = 0;
         self.allow_custom = incoming.allow_custom;
         self.identity_syncing = incoming.identity_syncing;
         if was_identity_syncing && !self.identity_syncing {
@@ -1335,6 +1789,54 @@ impl ActiveQuestion {
 
     fn draft(&self) -> &str {
         self.custom.as_deref().unwrap_or(&self.custom_draft)
+    }
+
+    fn child_approval(ui_id: String, queued: &QueuedChildApproval) -> Self {
+        let record = &queued.record;
+        let parent_session_id = record.parent_session_id.clone();
+        let child_session_id = record.child_session_id.clone();
+        let request_id = record.request_id.clone();
+        let tool_name = record.tool_name.clone();
+        let permission = record.permission.clone();
+        let resource = record.resource.clone();
+        let question = format!("Child {child_session_id} requests {permission}");
+        Self {
+            ui_id,
+            session_id: parent_session_id.clone(),
+            tool_call_id: Some(request_id.clone()),
+            tool_name: Some(tool_name.clone()),
+            source: Some("child_approval".to_string()),
+            kind: ActiveQuestionKind::ChildApproval(ChildApprovalQuestion {
+                parent_session_id,
+                child_session_id,
+                child_attempt: record.child_attempt,
+                request_id,
+                version: record.version,
+                tool_name,
+                permission,
+                resource,
+                exact_reviewed: false,
+            }),
+            question,
+            options: vec![
+                "Approve child action".to_string(),
+                "Deny child action".to_string(),
+            ],
+            selected: 0,
+            allow_custom: false,
+            custom: None,
+            custom_draft: String::new(),
+            number_entry: None,
+            inspecting: false,
+            inspect_option: false,
+            inspect_scroll: 0,
+            inspect_max_scroll: Cell::new(0),
+            error: None,
+            option_hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed_option: None,
+            submitting: false,
+            identity_syncing: !queued.authoritative,
+        }
     }
 }
 
@@ -1365,6 +1867,64 @@ impl ScheduleForm {
 pub struct ConfigEditor {
     pub textarea: TextArea<'static>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionEditorMode {
+    Create,
+    Edit { rule_id: String },
+    Diagnose,
+}
+
+/// Raw JSON is deliberate here: permission rules are typed at the API
+/// boundary, while an exact editor avoids hiding less-common matcher variants.
+/// Parse/validation errors never close or replace the draft.
+pub struct PermissionEditor {
+    pub epoch: u64,
+    pub mode: PermissionEditorMode,
+    pub expected_revision: u64,
+    pub textarea: TextArea<'static>,
+    pub error: Option<String>,
+    pub submitting: bool,
+    /// Set only after a 409. The next authoritative policy load rebases the
+    /// CAS token while preserving the draft; saving again remains explicit.
+    pub refresh_revision_on_load: bool,
+}
+
+pub struct PermissionRuleConfirm {
+    pub epoch: u64,
+    pub mode: PermissionEditorMode,
+    pub expected_revision: u64,
+    pub rule: DurablePermissionRule,
+    pub scroll: u16,
+    pub max_scroll: Cell<u16>,
+    pub error: Option<String>,
+    pub submitting: bool,
+}
+
+impl PermissionRuleConfirm {
+    pub fn exact_text(&self) -> String {
+        serde_json::to_string_pretty(&self.rule)
+            .unwrap_or_else(|error| format!("<failed to render exact rule: {error}>"))
+    }
+}
+
+pub struct PermissionDeleteConfirm {
+    pub rule_id: String,
+    pub rule: DurablePermissionRule,
+    pub expected_revision: u64,
+    pub error: Option<String>,
+    pub submitting: bool,
+}
+
+pub struct PermissionModeConfirm {
+    pub epoch: u64,
+    pub session_id: String,
+    pub from: SessionPermissionMode,
+    pub to: SessionPermissionMode,
+    pub metadata_version: u64,
+    pub error: Option<String>,
+    pub submitting: bool,
 }
 
 /// In-progress model picker (`Ctrl+O` on the Chat tab). Opens immediately with
@@ -2004,6 +2564,10 @@ pub struct App {
     /// In-progress raw-JSON config editor (Config tab). When `Some`, a modal
     /// textarea captures all keystrokes.
     pub config_editor: Option<ConfigEditor>,
+    pub permission_editor: Option<PermissionEditor>,
+    pub permission_rule_confirm: Option<PermissionRuleConfirm>,
+    pub permission_delete: Option<PermissionDeleteConfirm>,
+    pub permission_mode_confirm: Option<PermissionModeConfirm>,
     /// In-progress model picker (`Ctrl+O`, Chat tab). When `Some`, a modal
     /// captures navigation/apply keystrokes.
     pub model_picker: Option<ModelPicker>,
@@ -2055,6 +2619,15 @@ pub struct App {
     /// result is insufficient: a task waiting for SSE readiness could still
     /// POST after the UI already reported the run stopped.
     answer_task: Option<tokio::task::JoinHandle<()>>,
+    permission_editor_epoch: u64,
+    permission_policy_epoch: u64,
+    permission_mode_epoch: u64,
+    /// Actionable child approvals are queued independently from the single
+    /// visible question modal. Parent questions and concurrent children can
+    /// therefore never overwrite one another.
+    pending_child_approvals: VecDeque<QueuedChildApproval>,
+    child_approval_snapshot_epoch: u64,
+    child_approval_revision: u64,
     /// Free-text drafts survive dismissal, session switches, and SSE replay,
     /// keyed by the typed question identity rather than the active tab.
     question_drafts: HashMap<QuestionDraftKey, String>,
@@ -2174,6 +2747,10 @@ impl App {
             dismissed_question: None,
             schedule_form: None,
             config_editor: None,
+            permission_editor: None,
+            permission_rule_confirm: None,
+            permission_delete: None,
+            permission_mode_confirm: None,
             model_picker: None,
             session_picker: None,
             command_palette: None,
@@ -2188,6 +2765,12 @@ impl App {
             unseen_alerts: 0,
             answer_epoch: 0,
             answer_task: None,
+            permission_editor_epoch: 0,
+            permission_policy_epoch: 0,
+            permission_mode_epoch: 0,
+            pending_child_approvals: VecDeque::new(),
+            child_approval_snapshot_epoch: 0,
+            child_approval_revision: 0,
             question_drafts: HashMap::new(),
             question_draft_order: VecDeque::new(),
             opening_session_id: None,
@@ -2215,6 +2798,9 @@ impl App {
         self.theme = palette;
         apply_textarea_palette(&mut self.chat.textarea, palette);
         if let Some(editor) = self.config_editor.as_mut() {
+            apply_textarea_palette(&mut editor.textarea, palette);
+        }
+        if let Some(editor) = self.permission_editor.as_mut() {
             apply_textarea_palette(&mut editor.textarea, palette);
         }
     }
@@ -2514,6 +3100,421 @@ impl App {
                     Err(e) => self.config.error = Some(e),
                 }
             }
+            AppEvent::PermissionPolicyLoaded { epoch, result } => {
+                if epoch != self.permission_policy_epoch {
+                    return Ok(());
+                }
+                self.config.permissions.loading = false;
+                match result {
+                    Ok(snapshot) => {
+                        if self
+                            .config
+                            .permissions
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|current| current.revision > snapshot.revision)
+                        {
+                            return Ok(());
+                        }
+                        let global_confirmation_invalidated = self
+                            .permission_rule_confirm
+                            .as_ref()
+                            .is_some_and(|confirm| confirm.expected_revision != snapshot.revision);
+                        if global_confirmation_invalidated {
+                            self.permission_rule_confirm = None;
+                            if let Some(editor) = self.permission_editor.as_mut() {
+                                editor.expected_revision = snapshot.revision;
+                                editor.refresh_revision_on_load = false;
+                                editor.error = Some(
+                                    "Global allow confirmation expired after the policy changed; review the draft and confirm again."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        let selected_id = self
+                            .config
+                            .permissions
+                            .selected_rule()
+                            .map(|rule| rule.id.clone());
+                        self.config.permissions.selected = selected_id
+                            .and_then(|id| {
+                                snapshot
+                                    .policy
+                                    .durable_rules
+                                    .iter()
+                                    .position(|rule| rule.id == id)
+                            })
+                            .unwrap_or(0)
+                            .min(snapshot.policy.durable_rules.len().saturating_sub(1));
+                        if let Some(editor) = self
+                            .permission_editor
+                            .as_mut()
+                            .filter(|editor| editor.refresh_revision_on_load)
+                        {
+                            editor.expected_revision = snapshot.revision;
+                            editor.refresh_revision_on_load = false;
+                        }
+                        self.config.permissions.snapshot = Some(snapshot);
+                        self.config.permissions.error = None;
+                        if global_confirmation_invalidated {
+                            self.notify(
+                                NoticeLevel::Warn,
+                                "Global allow confirmation invalidated by a newer policy revision",
+                            );
+                        }
+                    }
+                    Err(error) => self.config.permissions.error = Some(error),
+                }
+            }
+            AppEvent::PermissionRuleSaved { epoch, result } => {
+                if let Some(confirm) = self
+                    .permission_rule_confirm
+                    .as_mut()
+                    .filter(|confirm| confirm.epoch == epoch)
+                {
+                    confirm.submitting = false;
+                }
+                let Some(editor) = self
+                    .permission_editor
+                    .as_mut()
+                    .filter(|editor| editor.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                editor.submitting = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.permission_policy_epoch = self.permission_policy_epoch.wrapping_add(1);
+                        let selected_id = match &editor.mode {
+                            PermissionEditorMode::Edit { rule_id } => Some(rule_id.clone()),
+                            PermissionEditorMode::Create => {
+                                serde_json::from_str::<DurablePermissionRule>(
+                                    &editor.textarea.lines().join("\n"),
+                                )
+                                .ok()
+                                .map(|rule| rule.id)
+                            }
+                            PermissionEditorMode::Diagnose => None,
+                        };
+                        self.permission_rule_confirm = None;
+                        self.permission_editor = None;
+                        self.config.permissions.selected = selected_id
+                            .and_then(|id| {
+                                snapshot
+                                    .policy
+                                    .durable_rules
+                                    .iter()
+                                    .position(|rule| rule.id == id)
+                            })
+                            .unwrap_or(0);
+                        self.config.permissions.snapshot = Some(snapshot);
+                        self.config.permissions.error = None;
+                        self.notify(NoticeLevel::Info, "Permission rule saved");
+                    }
+                    Err(error) => {
+                        let conflict = error.conflict;
+                        let message = error.to_string();
+                        if let Some(editor) = self.permission_editor.as_mut() {
+                            editor.refresh_revision_on_load = conflict;
+                            editor.error = Some(if conflict {
+                                format!(
+                                    "Policy revision changed; draft preserved and policy is refreshing. Review, then save again. {message}"
+                                )
+                            } else {
+                                message.clone()
+                            });
+                        }
+                        if conflict {
+                            // The CAS token and exact rule body reviewed by the
+                            // operator are stale. Never silently rebase a
+                            // global authorization confirmation.
+                            self.permission_rule_confirm = None;
+                            self.load_permission_policy();
+                        } else if let Some(confirm) = self
+                            .permission_rule_confirm
+                            .as_mut()
+                            .filter(|confirm| confirm.epoch == epoch)
+                        {
+                            confirm.error = Some(message.clone());
+                        }
+                        self.notify(NoticeLevel::Error, message);
+                    }
+                }
+            }
+            AppEvent::PermissionRuleDeleted { rule_id, result } => {
+                let Some(confirm) = self
+                    .permission_delete
+                    .as_mut()
+                    .filter(|confirm| confirm.rule_id == rule_id)
+                else {
+                    return Ok(());
+                };
+                confirm.submitting = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.permission_policy_epoch = self.permission_policy_epoch.wrapping_add(1);
+                        self.permission_delete = None;
+                        self.config.permissions.selected = self
+                            .config
+                            .permissions
+                            .selected
+                            .min(snapshot.policy.durable_rules.len().saturating_sub(1));
+                        self.config.permissions.snapshot = Some(snapshot);
+                        self.notify(
+                            NoticeLevel::Info,
+                            format!("Deleted permission rule {rule_id}"),
+                        );
+                    }
+                    Err(error) => {
+                        let conflict = error.conflict;
+                        let message = error.to_string();
+                        if conflict {
+                            // Never silently rebase a destructive confirmation
+                            // onto a different rule body/revision. Refresh the
+                            // list and require the operator to inspect and open
+                            // a new confirmation.
+                            self.permission_delete = None;
+                        } else if let Some(confirm) = self.permission_delete.as_mut() {
+                            confirm.error = Some(message.clone());
+                        }
+                        if conflict {
+                            self.load_permission_policy();
+                        }
+                        self.notify(NoticeLevel::Error, message);
+                    }
+                }
+            }
+            AppEvent::PermissionDiagnosed { epoch, result } => {
+                let Some(editor) = self
+                    .permission_editor
+                    .as_mut()
+                    .filter(|editor| editor.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                editor.submitting = false;
+                match result {
+                    Ok(outcome) => {
+                        self.permission_editor = None;
+                        self.config.permissions.diagnosis = Some(outcome);
+                        self.notify(NoticeLevel::Info, "Permission diagnosis completed");
+                    }
+                    Err(error) => {
+                        if let Some(editor) = self.permission_editor.as_mut() {
+                            editor.error = Some(error.clone());
+                        }
+                        self.notify(NoticeLevel::Error, error);
+                    }
+                }
+            }
+            AppEvent::PermissionModeLoaded {
+                epoch,
+                session_id,
+                result,
+            } => {
+                if epoch != self.permission_mode_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(versioned) => {
+                        let from = if versioned.summary.permission_mode
+                            == SessionPermissionMode::Default
+                            && versioned.summary.bypass_permissions
+                        {
+                            SessionPermissionMode::Bypass
+                        } else {
+                            versioned.summary.permission_mode
+                        };
+                        let to = if from == SessionPermissionMode::Bypass {
+                            SessionPermissionMode::Default
+                        } else {
+                            SessionPermissionMode::Bypass
+                        };
+                        self.permission_mode_confirm = Some(PermissionModeConfirm {
+                            epoch,
+                            session_id,
+                            from,
+                            to,
+                            metadata_version: versioned.metadata_version,
+                            error: None,
+                            submitting: false,
+                        });
+                        self.status_message = "Review the permission-mode warning".to_string();
+                    }
+                    Err(error) => self.notify(
+                        NoticeLevel::Error,
+                        format!("Could not load current permission mode: {error}"),
+                    ),
+                }
+            }
+            AppEvent::PermissionModePatched {
+                epoch,
+                session_id,
+                result,
+            } => {
+                if epoch != self.permission_mode_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                    || self
+                        .permission_mode_confirm
+                        .as_ref()
+                        .is_none_or(|confirm| confirm.epoch != epoch)
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(versioned) => {
+                        self.chat.permission_mode = versioned.summary.permission_mode;
+                        self.chat.bypass_permissions = versioned.summary.bypass_permissions;
+                        self.permission_mode_confirm = None;
+                        self.notify(
+                            if self.chat.permission_mode == SessionPermissionMode::Bypass {
+                                NoticeLevel::Warn
+                            } else {
+                                NoticeLevel::Info
+                            },
+                            format!(
+                                "Session permission mode is now {}",
+                                self.chat.permission_mode.label()
+                            ),
+                        );
+                    }
+                    Err(error) if error.conflict => {
+                        if let Some(confirm) = self.permission_mode_confirm.as_mut() {
+                            confirm.error = Some(
+                                "Session changed concurrently; current state is being refetched. You must confirm again."
+                                    .to_string(),
+                            );
+                            confirm.submitting = false;
+                        }
+                        self.fetch_permission_mode(session_id);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        if let Some(confirm) = self.permission_mode_confirm.as_mut() {
+                            confirm.error = Some(message.clone());
+                            confirm.submitting = false;
+                        }
+                        self.notify(NoticeLevel::Error, message);
+                    }
+                }
+            }
+            AppEvent::ChildApprovalSnapshotLoaded {
+                epoch,
+                session_id,
+                result,
+            } => {
+                if epoch != self.child_approval_snapshot_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                {
+                    return Ok(());
+                }
+                match result {
+                    Ok(snapshot) => {
+                        if snapshot.schema_version != 1 {
+                            self.notify(
+                                NoticeLevel::Error,
+                                format!(
+                                    "Unsupported child-approval snapshot schema {}",
+                                    snapshot.schema_version
+                                ),
+                            );
+                            return Ok(());
+                        }
+                        if snapshot.approvals_revision < self.child_approval_revision {
+                            return Ok(());
+                        }
+                        self.child_approval_revision = snapshot.approvals_revision;
+                        self.pending_child_approvals = snapshot
+                            .approvals
+                            .into_iter()
+                            .filter(|record| {
+                                record.parent_session_id == session_id
+                                    && record.state == ChildApprovalState::Pending
+                            })
+                            .map(|record| QueuedChildApproval {
+                                record,
+                                authoritative: true,
+                            })
+                            .collect();
+
+                        let active_match = self.pending_question.as_ref().and_then(|question| {
+                            matches!(question.kind, ActiveQuestionKind::ChildApproval(_)).then(
+                                || {
+                                    self.pending_child_approvals
+                                        .iter()
+                                        .find(|queued| {
+                                            Self::child_question_matches_record(
+                                                question,
+                                                &queued.record,
+                                            )
+                                        })
+                                        .cloned()
+                                },
+                            )
+                        });
+                        match active_match {
+                            Some(Some(queued)) => {
+                                if let Some(question) = self.pending_question.as_mut() {
+                                    Self::refresh_child_question(question, &queued);
+                                }
+                            }
+                            Some(None)
+                                if self
+                                    .pending_question
+                                    .as_ref()
+                                    .is_some_and(|question| !question.submitting) =>
+                            {
+                                self.supersede_pending_answer();
+                                self.pending_question = None;
+                            }
+                            _ => {}
+                        }
+
+                        let dismissed_match =
+                            self.dismissed_question.as_ref().and_then(|question| {
+                                matches!(question.kind, ActiveQuestionKind::ChildApproval(_)).then(
+                                    || {
+                                        self.pending_child_approvals
+                                            .iter()
+                                            .find(|queued| {
+                                                Self::child_question_matches_record(
+                                                    question,
+                                                    &queued.record,
+                                                )
+                                            })
+                                            .cloned()
+                                    },
+                                )
+                            });
+                        match dismissed_match {
+                            Some(Some(queued)) => {
+                                if let Some(question) = self.dismissed_question.as_mut() {
+                                    Self::refresh_child_question(question, &queued);
+                                }
+                            }
+                            Some(None) => self.dismissed_question = None,
+                            None => {}
+                        }
+                        self.show_next_child_approval();
+                    }
+                    Err(error) => {
+                        if let Some(question) = self.pending_question.as_mut().filter(|question| {
+                            matches!(question.kind, ActiveQuestionKind::ChildApproval(_))
+                                && question.identity_syncing
+                        }) {
+                            question.error = Some(format!(
+                                "Could not recover exact child approval identity: {error}"
+                            ));
+                        }
+                        self.notify(
+                            NoticeLevel::Error,
+                            format!("Failed to reconcile child approvals: {error}"),
+                        );
+                    }
+                }
+            }
             AppEvent::ActionDone {
                 outcome,
                 reload_tab,
@@ -2619,6 +3620,9 @@ impl App {
                 }
                 match r {
                     Ok(session_id) => {
+                        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+                            self.clear_child_approval_context();
+                        }
                         self.chat.session_id = Some(session_id.clone());
                         self.rebind_command_palette_to_active_session();
                         self.status_message = "Streaming...".to_string();
@@ -2702,6 +3706,8 @@ impl App {
                 self.opening_session_id = None;
                 match result {
                     Ok(opened) => {
+                        self.invalidate_permission_mode_context();
+                        self.clear_child_approval_context();
                         // Contextual pickers are bound to the chat session
                         // visible beneath them. A concurrently completing
                         // resume invalidates that context and any in-flight
@@ -2721,6 +3727,8 @@ impl App {
                         self.chat.model = opened.model;
                         self.chat.provider = opened.provider;
                         self.chat.project_id = opened.project_id;
+                        self.chat.permission_mode = opened.permission_mode;
+                        self.chat.bypass_permissions = opened.bypass_permissions;
                         self.chat.current_response.clear();
                         self.chat.current_tool_calls.clear();
                         self.chat.current_reasoning.clear();
@@ -2773,9 +3781,10 @@ impl App {
                         if let Some(pending) = &opened.pending {
                             self.status_message =
                                 format!("Question: {} (answer in the dialog)", pending.question);
-                            let question = self.question_from_pending(session_id, pending);
+                            let question = self.question_from_pending(session_id.clone(), pending);
                             self.pending_question = Some(question);
                         }
+                        self.refresh_child_approvals(session_id);
                     }
                     Err(e) => {
                         self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
@@ -2864,6 +3873,16 @@ impl App {
                         self.chat.note_update();
                     }
                     Ok(_) => {
+                        if self.pending_question.as_ref().is_some_and(|question| {
+                            matches!(question.kind, ActiveQuestionKind::ChildApproval(_))
+                        }) || self.dismissed_question.as_ref().is_some_and(|question| {
+                            matches!(question.kind, ActiveQuestionKind::ChildApproval(_))
+                        }) {
+                            // Parent `/respond/pending` is not authoritative
+                            // for child approvals. The account snapshot owns
+                            // this modal and queue.
+                            return Ok(());
+                        }
                         if let Some(question) = self.pending_question.as_mut() {
                             if question.identity_syncing {
                                 question.identity_syncing = false;
@@ -2883,6 +3902,7 @@ impl App {
                             self.dismissed_question = None;
                             self.status_message =
                                 "Pending question cleared after stream sync".to_string();
+                            self.show_next_child_approval();
                         }
                     }
                     Err(error) => self.notify(
@@ -2960,9 +3980,25 @@ impl App {
                 {
                     return Ok(());
                 }
+                let submitted_child = self.pending_question.as_ref().and_then(|question| {
+                    if let ActiveQuestionKind::ChildApproval(child) = &question.kind {
+                        Some(child.clone())
+                    } else {
+                        None
+                    }
+                });
                 self.answer_task.take();
                 match result {
-                    Ok(status) => {
+                    Ok(outcome) => {
+                        let (resume_status, child_delivered) = match outcome {
+                            AnswerSubmissionOutcome::Clarification { auto_resume_status } => {
+                                (Some(auto_resume_status), false)
+                            }
+                            AnswerSubmissionOutcome::Permission(response) => {
+                                (response.auto_resume_status, false)
+                            }
+                            AnswerSubmissionOutcome::ChildApproval => (None, true),
+                        };
                         self.remove_question_drafts_for_identity(&identity);
                         self.pending_question = None;
                         if self
@@ -2972,6 +4008,34 @@ impl App {
                         {
                             self.dismissed_question = None;
                         }
+                        if child_delivered {
+                            if let Some(child) = &submitted_child {
+                                self.remove_child_approval_generation(
+                                    &child.parent_session_id,
+                                    &child.child_session_id,
+                                    child.child_attempt,
+                                    &child.request_id,
+                                    u64::MAX,
+                                );
+                            }
+                            self.status_message = format!("{answer} — decision delivered");
+                            self.chat.note_update();
+                            self.show_next_child_approval();
+                            if let Some(child) = submitted_child {
+                                self.refresh_child_approvals(child.parent_session_id);
+                            }
+                            return Ok(());
+                        }
+                        let Some(status) = resume_status else {
+                            // An idempotent replay can legitimately omit a
+                            // successor status. Reload the authoritative
+                            // session instead of guessing whether it is still
+                            // running or completed.
+                            self.status_message =
+                                format!("Answered: {answer} — reconciling session state");
+                            self.resume_session(identity.session_id.clone());
+                            return Ok(());
+                        };
                         // Only keep the spinner on if a run is actually
                         // running: the server returns 200 even when it did
                         // NOT resume (e.g. the session already `completed`),
@@ -2996,6 +4060,7 @@ impl App {
                             self.finalize_streaming();
                             self.status_message = format!("Answered: {answer} ({status})");
                         }
+                        self.show_next_child_approval();
                     }
                     Err(error) if error.should_refresh_question() => {
                         let message = error.to_string();
@@ -3003,7 +4068,17 @@ impl App {
                             NoticeLevel::Warn,
                             format!("Answer rejected; refreshing question state: {message}"),
                         );
-                        self.refresh_question_after_rejection(identity, message);
+                        if let Some(child) = submitted_child {
+                            if let Some(question) = self.pending_question.as_mut() {
+                                question.submitting = false;
+                                question.error = Some(format!(
+                                    "{message}; refreshing child approvals from the server..."
+                                ));
+                            }
+                            self.refresh_child_approvals(child.parent_session_id);
+                        } else {
+                            self.refresh_question_after_rejection(identity, message);
+                        }
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -3540,7 +4615,8 @@ impl App {
             return;
         }
         if self.pending_question.is_some() {
-            let mut submit = None;
+            let mut clarification_submit = None;
+            let mut activate_typed_question = false;
             {
                 let question = self.pending_question.as_mut().unwrap();
                 if question.submitting {
@@ -3563,6 +4639,27 @@ impl App {
                                 question.inspect_scroll =
                                     current.saturating_add(delta as u16).min(max_scroll);
                             }
+                        } else if let ActiveQuestionKind::Permission(permission) =
+                            &mut question.kind
+                        {
+                            match permission.stage {
+                                PermissionStage::Matcher(_) => {
+                                    permission.matcher_selected = scroll_selection(
+                                        permission.matcher_selected,
+                                        permission.request.suggested_matchers.len(),
+                                        delta,
+                                    );
+                                }
+                                PermissionStage::Decision
+                                | PermissionStage::GlobalConfirm { .. } => {
+                                    question.selected = scroll_selection(
+                                        question.selected,
+                                        permission.request.allowed_decisions.len(),
+                                        delta,
+                                    );
+                                }
+                            }
+                            question.error = None;
                         } else if question.custom.is_none() && !question.options.is_empty() {
                             question.selected =
                                 scroll_selection(question.selected, question.options.len(), delta);
@@ -3582,9 +4679,38 @@ impl App {
                             // on mouse-down recenters a long option window on
                             // the next redraw and moves the hitboxes before the
                             // matching mouse-up arrives.
-                            question.selected = index;
                             question.error = None;
-                            submit = question.options.get(index).cloned();
+                            match &mut question.kind {
+                                ActiveQuestionKind::Clarification => {
+                                    question.selected = index;
+                                    clarification_submit = question.options.get(index).cloned();
+                                }
+                                ActiveQuestionKind::Permission(permission) => {
+                                    match permission.stage {
+                                        PermissionStage::Matcher(_) => {
+                                            permission.matcher_selected = index;
+                                        }
+                                        PermissionStage::Decision
+                                        | PermissionStage::GlobalConfirm { .. } => {
+                                            question.selected = index;
+                                        }
+                                    }
+                                    // Typed prompts must go through their
+                                    // structured decision handlers. Never turn
+                                    // their display labels into a clarification
+                                    // answer.
+                                    activate_typed_question = true;
+                                }
+                                ActiveQuestionKind::PermissionUnavailable { .. } => {}
+                                ActiveQuestionKind::ChildApproval(_) => {
+                                    question.selected = index;
+                                    // Typed prompts must go through their
+                                    // structured decision handlers. Never turn
+                                    // their display labels into a clarification
+                                    // answer.
+                                    activate_typed_question = true;
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -3592,8 +4718,23 @@ impl App {
                     }
                 }
             }
-            if let Some(answer) = submit {
-                self.submit_answer(answer);
+            if let Some(answer) = clarification_submit {
+                self.submit_question(QuestionSubmission::Clarification(answer));
+            } else if activate_typed_question {
+                match self
+                    .pending_question
+                    .as_ref()
+                    .map(|question| &question.kind)
+                {
+                    Some(ActiveQuestionKind::Permission(_)) => {
+                        self.handle_permission_question_action(Some(ActionId::Activate));
+                    }
+                    Some(ActiveQuestionKind::PermissionUnavailable { .. }) => {}
+                    Some(ActiveQuestionKind::ChildApproval(_)) => {
+                        self.handle_child_approval_action(Some(ActionId::Activate));
+                    }
+                    Some(ActiveQuestionKind::Clarification) | None => {}
+                }
             }
             return;
         }
@@ -3606,6 +4747,13 @@ impl App {
             || self.pending_schedule_delete.is_some()
             || self.schedule_form.is_some()
             || self.config_editor.is_some()
+            || self.permission_editor.is_some()
+            || self.permission_rule_confirm.is_some()
+            || self.permission_delete.is_some()
+            || self.permission_mode_confirm.is_some()
+            || self.permission_editor.is_some()
+            || self.permission_delete.is_some()
+            || self.permission_mode_confirm.is_some()
         {
             return;
         }
@@ -4024,6 +5172,9 @@ impl App {
             Tab::Mcp => ActionContext::Mcp,
             Tab::Schedules => ActionContext::Schedules,
             Tab::Skills => ActionContext::Skills,
+            Tab::Config if self.config.view == ConfigView::Permissions => {
+                ActionContext::Permissions
+            }
             Tab::Config => ActionContext::Config,
         }
     }
@@ -4040,6 +5191,12 @@ impl App {
             ActionContext::ServeOffer
         } else if self.pending_question.is_some() {
             self.pending_question_context()
+        } else if self.permission_rule_confirm.is_some() {
+            ActionContext::PermissionRuleConfirm
+        } else if self.permission_delete.is_some() {
+            ActionContext::PermissionDeleteConfirm
+        } else if self.permission_mode_confirm.is_some() {
+            ActionContext::PermissionModeConfirm
         } else if self.pending_delete.is_some() {
             ActionContext::SessionDeleteConfirm
         } else if self.pending_schedule_delete.is_some() {
@@ -4054,6 +5211,8 @@ impl App {
             ActionContext::ScheduleForm
         } else if self.config_editor.is_some() {
             ActionContext::ConfigEditor
+        } else if self.permission_editor.is_some() {
+            ActionContext::PermissionEditor
         } else {
             self.tab_context()
         };
@@ -4144,6 +5303,12 @@ impl App {
             form.error = Some(message.clone());
         } else if let Some(editor) = self.config_editor.as_mut() {
             editor.error = Some(message.clone());
+        } else if let Some(editor) = self.permission_editor.as_mut() {
+            editor.error = Some(message.clone());
+        } else if let Some(confirm) = self.permission_delete.as_mut() {
+            confirm.error = Some(message.clone());
+        } else if let Some(confirm) = self.permission_mode_confirm.as_mut() {
+            confirm.error = Some(message.clone());
         } else if let Some(palette) = self.command_palette.as_mut() {
             palette.error = Some(message.clone());
         } else if let Some(picker) = self.model_picker.as_mut() {
@@ -4228,6 +5393,8 @@ impl App {
                 self.tab = Tab::Config;
                 self.load_tab_data();
             }
+            ActionId::OpenPermissionPolicy => self.open_permission_policy(),
+            ActionId::TogglePermissionBypass => self.begin_permission_mode_toggle(),
             ActionId::OpenSchedulesTab => {
                 self.tab = Tab::Schedules;
                 self.load_tab_data();
@@ -4282,6 +5449,11 @@ impl App {
             | ActionContext::QuestionInspect => self.handle_question_key(key).await?,
             ActionContext::SessionDeleteConfirm => self.handle_delete_confirm_key(key).await?,
             ActionContext::ScheduleDeleteConfirm => self.handle_schedule_delete_confirm_key(key),
+            ActionContext::PermissionDeleteConfirm => {
+                self.handle_permission_delete_confirm_key(key)
+            }
+            ActionContext::PermissionRuleConfirm => self.handle_permission_rule_confirm_key(key),
+            ActionContext::PermissionModeConfirm => self.handle_permission_mode_confirm_key(key),
             ActionContext::SessionPickerBrowse
             | ActionContext::SessionPickerRename
             | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
@@ -4289,6 +5461,7 @@ impl App {
             ActionContext::CommandPalette => self.handle_command_palette_key(key),
             ActionContext::ScheduleForm => self.handle_schedule_form_key(key),
             ActionContext::ConfigEditor => self.handle_config_editor_key(key)?,
+            ActionContext::PermissionEditor => self.handle_permission_editor_key(key)?,
             ActionContext::Chat | ActionContext::ConversationBlock => {
                 self.handle_chat_key(key).await?
             }
@@ -4297,6 +5470,7 @@ impl App {
             ActionContext::Schedules => self.handle_schedules_key(key).await?,
             ActionContext::Skills => self.handle_skills_key(key).await?,
             ActionContext::Config => self.handle_config_key(key),
+            ActionContext::Permissions => self.handle_permissions_key(key),
             ActionContext::Global | ActionContext::Navigation => {}
         }
         self.routed_action = None;
@@ -4498,6 +5672,498 @@ impl App {
         });
     }
 
+    fn dismiss_pending_question(&mut self) {
+        self.supersede_pending_answer();
+        self.dismissed_question = self.pending_question.take();
+        let reopen = self.action_key_phrase(
+            ActionContext::Global,
+            ActionId::ReopenPendingQuestion,
+            "reopens",
+        );
+        let stop =
+            self.action_key_phrase(ActionContext::Global, ActionId::QuitOrStop, "stops the run");
+        self.status_message =
+            format!("Question dismissed (still pending on the server — {reopen}, {stop})");
+    }
+
+    fn quick_answer_index(action: ActionId) -> Option<usize> {
+        match action {
+            ActionId::QuickAnswer1 => Some(0),
+            ActionId::QuickAnswer2 => Some(1),
+            ActionId::QuickAnswer3 => Some(2),
+            ActionId::QuickAnswer4 => Some(3),
+            ActionId::QuickAnswer5 => Some(4),
+            ActionId::QuickAnswer6 => Some(5),
+            ActionId::QuickAnswer7 => Some(6),
+            ActionId::QuickAnswer8 => Some(7),
+            ActionId::QuickAnswer9 => Some(8),
+            _ => None,
+        }
+    }
+
+    fn handle_permission_question_action(&mut self, action: Option<ActionId>) {
+        enum Next {
+            None,
+            Dismiss,
+            Submit(PermissionDecision),
+            Copy(String),
+        }
+
+        let next = {
+            let Some(question) = self.pending_question.as_mut() else {
+                return;
+            };
+            if question.submitting {
+                return;
+            }
+            let ActiveQuestionKind::Permission(permission) = &mut question.kind else {
+                return;
+            };
+            if question.inspecting {
+                match action {
+                    Some(ActionId::Cancel) => {
+                        match permission.inspect_target {
+                            Some(PermissionInspectTarget::Matcher {
+                                decision,
+                                matcher_index,
+                            }) => {
+                                permission.reviewed_matcher = Some((decision, matcher_index));
+                            }
+                            Some(PermissionInspectTarget::GlobalScope { matcher_index }) => {
+                                permission.reviewed_matcher =
+                                    Some((PermissionDecisionKind::AllowGlobal, matcher_index));
+                                permission.global_scope_reviewed = true;
+                            }
+                            Some(PermissionInspectTarget::Request) | None => {}
+                        }
+                        question.inspecting = false;
+                        question.inspect_scroll = 0;
+                        permission.inspect_target = None;
+                        Next::None
+                    }
+                    Some(ActionId::NavigateUp) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_sub(1);
+                        Next::None
+                    }
+                    Some(ActionId::NavigateDown) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_add(1)
+                            .min(question.inspect_max_scroll.get());
+                        Next::None
+                    }
+                    Some(ActionId::PageUp) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_sub(5);
+                        Next::None
+                    }
+                    Some(ActionId::PageDown) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_add(5)
+                            .min(question.inspect_max_scroll.get());
+                        Next::None
+                    }
+                    Some(ActionId::JumpFirst) => {
+                        question.inspect_scroll = 0;
+                        Next::None
+                    }
+                    Some(ActionId::JumpLast) => {
+                        question.inspect_scroll = question.inspect_max_scroll.get();
+                        Next::None
+                    }
+                    Some(ActionId::CopyValue) => Next::Copy(permission.inspector_text()),
+                    _ => Next::None,
+                }
+            } else {
+                match permission.stage {
+                    PermissionStage::Decision => {
+                        let len = permission.request.allowed_decisions.len();
+                        match action {
+                            Some(ActionId::NavigateUp) => {
+                                question.selected = question.selected.saturating_sub(1);
+                                question.error = None;
+                                Next::None
+                            }
+                            Some(ActionId::NavigateDown) => {
+                                question.selected = question
+                                    .selected
+                                    .saturating_add(1)
+                                    .min(len.saturating_sub(1));
+                                question.error = None;
+                                Next::None
+                            }
+                            Some(quick) if Self::quick_answer_index(quick).is_some() => {
+                                let index = Self::quick_answer_index(quick).unwrap_or_default();
+                                if index < len {
+                                    question.selected = index;
+                                }
+                                Next::None
+                            }
+                            Some(ActionId::Activate) => {
+                                let Some(decision) = permission
+                                    .request
+                                    .allowed_decisions
+                                    .get(question.selected)
+                                    .copied()
+                                else {
+                                    question.error = Some(
+                                        "The server did not supply an allowed decision".to_string(),
+                                    );
+                                    return;
+                                };
+                                if decision.remembers() {
+                                    if permission.request.suggested_matchers.is_empty() {
+                                        question.error = Some(
+                                        "The server supplied no safe matcher for this remembered decision"
+                                            .to_string(),
+                                    );
+                                        Next::None
+                                    } else {
+                                        permission.matcher_selected = 0;
+                                        permission.stage = PermissionStage::Matcher(decision);
+                                        permission.reviewed_matcher = None;
+                                        permission.global_scope_reviewed = false;
+                                        question.error = None;
+                                        Next::None
+                                    }
+                                } else {
+                                    match build_permission_decision(
+                                        &permission.request,
+                                        decision,
+                                        None,
+                                        false,
+                                    ) {
+                                        Ok(decision) => Next::Submit(decision),
+                                        Err(error) => {
+                                            question.error = Some(error);
+                                            Next::None
+                                        }
+                                    }
+                                }
+                            }
+                            Some(ActionId::InspectValue) => {
+                                permission.inspect_target = Some(PermissionInspectTarget::Request);
+                                question.inspecting = true;
+                                question.inspect_scroll = 0;
+                                Next::None
+                            }
+                            Some(ActionId::Cancel) => Next::Dismiss,
+                            _ => Next::None,
+                        }
+                    }
+                    PermissionStage::Matcher(decision) => {
+                        let len = permission.request.suggested_matchers.len();
+                        match action {
+                            Some(ActionId::NavigateUp) => {
+                                permission.matcher_selected =
+                                    permission.matcher_selected.saturating_sub(1);
+                                permission.reviewed_matcher = None;
+                                permission.global_scope_reviewed = false;
+                                question.error = None;
+                                Next::None
+                            }
+                            Some(ActionId::NavigateDown) => {
+                                permission.matcher_selected = permission
+                                    .matcher_selected
+                                    .saturating_add(1)
+                                    .min(len.saturating_sub(1));
+                                permission.reviewed_matcher = None;
+                                permission.global_scope_reviewed = false;
+                                question.error = None;
+                                Next::None
+                            }
+                            Some(ActionId::Activate) => {
+                                let selection = (decision, permission.matcher_selected);
+                                if permission.reviewed_matcher != Some(selection) {
+                                    permission.inspect_target =
+                                        if decision == PermissionDecisionKind::AllowGlobal {
+                                            Some(PermissionInspectTarget::GlobalScope {
+                                                matcher_index: permission.matcher_selected,
+                                            })
+                                        } else {
+                                            Some(PermissionInspectTarget::Matcher {
+                                                decision,
+                                                matcher_index: permission.matcher_selected,
+                                            })
+                                        };
+                                    question.inspecting = true;
+                                    question.inspect_scroll = 0;
+                                    question.error = Some(
+                                    "Review the exact remembered scope and matcher before submission"
+                                        .to_string(),
+                                );
+                                    Next::None
+                                } else if decision == PermissionDecisionKind::AllowGlobal {
+                                    permission.stage = PermissionStage::GlobalConfirm {
+                                        matcher_index: permission.matcher_selected,
+                                    };
+                                    question.error = None;
+                                    Next::None
+                                } else {
+                                    match build_permission_decision(
+                                        &permission.request,
+                                        decision,
+                                        Some(permission.matcher_selected),
+                                        false,
+                                    ) {
+                                        Ok(decision) => Next::Submit(decision),
+                                        Err(error) => {
+                                            question.error = Some(error);
+                                            Next::None
+                                        }
+                                    }
+                                }
+                            }
+                            Some(ActionId::InspectValue) => {
+                                permission.inspect_target =
+                                    Some(PermissionInspectTarget::Matcher {
+                                        decision,
+                                        matcher_index: permission.matcher_selected,
+                                    });
+                                question.inspecting = true;
+                                question.inspect_scroll = 0;
+                                Next::None
+                            }
+                            Some(ActionId::Cancel) => {
+                                permission.stage = PermissionStage::Decision;
+                                question.selected = 0;
+                                permission.reviewed_matcher = None;
+                                permission.global_scope_reviewed = false;
+                                permission.inspect_target = None;
+                                question.error = None;
+                                Next::None
+                            }
+                            _ => Next::None,
+                        }
+                    }
+                    PermissionStage::GlobalConfirm { matcher_index } => match action {
+                        Some(ActionId::Activate) if !permission.global_scope_reviewed => {
+                            permission.inspect_target =
+                                Some(PermissionInspectTarget::GlobalScope { matcher_index });
+                            question.inspecting = true;
+                            question.inspect_scroll = 0;
+                            question.error = Some(
+                                "Review the exact GLOBAL scope and matcher before confirmation"
+                                    .to_string(),
+                            );
+                            Next::None
+                        }
+                        Some(ActionId::Activate) => {
+                            match build_permission_decision(
+                                &permission.request,
+                                PermissionDecisionKind::AllowGlobal,
+                                Some(matcher_index),
+                                true,
+                            ) {
+                                Ok(decision) => Next::Submit(decision),
+                                Err(error) => {
+                                    question.error = Some(error);
+                                    permission.stage = PermissionStage::Decision;
+                                    Next::None
+                                }
+                            }
+                        }
+                        Some(ActionId::InspectValue) => {
+                            permission.inspect_target =
+                                Some(PermissionInspectTarget::GlobalScope { matcher_index });
+                            question.inspecting = true;
+                            question.inspect_scroll = 0;
+                            Next::None
+                        }
+                        Some(ActionId::Cancel) => {
+                            permission.stage =
+                                PermissionStage::Matcher(PermissionDecisionKind::AllowGlobal);
+                            permission.global_scope_reviewed = false;
+                            permission.inspect_target = None;
+                            Next::None
+                        }
+                        _ => Next::None,
+                    },
+                }
+            }
+        };
+
+        match next {
+            Next::Submit(decision) => {
+                self.submit_question(QuestionSubmission::Permission(decision))
+            }
+            Next::Dismiss => self.dismiss_pending_question(),
+            Next::Copy(value) => match copy_via_osc52(&value) {
+                Ok(()) => self.status_message = "Copied exact permission details".to_string(),
+                Err(error) => {
+                    self.notify(NoticeLevel::Error, format!("Failed to copy text: {error}"))
+                }
+            },
+            Next::None => {}
+        }
+    }
+
+    fn handle_child_approval_action(&mut self, action: Option<ActionId>) {
+        enum Next {
+            None,
+            Dismiss,
+            Copy(String),
+            Submit {
+                parent_session_id: String,
+                child_session_id: String,
+                child_attempt: u32,
+                request_id: String,
+                expected_version: u64,
+                approved: bool,
+            },
+        }
+        let next = {
+            let Some(question) = self.pending_question.as_mut() else {
+                return;
+            };
+            if question.submitting {
+                return;
+            }
+            let ActiveQuestionKind::ChildApproval(child) = &mut question.kind else {
+                return;
+            };
+            if question.inspecting {
+                match action {
+                    Some(ActionId::Cancel) => {
+                        question.inspecting = false;
+                        question.inspect_scroll = 0;
+                        child.exact_reviewed = true;
+                        Next::None
+                    }
+                    Some(ActionId::NavigateUp) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_sub(1);
+                        Next::None
+                    }
+                    Some(ActionId::NavigateDown) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_add(1)
+                            .min(question.inspect_max_scroll.get());
+                        Next::None
+                    }
+                    Some(ActionId::PageUp) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_sub(5);
+                        Next::None
+                    }
+                    Some(ActionId::PageDown) => {
+                        question.inspect_scroll = question
+                            .inspect_scroll
+                            .min(question.inspect_max_scroll.get())
+                            .saturating_add(5)
+                            .min(question.inspect_max_scroll.get());
+                        Next::None
+                    }
+                    Some(ActionId::JumpFirst) => {
+                        question.inspect_scroll = 0;
+                        Next::None
+                    }
+                    Some(ActionId::JumpLast) => {
+                        question.inspect_scroll = question.inspect_max_scroll.get();
+                        Next::None
+                    }
+                    Some(ActionId::CopyValue) => Next::Copy(child.inspector_text()),
+                    _ => Next::None,
+                }
+            } else {
+                match action {
+                    Some(ActionId::NavigateUp) => {
+                        question.selected = question.selected.saturating_sub(1);
+                        Next::None
+                    }
+                    Some(ActionId::NavigateDown) => {
+                        question.selected = question.selected.saturating_add(1).min(1);
+                        Next::None
+                    }
+                    Some(quick) if Self::quick_answer_index(quick).is_some() => {
+                        let index = Self::quick_answer_index(quick).unwrap_or_default();
+                        if index < 2 {
+                            question.selected = index;
+                        }
+                        Next::None
+                    }
+                    Some(ActionId::Activate) if question.selected == 0 && !child.exact_reviewed => {
+                        question.inspecting = true;
+                        question.inspect_scroll = 0;
+                        question.error = Some(
+                            "Review the exact child identity and resource before approval"
+                                .to_string(),
+                        );
+                        Next::None
+                    }
+                    Some(ActionId::Activate) => Next::Submit {
+                        parent_session_id: child.parent_session_id.clone(),
+                        child_session_id: child.child_session_id.clone(),
+                        child_attempt: child.child_attempt,
+                        request_id: child.request_id.clone(),
+                        expected_version: child.version,
+                        approved: question.selected == 0,
+                    },
+                    Some(ActionId::InspectValue) => {
+                        question.inspecting = true;
+                        question.inspect_scroll = 0;
+                        Next::None
+                    }
+                    Some(ActionId::Cancel) => Next::Dismiss,
+                    _ => Next::None,
+                }
+            }
+        };
+        match next {
+            Next::Submit {
+                parent_session_id,
+                child_session_id,
+                child_attempt,
+                request_id,
+                expected_version,
+                approved,
+            } => self.submit_question(QuestionSubmission::ChildApproval {
+                parent_session_id,
+                child_session_id,
+                child_attempt,
+                request_id,
+                expected_version,
+                approved,
+            }),
+            Next::Copy(value) => match copy_via_osc52(&value) {
+                Ok(()) => self.status_message = "Copied exact child approval details".to_string(),
+                Err(error) => {
+                    self.notify(NoticeLevel::Error, format!("Failed to copy text: {error}"))
+                }
+            },
+            Next::Dismiss => self.dismiss_pending_question(),
+            Next::None => {}
+        }
+    }
+
+    fn handle_unavailable_permission_action(&mut self, action: Option<ActionId>) {
+        match action {
+            Some(ActionId::Activate) => {
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    self.status_message =
+                        "Retrying typed permission contract recovery...".to_string();
+                    self.reconcile_pending_question_after_stream_connect(session_id);
+                }
+            }
+            Some(ActionId::Cancel) => self.dismiss_pending_question(),
+            _ => {}
+        }
+    }
+
     /// Drive the pending-question modal. Returns an answer to submit (if the
     /// keystroke commits one) without holding a borrow across the async submit.
     async fn handle_question_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -4511,6 +6177,26 @@ impl App {
 
         let context = self.pending_question_context();
         let key_action = self.resolve_context_action(context, key);
+
+        match self
+            .pending_question
+            .as_ref()
+            .map(|question| &question.kind)
+        {
+            Some(ActiveQuestionKind::Permission(_)) => {
+                self.handle_permission_question_action(key_action);
+                return Ok(());
+            }
+            Some(ActiveQuestionKind::PermissionUnavailable { .. }) => {
+                self.handle_unavailable_permission_action(key_action);
+                return Ok(());
+            }
+            Some(ActiveQuestionKind::ChildApproval(_)) => {
+                self.handle_child_approval_action(key_action);
+                return Ok(());
+            }
+            _ => {}
+        }
 
         let action = {
             let Some(q) = self.pending_question.as_mut() else {
@@ -4758,7 +6444,9 @@ impl App {
         };
 
         match action {
-            QAction::Submit(answer) => self.submit_answer(answer),
+            QAction::Submit(answer) => {
+                self.submit_question(QuestionSubmission::Clarification(answer))
+            }
             QAction::CloseCustom => {
                 if let Some(question) = self.pending_question.as_mut() {
                     question.custom_draft = question.custom.take().unwrap_or_default();
@@ -4770,25 +6458,7 @@ impl App {
                     self.notify(NoticeLevel::Error, format!("Failed to copy text: {error}"))
                 }
             },
-            QAction::Dismiss => {
-                // Keep it, not just drop it: dismissing does NOT tell the
-                // server to stop waiting, so the run is still blocked on an
-                // answer — Ctrl+Q brings the modal back without a round-trip.
-                self.supersede_pending_answer();
-                self.dismissed_question = self.pending_question.take();
-                let reopen = self.action_key_phrase(
-                    ActionContext::Global,
-                    ActionId::ReopenPendingQuestion,
-                    "reopens",
-                );
-                let stop = self.action_key_phrase(
-                    ActionContext::Global,
-                    ActionId::QuitOrStop,
-                    "stops the run",
-                );
-                self.status_message =
-                    format!("Question dismissed (still pending on the server — {reopen}, {stop})");
-            }
+            QAction::Dismiss => self.dismiss_pending_question(),
             QAction::None => {}
         }
         Ok(())
@@ -4873,6 +6543,224 @@ impl App {
         ActiveQuestion::from_pending(ui_id, session_id, pending, draft)
     }
 
+    fn invalidate_child_approval_snapshot(&mut self) {
+        self.child_approval_snapshot_epoch = self.child_approval_snapshot_epoch.wrapping_add(1);
+    }
+
+    fn clear_child_approval_context(&mut self) {
+        self.invalidate_child_approval_snapshot();
+        self.child_approval_revision = 0;
+        self.pending_child_approvals.clear();
+        let active_is_child = self
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| matches!(question.kind, ActiveQuestionKind::ChildApproval(_)));
+        let dismissed_is_child = self
+            .dismissed_question
+            .as_ref()
+            .is_some_and(|question| matches!(question.kind, ActiveQuestionKind::ChildApproval(_)));
+        if active_is_child {
+            self.supersede_pending_answer();
+            self.pending_question = None;
+        }
+        if dismissed_is_child {
+            self.dismissed_question = None;
+        }
+    }
+
+    fn refresh_child_approvals(&mut self, session_id: String) {
+        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        self.invalidate_child_approval_snapshot();
+        let epoch = self.child_approval_snapshot_epoch;
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_subagent_snapshot()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::ChildApprovalSnapshotLoaded {
+                epoch,
+                session_id,
+                result,
+            });
+        });
+    }
+
+    fn child_question_matches_record(
+        question: &ActiveQuestion,
+        record: &ChildApprovalRecord,
+    ) -> bool {
+        matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.parent_session_id == record.parent_session_id
+                    && child.child_session_id == record.child_session_id
+                    && child.request_id == record.request_id
+                    && (question.identity_syncing
+                        || child.child_attempt == record.child_attempt)
+        )
+    }
+
+    fn refresh_child_question(question: &mut ActiveQuestion, queued: &QueuedChildApproval) {
+        let record = &queued.record;
+        let ActiveQuestionKind::ChildApproval(child) = &mut question.kind else {
+            return;
+        };
+        if child.parent_session_id != record.parent_session_id
+            || child.child_session_id != record.child_session_id
+            || child.request_id != record.request_id
+            || (!question.identity_syncing && child.child_attempt != record.child_attempt)
+            || (!question.identity_syncing && child.version > record.version)
+        {
+            return;
+        }
+        let exact_identity_changed = child.child_attempt != record.child_attempt
+            || child.version != record.version
+            || child.tool_name != record.tool_name
+            || child.permission != record.permission
+            || child.resource != record.resource;
+        child.child_attempt = record.child_attempt;
+        child.version = record.version;
+        child.tool_name.clone_from(&record.tool_name);
+        child.permission.clone_from(&record.permission);
+        child.resource.clone_from(&record.resource);
+        if exact_identity_changed {
+            child.exact_reviewed = false;
+            question.inspecting = false;
+            question.inspect_scroll = 0;
+        }
+        question.tool_name = Some(record.tool_name.clone());
+        question.question = format!(
+            "Child {} requests {}",
+            record.child_session_id, record.permission
+        );
+        question.identity_syncing = !queued.authoritative;
+        if queued.authoritative {
+            question.error = None;
+        }
+    }
+
+    fn upsert_child_approval(&mut self, queued: QueuedChildApproval) {
+        let record = &queued.record;
+        if self.chat.session_id.as_deref() != Some(record.parent_session_id.as_str())
+            || record.state != ChildApprovalState::Pending
+        {
+            return;
+        }
+
+        if queued.authoritative {
+            self.pending_child_approvals.retain(|existing| {
+                existing.authoritative
+                    || existing.record.parent_session_id != record.parent_session_id
+                    || existing.record.child_session_id != record.child_session_id
+                    || existing.record.request_id != record.request_id
+            });
+        } else if self.pending_child_approvals.iter().any(|existing| {
+            existing.record.parent_session_id == record.parent_session_id
+                && existing.record.child_session_id == record.child_session_id
+                && existing.record.request_id == record.request_id
+        }) {
+            return;
+        }
+
+        let exact_index = self.pending_child_approvals.iter().position(|existing| {
+            existing.record.parent_session_id == record.parent_session_id
+                && existing.record.child_session_id == record.child_session_id
+                && existing.record.child_attempt == record.child_attempt
+                && existing.record.request_id == record.request_id
+        });
+        if let Some(index) = exact_index {
+            if self.pending_child_approvals[index].record.version > record.version {
+                return;
+            }
+            self.pending_child_approvals[index] = queued.clone();
+        } else {
+            self.pending_child_approvals.push_back(queued.clone());
+        }
+
+        if let Some(question) = self.pending_question.as_mut().filter(|question| {
+            !question.submitting && Self::child_question_matches_record(question, record)
+        }) {
+            Self::refresh_child_question(question, &queued);
+        }
+        if let Some(question) = self
+            .dismissed_question
+            .as_mut()
+            .filter(|question| Self::child_question_matches_record(question, record))
+        {
+            Self::refresh_child_question(question, &queued);
+        }
+        self.show_next_child_approval();
+    }
+
+    fn show_next_child_approval(&mut self) {
+        if self.pending_question.is_some() || self.dismissed_question.is_some() {
+            return;
+        }
+        let Some(parent_session_id) = self.chat.session_id.as_deref() else {
+            return;
+        };
+        while self.pending_child_approvals.front().is_some_and(|queued| {
+            queued.record.parent_session_id != parent_session_id
+                || queued.record.state != ChildApprovalState::Pending
+        }) {
+            self.pending_child_approvals.pop_front();
+        }
+        let Some(queued) = self.pending_child_approvals.front().cloned() else {
+            return;
+        };
+        self.supersede_pending_answer();
+        let ui_id = self.chat.allocate_ui_id("child-approval");
+        self.pending_question = Some(ActiveQuestion::child_approval(ui_id, &queued));
+        self.status_message = if queued.authoritative {
+            "Child agent requires an approval decision".to_string()
+        } else {
+            "Synchronizing child approval identity...".to_string()
+        };
+        self.chat.note_update();
+    }
+
+    fn remove_child_approval_generation(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        child_attempt: u32,
+        request_id: &str,
+        terminal_version: u64,
+    ) {
+        self.pending_child_approvals.retain(|queued| {
+            queued.record.parent_session_id != parent_session_id
+                || queued.record.child_session_id != child_session_id
+                || queued.record.child_attempt != child_attempt
+                || queued.record.request_id != request_id
+                || queued.record.version > terminal_version
+        });
+    }
+
+    fn retire_parent_question_context(&mut self) {
+        let active_is_child = self
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| matches!(question.kind, ActiveQuestionKind::ChildApproval(_)));
+        let dismissed_is_child = self
+            .dismissed_question
+            .as_ref()
+            .is_some_and(|question| matches!(question.kind, ActiveQuestionKind::ChildApproval(_)));
+        if !active_is_child && self.pending_question.is_some() {
+            self.supersede_pending_answer();
+            self.pending_question = None;
+        }
+        if !dismissed_is_child {
+            self.dismissed_question = None;
+        }
+        self.show_next_child_approval();
+    }
+
     /// Invalidate any in-flight answer POST by bumping `answer_epoch`. Called
     /// from every site that changes the pending-question context (a new
     /// question arriving, a session switch/resume, the run finalizing, the
@@ -4893,7 +6781,7 @@ impl App {
     /// SSE drain until the server replied) and its outcome comes back as
     /// `AppEvent::AnswerSubmitted`. Until then the modal stays open in a
     /// "Submitting answer…" state with input disabled.
-    fn submit_answer(&mut self, answer: String) {
+    fn submit_question(&mut self, submission: QuestionSubmission) {
         let Some(identity) = self.pending_question.as_ref().map(ActiveQuestion::identity) else {
             return;
         };
@@ -4902,6 +6790,31 @@ impl App {
                 NoticeLevel::Warn,
                 "Question belongs to a different session; reopen that session before answering",
             );
+            return;
+        }
+        if self
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| question.identity_syncing)
+        {
+            let child_parent = self.pending_question.as_ref().and_then(|question| {
+                if let ActiveQuestionKind::ChildApproval(child) = &question.kind {
+                    Some(child.parent_session_id.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(question) = self.pending_question.as_mut() {
+                question.error = Some(
+                    "Waiting for the server's exact question identity; answer not sent".to_string(),
+                );
+            }
+            self.status_message = "Synchronizing question identity...".to_string();
+            if let Some(parent_session_id) = child_parent {
+                self.refresh_child_approvals(parent_session_id);
+            } else {
+                self.reconcile_pending_question_after_stream_connect(identity.session_id);
+            }
             return;
         }
         if identity.tool_call_id.is_none() {
@@ -4954,6 +6867,7 @@ impl App {
         // the current question when it lands.
         self.supersede_pending_answer();
         let epoch = self.answer_epoch;
+        let answer = submission.label();
         self.status_message = format!("Submitting answer: {answer}…");
 
         let client = self.client.clone();
@@ -4977,11 +6891,40 @@ impl App {
                 })
             };
             let result = match stream_ready {
-                Ok(()) => {
-                    client
+                Ok(()) => match submission {
+                    QuestionSubmission::Clarification(answer) => client
                         .respond(&session_id, &answer, expected_tool_call_id.as_deref())
                         .await
-                }
+                        .map(
+                            |auto_resume_status| AnswerSubmissionOutcome::Clarification {
+                                auto_resume_status,
+                            },
+                        ),
+                    QuestionSubmission::Permission(decision) => client
+                        .submit_permission_decision(&session_id, &decision)
+                        .await
+                        .map(AnswerSubmissionOutcome::Permission),
+                    QuestionSubmission::ChildApproval {
+                        parent_session_id,
+                        child_session_id,
+                        child_attempt,
+                        request_id,
+                        expected_version,
+                        approved,
+                    } => client
+                        .submit_child_approval(
+                            &child_session_id,
+                            &ChildApprovalDecision {
+                                parent_session_id,
+                                child_attempt,
+                                request_id,
+                                expected_version,
+                                approved,
+                            },
+                        )
+                        .await
+                        .map(|_| AnswerSubmissionOutcome::ChildApproval),
+                },
                 Err(message) => Err(RespondFailure::unavailable(format!(
                     "Answer not sent: {message}"
                 ))),
@@ -5181,11 +7124,24 @@ impl App {
                 });
             }
             Tab::Config => {
-                self.config.loading = true;
-                tokio::spawn(async move {
-                    let r = client.get_config().await.map_err(|e| e.to_string());
-                    let _ = tx.send(AppEvent::ConfigLoaded(r));
-                });
+                if self.config.view == ConfigView::Permissions {
+                    self.permission_policy_epoch = self.permission_policy_epoch.wrapping_add(1);
+                    let epoch = self.permission_policy_epoch;
+                    self.config.permissions.loading = true;
+                    tokio::spawn(async move {
+                        let r = client
+                            .get_permission_policy()
+                            .await
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::PermissionPolicyLoaded { epoch, result: r });
+                    });
+                } else {
+                    self.config.loading = true;
+                    tokio::spawn(async move {
+                        let r = client.get_config().await.map_err(|e| e.to_string());
+                        let _ = tx.send(AppEvent::ConfigLoaded(r));
+                    });
+                }
             }
         }
     }
@@ -5517,6 +7473,8 @@ impl App {
     /// by `Enter` on the Sessions tab and by `--session-id` at startup so
     /// there's exactly one resume code path.
     fn resume_session(&mut self, session_id: String) {
+        self.invalidate_permission_mode_context();
+        self.clear_child_approval_context();
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -5575,6 +7533,14 @@ impl App {
                 model: summary.model,
                 provider,
                 project_id: summary.project_id,
+                permission_mode: if summary.permission_mode == SessionPermissionMode::Default
+                    && summary.bypass_permissions
+                {
+                    SessionPermissionMode::Bypass
+                } else {
+                    summary.permission_mode
+                },
+                bypass_permissions: summary.bypass_permissions,
                 is_running: summary.is_running,
                 pending,
                 truncated: history.truncated,
@@ -5591,6 +7557,8 @@ impl App {
     /// membership (the operator picked both deliberately) while dropping
     /// per-session conversation state.
     fn new_session(&mut self) {
+        self.invalidate_permission_mode_context();
+        self.clear_child_approval_context();
         self.close_command_palette();
         self.stash_question_drafts();
         self.detach_stream();
@@ -5607,6 +7575,8 @@ impl App {
         self.chat.auto_scroll = true;
         self.chat.streaming = false;
         self.chat.plan_mode = false;
+        self.chat.permission_mode = SessionPermissionMode::Default;
+        self.chat.bypass_permissions = false;
         self.stream_disconnected = false;
         self.pending_answer_run_started = false;
         self.supersede_pending_answer();
@@ -5939,7 +7909,7 @@ impl App {
                 {
                     return Ok(());
                 }
-                self.handle_sse_event(event)
+                self.handle_sse_event(*event)
             }
             SessionSseEvent::Connected {
                 session_id,
@@ -5969,7 +7939,8 @@ impl App {
                     .as_ref()
                     .is_none_or(|question| !question.submitting)
                 {
-                    self.reconcile_pending_question_after_stream_connect(session_id);
+                    self.reconcile_pending_question_after_stream_connect(session_id.clone());
+                    self.refresh_child_approvals(session_id);
                 }
                 Ok(())
             }
@@ -6172,6 +8143,151 @@ impl App {
                 // dropped (it carries only supplementary progress info, unlike
                 // Complete/Error's definitive terminal result).
             }
+            AgentEvent::ToolApprovalRequested { .. } => {
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    self.status_message = "Synchronizing typed permission request...".to_string();
+                    self.reconcile_pending_question_after_stream_connect(session_id);
+                }
+            }
+            AgentEvent::ChildApprovalRequested {
+                child_session_id,
+                request_id,
+                tool_name,
+                permission,
+                resource,
+            } => {
+                let Some(parent_session_id) = self.chat.session_id.clone() else {
+                    self.notify(
+                        NoticeLevel::Warn,
+                        "Ignored child approval without an active parent session",
+                    );
+                    return Ok(());
+                };
+                // This legacy event intentionally lacks the durable attempt
+                // and version. Queue it without making it actionable, then
+                // hydrate from the authoritative account snapshot.
+                self.upsert_child_approval(QueuedChildApproval {
+                    record: ChildApprovalRecord {
+                        parent_session_id: parent_session_id.clone(),
+                        child_session_id,
+                        child_attempt: 0,
+                        request_id,
+                        tool_name,
+                        permission,
+                        resource,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                        version: 0,
+                        state: ChildApprovalState::Pending,
+                        approved: None,
+                        reason: None,
+                    },
+                    authoritative: false,
+                });
+                self.refresh_child_approvals(parent_session_id);
+            }
+            AgentEvent::ChildApprovalChanged {
+                parent_session_id,
+                child_session_id,
+                child_attempt,
+                request_id,
+                version,
+                status,
+                reason,
+                tool_name,
+                permission,
+                resource,
+                created_at,
+                resolved_at,
+            } => {
+                if self.chat.session_id.as_deref() != Some(parent_session_id.as_str()) {
+                    return Ok(());
+                }
+                self.invalidate_child_approval_snapshot();
+                // Early `ChildApprovalChanged` producers emitted 0/0 because
+                // the event did not yet carry the durable attempt/version
+                // identity. Treat that shape exactly like the legacy
+                // `ChildApprovalRequested` signal: it may make the request
+                // visible, but it must never make an approval actionable or
+                // retire a concrete generation. The snapshot below supplies
+                // the authoritative identity.
+                // Attempt zero is the first real child run. Version zero is
+                // the compatibility sentinel: every durable registry record
+                // starts at a positive version.
+                let authoritative_identity = version > 0;
+                if status == "pending" {
+                    self.upsert_child_approval(QueuedChildApproval {
+                        record: ChildApprovalRecord {
+                            parent_session_id: parent_session_id.clone(),
+                            child_session_id: child_session_id.clone(),
+                            child_attempt,
+                            request_id: request_id.clone(),
+                            tool_name,
+                            permission,
+                            resource,
+                            created_at: created_at.clone(),
+                            updated_at: created_at,
+                            version,
+                            state: ChildApprovalState::Pending,
+                            approved: None,
+                            reason: reason.clone(),
+                        },
+                        authoritative: authoritative_identity,
+                    });
+                } else if authoritative_identity {
+                    self.remove_child_approval_generation(
+                        &parent_session_id,
+                        &child_session_id,
+                        child_attempt,
+                        &request_id,
+                        version,
+                    );
+                    let matches_terminal = |question: &ActiveQuestion| {
+                        matches!(
+                            &question.kind,
+                            ActiveQuestionKind::ChildApproval(child)
+                                if !question.identity_syncing
+                                    && child.parent_session_id == parent_session_id
+                                    && child.child_session_id == child_session_id
+                                    && child.child_attempt == child_attempt
+                                    && child.request_id == request_id
+                                    && child.version <= version
+                        )
+                    };
+                    if self.pending_question.as_ref().is_some_and(matches_terminal) {
+                        self.supersede_pending_answer();
+                        self.pending_question = None;
+                    }
+                    if self
+                        .dismissed_question
+                        .as_ref()
+                        .is_some_and(matches_terminal)
+                    {
+                        self.dismissed_question = None;
+                    }
+                    let detail = reason
+                        .filter(|value| !value.is_empty())
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default();
+                    self.notify(
+                        if matches!(status.as_str(), "delivery_failed" | "expired") {
+                            NoticeLevel::Warn
+                        } else {
+                            NoticeLevel::Info
+                        },
+                        format!("Child approval {status}{detail}"),
+                    );
+                    let _ = resolved_at;
+                    self.show_next_child_approval();
+                } else {
+                    // A terminal compatibility event with no durable identity
+                    // cannot prove which generation it resolved. Reconcile
+                    // from the snapshot instead of guessing.
+                    let _ = (reason, resolved_at);
+                }
+                self.chat.note_update();
+                self.refresh_child_approvals(parent_session_id);
+            }
             AgentEvent::NeedClarification {
                 question,
                 options,
@@ -6195,9 +8311,21 @@ impl App {
                     tool_call_id,
                     tool_name,
                     source,
+                    // `NeedClarification` is a typed event variant, but it is
+                    // still non-actionable until the authoritative pending
+                    // endpoint supplies the exact request identity.
+                    interaction_kind: Some(PendingInteractionKind::Clarification),
+                    permission_request: None,
+                    tool_arguments: None,
+                    tool_arguments_truncated: false,
                 };
-                let incoming = self.question_from_pending(session_id, &pending);
-                let needs_identity_sync = incoming.tool_call_id.is_none();
+                let mut incoming = self.question_from_pending(session_id, &pending);
+                // SSE intentionally carries the display question but not the
+                // typed PermissionRequest. Block all submission until the
+                // authoritative pending snapshot distinguishes clarification
+                // from permission and supplies the exact policy contract.
+                incoming.identity_syncing = true;
+                let needs_identity_sync = true;
                 if let Some(existing) = self.pending_question.as_mut() {
                     if existing.identity() == incoming.identity() {
                         // Critical-event replay/reconnect may deliver the same
@@ -6248,7 +8376,7 @@ impl App {
                 self.pending_question = Some(incoming);
                 self.chat.note_update();
                 if needs_identity_sync {
-                    self.status_message = "Synchronizing question identity...".to_string();
+                    self.status_message = "Synchronizing question contract...".to_string();
                     if let Some(session_id) = self.chat.session_id.clone() {
                         self.reconcile_pending_question_after_stream_connect(session_id);
                     }
@@ -6454,9 +8582,7 @@ impl App {
         // an answer, so drop any open (or dismissed-but-cached) question modal
         // to avoid answering a dead session — and invalidate any answer POST
         // still in flight for it.
-        self.supersede_pending_answer();
-        self.pending_question = None;
-        self.dismissed_question = None;
+        self.retire_parent_question_context();
         self.chat.clear_replay_reconciliation();
     }
 
@@ -6481,9 +8607,7 @@ impl App {
         self.status_message = "Ready — background child agents still running".to_string();
         self.stream_disconnected = false;
         self.pending_answer_run_started = false;
-        self.supersede_pending_answer();
-        self.pending_question = None;
-        self.dismissed_question = None;
+        self.retire_parent_question_context();
     }
 
     fn handle_complete(&mut self, usage: TokenUsage) {
@@ -6906,6 +9030,7 @@ impl App {
                     }
                 }
             }
+            Some(ActionId::OpenPermissionPolicy) => self.open_permission_policy(),
             _ => {}
         }
     }
@@ -6962,6 +9087,523 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn open_permission_policy(&mut self) {
+        self.tab = Tab::Config;
+        self.config.view = ConfigView::Permissions;
+        self.load_permission_policy();
+    }
+
+    fn load_permission_policy(&mut self) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        self.permission_policy_epoch = self.permission_policy_epoch.wrapping_add(1);
+        let epoch = self.permission_policy_epoch;
+        self.config.permissions.loading = true;
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_permission_policy()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::PermissionPolicyLoaded { epoch, result });
+        });
+    }
+
+    fn open_permission_editor(&mut self, mode: PermissionEditorMode, json: String) {
+        let Some(revision) = self
+            .config
+            .permissions
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.revision)
+        else {
+            self.notify(
+                NoticeLevel::Warn,
+                "Load the permission policy before editing",
+            );
+            return;
+        };
+        self.permission_editor_epoch = self.permission_editor_epoch.wrapping_add(1);
+        let mut textarea = TextArea::new(json.lines().map(str::to_string).collect());
+        apply_textarea_palette(&mut textarea, self.theme);
+        self.permission_editor = Some(PermissionEditor {
+            epoch: self.permission_editor_epoch,
+            mode,
+            expected_revision: revision,
+            textarea,
+            error: None,
+            submitting: false,
+            refresh_revision_on_load: false,
+        });
+    }
+
+    fn handle_permissions_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::Permissions, key);
+        let rule_count = self
+            .config
+            .permissions
+            .snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.policy.durable_rules.len());
+        match action {
+            Some(ActionId::NavigateUp) => {
+                self.config.permissions.selected =
+                    self.config.permissions.selected.saturating_sub(1)
+            }
+            Some(ActionId::NavigateDown) => {
+                self.config.permissions.selected = self
+                    .config
+                    .permissions
+                    .selected
+                    .saturating_add(1)
+                    .min(rule_count.saturating_sub(1));
+            }
+            Some(ActionId::Cancel) => {
+                self.config.view = ConfigView::Raw;
+                self.load_tab_data();
+            }
+            Some(ActionId::Refresh) => self.load_permission_policy(),
+            Some(ActionId::TogglePermissionBypass) => self.begin_permission_mode_toggle(),
+            Some(ActionId::NewPermissionRule) => {
+                let template = serde_json::json!({
+                    "id": "new-rule-id",
+                    "permission_type": "write_file",
+                    "effect": "allow",
+                    "scope": "global",
+                    "matcher": {
+                        "id": "exact_resource",
+                        "kind": "exact_resource",
+                        "value": "/absolute/resource"
+                    },
+                    "source": "user"
+                });
+                self.open_permission_editor(
+                    PermissionEditorMode::Create,
+                    serde_json::to_string_pretty(&template).unwrap_or_default(),
+                );
+            }
+            Some(ActionId::EditPermissionRule | ActionId::Activate) => {
+                if let Some(rule) = self.config.permissions.selected_rule().cloned() {
+                    let json = serde_json::to_string_pretty(&rule).unwrap_or_default();
+                    self.open_permission_editor(
+                        PermissionEditorMode::Edit {
+                            rule_id: rule.id.clone(),
+                        },
+                        json,
+                    );
+                } else {
+                    self.notify(NoticeLevel::Warn, "No permission rule selected");
+                }
+            }
+            Some(ActionId::DeleteSelection) => {
+                if let (Some(rule), Some(snapshot)) = (
+                    self.config.permissions.selected_rule(),
+                    self.config.permissions.snapshot.as_ref(),
+                ) {
+                    self.permission_delete = Some(PermissionDeleteConfirm {
+                        rule_id: rule.id.clone(),
+                        rule: rule.clone(),
+                        expected_revision: snapshot.revision,
+                        error: None,
+                        submitting: false,
+                    });
+                }
+            }
+            Some(ActionId::DiagnosePermission) => {
+                let template = serde_json::json!({
+                    "request_id": "diagnostic-only",
+                    "session_id": self.chat.session_id.clone().unwrap_or_default(),
+                    "tool_name": "Write",
+                    "tool_args": {"path": "/absolute/resource"},
+                    "permission_type": "write_file",
+                    "resource": "/absolute/resource",
+                    "operation_summary": "diagnose without consuming a grant",
+                    "bypass_requested": false,
+                    "auto_approve_requested": false
+                });
+                self.open_permission_editor(
+                    PermissionEditorMode::Diagnose,
+                    serde_json::to_string_pretty(&template).unwrap_or_default(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_permission_editor_key(&mut self, key: KeyEvent) -> Result<()> {
+        let action = self.resolve_context_action(ActionContext::PermissionEditor, key);
+        if self
+            .permission_editor
+            .as_ref()
+            .is_some_and(|editor| editor.submitting)
+        {
+            return Ok(());
+        }
+        if action == Some(ActionId::Cancel) {
+            self.permission_editor = None;
+            self.status_message = "Permission edit cancelled".to_string();
+            return Ok(());
+        }
+        if action == Some(ActionId::SavePermissionForm) {
+            let Some(editor) = self.permission_editor.as_ref() else {
+                return Ok(());
+            };
+            let text = editor.textarea.lines().join("\n");
+            let epoch = editor.epoch;
+            let expected_revision = editor.expected_revision;
+            let mode = editor.mode.clone();
+            match mode {
+                PermissionEditorMode::Create | PermissionEditorMode::Edit { .. } => {
+                    let rule = match serde_json::from_str::<DurablePermissionRule>(&text) {
+                        Ok(rule) => rule,
+                        Err(error) => {
+                            if let Some(editor) = self.permission_editor.as_mut() {
+                                editor.error =
+                                    Some(format!("Invalid permission rule JSON: {error}"));
+                            }
+                            return Ok(());
+                        }
+                    };
+                    if let PermissionEditorMode::Edit { rule_id } = &mode {
+                        if &rule.id != rule_id {
+                            if let Some(editor) = self.permission_editor.as_mut() {
+                                editor.error =
+                                    Some(format!("Rule id must remain '{rule_id}' while editing"));
+                            }
+                            return Ok(());
+                        }
+                    }
+                    if rule.effect == PermissionRuleEffect::Allow
+                        && rule.scope == PermissionRuleScope::Global
+                    {
+                        if let Some(editor) = self.permission_editor.as_mut() {
+                            editor.error = None;
+                        }
+                        self.permission_rule_confirm = Some(PermissionRuleConfirm {
+                            epoch,
+                            mode,
+                            expected_revision,
+                            rule,
+                            scroll: 0,
+                            max_scroll: Cell::new(0),
+                            error: None,
+                            submitting: false,
+                        });
+                    } else {
+                        let _ = self.submit_permission_rule_request(
+                            epoch,
+                            mode,
+                            expected_revision,
+                            rule,
+                        );
+                    }
+                }
+                PermissionEditorMode::Diagnose => {
+                    let request = match serde_json::from_str::<DiagnosePermissionRequest>(&text) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            if let Some(editor) = self.permission_editor.as_mut() {
+                                editor.error =
+                                    Some(format!("Invalid diagnosis request JSON: {error}"));
+                            }
+                            return Ok(());
+                        }
+                    };
+                    let Some(tx) = self.event_tx.clone() else {
+                        if let Some(editor) = self.permission_editor.as_mut() {
+                            editor.error = Some("TUI event loop is unavailable".to_string());
+                        }
+                        return Ok(());
+                    };
+                    let client = self.client.clone();
+                    if let Some(editor) = self.permission_editor.as_mut() {
+                        editor.submitting = true;
+                        editor.error = None;
+                    }
+                    tokio::spawn(async move {
+                        let result = client
+                            .diagnose_permission(&request)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = tx.send(AppEvent::PermissionDiagnosed { epoch, result });
+                    });
+                }
+            }
+            return Ok(());
+        }
+        if action.is_none() {
+            if let Some(editor) = self.permission_editor.as_mut() {
+                editor.error = None;
+                if text_widget_input_allowed(key) {
+                    editor.textarea.input(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_permission_rule_request(
+        &mut self,
+        epoch: u64,
+        mode: PermissionEditorMode,
+        expected_revision: u64,
+        rule: DurablePermissionRule,
+    ) -> bool {
+        let Some(tx) = self.event_tx.clone() else {
+            if let Some(editor) = self.permission_editor.as_mut() {
+                editor.error = Some("TUI event loop is unavailable".to_string());
+            }
+            return false;
+        };
+        let client = self.client.clone();
+        if let Some(editor) = self
+            .permission_editor
+            .as_mut()
+            .filter(|editor| editor.epoch == epoch)
+        {
+            editor.submitting = true;
+            editor.error = None;
+        } else {
+            return false;
+        }
+        tokio::spawn(async move {
+            let result = match mode {
+                PermissionEditorMode::Create => {
+                    client
+                        .create_permission_rule(expected_revision, &rule)
+                        .await
+                }
+                PermissionEditorMode::Edit { .. } => {
+                    client
+                        .update_permission_rule(expected_revision, &rule)
+                        .await
+                }
+                PermissionEditorMode::Diagnose => unreachable!(),
+            };
+            let _ = tx.send(AppEvent::PermissionRuleSaved { epoch, result });
+        });
+        true
+    }
+
+    fn handle_permission_rule_confirm_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::PermissionRuleConfirm, key);
+        if self
+            .permission_rule_confirm
+            .as_ref()
+            .is_some_and(|confirm| confirm.submitting)
+        {
+            return;
+        }
+        match action {
+            Some(ActionId::Reject) => {
+                self.permission_rule_confirm = None;
+                self.status_message =
+                    "Global allow confirmation cancelled; draft preserved".to_string();
+            }
+            Some(ActionId::NavigateUp) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = confirm.scroll.saturating_sub(1);
+                }
+            }
+            Some(ActionId::NavigateDown) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = confirm
+                        .scroll
+                        .saturating_add(1)
+                        .min(confirm.max_scroll.get());
+                }
+            }
+            Some(ActionId::PageUp) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = confirm.scroll.saturating_sub(8);
+                }
+            }
+            Some(ActionId::PageDown) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = confirm
+                        .scroll
+                        .saturating_add(8)
+                        .min(confirm.max_scroll.get());
+                }
+            }
+            Some(ActionId::JumpFirst) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = 0;
+                }
+            }
+            Some(ActionId::JumpLast) => {
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.scroll = confirm.max_scroll.get();
+                }
+            }
+            Some(ActionId::Confirm) => {
+                let Some(confirm) = self.permission_rule_confirm.as_ref() else {
+                    return;
+                };
+                let current_revision = self
+                    .config
+                    .permissions
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.revision);
+                let editor_matches = self.permission_editor.as_ref().is_some_and(|editor| {
+                    editor.epoch == confirm.epoch
+                        && editor.expected_revision == confirm.expected_revision
+                        && editor.mode == confirm.mode
+                });
+                if !editor_matches || current_revision != Some(confirm.expected_revision) {
+                    self.permission_rule_confirm = None;
+                    if let Some(editor) = self.permission_editor.as_mut() {
+                        editor.error = Some(
+                            "Global allow confirmation expired; policy is refreshing. Review the draft and confirm again."
+                                .to_string(),
+                        );
+                        editor.refresh_revision_on_load = true;
+                    }
+                    self.load_permission_policy();
+                    return;
+                }
+                let epoch = confirm.epoch;
+                let mode = confirm.mode.clone();
+                let expected_revision = confirm.expected_revision;
+                let rule = confirm.rule.clone();
+                let submitted =
+                    self.submit_permission_rule_request(epoch, mode, expected_revision, rule);
+                if let Some(confirm) = self.permission_rule_confirm.as_mut() {
+                    confirm.submitting = submitted;
+                    confirm.error = (!submitted)
+                        .then(|| "TUI event loop is unavailable; nothing was sent".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_permission_delete_confirm_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::PermissionDeleteConfirm, key);
+        let Some(confirm) = self.permission_delete.as_mut() else {
+            return;
+        };
+        if confirm.submitting {
+            return;
+        }
+        match action {
+            Some(ActionId::Reject) => self.permission_delete = None,
+            Some(ActionId::Confirm) => {
+                let Some(tx) = self.event_tx.clone() else {
+                    return;
+                };
+                let client = self.client.clone();
+                let rule_id = confirm.rule_id.clone();
+                let expected_revision = confirm.expected_revision;
+                confirm.submitting = true;
+                confirm.error = None;
+                tokio::spawn(async move {
+                    let result = client
+                        .delete_permission_rule(&rule_id, expected_revision)
+                        .await;
+                    let _ = tx.send(AppEvent::PermissionRuleDeleted { rule_id, result });
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn begin_permission_mode_toggle(&mut self) {
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.notify(
+                NoticeLevel::Warn,
+                "Open an existing session before changing its permission mode",
+            );
+            return;
+        };
+        self.permission_mode_epoch = self.permission_mode_epoch.wrapping_add(1);
+        self.fetch_permission_mode(session_id);
+    }
+
+    fn invalidate_permission_mode_context(&mut self) {
+        self.permission_mode_epoch = self.permission_mode_epoch.wrapping_add(1);
+        self.permission_mode_confirm = None;
+    }
+
+    fn fetch_permission_mode(&mut self, session_id: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let epoch = self.permission_mode_epoch;
+        let client = self.client.clone();
+        self.status_message = "Loading current session permission mode...".to_string();
+        tokio::spawn(async move {
+            let result = client
+                .get_session_versioned(&session_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::PermissionModeLoaded {
+                epoch,
+                session_id,
+                result,
+            });
+        });
+    }
+
+    fn handle_permission_mode_confirm_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::PermissionModeConfirm, key);
+        if self
+            .permission_mode_confirm
+            .as_ref()
+            .is_some_and(|confirm| {
+                self.chat.session_id.as_deref() != Some(confirm.session_id.as_str())
+                    || confirm.epoch != self.permission_mode_epoch
+            })
+        {
+            self.invalidate_permission_mode_context();
+            self.notify(
+                NoticeLevel::Warn,
+                "Permission-mode confirmation expired after the session changed",
+            );
+            return;
+        }
+        let Some(confirm) = self.permission_mode_confirm.as_mut() else {
+            return;
+        };
+        if confirm.submitting {
+            return;
+        }
+        match action {
+            Some(ActionId::Reject) => self.permission_mode_confirm = None,
+            Some(ActionId::Refresh) => {
+                let session_id = confirm.session_id.clone();
+                self.permission_mode_epoch = self.permission_mode_epoch.wrapping_add(1);
+                self.permission_mode_confirm = None;
+                self.fetch_permission_mode(session_id);
+            }
+            Some(ActionId::Confirm) => {
+                let Some(tx) = self.event_tx.clone() else {
+                    return;
+                };
+                let client = self.client.clone();
+                let epoch = confirm.epoch;
+                let session_id = confirm.session_id.clone();
+                let expected_version = confirm.metadata_version;
+                let target = confirm.to;
+                confirm.submitting = true;
+                confirm.error = None;
+                tokio::spawn(async move {
+                    let result = client
+                        .patch_session_permission_mode(&session_id, expected_version, target)
+                        .await;
+                    let _ = tx.send(AppEvent::PermissionModePatched {
+                        epoch,
+                        session_id,
+                        result,
+                    });
+                });
+            }
+            _ => {}
+        }
     }
 
     // ── Contextual session picker (Ctrl+P) ──
@@ -8812,6 +11454,8 @@ mod question_tests {
             tool_call_id: Some(tool_call_id.to_string()),
             tool_name: Some("ConclusionWithOptions".to_string()),
             source: Some("pause_tool".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Clarification),
+            ..PendingQuestion::default()
         };
         ActiveQuestion::from_pending(
             format!("test:question:{tool_call_id}"),
@@ -8834,6 +11478,1503 @@ mod question_tests {
             "",
         ));
         app
+    }
+
+    fn sample_permission_request(
+        session_id: &str,
+        request_id: &str,
+        allowed_decisions: Vec<PermissionDecisionKind>,
+    ) -> PermissionRequest {
+        PermissionRequest {
+            request_id: request_id.to_string(),
+            request_generation: format!("generation-{request_id}"),
+            session_id: session_id.to_string(),
+            workspace_path: Some("/workspace/repo".to_string()),
+            tool_name: "Bash".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: "cargo test --workspace".to_string(),
+            operation_summary: "Run the workspace tests".to_string(),
+            risk_level: RiskLevel::High,
+            reason_code: PermissionReasonCode::ConfiguredAlwaysAsk,
+            effective_mode: EffectivePermissionMode::Default,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            policy_revision: 41,
+            matched_rule: Some(PermissionRuleRef {
+                id: "always-ask-tests".to_string(),
+                effect: PermissionRuleEffect::AlwaysAsk,
+                scope: PermissionRuleScope::Global,
+                source: PermissionRuleSource::User,
+            }),
+            allowed_decisions,
+            suggested_matchers: vec![PermissionMatcher {
+                id: "exact-resource".to_string(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: "cargo test --workspace".to_string(),
+            }],
+        }
+    }
+
+    fn app_with_permission(allowed_decisions: Vec<PermissionDecisionKind>) -> App {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let session_id = "permission-session";
+        let request_id = "permission-request";
+        app.chat.session_id = Some(session_id.to_string());
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "test:typed-permission".to_string(),
+            session_id.to_string(),
+            &PendingQuestion {
+                has_pending_question: true,
+                question: "Allow tests?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: true,
+                tool_call_id: Some(request_id.to_string()),
+                tool_name: Some("Bash".to_string()),
+                source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: Some(sample_permission_request(
+                    session_id,
+                    request_id,
+                    allowed_decisions,
+                )),
+                tool_arguments: Some(serde_json::json!({
+                    "command": "cargo test --workspace",
+                    "timeout_seconds": 120
+                })),
+                tool_arguments_truncated: false,
+            },
+            "must-not-be-used".to_string(),
+        ));
+        app
+    }
+
+    fn child_record(
+        parent_session_id: &str,
+        child_session_id: &str,
+        child_attempt: u32,
+        request_id: &str,
+        version: u64,
+        state: ChildApprovalState,
+    ) -> ChildApprovalRecord {
+        ChildApprovalRecord {
+            parent_session_id: parent_session_id.to_string(),
+            child_session_id: child_session_id.to_string(),
+            child_attempt,
+            request_id: request_id.to_string(),
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: format!("/workspace/{child_session_id}.txt"),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            updated_at: "2026-08-14T00:00:01Z".to_string(),
+            version,
+            state,
+            approved: None,
+            reason: None,
+        }
+    }
+
+    fn child_snapshot(
+        approvals_revision: u64,
+        approvals: Vec<ChildApprovalRecord>,
+    ) -> SubagentSnapshotResponse {
+        SubagentSnapshotResponse {
+            schema_version: 1,
+            snapshot_seq: approvals_revision,
+            approvals_revision,
+            approvals,
+        }
+    }
+
+    fn permission_rule(
+        id: &str,
+        effect: PermissionRuleEffect,
+        scope: PermissionRuleScope,
+        matcher_value: &str,
+    ) -> DurablePermissionRule {
+        DurablePermissionRule {
+            id: id.to_string(),
+            permission_type: PermissionType::WriteFile,
+            effect,
+            scope,
+            workspace_path: (scope == PermissionRuleScope::Workspace)
+                .then(|| "/workspace".to_string()),
+            matcher: PermissionMatcher {
+                id: "exact-resource".to_string(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: matcher_value.to_string(),
+            },
+            source: PermissionRuleSource::User,
+            expires_at: None,
+        }
+    }
+
+    fn permission_policy(
+        revision: u64,
+        rules: Vec<DurablePermissionRule>,
+    ) -> PermissionPolicyResponse {
+        PermissionPolicyResponse {
+            revision,
+            policy: PermissionPolicyConfig {
+                enabled: true,
+                mode: None,
+                confirm_threshold: None,
+                ask_rules: Vec::new(),
+                durable_rules: rules,
+            },
+            temporary_grants: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn every_permission_scope_preserves_request_matcher_revision_and_confirmation() {
+        let request = sample_permission_request(
+            "permission-session",
+            "permission-request",
+            vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::AllowSession,
+                PermissionDecisionKind::AllowWorkspace,
+                PermissionDecisionKind::AllowGlobal,
+                PermissionDecisionKind::DenyOnce,
+                PermissionDecisionKind::DenySession,
+            ],
+        );
+        let cases = [
+            (PermissionDecisionKind::AllowOnce, None, None, None, false),
+            (
+                PermissionDecisionKind::AllowSession,
+                Some(0),
+                Some("exact-resource"),
+                None,
+                false,
+            ),
+            (
+                PermissionDecisionKind::AllowWorkspace,
+                Some(0),
+                Some("exact-resource"),
+                Some(41),
+                false,
+            ),
+            (
+                PermissionDecisionKind::AllowGlobal,
+                Some(0),
+                Some("exact-resource"),
+                Some(41),
+                true,
+            ),
+            (PermissionDecisionKind::DenyOnce, None, None, None, false),
+            (
+                PermissionDecisionKind::DenySession,
+                Some(0),
+                Some("exact-resource"),
+                None,
+                false,
+            ),
+        ];
+        for (kind, matcher_index, matcher_id, revision, confirm_global) in cases {
+            let decision =
+                build_permission_decision(&request, kind, matcher_index, confirm_global).unwrap();
+            assert_eq!(decision.request_id, "permission-request");
+            assert_eq!(decision.decision, kind);
+            assert_eq!(decision.matcher_id.as_deref(), matcher_id);
+            assert_eq!(decision.expected_policy_revision, revision);
+            assert_eq!(decision.confirm_global, confirm_global);
+        }
+        assert!(build_permission_decision(
+            &request,
+            PermissionDecisionKind::AllowGlobal,
+            Some(0),
+            false,
+        )
+        .is_err());
+
+        let restricted = sample_permission_request(
+            "permission-session",
+            "permission-request",
+            vec![PermissionDecisionKind::DenyOnce],
+        );
+        assert!(build_permission_decision(
+            &restricted,
+            PermissionDecisionKind::AllowOnce,
+            None,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn global_permission_requires_matcher_then_a_second_confirmation_stage() {
+        let mut app = app_with_permission(vec![PermissionDecisionKind::AllowGlobal]);
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::Permission(PermissionQuestion {
+                stage: PermissionStage::Matcher(PermissionDecisionKind::AllowGlobal),
+                ..
+            })
+        ));
+
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::Permission(PermissionQuestion {
+                stage: PermissionStage::Matcher(PermissionDecisionKind::AllowGlobal),
+                ..
+            })
+        ));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(
+            question.inspecting,
+            "global flow must open the exact inspector"
+        );
+        assert!(!question.submitting);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::Permission(PermissionQuestion {
+                global_scope_reviewed: false,
+                ..
+            })
+        ));
+
+        app.handle_permission_question_action(Some(ActionId::Cancel));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(!question.inspecting);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::Permission(PermissionQuestion {
+                global_scope_reviewed: true,
+                reviewed_matcher: Some((PermissionDecisionKind::AllowGlobal, 0)),
+                ..
+            })
+        ));
+
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::Permission(PermissionQuestion {
+                stage: PermissionStage::GlobalConfirm { matcher_index: 0 },
+                global_scope_reviewed: true,
+                ..
+            })
+        ));
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+    }
+
+    #[test]
+    fn long_global_matcher_is_scrollable_at_60x20_before_confirmation() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_permission(vec![PermissionDecisionKind::AllowGlobal]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.suggested_matchers[0].value =
+            format!("git status {} TAIL-MATCHER-642", "segment-".repeat(160));
+
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(question.inspecting);
+        assert!(!question.submitting);
+        let ActiveQuestionKind::Permission(permission) = &question.kind else {
+            panic!("typed permission")
+        };
+        assert!(permission
+            .inspector_text()
+            .contains("GLOBAL - every session and workspace"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(
+            app.pending_question
+                .as_ref()
+                .unwrap()
+                .inspect_max_scroll
+                .get()
+                > 0
+        );
+        app.handle_permission_question_action(Some(ActionId::JumpLast));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("TAIL-MATCHER-642"),
+            "tail was unreachable: {text}"
+        );
+    }
+
+    #[test]
+    fn exact_request_inspector_exposes_full_typed_contract_at_60x20() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = app_with_permission(vec![PermissionDecisionKind::AllowOnce]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.operation_summary =
+            format!("{} OPERATION-TAIL-642", "operation-segment-".repeat(80));
+        permission.request.resource =
+            format!("{} RESOURCE-TAIL-642", "/very/long/resource/".repeat(80));
+        permission.tool_arguments_preview = format!(
+            "{{\"command\":\"{} ARGUMENT-TAIL-642\"}}",
+            "argument-segment-".repeat(80)
+        );
+
+        app.handle_permission_question_action(Some(ActionId::InspectValue));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(question.inspecting);
+        let ActiveQuestionKind::Permission(permission) = &question.kind else {
+            panic!("typed permission")
+        };
+        let exact = permission.inspector_text();
+        for expected in [
+            "OPERATION-TAIL-642",
+            "RESOURCE-TAIL-642",
+            "ARGUMENT-TAIL-642",
+            "risk level: high",
+            "reason code: configured always-ask rule",
+            "effective mode: default",
+            "bypass requested: false",
+            "auto approve requested: false",
+            "matched rule effect: AlwaysAsk",
+            "matched rule scope: Global",
+            "matched rule source: User",
+        ] {
+            assert!(exact.contains(expected), "missing {expected:?}: {exact}");
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(
+            app.pending_question
+                .as_ref()
+                .unwrap()
+                .inspect_max_scroll
+                .get()
+                > 0
+        );
+        app.handle_permission_question_action(Some(ActionId::JumpLast));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("matched rule source: User"),
+            "typed contract tail was unreachable: {text}"
+        );
+    }
+
+    #[test]
+    fn workspace_permission_without_registered_identity_is_not_submittable() {
+        let mut app = app_with_permission(vec![PermissionDecisionKind::AllowWorkspace]);
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            panic!("typed permission")
+        };
+        permission.request.workspace_path = None;
+
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        app.handle_permission_question_action(Some(ActionId::InspectValue));
+        let question = app.pending_question.as_ref().unwrap();
+        let ActiveQuestionKind::Permission(permission) = &question.kind else {
+            panic!("typed permission")
+        };
+        assert!(question.inspecting);
+        assert!(permission
+            .inspector_text()
+            .contains("registered workspace: <unavailable>"));
+
+        app.handle_permission_question_action(Some(ActionId::Cancel));
+        app.handle_permission_question_action(Some(ActionId::Activate));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(!question.submitting);
+        assert!(question
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("server-authoritative workspace")));
+    }
+
+    #[test]
+    fn every_non_global_remembered_scope_requires_exact_matcher_review() {
+        for decision in [
+            PermissionDecisionKind::AllowSession,
+            PermissionDecisionKind::AllowWorkspace,
+            PermissionDecisionKind::DenySession,
+        ] {
+            let mut app = app_with_permission(vec![decision]);
+            let ActiveQuestionKind::Permission(permission) =
+                &mut app.pending_question.as_mut().unwrap().kind
+            else {
+                panic!("typed permission")
+            };
+            permission.request.suggested_matchers[0].value =
+                format!("{}-MATCHER-TAIL-642", "very-long-segment-".repeat(80));
+
+            app.handle_permission_question_action(Some(ActionId::Activate));
+            app.handle_permission_question_action(Some(ActionId::Activate));
+            let question = app.pending_question.as_ref().unwrap();
+            assert!(question.inspecting, "{decision:?} skipped exact inspector");
+            assert!(
+                !question.submitting,
+                "{decision:?} submitted before inspection"
+            );
+            assert!(matches!(
+                &question.kind,
+                ActiveQuestionKind::Permission(PermissionQuestion {
+                    reviewed_matcher: None,
+                    ..
+                })
+            ));
+
+            app.handle_permission_question_action(Some(ActionId::Cancel));
+            assert!(matches!(
+                &app.pending_question.as_ref().unwrap().kind,
+                ActiveQuestionKind::Permission(PermissionQuestion {
+                    reviewed_matcher: Some((reviewed, 0)),
+                    ..
+                }) if *reviewed == decision
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_permission_narrow_render_shows_contract_and_only_allowed_decisions() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = app_with_permission(vec![
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in [
+            "Typed permission decision",
+            "Bash / execute_command",
+            "Run the workspace tests",
+            "cargo test --workspace",
+            "high / configured always-ask rule",
+            "mode/bypass/auto: default / false / false",
+            "always-ask-tests",
+            "Allow once",
+            "Deny once",
+            "Enter continue",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+        assert!(
+            !text.contains("Allow globally"),
+            "offered a disallowed scope"
+        );
+        assert!(
+            !text.contains("custom answer"),
+            "permission UI became generic"
+        );
+    }
+
+    #[test]
+    fn child_approval_narrow_render_keeps_origin_and_typed_choices_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-session".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-session".to_string(),
+            child_session_id: "child-session".to_string(),
+            child_attempt: 3,
+            request_id: "child-request".to_string(),
+            version: 5,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/repo/src/lib.rs".to_string(),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: None,
+        })
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in [
+            "Child approval request",
+            "parent-session",
+            "child-session",
+            "3 / 5",
+            "child-request",
+            "Write",
+            "write_file",
+            "/workspace/repo/src/lib.rs",
+            "Approve child action",
+            "Deny child action",
+            "Enter REVIEW EXACT",
+            "v inspect exact",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn child_approval_exact_inspector_is_required_and_scrollable_at_60x20() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-session".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-session".to_string(),
+            child_session_id: format!("child-{}-CHILD-ID-TAIL", "segment-".repeat(20)),
+            child_attempt: 7,
+            request_id: format!("request-{}-REQUEST-ID-TAIL", "segment-".repeat(20)),
+            version: 11,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: format!("/workspace/{}/RESOURCE-TAIL-642", "segment/".repeat(80)),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        app.handle_child_approval_action(Some(ActionId::Activate));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(
+            question.inspecting,
+            "approval must open exact inspector first"
+        );
+        assert!(!question.submitting);
+        let ActiveQuestionKind::ChildApproval(child) = &question.kind else {
+            panic!("child approval")
+        };
+        let exact = child.inspector_text();
+        assert!(exact.contains("CHILD-ID-TAIL"));
+        assert!(exact.contains("REQUEST-ID-TAIL"));
+        assert!(exact.contains("RESOURCE-TAIL-642"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(
+            app.pending_question
+                .as_ref()
+                .unwrap()
+                .inspect_max_scroll
+                .get()
+                > 0
+        );
+        app.handle_child_approval_action(Some(ActionId::JumpLast));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("RESOURCE-TAIL-642"),
+            "tail was unreachable: {text}"
+        );
+
+        app.handle_child_approval_action(Some(ActionId::Cancel));
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(!question.inspecting);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(ChildApprovalQuestion {
+                exact_reviewed: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_permission_without_a_recoverable_contract_fails_closed() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("permission-session".to_string());
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "test:permission-unavailable".to_string(),
+            "permission-session".to_string(),
+            &PendingQuestion {
+                has_pending_question: true,
+                question: "Approve this operation?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: true,
+                tool_call_id: Some("permission-request".to_string()),
+                tool_name: Some("Bash".to_string()),
+                source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: None,
+                tool_arguments: Some(serde_json::json!({"command": "git push"})),
+                tool_arguments_truncated: false,
+            },
+            "never-submit".to_string(),
+        ));
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(matches!(
+            question.kind,
+            ActiveQuestionKind::PermissionUnavailable { .. }
+        ));
+        assert!(question.options.is_empty());
+        assert!(!question.allow_custom);
+
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.pending_question.is_some());
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+        assert!(app.status_message.contains("Retrying typed permission"));
+    }
+
+    #[tokio::test]
+    async fn missing_interaction_discriminator_never_downgrades_to_legacy_response() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("legacy-server-session".to_string());
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "test:unclassified-pending".to_string(),
+            "legacy-server-session".to_string(),
+            &PendingQuestion {
+                has_pending_question: true,
+                question: "Approve this?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: true,
+                tool_call_id: Some("unclassified-request".to_string()),
+                tool_name: Some("Bash".to_string()),
+                source: Some("pause_tool".to_string()),
+                interaction_kind: None,
+                permission_request: None,
+                tool_arguments: None,
+                tool_arguments_truncated: false,
+            },
+            "Approve".to_string(),
+        ));
+
+        assert!(matches!(
+            app.pending_question.as_ref().map(|question| &question.kind),
+            Some(ActiveQuestionKind::PermissionUnavailable { .. })
+        ));
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.answer_task.is_none());
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+    }
+
+    #[tokio::test]
+    async fn child_requested_signal_is_non_actionable_until_snapshot_hydrates_generation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalRequested {
+            child_session_id: "child-1".to_string(),
+            request_id: "request-1".to_string(),
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/child-1.txt".to_string(),
+        })
+        .unwrap();
+        let ui_id = app.pending_question.as_ref().unwrap().ui_id.clone();
+        assert!(app.pending_question.as_ref().unwrap().identity_syncing);
+
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+        let epoch = app.child_approval_snapshot_epoch;
+        app.handle_event(AppEvent::ChildApprovalSnapshotLoaded {
+            epoch,
+            session_id: "parent-1".to_string(),
+            result: Ok(child_snapshot(
+                8,
+                vec![child_record(
+                    "parent-1",
+                    "child-1",
+                    3,
+                    "request-1",
+                    5,
+                    ChildApprovalState::Pending,
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert_eq!(question.ui_id, ui_id);
+        assert!(!question.identity_syncing);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_attempt == 3 && child.version == 5
+        ));
+        let identity = question.identity();
+        assert_eq!(identity.child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(identity.child_attempt, Some(3));
+        assert_eq!(identity.child_version, Some(5));
+    }
+
+    #[tokio::test]
+    async fn legacy_changed_zero_identity_is_non_actionable_until_snapshot_hydrates_generation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            child_attempt: 0,
+            request_id: "request-1".to_string(),
+            version: 0,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/child-1.txt".to_string(),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: None,
+        })
+        .unwrap();
+
+        let ui_id = app.pending_question.as_ref().unwrap().ui_id.clone();
+        assert!(app.pending_question.as_ref().unwrap().identity_syncing);
+        app.handle_question_key(key(KeyCode::Enter)).await.unwrap();
+        assert!(app.answer_task.is_none());
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+
+        let epoch = app.child_approval_snapshot_epoch;
+        app.handle_event(AppEvent::ChildApprovalSnapshotLoaded {
+            epoch,
+            session_id: "parent-1".to_string(),
+            result: Ok(child_snapshot(
+                9,
+                vec![child_record(
+                    "parent-1",
+                    "child-1",
+                    4,
+                    "request-1",
+                    6,
+                    ChildApprovalState::Pending,
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert_eq!(question.ui_id, ui_id);
+        assert!(!question.identity_syncing);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_attempt == 4 && child.version == 6
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_child_attempt_with_durable_version_is_actionable_and_terminally_removed() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        let changed = |status: &str, version: u64| AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            child_attempt: 0,
+            request_id: "request-1".to_string(),
+            version,
+            status: status.to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/child-1.txt".to_string(),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: (status != "pending").then(|| "2026-08-14T00:00:01Z".to_string()),
+        };
+
+        app.handle_sse_event(changed("pending", 3)).unwrap();
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(!question.identity_syncing);
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_attempt == 0 && child.version == 3
+        ));
+        assert!(app.pending_child_approvals.front().unwrap().authoritative);
+
+        app.handle_sse_event(changed("approved", 4)).unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.pending_child_approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn older_child_snapshot_revision_cannot_erase_newer_pending_state() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        app.child_approval_snapshot_epoch = 4;
+        app.handle_event(AppEvent::ChildApprovalSnapshotLoaded {
+            epoch: 4,
+            session_id: "parent-1".to_string(),
+            result: Ok(child_snapshot(
+                10,
+                vec![child_record(
+                    "parent-1",
+                    "child-1",
+                    2,
+                    "request-1",
+                    7,
+                    ChildApprovalState::Pending,
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_some());
+
+        app.child_approval_snapshot_epoch = 5;
+        app.handle_event(AppEvent::ChildApprovalSnapshotLoaded {
+            epoch: 5,
+            session_id: "parent-1".to_string(),
+            result: Ok(child_snapshot(9, Vec::new())),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.child_approval_revision, 10);
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_attempt == 2 && child.version == 7
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_child_approvals_queue_and_stale_attempts_cannot_clear_newer_work() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        let changed = |child: &str, attempt: u32, request: &str, version: u64, status: &str| {
+            AgentEvent::ChildApprovalChanged {
+                parent_session_id: "parent-1".to_string(),
+                child_session_id: child.to_string(),
+                child_attempt: attempt,
+                request_id: request.to_string(),
+                version,
+                status: status.to_string(),
+                reason: None,
+                tool_name: "Write".to_string(),
+                permission: "write_file".to_string(),
+                resource: format!("/workspace/{child}.txt"),
+                created_at: "2026-08-14T00:00:00Z".to_string(),
+                resolved_at: (status != "pending").then(|| "2026-08-14T00:00:01Z".to_string()),
+            }
+        };
+
+        app.handle_sse_event(changed("child-a", 1, "shared", 1, "pending"))
+            .unwrap();
+        app.handle_sse_event(changed("child-b", 1, "request-b", 1, "pending"))
+            .unwrap();
+        assert_eq!(app.pending_child_approvals.len(), 2);
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child) if child.child_session_id == "child-a"
+        ));
+
+        app.handle_sse_event(changed("child-a", 0, "shared", 99, "expired"))
+            .unwrap();
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child) if child.child_attempt == 1
+        ));
+
+        app.handle_sse_event(changed("child-a", 1, "shared", 2, "approved"))
+            .unwrap();
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child) if child.child_session_id == "child-b"
+        ));
+
+        app.handle_sse_event(changed("child-a", 2, "shared", 1, "pending"))
+            .unwrap();
+        app.handle_sse_event(changed("child-a", 1, "shared", 100, "expired"))
+            .unwrap();
+        assert!(app.pending_child_approvals.iter().any(|queued| {
+            queued.record.child_session_id == "child-a"
+                && queued.record.child_attempt == 2
+                && queued.record.request_id == "shared"
+        }));
+
+        app.handle_sse_event(changed("child-b", 1, "request-b", 2, "denied"))
+            .unwrap();
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_session_id == "child-a" && child.child_attempt == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn parent_question_keeps_child_queued_until_parent_answer_completes() {
+        let mut app = app_with_question(vec!["Continue"]);
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "sess-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            child_attempt: 2,
+            request_id: "child-request".to_string(),
+            version: 4,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/child-1.txt".to_string(),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::Clarification
+        ));
+        assert_eq!(app.pending_child_approvals.len(), 1);
+
+        let identity = question_identity(&app);
+        let epoch = app.answer_epoch;
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch,
+            identity,
+            answer: "Continue".to_string(),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "completed".to_string(),
+            }),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            &app.pending_question.as_ref().unwrap().kind,
+            ActiveQuestionKind::ChildApproval(child) if child.child_session_id == "child-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_404_reconciles_snapshot_instead_of_retrying_a_stale_modal() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-1".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-1".to_string(),
+            child_session_id: "child-1".to_string(),
+            child_attempt: 2,
+            request_id: "request-1".to_string(),
+            version: 4,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/child-1.txt".to_string(),
+            created_at: "2026-08-14T00:00:00Z".to_string(),
+            resolved_at: None,
+        })
+        .unwrap();
+        app.pending_question.as_mut().unwrap().submitting = true;
+        let identity = question_identity(&app);
+        let epoch = app.answer_epoch;
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch,
+            identity,
+            answer: "Approve child action".to_string(),
+            result: Err(RespondFailure::rejected(
+                reqwest::StatusCode::NOT_FOUND,
+                r#"{"delivered":false}"#.to_string(),
+            )),
+        })
+        .await
+        .unwrap();
+        let question = app.pending_question.as_ref().unwrap();
+        assert!(!question.submitting);
+        assert!(question.error.as_deref().unwrap().contains("refreshing"));
+
+        let snapshot_epoch = app.child_approval_snapshot_epoch;
+        app.handle_event(AppEvent::ChildApprovalSnapshotLoaded {
+            epoch: snapshot_epoch,
+            session_id: "parent-1".to_string(),
+            result: Ok(child_snapshot(9, Vec::new())),
+        })
+        .await
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert!(app.pending_child_approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_reconciles_a_generic_event_into_the_exact_typed_request() {
+        let mut app = app_with_question(vec!["Approve", "Deny"]);
+        let ui_id = app.pending_question.as_ref().unwrap().ui_id.clone();
+        app.pending_question.as_mut().unwrap().identity_syncing = true;
+        app.pending_reconcile_epoch = 7;
+        let epoch = app.answer_epoch;
+
+        app.handle_event(AppEvent::PendingQuestionReconciled {
+            session_id: "sess-1".to_string(),
+            epoch,
+            reconcile_epoch: 7,
+            result: Ok(PendingQuestion {
+                has_pending_question: true,
+                question: "Run this command?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: true,
+                tool_call_id: Some("tool-1".to_string()),
+                tool_name: Some("Bash".to_string()),
+                source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: Some(sample_permission_request(
+                    "sess-1",
+                    "tool-1",
+                    vec![
+                        PermissionDecisionKind::AllowOnce,
+                        PermissionDecisionKind::DenyOnce,
+                    ],
+                )),
+                tool_arguments: Some(serde_json::json!({"command": "cargo test"})),
+                tool_arguments_truncated: false,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let question = app.pending_question.as_ref().unwrap();
+        assert_eq!(
+            question.ui_id, ui_id,
+            "reconnect must preserve UI focus identity"
+        );
+        assert!(!question.identity_syncing);
+        assert!(!question.allow_custom);
+        assert!(question.options.is_empty());
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::Permission(PermissionQuestion { request, .. })
+                if request.request_id == "tool-1" && request.policy_revision == 41
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_approval_from_an_old_parent_cannot_cross_a_session_switch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent-old".to_string());
+        app.handle_sse_event(AgentEvent::ChildApprovalRequested {
+            child_session_id: "child-old".to_string(),
+            request_id: "request-old".to_string(),
+            tool_name: "Write".to_string(),
+            permission: "write_file".to_string(),
+            resource: "/workspace/old".to_string(),
+        })
+        .unwrap();
+        let old_identity = question_identity(&app);
+        let old_epoch = app.answer_epoch;
+
+        app.opening_session_id = Some("parent-new".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "parent-new".to_string(),
+            result: Ok(opened(Vec::new())),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("parent-new"));
+        assert!(app.pending_question.is_none());
+
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: old_epoch,
+            identity: old_identity,
+            answer: "Approve child action".to_string(),
+            result: Ok(AnswerSubmissionOutcome::ChildApproval),
+        })
+        .await
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ChildApprovalChanged {
+            parent_session_id: "parent-old".to_string(),
+            child_session_id: "child-old".to_string(),
+            child_attempt: 1,
+            request_id: "request-old".to_string(),
+            version: 2,
+            status: "pending".to_string(),
+            reason: None,
+            tool_name: "Write".to_string(),
+            resource: "/workspace/old".to_string(),
+            permission: "write_file".to_string(),
+            created_at: String::new(),
+            resolved_at: None,
+        })
+        .unwrap();
+        assert!(app.pending_question.is_none());
+        assert_eq!(app.chat.session_id.as_deref(), Some("parent-new"));
+    }
+
+    #[tokio::test]
+    async fn global_allow_create_and_edit_require_independent_exact_confirmation() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.event_tx = Some(tx);
+        app.config.permissions.snapshot = Some(permission_policy(4, Vec::new()));
+        let mut created = permission_rule(
+            "global-create",
+            PermissionRuleEffect::Allow,
+            PermissionRuleScope::Global,
+            &format!("{} MATCHER-TAIL-642", "/global/segment/".repeat(120)),
+        );
+        created.matcher.kind = PermissionMatcherKind::PathSubtree;
+        app.open_permission_editor(
+            PermissionEditorMode::Create,
+            serde_json::to_string_pretty(&created).unwrap(),
+        );
+        app.handle_permission_editor_key(key(KeyCode::F(2)))
+            .unwrap();
+        assert!(app.permission_rule_confirm.is_some());
+        assert!(!app.permission_editor.as_ref().unwrap().submitting);
+        let confirm = app.permission_rule_confirm.as_ref().unwrap();
+        assert!(confirm.exact_text().contains("MATCHER-TAIL-642"));
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(
+            app.permission_rule_confirm
+                .as_ref()
+                .unwrap()
+                .max_scroll
+                .get()
+                > 0
+        );
+        app.handle_permission_rule_confirm_key(key(KeyCode::End));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("MATCHER-TAIL-642"),
+            "full matcher was not reachable: {text}"
+        );
+
+        app.handle_permission_rule_confirm_key(key(KeyCode::Enter));
+        assert!(app.permission_rule_confirm.as_ref().unwrap().submitting);
+        assert!(app.permission_editor.as_ref().unwrap().submitting);
+
+        let original = permission_rule(
+            "global-edit",
+            PermissionRuleEffect::Deny,
+            PermissionRuleScope::Global,
+            "/old",
+        );
+        let mut edited = original.clone();
+        edited.effect = PermissionRuleEffect::Allow;
+        edited.matcher.value = "/expanded".to_string();
+        let mut edit_app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        edit_app.config.permissions.snapshot = Some(permission_policy(8, vec![original]));
+        edit_app.open_permission_editor(
+            PermissionEditorMode::Edit {
+                rule_id: edited.id.clone(),
+            },
+            serde_json::to_string_pretty(&edited).unwrap(),
+        );
+        edit_app
+            .handle_permission_editor_key(key(KeyCode::F(2)))
+            .unwrap();
+        assert!(edit_app.permission_rule_confirm.is_some());
+        assert!(!edit_app.permission_editor.as_ref().unwrap().submitting);
+    }
+
+    #[tokio::test]
+    async fn permission_policy_409_preserves_draft_and_session_412_requires_reconfirmation() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let draft = r#"{"id":"keep-this-draft"}"#;
+        app.permission_editor = Some(PermissionEditor {
+            epoch: 12,
+            mode: PermissionEditorMode::Create,
+            expected_revision: 4,
+            textarea: TextArea::new(vec![draft.to_string()]),
+            error: None,
+            submitting: true,
+            refresh_revision_on_load: false,
+        });
+        app.permission_rule_confirm = Some(PermissionRuleConfirm {
+            epoch: 12,
+            mode: PermissionEditorMode::Create,
+            expected_revision: 4,
+            rule: permission_rule(
+                "global-create",
+                PermissionRuleEffect::Allow,
+                PermissionRuleScope::Global,
+                "/global",
+            ),
+            scroll: 0,
+            max_scroll: Cell::new(0),
+            error: None,
+            submitting: true,
+        });
+        app.handle_event(AppEvent::PermissionRuleSaved {
+            epoch: 12,
+            result: Err(crate::api::PermissionMutationFailure::test_conflict()),
+        })
+        .await
+        .unwrap();
+        let editor = app.permission_editor.as_ref().expect("draft remains open");
+        assert_eq!(editor.textarea.lines().join("\n"), draft);
+        assert!(!editor.submitting);
+        assert!(editor.error.as_deref().unwrap().contains("draft preserved"));
+        assert!(
+            app.permission_rule_confirm.is_none(),
+            "a CAS conflict must invalidate the reviewed global rule"
+        );
+
+        app.chat.session_id = Some("permission-session".to_string());
+        app.permission_mode_epoch = 21;
+        app.permission_mode_confirm = Some(PermissionModeConfirm {
+            epoch: 21,
+            session_id: "permission-session".to_string(),
+            from: SessionPermissionMode::Default,
+            to: SessionPermissionMode::Bypass,
+            metadata_version: 7,
+            error: None,
+            submitting: true,
+        });
+        app.handle_event(AppEvent::PermissionModePatched {
+            epoch: 21,
+            session_id: "permission-session".to_string(),
+            result: Err(crate::api::SessionMutationFailure::test_conflict(8)),
+        })
+        .await
+        .unwrap();
+        let confirm = app
+            .permission_mode_confirm
+            .as_ref()
+            .expect("412 keeps a confirmation boundary");
+        assert!(!confirm.submitting);
+        assert!(confirm.error.as_deref().unwrap().contains("confirm again"));
+        assert_eq!(app.chat.permission_mode, SessionPermissionMode::Default);
+
+        app.handle_permission_mode_confirm_key(key(KeyCode::Char('b')));
+        assert!(app.permission_mode_confirm.is_some());
+        assert_eq!(app.chat.permission_mode, SessionPermissionMode::Default);
+        app.handle_permission_mode_confirm_key(key(KeyCode::Esc));
+        assert!(app.permission_mode_confirm.is_none());
+    }
+
+    #[tokio::test]
+    async fn permission_policy_loads_are_epoch_guarded_and_revision_monotonic() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.permission_policy_epoch = 5;
+        app.config.permissions.snapshot = Some(permission_policy(
+            10,
+            vec![permission_rule(
+                "current",
+                PermissionRuleEffect::Allow,
+                PermissionRuleScope::Global,
+                "/current",
+            )],
+        ));
+
+        app.handle_event(AppEvent::PermissionPolicyLoaded {
+            epoch: 4,
+            result: Ok(permission_policy(
+                99,
+                vec![permission_rule(
+                    "stale-epoch",
+                    PermissionRuleEffect::Deny,
+                    PermissionRuleScope::Global,
+                    "/stale",
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.config.permissions.selected_rule().unwrap().id,
+            "current"
+        );
+
+        app.handle_event(AppEvent::PermissionPolicyLoaded {
+            epoch: 5,
+            result: Ok(permission_policy(
+                9,
+                vec![permission_rule(
+                    "stale-revision",
+                    PermissionRuleEffect::Deny,
+                    PermissionRuleScope::Global,
+                    "/stale",
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.config.permissions.snapshot.as_ref().unwrap().revision,
+            10
+        );
+
+        app.handle_event(AppEvent::PermissionPolicyLoaded {
+            epoch: 5,
+            result: Ok(permission_policy(
+                11,
+                vec![permission_rule(
+                    "newest",
+                    PermissionRuleEffect::AlwaysAsk,
+                    PermissionRuleScope::Workspace,
+                    "/workspace/new",
+                )],
+            )),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.config.permissions.snapshot.as_ref().unwrap().revision,
+            11
+        );
+        assert_eq!(app.config.permissions.selected_rule().unwrap().id, "newest");
+    }
+
+    #[tokio::test]
+    async fn delete_conflict_closes_confirmation_and_reopen_uses_full_current_rule() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let stale = permission_rule(
+            "rule-1",
+            PermissionRuleEffect::Allow,
+            PermissionRuleScope::Global,
+            "/old",
+        );
+        app.config.permissions.snapshot = Some(permission_policy(3, vec![stale.clone()]));
+        app.permission_delete = Some(PermissionDeleteConfirm {
+            rule_id: stale.id.clone(),
+            rule: stale,
+            expected_revision: 3,
+            error: None,
+            submitting: true,
+        });
+        app.handle_event(AppEvent::PermissionRuleDeleted {
+            rule_id: "rule-1".to_string(),
+            result: Err(crate::api::PermissionMutationFailure::test_conflict()),
+        })
+        .await
+        .unwrap();
+        assert!(app.permission_delete.is_none());
+
+        let current = permission_rule(
+            "rule-1",
+            PermissionRuleEffect::Deny,
+            PermissionRuleScope::Workspace,
+            "/workspace/current",
+        );
+        app.config.permissions.snapshot = Some(permission_policy(4, vec![current]));
+        app.handle_permissions_key(key(KeyCode::Char('d')));
+        let confirm = app
+            .permission_delete
+            .as_ref()
+            .expect("destructive retry requires a fresh confirmation");
+        assert_eq!(confirm.expected_revision, 4);
+        assert_eq!(confirm.rule.effect, PermissionRuleEffect::Deny);
+        assert_eq!(confirm.rule.scope, PermissionRuleScope::Workspace);
+        assert_eq!(confirm.rule.matcher.value, "/workspace/current");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for expected in ["Deny", "Workspace", "/workspace/current", "revision 4"] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_mode_confirmation_is_invalidated_on_session_switch_and_new_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("old-session".to_string());
+        app.permission_mode_epoch = 12;
+        app.permission_mode_confirm = Some(PermissionModeConfirm {
+            epoch: 12,
+            session_id: "old-session".to_string(),
+            from: SessionPermissionMode::Default,
+            to: SessionPermissionMode::Bypass,
+            metadata_version: 7,
+            error: None,
+            submitting: false,
+        });
+        app.opening_session_id = Some("new-session".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "new-session".to_string(),
+            result: Ok(opened(Vec::new())),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("new-session"));
+        assert!(app.permission_mode_confirm.is_none());
+        assert_ne!(app.permission_mode_epoch, 12);
+        app.handle_permission_mode_confirm_key(key(KeyCode::Char('b')));
+        assert_eq!(app.chat.permission_mode, SessionPermissionMode::Default);
+
+        let epoch = app.permission_mode_epoch;
+        app.permission_mode_confirm = Some(PermissionModeConfirm {
+            epoch,
+            session_id: "new-session".to_string(),
+            from: SessionPermissionMode::Default,
+            to: SessionPermissionMode::Bypass,
+            metadata_version: 8,
+            error: None,
+            submitting: false,
+        });
+        app.new_session();
+        assert!(app.permission_mode_confirm.is_none());
+        assert!(app.chat.session_id.is_none());
+        assert_eq!(app.chat.permission_mode, SessionPermissionMode::Default);
     }
 
     #[tokio::test]
@@ -8971,6 +13112,8 @@ mod question_tests {
             tool_call_id: Some("call-7".to_string()),
             tool_name: Some("ConclusionWithOptions".to_string()),
             source: Some("pause_tool".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Clarification),
+            ..PendingQuestion::default()
         };
         let http = ActiveQuestion::from_pending(
             "test:question:http".to_string(),
@@ -9224,6 +13367,8 @@ mod question_tests {
                 tool_call_id: Some("durable-tool-id".to_string()),
                 tool_name: Some("ConclusionWithOptions".to_string()),
                 source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
+                ..PendingQuestion::default()
             },
         );
         assert!(app
@@ -9285,7 +13430,9 @@ mod question_tests {
             epoch: app.answer_epoch,
             identity,
             answer: "New answer".to_string(),
-            result: Ok("started".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "started".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -9319,6 +13466,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: None,
                 truncated: false,
@@ -9335,6 +13484,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
@@ -9344,6 +13495,8 @@ mod question_tests {
                     tool_call_id: Some("tool-1".to_string()),
                     tool_name: Some("ConclusionWithOptions".to_string()),
                     source: Some("pause_tool".to_string()),
+                    interaction_kind: Some(PendingInteractionKind::Clarification),
+                    ..PendingQuestion::default()
                 }),
                 truncated: false,
                 total_message_count: 0,
@@ -9388,6 +13541,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: None,
                 truncated: false,
@@ -9405,6 +13560,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
@@ -9414,6 +13571,8 @@ mod question_tests {
                     tool_call_id: Some("tool-1".to_string()),
                     tool_name: Some("ConclusionWithOptions".to_string()),
                     source: Some("pause_tool".to_string()),
+                    interaction_kind: Some(PendingInteractionKind::Clarification),
+                    ..PendingQuestion::default()
                 }),
                 truncated: false,
                 total_message_count: 0,
@@ -9443,6 +13602,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: None,
                 truncated: false,
@@ -9460,6 +13621,8 @@ mod question_tests {
                 model: "model".to_string(),
                 provider: None,
                 project_id: None,
+                permission_mode: SessionPermissionMode::Default,
+                bypass_permissions: false,
                 is_running: false,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
@@ -9469,6 +13632,8 @@ mod question_tests {
                     tool_call_id: Some("tool-new".to_string()),
                     tool_name: Some("ConclusionWithOptions".to_string()),
                     source: Some("pause_tool".to_string()),
+                    interaction_kind: Some(PendingInteractionKind::Clarification),
+                    ..PendingQuestion::default()
                 }),
                 truncated: false,
                 total_message_count: 0,
@@ -9526,6 +13691,7 @@ mod question_tests {
                 options: Some(vec!["Wrong".to_string()]),
                 allow_custom: false,
                 tool_call_id: Some("stale-tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
                 ..Default::default()
             }),
         })
@@ -9659,17 +13825,17 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                1_629_717_304_819_081_337,
-                2_435_904_485_675_274_227,
-                8_621_464_252_399_871_012,
-                17_724_800_445_688_683_857,
-                10_255_921_285_737_688_228,
-                13_189_008_884_911_027_983,
-                593_030_052_894_147_164,
-                11_931_795_620_947_757_325,
-                17_529_858_181_845_329_251,
-                7_545_373_857_546_054_913,
-                16_306_463_966_091_440_063,
+                1_936_576_969_800_014_661,
+                1_016_179_694_983_859_781,
+                13_759_760_406_078_337_809,
+                15_644_719_068_043_203_690,
+                12_374_578_251_050_668_689,
+                10_606_193_947_057_757_885,
+                16_216_417_660_881_801_177,
+                4_665_899_664_404_951_094,
+                16_412_116_153_658_708_020,
+                14_760_809_148_065_562_377,
+                8_317_322_361_854_739_360,
             ],
             "minimum-size modal golden changed"
         );
@@ -9741,7 +13907,8 @@ mod question_tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         app.event_tx = Some(tx);
         app.handle_key(key(KeyCode::Enter)).await.unwrap();
-        assert!(app.pending_question.as_ref().unwrap().submitting);
+        assert!(!app.pending_question.as_ref().unwrap().submitting);
+        assert!(app.pending_question.as_ref().unwrap().identity_syncing);
         assert!(app.config_editor.is_some(), "editor draft stays suspended");
     }
 
@@ -9833,7 +14000,9 @@ mod question_tests {
             epoch: stale_epoch,
             identity: stale_identity,
             answer: "Approve".to_string(),
-            result: Ok("started".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "started".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -9856,11 +14025,68 @@ mod question_tests {
             epoch: stale_epoch,
             identity: stale_identity,
             answer: "A".to_string(),
-            result: Ok("started".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "started".to_string(),
+            }),
         })
         .await
         .unwrap();
         assert!(!app.chat.streaming, "answer for a finalized run discarded");
+    }
+
+    #[tokio::test]
+    async fn reused_permission_request_id_isolated_by_generation() {
+        let forced_decisions = vec![
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ];
+        let mut app = app_with_permission(forced_decisions.clone());
+        let old_identity = question_identity(&app);
+        let mut current_request =
+            sample_permission_request("permission-session", "permission-request", forced_decisions);
+        current_request.request_generation = "generation-current".to_string();
+        app.pending_question = Some(ActiveQuestion::from_pending(
+            "test:typed-permission-current".to_string(),
+            "permission-session".to_string(),
+            &PendingQuestion {
+                has_pending_question: true,
+                question: "Allow the current operation?".to_string(),
+                options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+                allow_custom: false,
+                tool_call_id: Some("permission-request".to_string()),
+                tool_name: Some("Bash".to_string()),
+                source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Permission),
+                permission_request: Some(current_request),
+                tool_arguments: Some(serde_json::json!({"command": "cargo test"})),
+                tool_arguments_truncated: false,
+            },
+            String::new(),
+        ));
+        let current_identity = question_identity(&app);
+        assert_eq!(old_identity.tool_call_id, current_identity.tool_call_id);
+        assert_ne!(old_identity, current_identity);
+
+        // Even if an integration bug failed to advance the local epoch, the
+        // server generation in the identity independently rejects the delayed
+        // response for the previous operation.
+        app.handle_event(AppEvent::AnswerSubmitted {
+            epoch: app.answer_epoch,
+            identity: old_identity,
+            answer: "Allow once".to_string(),
+            result: Ok(AnswerSubmissionOutcome::Permission(
+                PermissionDecisionResponse {
+                    success: true,
+                    replayed: true,
+                    auto_resume_status: None,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(question_identity(&app), current_identity);
+        assert!(app.pending_question.is_some());
     }
 
     /// A failed submit re-enables the modal (question kept, `submitting`
@@ -9935,6 +14161,8 @@ mod question_tests {
                 tool_call_id: Some("tool-2".to_string()),
                 tool_name: Some("ConclusionWithOptions".to_string()),
                 source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
+                ..PendingQuestion::default()
             }),
         })
         .await
@@ -9997,7 +14225,9 @@ mod question_tests {
             epoch: app.answer_epoch,
             identity,
             answer: "Approve".to_string(),
-            result: Ok("started".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "started".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -10017,7 +14247,9 @@ mod question_tests {
             epoch: app.answer_epoch,
             identity,
             answer: "Approve".to_string(),
-            result: Ok("completed".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "completed".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -10064,7 +14296,9 @@ mod question_tests {
             epoch,
             identity,
             answer: "Approve".to_string(),
-            result: Ok("completed".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "completed".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -10163,6 +14397,8 @@ mod question_tests {
                 tool_call_id: Some("call-exact".to_string()),
                 tool_name: Some("ConclusionWithOptions".to_string()),
                 source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
+                ..PendingQuestion::default()
             }),
         })
         .await
@@ -10172,7 +14408,7 @@ mod question_tests {
         assert_eq!(resolved.tool_call_id.as_deref(), Some("call-exact"));
         assert!(!resolved.identity_syncing);
         assert_eq!(resolved.custom.as_deref(), Some("草稿🙂"));
-        app.submit_answer("草稿🙂".to_string());
+        app.submit_question(QuestionSubmission::Clarification("草稿🙂".to_string()));
         assert!(app.pending_question.as_ref().unwrap().submitting);
         assert!(app.sse_task.is_some());
 
@@ -10233,7 +14469,7 @@ mod question_tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         app.event_tx = Some(event_tx);
 
-        app.submit_answer("Approve".to_string());
+        app.submit_question(QuestionSubmission::Clarification("Approve".to_string()));
         sse_seen_rx.await.unwrap();
         assert!(app.answer_task.is_some());
         assert!(app.pending_question.as_ref().unwrap().submitting);
@@ -10400,6 +14636,8 @@ mod question_tests {
             updated_at: None,
             message_count: 0,
             pinned: false,
+            permission_mode: SessionPermissionMode::Default,
+            bypass_permissions: false,
         }
     }
 
@@ -11276,13 +15514,13 @@ mod question_tests {
         app.handle_session_sse_event(SessionSseEvent::Event {
             session_id: "parent".to_string(),
             stream_epoch: old_epoch,
-            event: AgentEvent::Complete {
+            event: Box::new(AgentEvent::Complete {
                 usage: TokenUsage {
                     prompt_tokens: 9,
                     completion_tokens: 9,
                     total_tokens: 18,
                 },
-            },
+            }),
         })
         .unwrap();
         assert!(app.chat.streaming);
@@ -11294,11 +15532,11 @@ mod question_tests {
         app.handle_session_sse_event(SessionSseEvent::Event {
             session_id: "parent".to_string(),
             stream_epoch: app.sse_epoch,
-            event: AgentEvent::SubAgentCompleted {
+            event: Box::new(AgentEvent::SubAgentCompleted {
                 child_session_id: "child-late".to_string(),
                 status: "completed".to_string(),
                 error: None,
-            },
+            }),
         })
         .unwrap();
         let children = app
@@ -12844,6 +17082,8 @@ mod question_tests {
             model: "claude-sonnet-5".to_string(),
             provider: None,
             project_id: None,
+            permission_mode: SessionPermissionMode::Default,
+            bypass_permissions: false,
             is_running: false,
             pending: None,
             truncated: false,
@@ -13112,7 +17352,7 @@ mod question_tests {
         app.handle_session_sse_event(SessionSseEvent::Event {
             session_id: "old".to_string(),
             stream_epoch: app.sse_epoch,
-            event: clarification(),
+            event: Box::new(clarification()),
         })
         .unwrap();
         assert!(app.pending_question.is_none());
@@ -13120,7 +17360,7 @@ mod question_tests {
         app.handle_session_sse_event(SessionSseEvent::Event {
             session_id: "new".to_string(),
             stream_epoch: app.sse_epoch,
-            event: clarification(),
+            event: Box::new(clarification()),
         })
         .unwrap();
         assert!(app.pending_question.is_some());
@@ -13168,7 +17408,9 @@ mod question_tests {
             epoch,
             identity,
             answer: "keep this draft".to_string(),
-            result: Ok("started".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "started".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -13354,7 +17596,9 @@ mod question_tests {
             epoch,
             identity,
             answer: "A".to_string(),
-            result: Ok("error: session not found".to_string()),
+            result: Ok(AnswerSubmissionOutcome::Clarification {
+                auto_resume_status: "error: session not found".to_string(),
+            }),
         })
         .await
         .unwrap();
@@ -13485,13 +17729,13 @@ mod question_tests {
             .send(SessionSseEvent::Event {
                 session_id: "sess-1".to_string(),
                 stream_epoch: old_epoch,
-                event: AgentEvent::Complete {
+                event: Box::new(AgentEvent::Complete {
                     usage: TokenUsage {
                         prompt_tokens: 1,
                         completion_tokens: 1,
                         total_tokens: 2,
                     },
-                },
+                }),
             })
             .unwrap();
         app.sse_tx = Some(old_tx);
@@ -13500,7 +17744,7 @@ mod question_tests {
         let (_old_ready_tx, old_ready_rx) = tokio::sync::watch::channel(true);
         app.sse_ready = Some(old_ready_rx);
 
-        app.submit_answer("A".to_string());
+        app.submit_question(QuestionSubmission::Clarification("A".to_string()));
         assert_ne!(
             app.sse_epoch, old_epoch,
             "answer must replace old generation"
@@ -13533,7 +17777,8 @@ mod question_tests {
         let fake_server = tokio::spawn(async move {
             let mut event_connections = 0;
             let mut pending_requests = 0;
-            while event_connections < 2 || pending_requests < 2 {
+            let mut snapshot_requests = 0;
+            while event_connections < 2 || pending_requests < 2 || snapshot_requests < 2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let path = read_test_http_path(&mut stream).await;
                 if path == "/api/v1/events/sess-gap" {
@@ -13568,6 +17813,16 @@ mod question_tests {
                         )
                         .await;
                     }
+                } else if path == "/api/v1/subagents/snapshot" {
+                    snapshot_requests += 1;
+                    respond_test_http(
+                        &mut stream,
+                        "application/json",
+                        &format!(
+                            r#"{{"schema_version":1,"snapshot_seq":{snapshot_requests},"approvals_revision":0,"approvals":[],"children":[]}}"#
+                        ),
+                    )
+                    .await;
                 } else {
                     panic!("unexpected fake-server path: {path}");
                 }
@@ -13609,6 +17864,7 @@ mod question_tests {
                 assert!(matches!(
                     &reconciled,
                     AppEvent::PendingQuestionReconciled { session_id, .. }
+                        | AppEvent::ChildApprovalSnapshotLoaded { session_id, .. }
                         if session_id == "sess-gap"
                 ));
                 app.handle_event(reconciled).await.unwrap();
@@ -13656,6 +17912,8 @@ mod question_tests {
                 tool_call_id: Some("tool-a".to_string()),
                 tool_name: Some("ConclusionWithOptions".to_string()),
                 source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
+                ..PendingQuestion::default()
             }),
         })
         .await
@@ -13675,6 +17933,8 @@ mod question_tests {
                 tool_call_id: Some("tool-b".to_string()),
                 tool_name: Some("ConclusionWithOptions".to_string()),
                 source: Some("pause_tool".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
+                ..PendingQuestion::default()
             }),
         })
         .await
@@ -13692,7 +17952,8 @@ mod question_tests {
         let fake_server = tokio::spawn(async move {
             let mut events_served = false;
             let mut pending_served = false;
-            while !events_served || !pending_served {
+            let mut snapshot_served = false;
+            while !events_served || !pending_served || !snapshot_served {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 match read_test_http_path(&mut stream).await.as_str() {
                     "/api/v1/events/sess-initial-gap" => {
@@ -13712,6 +17973,15 @@ mod question_tests {
                             &mut stream,
                             "application/json",
                             r#"{"has_pending_question":true,"question":"Initial gap question","options":["Continue"],"allow_custom":false,"tool_call_id":"initial-gap-tool","tool_name":"request_permissions","source":"pause_tool"}"#,
+                        )
+                        .await;
+                    }
+                    "/api/v1/subagents/snapshot" => {
+                        snapshot_served = true;
+                        respond_test_http(
+                            &mut stream,
+                            "application/json",
+                            r#"{"schema_version":1,"snapshot_seq":1,"approvals_revision":0,"approvals":[],"children":[]}"#,
                         )
                         .await;
                     }
@@ -13741,11 +18011,23 @@ mod question_tests {
         ));
         app.handle_session_sse_event(connected).unwrap();
 
-        let reconciled = tokio::time::timeout(std::time::Duration::from_secs(5), app_rx.recv())
-            .await
-            .expect("initial pending reconciliation should finish")
-            .expect("app event channel should stay open");
-        app.handle_event(reconciled).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.pending_question.is_none() {
+                let reconciled = app_rx
+                    .recv()
+                    .await
+                    .expect("app event channel should stay open");
+                assert!(matches!(
+                    &reconciled,
+                    AppEvent::PendingQuestionReconciled { session_id, .. }
+                        | AppEvent::ChildApprovalSnapshotLoaded { session_id, .. }
+                        if session_id == "sess-initial-gap"
+                ));
+                app.handle_event(reconciled).await.unwrap();
+            }
+        })
+        .await
+        .expect("initial pending reconciliation should finish");
         let question = app
             .pending_question
             .as_ref()
@@ -13823,6 +18105,7 @@ mod question_tests {
                     question: "Proceed?".to_string(),
                     options: None,
                     allow_custom: true,
+                    interaction_kind: Some(PendingInteractionKind::Clarification),
                     ..Default::default()
                 }),
                 ..opened(vec![])
@@ -14076,6 +18359,7 @@ mod question_tests {
                 options: Some(vec!["Yes".to_string()]),
                 allow_custom: false,
                 tool_call_id: Some("tool-1".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
                 ..Default::default()
             }),
         })
@@ -14102,6 +18386,7 @@ mod question_tests {
                 options: Some(vec!["Yes".to_string()]),
                 allow_custom: false,
                 tool_call_id: Some("tool-1".to_string()),
+                interaction_kind: Some(PendingInteractionKind::Clarification),
                 ..Default::default()
             }),
         })

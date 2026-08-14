@@ -105,6 +105,33 @@ pub struct SessionSummary {
     pub message_count: usize,
     #[serde(default)]
     pub pinned: bool,
+    /// Requested per-session permission posture. This must stay visible even
+    /// when no permission dialog is open.
+    #[serde(default)]
+    pub permission_mode: SessionPermissionMode,
+    /// Legacy/effective mirror retained by the server. A true value is always
+    /// rendered as bypass even if an older server omitted `permission_mode`.
+    #[serde(default)]
+    pub bypass_permissions: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPermissionMode {
+    #[default]
+    Default,
+    Bypass,
+    Auto,
+}
+
+impl SessionPermissionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 /// Wire shape of `GET /api/v1/sessions` — the server wraps the page in an
@@ -229,6 +256,415 @@ pub struct PendingQuestion {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Explicit server classification. A permission interaction with a missing
+    /// contract is rendered fail-closed; it is never downgraded to a legacy
+    /// English clarification answer.
+    #[serde(default)]
+    pub interaction_kind: Option<PendingInteractionKind>,
+    /// Authoritative typed permission contract, present only when this pending
+    /// question is the permission request with the same tool-call/request id.
+    #[serde(default)]
+    pub permission_request: Option<PermissionRequest>,
+    /// Exact originating tool arguments recovered by the server. Kept separate
+    /// from `PermissionRequest` because policy evaluation intentionally stores a
+    /// bounded resource rather than arbitrary argument payloads.
+    #[serde(default)]
+    pub tool_arguments: Option<serde_json::Value>,
+    /// True when the server bounded a large raw argument payload before
+    /// returning it. The exact authorization resource remains available on
+    /// `permission_request.resource`; this flag prevents the preview from
+    /// being mistaken for the complete invocation.
+    #[serde(default)]
+    pub tool_arguments_truncated: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingInteractionKind {
+    Clarification,
+    Permission,
+}
+
+// ── Typed permissions ──
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecisionKind {
+    AllowOnce,
+    AllowSession,
+    AllowWorkspace,
+    AllowGlobal,
+    DenyOnce,
+    DenySession,
+}
+
+impl PermissionDecisionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "Allow once",
+            Self::AllowSession => "Allow for session",
+            Self::AllowWorkspace => "Allow for workspace",
+            Self::AllowGlobal => "Allow globally",
+            Self::DenyOnce => "Deny once",
+            Self::DenySession => "Deny for session",
+        }
+    }
+
+    pub fn remembers(self) -> bool {
+        matches!(
+            self,
+            Self::AllowSession | Self::AllowWorkspace | Self::AllowGlobal | Self::DenySession
+        )
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionType {
+    WriteFile,
+    ExecuteCommand,
+    GitWrite,
+    HttpRequest,
+    DeleteOperation,
+    TerminalSession,
+}
+
+impl PermissionType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WriteFile => "write_file",
+            Self::ExecuteCommand => "execute_command",
+            Self::GitWrite => "git_write",
+            Self::HttpRequest => "http_request",
+            Self::DeleteOperation => "delete_operation",
+            Self::TerminalSession => "terminal_session",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl RiskLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionReasonCode {
+    PlatformHardDeny,
+    HardDangerous,
+    ConfiguredAlwaysAsk,
+    ExplicitDeny,
+    ModeDenied,
+    RiskThreshold,
+}
+
+impl PermissionReasonCode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PlatformHardDeny => "platform hard deny",
+            Self::HardDangerous => "hard-dangerous operation",
+            Self::ConfiguredAlwaysAsk => "configured always-ask rule",
+            Self::ExplicitDeny => "explicit deny rule",
+            Self::ModeDenied => "permission mode restriction",
+            Self::RiskThreshold => "risk threshold",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum EffectivePermissionMode {
+    #[default]
+    Default,
+    Plan,
+    AcceptEdits,
+    DontAsk,
+    BypassPermissions,
+    Auto,
+}
+
+impl EffectivePermissionMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "accept_edits",
+            Self::DontAsk => "dont_ask",
+            Self::BypassPermissions => "bypass",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMatcherKind {
+    ExactResource,
+    PathSubtree,
+    CommandPrefix,
+    HttpOrigin,
+    ToolAction,
+}
+
+impl PermissionMatcherKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExactResource => "exact resource",
+            Self::PathSubtree => "path subtree",
+            Self::CommandPrefix => "command prefix",
+            Self::HttpOrigin => "HTTP origin",
+            Self::ToolAction => "tool action",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionMatcher {
+    pub id: String,
+    pub kind: PermissionMatcherKind,
+    pub value: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRuleEffect {
+    Allow,
+    Deny,
+    AlwaysAsk,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRuleScope {
+    Workspace,
+    Global,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionRuleSource {
+    User,
+    Legacy,
+    Platform,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRuleRef {
+    pub id: String,
+    pub effect: PermissionRuleEffect,
+    pub scope: PermissionRuleScope,
+    pub source: PermissionRuleSource,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub request_id: String,
+    pub request_generation: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    pub tool_name: String,
+    pub permission_type: PermissionType,
+    pub resource: String,
+    pub operation_summary: String,
+    pub risk_level: RiskLevel,
+    pub reason_code: PermissionReasonCode,
+    pub effective_mode: EffectivePermissionMode,
+    pub bypass_requested: bool,
+    #[serde(default)]
+    pub auto_approve_requested: bool,
+    pub policy_revision: u64,
+    #[serde(default)]
+    pub matched_rule: Option<PermissionRuleRef>,
+    #[serde(default)]
+    pub allowed_decisions: Vec<PermissionDecisionKind>,
+    #[serde(default)]
+    pub suggested_matchers: Vec<PermissionMatcher>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDecision {
+    pub request_id: String,
+    pub request_generation: String,
+    pub decision: PermissionDecisionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_policy_revision: Option<u64>,
+    #[serde(default)]
+    pub confirm_global: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PermissionDecisionResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub replayed: bool,
+    #[serde(default)]
+    pub auto_resume_status: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DurablePermissionRule {
+    pub id: String,
+    pub permission_type: PermissionType,
+    pub effect: PermissionRuleEffect,
+    pub scope: PermissionRuleScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    pub matcher: PermissionMatcher,
+    #[serde(default = "default_permission_rule_source")]
+    pub source: PermissionRuleSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+fn default_permission_rule_source() -> PermissionRuleSource {
+    PermissionRuleSource::User
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct PermissionPolicyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: Option<EffectivePermissionMode>,
+    #[serde(default)]
+    pub confirm_threshold: Option<RiskLevel>,
+    #[serde(default)]
+    pub ask_rules: Vec<String>,
+    #[serde(default)]
+    pub durable_rules: Vec<DurablePermissionRule>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct TemporaryPermissionGrant {
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub effect: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub permission_type: PermissionType,
+    #[serde(default)]
+    pub matcher: String,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PermissionPolicyResponse {
+    pub revision: u64,
+    pub policy: PermissionPolicyConfig,
+    #[serde(default)]
+    pub temporary_grants: Vec<TemporaryPermissionGrant>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct PutPermissionRuleRequest {
+    pub expected_revision: u64,
+    pub rule: DurablePermissionRule,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DiagnosePermissionRequest {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_args: serde_json::Value,
+    pub permission_type: PermissionType,
+    pub resource: String,
+    #[serde(default)]
+    pub operation_summary: String,
+    #[serde(default)]
+    pub bypass_requested: bool,
+    #[serde(default)]
+    pub auto_approve_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_hard_deny: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct ChildApprovalDecision {
+    pub parent_session_id: String,
+    pub child_attempt: u32,
+    pub request_id: String,
+    pub expected_version: u64,
+    pub approved: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChildApprovalResponse {
+    pub delivered: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildApprovalState {
+    Pending,
+    DecisionRecorded,
+    Delivered,
+    DeliveryFailed,
+    Expired,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ChildApprovalRecord {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    #[serde(default)]
+    pub child_attempt: u32,
+    pub request_id: String,
+    pub tool_name: String,
+    pub permission: String,
+    pub resource: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub version: u64,
+    pub state: ChildApprovalState,
+    #[serde(default)]
+    pub approved: Option<bool>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct SubagentSnapshotResponse {
+    pub schema_version: u32,
+    pub snapshot_seq: u64,
+    pub approvals_revision: u64,
+    #[serde(default)]
+    pub approvals: Vec<ChildApprovalRecord>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct PatchSessionPermissionModeRequest {
+    pub permission_mode: SessionPermissionMode,
 }
 
 // ── MCP ──
@@ -563,6 +999,25 @@ mod tests {
         assert!(s.updated_at.is_none());
         assert_eq!(s.message_count, 0);
         assert!(!s.pinned);
+        assert_eq!(s.permission_mode, SessionPermissionMode::Default);
+        assert!(!s.bypass_permissions);
+    }
+
+    #[test]
+    fn session_summary_preserves_typed_permission_posture() {
+        let bypass: SessionSummary = serde_json::from_str(
+            r#"{"id":"bypass","permission_mode":"bypass","bypass_permissions":true}"#,
+        )
+        .unwrap();
+        assert_eq!(bypass.permission_mode, SessionPermissionMode::Bypass);
+        assert!(bypass.bypass_permissions);
+
+        let auto: SessionSummary = serde_json::from_str(
+            r#"{"id":"auto","permission_mode":"auto","bypass_permissions":false}"#,
+        )
+        .unwrap();
+        assert_eq!(auto.permission_mode, SessionPermissionMode::Auto);
+        assert!(!auto.bypass_permissions);
     }
 
     /// Fixture mirroring the real `GET /api/v1/history/{id}` response,
@@ -656,6 +1111,10 @@ mod tests {
             Some(&["Yes".to_string(), "No".to_string()][..])
         );
         assert!(some.allow_custom);
+        assert_eq!(
+            some.interaction_kind, None,
+            "missing discriminator must remain unknown instead of defaulting to clarification"
+        );
 
         let legacy: PendingQuestion =
             serde_json::from_str(r#"{"has_pending_question":true,"question":"Legacy question"}"#)
@@ -663,6 +1122,96 @@ mod tests {
         assert!(
             legacy.allow_custom,
             "missing legacy field preserves free-text compatibility"
+        );
+    }
+
+    #[test]
+    fn pending_question_preserves_typed_permission_and_exact_arguments() {
+        let pending: PendingQuestion = serde_json::from_str(
+            r#"{
+                "has_pending_question": true,
+                "question": "Allow git push?",
+                "options": ["Approve", "Deny"],
+                "allow_custom": false,
+                "tool_call_id": "permission-17",
+                "tool_name": "Bash",
+                "source": "pause_tool",
+                "interaction_kind": "permission",
+                "permission_request": {
+                    "request_id": "permission-17",
+                    "request_generation": "generation-17",
+                    "session_id": "session-9",
+                    "workspace_path": "/workspace/repo",
+                    "tool_name": "Bash",
+                    "permission_type": "execute_command",
+                    "resource": "git push origin dev",
+                    "operation_summary": "Push the dev branch",
+                    "risk_level": "high",
+                    "reason_code": "configured_always_ask",
+                    "effective_mode": "bypassPermissions",
+                    "bypass_requested": true,
+                    "auto_approve_requested": false,
+                    "policy_revision": 41,
+                    "matched_rule": {
+                        "id": "always-ask-git-push",
+                        "effect": "always_ask",
+                        "scope": "global",
+                        "source": "user"
+                    },
+                    "allowed_decisions": ["allow_once", "deny_once"],
+                    "suggested_matchers": [{
+                        "id": "exact_resource",
+                        "kind": "exact_resource",
+                        "value": "git push origin dev"
+                    }]
+                },
+                "tool_arguments": {
+                    "command": "git push origin dev",
+                    "cwd": "/workspace/repo"
+                },
+                "tool_arguments_truncated": false
+            }"#,
+        )
+        .unwrap();
+
+        let request = pending
+            .permission_request
+            .as_ref()
+            .expect("typed request must survive pending response decoding");
+        assert_eq!(request.request_id, "permission-17");
+        assert_eq!(request.request_generation, "generation-17");
+        assert_eq!(request.session_id, "session-9");
+        assert_eq!(request.permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(request.risk_level, RiskLevel::High);
+        assert_eq!(
+            request.reason_code,
+            PermissionReasonCode::ConfiguredAlwaysAsk
+        );
+        assert_eq!(
+            request.effective_mode,
+            EffectivePermissionMode::BypassPermissions
+        );
+        assert!(request.bypass_requested);
+        assert_eq!(request.policy_revision, 41);
+        assert_eq!(
+            request.allowed_decisions,
+            [
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce
+            ]
+        );
+        assert_eq!(request.suggested_matchers[0].id, "exact_resource");
+        assert_eq!(
+            pending.interaction_kind,
+            Some(PendingInteractionKind::Permission)
+        );
+        assert!(!pending.tool_arguments_truncated);
+        assert_eq!(
+            pending.tool_arguments,
+            Some(serde_json::json!({
+                "command": "git push origin dev",
+                "cwd": "/workspace/repo"
+            }))
         );
     }
 
@@ -681,6 +1230,71 @@ mod tests {
         })
         .unwrap();
         assert!(legacy.get("expected_tool_call_id").is_none());
+    }
+
+    #[test]
+    fn permission_decisions_preserve_scope_identity_and_confirmation_fields() {
+        let cases = [
+            (PermissionDecisionKind::AllowOnce, None, None, false),
+            (
+                PermissionDecisionKind::AllowSession,
+                Some("exact_resource"),
+                None,
+                false,
+            ),
+            (
+                PermissionDecisionKind::AllowWorkspace,
+                Some("path_subtree"),
+                Some(17),
+                false,
+            ),
+            (
+                PermissionDecisionKind::AllowGlobal,
+                Some("command_prefix"),
+                Some(17),
+                true,
+            ),
+            (PermissionDecisionKind::DenyOnce, None, None, false),
+            (
+                PermissionDecisionKind::DenySession,
+                Some("exact_resource"),
+                None,
+                false,
+            ),
+        ];
+
+        for (decision, matcher_id, expected_policy_revision, confirm_global) in cases {
+            let value = serde_json::to_value(PermissionDecision {
+                request_id: "permission-17".to_string(),
+                request_generation: "generation-17".to_string(),
+                decision,
+                matcher_id: matcher_id.map(str::to_string),
+                expected_policy_revision,
+                confirm_global,
+            })
+            .unwrap();
+
+            assert_eq!(value["request_id"], "permission-17");
+            assert_eq!(value["request_generation"], "generation-17");
+            assert_eq!(
+                value["decision"],
+                serde_json::to_value(decision).unwrap(),
+                "decision kind must remain machine-readable"
+            );
+            match matcher_id {
+                Some(matcher_id) => assert_eq!(value["matcher_id"], matcher_id),
+                None => assert!(value.get("matcher_id").is_none()),
+            }
+            match expected_policy_revision {
+                Some(revision) => assert_eq!(value["expected_policy_revision"], revision),
+                None => assert!(value.get("expected_policy_revision").is_none()),
+            }
+            assert_eq!(value["confirm_global"], confirm_global);
+            assert_eq!(
+                confirm_global,
+                decision == PermissionDecisionKind::AllowGlobal
+            );
+        }
     }
 
     /// `GET /api/v1/sessions/{id}` wraps the summary in a `{ "session": ... }`

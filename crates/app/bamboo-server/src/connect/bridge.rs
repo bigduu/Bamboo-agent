@@ -892,9 +892,7 @@ impl ConnectBridge {
         // mutate process-global permission workspace state.
         session.add_message(Message::user(text.to_string()));
         if let Some(config) = self.ctx.permission_checker.permission_config() {
-            if let Some(workspace) = session.workspace.as_ref() {
-                config.register_session_workspace(session_id.clone(), workspace.clone());
-            }
+            config.set_session_workspace(session_id.clone(), session.workspace.clone());
             if let Err(error) =
                 record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
             {

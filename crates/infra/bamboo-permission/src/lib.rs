@@ -35,6 +35,7 @@ pub mod checker;
 pub mod config;
 pub mod hierarchy;
 pub mod policy;
+mod replay;
 pub mod rule_parser;
 pub mod storage;
 pub mod tool_permissions;
@@ -60,8 +61,11 @@ pub use policy::{
     PermissionOutcome, PermissionReasonCode, PermissionRequest, PermissionRuleEffect,
     PermissionRuleRef, PermissionRuleScope, PermissionRuleSource,
 };
+pub use replay::{current_permission_replay_generation, with_permission_replay_generation};
 pub use rule_parser::ParsedRule;
 pub use storage::{
     default_permission_document, PermissionSection, PermissionStorage, PermissionStorageError,
 };
-pub use tool_permissions::{check_permissions, check_tool_rules, is_delete_command};
+pub use tool_permissions::{
+    check_permissions, check_tool_rules, is_delete_command, MAX_PROACTIVE_PERMISSION_BATCH,
+};

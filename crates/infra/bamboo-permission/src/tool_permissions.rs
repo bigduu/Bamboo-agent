@@ -6,11 +6,72 @@ use crate::{PermissionContext, PermissionError, PermissionType};
 
 const DELETE_COMMANDS: [&str; 7] = ["rm", "rmdir", "del", "erase", "unlink", "rd", "remove-item"];
 
+/// Maximum number of independent permission contexts that can be carried by
+/// one proactive request. This matches the bounded replay ledger so every
+/// schema-valid request can eventually complete.
+pub const MAX_PROACTIVE_PERMISSION_BATCH: usize = 64;
+
 pub fn check_permissions(
     tool_name: &str,
     args: &Value,
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
     match tool_name {
+        "request_permissions" => {
+            let reason = required_string_arg(args, "reason")?.trim();
+            if reason.is_empty() {
+                return Err(PermissionError::CheckFailed(
+                    "Missing or invalid 'reason' parameter".to_string(),
+                ));
+            }
+            let permissions = args
+                .get("permissions")
+                .and_then(Value::as_array)
+                .filter(|permissions| !permissions.is_empty())
+                .ok_or_else(|| {
+                    PermissionError::CheckFailed(
+                        "Missing or invalid 'permissions' array".to_string(),
+                    )
+                })?;
+            if permissions.len() > MAX_PROACTIVE_PERMISSION_BATCH {
+                return Err(PermissionError::CheckFailed(format!(
+                    "'permissions' array cannot contain more than {MAX_PROACTIVE_PERMISSION_BATCH} items"
+                )));
+            }
+            let mut contexts = Vec::with_capacity(permissions.len());
+            for (index, permission) in permissions.iter().enumerate() {
+                let permission_type = permission
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .and_then(parse_requested_permission_type)
+                    .ok_or_else(|| {
+                        PermissionError::CheckFailed(format!(
+                            "permissions[{index}] has an invalid permission type"
+                        ))
+                    })?;
+                let resource = permission
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|resource| !resource.is_empty())
+                    .ok_or_else(|| {
+                        PermissionError::CheckFailed(format!(
+                            "permissions[{index}] is missing a non-empty resource"
+                        ))
+                    })?;
+                let description = permission
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .unwrap_or_else(|| permission_type.description());
+                contexts.push(PermissionContext::new(
+                    permission_type,
+                    resource,
+                    format!("Proactive request: {reason} — {description}"),
+                ));
+            }
+            Ok(Some(contexts))
+        }
         "Write" | "Edit" | "apply_patch" => {
             let path = required_string_arg(args, "file_path")?;
             Ok(Some(vec![PermissionContext::new(
@@ -360,6 +421,18 @@ pub fn check_permissions(
     }
 }
 
+fn parse_requested_permission_type(value: &str) -> Option<PermissionType> {
+    match value {
+        "write_file" | "WriteFile" => Some(PermissionType::WriteFile),
+        "execute_command" | "ExecuteCommand" => Some(PermissionType::ExecuteCommand),
+        "git_write" | "GitWrite" => Some(PermissionType::GitWrite),
+        "http_request" | "HttpRequest" => Some(PermissionType::HttpRequest),
+        "delete_operation" | "DeleteOperation" => Some(PermissionType::DeleteOperation),
+        "terminal_session" | "TerminalSession" => Some(PermissionType::TerminalSession),
+        _ => None,
+    }
+}
+
 fn extract_domain(url: &str) -> String {
     url::Url::parse(url)
         .ok()
@@ -434,6 +507,59 @@ mod tests {
         let contexts = check_permissions("Write", &args).unwrap().unwrap();
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].permission_type, PermissionType::WriteFile);
+    }
+
+    #[test]
+    fn request_permissions_batch_becomes_independent_typed_contexts() {
+        let contexts = check_permissions(
+            "request_permissions",
+            &serde_json::json!({
+                "reason": "Deploy the service",
+                "permissions": [
+                    {"type": "execute_command", "resource": "docker compose up -d"},
+                    {
+                        "type": "http_request",
+                        "resource": "registry.example.com",
+                        "description": "pull images"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .expect("typed permission contexts");
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(contexts[0].resource, "docker compose up -d");
+        assert_eq!(contexts[1].permission_type, PermissionType::HttpRequest);
+        assert_eq!(contexts[1].resource, "registry.example.com");
+        assert!(contexts
+            .iter()
+            .all(|context| context.operation_description.contains("Deploy the service")));
+    }
+
+    #[test]
+    fn request_permissions_batch_enforces_replay_ledger_boundary() {
+        let permission = || json!({"type": "write_file", "resource": "/workspace/file"});
+        let at_limit = (0..MAX_PROACTIVE_PERMISSION_BATCH)
+            .map(|_| permission())
+            .collect::<Vec<_>>();
+        let contexts = check_permissions(
+            "request_permissions",
+            &json!({"reason": "Prepare files", "permissions": at_limit}),
+        )
+        .unwrap()
+        .expect("64 contexts fit the replay ledger");
+        assert_eq!(contexts.len(), MAX_PROACTIVE_PERMISSION_BATCH);
+
+        let over_limit = (0..=MAX_PROACTIVE_PERMISSION_BATCH)
+            .map(|_| permission())
+            .collect::<Vec<_>>();
+        let error = check_permissions(
+            "request_permissions",
+            &json!({"reason": "Prepare files", "permissions": over_limit}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("more than 64 items"));
     }
 
     // ── Server/overlay tool classification (#395) ──────────────────────────

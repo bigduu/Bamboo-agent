@@ -34,6 +34,11 @@ pub(crate) enum ActionContext {
     Skills,
     Config,
     ConfigEditor,
+    Permissions,
+    PermissionEditor,
+    PermissionRuleConfirm,
+    PermissionDeleteConfirm,
+    PermissionModeConfirm,
     SessionPickerBrowse,
     SessionPickerRename,
     SessionPickerPinning,
@@ -42,7 +47,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 25] = [
+    pub(crate) const ALL: [Self; 30] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -63,6 +68,11 @@ impl ActionContext {
         Self::Skills,
         Self::Config,
         Self::ConfigEditor,
+        Self::Permissions,
+        Self::PermissionEditor,
+        Self::PermissionRuleConfirm,
+        Self::PermissionDeleteConfirm,
+        Self::PermissionModeConfirm,
         Self::SessionPickerBrowse,
         Self::SessionPickerRename,
         Self::SessionPickerPinning,
@@ -92,6 +102,11 @@ impl ActionContext {
             Self::Skills => "Skills",
             Self::Config => "Config",
             Self::ConfigEditor => "Config editor",
+            Self::Permissions => "Permission policy",
+            Self::PermissionEditor => "Permission editor",
+            Self::PermissionRuleConfirm => "Global permission rule confirmation",
+            Self::PermissionDeleteConfirm => "Permission delete",
+            Self::PermissionModeConfirm => "Permission mode",
             Self::SessionPickerBrowse => "Session picker",
             Self::SessionPickerRename => "Session rename",
             Self::SessionPickerPinning => "Session pin",
@@ -191,6 +206,12 @@ pub(crate) enum ActionId {
     PreviousField,
     EditConfig,
     SaveConfig,
+    OpenPermissionPolicy,
+    TogglePermissionBypass,
+    NewPermissionRule,
+    EditPermissionRule,
+    DiagnosePermission,
+    SavePermissionForm,
     RenameSession,
     ToggleSessionPin,
     LoadMore,
@@ -434,11 +455,13 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             Sessions,
             Mcp,
             Schedules,
             Skills,
             Config,
+            Permissions,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -448,11 +471,13 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "Up; k"),
             (QuestionOptions, "Up; k"),
             (QuestionInspect, "Up; k"),
+            (PermissionRuleConfirm, "Up; k"),
             (Sessions, "Up"),
             (Mcp, "Up"),
             (Schedules, "Up"),
             (Skills, "Up"),
             (Config, "Up; k"),
+            (Permissions, "Up; k"),
             (SessionPickerBrowse, "Up"),
             (ModelPicker, "Up"),
             (CommandPalette, "Up")
@@ -468,11 +493,13 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             Sessions,
             Mcp,
             Schedules,
             Skills,
             Config,
+            Permissions,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -482,11 +509,13 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "Down; j"),
             (QuestionOptions, "Down; j"),
             (QuestionInspect, "Down; j"),
+            (PermissionRuleConfirm, "Down; j"),
             (Sessions, "Down"),
             (Mcp, "Down"),
             (Schedules, "Down"),
             (Skills, "Down"),
             (Config, "Down; j"),
+            (Permissions, "Down; j"),
             (SessionPickerBrowse, "Down"),
             (ModelPicker, "Down"),
             (CommandPalette, "Down")
@@ -502,6 +531,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             Config,
             ModelPicker,
             CommandPalette
@@ -511,6 +541,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "PageUp"),
             (QuestionOptions, "PageUp"),
             (QuestionInspect, "PageUp"),
+            (PermissionRuleConfirm, "PageUp"),
             (Config, "PageUp"),
             (ModelPicker, "PageUp"),
             (CommandPalette, "PageUp")
@@ -526,6 +557,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             Config,
             ModelPicker,
             CommandPalette
@@ -535,6 +567,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "PageDown"),
             (QuestionOptions, "PageDown"),
             (QuestionInspect, "PageDown"),
+            (PermissionRuleConfirm, "PageDown"),
             (Config, "PageDown"),
             (ModelPicker, "PageDown"),
             (CommandPalette, "PageDown")
@@ -550,6 +583,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             ConversationBlock,
             ModelPicker,
             CommandPalette
@@ -559,6 +593,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "Home"),
             (QuestionOptions, "Home"),
             (QuestionInspect, "Home"),
+            (PermissionRuleConfirm, "Home"),
             (ConversationBlock, "Home"),
             (ModelPicker, "Home"),
             (CommandPalette, "Home")
@@ -574,6 +609,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Notifications,
             QuestionOptions,
             QuestionInspect,
+            PermissionRuleConfirm,
             ConversationBlock,
             ModelPicker,
             CommandPalette
@@ -583,6 +619,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Notifications, "End"),
             (QuestionOptions, "End"),
             (QuestionInspect, "End"),
+            (PermissionRuleConfirm, "End"),
             (ConversationBlock, "End"),
             (ModelPicker, "End"),
             (CommandPalette, "End")
@@ -602,6 +639,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Mcp,
             ScheduleForm,
             Skills,
+            Permissions,
             SessionPickerBrowse,
             SessionPickerRename,
             ModelPicker,
@@ -616,6 +654,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Mcp, "Enter"),
             (ScheduleForm, "Enter"),
             (Skills, "Enter"),
+            (Permissions, "Enter"),
             (SessionPickerBrowse, "Enter"),
             (SessionPickerRename, "Enter"),
             (ModelPicker, "Enter"),
@@ -636,6 +675,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             ScheduleForm,
             ConfigEditor,
+            Permissions,
+            PermissionEditor,
             SessionPickerBrowse,
             SessionPickerRename,
             SessionPickerPinning,
@@ -651,6 +692,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "Esc; v"),
             (ScheduleForm, "Esc"),
             (ConfigEditor, "Esc"),
+            (Permissions, "Esc"),
+            (PermissionEditor, "Esc"),
             (SessionPickerBrowse, "Esc"),
             (SessionPickerRename, "Esc"),
             (SessionPickerPinning, "Esc"),
@@ -694,7 +737,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             SessionPickerRename,
             SessionPickerPinning,
             ModelPicker,
-            CommandPalette
+            CommandPalette,
+            Permissions,
+            PermissionModeConfirm
         ],
         [
             (Sessions, "r"),
@@ -703,7 +748,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (SessionPickerRename, "Ctrl+R"),
             (SessionPickerPinning, "Ctrl+R"),
             (ModelPicker, "Ctrl+R"),
-            (CommandPalette, "Ctrl+R")
+            (CommandPalette, "Ctrl+R"),
+            (Permissions, "r"),
+            (PermissionModeConfirm, "r")
         ]
     ),
     spec!(
@@ -723,11 +770,21 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Confirm",
         "Accept the pending confirmation",
         false,
-        [ServeOffer, SessionDeleteConfirm, ScheduleDeleteConfirm],
+        [
+            ServeOffer,
+            SessionDeleteConfirm,
+            ScheduleDeleteConfirm,
+            PermissionDeleteConfirm,
+            PermissionRuleConfirm,
+            PermissionModeConfirm
+        ],
         [
             (ServeOffer, "y; Enter"),
             (SessionDeleteConfirm, "y; Enter"),
-            (ScheduleDeleteConfirm, "y; Enter")
+            (ScheduleDeleteConfirm, "y; Enter"),
+            (PermissionDeleteConfirm, "y; Enter"),
+            (PermissionRuleConfirm, "y; Enter"),
+            (PermissionModeConfirm, "y; Enter")
         ]
     ),
     spec!(
@@ -735,11 +792,21 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Reject",
         "Decline or cancel the pending confirmation",
         false,
-        [ServeOffer, SessionDeleteConfirm, ScheduleDeleteConfirm],
+        [
+            ServeOffer,
+            SessionDeleteConfirm,
+            ScheduleDeleteConfirm,
+            PermissionDeleteConfirm,
+            PermissionRuleConfirm,
+            PermissionModeConfirm
+        ],
         [
             (ServeOffer, "n; Esc"),
             (SessionDeleteConfirm, "n; Esc"),
-            (ScheduleDeleteConfirm, "n; Esc")
+            (ScheduleDeleteConfirm, "n; Esc"),
+            (PermissionDeleteConfirm, "n; Esc"),
+            (PermissionRuleConfirm, "n; Esc"),
+            (PermissionModeConfirm, "n; Esc")
         ]
     ),
     spec!(
@@ -983,11 +1050,12 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Delete selection",
         "Open a destructive confirmation for the selected item",
         false,
-        [Sessions, Schedules, SessionPickerBrowse],
+        [Sessions, Schedules, SessionPickerBrowse, Permissions],
         [
             (Sessions, "d"),
             (Schedules, "d"),
-            (SessionPickerBrowse, "Delete; Ctrl+D")
+            (SessionPickerBrowse, "Delete; Ctrl+D"),
+            (Permissions, "d; Delete")
         ]
     ),
     spec!(
@@ -1061,6 +1129,54 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [ConfigEditor],
         [(ConfigEditor, "F2; Ctrl+S; Leader s")]
+    ),
+    spec!(
+        OpenPermissionPolicy,
+        "Open permission policy",
+        "Open the typed permission rules and runtime grants view",
+        true,
+        [Global, Config],
+        [(Config, "p")]
+    ),
+    spec!(
+        TogglePermissionBypass,
+        "Toggle session bypass",
+        "Review and confirm a per-session bypass posture change",
+        true,
+        [Global, Permissions],
+        [(Permissions, "b")]
+    ),
+    spec!(
+        NewPermissionRule,
+        "New permission rule",
+        "Create a typed permission rule from exact JSON",
+        false,
+        [Permissions],
+        [(Permissions, "n")]
+    ),
+    spec!(
+        EditPermissionRule,
+        "Edit permission rule",
+        "Edit the selected typed permission rule",
+        false,
+        [Permissions],
+        [(Permissions, "e")]
+    ),
+    spec!(
+        DiagnosePermission,
+        "Diagnose permission",
+        "Evaluate a typed permission request without consuming a grant",
+        false,
+        [Permissions],
+        [(Permissions, "x")]
+    ),
+    spec!(
+        SavePermissionForm,
+        "Submit permission form",
+        "Validate and submit the typed permission JSON",
+        false,
+        [PermissionEditor],
+        [(PermissionEditor, "F2; Ctrl+S; Leader s")]
     ),
     spec!(
         RenameSession,

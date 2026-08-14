@@ -3,10 +3,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
-use bamboo_agent_core::{PendingQuestion, Session};
+use bamboo_agent_core::{Message, PendingQuestion, Session};
 use bamboo_domain::session::runtime_state::{AgentRuntimeState, PlanModeState, PlanModeStatus};
-use bamboo_domain::SessionPermissionMode;
-use bamboo_tools::permission::PermissionType;
+use bamboo_domain::{
+    latest_response_occurrence, ResponseOccurrence, SessionPermissionMode,
+    CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+};
+use bamboo_tools::permission::{PermissionDecisionKind, PermissionDecisionReceipt, PermissionType};
 use chrono::Utc;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
@@ -20,7 +23,6 @@ use super::types::RespondInput;
 
 const CLARIFICATION_RESUME_PENDING_KEY: &str = "clarification_resume_pending";
 const CONCLUSION_WITH_OPTIONS_RESUME_PENDING_KEY: &str = "conclusion_with_options_resume_pending";
-const CONSUMED_CLARIFICATION_IDS_KEY: &str = "clarification.consumed_tool_call_ids";
 
 type AppliedPendingResponse = (
     String,
@@ -147,6 +149,8 @@ pub async fn inspect_pending_response_guarded(
 /// server resume adapter re-runs it and writes the real output back — instead of
 /// leaving the model to infer/fabricate it. Value = the tool_call_id.
 pub const PERMISSION_REEXECUTE_METADATA_KEY: &str = "permission.reexecute_tool_call_id";
+pub const PERMISSION_REEXECUTE_GENERATION_METADATA_KEY: &str =
+    "permission.reexecute_request_generation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseSource {
@@ -240,6 +244,34 @@ pub async fn submit_pending_response_checked_guarded(
     .await
 }
 
+/// Typed-permission variant that persists the exact decision receipt in the
+/// same durable session mutation that consumes the pending question.
+pub async fn submit_pending_permission_response_checked_guarded(
+    repo: &dyn SessionAccess,
+    input: RespondInput,
+    expected_tool_call_id: Option<String>,
+    permission_receipt: PermissionDecisionReceipt,
+    guard: &PendingResponseGuard,
+) -> Result<
+    (
+        Session,
+        String,
+        Option<PlanModeTransition>,
+        Vec<(PermissionType, String)>,
+    ),
+    RespondError,
+> {
+    submit_pending_response_with_source_checked_guarded_inner(
+        repo,
+        input,
+        expected_tool_call_id,
+        ResponseSource::Human,
+        Some(permission_receipt),
+        guard,
+    )
+    .await
+}
+
 pub async fn submit_pending_response_with_source(
     repo: &dyn SessionAccess,
     input: RespondInput,
@@ -299,12 +331,40 @@ pub async fn submit_pending_response_with_source_checked_guarded(
     ),
     RespondError,
 > {
+    submit_pending_response_with_source_checked_guarded_inner(
+        repo,
+        input,
+        expected_tool_call_id,
+        response_source,
+        None,
+        guard,
+    )
+    .await
+}
+
+async fn submit_pending_response_with_source_checked_guarded_inner(
+    repo: &dyn SessionAccess,
+    input: RespondInput,
+    expected_tool_call_id: Option<String>,
+    response_source: ResponseSource,
+    permission_receipt: Option<PermissionDecisionReceipt>,
+    guard: &PendingResponseGuard,
+) -> Result<
+    (
+        Session,
+        String,
+        Option<PlanModeTransition>,
+        Vec<(PermissionType, String)>,
+    ),
+    RespondError,
+> {
     guard.ensure_session(&input.session_id)?;
 
     let applied = Arc::new(StdMutex::new(None));
     let mutation_outcome = applied.clone();
     let mutation_input = input.clone();
     let mutation_expected_tool_call_id = expected_tool_call_id.clone();
+    let mutation_permission_receipt = permission_receipt.clone();
     let session = repo
         .mutate_for_response(
             &input.session_id,
@@ -314,6 +374,7 @@ pub async fn submit_pending_response_with_source_checked_guarded(
                     &mutation_input,
                     mutation_expected_tool_call_id.as_deref(),
                     response_source,
+                    mutation_permission_receipt.as_ref(),
                 )?;
                 *mutation_outcome
                     .lock()
@@ -347,6 +408,7 @@ fn apply_pending_response(
     input: &RespondInput,
     expected_tool_call_id: Option<&str>,
     response_source: ResponseSource,
+    permission_receipt: Option<&PermissionDecisionReceipt>,
 ) -> Result<AppliedPendingResponse, RespondError> {
     let pending = session
         .pending_question
@@ -364,11 +426,38 @@ fn apply_pending_response(
         }
     }
 
-    // ---- Validate response ----
-    if let Err(error_message) = validate_pending_response(&pending, &input.user_response) {
-        // Put the pending question back when validation fails.
-        session.pending_question = Some(pending);
-        return Err(RespondError::InvalidResponse(error_message));
+    if let Some(receipt) = permission_receipt {
+        if receipt.session_id != input.session_id
+            || receipt.decision.request_id != pending.tool_call_id
+        {
+            session.pending_question = Some(pending);
+            return Err(RespondError::InvalidResponse(
+                "permission receipt identity does not match the pending question".to_string(),
+            ));
+        }
+        let current_generation = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(pending.tool_call_id.as_str()))
+            .and_then(permission_request_generation);
+        if current_generation.as_deref() != Some(receipt.decision.request_generation.as_str()) {
+            session.pending_question = Some(pending);
+            return Err(RespondError::InvalidResponse(
+                "permission receipt generation does not match the pending operation".to_string(),
+            ));
+        }
+    }
+
+    // Typed permission control flow comes exclusively from the structured
+    // receipt. Display strings and localized options remain transcript-only.
+    // Legacy clarifications still validate their selected display option.
+    if permission_receipt.is_none() {
+        if let Err(error_message) = validate_pending_response(&pending, &input.user_response) {
+            // Put the pending question back when validation fails.
+            session.pending_question = Some(pending);
+            return Err(RespondError::InvalidResponse(error_message));
+        }
     }
 
     let tool_call_id = pending.tool_call_id.clone();
@@ -383,12 +472,27 @@ fn apply_pending_response(
     // Permission grants implied by approving a permission prompt. Read from the
     // (still-unmodified) synthesized tool-result payload, BEFORE it is overwritten
     // by the user's selection below.
-    let permission_grants = if is_permission_approval(&input.user_response) {
+    let typed_permission_approved = permission_receipt.is_some_and(|receipt| {
+        matches!(
+            receipt.decision.decision,
+            PermissionDecisionKind::AllowOnce
+                | PermissionDecisionKind::AllowSession
+                | PermissionDecisionKind::AllowWorkspace
+                | PermissionDecisionKind::AllowGlobal
+        )
+    });
+    let permission_approved = permission_receipt
+        .map(|_| typed_permission_approved)
+        .unwrap_or_else(|| is_permission_approval(&input.user_response));
+    let permission_grants = if permission_approved {
         extract_permission_grants_from_tool_result_message(session, &tool_call_id)
     } else {
         Vec::new()
     };
-    if !permission_grants.is_empty() {
+    let should_reexecute = permission_receipt
+        .map(|_| typed_permission_approved)
+        .unwrap_or(!permission_grants.is_empty());
+    if should_reexecute {
         // Approved a permission prompt: mark the gated tool call for re-execution
         // on resume so the operation actually runs (real output) rather than the
         // model inferring it. Consumed by the server resume adapter.
@@ -396,6 +500,22 @@ fn apply_pending_response(
             PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
             tool_call_id.clone(),
         );
+        if let Some(receipt) = permission_receipt {
+            session.metadata.insert(
+                PERMISSION_REEXECUTE_GENERATION_METADATA_KEY.to_string(),
+                receipt.decision.request_generation.clone(),
+            );
+        } else {
+            session
+                .metadata
+                .remove(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
+        }
+    } else if permission_receipt.is_some() {
+        // A typed deny cannot inherit replay markers from an older occurrence.
+        session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+        session
+            .metadata
+            .remove(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
     }
 
     // ---- Update or append tool result message ----
@@ -405,6 +525,13 @@ fn apply_pending_response(
         &input.user_response,
         response_source,
     );
+    if let Some(receipt) = permission_receipt {
+        debug_assert!(persist_permission_decision_receipt(
+            session,
+            &tool_call_id,
+            receipt
+        ));
+    }
     if found {
         tracing::info!(
             "[{}] Updated existing tool result message",
@@ -459,20 +586,39 @@ fn apply_pending_response(
 }
 
 fn record_consumed_clarification(session: &mut Session, tool_call_id: &str) {
-    let mut consumed = session
+    let mut legacy_consumed = session
         .metadata
         .get(CONSUMED_CLARIFICATION_IDS_KEY)
         .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
         .unwrap_or_default();
-    consumed.retain(|existing| existing != tool_call_id);
-    consumed.push(tool_call_id.to_string());
+    legacy_consumed.retain(|existing| existing != tool_call_id);
+    legacy_consumed.push(tool_call_id.to_string());
+    if legacy_consumed.len() > 64 {
+        legacy_consumed.drain(..legacy_consumed.len() - 64);
+    }
+    if let Ok(serialized) = serde_json::to_string(&legacy_consumed) {
+        session
+            .metadata
+            .insert(CONSUMED_CLARIFICATION_IDS_KEY.to_string(), serialized);
+    }
+
+    let Some(occurrence) = latest_response_occurrence(session, tool_call_id) else {
+        return;
+    };
+    let mut consumed = session
+        .metadata
+        .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<ResponseOccurrence>>(value).ok())
+        .unwrap_or_default();
+    consumed.retain(|existing| existing != &occurrence);
+    consumed.push(occurrence);
     if consumed.len() > 64 {
         consumed.drain(..consumed.len() - 64);
     }
     if let Ok(serialized) = serde_json::to_string(&consumed) {
         session
             .metadata
-            .insert(CONSUMED_CLARIFICATION_IDS_KEY.to_string(), serialized);
+            .insert(CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(), serialized);
     }
 }
 
@@ -572,8 +718,22 @@ pub fn update_or_append_tool_result_message(
     user_response: &str,
     response_source: ResponseSource,
 ) -> bool {
-    for message in &mut session.messages {
+    for message in session.messages.iter_mut().rev() {
         if message.tool_call_id.as_deref() == Some(tool_call_id) {
+            // Preserve the server-issued typed permission contract outside the
+            // model-visible content before replacing the synthetic waiting
+            // payload with the selected answer. This lets an exact durable
+            // decision receipt be reconstructed after a daemon restart without
+            // trusting display strings or replaying an already-consumed run.
+            if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&message.content) {
+                if payload.get("status").and_then(serde_json::Value::as_str)
+                    == Some("awaiting_permission_approval")
+                {
+                    if let Some(request) = payload.get("permission_request") {
+                        insert_message_metadata(message, "permission_request", request.clone());
+                    }
+                }
+            }
             message.content = selected_message_content(user_response, response_source);
             message.tool_success = Some(true);
             return true;
@@ -586,6 +746,67 @@ pub fn update_or_append_tool_result_message(
         true,
     ));
     false
+}
+
+fn insert_message_metadata(message: &mut Message, key: &str, value: serde_json::Value) {
+    let metadata = message
+        .metadata
+        .get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !metadata.is_object() {
+        let previous = std::mem::replace(metadata, serde_json::Value::Object(Default::default()));
+        metadata
+            .as_object_mut()
+            .expect("replacement metadata is an object")
+            .insert("previous_metadata".to_string(), previous);
+    }
+    metadata
+        .as_object_mut()
+        .expect("message metadata is an object")
+        .insert(key.to_string(), value);
+}
+
+fn permission_request_generation(message: &Message) -> Option<String> {
+    message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("permission_request"))
+        .and_then(|request| request.get("request_generation"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&message.content)
+                .ok()?
+                .get("permission_request")?
+                .get("request_generation")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn persist_permission_decision_receipt(
+    session: &mut Session,
+    tool_call_id: &str,
+    receipt: &PermissionDecisionReceipt,
+) -> bool {
+    let Some(message) = session
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))
+    else {
+        return false;
+    };
+    if permission_request_generation(message).as_deref()
+        != Some(receipt.decision.request_generation.as_str())
+    {
+        return false;
+    }
+    insert_message_metadata(
+        message,
+        "permission_decision_receipt",
+        serde_json::to_value(receipt).expect("permission receipt is serializable"),
+    );
+    true
 }
 
 fn selected_message_content(user_response: &str, response_source: ResponseSource) -> String {
@@ -602,6 +823,7 @@ fn extract_exit_plan_from_tool_result_message(
     let message = session
         .messages
         .iter()
+        .rev()
         .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))?;
     let payload = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
     payload
@@ -635,6 +857,7 @@ fn extract_permission_grants_from_tool_result_message(
     let message = match session
         .messages
         .iter()
+        .rev()
         .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))
     {
         Some(message) => message,
@@ -1090,5 +1313,301 @@ mod tests {
 
         let plan = extract_exit_plan_from_tool_result_message(&session, "call-1");
         assert_eq!(plan.as_deref(), Some("# Plan\n\n1. Step"));
+    }
+
+    #[test]
+    fn selected_permission_preserves_typed_request_and_receipt_in_non_visible_metadata() {
+        let mut session = Session::new("sess-1", "test-model");
+        session.add_message(bamboo_agent_core::Message::tool_result(
+            "permission-1",
+            serde_json::json!({
+                "status": "awaiting_permission_approval",
+                "permission_request": {
+                    "request_id": "permission-1",
+                    "request_generation": "generation-1",
+                    "session_id": "sess-1",
+                    "allowed_decisions": ["allow_once", "deny_once"]
+                }
+            })
+            .to_string(),
+        ));
+        session
+            .messages
+            .last_mut()
+            .expect("permission tool result")
+            .metadata = Some(serde_json::json!("legacy-metadata"));
+
+        assert!(update_or_append_tool_result_message(
+            &mut session,
+            "permission-1",
+            "Approve",
+            ResponseSource::Human,
+        ));
+        let receipt = PermissionDecisionReceipt {
+            session_id: "sess-1".to_string(),
+            decision: bamboo_tools::permission::PermissionDecision {
+                request_id: "permission-1".to_string(),
+                request_generation: "generation-1".to_string(),
+                decision: bamboo_tools::permission::PermissionDecisionKind::AllowOnce,
+                matcher_id: None,
+                expected_policy_revision: Some(4),
+                confirm_global: false,
+            },
+            decided_at: Utc::now(),
+        };
+        assert!(persist_permission_decision_receipt(
+            &mut session,
+            "permission-1",
+            &receipt
+        ));
+
+        let message = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("permission-1"))
+            .expect("permission tool result");
+        assert_eq!(message.content, "Selected response: Approve");
+        assert_eq!(
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("permission_request"))
+                .and_then(|request| request.get("request_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("permission-1")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("previous_metadata")),
+            Some(&serde_json::json!("legacy-metadata"))
+        );
+        assert_eq!(
+            message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("permission_decision_receipt"))
+                .cloned()
+                .and_then(|receipt| {
+                    serde_json::from_value::<PermissionDecisionReceipt>(receipt).ok()
+                }),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn reused_tool_call_id_requires_current_permission_generation() {
+        let mut session = Session::new("sess-1", "test-model");
+        for generation in ["generation-old", "generation-current"] {
+            session.add_message(bamboo_agent_core::Message::tool_result(
+                "permission-reused",
+                serde_json::json!({
+                    "status": "awaiting_permission_approval",
+                    "permission_type": "execute_command",
+                    "resource": format!("resource-{generation}"),
+                    "permission_request": {
+                        "request_id": "permission-reused",
+                        "request_generation": generation,
+                        "session_id": "sess-1",
+                        "allowed_decisions": ["allow_once", "deny_once"]
+                    }
+                })
+                .to_string(),
+            ));
+        }
+        session.set_pending_question_with_source(
+            "permission-reused".to_string(),
+            "Bash".to_string(),
+            "Allow the current operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+            bamboo_agent_core::PendingQuestionSource::PauseTool,
+        );
+        let input = RespondInput {
+            session_id: "sess-1".to_string(),
+            user_response: "Approve".to_string(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        };
+        let receipt = |generation: &str| PermissionDecisionReceipt {
+            session_id: "sess-1".to_string(),
+            decision: bamboo_tools::permission::PermissionDecision {
+                request_id: "permission-reused".to_string(),
+                request_generation: generation.to_string(),
+                decision: bamboo_tools::permission::PermissionDecisionKind::AllowOnce,
+                matcher_id: None,
+                expected_policy_revision: None,
+                confirm_global: false,
+            },
+            decided_at: Utc::now(),
+        };
+
+        let stale = receipt("generation-old");
+        assert!(matches!(
+            apply_pending_response(
+                &mut session,
+                &input,
+                Some("permission-reused"),
+                ResponseSource::Human,
+                Some(&stale),
+            ),
+            Err(RespondError::InvalidResponse(message))
+                if message.contains("generation")
+        ));
+        assert!(session.pending_question.is_some());
+
+        let current = receipt("generation-current");
+        apply_pending_response(
+            &mut session,
+            &input,
+            Some("permission-reused"),
+            ResponseSource::Human,
+            Some(&current),
+        )
+        .expect("current generation resolves the parked operation");
+        assert!(session.pending_question.is_none());
+        assert_eq!(
+            session
+                .metadata
+                .get(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY)
+                .map(String::as_str),
+            Some("generation-current")
+        );
+        assert!(session.messages[0].content.contains("generation-old"));
+        assert_eq!(session.messages[1].content, "Selected response: Approve");
+        assert_eq!(
+            session.messages[1]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("permission_decision_receipt"))
+                .and_then(|receipt| receipt.get("decision"))
+                .and_then(|decision| decision.get("request_generation"))
+                .and_then(serde_json::Value::as_str),
+            Some("generation-current")
+        );
+    }
+
+    #[test]
+    fn typed_permission_receipt_controls_replay_independent_of_display_options() {
+        let session = || {
+            let mut session = Session::new("sess-typed", "test-model");
+            session.add_message(bamboo_agent_core::Message::tool_result(
+                "permission-localized",
+                serde_json::json!({
+                    "status": "awaiting_permission_approval",
+                    "permission_type": "execute_command",
+                    "resource": "cargo test --workspace",
+                    "permission_request": {
+                        "request_id": "permission-localized",
+                        "request_generation": "generation-localized",
+                        "session_id": "sess-typed",
+                        "allowed_decisions": ["allow_once", "deny_once"]
+                    }
+                })
+                .to_string(),
+            ));
+            session.set_pending_question_with_source(
+                "permission-localized".to_string(),
+                "Bash".to_string(),
+                "允许执行吗？".to_string(),
+                vec!["允许".to_string(), "拒绝".to_string()],
+                false,
+                bamboo_agent_core::PendingQuestionSource::PauseTool,
+            );
+            session
+        };
+        let receipt = |decision| PermissionDecisionReceipt {
+            session_id: "sess-typed".to_string(),
+            decision: bamboo_tools::permission::PermissionDecision {
+                request_id: "permission-localized".to_string(),
+                request_generation: "generation-localized".to_string(),
+                decision,
+                matcher_id: None,
+                expected_policy_revision: None,
+                confirm_global: false,
+            },
+            decided_at: Utc::now(),
+        };
+
+        let mut allowed = session();
+        let allow_input = RespondInput {
+            session_id: "sess-typed".to_string(),
+            user_response: "已由结构化决定允许".to_string(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        };
+        apply_pending_response(
+            &mut allowed,
+            &allow_input,
+            Some("permission-localized"),
+            ResponseSource::Human,
+            Some(&receipt(PermissionDecisionKind::AllowOnce)),
+        )
+        .expect("typed allow must not depend on localized display options");
+        assert_eq!(
+            allowed
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("permission-localized")
+        );
+        assert_eq!(
+            allowed
+                .metadata
+                .get(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY)
+                .map(String::as_str),
+            Some("generation-localized")
+        );
+
+        let mut denied = session();
+        denied.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "stale-call".to_string(),
+        );
+        denied.metadata.insert(
+            PERMISSION_REEXECUTE_GENERATION_METADATA_KEY.to_string(),
+            "stale-generation".to_string(),
+        );
+        let deny_input = RespondInput {
+            session_id: "sess-typed".to_string(),
+            // Deliberately approval-looking: the receipt enum must win.
+            user_response: "Approve".to_string(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        };
+        apply_pending_response(
+            &mut denied,
+            &deny_input,
+            Some("permission-localized"),
+            ResponseSource::Human,
+            Some(&receipt(PermissionDecisionKind::DenyOnce)),
+        )
+        .expect("typed deny must not depend on display text");
+        assert!(!denied
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+        assert!(!denied
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
+
+        let mut legacy = session();
+        assert!(matches!(
+            apply_pending_response(
+                &mut legacy,
+                &allow_input,
+                Some("permission-localized"),
+                ResponseSource::Human,
+                None,
+            ),
+            Err(RespondError::InvalidResponse(_))
+        ));
+        assert!(legacy.pending_question.is_some());
     }
 }

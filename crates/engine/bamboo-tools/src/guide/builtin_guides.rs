@@ -490,13 +490,13 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "request_permissions" => Some(guide(
             "request_permissions",
             ToolCategory::UserInteraction,
-            "Request elevated permissions from the user when a needed operation would be blocked. The agent loop pauses until the user approves or denies.",
-            "Do not use pre-emptively for every operation; only request when you know the current permission set is insufficient.",
-            &["conclusion_with_options"],
+            "Request one or more remembered permission scopes through independent typed decisions. Batch entries are reviewed one at a time.",
+            "Do not use this for a one-shot operation: invoke the target tool directly so Allow once is bound to that exact tool-call occurrence.",
+            &["conclusion_with_options", "Write", "Edit", "Bash", "WebFetch"],
             vec![example(
-                "Request file write permission",
+                "Request remembered file-write permission",
                 json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),
-                "Use when a Write/Edit would be denied due to path restrictions.",
+                "Use when later target operations need a session/workspace/global remembered scope.",
             )],
         )),
         "Sleep" => Some(guide(

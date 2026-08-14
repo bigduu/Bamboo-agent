@@ -17,7 +17,8 @@ use bamboo_subagent::proto::ParentFrame;
 use tokio::sync::mpsc;
 
 use super::approval_registry::{
-    ApprovalRegistry, ApprovalState, DurableApproval, SharedApprovalRegistry,
+    ApprovalDecisionCasResult, ApprovalRegistry, ApprovalState, DurableApproval,
+    SharedApprovalRegistry,
 };
 
 type ScopeId = usize;
@@ -324,24 +325,73 @@ pub fn deliver_approval_checked(
     request_id: &str,
     approved: bool,
 ) -> bool {
-    let Some((key, record)) = find_unique_pending(registry, child_id, request_id) else {
+    let Some((_, record)) = find_unique_pending(registry, child_id, request_id) else {
         return false;
+    };
+    deliver_approval_checked_cas(
+        registry,
+        &record.parent_session_id,
+        child_id,
+        record.child_attempt,
+        request_id,
+        record.version,
+        approved,
+    ) == ApprovalDeliveryResult::Delivered
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDeliveryResult {
+    Delivered,
+    NotFound,
+    Conflict,
+    DeliveryFailed,
+}
+
+/// Versioned external entry point used by typed HTTP clients. The complete
+/// durable identity is checked against both live pending state and the durable
+/// registry before either is mutated. Identity/version mismatches are reported
+/// as conflicts and never fall back to another attempt with the same request id.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the complete durable approval CAS identity must remain explicit"
+)]
+pub fn deliver_approval_checked_cas(
+    registry: Option<&SharedApprovalRegistry>,
+    parent_session_id: &str,
+    child_id: &str,
+    child_attempt: u32,
+    request_id: &str,
+    expected_version: u64,
+    approved: bool,
+) -> ApprovalDeliveryResult {
+    let (key, record) = match find_pending_cas(
+        registry,
+        parent_session_id,
+        child_id,
+        child_attempt,
+        request_id,
+        expected_version,
+    ) {
+        Ok(found) => found,
+        Err(result) => return result,
     };
     // Persist DecisionRecorded before touching the live transport. Duplicate or
     // concurrent decisions fail this transition and cannot deliver twice.
     if let Some(registry) = registry {
-        match registry.lock().recover_poison().record_decision(
-            &record.parent_session_id,
+        match registry.lock().recover_poison().record_decision_cas(
+            parent_session_id,
             child_id,
-            record.child_attempt,
+            child_attempt,
             request_id,
+            expected_version,
             approved,
         ) {
-            Ok(Some(_)) => {}
-            Ok(None) => return false,
+            Ok(ApprovalDecisionCasResult::Recorded(_)) => {}
+            Ok(ApprovalDecisionCasResult::Conflict) => return ApprovalDeliveryResult::Conflict,
+            Ok(ApprovalDecisionCasResult::NotFound) => return ApprovalDeliveryResult::NotFound,
             Err(error) => {
                 tracing::error!("failed to persist child approval decision: {error}");
-                return false;
+                return ApprovalDeliveryResult::DeliveryFailed;
             }
         }
     }
@@ -355,7 +405,7 @@ pub fn deliver_approval_checked(
             false,
             Some("pending_state_lost"),
         );
-        return false;
+        return ApprovalDeliveryResult::DeliveryFailed;
     };
     let delivered = deliver_approval_scoped(
         registry,
@@ -392,7 +442,11 @@ pub fn deliver_approval_checked(
             durable.as_ref(),
         );
     }
-    delivered
+    if delivered {
+        ApprovalDeliveryResult::Delivered
+    } else {
+        ApprovalDeliveryResult::DeliveryFailed
+    }
 }
 
 fn finish_durable(
@@ -508,6 +562,41 @@ fn find_unique_pending(
         return None;
     }
     Some((key.clone(), record.clone()))
+}
+
+fn find_pending_cas(
+    registry: Option<&SharedApprovalRegistry>,
+    parent_session_id: &str,
+    child_id: &str,
+    child_attempt: u32,
+    request_id: &str,
+    expected_version: u64,
+) -> Result<(PendingKey, PendingApproval), ApprovalDeliveryResult> {
+    let scope = scope_id(registry);
+    let guard = pending().lock().recover_poison();
+    let key = (
+        scope,
+        parent_session_id.to_string(),
+        child_id.to_string(),
+        child_attempt,
+        request_id.to_string(),
+    );
+    if let Some(record) = guard.get(&key) {
+        if record.parent_session_id != parent_session_id
+            || record.child_attempt != child_attempt
+            || record.version != expected_version
+        {
+            return Err(ApprovalDeliveryResult::Conflict);
+        }
+        return Ok((key, record.clone()));
+    }
+    if guard.keys().any(|candidate| {
+        candidate.0 == scope && candidate.2 == child_id && candidate.4 == request_id
+    }) {
+        Err(ApprovalDeliveryResult::Conflict)
+    } else {
+        Err(ApprovalDeliveryResult::NotFound)
+    }
 }
 
 fn remove_unique_pending(
@@ -808,6 +897,139 @@ mod tests {
                 status,
                 ..
             }) if version == pending_version + 2 && status == "approved"
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_attempt_one_decision_cannot_approve_attempt_two() {
+        let registry = registry();
+        let child_id = "c-delayed-attempt";
+        let request_id = "req-reused";
+        let (attempt_one_tx, mut attempt_one_rx) = mpsc::unbounded_channel();
+        let attempt_one_guard = register(child_id, attempt_one_tx, 1, Some(registry.clone()));
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (attempt_one_version, _) = observe_pending_approval(PendingApprovalObservation {
+            registry: Some(&registry),
+            parent_session_id: "parent-delayed",
+            child_id,
+            child_attempt: 1,
+            request_id,
+            tool_name: "Bash",
+            permission: "execute",
+            resource: "cargo test",
+            event_tx: event_tx.clone(),
+        });
+        clear_pending_approvals_for(Some(&registry), child_id, 1);
+
+        let (attempt_two_tx, mut attempt_two_rx) = mpsc::unbounded_channel();
+        let _attempt_two_guard = register(child_id, attempt_two_tx, 2, Some(registry.clone()));
+        let (attempt_two_version, _) = observe_pending_approval(PendingApprovalObservation {
+            registry: Some(&registry),
+            parent_session_id: "parent-delayed",
+            child_id,
+            child_attempt: 2,
+            request_id,
+            tool_name: "Bash",
+            permission: "execute",
+            resource: "cargo test",
+            event_tx,
+        });
+
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-delayed",
+                child_id,
+                1,
+                request_id,
+                attempt_one_version,
+                true,
+            ),
+            ApprovalDeliveryResult::Conflict
+        );
+        assert!(attempt_one_rx.try_recv().is_err());
+        assert!(attempt_two_rx.try_recv().is_err());
+
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-delayed",
+                child_id,
+                2,
+                request_id,
+                attempt_two_version,
+                true,
+            ),
+            ApprovalDeliveryResult::Delivered
+        );
+        assert!(matches!(
+            attempt_two_rx.try_recv(),
+            Ok(ParentFrame::ApprovalReply { id, approved }) if id == request_id && approved
+        ));
+        drop(attempt_one_guard);
+    }
+
+    #[tokio::test]
+    async fn parent_and_version_mismatches_do_not_consume_current_approval() {
+        let registry = registry();
+        let child_id = "c-identity-cas";
+        let request_id = "req-identity-cas";
+        let (wire_tx, mut wire_rx) = mpsc::unbounded_channel();
+        let _guard = register(child_id, wire_tx, 3, Some(registry.clone()));
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let (version, _) = observe_pending_approval(PendingApprovalObservation {
+            registry: Some(&registry),
+            parent_session_id: "parent-current",
+            child_id,
+            child_attempt: 3,
+            request_id,
+            tool_name: "Write",
+            permission: "write",
+            resource: "/tmp/current",
+            event_tx,
+        });
+
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-stale",
+                child_id,
+                3,
+                request_id,
+                version,
+                true,
+            ),
+            ApprovalDeliveryResult::Conflict
+        );
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-current",
+                child_id,
+                3,
+                request_id,
+                version.saturating_add(1),
+                true,
+            ),
+            ApprovalDeliveryResult::Conflict
+        );
+        assert!(wire_rx.try_recv().is_err());
+
+        assert_eq!(
+            deliver_approval_checked_cas(
+                Some(&registry),
+                "parent-current",
+                child_id,
+                3,
+                request_id,
+                version,
+                false,
+            ),
+            ApprovalDeliveryResult::Delivered
+        );
+        assert!(matches!(
+            wire_rx.try_recv(),
+            Ok(ParentFrame::ApprovalReply { id, approved }) if id == request_id && !approved
         ));
     }
 

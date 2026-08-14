@@ -310,6 +310,8 @@ mod tests {
             updated_at: None,
             message_count: 0,
             pinned: false,
+            permission_mode: crate::api::types::SessionPermissionMode::Default,
+            bypass_permissions: false,
         }
     }
 

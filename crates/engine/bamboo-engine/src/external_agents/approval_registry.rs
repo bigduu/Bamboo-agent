@@ -20,6 +20,13 @@ pub enum ApprovalState {
     Expired,
 }
 
+#[derive(Debug, Clone)]
+pub enum ApprovalDecisionCasResult {
+    Recorded(Box<DurableApproval>),
+    NotFound,
+    Conflict,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableApproval {
     pub parent_session_id: String,
@@ -222,6 +229,45 @@ impl ApprovalRegistry {
             return Err(error);
         }
         Ok(Some(updated))
+    }
+
+    /// Record a decision only when the caller presents the complete durable
+    /// approval identity and the exact version that was displayed. A matching
+    /// child/request under another parent or child attempt is a conflict, not a
+    /// fallback target: delayed UI traffic must never resolve a newer attempt.
+    pub fn record_decision_cas(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        child_attempt: u32,
+        request_id: &str,
+        expected_version: u64,
+        approved: bool,
+    ) -> io::Result<ApprovalDecisionCasResult> {
+        let key = approval_key(parent_id, child_id, child_attempt, request_id);
+        let Some(record) = self.records.get_mut(&key) else {
+            let identity_conflict = self.records.values().any(|record| {
+                record.child_session_id == child_id && record.request_id == request_id
+            });
+            return Ok(if identity_conflict {
+                ApprovalDecisionCasResult::Conflict
+            } else {
+                ApprovalDecisionCasResult::NotFound
+            });
+        };
+        if record.state != ApprovalState::Pending || record.version != expected_version {
+            return Ok(ApprovalDecisionCasResult::Conflict);
+        }
+        let previous = record.clone();
+        record.state = ApprovalState::DecisionRecorded;
+        record.approved = Some(approved);
+        bump(record);
+        let updated = record.clone();
+        if let Err(error) = self.persist() {
+            self.records.insert(key, previous);
+            return Err(error);
+        }
+        Ok(ApprovalDecisionCasResult::Recorded(Box::new(updated)))
     }
 
     pub fn finish(

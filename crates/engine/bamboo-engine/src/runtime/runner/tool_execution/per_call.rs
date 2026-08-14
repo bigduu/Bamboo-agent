@@ -394,6 +394,7 @@ async fn hook_ask_outcome(
     );
     let request = bamboo_tools::permission::PermissionRequest {
         request_id: tool_call.id.clone(),
+        request_generation: bamboo_tools::permission::PermissionRequest::fresh_generation(),
         session_id: session.id.clone(),
         workspace_path: session.workspace_path_meta(),
         tool_name: tool_name.clone(),

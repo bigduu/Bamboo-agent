@@ -680,6 +680,10 @@ mod tests {
 
     #[tokio::test]
     async fn auto_execute_schedule_runs_forced_ask_tool_without_approval_while_interactive_asks() {
+        // The workspace suite runs many process- and server-backed tests in
+        // parallel. Give the background scheduler enough time to be selected
+        // even when those tests temporarily saturate the runtime.
+        const BACKGROUND_SCHEDULE_TIMEOUT: Duration = Duration::from_secs(30);
         let dir = tempfile::tempdir().unwrap();
         bamboo_config::paths::init_bamboo_dir(dir.path().to_path_buf());
         let workspace = dir.path().join("scheduled-project");
@@ -772,7 +776,7 @@ mod tests {
         )
         .await
         .expect("enqueue scheduled auto run");
-        tokio::time::timeout(Duration::from_secs(5), first_call_started.notified())
+        tokio::time::timeout(BACKGROUND_SCHEDULE_TIMEOUT, first_call_started.notified())
             .await
             .expect("scheduled agent reaches scripted provider");
 
@@ -828,7 +832,7 @@ mod tests {
         assert_eq!(permission_config.mode(), PermissionMode::Default);
 
         release_first_call.notify_one();
-        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        let terminal = tokio::time::timeout(BACKGROUND_SCHEDULE_TIMEOUT, async {
             loop {
                 if let Some(record) = state
                     .schedule_store
@@ -852,7 +856,7 @@ mod tests {
         let scheduled_session_id = terminal.session_id.expect("scheduled session id");
 
         let mut scheduled_approval_seen = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(BACKGROUND_SCHEDULE_TIMEOUT, async {
             loop {
                 let change = account_feed.recv().await.expect("account event");
                 if change.session_id.as_deref() != Some(scheduled_session_id.as_str()) {
