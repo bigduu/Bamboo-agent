@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::api::sse::{SessionSseEvent, SseStream};
+use crate::api::sse::{SessionSseEvent, SseStream, SESSION_SSE_CHANNEL_CAPACITY};
 use crate::api::types::*;
 use crate::api::{BambooClient, RespondFailure};
 use crate::event::{AnswerSubmissionOutcome, AppEvent};
@@ -557,6 +557,14 @@ struct InspectorCacheEntry {
 }
 
 pub struct ChatState {
+    /// Stable UI identity for this conversation view. A newly-authored chat
+    /// does not have a server session id until the first `/chat` request
+    /// returns, so async results use this identity until `session_id` exists.
+    context_id: u64,
+    /// Whether this view has installed authoritative history (or originated a
+    /// local first turn). A startup `--session-id` sets only the id and must
+    /// still perform its initial fetch instead of taking the cache fast path.
+    history_loaded: bool,
     pub session_id: Option<String>,
     /// Project inherited from the opened/selected session and propagated when
     /// Ctrl+N creates a new root session.
@@ -576,6 +584,17 @@ pub struct ChatState {
     /// Number of conversation updates received while auto-scroll is detached.
     /// It is independent from notification-log alerts.
     pub unseen_updates: usize,
+    /// Events received while this session was not the foreground view. Cleared
+    /// only when the operator switches back to this session.
+    pub background_unread: usize,
+    /// Lightweight status learned from summary polling after this context's
+    /// full SSE subscription was evicted. Live events and authoritative
+    /// resume clear the hint again.
+    observed_activity: Option<SessionActivityStatus>,
+    /// Newest locally-issued summary request incorporated into this context.
+    /// This orders dynamic runner state that can change without advancing the
+    /// persisted session timestamp (notably `running_child_count`).
+    latest_summary_observation_epoch: u64,
     pub streaming: bool,
     pub current_response: String,
     pub current_tool_calls: Vec<ToolCallDisplay>,
@@ -656,6 +675,8 @@ impl ChatState {
         textarea.set_placeholder_text(chat_placeholder_for(&Keymap::default()));
         apply_textarea_palette(&mut textarea, crate::theme::ThemePalette::TrueColor);
         Self {
+            context_id: 0,
+            history_loaded: false,
             session_id: None,
             project_id: None,
             messages: Vec::new(),
@@ -664,6 +685,9 @@ impl ChatState {
             max_scroll: Cell::new(0),
             auto_scroll: true,
             unseen_updates: 0,
+            background_unread: 0,
+            observed_activity: None,
+            latest_summary_observation_epoch: 0,
             streaming: false,
             current_response: String::new(),
             current_tool_calls: Vec::new(),
@@ -697,6 +721,12 @@ impl ChatState {
             parent_terminal_pending: false,
             next_ui_id: 0,
         }
+    }
+
+    fn with_context_id(context_id: u64) -> Self {
+        let mut chat = Self::new();
+        chat.context_id = context_id;
+        chat
     }
 
     fn allocate_ui_id(&mut self, kind: &str) -> String {
@@ -969,6 +999,8 @@ pub struct OpenedSession {
     pub permission_mode: SessionPermissionMode,
     pub bypass_permissions: bool,
     pub is_running: bool,
+    pub running_child_count: u32,
+    pub last_run_status: Option<String>,
     pub pending: Option<PendingQuestion>,
     /// The server dropped older messages to stay under its cold-fetch cap.
     pub truncated: bool,
@@ -997,6 +1029,9 @@ pub struct SessionsState {
     /// Offset to request for the next page, or `None` on the last page —
     /// gates whether `]` does anything.
     pub next_offset: Option<usize>,
+    /// Newest list request issued for this tab. A slower prior page must not
+    /// replace newer rows after a rapid refresh.
+    summary_observation_epoch: u64,
 }
 
 impl SessionsState {
@@ -1010,6 +1045,7 @@ impl SessionsState {
             offset: 0,
             page_limit: 0,
             next_offset: None,
+            summary_observation_epoch: 0,
         }
     }
 }
@@ -1150,6 +1186,9 @@ pub struct Notification {
     pub level: NoticeLevel,
     pub text: String,
     pub at: DateTime<Utc>,
+    /// Background session that produced the notice. `Enter` in the log jumps
+    /// to the most recent linked session.
+    pub session_id: Option<String>,
 }
 
 // ── Interactive question (permission gate / clarification) ──
@@ -2295,6 +2334,16 @@ fn merged_command_palette_entries(commands: Vec<CommandItem>) -> Vec<CommandPale
 
 const MAX_SESSION_PICKER_SESSIONS: usize = 1_000;
 const MAX_RECENT_MODELS: usize = 8;
+/// Full transcript/editor state is intentionally bounded. The active context
+/// lives directly on `App`, so this is the number of additional recent views.
+const MAX_SESSION_UI_STATES: usize = 24;
+/// Each SSE subscription owns a Tokio task and a bounded channel. Retain a
+/// small full-fidelity set; one shared summary poller observes older runs and
+/// authoritative history closes content gaps when they are revisited.
+const MAX_SESSION_SUBSCRIPTIONS: usize = 8;
+const MAX_SSE_EVENTS_PER_TICK: usize = 512;
+const MAX_SSE_EVENTS_PER_SUBSCRIPTION: usize = MAX_SSE_EVENTS_PER_TICK / MAX_SESSION_SUBSCRIPTIONS;
+const BACKGROUND_STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn model_key(model: &CatalogModel) -> (String, String) {
     (
@@ -2513,6 +2562,121 @@ pub fn discover_bamboo_bin(
 
 // ── Main App ──
 
+/// Everything that must follow a chat session when it moves between the
+/// foreground and background. Keeping the existing foreground fields on
+/// `App` avoids a broad UI rewrite; switching is a move, not a clone, so
+/// textarea cursor state, `Cell`/`RefCell` render caches, modal drafts, and
+/// live task handles all remain exact.
+struct SessionUiContext {
+    chat: ChatState,
+    pending_question: Option<ActiveQuestion>,
+    dismissed_question: Option<ActiveQuestion>,
+    answer_epoch: u64,
+    answer_task: Option<tokio::task::JoinHandle<()>>,
+    pending_child_approvals: VecDeque<QueuedChildApproval>,
+    child_approval_snapshot_epoch: u64,
+    child_approval_revision: u64,
+    sse_tx: Option<mpsc::Sender<SessionSseEvent>>,
+    sse_rx: Option<mpsc::Receiver<SessionSseEvent>>,
+    sse_task: Option<tokio::task::JoinHandle<()>>,
+    sse_epoch: u64,
+    pending_reconcile_epoch: u64,
+    sse_ready: Option<watch::Receiver<bool>>,
+    stream_disconnected: bool,
+    pending_answer_run_started: bool,
+    /// A bounded subscription was evicted or exhausted. Reopening this view
+    /// must fetch history before attaching again so non-critical SSE gaps are
+    /// recovered without appending duplicate partial blocks.
+    needs_history_refresh: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionActivityStatus {
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Disconnected,
+    Idle,
+}
+
+impl SessionActivityStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Waiting => "question",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Disconnected => "reconnect",
+            Self::Idle => "idle",
+        }
+    }
+
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => "▶",
+            Self::Waiting => "?",
+            Self::Completed => "✓",
+            Self::Failed => "✗",
+            Self::Disconnected => "↻",
+            Self::Idle => "·",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionActivity {
+    pub(crate) session_id: String,
+    pub(crate) status: SessionActivityStatus,
+    pub(crate) unread: usize,
+    pub(crate) active: bool,
+}
+
+impl SessionUiContext {
+    fn blank(context_id: u64) -> Self {
+        Self {
+            chat: ChatState::with_context_id(context_id),
+            pending_question: None,
+            dismissed_question: None,
+            answer_epoch: 0,
+            answer_task: None,
+            pending_child_approvals: VecDeque::new(),
+            child_approval_snapshot_epoch: 0,
+            child_approval_revision: 0,
+            sse_tx: None,
+            sse_rx: None,
+            sse_task: None,
+            sse_epoch: 0,
+            pending_reconcile_epoch: 0,
+            sse_ready: None,
+            stream_disconnected: false,
+            pending_answer_run_started: false,
+            needs_history_refresh: false,
+        }
+    }
+
+    fn cache_key(&self) -> String {
+        self.chat
+            .session_id
+            .clone()
+            .unwrap_or_else(|| format!("@local:{}", self.chat.context_id))
+    }
+
+    fn abort_background_work(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.answer_task.take() {
+            task.abort();
+        }
+        self.sse_tx = None;
+        self.sse_rx = None;
+        self.sse_ready = None;
+        self.sse_epoch = self.sse_epoch.wrapping_add(1);
+        self.pending_reconcile_epoch = self.pending_reconcile_epoch.wrapping_add(1);
+    }
+}
+
 pub struct App {
     pub running: bool,
     pub tab: Tab,
@@ -2524,6 +2688,24 @@ pub struct App {
     pub terminal_height: u16,
     pub client: BambooClient,
     pub chat: ChatState,
+    /// Recently visited non-foreground chats, keyed by server session id (or a
+    /// temporary local id until the first chat request creates the session).
+    session_views: HashMap<String, SessionUiContext>,
+    session_view_order: VecDeque<String>,
+    next_context_id: u64,
+    /// Set only while reducing an event for a cached background session. It
+    /// keeps transient foreground status stable and prefixes log notices with
+    /// the session that actually produced them.
+    routing_background_session: Option<String>,
+    /// A single bounded poller observes cached runs whose full event stream
+    /// was evicted. It replaces one-task-per-session polling and is guarded by
+    /// an epoch so stale summaries cannot overwrite a reattached context.
+    background_status_poll_epoch: u64,
+    background_status_poll_task: Option<tokio::task::JoinHandle<()>>,
+    /// Shared issue-order clock for every endpoint that returns a
+    /// `SessionSummary`. The epoch is allocated before spawning the request,
+    /// so a slow older response cannot overwrite a newer list/picker/poll.
+    summary_observation_epoch: u64,
     pub sessions: SessionsState,
     pub mcp: McpState,
     pub schedules: SchedulesState,
@@ -2638,6 +2820,12 @@ pub struct App {
     /// Latest session whose async resume result is authoritative. An older
     /// request finishing later must not switch the operator back.
     opening_session_id: Option<String>,
+    /// Exact generation of `opening_session_id`, including failures. Repeated
+    /// opens of the same session must not let request A satisfy request B.
+    opening_session_epoch: u64,
+    /// At most one history/summary resume request may exist. Generation
+    /// checks protect state; retaining the handle also bounds network tasks.
+    opening_session_task: Option<tokio::task::JoinHandle<()>>,
     /// Shared monotonic identity for picker fetches/mutations. Closing and
     /// reopening a picker invalidates every result from the previous overlay.
     picker_epoch: u64,
@@ -2649,8 +2837,8 @@ pub struct App {
     /// Sender into the main event loop, used to post results of background API
     /// calls (so those calls never block the UI thread). Set in [`run`].
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
-    sse_tx: Option<mpsc::UnboundedSender<SessionSseEvent>>,
-    sse_rx: Option<mpsc::UnboundedReceiver<SessionSseEvent>>,
+    sse_tx: Option<mpsc::Sender<SessionSseEvent>>,
+    sse_rx: Option<mpsc::Receiver<SessionSseEvent>>,
     sse_task: Option<tokio::task::JoinHandle<()>>,
     /// Monotonic identity for an attached SSE task. Control/data events from a
     /// detached generation are ignored even if they were already queued when
@@ -2673,6 +2861,27 @@ pub struct App {
     /// clarification answer. Its Complete is a real terminal event even if the
     /// respond HTTP result has not yet arrived to clear the local modal.
     pending_answer_run_started: bool,
+    active_needs_history_refresh: bool,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.answer_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.background_status_poll_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.opening_session_task.take() {
+            task.abort();
+        }
+        for context in self.session_views.values_mut() {
+            context.abort_background_work();
+        }
+    }
 }
 
 /// Move a list selection by `delta` (positive = down, negative = up),
@@ -2684,6 +2893,13 @@ fn scroll_selection(selected: usize, len: usize, delta: i32) -> usize {
     }
     let next = selected as i64 + delta as i64;
     next.clamp(0, (len - 1) as i64) as usize
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id
+        .strip_prefix("@local:")
+        .map(|id| format!("draft:{id}"))
+        .unwrap_or_else(|| session_id.chars().take(8).collect())
 }
 
 fn question_option_at(question: &ActiveQuestion, column: u16, row: u16) -> Option<usize> {
@@ -2729,7 +2945,14 @@ impl App {
             terminal_width: u16::MAX,
             terminal_height: u16::MAX,
             client,
-            chat: ChatState::new(),
+            chat: ChatState::with_context_id(1),
+            session_views: HashMap::new(),
+            session_view_order: VecDeque::new(),
+            next_context_id: 1,
+            routing_background_session: None,
+            background_status_poll_epoch: 0,
+            background_status_poll_task: None,
+            summary_observation_epoch: 0,
             sessions: SessionsState::new(),
             mcp: McpState::new(),
             schedules: SchedulesState::new(),
@@ -2774,6 +2997,8 @@ impl App {
             question_drafts: HashMap::new(),
             question_draft_order: VecDeque::new(),
             opening_session_id: None,
+            opening_session_epoch: 0,
+            opening_session_task: None,
             picker_epoch: 0,
             model_picker_task: None,
             session_picker_task: None,
@@ -2789,7 +3014,459 @@ impl App {
             sse_ready: None,
             stream_disconnected: false,
             pending_answer_run_started: false,
+            active_needs_history_refresh: false,
         }
+    }
+
+    fn allocate_context_id(&mut self) -> u64 {
+        self.next_context_id = self.next_context_id.wrapping_add(1).max(1);
+        self.next_context_id
+    }
+
+    fn next_summary_observation_epoch(&mut self) -> u64 {
+        self.summary_observation_epoch = self.summary_observation_epoch.wrapping_add(1).max(1);
+        self.summary_observation_epoch
+    }
+
+    fn cancel_opening_session(&mut self) {
+        if let Some(task) = self.opening_session_task.take() {
+            task.abort();
+        }
+        self.opening_session_id = None;
+    }
+
+    fn take_active_context(&mut self) -> SessionUiContext {
+        SessionUiContext {
+            chat: std::mem::replace(&mut self.chat, ChatState::with_context_id(0)),
+            pending_question: self.pending_question.take(),
+            dismissed_question: self.dismissed_question.take(),
+            answer_epoch: std::mem::take(&mut self.answer_epoch),
+            answer_task: self.answer_task.take(),
+            pending_child_approvals: std::mem::take(&mut self.pending_child_approvals),
+            child_approval_snapshot_epoch: std::mem::take(&mut self.child_approval_snapshot_epoch),
+            child_approval_revision: std::mem::take(&mut self.child_approval_revision),
+            sse_tx: self.sse_tx.take(),
+            sse_rx: self.sse_rx.take(),
+            sse_task: self.sse_task.take(),
+            sse_epoch: std::mem::take(&mut self.sse_epoch),
+            pending_reconcile_epoch: std::mem::take(&mut self.pending_reconcile_epoch),
+            sse_ready: self.sse_ready.take(),
+            stream_disconnected: std::mem::take(&mut self.stream_disconnected),
+            pending_answer_run_started: std::mem::take(&mut self.pending_answer_run_started),
+            needs_history_refresh: std::mem::take(&mut self.active_needs_history_refresh),
+        }
+    }
+
+    fn install_active_context(&mut self, context: SessionUiContext) {
+        self.chat = context.chat;
+        self.pending_question = context.pending_question;
+        self.dismissed_question = context.dismissed_question;
+        self.answer_epoch = context.answer_epoch;
+        self.answer_task = context.answer_task;
+        self.pending_child_approvals = context.pending_child_approvals;
+        self.child_approval_snapshot_epoch = context.child_approval_snapshot_epoch;
+        self.child_approval_revision = context.child_approval_revision;
+        self.sse_tx = context.sse_tx;
+        self.sse_rx = context.sse_rx;
+        self.sse_task = context.sse_task;
+        self.sse_epoch = context.sse_epoch;
+        self.pending_reconcile_epoch = context.pending_reconcile_epoch;
+        self.sse_ready = context.sse_ready;
+        self.stream_disconnected = context.stream_disconnected;
+        self.pending_answer_run_started = context.pending_answer_run_started;
+        self.active_needs_history_refresh = context.needs_history_refresh;
+        apply_textarea_palette(&mut self.chat.textarea, self.theme);
+    }
+
+    fn active_context_is_meaningful(&self) -> bool {
+        self.chat.session_id.is_some() || self.chat.streaming || self.pending_question.is_some()
+    }
+
+    fn cache_context(&mut self, context: SessionUiContext) {
+        let key = context.cache_key();
+        if let Some(mut replaced) = self.session_views.remove(&key) {
+            replaced.abort_background_work();
+        }
+        self.session_view_order.retain(|existing| existing != &key);
+        self.session_view_order.push_back(key.clone());
+        self.session_views.insert(key, context);
+
+        while self.session_views.len() > MAX_SESSION_UI_STATES {
+            let Some(oldest) = self.session_view_order.pop_front() else {
+                break;
+            };
+            if let Some(mut evicted) = self.session_views.remove(&oldest) {
+                evicted.abort_background_work();
+            }
+        }
+        self.enforce_subscription_limit();
+    }
+
+    fn park_active_context(&mut self) {
+        let meaningful = self.active_context_is_meaningful();
+        let mut context = self.take_active_context();
+        if meaningful {
+            self.cache_context(context);
+        } else {
+            context.abort_background_work();
+        }
+    }
+
+    fn take_cached_session(&mut self, session_id: &str) -> Option<SessionUiContext> {
+        self.session_view_order
+            .retain(|existing| existing != session_id);
+        self.session_views.remove(session_id)
+    }
+
+    fn cached_key_for_context(&self, context_id: u64) -> Option<String> {
+        self.session_views
+            .iter()
+            .find_map(|(key, context)| (context.chat.context_id == context_id).then(|| key.clone()))
+    }
+
+    fn context_id_for_session(&self, session_id: &str) -> Option<u64> {
+        if self.chat.session_id.as_deref() == Some(session_id) {
+            return Some(self.chat.context_id);
+        }
+        self.session_views
+            .get(session_id)
+            .map(|context| context.chat.context_id)
+    }
+
+    fn take_cached_context_id(&mut self, context_id: u64) -> Option<SessionUiContext> {
+        let key = self.cached_key_for_context(context_id)?;
+        self.session_view_order.retain(|existing| existing != &key);
+        self.session_views.remove(&key)
+    }
+
+    fn enforce_subscription_limit(&mut self) {
+        let mut subscriptions = usize::from(self.sse_task.is_some())
+            + self
+                .session_views
+                .values()
+                .filter(|context| context.sse_task.is_some())
+                .count();
+        if subscriptions <= MAX_SESSION_SUBSCRIPTIONS {
+            return;
+        }
+        let oldest = self.session_view_order.iter().cloned().collect::<Vec<_>>();
+        for key in oldest {
+            if subscriptions <= MAX_SESSION_SUBSCRIPTIONS {
+                break;
+            }
+            let Some(context) = self.session_views.get_mut(&key) else {
+                continue;
+            };
+            let Some(task) = context.sse_task.take() else {
+                continue;
+            };
+            task.abort();
+            context.sse_tx = None;
+            context.sse_rx = None;
+            context.sse_ready = None;
+            context.sse_epoch = context.sse_epoch.wrapping_add(1);
+            context.pending_reconcile_epoch = context.pending_reconcile_epoch.wrapping_add(1);
+            context.stream_disconnected =
+                context.chat.streaming || context.chat.parent_terminal_pending;
+            context.needs_history_refresh = true;
+            subscriptions -= 1;
+        }
+    }
+
+    fn prepare_visible_session_switch(&mut self) {
+        self.invalidate_permission_mode_context();
+        if self.session_picker.is_some() {
+            self.pending_delete = None;
+        }
+        self.close_session_picker();
+        self.close_model_picker();
+        self.close_command_palette();
+    }
+
+    /// Fast path for a recent session whose transcript and live subscription
+    /// are still resident. A context marked stale deliberately falls back to
+    /// `resume_session` so history closes any SSE gap before it is displayed.
+    fn activate_cached_session(&mut self, session_id: &str) -> bool {
+        if self.chat.session_id.as_deref() == Some(session_id)
+            && self.chat.history_loaded
+            && !self.active_needs_history_refresh
+        {
+            self.chat.background_unread = 0;
+            self.tab = Tab::Chat;
+            self.status_message = "Session already active".to_string();
+            return true;
+        }
+        let Some(context) = self.take_cached_session(session_id) else {
+            return false;
+        };
+        if context.needs_history_refresh {
+            self.cache_context(context);
+            return false;
+        }
+        self.prepare_visible_session_switch();
+        self.park_active_context();
+        self.install_active_context(context);
+        self.chat.background_unread = 0;
+        self.tab = Tab::Chat;
+        self.status_message = if self.pending_question.is_some() {
+            "Switched session — waiting for a decision".to_string()
+        } else if self.chat.streaming {
+            "Switched session — streaming".to_string()
+        } else {
+            "Switched session".to_string()
+        };
+        true
+    }
+
+    fn activity_from_parts(
+        chat: &ChatState,
+        pending_question: bool,
+        stream_disconnected: bool,
+        active: bool,
+        fallback_key: Option<&str>,
+    ) -> Option<SessionActivity> {
+        if chat.session_id.is_none()
+            && !chat.streaming
+            && chat.messages.is_empty()
+            && chat.current_response.is_empty()
+            && chat.current_tool_calls.is_empty()
+            && chat.current_reasoning.is_empty()
+            && chat.current_terminal_status.is_none()
+            && chat.background_unread == 0
+            && chat.textarea.lines().iter().all(String::is_empty)
+        {
+            return None;
+        }
+        let session_id = chat
+            .session_id
+            .clone()
+            .or_else(|| fallback_key.map(str::to_string))?;
+        let terminal = chat.current_terminal_status.as_deref().or_else(|| {
+            chat.messages
+                .iter()
+                .rev()
+                .find_map(|message| message.terminal_status.as_deref())
+        });
+        let status = if pending_question {
+            SessionActivityStatus::Waiting
+        } else if let Some(observed) = chat.observed_activity {
+            observed
+        } else if stream_disconnected && (chat.streaming || chat.parent_terminal_pending) {
+            SessionActivityStatus::Disconnected
+        } else if chat.streaming || chat.parent_terminal_pending {
+            SessionActivityStatus::Running
+        } else if terminal.is_some_and(|status| {
+            let status = status.to_ascii_lowercase();
+            status.contains("error") || status.contains("fail")
+        }) {
+            SessionActivityStatus::Failed
+        } else if terminal.is_some() {
+            SessionActivityStatus::Completed
+        } else {
+            SessionActivityStatus::Idle
+        };
+        Some(SessionActivity {
+            session_id,
+            status,
+            unread: chat.background_unread,
+            active,
+        })
+    }
+
+    fn activity_from_summary(summary: &SessionSummary) -> SessionActivityStatus {
+        if summary.has_pending_question {
+            SessionActivityStatus::Waiting
+        } else if summary.is_running || summary.running_child_count > 0 {
+            SessionActivityStatus::Running
+        } else if summary.last_run_status.as_deref().is_some_and(|status| {
+            let status = status.to_ascii_lowercase();
+            status.contains("error") || status.contains("fail")
+        }) {
+            SessionActivityStatus::Failed
+        } else if summary.last_run_status.is_some() {
+            SessionActivityStatus::Completed
+        } else {
+            SessionActivityStatus::Idle
+        }
+    }
+
+    /// Install a summary only when its request was issued after every summary
+    /// already seen by this cached context. Server `updated_at` alone cannot
+    /// order runner-backed fields such as `is_running` and
+    /// `running_child_count`, so all summary-producing requests share a local
+    /// observation epoch allocated before they are spawned.
+    fn apply_summary_to_cached_context(
+        context: &mut SessionUiContext,
+        summary: &SessionSummary,
+        observation_epoch: u64,
+    ) -> Option<SessionActivityStatus> {
+        if context.sse_task.is_some()
+            || observation_epoch <= context.chat.latest_summary_observation_epoch
+        {
+            return None;
+        }
+        context.chat.latest_summary_observation_epoch = observation_epoch;
+        if !summary.has_pending_question
+            && (context.pending_question.is_some()
+                || context.dismissed_question.is_some()
+                || context.answer_task.is_some())
+        {
+            context.answer_epoch = context.answer_epoch.wrapping_add(1);
+            if let Some(task) = context.answer_task.take() {
+                task.abort();
+            }
+            context.pending_question = None;
+            context.dismissed_question = None;
+            context.pending_answer_run_started = false;
+        }
+
+        let status = Self::activity_from_summary(summary);
+        context.chat.observed_activity = Some(status);
+        context.chat.streaming = summary.is_running || summary.has_pending_question;
+        context.chat.parent_terminal_pending =
+            !summary.is_running && summary.running_child_count > 0;
+        context.chat.current_terminal_status = summary.last_run_status.clone();
+        context.chat.model.clone_from(&summary.model);
+        context.chat.provider = summary
+            .model_ref
+            .as_ref()
+            .map(|model_ref| model_ref.provider.clone())
+            .or_else(|| summary.provider.clone());
+        context.chat.project_id.clone_from(&summary.project_id);
+        context.chat.permission_mode = summary.permission_mode;
+        context.chat.bypass_permissions = summary.bypass_permissions;
+        context.stream_disconnected = false;
+        // A lightweight summary proves status, not transcript contents.
+        context.needs_history_refresh = true;
+        Some(status)
+    }
+
+    fn observe_cached_summaries(&mut self, summaries: &[SessionSummary], observation_epoch: u64) {
+        let mut notices = Vec::new();
+        for summary in summaries {
+            if let Some(context) = self.session_views.get_mut(&summary.id) {
+                let previous = Self::activity_from_parts(
+                    &context.chat,
+                    context.pending_question.is_some() || context.dismissed_question.is_some(),
+                    context.stream_disconnected,
+                    false,
+                    Some(&summary.id),
+                )
+                .map(|activity| activity.status)
+                .unwrap_or(SessionActivityStatus::Idle);
+                let Some(status) =
+                    Self::apply_summary_to_cached_context(context, summary, observation_epoch)
+                else {
+                    continue;
+                };
+                if status != previous {
+                    if let Some((level, text)) = Self::background_transition_notice(status) {
+                        context.chat.background_unread =
+                            context.chat.background_unread.saturating_add(1);
+                        notices.push((summary.id.clone(), level, text));
+                    }
+                }
+            }
+        }
+        for (session_id, level, text) in notices {
+            self.notify_background_session(&session_id, level, text);
+        }
+    }
+
+    fn background_transition_notice(
+        status: SessionActivityStatus,
+    ) -> Option<(NoticeLevel, &'static str)> {
+        match status {
+            SessionActivityStatus::Running => Some((
+                NoticeLevel::Info,
+                "Background run continues (status monitoring restored)",
+            )),
+            SessionActivityStatus::Waiting => Some((
+                NoticeLevel::Warn,
+                "Background session is waiting for a decision",
+            )),
+            SessionActivityStatus::Completed => {
+                Some((NoticeLevel::Info, "Background run completed"))
+            }
+            SessionActivityStatus::Failed => Some((NoticeLevel::Error, "Background run failed")),
+            SessionActivityStatus::Disconnected | SessionActivityStatus::Idle => None,
+        }
+    }
+
+    pub(crate) fn session_activity(&self, session_id: &str) -> Option<SessionActivity> {
+        if self.chat.session_id.as_deref() == Some(session_id) {
+            return Self::activity_from_parts(
+                &self.chat,
+                self.pending_question.is_some() || self.dismissed_question.is_some(),
+                self.stream_disconnected,
+                true,
+                Some(session_id),
+            );
+        }
+        let context = self.session_views.get(session_id)?;
+        Self::activity_from_parts(
+            &context.chat,
+            context.pending_question.is_some() || context.dismissed_question.is_some(),
+            context.stream_disconnected,
+            false,
+            Some(session_id),
+        )
+    }
+
+    pub(crate) fn session_activity_for_summary(
+        &self,
+        summary: &SessionSummary,
+    ) -> Option<SessionActivity> {
+        let mut activity = self.session_activity(&summary.id)?;
+        let has_no_live_subscription = if activity.active {
+            self.sse_task.is_none()
+        } else {
+            self.session_views
+                .get(&summary.id)
+                .is_some_and(|context| context.sse_task.is_none())
+        };
+        if has_no_live_subscription {
+            // A freshly fetched Sessions/picker row is more authoritative
+            // than disconnected or last-polled state when there is no live
+            // SSE, including for the foreground session.
+            activity.status = Self::activity_from_summary(summary);
+        }
+        Some(activity)
+    }
+
+    pub(crate) fn session_strip_activities(&self) -> Vec<SessionActivity> {
+        let mut activities = Vec::new();
+        let active_key = format!("@local:{}", self.chat.context_id);
+        if let Some(active) = Self::activity_from_parts(
+            &self.chat,
+            self.pending_question.is_some() || self.dismissed_question.is_some(),
+            self.stream_disconnected,
+            true,
+            Some(&active_key),
+        ) {
+            activities.push(active);
+        }
+        for key in self.session_view_order.iter().rev() {
+            let Some(context) = self.session_views.get(key) else {
+                continue;
+            };
+            let Some(activity) = Self::activity_from_parts(
+                &context.chat,
+                context.pending_question.is_some() || context.dismissed_question.is_some(),
+                context.stream_disconnected,
+                false,
+                Some(key),
+            ) else {
+                continue;
+            };
+            if activity.status != SessionActivityStatus::Idle || activity.unread > 0 {
+                activities.push(activity);
+            }
+            if activities.len() >= MAX_SESSION_SUBSCRIPTIONS {
+                break;
+            }
+        }
+        activities
     }
 
     /// Select the semantic palette and apply it to stateful third-party
@@ -2929,6 +3606,9 @@ impl App {
         // correctly accounts for elapsed time across iterations instead of
         // firing immediately every time.
         let mut redraw_interval = tokio::time::interval(std::time::Duration::from_millis(120));
+        let mut background_status_interval =
+            tokio::time::interval(std::time::Duration::from_secs(2));
+        background_status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Main event loop.
         while self.running {
@@ -2967,6 +3647,9 @@ impl App {
                 _ = redraw_interval.tick() => {
                     // No new state — just a steady redraw so the spinner animates.
                 }
+                _ = background_status_interval.tick() => {
+                    self.refresh_evicted_session_statuses();
+                }
             }
         }
 
@@ -2984,11 +3667,28 @@ impl App {
     }
 
     fn poll_sse(&mut self) {
-        let events: Vec<SessionSseEvent> = if let Some(rx) = &mut self.sse_rx {
-            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        let mut events: Vec<SessionSseEvent> = if let Some(rx) = &mut self.sse_rx {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .take(MAX_SSE_EVENTS_PER_SUBSCRIPTION)
+                .collect()
         } else {
             Vec::new()
         };
+        // Use the explicit LRU order rather than randomized HashMap iteration.
+        // Event arrival order therefore produces the same subsequent eviction
+        // choice in every process.
+        let ordered_keys = self.session_view_order.iter().cloned().collect::<Vec<_>>();
+        for key in ordered_keys {
+            if let Some(rx) = self
+                .session_views
+                .get_mut(&key)
+                .and_then(|context| context.sse_rx.as_mut())
+            {
+                events.extend(
+                    std::iter::from_fn(|| rx.try_recv().ok()).take(MAX_SSE_EVENTS_PER_SUBSCRIPTION),
+                );
+            }
+        }
         for event in events {
             if let Err(e) = self.handle_session_sse_event(event) {
                 self.notify(NoticeLevel::Error, format!("SSE error: {e}"));
@@ -2996,7 +3696,202 @@ impl App {
         }
     }
 
+    fn refresh_evicted_session_statuses(&mut self) {
+        if self.background_status_poll_task.is_some() {
+            return;
+        }
+        let ordered_keys = self.session_view_order.iter().cloned().collect::<Vec<_>>();
+        for key in ordered_keys {
+            let Some(context) = self.session_views.get_mut(&key) else {
+                continue;
+            };
+            if !context
+                .sse_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                continue;
+            }
+            context.sse_task = None;
+            context.sse_tx = None;
+            context.sse_rx = None;
+            context.sse_ready = None;
+            context.sse_epoch = context.sse_epoch.wrapping_add(1);
+            context.pending_reconcile_epoch = context.pending_reconcile_epoch.wrapping_add(1);
+            context.stream_disconnected =
+                context.chat.streaming || context.chat.parent_terminal_pending;
+            context.needs_history_refresh = true;
+        }
+        let targets = self
+            .session_view_order
+            .iter()
+            .filter_map(|key| {
+                let context = self.session_views.get(key)?;
+                let session_id = context.chat.session_id.clone()?;
+                if self.opening_session_id.as_deref() == Some(session_id.as_str()) {
+                    return None;
+                }
+                (context.sse_task.is_none()
+                    && (context.chat.streaming
+                        || context.stream_disconnected
+                        || context.chat.parent_terminal_pending))
+                    .then_some((context.chat.context_id, session_id, context.sse_epoch))
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        self.background_status_poll_epoch = self.background_status_poll_epoch.wrapping_add(1);
+        let epoch = self.background_status_poll_epoch;
+        let observation_epoch = self.next_summary_observation_epoch();
+        let client = self.client.clone();
+        self.background_status_poll_task = Some(tokio::spawn(async move {
+            let mut results = futures::stream::iter(targets.into_iter().enumerate())
+                .map(|(order, (context_id, session_id, stream_epoch))| {
+                    let client = client.clone();
+                    async move {
+                        let result = match tokio::time::timeout(
+                            BACKGROUND_STATUS_POLL_TIMEOUT,
+                            client.get_session(&session_id),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(_) => Err("background status request timed out".to_string()),
+                        };
+                        (order, context_id, session_id, stream_epoch, result)
+                    }
+                })
+                .buffer_unordered(4)
+                .collect::<Vec<_>>()
+                .await;
+            results.sort_by_key(|(order, ..)| *order);
+            let results = results
+                .into_iter()
+                .map(|(_, context_id, session_id, stream_epoch, result)| {
+                    (context_id, session_id, stream_epoch, result)
+                })
+                .collect();
+            let _ = tx.send(AppEvent::BackgroundSessionStatusesLoaded {
+                epoch,
+                observation_epoch,
+                results,
+            });
+        }));
+    }
+
+    fn apply_background_statuses(
+        &mut self,
+        epoch: u64,
+        observation_epoch: u64,
+        results: Vec<(u64, String, u64, Result<SessionSummary, String>)>,
+    ) {
+        if epoch != self.background_status_poll_epoch {
+            return;
+        }
+        self.background_status_poll_task = None;
+        let mut notices = Vec::new();
+        for (context_id, session_id, stream_epoch, result) in results {
+            let Some(context) = self.session_views.get_mut(&session_id) else {
+                continue;
+            };
+            if context.chat.context_id != context_id
+                || context.sse_epoch != stream_epoch
+                || context.sse_task.is_some()
+            {
+                continue;
+            }
+            let previous = Self::activity_from_parts(
+                &context.chat,
+                context.pending_question.is_some() || context.dismissed_question.is_some(),
+                context.stream_disconnected,
+                false,
+                Some(&session_id),
+            )
+            .map(|activity| activity.status)
+            .unwrap_or(SessionActivityStatus::Idle);
+            let Ok(summary) = result else {
+                // Retain the explicit reconnect state. The poll is retried by
+                // the single coordinator rather than creating per-session
+                // retry tasks or repeated error notifications.
+                continue;
+            };
+            let Some(status) =
+                Self::apply_summary_to_cached_context(context, &summary, observation_epoch)
+            else {
+                continue;
+            };
+
+            if status == previous {
+                continue;
+            }
+            if let Some((level, text)) = Self::background_transition_notice(status) {
+                context.chat.background_unread = context.chat.background_unread.saturating_add(1);
+                notices.push((session_id, level, text));
+            }
+        }
+        for (session_id, level, text) in notices {
+            self.notify_background_session(&session_id, level, text);
+        }
+    }
+
+    /// Resolve the session context owned by an async result. `Some(None)` means
+    /// the event is session-scoped but its bounded UI context was evicted, so
+    /// it must be ignored instead of falling through to the visible chat.
+    fn event_context_target(&self, event: &AppEvent) -> Option<Option<u64>> {
+        let session_target = |session_id: &str| self.context_id_for_session(session_id);
+        match event {
+            AppEvent::ChatStarted { context_id, .. } => Some(Some(*context_id)),
+            AppEvent::ExecuteFailed { session_id, .. }
+            | AppEvent::StopFinished { session_id, .. }
+            | AppEvent::PendingQuestionChecked { session_id, .. }
+            | AppEvent::PendingQuestionReconciled { session_id, .. }
+            | AppEvent::PendingQuestionRefreshed { session_id, .. }
+            | AppEvent::ChildApprovalSnapshotLoaded { session_id, .. } => {
+                Some(session_target(session_id))
+            }
+            AppEvent::AnswerSubmitted { identity, .. } => {
+                Some(session_target(&identity.session_id))
+            }
+            _ => None,
+        }
+    }
+
     async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
+        match self.event_context_target(&event) {
+            Some(None) => return Ok(()),
+            Some(Some(context_id)) if context_id != self.chat.context_id => {
+                let Some(background) = self.take_cached_context_id(context_id) else {
+                    return Ok(());
+                };
+                let foreground_status = self.status_message.clone();
+                let foreground_connected = self.connected;
+                let foreground = self.take_active_context();
+                self.install_active_context(background);
+                self.routing_background_session = self
+                    .chat
+                    .session_id
+                    .clone()
+                    .or_else(|| Some(format!("@local:{}", self.chat.context_id)));
+                let result = self.handle_event_current(event).await;
+                self.chat.background_unread = self.chat.background_unread.saturating_add(1);
+                let background = self.take_active_context();
+                self.routing_background_session = None;
+                self.install_active_context(foreground);
+                self.status_message = foreground_status;
+                self.connected = foreground_connected;
+                self.cache_context(background);
+                return result;
+            }
+            _ => {}
+        }
+        self.handle_event_current(event).await
+    }
+
+    async fn handle_event_current(&mut self, event: AppEvent) -> Result<()> {
         if let AppEvent::Resize(width, height) = event {
             self.terminal_width = width;
             self.terminal_height = height;
@@ -3029,10 +3924,18 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await?,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
-            AppEvent::SessionsLoaded(r) => {
+            AppEvent::SessionsLoaded {
+                observation_epoch,
+                result: r,
+            } => {
+                if observation_epoch < self.sessions.summary_observation_epoch {
+                    return Ok(());
+                }
+                self.sessions.summary_observation_epoch = observation_epoch;
                 self.sessions.loading = false;
                 match r {
                     Ok(envelope) => {
+                        self.observe_cached_summaries(&envelope.sessions, observation_epoch);
                         self.sessions.selected = self
                             .sessions
                             .selected
@@ -3548,6 +4451,13 @@ impl App {
                     self.deleting_session_id = None;
                 }
                 let succeeded = result.is_ok();
+                if succeeded {
+                    self.session_view_order
+                        .retain(|existing| existing != &session_id);
+                    if let Some(mut deleted) = self.session_views.remove(&session_id) {
+                        deleted.abort_background_work();
+                    }
+                }
                 let deleted_active =
                     succeeded && self.chat.session_id.as_deref() == Some(session_id.as_str());
                 let deleted_opening =
@@ -3563,13 +4473,21 @@ impl App {
                         .opening_session_id
                         .take()
                         .filter(|opening| opening != &session_id);
-                    self.new_session();
+                    let unrelated_opening_epoch = self.opening_session_epoch;
+                    let unrelated_opening_task = if unrelated_opening.is_some() {
+                        self.opening_session_task.take()
+                    } else {
+                        if let Some(task) = self.opening_session_task.take() {
+                            task.abort();
+                        }
+                        None
+                    };
+                    self.replace_with_new_session(false);
                     self.opening_session_id = unrelated_opening;
+                    self.opening_session_epoch = unrelated_opening_epoch;
+                    self.opening_session_task = unrelated_opening_task;
                 } else if deleted_opening {
-                    // The resume task itself is best-effort and may already
-                    // have queued a result. Clearing its authoritative id
-                    // makes that stale SessionOpened harmless.
-                    self.opening_session_id = None;
+                    self.cancel_opening_session();
                 }
                 match result {
                     Ok(()) => self.notify(
@@ -3611,7 +4529,11 @@ impl App {
                 }
                 self.load_tab_data();
             }
-            AppEvent::ChatStarted { turn_id, result: r } => {
+            AppEvent::ChatStarted {
+                context_id: _,
+                turn_id,
+                result: r,
+            } => {
                 if !self.chat.streaming
                     || self.chat.current_turn_id.as_deref() != Some(turn_id.as_str())
                     || self.chat.stop_requested_turn_id.as_deref() == Some(turn_id.as_str())
@@ -3624,6 +4546,8 @@ impl App {
                             self.clear_child_approval_context();
                         }
                         self.chat.session_id = Some(session_id.clone());
+                        self.chat.history_loaded = true;
+                        self.chat.observed_activity = None;
                         self.rebind_command_palette_to_active_session();
                         self.status_message = "Streaming...".to_string();
                         self.start_stream_and_execute(session_id, turn_id);
@@ -3699,31 +4623,71 @@ impl App {
                 }
                 Err(e) => self.skills.error = Some(e),
             },
-            AppEvent::SessionOpened { session_id, result } => {
-                if self.opening_session_id.as_deref() != Some(session_id.as_str()) {
+            AppEvent::SessionOpened {
+                session_id,
+                epoch,
+                result,
+            } => {
+                if self.opening_session_id.as_deref() != Some(session_id.as_str())
+                    || self.opening_session_epoch != epoch
+                {
                     return Ok(());
+                }
+                if let Some(task) = self.opening_session_task.take() {
+                    task.abort();
                 }
                 self.opening_session_id = None;
                 match result {
                     Ok(opened) => {
-                        self.invalidate_permission_mode_context();
-                        self.clear_child_approval_context();
-                        // Contextual pickers are bound to the chat session
-                        // visible beneath them. A concurrently completing
-                        // resume invalidates that context and any in-flight
-                        // model PATCH result before installing the new session.
-                        if self.session_picker.is_some() {
-                            self.pending_delete = None;
+                        let latest_observation_epoch =
+                            if self.chat.session_id.as_deref() == Some(session_id.as_str()) {
+                                self.chat.latest_summary_observation_epoch
+                            } else {
+                                self.session_views
+                                    .get(&session_id)
+                                    .map(|context| context.chat.latest_summary_observation_epoch)
+                                    .unwrap_or(0)
+                            };
+                        if latest_observation_epoch > epoch {
+                            self.status_message =
+                                "Session changed while loading — refreshing history".to_string();
+                            self.resume_session(session_id);
+                            return Ok(());
                         }
-                        self.close_session_picker();
-                        self.close_model_picker();
-                        self.close_command_palette();
+                        let target_is_active =
+                            self.chat.session_id.as_deref() == Some(session_id.as_str());
+                        let target_context = if target_is_active {
+                            None
+                        } else {
+                            let context_id = self.allocate_context_id();
+                            Some(
+                                self.take_cached_session(&session_id)
+                                    .unwrap_or_else(|| SessionUiContext::blank(context_id)),
+                            )
+                        };
+                        self.prepare_visible_session_switch();
+                        if let Some(target_context) = target_context {
+                            self.park_active_context();
+                            self.install_active_context(target_context);
+                        }
+
                         // Reset every per-run scratch field `finalize_streaming`
                         // would otherwise leave behind from whatever was open
-                        // before — a resumed session must not inherit stale
-                        // in-flight-turn state from a prior chat.
+                        // before. The target context's composer, cursor, scroll,
+                        // and block expansion state deliberately survive an
+                        // authoritative refresh after an evicted subscription.
+                        let scroll_offset = self.chat.scroll_offset;
+                        let auto_scroll = self.chat.auto_scroll;
+                        let block_ui = std::mem::take(&mut self.chat.block_ui);
+                        let focused_block = self.chat.focused_block.take();
+                        self.stash_question_drafts();
+                        self.supersede_pending_answer();
+                        self.clear_child_approval_context();
                         self.detach_stream();
                         self.chat.session_id = Some(session_id.clone());
+                        self.chat.history_loaded = true;
+                        self.chat.observed_activity = None;
+                        self.chat.latest_summary_observation_epoch = epoch;
                         self.chat.model = opened.model;
                         self.chat.provider = opened.provider;
                         self.chat.project_id = opened.project_id;
@@ -3734,20 +4698,25 @@ impl App {
                         self.chat.current_reasoning.clear();
                         self.chat.sub_agents.clear();
                         self.chat.reset_conversation_ui();
+                        self.chat.block_ui = block_ui;
+                        self.chat.focused_block = focused_block;
+                        self.chat.current_terminal_status = opened.last_run_status;
+                        self.chat.parent_terminal_pending =
+                            !opened.is_running && opened.running_child_count > 0;
                         self.chat.token_usage = None;
-                        self.chat.scroll_offset = 0;
+                        self.chat.scroll_offset = scroll_offset;
                         self.chat.streaming = false;
                         self.stream_disconnected = false;
                         self.pending_answer_run_started = false;
-                        self.stash_question_drafts();
-                        self.supersede_pending_answer();
                         self.pending_question = None;
                         self.dismissed_question = None;
+                        self.active_needs_history_refresh = false;
 
                         let shown = opened.messages.len();
                         self.chat.messages = opened.messages;
                         self.sync_conversation_block_ui();
-                        self.chat.auto_scroll = true;
+                        self.chat.auto_scroll = auto_scroll;
+                        self.chat.background_unread = 0;
                         self.tab = Tab::Chat;
                         self.status_message = "Session resumed".to_string();
 
@@ -3765,14 +4734,24 @@ impl App {
                         // it resumes execution inside the respond handler
                         // before that HTTP response returns. Subscribe now so
                         // even an immediate resumed Token/Complete is observed.
-                        if opened.is_running || opened.pending.is_some() {
+                        if opened.is_running
+                            || opened.running_child_count > 0
+                            || opened.pending.is_some()
+                        {
                             self.chat.prepare_replay_reconciliation();
                             self.chat.current_turn_id =
                                 Some(format!("session:{session_id}:active"));
                             self.attach_stream(session_id.clone());
-                            self.chat.streaming = true;
+                            // History was sampled before this subscription was
+                            // installed. Critical replay preserves terminal
+                            // boundaries, but not every token, so a later
+                            // revisit must close that finite attach gap.
+                            self.active_needs_history_refresh = true;
+                            self.chat.streaming = opened.is_running || opened.pending.is_some();
                             self.status_message = if opened.is_running {
                                 "Reattached — streaming".to_string()
+                            } else if opened.running_child_count > 0 {
+                                "Reattached — child agents running".to_string()
                             } else {
                                 "Reattached — waiting for answer".to_string()
                             };
@@ -3790,6 +4769,13 @@ impl App {
                         self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
                     }
                 }
+            }
+            AppEvent::BackgroundSessionStatusesLoaded {
+                epoch,
+                observation_epoch,
+                results,
+            } => {
+                self.apply_background_statuses(epoch, observation_epoch, results);
             }
             AppEvent::PendingQuestionChecked {
                 session_id,
@@ -4033,7 +5019,19 @@ impl App {
                             // running or completed.
                             self.status_message =
                                 format!("Answered: {answer} — reconciling session state");
-                            self.resume_session(identity.session_id.clone());
+                            if self.routing_background_session.is_some() {
+                                // Do not turn a late background answer result
+                                // into a foreground session switch. Mark this
+                                // context stale; selecting it performs the
+                                // authoritative history/summary refresh.
+                                self.active_needs_history_refresh = true;
+                                self.notify(
+                                    NoticeLevel::Info,
+                                    "Decision delivered; reopen to reconcile session state",
+                                );
+                            } else {
+                                self.resume_session(identity.session_id.clone());
+                            }
                             return Ok(());
                         };
                         // Only keep the spinner on if a run is actually
@@ -4293,6 +5291,7 @@ impl App {
             AppEvent::SessionPickerPageLoaded {
                 epoch,
                 offset,
+                observation_epoch,
                 result,
             } => {
                 let retry = self.action_key_phrase(
@@ -4300,6 +5299,16 @@ impl App {
                     ActionId::Refresh,
                     "retries",
                 );
+                if !self
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.epoch == epoch)
+                {
+                    return Ok(());
+                }
+                if let Ok(envelope) = &result {
+                    self.observe_cached_summaries(&envelope.sessions, observation_epoch);
+                }
                 let Some(picker) = self
                     .session_picker
                     .as_mut()
@@ -5273,15 +6282,7 @@ impl App {
     fn action_disabled_reason(&self, action: ActionId) -> Option<&'static str> {
         match action.availability() {
             ActionAvailability::Always => None,
-            ActionAvailability::Idle | ActionAvailability::ChatIdle if self.chat.streaming => {
-                Some("Unavailable while an agent run is active")
-            }
-            ActionAvailability::Idle | ActionAvailability::ChatIdle
-                if self.opening_session_id.is_some() =>
-            {
-                Some("Unavailable while a session is resuming")
-            }
-            ActionAvailability::ChatIdle | ActionAvailability::Chat if self.tab != Tab::Chat => {
+            ActionAvailability::Chat if self.tab != Tab::Chat => {
                 Some("Switch to Chat before using this action")
             }
             ActionAvailability::ActiveRun if !self.chat.streaming => Some("No active run to stop"),
@@ -5516,6 +6517,26 @@ impl App {
             }
             ActionId::JumpFirst => self.notification_scroll = 0,
             ActionId::JumpLast => self.notification_scroll = max,
+            ActionId::Activate => {
+                let session_id = self
+                    .notifications
+                    .iter()
+                    .rev()
+                    .find_map(|notification| notification.session_id.clone());
+                if let Some(session_id) = session_id {
+                    self.notifications_visible = false;
+                    if session_id.starts_with("@local:") {
+                        if !self.activate_cached_session(&session_id) {
+                            self.status_message =
+                                "The originating local chat is no longer cached".to_string();
+                        }
+                    } else {
+                        self.resume_session(session_id);
+                    }
+                } else {
+                    self.status_message = "No background-session notification to open".to_string();
+                }
+            }
             ActionId::Cancel => self.notifications_visible = false,
             _ => {}
         }
@@ -7090,6 +8111,8 @@ impl App {
             Tab::Chat => {}
             Tab::Sessions => {
                 self.sessions.loading = true;
+                let observation_epoch = self.next_summary_observation_epoch();
+                self.sessions.summary_observation_epoch = observation_epoch;
                 let offset = self.sessions.offset;
                 // `0` means "no page size established yet" — let the server
                 // pick its own bounded default rather than guessing one here.
@@ -7099,7 +8122,10 @@ impl App {
                         .list_sessions(limit, Some(offset))
                         .await
                         .map_err(|e| e.to_string());
-                    let _ = tx.send(AppEvent::SessionsLoaded(r));
+                    let _ = tx.send(AppEvent::SessionsLoaded {
+                        observation_epoch,
+                        result: r,
+                    });
                 });
             }
             Tab::Mcp => {
@@ -7323,6 +8349,7 @@ impl App {
         self.status_message = "Sending...".to_string();
 
         let client = self.client.clone();
+        let context_id = self.chat.context_id;
         let existing_session = self.chat.session_id.clone();
         let project_id = self.chat.project_id.clone();
         let provider = self.chat.provider.clone();
@@ -7340,6 +8367,7 @@ impl App {
                 .map(|resp| resp.session_id)
                 .map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::ChatStarted {
+                context_id,
                 turn_id: assistant_turn_id,
                 result,
             });
@@ -7358,7 +8386,7 @@ impl App {
     fn attach_stream(&mut self, session_id: String) -> bool {
         self.detach_stream();
         let stream_epoch = self.sse_epoch;
-        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        let (sse_tx, sse_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         self.sse_tx = Some(sse_tx.clone());
         self.sse_rx = Some(sse_rx);
         self.stream_disconnected = true;
@@ -7367,6 +8395,8 @@ impl App {
             Ok((task, ready)) => {
                 self.sse_task = Some(task);
                 self.sse_ready = Some(ready);
+                self.active_needs_history_refresh = false;
+                self.enforce_subscription_limit();
             }
             Err(error) => {
                 self.detach_stream();
@@ -7473,31 +8503,78 @@ impl App {
     /// by `Enter` on the Sessions tab and by `--session-id` at startup so
     /// there's exactly one resume code path.
     fn resume_session(&mut self, session_id: String) {
-        self.invalidate_permission_mode_context();
-        self.clear_child_approval_context();
+        self.cancel_opening_session();
+        if self.activate_cached_session(&session_id) {
+            return;
+        }
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
+        let summary_observation_epoch = self.next_summary_observation_epoch();
         self.opening_session_id = Some(session_id.clone());
+        self.opening_session_epoch = summary_observation_epoch;
         let client = self.client.clone();
         self.status_message = "Resuming session...".to_string();
-        tokio::spawn(async move {
-            let history = match client.get_history(&session_id).await {
-                Ok(h) => h,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::SessionOpened {
-                        session_id,
-                        result: Err(e.to_string()),
-                    });
-                    return;
+        self.opening_session_task = Some(tokio::spawn(async move {
+            // Bracket history with two summary reads. If completion or a
+            // permission transition lands between them, retry so a terminal
+            // summary can never be paired with a pre-terminal transcript.
+            // A still-running stable snapshot attaches SSE below; its replayed
+            // terminal boundary marks history stale for the next revisit.
+            const MAX_CONSISTENCY_ATTEMPTS: usize = 3;
+            let mut attempt = 0;
+            let (history, summary) = loop {
+                let before = match client.get_session(&session_id).await {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::SessionOpened {
+                            session_id,
+                            epoch: summary_observation_epoch,
+                            result: Err(error.to_string()),
+                        });
+                        return;
+                    }
+                };
+                let history = match client.get_history(&session_id).await {
+                    Ok(history) => history,
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::SessionOpened {
+                            session_id,
+                            epoch: summary_observation_epoch,
+                            result: Err(error.to_string()),
+                        });
+                        return;
+                    }
+                };
+                let after = match client.get_session(&session_id).await {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::SessionOpened {
+                            session_id,
+                            epoch: summary_observation_epoch,
+                            result: Err(error.to_string()),
+                        });
+                        return;
+                    }
+                };
+                let stable = before.is_running == after.is_running
+                    && before.has_pending_question == after.has_pending_question
+                    && before.running_child_count == after.running_child_count
+                    && before.last_run_status == after.last_run_status
+                    && before.message_count == after.message_count
+                    && before.updated_at == after.updated_at;
+                if stable {
+                    break (history, after);
                 }
-            };
-            let summary = match client.get_session(&session_id).await {
-                Ok(s) => s,
-                Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_CONSISTENCY_ATTEMPTS {
                     let _ = tx.send(AppEvent::SessionOpened {
                         session_id,
-                        result: Err(e.to_string()),
+                        epoch: summary_observation_epoch,
+                        result: Err(
+                            "session kept changing while history was loading; retry the open"
+                                .to_string(),
+                        ),
                     });
                     return;
                 }
@@ -7509,10 +8586,22 @@ impl App {
             // chat composer and lose the discoverable retry path.
             let pending = if summary.has_pending_question {
                 match client.get_pending_question(&session_id).await {
-                    Ok(pending) => pending.has_pending_question.then_some(pending),
+                    Ok(pending) if pending.has_pending_question => Some(pending),
+                    Ok(_) => {
+                        let _ = tx.send(AppEvent::SessionOpened {
+                            session_id,
+                            epoch: summary_observation_epoch,
+                            result: Err(
+                                "pending-question state changed while loading; retry the open"
+                                    .to_string(),
+                            ),
+                        });
+                        return;
+                    }
                     Err(error) => {
                         let _ = tx.send(AppEvent::SessionOpened {
                             session_id,
+                            epoch: summary_observation_epoch,
                             result: Err(format!(
                                 "session has a pending question, but its details could not be loaded: {error}"
                             )),
@@ -7542,46 +8631,56 @@ impl App {
                 },
                 bypass_permissions: summary.bypass_permissions,
                 is_running: summary.is_running,
+                running_child_count: summary.running_child_count,
+                last_run_status: summary.last_run_status,
                 pending,
                 truncated: history.truncated,
                 total_message_count: history.total_message_count,
             };
             let _ = tx.send(AppEvent::SessionOpened {
                 session_id,
+                epoch: summary_observation_epoch,
                 result: Ok(opened),
             });
-        });
+        }));
     }
 
-    /// `Ctrl+N`: start a fresh session. Keeps the current model and Project
-    /// membership (the operator picked both deliberately) while dropping
-    /// per-session conversation state.
+    /// `Ctrl+N`: park the exact current context and start a fresh session.
+    /// The new composer inherits the selected model and Project membership;
+    /// every per-session field remains attached to the parked context.
     fn new_session(&mut self) {
-        self.invalidate_permission_mode_context();
-        self.clear_child_approval_context();
-        self.close_command_palette();
+        self.cancel_opening_session();
+        self.replace_with_new_session(true);
+    }
+
+    fn replace_with_new_session(&mut self, preserve_current: bool) {
         self.stash_question_drafts();
-        self.detach_stream();
+        let model = self.chat.model.clone();
+        let provider = self.chat.provider.clone();
+        let project_id = self.chat.project_id.clone();
+        let expand_tools = self.chat.expand_tools;
+        self.prepare_visible_session_switch();
+        let context_id = self.allocate_context_id();
+        let preserved_composer = if preserve_current {
+            self.park_active_context();
+            None
+        } else {
+            let mut discarded = self.take_active_context();
+            let textarea = std::mem::take(&mut discarded.chat.textarea);
+            discarded.abort_background_work();
+            Some(textarea)
+        };
+        self.install_active_context(SessionUiContext::blank(context_id));
+        if let Some(textarea) = preserved_composer {
+            self.chat.textarea = textarea;
+            apply_textarea_palette(&mut self.chat.textarea, self.theme);
+        }
+        self.chat.model = model;
+        self.chat.provider = provider;
+        self.chat.project_id = project_id;
+        self.chat.expand_tools = expand_tools;
         self.opening_session_id = None;
-        self.chat.session_id = None;
-        self.chat.messages.clear();
-        self.chat.current_response.clear();
-        self.chat.current_tool_calls.clear();
-        self.chat.current_reasoning.clear();
-        self.chat.sub_agents.clear();
-        self.chat.reset_conversation_ui();
-        self.chat.token_usage = None;
-        self.chat.scroll_offset = 0;
-        self.chat.auto_scroll = true;
-        self.chat.streaming = false;
-        self.chat.plan_mode = false;
-        self.chat.permission_mode = SessionPermissionMode::Default;
-        self.chat.bypass_permissions = false;
-        self.stream_disconnected = false;
-        self.pending_answer_run_started = false;
-        self.supersede_pending_answer();
-        self.pending_question = None;
-        self.dismissed_question = None;
+        self.tab = Tab::Chat;
         self.status_message = "New session".to_string();
     }
 
@@ -7892,12 +8991,132 @@ impl App {
                     .map(|child| subagent_block_id(&message_id, &child.child_session_id)),
             );
         }
+        let valid = ids.iter().cloned().collect::<HashSet<_>>();
+        self.chat.block_ui.retain(|id, _| valid.contains(id));
+        if self
+            .chat
+            .focused_block
+            .as_ref()
+            .is_some_and(|id| !valid.contains(id))
+        {
+            self.chat.focused_block = None;
+        }
         for id in ids {
             self.chat.register_block(id);
         }
     }
 
     fn handle_session_sse_event(&mut self, message: SessionSseEvent) -> Result<()> {
+        let (session_id, stream_epoch) = match &message {
+            SessionSseEvent::Event {
+                session_id,
+                stream_epoch,
+                ..
+            }
+            | SessionSseEvent::Connected {
+                session_id,
+                stream_epoch,
+                ..
+            }
+            | SessionSseEvent::TransportFailed {
+                session_id,
+                stream_epoch,
+                ..
+            } => (session_id.clone(), *stream_epoch),
+        };
+        if self.chat.session_id.as_deref() == Some(session_id.as_str()) {
+            return self.handle_session_sse_event_current(message);
+        }
+
+        let Some(mut background) = self.take_cached_session(&session_id) else {
+            return Ok(());
+        };
+        if background.sse_epoch != stream_epoch {
+            self.cache_context(background);
+            return Ok(());
+        }
+        let reconnecting = matches!(
+            &message,
+            SessionSseEvent::Connected {
+                reconnecting: true,
+                ..
+            }
+        );
+        let question_event = matches!(
+            &message,
+            SessionSseEvent::Event { event, .. }
+                if matches!(
+                    event.as_ref(),
+                    AgentEvent::NeedClarification { .. }
+                        | AgentEvent::ToolApprovalRequested { .. }
+                        | AgentEvent::ChildApprovalRequested { .. }
+                )
+        );
+        let complete_event = matches!(
+            &message,
+            SessionSseEvent::Event { event, .. }
+                if matches!(event.as_ref(), AgentEvent::Complete { .. })
+        );
+        let cancelled_event = matches!(
+            &message,
+            SessionSseEvent::Event { event, .. }
+                if matches!(event.as_ref(), AgentEvent::Cancelled { .. })
+        );
+        let foreground_status = self.status_message.clone();
+        let foreground_connected = self.connected;
+        let foreground = self.take_active_context();
+        self.install_active_context(background);
+        self.routing_background_session = Some(session_id.clone());
+        let question_before = self
+            .pending_question
+            .as_ref()
+            .or(self.dismissed_question.as_ref())
+            .map(ActiveQuestion::identity);
+        let result = self.handle_session_sse_event_current(message);
+        self.chat.background_unread = self.chat.background_unread.saturating_add(1);
+        let question_after = self
+            .pending_question
+            .as_ref()
+            .or(self.dismissed_question.as_ref())
+            .map(ActiveQuestion::identity);
+        let notice = if reconnecting {
+            Some((NoticeLevel::Info, "Background event stream reconnected"))
+        } else if question_event && (question_after != question_before || question_after.is_none())
+        {
+            Some((
+                NoticeLevel::Warn,
+                "Background session is waiting for a decision",
+            ))
+        } else if complete_event && !self.chat.streaming && !self.chat.parent_terminal_pending {
+            Some((NoticeLevel::Info, "Background run completed"))
+        } else if complete_event && self.chat.parent_terminal_pending {
+            Some((
+                NoticeLevel::Info,
+                "Background parent completed; child agents are still running",
+            ))
+        } else if cancelled_event && !self.chat.parent_terminal_pending {
+            Some((NoticeLevel::Info, "Background run cancelled"))
+        } else if cancelled_event {
+            Some((
+                NoticeLevel::Info,
+                "Background parent cancelled; child agents are still running",
+            ))
+        } else {
+            None
+        };
+        if let Some((level, text)) = notice {
+            self.notify(level, text);
+        }
+        background = self.take_active_context();
+        self.routing_background_session = None;
+        self.install_active_context(foreground);
+        self.status_message = foreground_status;
+        self.connected = foreground_connected;
+        self.cache_context(background);
+        result
+    }
+
+    fn handle_session_sse_event_current(&mut self, message: SessionSseEvent) -> Result<()> {
         match message {
             SessionSseEvent::Event {
                 session_id,
@@ -7909,6 +9128,7 @@ impl App {
                 {
                     return Ok(());
                 }
+                self.chat.observed_activity = None;
                 self.handle_sse_event(*event)
             }
             SessionSseEvent::Connected {
@@ -7923,8 +9143,10 @@ impl App {
                 }
                 self.connected = true;
                 self.stream_disconnected = false;
+                self.chat.observed_activity = None;
                 if reconnecting {
                     self.status_message = "SSE reconnected — synchronizing".to_string();
+                    self.active_needs_history_refresh = true;
                     self.chat.note_update();
                 }
                 // Answer submission deliberately attaches a fresh stream
@@ -7961,6 +9183,7 @@ impl App {
                 self.detach_stream();
                 self.connected = false;
                 self.stream_disconnected = true;
+                self.active_needs_history_refresh = true;
                 self.chat.note_update();
                 self.notify(NoticeLevel::Error, format!("SSE disconnected: {message}"));
                 Ok(())
@@ -8986,16 +10209,37 @@ impl App {
     /// Record a notification in the scrollback log and mirror it to the
     /// transient status line. Warn/error entries bump the unseen-alert badge
     /// until the log is opened. The log is capped so it can't grow unbounded.
+    fn notify_background_session(
+        &mut self,
+        session_key: &str,
+        level: NoticeLevel,
+        text: impl Into<String>,
+    ) {
+        let previous = self
+            .routing_background_session
+            .replace(session_key.to_string());
+        self.notify(level, text);
+        self.routing_background_session = previous;
+    }
+
     fn notify(&mut self, level: NoticeLevel, text: impl Into<String>) {
-        let text = text.into();
+        let mut text = text.into();
+        if let Some(session) = &self.routing_background_session {
+            text = format!("[{}] {text}", short_session_id(session));
+        }
         if matches!(level, NoticeLevel::Warn | NoticeLevel::Error) {
             self.unseen_alerts = self.unseen_alerts.saturating_add(1);
         }
-        self.status_message = text.clone();
+        // Background work belongs in the durable notification log, but must
+        // never overwrite the transient status of the session on screen.
+        if self.routing_background_session.is_none() {
+            self.status_message = text.clone();
+        }
         self.notifications.push(Notification {
             level,
             text,
             at: Utc::now(),
+            session_id: self.routing_background_session.clone(),
         });
         const CAP: usize = 200;
         if self.notifications.len() > CAP {
@@ -9688,6 +10932,7 @@ impl App {
         };
         picker.loading = true;
         let limit = (picker.page_limit > 0).then_some(picker.page_limit);
+        let observation_epoch = self.next_summary_observation_epoch();
         let client = self.client.clone();
         self.session_picker_task = Some(tokio::spawn(async move {
             let result = client
@@ -9697,6 +10942,7 @@ impl App {
             let _ = tx.send(AppEvent::SessionPickerPageLoaded {
                 epoch,
                 offset,
+                observation_epoch,
                 result,
             });
         }));
@@ -12607,6 +13853,7 @@ mod question_tests {
         app.opening_session_id = Some("parent-new".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "parent-new".to_string(),
+            epoch: 0,
             result: Ok(opened(Vec::new())),
         })
         .await
@@ -12951,6 +14198,7 @@ mod question_tests {
         app.opening_session_id = Some("new-session".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "new-session".to_string(),
+            epoch: 0,
             result: Ok(opened(Vec::new())),
         })
         .await
@@ -13461,6 +14709,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-2".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-2".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13469,6 +14718,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: None,
                 truncated: false,
                 total_message_count: 0,
@@ -13479,6 +14730,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13487,6 +14739,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
                     question: "Run this command?".to_string(),
@@ -13536,6 +14790,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-2".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-2".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13544,6 +14799,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: None,
                 truncated: false,
                 total_message_count: 0,
@@ -13555,6 +14812,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13563,6 +14821,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
                     question: "Run this command?".to_string(),
@@ -13597,6 +14857,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-2".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-2".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13605,6 +14866,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: None,
                 truncated: false,
                 total_message_count: 0,
@@ -13616,6 +14879,7 @@ mod question_tests {
         app.opening_session_id = Some("sess-1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "sess-1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 messages: Vec::new(),
                 model: "model".to_string(),
@@ -13624,6 +14888,8 @@ mod question_tests {
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
                 is_running: false,
+                running_child_count: 0,
+                last_run_status: None,
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
                     question: "Run this command?".to_string(),
@@ -13825,17 +15091,17 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                1_936_576_969_800_014_661,
-                1_016_179_694_983_859_781,
-                13_759_760_406_078_337_809,
-                15_644_719_068_043_203_690,
-                12_374_578_251_050_668_689,
-                10_606_193_947_057_757_885,
-                16_216_417_660_881_801_177,
-                4_665_899_664_404_951_094,
-                16_412_116_153_658_708_020,
-                14_760_809_148_065_562_377,
-                8_317_322_361_854_739_360,
+                12_013_467_434_067_207_854,
+                1_057_473_937_556_339_135,
+                1_502_110_673_089_046_554,
+                14_484_161_115_671_232_577,
+                4_091_854_584_326_177_690,
+                16_229_128_572_274_018_012,
+                10_493_202_686_479_633_261,
+                9_858_505_864_262_550_789,
+                8_710_182_394_295_884_107,
+                1_923_556_055_944_460_855,
+                3_245_283_921_451_133_623,
             ],
             "minimum-size modal golden changed"
         );
@@ -14632,6 +15898,7 @@ mod question_tests {
             provider: None,
             is_running: false,
             has_pending_question: false,
+            running_child_count: 0,
             last_run_status: None,
             updated_at: None,
             message_count: 0,
@@ -14645,13 +15912,16 @@ mod question_tests {
     async fn loaded_event_applies_to_state_and_clears_loading() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.sessions.loading = true;
-        app.handle_event(AppEvent::SessionsLoaded(Ok(ListSessionsEnvelope {
-            sessions: vec![bare_session("s1")],
-            total: 1,
-            limit: 200,
-            offset: 0,
-            next_offset: None,
-        })))
+        app.handle_event(AppEvent::SessionsLoaded {
+            observation_epoch: 1,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("s1")],
+                total: 1,
+                limit: 200,
+                offset: 0,
+                next_offset: None,
+            }),
+        })
         .await
         .unwrap();
         assert!(!app.sessions.loading, "loading flag must clear");
@@ -14663,11 +15933,50 @@ mod question_tests {
 
         // Error result surfaces on the tab and clears loading.
         app.sessions.loading = true;
-        app.handle_event(AppEvent::SessionsLoaded(Err("boom".into())))
-            .await
-            .unwrap();
+        app.handle_event(AppEvent::SessionsLoaded {
+            observation_epoch: 2,
+            result: Err("boom".into()),
+        })
+        .await
+        .unwrap();
         assert!(!app.sessions.loading);
         assert_eq!(app.sessions.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn sessions_list_drops_an_older_response_that_finishes_last() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.sessions.loading = true;
+        app.sessions.summary_observation_epoch = 2;
+
+        app.handle_event(AppEvent::SessionsLoaded {
+            observation_epoch: 2,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("new")],
+                total: 1,
+                limit: 200,
+                offset: 0,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::SessionsLoaded {
+            observation_epoch: 1,
+            result: Ok(ListSessionsEnvelope {
+                sessions: vec![bare_session("stale")],
+                total: 1,
+                limit: 200,
+                offset: 0,
+                next_offset: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.sessions.sessions.len(), 1);
+        assert_eq!(app.sessions.sessions[0].id, "new");
+        assert_eq!(app.sessions.summary_observation_epoch, 2);
     }
 
     /// `]` advances to the next page only when the server reported one; `[`
@@ -14833,6 +16142,7 @@ mod question_tests {
 
         app.handle_event(AppEvent::SessionOpened {
             session_id: "delete-me".to_string(),
+            epoch: 0,
             result: Ok(opened(vec![asst_msg("must stay stale")])),
         })
         .await
@@ -16897,8 +18207,10 @@ mod question_tests {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
         app.chat.current_turn_id = Some("live:assistant:7".to_string());
+        let context_id = app.chat.context_id;
 
         app.handle_event(AppEvent::ChatStarted {
+            context_id,
             turn_id: "live:assistant:7".to_string(),
             result: Err("server unavailable".to_string()),
         })
@@ -16924,8 +18236,10 @@ mod question_tests {
         app.chat.current_turn_id = Some("new-turn".to_string());
         app.chat.current_response = "new partial".to_string();
         app.status_message = "Streaming new turn".to_string();
+        let context_id = app.chat.context_id;
 
         app.handle_event(AppEvent::ChatStarted {
+            context_id,
             turn_id: "old-turn".to_string(),
             result: Ok("stale-session".to_string()),
         })
@@ -16961,7 +18275,9 @@ mod question_tests {
             app.chat.stop_requested_turn_id.as_deref(),
             Some("turn-being-stopped")
         );
+        let context_id = app.chat.context_id;
         app.handle_event(AppEvent::ChatStarted {
+            context_id,
             turn_id: "turn-being-stopped".to_string(),
             result: Ok("existing-session".to_string()),
         })
@@ -17085,6 +18401,8 @@ mod question_tests {
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             is_running: false,
+            running_child_count: 0,
+            last_run_status: None,
             pending: None,
             truncated: false,
             total_message_count: 0,
@@ -17240,6 +18558,7 @@ mod question_tests {
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
+            epoch: 0,
             result: Ok(opened(vec![asst_msg("hello again")])),
         })
         .await
@@ -17291,6 +18610,7 @@ mod question_tests {
 
         app.handle_event(AppEvent::SessionOpened {
             session_id: "older".to_string(),
+            epoch: 0,
             result: Ok(opened(vec![asst_msg("stale")])),
         })
         .await
@@ -17300,6 +18620,7 @@ mod question_tests {
 
         app.handle_event(AppEvent::SessionOpened {
             session_id: "newest".to_string(),
+            epoch: 0,
             result: Ok(opened(vec![asst_msg("fresh")])),
         })
         .await
@@ -17310,10 +18631,120 @@ mod question_tests {
     }
 
     #[tokio::test]
-    async fn opening_a_stopped_session_detaches_the_previous_stream() {
+    async fn older_success_for_the_same_session_cannot_satisfy_a_newer_open() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current".to_string());
+        app.opening_session_id = Some("target".to_string());
+        app.opening_session_epoch = 2;
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "target".to_string(),
+            epoch: 1,
+            result: Ok(opened(vec![asst_msg("stale")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("current"));
+        assert_eq!(app.opening_session_id.as_deref(), Some("target"));
+        assert_eq!(app.opening_session_epoch, 2);
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "target".to_string(),
+            epoch: 2,
+            result: Ok(opened(vec![asst_msg("fresh")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("target"));
+        assert_eq!(app.chat.messages[0].content, "fresh");
+        assert!(app.opening_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn older_failure_for_the_same_session_cannot_cancel_a_newer_open() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("current".to_string());
+        app.opening_session_id = Some("target".to_string());
+        app.opening_session_epoch = 2;
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "target".to_string(),
+            epoch: 1,
+            result: Err("stale failure".to_string()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.opening_session_id.as_deref(), Some("target"));
+        assert!(app.notifications.is_empty());
+
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "target".to_string(),
+            epoch: 2,
+            result: Ok(opened(vec![asst_msg("fresh")])),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("target"));
+        assert_eq!(app.chat.messages[0].content, "fresh");
+        assert!(app.opening_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_resume_aborts_the_previous_network_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_test_http_path(&mut socket).await,
+                    "/api/v1/sessions/target"
+                );
+                sockets.push(socket);
+                accepted_tx.send(index).unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+        app.resume_session("target".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .expect("first request should connect")
+            .expect("server signal should remain open");
+        let first = app
+            .opening_session_task
+            .as_ref()
+            .expect("first resume task tracked")
+            .abort_handle();
+        let first_epoch = app.opening_session_epoch;
+
+        app.resume_session("target".to_string());
+        tokio::time::timeout(std::time::Duration::from_secs(5), accepted_rx.recv())
+            .await
+            .expect("replacement request should connect")
+            .expect("server signal should remain open");
+        tokio::task::yield_now().await;
+
+        assert!(
+            first.is_finished(),
+            "superseded resume task must be aborted"
+        );
+        assert!(app.opening_session_task.is_some());
+        assert!(app.opening_session_epoch > first_epoch);
+        assert_eq!(app.opening_session_id.as_deref(), Some("target"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opening_another_session_keeps_the_previous_stream_in_background() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("old".to_string());
-        let (sse_tx, sse_rx) = mpsc::unbounded_channel::<SessionSseEvent>();
+        let (sse_tx, sse_rx) = mpsc::channel::<SessionSseEvent>(SESSION_SSE_CHANNEL_CAPACITY);
         let old_tx = sse_tx.clone();
         app.sse_tx = Some(sse_tx);
         app.sse_rx = Some(sse_rx);
@@ -17322,17 +18753,21 @@ mod question_tests {
 
         app.handle_event(AppEvent::SessionOpened {
             session_id: "new".to_string(),
+            epoch: 0,
             result: Ok(opened(vec![])),
         })
         .await
         .unwrap();
 
-        assert!(app.sse_tx.is_none());
-        assert!(app.sse_rx.is_none());
-        assert!(app.sse_task.is_none());
+        assert!(app.sse_tx.is_none(), "new stopped session has no stream");
+        assert!(app.sse_rx.is_none(), "new stopped session has no receiver");
+        assert!(app.sse_task.is_none(), "new stopped session has no task");
+        let parked = app.session_views.get("old").expect("old session parked");
+        assert!(parked.sse_task.is_some());
+        assert!(parked.sse_rx.is_some());
         assert!(
-            old_tx.is_closed(),
-            "the old SSE sender must lose its receiver"
+            !old_tx.is_closed(),
+            "the old SSE sender remains observed in the background"
         );
     }
 
@@ -17381,7 +18816,7 @@ mod question_tests {
         }
         let identity = question_identity(&app);
         let epoch = app.answer_epoch;
-        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        let (sse_tx, sse_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         app.sse_tx = Some(sse_tx);
         app.sse_rx = Some(sse_rx);
         app.sse_task = Some(tokio::spawn(std::future::pending()));
@@ -17444,7 +18879,7 @@ mod question_tests {
         app.chat.textarea.input(key(KeyCode::Char('n')));
         app.chat.textarea.input(key(KeyCode::Char('e')));
         app.chat.textarea.input(key(KeyCode::Char('w')));
-        let (sse_tx, sse_rx) = mpsc::unbounded_channel();
+        let (sse_tx, sse_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         app.sse_tx = Some(sse_tx);
         app.sse_rx = Some(sse_rx);
         app.sse_task = Some(tokio::spawn(std::future::pending()));
@@ -17724,7 +19159,7 @@ mod question_tests {
         // Model the dangerous old state: readiness is still true and the task
         // is still live, but its pause Complete is already queued for the UI.
         let old_epoch = app.sse_epoch;
-        let (old_tx, old_rx) = mpsc::unbounded_channel();
+        let (old_tx, old_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         old_tx
             .send(SessionSseEvent::Event {
                 session_id: "sess-1".to_string(),
@@ -17737,6 +19172,7 @@ mod question_tests {
                     },
                 }),
             })
+            .await
             .unwrap();
         app.sse_tx = Some(old_tx);
         app.sse_rx = Some(old_rx);
@@ -17833,7 +19269,7 @@ mod question_tests {
         app.chat.session_id = Some("sess-gap".to_string());
         let (app_tx, mut app_rx) = mpsc::unbounded_channel();
         app.event_tx = Some(app_tx);
-        let (sse_tx, mut sse_rx) = mpsc::unbounded_channel();
+        let (sse_tx, mut sse_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         let (sse_task, _ready) = SseStream::start(&base_url, "sess-gap", 0, sse_tx).unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -17994,7 +19430,7 @@ mod question_tests {
         app.chat.session_id = Some("sess-initial-gap".to_string());
         let (app_tx, mut app_rx) = mpsc::unbounded_channel();
         app.event_tx = Some(app_tx);
-        let (sse_tx, mut sse_rx) = mpsc::unbounded_channel();
+        let (sse_tx, mut sse_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         let (sse_task, _ready) =
             SseStream::start(&base_url, "sess-initial-gap", 0, sse_tx).unwrap();
 
@@ -18056,6 +19492,7 @@ mod question_tests {
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 is_running: true,
                 ..opened(vec![])
@@ -18068,6 +19505,40 @@ mod question_tests {
         assert_eq!(app.status_message, "Reattached — streaming");
     }
 
+    #[tokio::test]
+    async fn session_opened_reattaches_for_running_children_without_locking_composer() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.opening_session_id = Some("parent".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "parent".to_string(),
+            epoch: 0,
+            result: Ok(OpenedSession {
+                running_child_count: 1,
+                last_run_status: Some("completed".to_string()),
+                ..opened(vec![])
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.chat.parent_terminal_pending);
+        assert!(
+            !app.chat.streaming,
+            "a terminal parent must leave the composer usable"
+        );
+        assert!(app.active_needs_history_refresh);
+        assert_eq!(app.status_message, "Reattached — child agents running");
+        assert!(app.sse_task.is_some(), "child-only work must reattach SSE");
+        assert_eq!(
+            app.session_activity("parent").unwrap().status,
+            SessionActivityStatus::Disconnected,
+            "the strip stays explicit about reconnecting until Connected arrives"
+        );
+    }
+
     /// A truncated resume surfaces "showing last N of M" as an Info
     /// notification.
     #[tokio::test]
@@ -18077,6 +19548,7 @@ mod question_tests {
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 truncated: true,
                 total_message_count: 5000,
@@ -18099,6 +19571,7 @@ mod question_tests {
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 pending: Some(PendingQuestion {
                     has_pending_question: true,
@@ -18132,6 +19605,7 @@ mod question_tests {
         app.opening_session_id = Some("s1".to_string());
         app.handle_event(AppEvent::SessionOpened {
             session_id: "s1".to_string(),
+            epoch: 0,
             result: Err("not found".to_string()),
         })
         .await
@@ -18164,6 +19638,14 @@ mod question_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
+            let summary_body = r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":true,"message_count":0}}"#;
+            let (mut summary_before, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut summary_before).await,
+                "/api/v1/sessions/s1"
+            );
+            respond_test_http(&mut summary_before, "application/json", summary_body).await;
+
             let (mut history, _) = listener.accept().await.unwrap();
             assert_eq!(
                 read_test_http_path(&mut history).await,
@@ -18176,17 +19658,12 @@ mod question_tests {
             )
             .await;
 
-            let (mut summary, _) = listener.accept().await.unwrap();
+            let (mut summary_after, _) = listener.accept().await.unwrap();
             assert_eq!(
-                read_test_http_path(&mut summary).await,
+                read_test_http_path(&mut summary_after).await,
                 "/api/v1/sessions/s1"
             );
-            respond_test_http(
-                &mut summary,
-                "application/json",
-                r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":true}}"#,
-            )
-            .await;
+            respond_test_http(&mut summary_after, "application/json", summary_body).await;
 
             let (mut pending, _) = listener.accept().await.unwrap();
             assert_eq!(
@@ -18217,6 +19694,7 @@ mod question_tests {
             AppEvent::SessionOpened {
                 session_id,
                 result: Err(error),
+                ..
             } if session_id == "s1" && error.contains("pending question")
         ));
         app.handle_event(event).await.unwrap();
@@ -18227,6 +19705,181 @@ mod question_tests {
             .notifications
             .last()
             .is_some_and(|notice| notice.text.contains("pending question")));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_retries_when_completion_lands_between_history_and_summary() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let running = r#"{"session":{"id":"s1","model":"model","is_running":true,"has_pending_question":false,"message_count":1}}"#;
+            let completed = r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","message_count":2}}"#;
+            let early_history = r#"{"session_id":"s1","messages":[{"id":"u1","role":"user","content":"prompt"}],"truncated":false,"total_message_count":1}"#;
+            let final_history = r#"{"session_id":"s1","messages":[{"id":"u1","role":"user","content":"prompt"},{"id":"a1","role":"assistant","content":"final answer"}],"truncated":false,"total_message_count":2}"#;
+            for (path, body) in [
+                ("/api/v1/sessions/s1", running),
+                ("/api/v1/history/s1", early_history),
+                ("/api/v1/sessions/s1", completed),
+                ("/api/v1/sessions/s1", completed),
+                ("/api/v1/history/s1", final_history),
+                ("/api/v1/sessions/s1", completed),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.resume_session("s1".to_string());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume should finish")
+            .expect("event channel should remain open");
+        let AppEvent::SessionOpened {
+            result: Ok(opened), ..
+        } = &event
+        else {
+            panic!("expected successful session open");
+        };
+        assert_eq!(
+            opened
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prompt", "final answer"]
+        );
+        app.handle_event(event).await.unwrap();
+        assert_eq!(app.chat.messages.len(), 2);
+        assert_eq!(app.chat.messages[1].content, "final answer");
+        assert!(!app.active_needs_history_refresh);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_retries_when_summary_timestamp_changes_without_count_change() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let before = r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","message_count":1,"updated_at":"2026-08-15T01:00:00Z"}}"#;
+            let after = r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","message_count":1,"updated_at":"2026-08-15T01:00:01Z"}}"#;
+            let stale_history = r#"{"session_id":"s1","messages":[{"id":"a1","role":"assistant","content":"stale tool state"}],"truncated":false,"total_message_count":1}"#;
+            let fresh_history = r#"{"session_id":"s1","messages":[{"id":"a1","role":"assistant","content":"fresh tool state"}],"truncated":false,"total_message_count":1}"#;
+            for (path, body) in [
+                ("/api/v1/sessions/s1", before),
+                ("/api/v1/history/s1", stale_history),
+                ("/api/v1/sessions/s1", after),
+                ("/api/v1/sessions/s1", after),
+                ("/api/v1/history/s1", fresh_history),
+                ("/api/v1/sessions/s1", after),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.resume_session("s1".to_string());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume should finish")
+            .expect("event channel should remain open");
+        let AppEvent::SessionOpened {
+            result: Ok(opened), ..
+        } = event
+        else {
+            panic!("expected successful session open");
+        };
+        assert_eq!(opened.messages.len(), 1);
+        assert_eq!(opened.messages[0].content, "fresh tool state");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_retries_when_running_child_count_changes_during_history_fetch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let child_running = r#"{"session":{"id":"parent","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","running_child_count":1,"message_count":1,"updated_at":"2026-08-15T01:00:00Z"}}"#;
+            let child_done = r#"{"session":{"id":"parent","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","running_child_count":0,"message_count":1,"updated_at":"2026-08-15T01:00:00Z"}}"#;
+            let early_history = r#"{"session_id":"parent","messages":[{"id":"a1","role":"assistant","content":"child running"}],"truncated":false,"total_message_count":1}"#;
+            let final_history = r#"{"session_id":"parent","messages":[{"id":"a1","role":"assistant","content":"child finished"}],"truncated":false,"total_message_count":1}"#;
+            for (path, body) in [
+                ("/api/v1/sessions/parent", child_running),
+                ("/api/v1/history/parent", early_history),
+                ("/api/v1/sessions/parent", child_done),
+                ("/api/v1/sessions/parent", child_done),
+                ("/api/v1/history/parent", final_history),
+                ("/api/v1/sessions/parent", child_done),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.resume_session("parent".to_string());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume should finish")
+            .expect("event channel should remain open");
+        let AppEvent::SessionOpened {
+            result: Ok(opened), ..
+        } = event
+        else {
+            panic!("expected successful session open");
+        };
+        assert_eq!(opened.running_child_count, 0);
+        assert_eq!(opened.messages[0].content, "child finished");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_accepts_stable_summary_when_history_hides_internal_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let summary = r#"{"session":{"id":"s1","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","message_count":2}}"#;
+            let visible_history = r#"{"session_id":"s1","messages":[{"id":"a1","role":"assistant","content":"visible answer"}],"truncated":false,"total_message_count":1}"#;
+            for (path, body) in [
+                ("/api/v1/sessions/s1", summary),
+                ("/api/v1/history/s1", visible_history),
+                ("/api/v1/sessions/s1", summary),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(read_test_http_path(&mut socket).await, path);
+                respond_test_http(&mut socket, "application/json", body).await;
+            }
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+        app.resume_session("s1".to_string());
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("resume should finish without retrying visible history")
+            .expect("event channel should remain open");
+        let AppEvent::SessionOpened {
+            result: Ok(opened), ..
+        } = event
+        else {
+            panic!("expected successful session open");
+        };
+        assert_eq!(opened.total_message_count, 1);
+        assert_eq!(opened.messages.len(), 1);
+        assert_eq!(opened.messages[0].content, "visible answer");
         server.await.unwrap();
     }
 
@@ -18281,19 +19934,29 @@ mod question_tests {
         assert_eq!(app.status_message, "New session");
     }
 
-    /// `Ctrl+N` is a no-op while a run is streaming (must stop it explicitly
-    /// first, same as every other destructive Sessions/Chat action).
+    /// `Ctrl+N` parks a running session without stopping it and opens an
+    /// isolated composer for the next session.
     #[tokio::test]
-    async fn ctrl_n_is_noop_while_streaming() {
+    async fn ctrl_n_parks_streaming_session_and_opens_fresh_context() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.streaming = true;
+        app.chat.history_loaded = true;
         app.chat.session_id = Some("s1".to_string());
+        app.chat.textarea.input(key(KeyCode::Char('a')));
+        app.chat.scroll_offset = 7;
+        let old_context_id = app.chat.context_id;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
             .await
             .unwrap();
 
-        assert_eq!(app.chat.session_id.as_deref(), Some("s1"));
+        assert!(app.chat.session_id.is_none());
+        assert!(!app.chat.streaming);
+        assert_ne!(app.chat.context_id, old_context_id);
+        let parked = app.session_views.get("s1").expect("running view parked");
+        assert!(parked.chat.streaming);
+        assert_eq!(parked.chat.textarea.lines().join("\n"), "a");
+        assert_eq!(parked.chat.scroll_offset, 7);
     }
 
     /// Esc dismisses the question modal but caches it; the resolved reopen
@@ -18606,14 +20269,14 @@ mod question_tests {
     }
 
     #[tokio::test]
-    async fn ctrl_p_is_ignored_while_streaming() {
+    async fn ctrl_p_opens_session_switcher_while_streaming() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.streaming = true;
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
             .await
             .unwrap();
-        assert!(app.session_picker.is_none());
+        assert!(app.session_picker.is_some());
     }
 
     #[tokio::test]
@@ -18665,6 +20328,7 @@ mod question_tests {
         app.handle_event(AppEvent::SessionPickerPageLoaded {
             epoch: 7,
             offset: 0,
+            observation_epoch: 1,
             result: Ok(ListSessionsEnvelope {
                 sessions: vec![bare_session("s1"), bare_session("s2")],
                 total: 3,
@@ -18678,6 +20342,7 @@ mod question_tests {
         app.handle_event(AppEvent::SessionPickerPageLoaded {
             epoch: 7,
             offset: 2,
+            observation_epoch: 2,
             result: Ok(ListSessionsEnvelope {
                 sessions: vec![bare_session("s2"), bare_session("s3")],
                 total: 3,
@@ -18691,6 +20356,7 @@ mod question_tests {
         app.handle_event(AppEvent::SessionPickerPageLoaded {
             epoch: 6,
             offset: 0,
+            observation_epoch: 3,
             result: Ok(ListSessionsEnvelope {
                 sessions: vec![bare_session("stale")],
                 total: 1,
@@ -18726,6 +20392,7 @@ mod question_tests {
         app.handle_event(AppEvent::SessionPickerPageLoaded {
             epoch: 7,
             offset: 1,
+            observation_epoch: 1,
             result: Err("offline".to_string()),
         })
         .await
@@ -18752,6 +20419,7 @@ mod question_tests {
             app.handle_event(AppEvent::SessionPickerPageLoaded {
                 epoch: 7,
                 offset,
+                observation_epoch: offset as u64 + 1,
                 result: Ok(ListSessionsEnvelope {
                     sessions,
                     total: 2,
@@ -18788,6 +20456,7 @@ mod question_tests {
         app.handle_event(AppEvent::SessionPickerPageLoaded {
             epoch: 7,
             offset: 2,
+            observation_epoch: 1,
             result: Ok(ListSessionsEnvelope {
                 sessions: vec![bare_session("active")],
                 total: 3,
@@ -19307,8 +20976,8 @@ mod question_tests {
         }
     }
 
-    /// `Ctrl+O` opens the picker only on the Chat tab, and only when idle —
-    /// same rationale as `Ctrl+N` being a no-op while streaming.
+    /// `Ctrl+O` opens the picker only on the Chat tab. A running session may
+    /// still choose the model explicitly for its next turn.
     #[tokio::test]
     async fn ctrl_o_opens_model_picker_on_chat_tab_only() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
@@ -19330,14 +20999,14 @@ mod question_tests {
     }
 
     #[tokio::test]
-    async fn ctrl_o_ignored_while_streaming() {
+    async fn ctrl_o_targets_visible_session_while_streaming() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.tab = Tab::Chat;
         app.chat.streaming = true;
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
             .await
             .unwrap();
-        assert!(app.model_picker.is_none());
+        assert!(app.model_picker.is_some());
     }
 
     #[tokio::test]
@@ -19446,6 +21115,7 @@ mod question_tests {
 
         app.handle_event(AppEvent::SessionOpened {
             session_id: "session-b".to_string(),
+            epoch: 0,
             result: Ok(OpenedSession {
                 model: "model-b".to_string(),
                 provider: Some("provider-b".to_string()),
@@ -19812,6 +21482,753 @@ mod question_tests {
             "catalog failed",
         ] {
             assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn two_session_streams_reduce_out_of_order_without_foreground_overwrite() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-a".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-a".to_string());
+        app.chat.model = "model-a".to_string();
+        app.chat.permission_mode = SessionPermissionMode::Auto;
+        app.chat.messages.push(asst_msg("A history"));
+        app.chat.textarea.input(key(KeyCode::Char('a')));
+        app.chat.scroll_offset = 13;
+        app.chat.auto_scroll = false;
+        app.sse_epoch = 11;
+        let (a_tx, a_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
+        app.sse_tx = Some(a_tx);
+        app.sse_rx = Some(a_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+
+        app.new_session();
+        app.chat.session_id = Some("session-b".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-b".to_string());
+        app.chat.model = "model-b".to_string();
+        app.chat.permission_mode = SessionPermissionMode::Bypass;
+        app.chat.bypass_permissions = true;
+        app.chat.textarea.input(key(KeyCode::Char('b')));
+        app.chat.scroll_offset = 4;
+        app.sse_epoch = 22;
+        let (b_tx, b_rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
+        app.sse_tx = Some(b_tx);
+        app.sse_rx = Some(b_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "session-a".to_string(),
+            stream_epoch: 11,
+            event: Box::new(AgentEvent::Token {
+                content: "alpha".to_string(),
+            }),
+        })
+        .unwrap();
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "session-b".to_string(),
+            stream_epoch: 22,
+            event: Box::new(AgentEvent::Token {
+                content: "beta".to_string(),
+            }),
+        })
+        .unwrap();
+        // A queued event from A's superseded generation is ignored even while
+        // B remains the foreground session.
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "session-a".to_string(),
+            stream_epoch: 10,
+            event: Box::new(AgentEvent::Token {
+                content: "stale".to_string(),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-b"));
+        assert_eq!(app.chat.current_response, "beta");
+        assert_eq!(app.chat.textarea.lines().join("\n"), "b");
+        let a = app.session_views.get("session-a").unwrap();
+        assert_eq!(a.chat.current_response, "alpha");
+        assert_eq!(a.chat.textarea.lines().join("\n"), "a");
+        assert_eq!(a.chat.scroll_offset, 13);
+        assert_eq!(a.chat.background_unread, 1);
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "session-a".to_string(),
+            stream_epoch: 11,
+            event: Box::new(AgentEvent::Complete {
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-b"));
+        assert!(app.chat.streaming, "B keeps running after A completes");
+        let completion = app
+            .notifications
+            .last()
+            .expect("background completion notice");
+        assert_eq!(completion.session_id.as_deref(), Some("session-a"));
+        assert!(completion.text.contains("Background run completed"));
+
+        app.notifications_visible = true;
+        app.handle_notifications_key(key(KeyCode::Enter));
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-a"));
+        assert_eq!(app.chat.textarea.lines().join("\n"), "a");
+        assert_eq!(app.chat.scroll_offset, 13);
+        assert_eq!(app.chat.model, "model-a");
+        assert_eq!(app.chat.permission_mode, SessionPermissionMode::Auto);
+        assert!(!app.chat.streaming);
+        assert_eq!(app.chat.messages.last().unwrap().content, "alpha");
+        let b = app
+            .session_views
+            .get("session-b")
+            .expect("B parked on jump");
+        assert!(b.chat.streaming);
+        assert_eq!(b.chat.current_response, "beta");
+        assert_eq!(b.chat.textarea.lines().join("\n"), "b");
+        assert_eq!(b.chat.model, "model-b");
+        assert_eq!(b.chat.permission_mode, SessionPermissionMode::Bypass);
+    }
+
+    #[tokio::test]
+    async fn background_permission_is_queued_for_its_session_and_marks_unread() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("permission-a".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.sse_epoch = 5;
+        app.new_session();
+        app.chat.session_id = Some("visible-b".to_string());
+        app.chat.history_loaded = true;
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "permission-a".to_string(),
+            stream_epoch: 5,
+            event: Box::new(AgentEvent::NeedClarification {
+                question: "Allow command?".to_string(),
+                options: Some(vec!["Allow".to_string(), "Deny".to_string()]),
+                tool_call_id: Some("permission-1".to_string()),
+                tool_name: Some("execute_command".to_string()),
+                allow_custom: false,
+                source: Some("permission".to_string()),
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("visible-b"));
+        assert!(app.pending_question.is_none());
+        let permission = app.session_views.get("permission-a").unwrap();
+        assert!(permission.pending_question.is_some());
+        assert_eq!(permission.chat.background_unread, 1);
+        let activity = app.session_activity("permission-a").unwrap();
+        assert_eq!(activity.status, SessionActivityStatus::Waiting);
+        let notice = app.notifications.last().expect("permission notification");
+        assert_eq!(notice.session_id.as_deref(), Some("permission-a"));
+        assert_eq!(notice.level, NoticeLevel::Warn);
+
+        let notices_before_pause_complete = app.notifications.len();
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "permission-a".to_string(),
+            stream_epoch: 5,
+            event: Box::new(AgentEvent::Complete {
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            }),
+        })
+        .unwrap();
+        assert!(app.session_views["permission-a"].chat.streaming);
+        assert!(!app.notifications[notices_before_pause_complete..]
+            .iter()
+            .any(|notice| notice.text.contains("Background run completed")));
+    }
+
+    #[tokio::test]
+    async fn background_delete_and_late_chat_failure_never_mutate_visible_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-a".to_string());
+        let context_a = app.chat.context_id;
+        app.new_session();
+        app.chat.session_id = Some("visible-b".to_string());
+        app.chat.history_loaded = true;
+        app.chat.messages.push(asst_msg("B stays"));
+
+        app.handle_event(AppEvent::ChatStarted {
+            context_id: context_a,
+            turn_id: "turn-a".to_string(),
+            result: Err("late failure".to_string()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.chat.session_id.as_deref(), Some("visible-b"));
+        assert_eq!(app.chat.messages[0].content, "B stays");
+
+        app.chat.streaming = false;
+        app.new_session();
+        app.chat.session_id = Some("visible-c".to_string());
+        app.chat.history_loaded = true;
+        app.handle_event(AppEvent::SessionDeleted {
+            session_id: "visible-b".to_string(),
+            result: Ok(()),
+            session_picker_epoch: None,
+        })
+        .await
+        .unwrap();
+        assert!(!app.session_views.contains_key("visible-b"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("visible-c"));
+    }
+
+    #[tokio::test]
+    async fn failed_background_first_chat_can_be_reopened_from_its_notification() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-local".to_string());
+        app.chat.messages.push(asst_msg("original prompt"));
+        let origin_context_id = app.chat.context_id;
+
+        app.new_session();
+        app.chat.session_id = Some("visible-session".to_string());
+        app.chat.history_loaded = true;
+        app.handle_event(AppEvent::ChatStarted {
+            context_id: origin_context_id,
+            turn_id: "turn-local".to_string(),
+            result: Err("creation failed".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("visible-session"));
+        let notification = app.notifications.last().expect("failure notification");
+        let local_key = format!("@local:{origin_context_id}");
+        assert_eq!(notification.session_id.as_deref(), Some(local_key.as_str()));
+
+        app.notifications_visible = true;
+        app.handle_notifications_key(key(KeyCode::Enter));
+        assert_eq!(app.chat.context_id, origin_context_id);
+        assert!(app.chat.session_id.is_none());
+        assert_eq!(app.chat.messages[0].content, "original prompt");
+        assert!(app
+            .chat
+            .messages
+            .last()
+            .and_then(|message| message.terminal_status.as_deref())
+            .is_some_and(|status| status.contains("creation failed")));
+    }
+
+    #[tokio::test]
+    async fn late_stop_result_finalizes_only_the_origin_session() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("stop-a".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-a".to_string());
+        app.chat.current_response = "A partial".to_string();
+        app.sse_epoch = 41;
+        app.new_session();
+
+        app.chat.session_id = Some("run-b".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-b".to_string());
+        app.chat.current_response = "B partial".to_string();
+        app.sse_epoch = 52;
+
+        app.handle_event(AppEvent::StopFinished {
+            session_id: "stop-a".to_string(),
+            turn_id: "turn-a".to_string(),
+            stream_epoch: 41,
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("run-b"));
+        assert!(app.chat.streaming);
+        assert_eq!(app.chat.current_response, "B partial");
+        let stopped = app.session_views.get("stop-a").unwrap();
+        assert!(!stopped.chat.streaming);
+        assert_eq!(
+            stopped
+                .chat
+                .messages
+                .last()
+                .unwrap()
+                .terminal_status
+                .as_deref(),
+            Some("stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_subscription_revisit_replaces_history_without_duplicates() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("stale-a".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.chat.current_turn_id = Some("turn-a".to_string());
+        app.chat.messages.push(asst_msg("old persisted"));
+        app.chat.current_response = "possibly duplicated partial".to_string();
+        app.chat.textarea.input(key(KeyCode::Char('d')));
+        app.chat.scroll_offset = 8;
+        app.sse_epoch = 9;
+        app.new_session();
+        app.chat.session_id = Some("visible-b".to_string());
+        app.chat.history_loaded = true;
+
+        {
+            let stale = app.session_views.get_mut("stale-a").unwrap();
+            stale.needs_history_refresh = true;
+            stale.stream_disconnected = true;
+        }
+        assert!(!app.activate_cached_session("stale-a"));
+        assert_eq!(app.chat.session_id.as_deref(), Some("visible-b"));
+
+        app.opening_session_id = Some("stale-a".to_string());
+        app.handle_event(AppEvent::SessionOpened {
+            session_id: "stale-a".to_string(),
+            epoch: 0,
+            result: Ok(opened(vec![asst_msg("authoritative once")])),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("stale-a"));
+        assert_eq!(app.chat.messages.len(), 1);
+        assert_eq!(app.chat.messages[0].content, "authoritative once");
+        assert!(app.chat.current_response.is_empty());
+        assert_eq!(app.chat.textarea.lines().join("\n"), "d");
+        assert_eq!(app.chat.scroll_offset, 8);
+        assert!(!app.active_needs_history_refresh);
+    }
+
+    #[tokio::test]
+    async fn evicted_runs_use_one_status_path_for_reconnect_terminal_and_permission_updates() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        for index in 0..10_u64 {
+            app.chat.session_id = Some(format!("session-{index:02}"));
+            app.chat.history_loaded = true;
+            app.chat.streaming = true;
+            app.chat.current_turn_id = Some(format!("turn-{index}"));
+            app.sse_epoch = index + 1;
+            let (tx, rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
+            app.sse_tx = Some(tx);
+            app.sse_rx = Some(rx);
+            app.sse_task = Some(tokio::spawn(std::future::pending()));
+            app.new_session();
+        }
+        let target = |app: &App, id: &str| {
+            let context = app.session_views.get(id).expect("cached session");
+            assert!(context.sse_task.is_none(), "old subscription was evicted");
+            (context.chat.context_id, context.sse_epoch)
+        };
+        let (complete_context, complete_epoch) = target(&app, "session-00");
+        let (permission_context, permission_epoch) = target(&app, "session-01");
+        let summary = |id: &str,
+                       is_running: bool,
+                       has_pending_question: bool,
+                       last_run_status: Option<&str>| {
+            let mut summary = bare_session(id);
+            summary.is_running = is_running;
+            summary.has_pending_question = has_pending_question;
+            summary.last_run_status = last_run_status.map(str::to_string);
+            summary
+        };
+
+        app.background_status_poll_epoch = 1;
+        app.apply_background_statuses(
+            1,
+            1,
+            vec![
+                (
+                    complete_context,
+                    "session-00".to_string(),
+                    complete_epoch,
+                    Ok(summary("session-00", true, false, None)),
+                ),
+                (
+                    permission_context,
+                    "session-01".to_string(),
+                    permission_epoch,
+                    Ok(summary("session-01", true, false, None)),
+                ),
+            ],
+        );
+        assert_eq!(
+            app.session_activity("session-00").unwrap().status,
+            SessionActivityStatus::Running
+        );
+        assert!(app
+            .notifications
+            .iter()
+            .any(|notice| notice.session_id.as_deref() == Some("session-00")
+                && notice.text.contains("monitoring restored")));
+
+        app.background_status_poll_epoch = 2;
+        app.apply_background_statuses(
+            2,
+            2,
+            vec![
+                (
+                    complete_context,
+                    "session-00".to_string(),
+                    complete_epoch,
+                    Ok(summary("session-00", false, false, Some("completed"))),
+                ),
+                (
+                    permission_context,
+                    "session-01".to_string(),
+                    permission_epoch,
+                    Ok(summary("session-01", false, true, None)),
+                ),
+            ],
+        );
+        assert_eq!(
+            app.session_activity("session-00").unwrap().status,
+            SessionActivityStatus::Completed
+        );
+        assert_eq!(
+            app.session_activity("session-01").unwrap().status,
+            SessionActivityStatus::Waiting
+        );
+        assert!(app.notifications.iter().any(|notice| {
+            notice.session_id.as_deref() == Some("session-01") && notice.level == NoticeLevel::Warn
+        }));
+
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Approve?".to_string(),
+            allow_custom: true,
+            interaction_kind: Some(PendingInteractionKind::Clarification),
+            ..Default::default()
+        };
+        app.session_views
+            .get_mut("session-01")
+            .unwrap()
+            .pending_question = Some(ActiveQuestion::from_pending(
+            "poll-question".to_string(),
+            "session-01".to_string(),
+            &pending,
+            String::new(),
+        ));
+
+        app.background_status_poll_epoch = 3;
+        app.apply_background_statuses(
+            3,
+            3,
+            vec![(
+                permission_context,
+                "session-01".to_string(),
+                permission_epoch,
+                Ok(summary("session-01", false, false, Some("failed"))),
+            )],
+        );
+        assert_eq!(
+            app.session_activity("session-01").unwrap().status,
+            SessionActivityStatus::Failed
+        );
+        assert!(app.session_views["session-01"].pending_question.is_none());
+        assert!(app.notifications.iter().any(|notice| {
+            notice.session_id.as_deref() == Some("session-01") && notice.level == NoticeLevel::Error
+        }));
+        let fresh_row = summary("session-01", false, false, Some("completed"));
+        assert_eq!(
+            app.session_activity_for_summary(&fresh_row).unwrap().status,
+            SessionActivityStatus::Completed,
+            "a fresh Sessions/picker summary outranks stale non-live cache state"
+        );
+        assert_eq!(app.status_message, "New session");
+    }
+
+    #[tokio::test]
+    async fn evicted_parent_stays_running_until_its_last_child_finishes() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("parent".to_string());
+        app.chat.history_loaded = true;
+        app.chat.parent_terminal_pending = true;
+        app.chat.current_terminal_status = Some("completed".to_string());
+        app.new_session();
+
+        let context = app.session_views.get("parent").expect("cached parent");
+        let context_id = context.chat.context_id;
+        let stream_epoch = context.sse_epoch;
+        let mut summary = bare_session("parent");
+        summary.last_run_status = Some("completed".to_string());
+        summary.running_child_count = 1;
+
+        app.background_status_poll_epoch = 1;
+        app.apply_background_statuses(
+            1,
+            1,
+            vec![(
+                context_id,
+                "parent".to_string(),
+                stream_epoch,
+                Ok(summary.clone()),
+            )],
+        );
+
+        let context = app.session_views.get("parent").unwrap();
+        assert!(context.chat.parent_terminal_pending);
+        assert_eq!(
+            app.session_activity("parent").unwrap().status,
+            SessionActivityStatus::Running
+        );
+        assert!(!app
+            .notifications
+            .iter()
+            .any(|notice| notice.text.contains("Background run completed")));
+
+        summary.running_child_count = 0;
+        app.background_status_poll_epoch = 2;
+        app.apply_background_statuses(
+            2,
+            2,
+            vec![(context_id, "parent".to_string(), stream_epoch, Ok(summary))],
+        );
+
+        let context = app.session_views.get("parent").unwrap();
+        assert!(!context.chat.parent_terminal_pending);
+        assert_eq!(
+            app.session_activity("parent").unwrap().status,
+            SessionActivityStatus::Completed
+        );
+        assert!(app.notifications.iter().any(|notice| {
+            notice.session_id.as_deref() == Some("parent")
+                && notice.text.contains("Background run completed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn older_poll_cannot_roll_back_a_newer_sessions_summary() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("race".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.new_session();
+        let context = app.session_views.get("race").unwrap();
+        let context_id = context.chat.context_id;
+        let stream_epoch = context.sse_epoch;
+
+        let mut newer_running = bare_session("race");
+        newer_running.is_running = true;
+        app.observe_cached_summaries(&[newer_running], 2);
+
+        let mut stale_completed = bare_session("race");
+        stale_completed.last_run_status = Some("completed".to_string());
+        app.background_status_poll_epoch = 1;
+        app.apply_background_statuses(
+            1,
+            1,
+            vec![(
+                context_id,
+                "race".to_string(),
+                stream_epoch,
+                Ok(stale_completed),
+            )],
+        );
+
+        let context = app.session_views.get("race").unwrap();
+        assert_eq!(context.chat.latest_summary_observation_epoch, 2);
+        assert!(context.chat.streaming);
+        assert_eq!(
+            app.session_activity("race").unwrap().status,
+            SessionActivityStatus::Running
+        );
+        assert!(!app
+            .notifications
+            .iter()
+            .any(|notice| notice.text.contains("Background run completed")));
+    }
+
+    #[tokio::test]
+    async fn status_poll_skips_a_session_while_authoritative_resume_is_loading() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("opening".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.new_session();
+        app.opening_session_id = Some("opening".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(tx);
+
+        app.refresh_evicted_session_statuses();
+
+        assert!(app.background_status_poll_task.is_none());
+        assert_eq!(app.background_status_poll_epoch, 0);
+        assert_eq!(app.summary_observation_epoch, 0);
+    }
+
+    #[test]
+    fn fresh_row_recovers_active_disconnected_status_without_live_sse() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("active".to_string());
+        app.chat.streaming = true;
+        app.stream_disconnected = true;
+        let mut summary = bare_session("active");
+        summary.last_run_status = Some("completed".to_string());
+
+        assert_eq!(
+            app.session_activity_for_summary(&summary).unwrap().status,
+            SessionActivityStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn evicted_status_refresh_uses_one_in_flight_coordinator() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_test_http_path(&mut socket).await,
+                "/api/v1/sessions/polled"
+            );
+            respond_test_http(
+                &mut socket,
+                "application/json",
+                r#"{"session":{"id":"polled","model":"model","is_running":false,"has_pending_question":false,"last_run_status":"completed","message_count":2}}"#,
+            )
+            .await;
+        });
+
+        let mut app = App::new(BambooClient::new(&base_url));
+        app.chat.session_id = Some("polled".to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.new_session();
+        app.session_views
+            .get_mut("polled")
+            .unwrap()
+            .stream_disconnected = true;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        app.event_tx = Some(event_tx);
+
+        app.refresh_evicted_session_statuses();
+        app.refresh_evicted_session_statuses();
+        assert_eq!(app.background_status_poll_epoch, 1);
+        assert!(app.background_status_poll_task.is_some());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("status poll should finish")
+            .expect("event loop should stay open");
+        app.handle_event(event).await.unwrap();
+        assert!(app.background_status_poll_task.is_none());
+        assert_eq!(
+            app.session_activity("polled").unwrap().status,
+            SessionActivityStatus::Completed
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn many_sessions_keep_state_and_subscription_resources_bounded() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        for index in 0..40_u64 {
+            app.chat.session_id = Some(format!("session-{index:02}"));
+            app.chat.history_loaded = true;
+            app.chat.streaming = true;
+            app.chat.current_turn_id = Some(format!("turn-{index}"));
+            app.sse_epoch = index + 1;
+            let (tx, rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
+            app.sse_tx = Some(tx);
+            app.sse_rx = Some(rx);
+            app.sse_task = Some(tokio::spawn(std::future::pending()));
+            app.new_session();
+        }
+
+        assert!(app.session_views.len() <= MAX_SESSION_UI_STATES);
+        assert_eq!(app.session_view_order.len(), app.session_views.len());
+        let subscriptions = app
+            .session_views
+            .values()
+            .filter(|context| context.sse_task.is_some())
+            .count()
+            + usize::from(app.sse_task.is_some());
+        assert!(subscriptions <= MAX_SESSION_SUBSCRIPTIONS);
+        assert!(app
+            .session_views
+            .values()
+            .filter_map(|context| context.sse_tx.as_ref())
+            .all(|sender| sender.max_capacity() == SESSION_SSE_CHANNEL_CAPACITY));
+        assert!(!app.session_views.contains_key("session-00"));
+        assert!(app
+            .session_views
+            .values()
+            .any(|context| context.needs_history_refresh));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(app.session_strip_activities().len() <= MAX_SESSION_SUBSCRIPTIONS);
+    }
+
+    #[tokio::test]
+    async fn background_sse_drain_preserves_explicit_lru_order() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        for index in 0..3_u64 {
+            let session_id = format!("ordered-{index}");
+            app.chat.session_id = Some(session_id.clone());
+            app.chat.history_loaded = true;
+            app.chat.streaming = true;
+            app.chat.current_turn_id = Some(format!("turn-{index}"));
+            app.sse_epoch = index + 1;
+            let (tx, rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
+            app.sse_tx = Some(tx);
+            app.sse_rx = Some(rx);
+            app.sse_task = Some(tokio::spawn(std::future::pending()));
+            app.new_session();
+        }
+
+        for index in 0..3_u64 {
+            let session_id = format!("ordered-{index}");
+            let sender = app
+                .session_views
+                .get(&session_id)
+                .and_then(|context| context.sse_tx.clone())
+                .expect("cached sender");
+            sender
+                .send(SessionSseEvent::Event {
+                    session_id,
+                    stream_epoch: index + 1,
+                    event: Box::new(AgentEvent::Token {
+                        content: index.to_string(),
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+        app.poll_sse();
+
+        assert_eq!(
+            app.session_view_order.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "ordered-0".to_string(),
+                "ordered-1".to_string(),
+                "ordered-2".to_string(),
+            ]
+        );
+        for index in 0..3_u64 {
+            let session_id = format!("ordered-{index}");
+            assert_eq!(
+                app.session_views[&session_id].chat.current_response,
+                index.to_string()
+            );
         }
     }
 }

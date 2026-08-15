@@ -236,8 +236,6 @@ pub(crate) struct ActionSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionAvailability {
     Always,
-    Idle,
-    ChatIdle,
     ActiveRun,
     Chat,
 }
@@ -312,9 +310,9 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
     spec!(
         NewSession,
         "New session",
-        "Clear conversation state and start a fresh session",
+        "Start fresh and keep the current session in background",
         true,
-        Idle,
+        Always,
         [Global],
         [(Global, "Ctrl+N; Leader n")]
     ),
@@ -331,7 +329,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Select model",
         "Choose a provider-qualified model",
         true,
-        ChatIdle,
+        Chat,
         [Global],
         [(Global, "Ctrl+O; Leader m")]
     ),
@@ -340,7 +338,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Open session",
         "Search and resume an existing session",
         true,
-        ChatIdle,
+        Chat,
         [Global],
         [(Global, "Ctrl+P; Leader p")]
     ),
@@ -635,6 +633,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionCustom,
             QuestionNumber,
             ConversationBlock,
+            Notifications,
             Sessions,
             Mcp,
             ScheduleForm,
@@ -650,6 +649,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionCustom, "Enter"),
             (QuestionNumber, "Enter"),
             (ConversationBlock, "Enter"),
+            (Notifications, "Enter"),
             (Sessions, "Enter"),
             (Mcp, "Enter"),
             (ScheduleForm, "Enter"),

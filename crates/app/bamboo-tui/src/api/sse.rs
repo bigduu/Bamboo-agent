@@ -6,6 +6,11 @@ use super::types::AgentEvent;
 
 pub struct SseStream;
 
+/// A slow renderer must apply backpressure to the HTTP reader instead of
+/// accumulating an unbounded token/tool-output queue in memory. Eight live
+/// subscriptions therefore retain at most 2,048 pending frames in total.
+pub const SESSION_SSE_CHANNEL_CAPACITY: usize = 256;
+
 #[derive(Debug)]
 pub enum SessionSseEvent {
     Event {
@@ -42,7 +47,7 @@ impl SseStream {
         base_url: &str,
         session_id: &str,
         stream_epoch: u64,
-        tx: mpsc::UnboundedSender<SessionSseEvent>,
+        tx: mpsc::Sender<SessionSseEvent>,
     ) -> Result<(tokio::task::JoinHandle<()>, watch::Receiver<bool>)> {
         let url = format!("{}/api/v1/events/{}", base_url, session_id);
         let session_id = session_id.to_string();
@@ -82,6 +87,7 @@ impl SseStream {
                         stream_epoch,
                         message: "SSE stream lost and reconnect gave up after retries".to_string(),
                     })
+                    .await
                     .ok();
                     return;
                 }
@@ -103,7 +109,7 @@ impl SseStream {
         session_id: &str,
         stream_epoch: u64,
         reconnecting: bool,
-        tx: &mpsc::UnboundedSender<SessionSseEvent>,
+        tx: &mpsc::Sender<SessionSseEvent>,
         ready_tx: &watch::Sender<bool>,
     ) -> bool {
         let resp = match client.get(url).send().await {
@@ -122,6 +128,7 @@ impl SseStream {
                     stream_epoch,
                     message: format!("SSE connection failed: {} - {}", status, body),
                 })
+                .await
                 .ok();
                 return true;
             }
@@ -138,6 +145,7 @@ impl SseStream {
                 stream_epoch,
                 reconnecting,
             })
+            .await
             .is_err()
         {
             return true;
@@ -168,7 +176,7 @@ impl SseStream {
                     // network chunks.
                     continue;
                 };
-                if Self::parse_sse_block(event_text, session_id, stream_epoch, tx) {
+                if Self::parse_sse_block(event_text, session_id, stream_epoch, tx).await {
                     return true; // protocol sentinel delivered
                 }
             }
@@ -181,11 +189,11 @@ impl SseStream {
     /// not necessarily close the transport: the server keeps the session SSE
     /// alive while background children emit lifecycle events. Only the
     /// protocol `[DONE]` sentinel (or a closed receiver) ends this consumer.
-    fn parse_sse_block(
+    async fn parse_sse_block(
         block: &str,
         session_id: &str,
         stream_epoch: u64,
-        tx: &mpsc::UnboundedSender<SessionSseEvent>,
+        tx: &mpsc::Sender<SessionSseEvent>,
     ) -> bool {
         for line in block.lines() {
             // Skip comments (heartbeat, etc.)
@@ -206,6 +214,7 @@ impl SseStream {
                             stream_epoch,
                             event: Box::new(event),
                         })
+                        .await
                         .is_err()
                     {
                         return true; // receiver gone — stop
@@ -235,13 +244,14 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[test]
-    fn parse_block_only_closes_on_done_sentinel() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+    #[tokio::test]
+    async fn parse_block_only_closes_on_done_sentinel() {
+        let (tx, mut rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
 
         // A token is not terminal.
         let terminal =
-            SseStream::parse_sse_block(r#"data: {"type":"token","content":"hi"}"#, "s1", 7, &tx);
+            SseStream::parse_sse_block(r#"data: {"type":"token","content":"hi"}"#, "s1", 7, &tx)
+                .await;
         assert!(!terminal);
         let event = rx.try_recv().unwrap();
         assert!(matches!(
@@ -254,13 +264,8 @@ mod tests {
         ));
 
         // A heartbeat comment / keepalive is skipped, not terminal.
-        assert!(!SseStream::parse_sse_block(": heartbeat", "s1", 7, &tx));
-        assert!(!SseStream::parse_sse_block(
-            "data: [KEEPALIVE]",
-            "s1",
-            7,
-            &tx
-        ));
+        assert!(!SseStream::parse_sse_block(": heartbeat", "s1", 7, &tx).await);
+        assert!(!SseStream::parse_sse_block("data: [KEEPALIVE]", "s1", 7, &tx).await);
         assert!(rx.try_recv().is_err());
 
         // Parent completion is forwarded but the transport remains open for
@@ -270,7 +275,8 @@ mod tests {
             "s1",
             7,
             &tx,
-        );
+        )
+        .await;
         assert!(!terminal);
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -285,7 +291,8 @@ mod tests {
             "s1",
             7,
             &tx,
-        ));
+        )
+        .await);
         assert!(matches!(
             rx.try_recv().unwrap(),
             SessionSseEvent::Event {
@@ -294,20 +301,51 @@ mod tests {
             } if matches!(event.as_ref(), AgentEvent::SubAgentCompleted { .. })
         ));
 
-        assert!(SseStream::parse_sse_block("data: [DONE]", "s1", 7, &tx));
+        assert!(SseStream::parse_sse_block("data: [DONE]", "s1", 7, &tx).await);
     }
 
-    #[test]
-    fn closed_receiver_is_reported_terminal() {
-        let (tx, rx) = mpsc::unbounded_channel::<SessionSseEvent>();
+    #[tokio::test]
+    async fn closed_receiver_is_reported_terminal() {
+        let (tx, rx) = mpsc::channel::<SessionSseEvent>(1);
         drop(rx);
         // With no receiver, sending fails and the block reports "stop".
-        assert!(SseStream::parse_sse_block(
-            r#"data: {"type":"token","content":"x"}"#,
-            "s1",
-            1,
-            &tx
-        ));
+        assert!(
+            SseStream::parse_sse_block(r#"data: {"type":"token","content":"x"}"#, "s1", 1, &tx)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_channel_backpressures_the_http_reader() {
+        let (tx, mut rx) = mpsc::channel::<SessionSseEvent>(1);
+        assert!(
+            !SseStream::parse_sse_block(
+                r#"data: {"type":"token","content":"first"}"#,
+                "s1",
+                1,
+                &tx,
+            )
+            .await
+        );
+
+        let blocked_tx = tx.clone();
+        let blocked = tokio::spawn(async move {
+            SseStream::parse_sse_block(
+                r#"data: {"type":"token","content":"second"}"#,
+                "s1",
+                1,
+                &blocked_tx,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "the producer must wait for capacity"
+        );
+        assert!(rx.recv().await.is_some());
+        assert!(!blocked.await.unwrap());
+        assert!(rx.recv().await.is_some());
     }
 
     #[tokio::test]
@@ -350,7 +388,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(SESSION_SSE_CHANNEL_CAPACITY);
         let (task, _ready) = SseStream::start(&base_url, "unicode", 42, tx).unwrap();
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())

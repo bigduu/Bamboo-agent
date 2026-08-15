@@ -10,12 +10,12 @@ use unicode_width::UnicodeWidthChar;
 use crate::api::types::PermissionDecisionKind;
 use crate::app::{
     ActiveQuestion, ActiveQuestionKind, App, CommandPaletteEntry, CommandPaletteHitbox,
-    CommandPaletteTrigger, NoticeLevel, PermissionStage, QuestionOptionHitbox, SessionPickerMode,
-    Tab,
+    CommandPaletteTrigger, NoticeLevel, PermissionStage, QuestionOptionHitbox,
+    SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
-use crate::ui::sessions::{session_row_line, truncate_cells};
+use crate::ui::sessions::{session_row_line_with_activity, truncate_cells};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -36,6 +36,7 @@ pub fn layout_mode(area: Rect) -> LayoutMode {
 
 pub struct AppLayout {
     pub content: Rect,
+    pub session_strip: Rect,
     pub input: Rect,
     pub status_info: Rect,
     pub status_tabs: Rect,
@@ -54,6 +55,7 @@ pub fn app_layout(area: Rect, app: &App) -> AppLayout {
         .constraints(if show_input {
             vec![
                 Constraint::Min(1),
+                Constraint::Length(1), // active/background session strip
                 Constraint::Length(input_height),
                 Constraint::Length(1), // status info
                 Constraint::Length(1), // status tabs
@@ -70,18 +72,69 @@ pub fn app_layout(area: Rect, app: &App) -> AppLayout {
     if show_input {
         AppLayout {
             content: vertical[0],
-            input: vertical[1],
-            status_info: vertical[2],
-            status_tabs: vertical[3],
+            session_strip: vertical[1],
+            input: vertical[2],
+            status_info: vertical[3],
+            status_tabs: vertical[4],
         }
     } else {
         AppLayout {
             content: vertical[0],
+            session_strip: Rect::default(),
             input: Rect::default(),
             status_info: vertical[1],
             status_tabs: vertical[2],
         }
     }
+}
+
+pub fn render_session_strip(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        format!(
+            " {} sessions",
+            app.key_hint(ActionContext::Global, ActionId::OpenSessionPicker)
+        ),
+        Style::default().fg(colors::subtle()),
+    )];
+    let mut used = spans[0].content.chars().count();
+    for activity in app.session_strip_activities() {
+        let unread = if activity.unread > 0 {
+            format!("+{}", activity.unread)
+        } else {
+            String::new()
+        };
+        let marker = if activity.active { "◆" } else { "" };
+        let item = format!(
+            " {marker}{} {}{unread}",
+            short_session_id(&activity.session_id),
+            activity.status.glyph(),
+        );
+        if used + item.chars().count() > area.width as usize {
+            break;
+        }
+        used += item.chars().count();
+        let color = match activity.status {
+            SessionActivityStatus::Running => colors::tool_running(),
+            SessionActivityStatus::Waiting => colors::warning(),
+            SessionActivityStatus::Completed => colors::success(),
+            SessionActivityStatus::Failed => colors::error(),
+            SessionActivityStatus::Disconnected => colors::warning(),
+            SessionActivityStatus::Idle => colors::inactive(),
+        };
+        let mut style = Style::default().fg(color);
+        if activity.active || activity.unread > 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(item, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id
+        .strip_prefix("@local:")
+        .map(|id| format!("draft:{id}"))
+        .unwrap_or_else(|| session_id.chars().take(8).collect())
 }
 
 pub fn render_terminal_too_small(f: &mut Frame, app: &App) {
@@ -639,11 +692,12 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
         )));
     }
     lines.push(Line::raw(format!(
-        "  {}/{} · {}/{} · {} close",
+        "  {}/{} · {}/{} · {} jump to latest session · {} close",
         app.key_hint(ActionContext::Notifications, ActionId::NavigateUp),
         app.key_hint(ActionContext::Notifications, ActionId::NavigateDown),
         app.key_hint(ActionContext::Notifications, ActionId::PageUp),
         app.key_hint(ActionContext::Notifications, ActionId::PageDown),
+        app.key_hint(ActionContext::Notifications, ActionId::Activate),
         app.key_hint(ActionContext::Notifications, ActionId::Cancel),
     )));
 
@@ -1928,10 +1982,11 @@ pub fn render_session_picker(f: &mut Frame, app: &App) {
                         .get(visible_index)
                         .and_then(|index| picker.sessions.get(*index))
                     {
-                        lines.push(session_row_line(
+                        lines.push(session_row_line_with_activity(
                             session,
                             visible_index == picker.selected,
                             row_width,
+                            app.session_activity_for_summary(session),
                         ));
                     }
                 }
@@ -2817,7 +2872,7 @@ mod tests {
                 6_299_991_410_263_413_121,
             ],
             [
-                4_770_761_534_398_976_274,
+                2_517_265_782_827_400_128,
                 6_453_233_658_533_265_880,
                 9_926_554_654_485_580_947,
                 13_088_776_314_879_203_646,
@@ -2825,7 +2880,7 @@ mod tests {
                 3_944_301_344_853_503_540,
             ],
             [
-                8_172_607_251_902_550_761,
+                6_353_706_855_117_373_427,
                 4_949_655_866_133_198_277,
                 10_134_078_088_138_427_242,
                 11_816_528_128_860_418_159,
@@ -2833,7 +2888,7 @@ mod tests {
                 12_446_404_274_958_450_273,
             ],
             [
-                14_040_822_986_534_502_348,
+                609_548_665_447_335_598,
                 15_455_926_307_789_286_752,
                 15_067_376_218_731_150_667,
                 3_277_314_811_073_656_778,
@@ -2841,7 +2896,7 @@ mod tests {
                 11_436_591_821_112_263_934,
             ],
             [
-                4_354_590_130_364_386_112,
+                9_618_507_591_432_411_738,
                 18_322_932_115_686_371_420,
                 13_335_556_050_296_598_231,
                 15_586_733_975_648_698_454,
@@ -2928,9 +2983,9 @@ mod tests {
         assert_eq!(
             fingerprints,
             [
-                7_698_068_719_230_116_139,
-                1_749_609_507_150_741_583,
-                5_610_873_700_364_300_705,
+                17_991_098_218_976_020_060,
+                8_889_104_856_394_915_189,
+                1_188_897_666_786_120_771,
             ],
             "full-buffer theme golden changed"
         );
@@ -2996,7 +3051,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [132_796_132_005_702_974, 2_553_641_780_655_268_506],
+            [17_065_867_340_943_315_060, 12_487_818_554_989_084_324,],
             "complete help-overlay buffer golden changed"
         );
     }

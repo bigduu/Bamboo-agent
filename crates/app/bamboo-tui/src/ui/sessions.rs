@@ -5,7 +5,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::types::SessionSummary;
-use crate::app::App;
+use crate::app::{App, SessionActivity, SessionActivityStatus};
 use crate::keymap::{ActionContext, ActionId};
 use crate::text;
 use crate::theme::colors;
@@ -108,7 +108,12 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         .take(visible.end)
         .skip(visible.start)
     {
-        lines.push(session_row_line(session, i == selected, chunks[1].width));
+        lines.push(session_row_line_with_activity(
+            session,
+            i == selected,
+            chunks[1].width,
+            app.session_activity_for_summary(session),
+        ));
     }
 
     let list = Paragraph::new(lines);
@@ -217,10 +222,20 @@ fn session_header(width: u16) -> Line<'static> {
 /// Adaptive row shared by the full Sessions tab and the contextual overlay.
 /// Width is measured in terminal cells so long Unicode titles never shift the
 /// model/status columns or make a 60-column picker unusable.
+#[cfg(test)]
 pub(crate) fn session_row_line(
     session: &SessionSummary,
     selected: bool,
     width: u16,
+) -> Line<'static> {
+    session_row_line_with_activity(session, selected, width, None)
+}
+
+pub(crate) fn session_row_line_with_activity(
+    session: &SessionSummary,
+    selected: bool,
+    width: u16,
+    activity: Option<SessionActivity>,
 ) -> Line<'static> {
     let row_style = if selected {
         Style::default()
@@ -234,7 +249,30 @@ pub(crate) fn session_row_line(
     } else {
         session.title.as_str()
     };
-    let (glyph, glyph_color) = status_glyph(session);
+    let (glyph, glyph_color, status, unread) = if let Some(activity) = activity {
+        let color = match activity.status {
+            SessionActivityStatus::Running => colors::tool_running(),
+            SessionActivityStatus::Waiting => colors::warning(),
+            SessionActivityStatus::Completed => colors::success(),
+            SessionActivityStatus::Failed => colors::error(),
+            SessionActivityStatus::Disconnected => colors::warning(),
+            SessionActivityStatus::Idle => colors::inactive(),
+        };
+        (
+            activity.status.glyph(),
+            color,
+            activity.status.label(),
+            activity.unread,
+        )
+    } else {
+        let (glyph, color) = status_glyph(session);
+        (glyph, color, session_status_label(session), 0)
+    };
+    let status = if unread > 0 {
+        format!("{status}+{}", unread.min(99))
+    } else {
+        status.to_string()
+    };
     let pin = if session.pinned { "★" } else { " " };
     let marker = if selected { "›" } else { " " };
 
@@ -245,42 +283,55 @@ pub(crate) fn session_row_line(
             .unwrap_or_else(|| "-".to_string());
         format!(
             "{marker}{pin} {}  {}  {:>4}  {updated}",
-            truncate_cells(title, 30),
+            truncate_cells(
+                &if unread > 0 {
+                    format!("{title} · {unread} unread")
+                } else {
+                    title.to_string()
+                },
+                30,
+            ),
             truncate_cells(&session.model, 20),
             session.message_count,
         )
     } else if width >= 60 {
+        let available = width.saturating_sub((27 + status.chars().count()) as u16) as usize;
         format!(
             "{marker}{pin} {}  {} · {}",
-            truncate_cells(title, 24),
+            truncate_cells(title, available.max(1)),
             truncate_cells(&session.model, 16),
-            session_status_label(session),
+            text::clip_cells(&status, 12),
         )
     } else if width >= 40 {
         // Prefix + markers + separators + longest status + short id consume
         // 28 cells. Give every remaining cell to the title so the row never
         // wraps at the 60-column acceptance width (overlay row width: 52).
-        let available = width.saturating_sub(28) as usize;
+        let available = width.saturating_sub((20 + status.chars().count()) as u16) as usize;
         let short_id = session.id.chars().take(8).collect::<String>();
         format!(
             "{marker}{pin} {} · {} · {short_id}",
             truncate_cells(title, available.max(1)),
-            session_status_label(session),
+            text::clip_cells(&status, 12),
         )
     } else if width >= 20 {
-        let available = width.saturating_sub(17) as usize;
+        let available = width.saturating_sub((9 + status.chars().count()) as u16) as usize;
         format!(
             "{marker}{pin} {} · {}",
             truncate_cells(title, available.max(1)),
-            session_status_label(session),
+            text::clip_cells(&status, 12),
         )
     } else {
         let available = width.saturating_sub(6) as usize;
         format!("{marker}{pin} {}", truncate_cells(title, available.max(1)),)
     };
 
+    let prefix = format!(" {glyph} ");
+    let body = text::clip_cells(
+        &body,
+        (width as usize).saturating_sub(text::display_width(&prefix)),
+    );
     Line::from(vec![
-        Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(prefix, Style::default().fg(glyph_color)),
         Span::styled(body, row_style),
     ])
 }
@@ -306,6 +357,7 @@ mod tests {
             provider: None,
             is_running: false,
             has_pending_question: false,
+            running_child_count: 0,
             last_run_status: None,
             updated_at: None,
             message_count: 0,
