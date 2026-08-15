@@ -32,7 +32,7 @@ impl SessionMutationFailure {
         }
     }
 
-    fn protocol(message: impl Into<String>) -> Self {
+    pub(crate) fn protocol(message: impl Into<String>) -> Self {
         Self {
             conflict: false,
             current_version: None,
@@ -312,6 +312,7 @@ impl BambooClient {
         session_id: &str,
         model: Option<&str>,
         provider: Option<&str>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<ExecuteResponse> {
         let resp = self
             .client
@@ -319,6 +320,7 @@ impl BambooClient {
             .json(&ExecuteRequest {
                 model: model.map(|m| m.to_string()),
                 provider: provider.map(str::to_string),
+                reasoning_effort,
             })
             .send()
             .await?;
@@ -742,29 +744,52 @@ impl BambooClient {
         Ok(catalog)
     }
 
-    /// PATCH the active session's model before the picker commits a selection
-    /// locally. The caller keeps the overlay open on failure so the visible
-    /// model badge can never drift from the persisted session record.
-    pub async fn patch_session_model(
+    /// PATCH the active session's model and reasoning choice as one CAS-guarded
+    /// operation before the picker commits either value locally. Returning the
+    /// authoritative summary + ETag lets the UI distinguish validation errors
+    /// from a stale-session conflict without guessing from display text.
+    pub async fn patch_session_execution_profile(
         &self,
         session_id: &str,
+        expected_version: u64,
         model_ref: &CatalogModelRef,
-    ) -> Result<()> {
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> std::result::Result<VersionedSession, SessionMutationFailure> {
         let resp = self
             .client
             .patch(self.url(&format!("/api/v1/sessions/{}", session_id)))
-            .json(&PatchSessionModelRequest {
-                model: model_ref.model.clone(),
-                provider: model_ref.provider.clone(),
-            })
+            .header(reqwest::header::IF_MATCH, format!("\"{expected_version}\""))
+            .json(&PatchSessionExecutionProfileRequest::new(
+                model_ref,
+                reasoning_effort,
+            ))
             .send()
-            .await?;
+            .await
+            .map_err(SessionMutationFailure::transport)?;
         let status = resp.status();
+        let metadata_version = parse_etag(resp.headers());
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("patch session model failed ({status}): {}", body.trim());
+            return Err(SessionMutationFailure::rejected(
+                status,
+                body,
+                metadata_version,
+            ));
         }
-        Ok(())
+        let metadata_version = metadata_version.ok_or_else(|| {
+            SessionMutationFailure::protocol(
+                "session execution-profile PATCH response omitted metadata ETag",
+            )
+        })?;
+        let envelope: GetSessionEnvelope = resp.json().await.map_err(|error| {
+            SessionMutationFailure::protocol(format!(
+                "session execution-profile PATCH returned an unreadable response: {error}"
+            ))
+        })?;
+        Ok(VersionedSession {
+            summary: envelope.session,
+            metadata_version,
+        })
     }
 
     // ── MCP ──
@@ -1792,27 +1817,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_patch_preserves_provider_model_identity() {
+    async fn execution_profile_patch_is_atomic_and_cas_guarded() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let patch = read_request(&mut socket).await;
             assert!(patch.starts_with("PATCH /api/v1/sessions/s1 HTTP/1.1"));
-            assert!(patch.ends_with(r#"{"model":"shared","provider":"provider-b"}"#));
-            respond(&mut socket, "200 OK", "\"1\"", "{}").await;
+            assert!(patch.to_ascii_lowercase().contains("if-match: \"7\""));
+            assert_eq!(
+                request_json(&patch),
+                serde_json::json!({
+                    "model": "shared",
+                    "provider": "provider-b",
+                    "reasoning_effort": "max"
+                })
+            );
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"8\"",
+                r#"{"session":{"id":"s1","title":"Session","model":"shared","provider":"provider-b","reasoning_effort":"max"}}"#,
+            )
+            .await;
         });
 
-        BambooClient::new(&base_url)
-            .patch_session_model(
+        let updated = BambooClient::new(&base_url)
+            .patch_session_execution_profile(
                 "s1",
+                7,
                 &CatalogModelRef {
                     provider: "provider-b".to_string(),
                     model: "shared".to_string(),
                 },
+                Some(ReasoningEffort::Max),
             )
             .await
             .unwrap();
+        assert_eq!(updated.metadata_version, 8);
+        assert_eq!(updated.summary.reasoning_effort, Some(ReasoningEffort::Max));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_profile_patch_reports_stale_session_conflict() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let patch = read_request(&mut socket).await;
+            assert_eq!(
+                request_json(&patch),
+                serde_json::json!({
+                    "model": "plain",
+                    "provider": "provider-b",
+                    "clear_reasoning_effort": true
+                })
+            );
+            respond(
+                &mut socket,
+                "412 Precondition Failed",
+                "\"11\"",
+                r#"{"error":{"message":"Version conflict"},"current_version":11}"#,
+            )
+            .await;
+        });
+
+        let error = BambooClient::new(&base_url)
+            .patch_session_execution_profile(
+                "s1",
+                7,
+                &CatalogModelRef {
+                    provider: "provider-b".to_string(),
+                    model: "plain".to_string(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.conflict);
+        assert_eq!(error.current_version, Some(11));
         server.await.unwrap();
     }
 }

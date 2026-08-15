@@ -168,6 +168,7 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
         if let Some(project_id) = input.project_id.as_ref() {
             session.set_project_id_meta(project_id.to_string());
         }
+        session.reasoning_effort = input.reasoning_effort;
     }
 
     // ---- Resolve base prompt ----
@@ -852,6 +853,7 @@ mod tests {
             model: "gpt-5".to_string(),
             model_ref: None,
             provider: None,
+            reasoning_effort: None,
             message: "hello".to_string(),
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
@@ -872,6 +874,25 @@ mod tests {
             .find(|message| matches!(message.role, Role::System))
             .map(|message| message.content.clone())
             .expect("session should have a system message")
+    }
+
+    #[test]
+    fn new_chat_session_persists_explicit_reasoning_profile() {
+        let mut input = chat_turn_input(None);
+        input.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Xhigh);
+
+        let session = prepare_chat_turn_from_authoritative_session(
+            None,
+            input,
+            "Global prompt",
+            "Builtin prompt",
+        )
+        .expect("new chat session");
+
+        assert_eq!(
+            session.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Xhigh)
+        );
     }
 
     fn active_workflow(id: &str, revision: u64) -> ActiveWorkflow {

@@ -415,6 +415,7 @@ pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         model: model.clone(),
         model_ref: req.model_ref.clone(),
         provider: req.provider.clone(),
+        reasoning_effort: req.reasoning_effort,
         message: req.message.clone(),
         system_prompt: request::optional_non_empty(req.system_prompt.as_deref()).map(String::from),
         enhance_prompt: request::optional_non_empty(req.enhance_prompt.as_deref())

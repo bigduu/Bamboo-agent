@@ -160,6 +160,8 @@ pub(crate) enum ActionId {
     Backspace,
     Refresh,
     ClearInput,
+    PreviousReasoningEffort,
+    NextReasoningEffort,
     Confirm,
     Reject,
     OpenSlashPalette,
@@ -334,7 +336,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
     spec!(
         OpenModelPicker,
         "Select model",
-        "Choose a provider-qualified model",
+        "Choose a provider-qualified model and reasoning profile",
         true,
         Chat,
         [Global],
@@ -798,6 +800,22 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (ModelPicker, "Ctrl+U"),
             (CommandPalette, "Ctrl+U")
         ]
+    ),
+    spec!(
+        PreviousReasoningEffort,
+        "Previous reasoning effort",
+        "Select the previous canonical reasoning profile",
+        false,
+        [ModelPicker],
+        [(ModelPicker, "Left")]
+    ),
+    spec!(
+        NextReasoningEffort,
+        "Next reasoning effort",
+        "Select the next canonical reasoning profile",
+        false,
+        [ModelPicker],
+        [(ModelPicker, "Right")]
     ),
     spec!(
         Confirm,

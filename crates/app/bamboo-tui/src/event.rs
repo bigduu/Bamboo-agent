@@ -3,8 +3,8 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::api::types::{
     CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
     ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
-    PermissionPolicyResponse, ProviderCatalog, Schedule, SessionSummary, SessionTreeSummary, Skill,
-    SkillDetail, SubagentSnapshotResponse, ToolInfo,
+    PermissionPolicyResponse, ProviderCatalog, ReasoningEffort, Schedule, SessionSummary,
+    SessionTreeSummary, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
 };
 use crate::api::{
     PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
@@ -202,7 +202,11 @@ pub enum AppEvent {
     /// safe when an older HTTP response arrives after the new overlay opened.
     CatalogLoaded {
         epoch: u64,
+        session_id: Option<String>,
         result: Loaded<ProviderCatalog>,
+        /// Matching session snapshot + ETag when an existing session opened
+        /// the picker. `None` is the intentional new-session path.
+        session: Option<Loaded<VersionedSession>>,
     },
     /// Recoverable model PATCH result. The picker stays open until success so
     /// query/selection and the chat draft survive validation/network errors.
@@ -210,7 +214,8 @@ pub enum AppEvent {
         epoch: u64,
         session_id: String,
         model: CatalogModel,
-        result: Loaded<()>,
+        reasoning_effort: Option<ReasoningEffort>,
+        result: Result<VersionedSession, SessionMutationFailure>,
     },
     /// One lazily-loaded page for the contextual session picker. Pages are
     /// requested serially and capped in memory; stale epochs are discarded.
