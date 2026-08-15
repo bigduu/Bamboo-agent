@@ -3327,6 +3327,12 @@ mod tests {
                 "generated help omitted {needle:?}"
             );
         }
+        assert!(
+            generated
+                .iter()
+                .any(|entry| entry.description.contains("Sub-agent tree")),
+            "generated help omitted the global sub-agent tree action"
+        );
 
         app.help_scroll = app.help_max_scroll.get();
         terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
@@ -3367,7 +3373,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [17_065_867_340_943_315_060, 12_487_818_554_989_084_324,],
+            [10_497_738_457_900_557_685, 4_621_970_272_475_212_681,],
             "complete help-overlay buffer golden changed"
         );
     }

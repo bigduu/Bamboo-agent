@@ -26,6 +26,7 @@ use crate::keymap::{
     HelpEntry, KeyResolution, Keymap, PendingSequence,
 };
 use crate::search::ranked_indices;
+use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,6 +37,284 @@ pub enum Tab {
     Schedules,
     Skills,
     Config,
+}
+
+#[cfg(test)]
+mod subagent_tree_navigation_tests {
+    use super::*;
+    use crate::api::types::{SessionTreeKind, SessionTreeSummary};
+
+    fn summary(id: &str, parent: Option<&str>, root: &str, depth: u32) -> SessionTreeSummary {
+        let mut value = SessionTreeSummary::placeholder(id);
+        value.kind = if parent.is_some() {
+            SessionTreeKind::Child
+        } else {
+            SessionTreeKind::Root
+        };
+        value.title = id.to_string();
+        value.parent_session_id = parent.map(str::to_string);
+        value.root_session_id = root.to_string();
+        value.spawn_depth = depth;
+        value
+    }
+
+    fn tree(active: &str, children: &[SessionTreeSummary]) -> SubagentTreeState {
+        let active_summary = children
+            .iter()
+            .find(|summary| summary.id == active)
+            .cloned()
+            .expect("active summary");
+        let mut tree = SubagentTreeState::new(1, active.to_string());
+        tree.install_root(active_summary);
+        tree.install_page(children.to_vec(), children.len(), 100, 0, None);
+        tree
+    }
+
+    fn child_approval(parent: &str, child: &str, request: &str) -> QueuedChildApproval {
+        QueuedChildApproval {
+            record: ChildApprovalRecord {
+                parent_session_id: parent.to_string(),
+                child_session_id: child.to_string(),
+                child_attempt: 1,
+                request_id: request.to_string(),
+                tool_name: "Write".to_string(),
+                permission: "write_file".to_string(),
+                resource: format!("/workspace/{child}.txt"),
+                created_at: "2026-08-15T00:00:00Z".to_string(),
+                updated_at: "2026-08-15T00:00:00Z".to_string(),
+                version: 2,
+                state: ChildApprovalState::Pending,
+                approved: None,
+                reason: None,
+            },
+            authoritative: true,
+        }
+    }
+
+    #[test]
+    fn child_open_and_parent_return_restore_exact_cached_ui_state() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.history_loaded = true;
+        app.chat.textarea = TextArea::from(["parent draft".to_string()]);
+        app.chat.textarea.move_cursor(CursorMove::Jump(0, 6));
+        app.chat.scroll_offset = 17;
+        app.chat.auto_scroll = false;
+        app.chat.focused_block = Some("parent:block".to_string());
+        app.chat.block_ui.insert(
+            "parent:block".to_string(),
+            ConversationBlockUiState {
+                expanded: true,
+                scroll: 4,
+            },
+        );
+
+        let child_context_id = app.allocate_context_id();
+        let mut child_context = SessionUiContext::blank(child_context_id);
+        child_context.chat.session_id = Some("child".to_string());
+        child_context.chat.history_loaded = true;
+        child_context.chat.textarea = TextArea::from(["child draft".to_string()]);
+        app.cache_context(child_context);
+
+        let graph = vec![
+            summary("root", None, "root", 0),
+            summary("child", Some("root"), "root", 1),
+        ];
+        let mut root_tree = tree("root", &graph);
+        root_tree.move_selection(1);
+        assert_eq!(root_tree.selected_id(), Some("child"));
+        app.subagent_tree = Some(root_tree);
+        app.open_selected_subagent_session();
+        assert_eq!(app.chat.session_id.as_deref(), Some("child"));
+
+        let mut child_tree = tree("child", &graph);
+        child_tree.select_first();
+        assert_eq!(child_tree.selected_id(), Some("root"));
+        app.subagent_tree = Some(child_tree);
+        app.open_selected_subagent_session();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("root"));
+        assert_eq!(app.chat.textarea.lines(), ["parent draft"]);
+        assert_eq!(app.chat.textarea.cursor(), (0, 6));
+        assert_eq!(app.chat.scroll_offset, 17);
+        assert!(!app.chat.auto_scroll);
+        assert_eq!(app.chat.focused_block.as_deref(), Some("parent:block"));
+        assert_eq!(
+            app.chat.block_ui["parent:block"],
+            ConversationBlockUiState {
+                expanded: true,
+                scroll: 4
+            }
+        );
+    }
+
+    #[test]
+    fn pending_permission_jump_selects_the_exact_child_request() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.history_loaded = true;
+        app.pending_child_approvals = VecDeque::from([
+            child_approval("root", "child-a", "request-a"),
+            child_approval("root", "child-b", "request-b"),
+        ]);
+        let graph = vec![
+            summary("root", None, "root", 0),
+            summary("child-a", Some("root"), "root", 1),
+            summary("child-b", Some("root"), "root", 1),
+        ];
+        let mut state = tree("root", &graph);
+        state.sync_pending_permissions([("root", "child-a"), ("root", "child-b")]);
+        state.move_selection(2);
+        assert_eq!(state.selected_id(), Some("child-b"));
+        app.subagent_tree = Some(state);
+
+        app.open_selected_subagent_pending();
+
+        let question = app.pending_question.as_ref().expect("child modal opened");
+        assert!(matches!(
+            &question.kind,
+            ActiveQuestionKind::ChildApproval(child)
+                if child.child_session_id == "child-b" && child.request_id == "request-b"
+        ));
+    }
+
+    #[test]
+    fn pending_clarification_jump_opens_the_selected_child_context() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.history_loaded = true;
+
+        let child_context_id = app.allocate_context_id();
+        let mut child_context = SessionUiContext::blank(child_context_id);
+        child_context.chat.session_id = Some("child".to_string());
+        child_context.chat.history_loaded = true;
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Choose a target".to_string(),
+            options: Some(vec!["A".to_string(), "B".to_string()]),
+            allow_custom: false,
+            tool_call_id: Some("question-1".to_string()),
+            tool_name: Some("ask".to_string()),
+            source: Some("pause_tool".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Clarification),
+            permission_request: None,
+            tool_arguments: None,
+            tool_arguments_truncated: false,
+        };
+        child_context.pending_question = Some(ActiveQuestion::from_pending(
+            "child-question".to_string(),
+            "child".to_string(),
+            &pending,
+            String::new(),
+        ));
+        app.cache_context(child_context);
+
+        let mut child = summary("child", Some("root"), "root", 1);
+        child.has_pending_question = true;
+        let graph = vec![summary("root", None, "root", 0), child];
+        let mut state = tree("root", &graph);
+        state.move_selection(1);
+        app.subagent_tree = Some(state);
+
+        app.open_selected_subagent_pending();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("child"));
+        assert_eq!(
+            app.pending_question
+                .as_ref()
+                .map(|question| question.session_id.as_str()),
+            Some("child")
+        );
+    }
+
+    #[test]
+    fn pending_permission_on_the_active_session_reopens_its_own_request() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.history_loaded = true;
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Allow the command?".to_string(),
+            options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+            allow_custom: false,
+            tool_call_id: Some("permission-1".to_string()),
+            tool_name: Some("Bash".to_string()),
+            source: Some("permission_gate".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Permission),
+            permission_request: None,
+            tool_arguments: None,
+            tool_arguments_truncated: false,
+        };
+        app.dismissed_question = Some(ActiveQuestion::from_pending(
+            "root-permission".to_string(),
+            "root".to_string(),
+            &pending,
+            String::new(),
+        ));
+
+        let graph = vec![summary("root", None, "root", 0)];
+        let mut state = tree("root", &graph);
+        state.mark_waiting_permission("root", "permission for Bash".to_string());
+        app.subagent_tree = Some(state);
+
+        app.open_selected_subagent_pending();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("root"));
+        assert_eq!(
+            app.pending_question
+                .as_ref()
+                .map(|question| question.session_id.as_str()),
+            Some("root")
+        );
+    }
+
+    #[test]
+    fn forwarded_progress_cannot_cross_update_a_sibling_row() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.current_execution_started = true;
+        let graph = vec![
+            summary("root", None, "root", 0),
+            summary("child-a", Some("root"), "root", 1),
+            summary("child-b", Some("root"), "root", 1),
+        ];
+        app.subagent_tree = Some(tree("root", &graph));
+
+        app.handle_sse_event(AgentEvent::SubAgentEvent {
+            child_session_id: "child-a".to_string(),
+            event: Box::new(AgentEvent::RunnerProgress {
+                session_id: "child-b".to_string(),
+                round_count: 9,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            app.subagent_tree.as_ref().unwrap().nodes["child-a"].status(),
+            SubagentTreeStatus::Idle,
+            "a mismatched nested identity must not change the envelope row"
+        );
+        assert_eq!(
+            app.subagent_tree.as_ref().unwrap().nodes["child-a"].round_count,
+            None
+        );
+        assert_eq!(
+            app.subagent_tree.as_ref().unwrap().nodes["child-b"].round_count,
+            None
+        );
+
+        app.handle_sse_event(AgentEvent::SubAgentEvent {
+            child_session_id: "child-a".to_string(),
+            event: Box::new(AgentEvent::RunnerProgress {
+                session_id: "child-a".to_string(),
+                round_count: 3,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            app.subagent_tree.as_ref().unwrap().nodes["child-a"].round_count,
+            Some(3)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3418,6 +3697,12 @@ pub struct App {
     /// Sessions management tab, closing this overlay leaves the transcript,
     /// composer draft/cursor, and scroll position untouched.
     pub session_picker: Option<SessionPicker>,
+    /// Focusable, relationship-aware view of the active root/child session
+    /// graph. It is global overlay state rather than part of a session view;
+    /// opening a row closes it before moving the exact cached Chat context.
+    pub(crate) subagent_tree: Option<SubagentTreeState>,
+    subagent_tree_epoch: u64,
+    subagent_tree_task: Option<tokio::task::JoinHandle<()>>,
     /// Combined built-in/server command palette (`Ctrl+K` globally or `/` as
     /// the first composer character). It never mutates the composer until a
     /// selection succeeds, so cancellation and every async failure preserve
@@ -3539,6 +3824,9 @@ impl Drop for App {
         if let Some(task) = self.opening_session_task.take() {
             task.abort();
         }
+        if let Some(task) = self.subagent_tree_task.take() {
+            task.abort();
+        }
         for context in self.session_views.values_mut() {
             context.abort_background_work();
         }
@@ -3639,6 +3927,9 @@ impl App {
             permission_mode_confirm: None,
             model_picker: None,
             session_picker: None,
+            subagent_tree: None,
+            subagent_tree_epoch: 0,
+            subagent_tree_task: None,
             command_palette: None,
             pending_delete: None,
             pending_schedule_delete: None,
@@ -3844,6 +4135,7 @@ impl App {
         if self.session_picker.is_some() {
             self.pending_delete = None;
         }
+        self.close_subagent_tree();
         self.close_session_picker();
         self.close_model_picker();
         self.close_command_palette();
@@ -5054,6 +5346,7 @@ impl App {
                                 authoritative: true,
                             })
                             .collect();
+                        self.sync_subagent_tree_permissions();
 
                         let active_match = self.pending_question.as_ref().and_then(|question| {
                             matches!(question.kind, ActiveQuestionKind::ChildApproval(_)).then(
@@ -6150,6 +6443,90 @@ impl App {
                     self.load_next_session_picker_page();
                 }
             }
+            AppEvent::SubagentTreeRootLoaded {
+                epoch,
+                active_session_id,
+                result,
+            } => {
+                let current_session_matches =
+                    self.chat.session_id.as_deref() == Some(active_session_id.as_str());
+                let Some(tree) = self.subagent_tree.as_mut().filter(|tree| {
+                    tree.epoch == epoch && tree.active_session_id == active_session_id
+                }) else {
+                    return Ok(());
+                };
+                self.subagent_tree_task = None;
+                tree.loading_root = false;
+                if !current_session_matches {
+                    tree.error =
+                        Some("Active session changed while the child tree was loading".to_string());
+                    return Ok(());
+                }
+                let mut load_first_page = false;
+                match result {
+                    Ok(summary) if summary.id == active_session_id => {
+                        tree.error = None;
+                        tree.install_root(summary);
+                        load_first_page = true;
+                    }
+                    Ok(summary) => {
+                        tree.error = Some(format!(
+                            "Session detail identity mismatch: requested {active_session_id}, received {}",
+                            summary.id
+                        ));
+                    }
+                    Err(error) => {
+                        tree.error = Some(format!(
+                            "Failed to discover the child-session root: {error}"
+                        ));
+                    }
+                }
+                if load_first_page {
+                    self.load_subagent_tree_page(epoch, 0);
+                }
+            }
+            AppEvent::SubagentTreePageLoaded {
+                epoch,
+                offset,
+                result,
+            } => {
+                let Some(tree) = self
+                    .subagent_tree
+                    .as_mut()
+                    .filter(|tree| tree.epoch == epoch)
+                else {
+                    return Ok(());
+                };
+                self.subagent_tree_task = None;
+                tree.loading_page = false;
+                match result {
+                    Ok(envelope) => {
+                        tree.error = None;
+                        tree.install_page(
+                            envelope.sessions,
+                            envelope.total,
+                            envelope.limit,
+                            envelope.offset,
+                            envelope.next_offset,
+                        );
+                    }
+                    Err(error) => {
+                        tree.error = Some(format!(
+                            "Failed to load child-session relationships: {error}"
+                        ));
+                    }
+                }
+                self.sync_subagent_tree_permissions();
+                let next_offset = self
+                    .subagent_tree
+                    .as_ref()
+                    .filter(|tree| tree.epoch == epoch && !tree.capped)
+                    .and_then(|tree| tree.next_offset)
+                    .filter(|next| *next > offset);
+                if let Some(next_offset) = next_offset {
+                    self.load_subagent_tree_page(epoch, next_offset);
+                }
+            }
             AppEvent::SessionPickerVersionLoaded {
                 epoch,
                 session_id,
@@ -6923,6 +7300,7 @@ impl App {
             || self.pending_question.is_some()
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
+            || self.subagent_tree.is_some()
             || self.session_picker.is_some()
             || self.model_picker.is_some()
             || self.command_palette.is_some()
@@ -6984,6 +7362,8 @@ impl App {
             ActionContext::SessionDeleteConfirm
         } else if self.pending_schedule_delete.is_some() {
             ActionContext::ScheduleDeleteConfirm
+        } else if self.subagent_tree.is_some() {
+            ActionContext::SubagentTree
         } else if self.session_picker.is_some() {
             self.session_picker_context()
         } else if self.model_picker.is_some() {
@@ -7090,6 +7470,8 @@ impl App {
             picker.error = Some(message.clone());
         } else if let Some(picker) = self.session_picker.as_mut() {
             picker.error = Some(message.clone());
+        } else if let Some(tree) = self.subagent_tree.as_mut() {
+            tree.error = Some(message.clone());
         }
         self.status_message = message;
     }
@@ -7162,6 +7544,7 @@ impl App {
             ActionId::ReopenPendingQuestion => self.reopen_pending_question(),
             ActionId::OpenModelPicker => self.open_model_picker(),
             ActionId::OpenSessionPicker => self.open_session_picker(),
+            ActionId::OpenSubagentTree => self.open_subagent_tree(),
             ActionId::StopRun => self.stop_streaming(),
             ActionId::ToggleDetails => self.toggle_conversation_details(),
             ActionId::OpenConfigTab => {
@@ -7229,6 +7612,7 @@ impl App {
             }
             ActionContext::PermissionRuleConfirm => self.handle_permission_rule_confirm_key(key),
             ActionContext::PermissionModeConfirm => self.handle_permission_mode_confirm_key(key),
+            ActionContext::SubagentTree => self.handle_subagent_tree_key(key),
             ActionContext::SessionPickerBrowse
             | ActionContext::SessionPickerRename
             | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
@@ -8490,6 +8874,7 @@ impl App {
         {
             Self::refresh_child_question(question, &queued);
         }
+        self.sync_subagent_tree_permissions();
         self.show_next_child_approval();
     }
 
@@ -8535,6 +8920,7 @@ impl App {
                 || queued.record.request_id != request_id
                 || queued.record.version > terminal_version
         });
+        self.sync_subagent_tree_permissions();
     }
 
     fn retire_parent_question_context(&mut self) {
@@ -10020,7 +10406,9 @@ impl App {
                 self.chat.note_update();
             }
             AgentEvent::ExecutionStarted {
-                run_id, started_at, ..
+                run_id,
+                session_id,
+                started_at,
             } => {
                 if !self
                     .chat
@@ -10051,6 +10439,28 @@ impl App {
                     self.pending_answer_run_started = true;
                 }
                 self.stream_disconnected = false;
+                if let Some(tree) = self
+                    .subagent_tree
+                    .as_mut()
+                    .filter(|tree| tree.contains_session(&session_id))
+                {
+                    tree.mark_running(&session_id, "execution started", true);
+                }
+            }
+            AgentEvent::RunnerProgress {
+                session_id,
+                round_count,
+            } => {
+                if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+                    return Ok(());
+                }
+                if let Some(tree) = self
+                    .subagent_tree
+                    .as_mut()
+                    .filter(|tree| tree.contains_session(&session_id))
+                {
+                    tree.apply_runner_progress(&session_id, round_count);
+                }
             }
             AgentEvent::ReasoningToken { content } => {
                 if self.chat.run_status.phase.is_terminal() {
@@ -10323,6 +10733,16 @@ impl App {
                     format!("Permission required for {tool_name}"),
                 );
                 if let Some(session_id) = self.chat.session_id.clone() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&session_id))
+                    {
+                        tree.mark_waiting_permission(
+                            &session_id,
+                            format!("permission for {tool_name}"),
+                        );
+                    }
                     self.status_message = "Synchronizing typed permission request...".to_string();
                     self.reconcile_pending_question_after_stream_connect(session_id);
                 }
@@ -10404,6 +10824,20 @@ impl App {
                 // the compatibility sentinel: every durable registry record
                 // starts at a positive version.
                 let authoritative_identity = version > 0;
+                if status == "pending" || authoritative_identity {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&parent_session_id))
+                    {
+                        tree.apply_child_approval_changed(
+                            &parent_session_id,
+                            &child_session_id,
+                            &status,
+                            authoritative_identity,
+                        );
+                    }
+                }
                 if status == "pending" {
                     self.chat
                         .run_status
@@ -10524,6 +10958,13 @@ impl App {
                     );
                     return Ok(());
                 };
+                if let Some(tree) = self
+                    .subagent_tree
+                    .as_mut()
+                    .filter(|tree| tree.contains_session(&session_id))
+                {
+                    tree.mark_waiting_input(&session_id);
+                }
                 let pending = PendingQuestion {
                     has_pending_question: true,
                     question,
@@ -10607,6 +11048,15 @@ impl App {
                 if self.chat.run_status.phase.is_terminal() && !self.chat.streaming {
                     return Ok(());
                 }
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&session_id))
+                    {
+                        tree.apply_completed(&session_id, "completed", None);
+                    }
+                }
                 self.handle_complete(usage);
             }
             AgentEvent::Cancelled { message } => {
@@ -10614,6 +11064,15 @@ impl App {
                     return Ok(());
                 }
                 let message = message.unwrap_or_else(|| "Cancelled".to_string());
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&session_id))
+                    {
+                        tree.apply_completed(&session_id, "cancelled", Some(message.clone()));
+                    }
+                }
                 self.chat
                     .run_status
                     .finish(RunPhase::Cancelled, message.clone());
@@ -10644,6 +11103,15 @@ impl App {
             AgentEvent::Error { message } => {
                 if self.chat.run_status.phase.is_terminal() && !self.chat.streaming {
                     return Ok(());
+                }
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&session_id))
+                    {
+                        tree.apply_completed(&session_id, "error", Some(message.clone()));
+                    }
                 }
                 self.chat
                     .run_status
@@ -10783,10 +11251,35 @@ impl App {
                 );
                 self.status_message = format!("Plan updated: {}", file_path);
             }
+            AgentEvent::SubAgentEvent {
+                child_session_id,
+                event,
+            } => {
+                let identity_matches = match event.as_ref() {
+                    AgentEvent::ExecutionStarted { session_id, .. }
+                    | AgentEvent::RunnerProgress { session_id, .. } => {
+                        session_id == &child_session_id
+                    }
+                    _ => true,
+                };
+                if !identity_matches {
+                    return Ok(());
+                }
+                let parent_session_id = self.chat.session_id.clone();
+                if let (Some(parent_session_id), Some(tree)) =
+                    (parent_session_id, self.subagent_tree.as_mut())
+                {
+                    if tree.contains_session(&parent_session_id) {
+                        tree.apply_started(&parent_session_id, &child_session_id, None, false);
+                        tree.apply_forwarded_event(&child_session_id, &event);
+                    }
+                }
+            }
             AgentEvent::SubAgentStarted {
                 child_session_id,
                 title,
             } => {
+                let tree_title = title.clone();
                 let replay_expected = self
                     .chat
                     .replay_expected_child_ids
@@ -10860,6 +11353,20 @@ impl App {
                     NoticeLevel::Info,
                     format!("Sub-agent {child_session_id} started"),
                 );
+                if let Some(parent_session_id) = self.chat.session_id.clone() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(&parent_session_id))
+                    {
+                        tree.apply_started(
+                            &parent_session_id,
+                            &child_session_id,
+                            tree_title,
+                            fresh_start || active_in_current_turn,
+                        );
+                    }
+                }
                 if active_in_current_turn {
                     self.chat
                         .current_turn_child_ids
@@ -10871,13 +11378,33 @@ impl App {
                 self.chat.note_update();
             }
             AgentEvent::SubAgentHeartbeat { child_session_id } => {
-                self.chat.run_status.subagent_heartbeat(child_session_id);
+                self.chat
+                    .run_status
+                    .subagent_heartbeat(child_session_id.clone());
+                if let Some(parent_session_id) = self.chat.session_id.as_deref() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(parent_session_id))
+                    {
+                        tree.apply_heartbeat(&child_session_id);
+                    }
+                }
             }
             AgentEvent::SubAgentCompleted {
                 child_session_id,
                 status,
                 error,
             } => {
+                if let Some(parent_session_id) = self.chat.session_id.as_deref() {
+                    if let Some(tree) = self
+                        .subagent_tree
+                        .as_mut()
+                        .filter(|tree| tree.contains_session(parent_session_id))
+                    {
+                        tree.apply_completed(&child_session_id, &status, error.clone());
+                    }
+                }
                 self.chat
                     .run_status
                     .subagent_finished(child_session_id.clone(), &status);
@@ -12077,6 +12604,276 @@ impl App {
                     });
                 });
             }
+            _ => {}
+        }
+    }
+
+    // ── Persistent child-session tree (Leader+A) ──
+
+    fn open_subagent_tree(&mut self) {
+        let Some(active_session_id) = self.chat.session_id.clone() else {
+            self.status_message =
+                "Start or open a session before inspecting sub-agents".to_string();
+            return;
+        };
+        if self.event_tx.is_none() {
+            self.status_message = "Sub-agent tree is not attached to the event loop".to_string();
+            return;
+        }
+        if let Some(task) = self.subagent_tree_task.take() {
+            task.abort();
+        }
+        self.subagent_tree_epoch = self.subagent_tree_epoch.wrapping_add(1).max(1);
+        let epoch = self.subagent_tree_epoch;
+        self.subagent_tree = Some(SubagentTreeState::new(epoch, active_session_id.clone()));
+        self.sync_subagent_tree_permissions();
+        self.load_subagent_tree_root(epoch, active_session_id);
+    }
+
+    fn close_subagent_tree(&mut self) {
+        if let Some(task) = self.subagent_tree_task.take() {
+            task.abort();
+        }
+        self.subagent_tree = None;
+    }
+
+    fn reload_subagent_tree(&mut self) {
+        let Some(active_session_id) = self
+            .subagent_tree
+            .as_ref()
+            .map(|tree| tree.active_session_id.clone())
+        else {
+            return;
+        };
+        if let Some(task) = self.subagent_tree_task.take() {
+            task.abort();
+        }
+        self.subagent_tree_epoch = self.subagent_tree_epoch.wrapping_add(1).max(1);
+        let epoch = self.subagent_tree_epoch;
+        self.subagent_tree = Some(SubagentTreeState::new(epoch, active_session_id.clone()));
+        self.sync_subagent_tree_permissions();
+        self.load_subagent_tree_root(epoch, active_session_id);
+    }
+
+    fn load_subagent_tree_root(&mut self, epoch: u64, active_session_id: String) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let client = self.client.clone();
+        self.subagent_tree_task = Some(tokio::spawn(async move {
+            let result = client
+                .get_session_tree(&active_session_id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SubagentTreeRootLoaded {
+                epoch,
+                active_session_id,
+                result,
+            });
+        }));
+    }
+
+    fn load_subagent_tree_page(&mut self, epoch: u64, offset: usize) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let Some(tree) = self
+            .subagent_tree
+            .as_mut()
+            .filter(|tree| tree.epoch == epoch)
+        else {
+            return;
+        };
+        if tree.scanned >= MAX_SUBAGENT_TREE_SESSIONS {
+            tree.capped = tree.scanned < tree.total;
+            tree.loading_page = false;
+            return;
+        }
+        tree.loading_page = true;
+        let limit = (tree.page_limit > 0).then_some(tree.page_limit);
+        let client = self.client.clone();
+        self.subagent_tree_task = Some(tokio::spawn(async move {
+            let result = client
+                .list_session_tree(limit, (offset > 0).then_some(offset))
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::SubagentTreePageLoaded {
+                epoch,
+                offset,
+                result,
+            });
+        }));
+    }
+
+    fn sync_subagent_tree_permissions(&mut self) {
+        let pending = self
+            .pending_child_approvals
+            .iter()
+            .filter(|queued| queued.record.state == ChildApprovalState::Pending)
+            .map(|queued| {
+                (
+                    queued.record.parent_session_id.clone(),
+                    queued.record.child_session_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(tree) = self.subagent_tree.as_mut() {
+            tree.sync_pending_permissions(
+                pending
+                    .iter()
+                    .map(|(parent, child)| (parent.as_str(), child.as_str())),
+            );
+        }
+    }
+
+    fn focus_child_approval(&mut self, child_session_id: &str) -> bool {
+        let active_matches = self.pending_question.as_ref().is_some_and(|question| {
+            matches!(
+                &question.kind,
+                ActiveQuestionKind::ChildApproval(child)
+                    if child.child_session_id == child_session_id
+            )
+        });
+        if active_matches {
+            return true;
+        }
+        let dismissed_matches = self.dismissed_question.as_ref().is_some_and(|question| {
+            matches!(
+                &question.kind,
+                ActiveQuestionKind::ChildApproval(child)
+                    if child.child_session_id == child_session_id
+            )
+        });
+        if dismissed_matches {
+            self.pending_question = self.dismissed_question.take();
+            self.status_message = format!("Child {child_session_id} approval reopened");
+            return true;
+        }
+        let Some(index) = self.pending_child_approvals.iter().position(|queued| {
+            queued.record.child_session_id == child_session_id
+                && queued.record.state == ChildApprovalState::Pending
+        }) else {
+            return false;
+        };
+        let Some(queued) = self.pending_child_approvals.remove(index) else {
+            return false;
+        };
+        self.pending_child_approvals.push_front(queued);
+        self.show_next_child_approval();
+        self.pending_question.is_some()
+    }
+
+    fn open_selected_subagent_session(&mut self) {
+        let selected = self
+            .subagent_tree
+            .as_ref()
+            .and_then(SubagentTreeState::selected_id)
+            .map(str::to_string);
+        let Some(session_id) = selected else {
+            return;
+        };
+        let already_active = self.chat.session_id.as_deref() == Some(session_id.as_str());
+        self.close_subagent_tree();
+        if already_active {
+            self.status_message = "Already viewing the selected session".to_string();
+        } else {
+            self.resume_session(session_id);
+        }
+    }
+
+    fn open_selected_subagent_pending(&mut self) {
+        let selected = self.subagent_tree.as_ref().and_then(|tree| {
+            tree.selected_node().map(|node| {
+                (
+                    node.summary.id.clone(),
+                    node.status(),
+                    node.summary.has_pending_question,
+                )
+            })
+        });
+        let Some((session_id, status, has_pending_question)) = selected else {
+            return;
+        };
+        if !status.is_pending() {
+            if let Some(tree) = self.subagent_tree.as_mut() {
+                tree.error = Some("The selected session has no pending request".to_string());
+            }
+            return;
+        }
+        self.close_subagent_tree();
+        match status {
+            SubagentTreeStatus::WaitingForPermission => {
+                if !self.focus_child_approval(&session_id) {
+                    if self.chat.session_id.as_deref() == Some(session_id.as_str()) {
+                        self.reopen_pending_question();
+                    } else if has_pending_question {
+                        self.resume_session(session_id);
+                    } else if let Some(parent_session_id) = self.chat.session_id.clone() {
+                        self.refresh_child_approvals(parent_session_id);
+                        self.status_message = format!(
+                            "Refreshing the exact pending permission for child {session_id}"
+                        );
+                    }
+                }
+            }
+            SubagentTreeStatus::WaitingForInput => {
+                if self.chat.session_id.as_deref() == Some(session_id.as_str()) {
+                    self.reopen_pending_question();
+                } else {
+                    self.resume_session(session_id);
+                }
+            }
+            _ => unreachable!("pending status checked above"),
+        }
+    }
+
+    fn handle_subagent_tree_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::SubagentTree, key);
+        match action {
+            Some(ActionId::NavigateUp) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.move_selection(-1);
+                }
+            }
+            Some(ActionId::NavigateDown) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.move_selection(1);
+                }
+            }
+            Some(ActionId::PageUp) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.move_selection(-8);
+                }
+            }
+            Some(ActionId::PageDown) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.move_selection(8);
+                }
+            }
+            Some(ActionId::JumpFirst) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.select_first();
+                }
+            }
+            Some(ActionId::JumpLast) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.select_last();
+                }
+            }
+            Some(ActionId::ExpandTreeNode) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.expand_or_descend();
+                }
+            }
+            Some(ActionId::CollapseTreeNode) => {
+                if let Some(tree) = self.subagent_tree.as_mut() {
+                    tree.collapse_or_ascend();
+                }
+            }
+            Some(ActionId::Activate) => self.open_selected_subagent_session(),
+            Some(ActionId::OpenPendingRequest) => self.open_selected_subagent_pending(),
+            Some(ActionId::Refresh) => self.reload_subagent_tree(),
+            Some(ActionId::Cancel) => self.close_subagent_tree(),
             _ => {}
         }
     }
@@ -16313,6 +17110,25 @@ mod question_tests {
         commands.open_command_palette(CommandPaletteTrigger::Global);
         actual.push(minimum_modal_fingerprint(&commands));
 
+        let mut subagents = App::new(BambooClient::new("http://127.0.0.1:0"));
+        subagents.chat.session_id = Some("root".to_string());
+        let mut root = SessionTreeSummary::placeholder("root");
+        root.kind = SessionTreeKind::Root;
+        root.title = "root agent".to_string();
+        root.root_session_id = "root".to_string();
+        let mut child = SessionTreeSummary::placeholder("child");
+        child.kind = SessionTreeKind::Child;
+        child.title = "child agent".to_string();
+        child.parent_session_id = Some("root".to_string());
+        child.root_session_id = "root".to_string();
+        child.spawn_depth = 1;
+        child.has_pending_question = true;
+        let mut tree = SubagentTreeState::new(1, "root".to_string());
+        tree.install_root(root.clone());
+        tree.install_page(vec![root, child], 2, 100, 0, None);
+        subagents.subagent_tree = Some(tree);
+        actual.push(minimum_modal_fingerprint(&subagents));
+
         let mut serve = App::new(BambooClient::new("http://127.0.0.1:0"));
         serve.serve_offer = Some(ServeOffer {
             url: format!("http://127.0.0.1:9562/{}", "long-path-".repeat(12)),
@@ -16322,7 +17138,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                12_013_467_434_067_207_854,
+                2_521_080_266_750_332_561,
                 1_057_473_937_556_339_135,
                 1_502_110_673_089_046_554,
                 14_484_161_115_671_232_577,
@@ -16331,7 +17147,8 @@ mod question_tests {
                 10_493_202_686_479_633_261,
                 9_858_505_864_262_550_789,
                 8_710_182_394_295_884_107,
-                1_923_556_055_944_460_855,
+                15_353_719_274_755_616_638,
+                5_239_033_309_572_019_229,
                 3_245_283_921_451_133_623,
             ],
             "minimum-size modal golden changed"

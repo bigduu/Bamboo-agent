@@ -227,6 +227,13 @@ pub enum AgentEvent {
         #[serde(default)]
         content_summary: Option<String>,
     },
+    /// Current round for a session. Parent streams may carry this inside a
+    /// `SubAgentEvent`, allowing clients to update the exact child row without
+    /// interpreting display text.
+    RunnerProgress {
+        session_id: String,
+        round_count: u32,
+    },
     /// A per-run token/tool-call/subagent budget tripped and the run was
     /// gracefully stopped (issue #221).
     BudgetExceeded {
@@ -248,12 +255,18 @@ pub enum AgentEvent {
     },
 
     // ── Sub-agent lifecycle (forwarded from the parent session's stream) ──
-    // Minimal projections of the server's SubAgent* events; extra server fields
-    // (parent_session_id, timestamp, the nested `event`) are ignored on decode.
+    // Typed projections of the server's SubAgent* events. Extra envelope fields
+    // such as parent_session_id and timestamp are ignored on decode.
     SubAgentStarted {
         child_session_id: String,
         #[serde(default)]
         title: Option<String>,
+    },
+    /// Full-fidelity child event forwarded on the parent session stream.
+    /// Boxing keeps the recursively-shaped wire contract finite.
+    SubAgentEvent {
+        child_session_id: String,
+        event: Box<AgentEvent>,
     },
     SubAgentHeartbeat {
         child_session_id: String,
@@ -374,6 +387,32 @@ mod clarification_event_tests {
             } if child_session_id == "child-1"
                 && request_id == "request-7"
                 && resource == "/tmp/result.txt"
+        ));
+    }
+
+    #[test]
+    fn forwarded_child_progress_preserves_child_and_session_identity() {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "sub_agent_event",
+            "parent_session_id": "parent-1",
+            "child_session_id": "child-2",
+            "event": {
+                "type": "runner_progress",
+                "session_id": "child-2",
+                "round_count": 7
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            AgentEvent::SubAgentEvent { child_session_id, event }
+                if child_session_id == "child-2"
+                    && matches!(
+                        event.as_ref(),
+                        AgentEvent::RunnerProgress { session_id, round_count: 7 }
+                            if session_id == "child-2"
+                    )
         ));
     }
 
