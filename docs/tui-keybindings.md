@@ -86,6 +86,42 @@ Action and context IDs are stable kebab-case strings:
 Use the F1 reference to confirm the exact resolved action labels before
 distributing a keymap.
 
+## Run-status HUD and activity center
+
+The Chat footer is a typed, per-session HUD. It keeps permission posture,
+run phase and id, connection state, plan mode, the current tool, compression,
+sub-agent counts, and budget failures separate from the short-lived status
+message. The active/background session strip carries the same session-scoped
+state when work continues outside the foreground. Text labels accompany every
+color and symbol. Press `Ctrl+L` to open the Activity center, where durable
+entries are grouped by session and run; `Enter` opens the newest linked
+session. The center retains at most 200 entries.
+
+Run transitions are reduced as follows:
+
+- local send: `idle|terminal -> starting`; the matching
+  `execution_started` supplies the run id and enters `running`;
+- tokens, reasoning, tool activity, and a resumed answer keep a non-terminal
+  generation `running`;
+- clarification and approval events enter `waiting for input` and
+  `waiting for permission`; an authoritative resolution returns to `running`;
+- a stop request enters `stopping`; its response ends in `cancelled`, or
+  `failed` when the request itself fails;
+- `complete`, `cancelled`, `error`, and `budget_exceeded` enter sticky terminal
+  phases. Later replayed progress for that generation is ignored;
+- only a previously unseen `execution_started` run id or an explicit local
+  send can create a successor generation. Recently seen ids are retained so a
+  delayed start cannot reopen an older run;
+- SSE readiness maps to `connecting`, `online`, and `reconnecting`; exhausted
+  transport retries map to `offline`. Reconnection does not reset run state.
+
+Tool and sub-agent lifecycles are independently keyed by their protocol ids,
+so overlapping work cannot overwrite a sibling. Their terminal states are
+also sticky unless the existing child-generation reconciliation proves a
+successor. Run detail is bounded to the latest 32 tools and 64 sub-agents.
+Transient footer messages expire after five seconds without clearing any of
+these durable fields.
+
 ## Validation and terminal safety
 
 The complete custom layer is applied atomically. Unknown fields, versions,

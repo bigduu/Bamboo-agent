@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -612,6 +613,10 @@ pub struct ChatState {
     pub provider: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
+    /// Typed, durable execution state for this exact session context. It moves
+    /// with the rest of `ChatState`, so background events can never overwrite
+    /// whichever session happens to be visible.
+    pub(crate) run_status: RunStatusState,
     /// Expansion default captured by detail blocks when they first appear.
     /// Existing blocks keep their independent state when this changes.
     pub expand_tools: bool,
@@ -700,6 +705,7 @@ impl ChatState {
             provider: None,
             token_usage: None,
             plan_mode: false,
+            run_status: RunStatusState::default(),
             expand_tools: false,
             sub_agents: Vec::new(),
             block_ui: HashMap::new(),
@@ -1189,6 +1195,657 @@ pub struct Notification {
     /// Background session that produced the notice. `Enter` in the log jumps
     /// to the most recent linked session.
     pub session_id: Option<String>,
+    /// Structured activity category. Ordinary notices retain `Notice`, while
+    /// run lifecycle entries let the Activity overlay group and label durable
+    /// execution state without parsing display text.
+    pub kind: ActivityKind,
+    /// Server run identity when the event contract exposes one. Entries that
+    /// arrive before `ExecutionStarted` remain grouped under the session.
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    Notice,
+    Run,
+    Tool,
+    Input,
+    Permission,
+    Connection,
+    Compression,
+    Plan,
+    Budget,
+    SubAgent,
+}
+
+impl ActivityKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Notice => "notice",
+            Self::Run => "run",
+            Self::Tool => "tool",
+            Self::Input => "input",
+            Self::Permission => "permission",
+            Self::Connection => "connection",
+            Self::Compression => "compression",
+            Self::Plan => "plan",
+            Self::Budget => "budget",
+            Self::SubAgent => "sub-agent",
+        }
+    }
+}
+
+/// Durable execution phase for one session view. Terminal phases are sticky:
+/// replayed or out-of-order progress cannot turn a completed/failed run back
+/// into running. Only a distinct `ExecutionStarted` run id or an explicit
+/// local send begins a successor generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RunPhase {
+    #[default]
+    Idle,
+    Starting,
+    Running,
+    WaitingForInput,
+    WaitingForPermission,
+    Stopping,
+    Completed,
+    Cancelled,
+    Failed,
+    BudgetExceeded,
+}
+
+impl RunPhase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::WaitingForInput => "waiting for input",
+            Self::WaitingForPermission => "waiting for permission",
+            Self::Stopping => "stopping",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::BudgetExceeded => "budget exceeded",
+        }
+    }
+
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::Idle => "·",
+            Self::Starting => "…",
+            Self::Running => "▶",
+            Self::WaitingForInput => "?",
+            Self::WaitingForPermission => "!",
+            Self::Stopping => "■",
+            Self::Completed => "✓",
+            Self::Cancelled => "■",
+            Self::Failed => "✗",
+            Self::BudgetExceeded => "!",
+        }
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Failed | Self::BudgetExceeded
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ConnectionStatus {
+    #[default]
+    Unknown,
+    Connecting,
+    Online,
+    Reconnecting,
+    Offline,
+}
+
+impl ConnectionStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Connecting => "connecting",
+            Self::Online => "online",
+            Self::Reconnecting => "reconnecting",
+            Self::Offline => "offline",
+        }
+    }
+
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Self::Unknown => "○",
+            Self::Connecting => "…",
+            Self::Online => "●",
+            Self::Reconnecting => "↻",
+            Self::Offline => "○",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolRunPhase {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl ToolRunPhase {
+    fn from_lifecycle(phase: &str, error: bool) -> Self {
+        if error {
+            return Self::Failed;
+        }
+        match phase.to_ascii_lowercase().as_str() {
+            "complete" | "completed" | "finish" | "finished" | "success" => Self::Completed,
+            "error" | "failed" | "failure" => Self::Failed,
+            "cancelled" | "canceled" | "stopped" => Self::Cancelled,
+            _ => Self::Running,
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunToolStatus {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) phase: ToolRunPhase,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) is_mutating: bool,
+    pub(crate) auto_approved: bool,
+    pub(crate) summary: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompressionRunStatus {
+    pub(crate) phase: String,
+    pub(crate) status: String,
+    pub(crate) active: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlanRunStatus {
+    pub(crate) active: bool,
+    pub(crate) reason: Option<String>,
+    pub(crate) file_path: Option<String>,
+    pub(crate) last_outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BudgetRunStatus {
+    pub(crate) kind: String,
+    pub(crate) limit: u64,
+    pub(crate) actual: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubAgentRunPhase {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubAgentRunStatus {
+    id: String,
+    phase: SubAgentRunPhase,
+}
+
+const MAX_RUN_TOOLS: usize = 32;
+const MAX_RUN_SUBAGENTS: usize = 64;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunStatusState {
+    pub(crate) generation: u64,
+    pub(crate) run_id: Option<String>,
+    pub(crate) phase: RunPhase,
+    pub(crate) started_at: Option<String>,
+    pub(crate) terminal_reason: Option<String>,
+    pub(crate) connection: ConnectionStatus,
+    pub(crate) tools: VecDeque<RunToolStatus>,
+    pub(crate) compression: Option<CompressionRunStatus>,
+    pub(crate) plan: PlanRunStatus,
+    pub(crate) budget: Option<BudgetRunStatus>,
+    sub_agents: VecDeque<SubAgentRunStatus>,
+    /// Recently observed server run ids for this session. A delayed
+    /// `ExecutionStarted` from an older generation must not reopen it after a
+    /// successor has become current or terminal.
+    seen_run_ids: VecDeque<String>,
+}
+
+impl RunStatusState {
+    fn reset_for_successor(&mut self, phase: RunPhase) {
+        let plan = self.plan.clone();
+        let connection = self.connection;
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.run_id = None;
+        self.phase = phase;
+        self.started_at = None;
+        self.terminal_reason = None;
+        self.connection = connection;
+        self.tools.clear();
+        self.compression = None;
+        self.plan = plan;
+        self.budget = None;
+        self.sub_agents.clear();
+    }
+
+    fn begin_local(&mut self) {
+        self.reset_for_successor(RunPhase::Starting);
+    }
+
+    fn resume_after_answer(&mut self) {
+        self.reset_for_successor(RunPhase::Running);
+    }
+
+    /// Returns true only when this event establishes a new current run id.
+    /// Duplicate and recently superseded ids are rejected, keeping both the
+    /// reducer state and Activity history replay-idempotent.
+    fn begin_server(&mut self, run_id: String, started_at: String) -> bool {
+        if self.run_id.as_deref() == Some(run_id.as_str()) {
+            return false;
+        }
+
+        if self.seen_run_ids.iter().any(|seen| seen == &run_id) {
+            return false;
+        }
+
+        if self.run_id.is_none()
+            && matches!(
+                self.phase,
+                RunPhase::Starting
+                    | RunPhase::Running
+                    | RunPhase::WaitingForInput
+                    | RunPhase::WaitingForPermission
+                    | RunPhase::Stopping
+            )
+        {
+            self.run_id = Some(run_id);
+            self.remember_run_id();
+            self.started_at = Some(started_at);
+            if !matches!(
+                self.phase,
+                RunPhase::WaitingForInput | RunPhase::WaitingForPermission | RunPhase::Stopping
+            ) {
+                self.phase = RunPhase::Running;
+            }
+            return true;
+        }
+
+        self.reset_for_successor(RunPhase::Running);
+        self.run_id = Some(run_id);
+        self.remember_run_id();
+        self.started_at = Some(started_at);
+        true
+    }
+
+    fn remember_run_id(&mut self) {
+        const MAX_SEEN_RUN_IDS: usize = 16;
+        let Some(run_id) = self.run_id.clone() else {
+            return;
+        };
+        self.seen_run_ids.push_back(run_id);
+        if self.seen_run_ids.len() > MAX_SEEN_RUN_IDS {
+            self.seen_run_ids.pop_front();
+        }
+    }
+
+    fn mark_running(&mut self) {
+        if self.phase.is_terminal() {
+            return;
+        }
+        if self.phase == RunPhase::Idle {
+            self.generation = self.generation.wrapping_add(1).max(1);
+        }
+        if !matches!(
+            self.phase,
+            RunPhase::WaitingForInput | RunPhase::WaitingForPermission | RunPhase::Stopping
+        ) {
+            self.phase = RunPhase::Running;
+        }
+    }
+
+    fn resolve_wait(&mut self) {
+        if matches!(
+            self.phase,
+            RunPhase::WaitingForInput | RunPhase::WaitingForPermission
+        ) {
+            self.phase = RunPhase::Running;
+        }
+    }
+
+    fn wait_for(&mut self, phase: RunPhase) {
+        if !self.phase.is_terminal() {
+            self.phase = phase;
+        }
+    }
+
+    fn mark_stopping(&mut self) {
+        if !self.phase.is_terminal() {
+            self.phase = RunPhase::Stopping;
+        }
+    }
+
+    fn finish(&mut self, phase: RunPhase, reason: impl Into<String>) {
+        debug_assert!(phase.is_terminal());
+        let reason = reason.into();
+        if self.phase.is_terminal() {
+            return;
+        }
+        self.phase = phase;
+        self.terminal_reason = Some(reason);
+        for tool in &mut self.tools {
+            if !tool.phase.is_terminal() {
+                tool.phase = if matches!(self.phase, RunPhase::Failed) {
+                    ToolRunPhase::Failed
+                } else {
+                    ToolRunPhase::Cancelled
+                };
+            }
+        }
+        if let Some(compression) = self.compression.as_mut() {
+            compression.active = false;
+        }
+    }
+
+    fn restore_summary(
+        &mut self,
+        is_running: bool,
+        has_pending_question: bool,
+        last_run_status: Option<&str>,
+    ) {
+        if has_pending_question {
+            if self.phase.is_terminal() || self.phase == RunPhase::Idle {
+                self.reset_for_successor(RunPhase::WaitingForInput);
+            } else {
+                self.phase = RunPhase::WaitingForInput;
+            }
+            return;
+        }
+        if is_running {
+            if self.phase.is_terminal() || self.phase == RunPhase::Idle {
+                self.reset_for_successor(RunPhase::Running);
+            } else {
+                self.phase = RunPhase::Running;
+            }
+            return;
+        }
+        let Some(status) = last_run_status else {
+            if !self.phase.is_terminal() {
+                self.phase = RunPhase::Idle;
+            }
+            return;
+        };
+        let normalized = status.to_ascii_lowercase();
+        let phase = if normalized.contains("budget") {
+            RunPhase::BudgetExceeded
+        } else if normalized.contains("error") || normalized.contains("fail") {
+            RunPhase::Failed
+        } else if normalized.contains("cancel") || normalized.contains("stop") {
+            RunPhase::Cancelled
+        } else if normalized.contains("wait") || normalized.contains("pause") {
+            RunPhase::WaitingForInput
+        } else {
+            RunPhase::Completed
+        };
+        if phase.is_terminal() {
+            if self.phase == RunPhase::BudgetExceeded
+                && matches!(phase, RunPhase::Completed | RunPhase::Cancelled)
+            {
+                return;
+            }
+            if self.phase.is_terminal() && self.phase != phase {
+                self.reset_for_successor(RunPhase::Idle);
+            }
+            self.finish(phase, status);
+        } else if !self.phase.is_terminal() {
+            self.phase = phase;
+            self.terminal_reason = Some(status.to_string());
+        }
+    }
+
+    fn tool_started(&mut self, id: String, name: String) {
+        if self.phase.is_terminal() {
+            return;
+        }
+        self.mark_running();
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            if !tool.phase.is_terminal() {
+                tool.name = name;
+                tool.phase = ToolRunPhase::Running;
+            }
+            return;
+        }
+        if self.tools.len() >= MAX_RUN_TOOLS {
+            self.tools.pop_front();
+        }
+        self.tools.push_back(RunToolStatus {
+            id,
+            name,
+            phase: ToolRunPhase::Running,
+            elapsed_ms: None,
+            is_mutating: false,
+            auto_approved: false,
+            summary: None,
+            error: None,
+        });
+    }
+
+    fn tool_finished(&mut self, id: String, succeeded: bool, detail: Option<String>) -> bool {
+        if !self.tools.iter().any(|tool| tool.id == id) {
+            if self.phase.is_terminal() {
+                return false;
+            }
+            self.tool_started(id.clone(), "unknown".to_string());
+        }
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            if tool.phase.is_terminal() {
+                return false;
+            }
+            tool.phase = if succeeded {
+                ToolRunPhase::Completed
+            } else {
+                ToolRunPhase::Failed
+            };
+            if succeeded {
+                tool.summary = detail;
+            } else {
+                tool.error = detail;
+            }
+            return true;
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_lifecycle(
+        &mut self,
+        id: String,
+        name: String,
+        phase: String,
+        elapsed_ms: Option<u64>,
+        is_mutating: bool,
+        auto_approved: bool,
+        summary: Option<String>,
+        error: Option<String>,
+    ) -> bool {
+        let next_phase = ToolRunPhase::from_lifecycle(&phase, error.is_some());
+        if !self.tools.iter().any(|tool| tool.id == id) {
+            if self.phase.is_terminal() {
+                return false;
+            }
+            self.tool_started(id.clone(), name.clone());
+        }
+        if let Some(tool) = self.tools.iter_mut().find(|tool| tool.id == id) {
+            if tool.phase.is_terminal() {
+                return false;
+            }
+            if self.phase.is_terminal() && !next_phase.is_terminal() {
+                return false;
+            }
+            tool.name = name;
+            tool.phase = next_phase;
+            tool.elapsed_ms = elapsed_ms.or(tool.elapsed_ms);
+            tool.is_mutating = is_mutating;
+            tool.auto_approved = auto_approved;
+            if summary.is_some() {
+                tool.summary = summary;
+            }
+            if error.is_some() {
+                tool.error = error;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn tool_token(&mut self, id: String) {
+        if self.phase.is_terminal() {
+            return;
+        }
+        if !self.tools.iter().any(|tool| tool.id == id) {
+            self.tool_started(id, "unknown".to_string());
+        }
+    }
+
+    pub(crate) fn current_tool(&self) -> Option<&RunToolStatus> {
+        self.tools
+            .iter()
+            .rev()
+            .find(|tool| !tool.phase.is_terminal())
+    }
+
+    fn set_compression(&mut self, phase: String, status: String) {
+        if self.phase.is_terminal() {
+            return;
+        }
+        let normalized = format!("{phase} {status}").to_ascii_lowercase();
+        let active = ![
+            "complete",
+            "completed",
+            "done",
+            "failed",
+            "error",
+            "cancelled",
+            "canceled",
+            "idle",
+        ]
+        .iter()
+        .any(|terminal| normalized.contains(terminal));
+        self.compression = Some(CompressionRunStatus {
+            phase,
+            status,
+            active,
+        });
+    }
+
+    fn enter_plan(&mut self, reason: Option<String>, file_path: Option<String>) {
+        self.plan.active = true;
+        self.plan.reason = reason;
+        if file_path.is_some() {
+            self.plan.file_path = file_path;
+        }
+        self.plan.last_outcome = None;
+    }
+
+    fn exit_plan(&mut self, approved: bool) {
+        self.plan.active = false;
+        self.plan.last_outcome = Some(if approved {
+            "approved".to_string()
+        } else {
+            "exited".to_string()
+        });
+    }
+
+    fn update_plan_file(&mut self, file_path: String) {
+        self.plan.file_path = Some(file_path);
+    }
+
+    fn exceed_budget(&mut self, kind: String, limit: u64, actual: u64) -> bool {
+        if self.phase.is_terminal() {
+            return false;
+        }
+        self.budget = Some(BudgetRunStatus {
+            kind: kind.clone(),
+            limit,
+            actual,
+        });
+        self.phase = RunPhase::BudgetExceeded;
+        self.terminal_reason = Some(format!("{kind}: {actual}/{limit}"));
+        true
+    }
+
+    fn subagent_started(&mut self, id: String, authoritative_successor: bool) {
+        if let Some(child) = self.sub_agents.iter_mut().find(|child| child.id == id) {
+            if child.phase == SubAgentRunPhase::Running || authoritative_successor {
+                child.phase = SubAgentRunPhase::Running;
+            }
+            return;
+        }
+        if self.sub_agents.len() >= MAX_RUN_SUBAGENTS {
+            self.sub_agents.pop_front();
+        }
+        self.sub_agents.push_back(SubAgentRunStatus {
+            id,
+            phase: SubAgentRunPhase::Running,
+        });
+    }
+
+    fn subagent_heartbeat(&mut self, id: String) {
+        if self.sub_agents.iter().any(|child| child.id == id) {
+            // A heartbeat confirms an already-running child but is not enough
+            // evidence to reopen a terminal child generation.
+            return;
+        }
+        if self.sub_agents.len() >= MAX_RUN_SUBAGENTS {
+            self.sub_agents.pop_front();
+        }
+        self.sub_agents.push_back(SubAgentRunStatus {
+            id,
+            phase: SubAgentRunPhase::Running,
+        });
+    }
+
+    fn subagent_finished(&mut self, id: String, status: &str) {
+        let normalized = status.to_ascii_lowercase();
+        let phase = if normalized.contains("error") || normalized.contains("fail") {
+            SubAgentRunPhase::Failed
+        } else if normalized.contains("cancel") || normalized.contains("stop") {
+            SubAgentRunPhase::Cancelled
+        } else {
+            SubAgentRunPhase::Completed
+        };
+        if let Some(child) = self.sub_agents.iter_mut().find(|child| child.id == id) {
+            child.phase = phase;
+            return;
+        }
+        if self.sub_agents.len() >= MAX_RUN_SUBAGENTS {
+            self.sub_agents.pop_front();
+        }
+        self.sub_agents.push_back(SubAgentRunStatus { id, phase });
+    }
+
+    pub(crate) fn subagent_counts(&self) -> (usize, usize, usize) {
+        let mut running = 0;
+        let mut completed = 0;
+        let mut failed = 0;
+        for child in &self.sub_agents {
+            match child.phase {
+                SubAgentRunPhase::Running => running += 1,
+                SubAgentRunPhase::Completed => completed += 1,
+                SubAgentRunPhase::Failed | SubAgentRunPhase::Cancelled => failed += 1,
+            }
+        }
+        (running, completed, failed)
+    }
 }
 
 // ── Interactive question (permission gate / clarification) ──
@@ -2711,7 +3368,11 @@ pub struct App {
     pub schedules: SchedulesState,
     pub skills: SkillsState,
     pub config: ConfigState,
+    /// Short-lived operator feedback. Durable run/permission/connection state
+    /// lives in `ChatState::run_status` and is rendered independently.
     pub status_message: String,
+    status_message_observed: String,
+    status_message_expires_at: Option<Instant>,
     pub connected: bool,
     pub help_visible: bool,
     pub help_scroll: u16,
@@ -2959,6 +3620,8 @@ impl App {
             skills: SkillsState::new(),
             config: ConfigState::new(),
             status_message: String::new(),
+            status_message_observed: String::new(),
+            status_message_expires_at: None,
             connected: false,
             help_visible: false,
             help_scroll: 0,
@@ -3168,6 +3831,9 @@ impl App {
             context.pending_reconcile_epoch = context.pending_reconcile_epoch.wrapping_add(1);
             context.stream_disconnected =
                 context.chat.streaming || context.chat.parent_terminal_pending;
+            if context.stream_disconnected {
+                context.chat.run_status.connection = ConnectionStatus::Offline;
+            }
             context.needs_history_refresh = true;
             subscriptions -= 1;
         }
@@ -3335,6 +4001,11 @@ impl App {
         context.chat.project_id.clone_from(&summary.project_id);
         context.chat.permission_mode = summary.permission_mode;
         context.chat.bypass_permissions = summary.bypass_permissions;
+        context.chat.run_status.restore_summary(
+            summary.is_running,
+            summary.has_pending_question,
+            summary.last_run_status.as_deref(),
+        );
         context.stream_disconnected = false;
         // A lightweight summary proves status, not transcript contents.
         context.needs_history_refresh = true;
@@ -3467,6 +4138,47 @@ impl App {
             }
         }
         activities
+    }
+
+    pub(crate) fn active_run_phase(&self) -> RunPhase {
+        let question = self
+            .pending_question
+            .as_ref()
+            .or(self.dismissed_question.as_ref());
+        match question.map(|question| &question.kind) {
+            Some(ActiveQuestionKind::Clarification) => RunPhase::WaitingForInput,
+            Some(
+                ActiveQuestionKind::Permission(_)
+                | ActiveQuestionKind::PermissionUnavailable { .. }
+                | ActiveQuestionKind::ChildApproval(_),
+            ) => RunPhase::WaitingForPermission,
+            None => self.chat.run_status.phase,
+        }
+    }
+
+    /// Resolve connection state from the per-session stream rather than the
+    /// global health bit alone. The SSE readiness watch flips false while its
+    /// retry loop is active, so reconnecting is visible even before another
+    /// parsed event reaches the reducer.
+    pub(crate) fn active_connection_status(&self) -> ConnectionStatus {
+        if self.sse_task.is_some() {
+            let ready = self.sse_ready.as_ref().is_some_and(|ready| *ready.borrow());
+            if ready {
+                return ConnectionStatus::Online;
+            }
+            return if self.chat.run_status.connection == ConnectionStatus::Online {
+                ConnectionStatus::Reconnecting
+            } else {
+                ConnectionStatus::Connecting
+            };
+        }
+        if self.stream_disconnected {
+            ConnectionStatus::Offline
+        } else if self.connected {
+            ConnectionStatus::Online
+        } else {
+            ConnectionStatus::Offline
+        }
     }
 
     /// Select the semantic palette and apply it to stateful third-party
@@ -3621,6 +4333,7 @@ impl App {
             {
                 self.status_message = message;
             }
+            self.refresh_transient_status(Instant::now());
             self.poll_sse();
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
             terminal.draw(|f| ui::render(f, self))?;
@@ -4559,6 +5272,14 @@ impl App {
                         // scratch id and the failed start disappears from the
                         // structured transcript.
                         self.chat.current_terminal_status = Some(format!("failed to start: {e}"));
+                        self.chat
+                            .run_status
+                            .finish(RunPhase::Failed, format!("failed to start: {e}"));
+                        self.record_activity(
+                            ActivityKind::Run,
+                            NoticeLevel::Error,
+                            format!("Run failed to start: {e}"),
+                        );
                         self.finalize_streaming();
                         self.notify(NoticeLevel::Error, format!("Error: {e}"));
                     }
@@ -4580,6 +5301,14 @@ impl App {
                 // `chat.streaming` spins forever.
                 self.notify(NoticeLevel::Error, format!("Failed to start run: {msg}"));
                 self.chat.current_terminal_status = Some(format!("failed to start: {msg}"));
+                self.chat
+                    .run_status
+                    .finish(RunPhase::Failed, format!("failed to start: {msg}"));
+                self.record_activity(
+                    ActivityKind::Run,
+                    NoticeLevel::Error,
+                    format!("Run failed to start: {msg}"),
+                );
                 self.finalize_streaming();
             }
             AppEvent::StopFinished {
@@ -4610,6 +5339,25 @@ impl App {
                     Ok(()) => "stopped".to_string(),
                     Err(error) => format!("stop failed: {error}"),
                 });
+                match &r {
+                    Ok(()) => self.chat.run_status.finish(RunPhase::Cancelled, "stopped"),
+                    Err(error) => self
+                        .chat
+                        .run_status
+                        .finish(RunPhase::Failed, format!("stop failed: {error}")),
+                }
+                self.record_activity(
+                    ActivityKind::Run,
+                    if r.is_ok() {
+                        NoticeLevel::Info
+                    } else {
+                        NoticeLevel::Error
+                    },
+                    self.chat
+                        .current_terminal_status
+                        .clone()
+                        .unwrap_or_else(|| "stopped".to_string()),
+                );
                 self.finalize_streaming();
                 match r {
                     Ok(()) => self.status_message = "Stopped".to_string(),
@@ -4701,6 +5449,11 @@ impl App {
                         self.chat.block_ui = block_ui;
                         self.chat.focused_block = focused_block;
                         self.chat.current_terminal_status = opened.last_run_status;
+                        self.chat.run_status.restore_summary(
+                            opened.is_running,
+                            opened.pending.is_some(),
+                            self.chat.current_terminal_status.as_deref(),
+                        );
                         self.chat.parent_terminal_pending =
                             !opened.is_running && opened.running_child_count > 0;
                         self.chat.token_usage = None;
@@ -4800,6 +5553,7 @@ impl App {
                         // the TUI), and subscribe before any answer can resume.
                         self.attach_stream(session_id);
                         self.chat.streaming = true;
+                        self.chat.run_status.restore_summary(false, true, None);
                         self.status_message = "Question reopened".to_string();
                     }
                     Ok(_) => {
@@ -5007,6 +5761,11 @@ impl App {
                             self.status_message = format!("{answer} — decision delivered");
                             self.chat.note_update();
                             self.show_next_child_approval();
+                            if self.pending_question.is_none()
+                                && self.pending_child_approvals.is_empty()
+                            {
+                                self.chat.run_status.resolve_wait();
+                            }
                             if let Some(child) = submitted_child {
                                 self.refresh_child_approvals(child.parent_session_id);
                             }
@@ -5052,9 +5811,24 @@ impl App {
                             if !self.stream_is_ready() {
                                 self.attach_stream(identity.session_id.clone());
                             }
+                            if self.pending_answer_run_started {
+                                self.chat.run_status.resolve_wait();
+                            } else {
+                                self.chat.run_status.resume_after_answer();
+                            }
+                            self.record_activity(
+                                ActivityKind::Run,
+                                NoticeLevel::Info,
+                                "Answer accepted; run resumed",
+                            );
                             self.status_message = format!("Answered: {answer} — resuming");
                             self.chat.streaming = true;
                         } else {
+                            self.chat.run_status.restore_summary(
+                                false,
+                                false,
+                                Some(status.as_str()),
+                            );
                             self.finalize_streaming();
                             self.status_message = format!("Answered: {answer} ({status})");
                         }
@@ -8339,6 +9113,7 @@ impl App {
         });
         self.chat.auto_scroll = true;
         self.chat.unseen_updates = 0;
+        self.chat.run_status.begin_local();
         self.chat.streaming = true;
         self.chat.current_response.clear();
         self.chat.current_tool_calls.clear();
@@ -8347,6 +9122,7 @@ impl App {
         self.chat.current_turn_id = Some(assistant_turn_id.clone());
         self.chat.current_terminal_status = None;
         self.status_message = "Sending...".to_string();
+        self.record_activity(ActivityKind::Run, NoticeLevel::Info, "Run starting");
 
         let client = self.client.clone();
         let context_id = self.chat.context_id;
@@ -8390,6 +9166,7 @@ impl App {
         self.sse_tx = Some(sse_tx.clone());
         self.sse_rx = Some(sse_rx);
         self.stream_disconnected = true;
+        self.chat.run_status.connection = ConnectionStatus::Connecting;
         let base_url = self.client.base_url.clone();
         match SseStream::start(&base_url, &session_id, stream_epoch, sse_tx) {
             Ok((task, ready)) => {
@@ -8399,6 +9176,7 @@ impl App {
                 self.enforce_subscription_limit();
             }
             Err(error) => {
+                self.chat.run_status.connection = ConnectionStatus::Offline;
                 self.detach_stream();
                 self.notify(NoticeLevel::Error, format!("SSE start failed: {error}"));
                 return false;
@@ -8431,6 +9209,14 @@ impl App {
         if !self.attach_stream(session_id.clone()) {
             self.chat.current_terminal_status =
                 Some("failed to start: SSE unavailable".to_string());
+            self.chat
+                .run_status
+                .finish(RunPhase::Failed, "failed to start: SSE unavailable");
+            self.record_activity(
+                ActivityKind::Run,
+                NoticeLevel::Error,
+                "Run failed to start: SSE unavailable",
+            );
             self.finalize_streaming();
             return;
         }
@@ -8441,12 +9227,30 @@ impl App {
             );
             self.chat.current_terminal_status =
                 Some("failed to start: SSE readiness unavailable".to_string());
+            self.chat.run_status.finish(
+                RunPhase::Failed,
+                "failed to start: SSE readiness unavailable",
+            );
+            self.record_activity(
+                ActivityKind::Run,
+                NoticeLevel::Error,
+                "Run failed to start: SSE readiness unavailable",
+            );
             self.finalize_streaming();
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
             self.chat.current_terminal_status =
                 Some("failed to start: event channel unavailable".to_string());
+            self.chat.run_status.finish(
+                RunPhase::Failed,
+                "failed to start: event channel unavailable",
+            );
+            self.record_activity(
+                ActivityKind::Run,
+                NoticeLevel::Error,
+                "Run failed to start: event channel unavailable",
+            );
             self.finalize_streaming();
             return;
         };
@@ -9143,8 +9947,14 @@ impl App {
                 }
                 self.connected = true;
                 self.stream_disconnected = false;
+                self.chat.run_status.connection = ConnectionStatus::Online;
                 self.chat.observed_activity = None;
                 if reconnecting {
+                    self.record_activity(
+                        ActivityKind::Connection,
+                        NoticeLevel::Info,
+                        "Event stream reconnected",
+                    );
                     self.status_message = "SSE reconnected — synchronizing".to_string();
                     self.active_needs_history_refresh = true;
                     self.chat.note_update();
@@ -9183,8 +9993,14 @@ impl App {
                 self.detach_stream();
                 self.connected = false;
                 self.stream_disconnected = true;
+                self.chat.run_status.connection = ConnectionStatus::Offline;
                 self.active_needs_history_refresh = true;
                 self.chat.note_update();
+                self.record_activity(
+                    ActivityKind::Connection,
+                    NoticeLevel::Error,
+                    format!("Event stream offline: {message}"),
+                );
                 self.notify(NoticeLevel::Error, format!("SSE disconnected: {message}"));
                 Ok(())
             }
@@ -9194,12 +10010,30 @@ impl App {
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
         match event {
             AgentEvent::Token { content } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat.run_status.mark_running();
                 self.begin_next_round_after_tools();
                 self.chat.ensure_current_turn_id();
                 self.chat.current_response.push_str(&content);
                 self.chat.note_update();
             }
-            AgentEvent::ExecutionStarted { run_id, .. } => {
+            AgentEvent::ExecutionStarted {
+                run_id, started_at, ..
+            } => {
+                if !self
+                    .chat
+                    .run_status
+                    .begin_server(run_id.clone(), started_at)
+                {
+                    return Ok(());
+                }
+                self.record_activity(
+                    ActivityKind::Run,
+                    NoticeLevel::Info,
+                    format!("Run {run_id} started"),
+                );
                 // ExecutionStarted is not part of the critical replay cache.
                 // Seeing it therefore begins a successor parent generation and
                 // retires any child-generation expectation reconstructed for
@@ -9219,6 +10053,10 @@ impl App {
                 self.stream_disconnected = false;
             }
             AgentEvent::ReasoningToken { content } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat.run_status.mark_running();
                 self.begin_next_round_after_tools();
                 let turn_id = self.chat.ensure_current_turn_id();
                 self.chat.register_block(format!("{turn_id}:reasoning"));
@@ -9230,6 +10068,17 @@ impl App {
                 tool_name,
                 arguments,
             } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat
+                    .run_status
+                    .tool_started(tool_call_id.clone(), tool_name.clone());
+                self.record_activity(
+                    ActivityKind::Tool,
+                    NoticeLevel::Info,
+                    format!("Tool {tool_name} [{tool_call_id}] started"),
+                );
                 if let Some(intent) = child_start_intent(&tool_name, &arguments) {
                     self.chat
                         .child_start_intents
@@ -9268,6 +10117,42 @@ impl App {
             } => {
                 let success = result.success;
                 let result = result.result;
+                let activity_name = self
+                    .chat
+                    .run_status
+                    .tools
+                    .iter()
+                    .find(|tool| tool.id == tool_call_id)
+                    .map(|tool| tool.name.clone())
+                    .unwrap_or_else(|| tool_call_id.clone());
+                let typed_known = self
+                    .chat
+                    .run_status
+                    .tools
+                    .iter()
+                    .any(|tool| tool.id == tool_call_id);
+                if self.chat.run_status.phase.is_terminal() && !typed_known {
+                    return Ok(());
+                }
+                if self.chat.run_status.tool_finished(
+                    tool_call_id.clone(),
+                    success,
+                    Some(result.clone()),
+                ) {
+                    self.record_activity(
+                        ActivityKind::Tool,
+                        if success {
+                            NoticeLevel::Info
+                        } else {
+                            NoticeLevel::Error
+                        },
+                        if success {
+                            format!("Tool {activity_name} [{tool_call_id}] completed")
+                        } else {
+                            format!("Tool {activity_name} [{tool_call_id}] failed: {result}")
+                        },
+                    );
+                }
                 match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
                         if success {
@@ -9313,6 +10198,34 @@ impl App {
                 tool_call_id,
                 error,
             } => {
+                let activity_name = self
+                    .chat
+                    .run_status
+                    .tools
+                    .iter()
+                    .find(|tool| tool.id == tool_call_id)
+                    .map(|tool| tool.name.clone())
+                    .unwrap_or_else(|| tool_call_id.clone());
+                let typed_known = self
+                    .chat
+                    .run_status
+                    .tools
+                    .iter()
+                    .any(|tool| tool.id == tool_call_id);
+                if self.chat.run_status.phase.is_terminal() && !typed_known {
+                    return Ok(());
+                }
+                if self.chat.run_status.tool_finished(
+                    tool_call_id.clone(),
+                    false,
+                    Some(error.clone()),
+                ) {
+                    self.record_activity(
+                        ActivityKind::Tool,
+                        NoticeLevel::Error,
+                        format!("Tool {activity_name} [{tool_call_id}] failed: {error}"),
+                    );
+                }
                 match self.find_tool_mut(&tool_call_id, true) {
                     Some(tc) => {
                         tc.error = Some(error);
@@ -9339,11 +10252,42 @@ impl App {
             }
             AgentEvent::ToolLifecycle {
                 tool_call_id,
+                tool_name,
                 phase,
+                elapsed_ms,
+                is_mutating,
+                auto_approved,
                 summary,
                 error,
-                ..
             } => {
+                if !self.chat.run_status.tool_lifecycle(
+                    tool_call_id.clone(),
+                    tool_name.clone(),
+                    phase.clone(),
+                    elapsed_ms,
+                    is_mutating,
+                    auto_approved,
+                    summary.clone(),
+                    error.clone(),
+                ) {
+                    return Ok(());
+                }
+                let detail = elapsed_ms
+                    .map(|elapsed| format!(" ({elapsed}ms)"))
+                    .unwrap_or_default();
+                let failure = error
+                    .as_deref()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default();
+                self.record_activity(
+                    ActivityKind::Tool,
+                    if error.is_some() {
+                        NoticeLevel::Error
+                    } else {
+                        NoticeLevel::Info
+                    },
+                    format!("Tool {tool_name} [{tool_call_id}]: {phase}{detail}{failure}"),
+                );
                 // Lifecycle phases ("begin"/"executing"/"finished"/"cancelled")
                 // are supplementary progress strings, not the UI's terminal
                 // vocabulary ("complete"/"error") — once ToolComplete/ToolError
@@ -9366,7 +10310,18 @@ impl App {
                 // dropped (it carries only supplementary progress info, unlike
                 // Complete/Error's definitive terminal result).
             }
-            AgentEvent::ToolApprovalRequested { .. } => {
+            AgentEvent::ToolApprovalRequested { tool_name, .. } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat
+                    .run_status
+                    .wait_for(RunPhase::WaitingForPermission);
+                self.record_activity(
+                    ActivityKind::Permission,
+                    NoticeLevel::Warn,
+                    format!("Permission required for {tool_name}"),
+                );
                 if let Some(session_id) = self.chat.session_id.clone() {
                     self.status_message = "Synchronizing typed permission request...".to_string();
                     self.reconcile_pending_question_after_stream_connect(session_id);
@@ -9379,6 +10334,17 @@ impl App {
                 permission,
                 resource,
             } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat
+                    .run_status
+                    .wait_for(RunPhase::WaitingForPermission);
+                self.record_activity(
+                    ActivityKind::Permission,
+                    NoticeLevel::Warn,
+                    format!("Child {child_session_id} requires permission for {tool_name}"),
+                );
                 let Some(parent_session_id) = self.chat.session_id.clone() else {
                     self.notify(
                         NoticeLevel::Warn,
@@ -9439,6 +10405,14 @@ impl App {
                 // starts at a positive version.
                 let authoritative_identity = version > 0;
                 if status == "pending" {
+                    self.chat
+                        .run_status
+                        .wait_for(RunPhase::WaitingForPermission);
+                    self.record_activity(
+                        ActivityKind::Permission,
+                        NoticeLevel::Warn,
+                        format!("Child {child_session_id} approval pending"),
+                    );
                     self.upsert_child_approval(QueuedChildApproval {
                         record: ChildApprovalRecord {
                             parent_session_id: parent_session_id.clone(),
@@ -9500,8 +10474,23 @@ impl App {
                         },
                         format!("Child approval {status}{detail}"),
                     );
+                    self.record_activity(
+                        ActivityKind::Permission,
+                        if matches!(status.as_str(), "delivery_failed" | "expired") {
+                            NoticeLevel::Warn
+                        } else {
+                            NoticeLevel::Info
+                        },
+                        format!("Child {child_session_id} approval {status}{detail}"),
+                    );
                     let _ = resolved_at;
                     self.show_next_child_approval();
+                    if self.pending_question.is_none()
+                        && self.pending_child_approvals.is_empty()
+                        && self.chat.run_status.phase == RunPhase::WaitingForPermission
+                    {
+                        self.chat.run_status.resolve_wait();
+                    }
                 } else {
                     // A terminal compatibility event with no durable identity
                     // cannot prove which generation it resolved. Reconcile
@@ -9519,6 +10508,15 @@ impl App {
                 allow_custom,
                 source,
             } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat.run_status.wait_for(RunPhase::WaitingForInput);
+                self.record_activity(
+                    ActivityKind::Input,
+                    NoticeLevel::Warn,
+                    format!("Input required: {question}"),
+                );
                 let Some(session_id) = self.chat.session_id.clone() else {
                     self.notify(
                         NoticeLevel::Warn,
@@ -9605,21 +10603,88 @@ impl App {
                     }
                 }
             }
-            AgentEvent::Complete { usage } => self.handle_complete(usage),
+            AgentEvent::Complete { usage } => {
+                if self.chat.run_status.phase.is_terminal() && !self.chat.streaming {
+                    return Ok(());
+                }
+                self.handle_complete(usage);
+            }
             AgentEvent::Cancelled { message } => {
+                if self.chat.run_status.phase.is_terminal() && !self.chat.streaming {
+                    return Ok(());
+                }
                 let message = message.unwrap_or_else(|| "Cancelled".to_string());
-                self.status_message = message;
-                self.finish_parent_terminal(self.status_message.clone());
+                self.chat
+                    .run_status
+                    .finish(RunPhase::Cancelled, message.clone());
+                let terminal = if self.chat.run_status.phase == RunPhase::BudgetExceeded {
+                    format!(
+                        "budget exceeded: {}",
+                        self.chat
+                            .run_status
+                            .terminal_reason
+                            .as_deref()
+                            .unwrap_or("configured limit reached")
+                    )
+                } else {
+                    message
+                };
+                self.record_activity(
+                    ActivityKind::Run,
+                    if self.chat.run_status.phase == RunPhase::BudgetExceeded {
+                        NoticeLevel::Warn
+                    } else {
+                        NoticeLevel::Info
+                    },
+                    format!("Run terminal: {terminal}"),
+                );
+                self.status_message.clone_from(&terminal);
+                self.finish_parent_terminal(terminal);
             }
             AgentEvent::Error { message } => {
+                if self.chat.run_status.phase.is_terminal() && !self.chat.streaming {
+                    return Ok(());
+                }
+                self.chat
+                    .run_status
+                    .finish(RunPhase::Failed, message.clone());
+                let terminal = if self.chat.run_status.phase == RunPhase::BudgetExceeded {
+                    format!(
+                        "budget exceeded: {}",
+                        self.chat
+                            .run_status
+                            .terminal_reason
+                            .as_deref()
+                            .unwrap_or("configured limit reached")
+                    )
+                } else {
+                    format!("error: {message}")
+                };
+                self.record_activity(
+                    ActivityKind::Run,
+                    NoticeLevel::Error,
+                    format!("Run terminal: {terminal}"),
+                );
                 self.notify(NoticeLevel::Error, format!("Error: {message}"));
-                self.finish_parent_terminal(format!("error: {message}"));
+                self.finish_parent_terminal(terminal);
             }
             AgentEvent::BudgetExceeded {
                 kind,
                 limit,
                 actual,
             } => {
+                if !self
+                    .chat
+                    .run_status
+                    .exceed_budget(kind.clone(), limit, actual)
+                {
+                    return Ok(());
+                }
+                self.record_activity(
+                    ActivityKind::Budget,
+                    NoticeLevel::Warn,
+                    format!("Budget exceeded: {kind} {actual}/{limit}"),
+                );
                 // Precedes the run's normal `Complete`/`Cancelled` terminal
                 // event (see bamboo_agent_core::AgentEvent::BudgetExceeded) —
                 // just surface why the run is about to stop; the terminal
@@ -9633,6 +10698,10 @@ impl App {
                 tool_call_id,
                 content,
             } => {
+                if self.chat.run_status.phase.is_terminal() {
+                    return Ok(());
+                }
+                self.chat.run_status.tool_token(tool_call_id.clone());
                 if let Some(tool) = self.find_tool_mut(&tool_call_id, false) {
                     tool.stream_output.push_str(&content);
                 } else {
@@ -9653,9 +10722,31 @@ impl App {
                 self.chat.note_update();
             }
             AgentEvent::ContextCompressionStatus { phase, status } => {
+                self.chat
+                    .run_status
+                    .set_compression(phase.clone(), status.clone());
+                self.record_activity(
+                    ActivityKind::Compression,
+                    if status.to_ascii_lowercase().contains("fail")
+                        || status.to_ascii_lowercase().contains("error")
+                    {
+                        NoticeLevel::Error
+                    } else {
+                        NoticeLevel::Info
+                    },
+                    format!("Compression {status} ({phase})"),
+                );
                 self.status_message = format!("Compression: {} ({})", status, phase);
             }
-            AgentEvent::PlanModeEntered { reason, .. } => {
+            AgentEvent::PlanModeEntered {
+                reason,
+                plan_file_path,
+                ..
+            } => {
+                self.chat
+                    .run_status
+                    .enter_plan(reason.clone(), plan_file_path);
+                self.record_activity(ActivityKind::Plan, NoticeLevel::Info, "Plan mode entered");
                 self.chat.plan_mode = true;
                 self.status_message = format!(
                     "Plan mode active{}",
@@ -9666,6 +10757,16 @@ impl App {
                 );
             }
             AgentEvent::PlanModeExited { approved, .. } => {
+                self.chat.run_status.exit_plan(approved);
+                self.record_activity(
+                    ActivityKind::Plan,
+                    NoticeLevel::Info,
+                    if approved {
+                        "Plan mode exited (approved)"
+                    } else {
+                        "Plan mode exited"
+                    },
+                );
                 self.chat.plan_mode = false;
                 self.status_message = if approved {
                     "Plan mode exited (approved)".to_string()
@@ -9674,6 +10775,12 @@ impl App {
                 };
             }
             AgentEvent::PlanFileUpdated { file_path, .. } => {
+                self.chat.run_status.update_plan_file(file_path.clone());
+                self.record_activity(
+                    ActivityKind::Plan,
+                    NoticeLevel::Info,
+                    format!("Plan updated: {file_path}"),
+                );
                 self.status_message = format!("Plan updated: {}", file_path);
             }
             AgentEvent::SubAgentStarted {
@@ -9744,6 +10851,15 @@ impl App {
                             || owned_by_current_turn
                             || current_execution_started
                     };
+                self.chat.run_status.subagent_started(
+                    child_session_id.clone(),
+                    fresh_start || active_in_current_turn,
+                );
+                self.record_activity(
+                    ActivityKind::SubAgent,
+                    NoticeLevel::Info,
+                    format!("Sub-agent {child_session_id} started"),
+                );
                 if active_in_current_turn {
                     self.chat
                         .current_turn_child_ids
@@ -9754,12 +10870,26 @@ impl App {
                 }
                 self.chat.note_update();
             }
-            AgentEvent::SubAgentHeartbeat { .. } => {}
+            AgentEvent::SubAgentHeartbeat { child_session_id } => {
+                self.chat.run_status.subagent_heartbeat(child_session_id);
+            }
             AgentEvent::SubAgentCompleted {
                 child_session_id,
                 status,
                 error,
             } => {
+                self.chat
+                    .run_status
+                    .subagent_finished(child_session_id.clone(), &status);
+                self.record_activity(
+                    ActivityKind::SubAgent,
+                    if status.contains("error") || status.contains("fail") {
+                        NoticeLevel::Error
+                    } else {
+                        NoticeLevel::Info
+                    },
+                    format!("Sub-agent {child_session_id} {status}"),
+                );
                 self.chat.active_child_ids.remove(&child_session_id);
                 self.chat
                     .replay_expected_child_ids
@@ -9810,6 +10940,17 @@ impl App {
     }
 
     fn finish_parent_terminal(&mut self, status: String) {
+        if !self.chat.run_status.phase.is_terminal() {
+            let normalized = status.to_ascii_lowercase();
+            let phase = if normalized.contains("error") || normalized.contains("fail") {
+                RunPhase::Failed
+            } else if normalized.contains("cancel") || normalized.contains("stop") {
+                RunPhase::Cancelled
+            } else {
+                RunPhase::Completed
+            };
+            self.chat.run_status.finish(phase, status.clone());
+        }
         self.chat.child_start_intents.clear();
         self.chat.current_execution_started = false;
         self.chat.current_terminal_status = Some(status);
@@ -9851,6 +10992,12 @@ impl App {
             self.flush_streaming_output();
             self.chat.token_usage = Some(usage);
             self.chat.streaming = true;
+            self.chat.run_status.wait_for(RunPhase::WaitingForInput);
+            self.record_activity(
+                ActivityKind::Input,
+                NoticeLevel::Warn,
+                "Run paused while waiting for input",
+            );
             self.status_message = "Paused — waiting for your answer".to_string();
             if let Some(session_id) = self.chat.session_id.clone() {
                 self.attach_stream(session_id);
@@ -9858,7 +11005,28 @@ impl App {
             return;
         }
         self.chat.token_usage = Some(usage);
-        self.finish_parent_terminal("completed".to_string());
+        self.chat
+            .run_status
+            .finish(RunPhase::Completed, "completed");
+        if self.chat.run_status.phase == RunPhase::BudgetExceeded {
+            self.record_activity(
+                ActivityKind::Run,
+                NoticeLevel::Warn,
+                "Run stopped at its budget limit",
+            );
+            let status = format!(
+                "budget exceeded: {}",
+                self.chat
+                    .run_status
+                    .terminal_reason
+                    .as_deref()
+                    .unwrap_or("configured limit reached")
+            );
+            self.finish_parent_terminal(status);
+        } else {
+            self.record_activity(ActivityKind::Run, NoticeLevel::Info, "Run completed");
+            self.finish_parent_terminal("completed".to_string());
+        }
     }
 
     fn flush_streaming_output(&mut self) {
@@ -9915,15 +11083,23 @@ impl App {
         let Some(sid) = self.chat.session_id.clone() else {
             // Nothing to stop server-side; still clear local streaming state.
             self.chat.current_terminal_status = Some("stopped".to_string());
+            self.chat.run_status.finish(RunPhase::Cancelled, "stopped");
+            self.record_activity(ActivityKind::Run, NoticeLevel::Info, "Run stopped");
             self.finalize_streaming();
             self.status_message = "Stopped".to_string();
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
             self.chat.current_terminal_status = Some("stopped locally".to_string());
+            self.chat
+                .run_status
+                .finish(RunPhase::Cancelled, "stopped locally");
+            self.record_activity(ActivityKind::Run, NoticeLevel::Info, "Run stopped locally");
             self.finalize_streaming();
             return;
         };
+        self.chat.run_status.mark_stopping();
+        self.record_activity(ActivityKind::Run, NoticeLevel::Warn, "Stopping run");
         self.status_message = "Stopping...".to_string();
         let client = self.client.clone();
         let stream_epoch = self.sse_epoch;
@@ -10240,11 +11416,66 @@ impl App {
             text,
             at: Utc::now(),
             session_id: self.routing_background_session.clone(),
+            kind: ActivityKind::Notice,
+            run_id: None,
         });
         const CAP: usize = 200;
         if self.notifications.len() > CAP {
             let excess = self.notifications.len() - CAP;
             self.notifications.drain(0..excess);
+        }
+    }
+
+    fn record_activity(&mut self, kind: ActivityKind, level: NoticeLevel, text: impl Into<String>) {
+        let text = text.into();
+        let session_id = self
+            .routing_background_session
+            .clone()
+            .or_else(|| self.chat.session_id.clone())
+            .or_else(|| Some(format!("@local:{}", self.chat.context_id)));
+        let run_id = self.chat.run_status.run_id.clone();
+        if self.notifications.last().is_some_and(|entry| {
+            entry.kind == kind
+                && entry.session_id == session_id
+                && entry.run_id == run_id
+                && entry.text == text
+        }) {
+            return;
+        }
+        if matches!(level, NoticeLevel::Warn | NoticeLevel::Error) {
+            self.unseen_alerts = self.unseen_alerts.saturating_add(1);
+        }
+        self.notifications.push(Notification {
+            level,
+            text,
+            at: Utc::now(),
+            session_id,
+            kind,
+            run_id,
+        });
+        const CAP: usize = 200;
+        if self.notifications.len() > CAP {
+            let excess = self.notifications.len() - CAP;
+            self.notifications.drain(0..excess);
+        }
+    }
+
+    fn refresh_transient_status(&mut self, now: Instant) {
+        const STATUS_TTL: Duration = Duration::from_secs(5);
+        if self.status_message != self.status_message_observed {
+            self.status_message_observed
+                .clone_from(&self.status_message);
+            self.status_message_expires_at =
+                (!self.status_message.is_empty()).then_some(now + STATUS_TTL);
+            return;
+        }
+        if self
+            .status_message_expires_at
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.status_message.clear();
+            self.status_message_observed.clear();
+            self.status_message_expires_at = None;
         }
     }
 
@@ -22230,6 +23461,551 @@ mod question_tests {
                 index.to_string()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod run_status_tests {
+    use super::*;
+    use bamboo_client_core::ToolResult;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn usage() -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        }
+    }
+
+    fn running_app(session_id: &str, run_id: &str) -> App {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some(session_id.to_string());
+        app.chat.history_loaded = true;
+        app.chat.streaming = true;
+        app.connected = true;
+        app.handle_sse_event(AgentEvent::ExecutionStarted {
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            started_at: "2026-08-15T05:00:00Z".to_string(),
+        })
+        .unwrap();
+        app
+    }
+
+    fn terminal_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (area.y..area.y.saturating_add(area.height))
+            .map(|row| {
+                (area.x..area.x.saturating_add(area.width))
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn reducer_replay_is_idempotent_and_terminal_generations_never_regress() {
+        fn reduce(state: &mut RunStatusState, replay: bool) {
+            assert!(state.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));
+            state.tool_started("tool-one".to_string(), "read_file".to_string());
+            state.tool_lifecycle(
+                "tool-one".to_string(),
+                "read_file".to_string(),
+                "running".to_string(),
+                Some(17),
+                false,
+                true,
+                Some("reading".to_string()),
+                None,
+            );
+            if replay {
+                assert!(
+                    !state.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string())
+                );
+                state.tool_started("tool-one".to_string(), "read_file".to_string());
+            }
+            state.set_compression("compact".to_string(), "running".to_string());
+            state.set_compression("compact".to_string(), "completed".to_string());
+            state.tool_finished("tool-one".to_string(), true, Some("done".to_string()));
+            if replay {
+                state.tool_finished("tool-one".to_string(), true, Some("duplicate".to_string()));
+            }
+            state.finish(RunPhase::Completed, "completed");
+        }
+
+        let mut uninterrupted = RunStatusState::default();
+        reduce(&mut uninterrupted, false);
+        let mut replayed = RunStatusState::default();
+        reduce(&mut replayed, true);
+        assert_eq!(replayed, uninterrupted);
+
+        let settled = replayed.clone();
+        assert!(!replayed.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));
+        replayed.mark_running();
+        replayed.tool_started("late-tool".to_string(), "write_file".to_string());
+        replayed.set_compression("compact".to_string(), "running".to_string());
+        assert_eq!(replayed, settled, "late replay reopened a terminal run");
+
+        assert!(replayed.begin_server("run-two".to_string(), "2026-08-15T05:01:00Z".to_string()));
+        assert_eq!(replayed.phase, RunPhase::Running);
+        assert!(replayed.tools.is_empty());
+        let successor = replayed.clone();
+        assert!(!replayed.begin_server("run-one".to_string(), "2026-08-15T05:00:00Z".to_string()));
+        assert_eq!(
+            replayed, successor,
+            "an older run id attached state to its successor"
+        );
+    }
+
+    #[test]
+    fn reducer_bounds_parallel_tool_and_subagent_detail() {
+        let mut state = RunStatusState::default();
+        state.begin_local();
+        for index in 0..40 {
+            state.tool_started(format!("tool-{index}"), format!("call-{index}"));
+        }
+        for index in 0..70 {
+            state.subagent_started(format!("child-{index}"), false);
+        }
+        assert_eq!(state.tools.len(), MAX_RUN_TOOLS);
+        assert_eq!(state.tools.front().unwrap().id, "tool-8");
+        assert_eq!(state.sub_agents.len(), MAX_RUN_SUBAGENTS);
+        assert_eq!(state.sub_agents.front().unwrap().id, "child-6");
+
+        state.subagent_finished("child-69".to_string(), "completed");
+        state.subagent_heartbeat("child-69".to_string());
+        assert_eq!(state.subagent_counts(), (63, 1, 0));
+    }
+
+    #[test]
+    fn authoritative_summary_can_advance_terminal_generations_but_keeps_budget_cause() {
+        let mut state = RunStatusState::default();
+        state.finish(RunPhase::Completed, "completed");
+        let completed_generation = state.generation;
+        state.restore_summary(false, false, Some("failed"));
+        assert_eq!(state.phase, RunPhase::Failed);
+        assert!(state.generation > completed_generation);
+
+        let mut budget = RunStatusState::default();
+        assert!(budget.exceed_budget("max_total_tokens".to_string(), 100, 101));
+        budget.restore_summary(false, false, Some("cancelled"));
+        assert_eq!(budget.phase, RunPhase::BudgetExceeded);
+        assert_eq!(
+            budget.terminal_reason.as_deref(),
+            Some("max_total_tokens: 101/100")
+        );
+    }
+
+    #[test]
+    fn complete_lifecycle_reduces_tools_plan_compression_subagents_and_activity() {
+        let mut app = running_app("session-life", "run-life");
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "read".to_string(),
+            tool_name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "write".to_string(),
+            tool_name: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "notes.md"}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolLifecycle {
+            tool_call_id: "write".to_string(),
+            tool_name: "write_file".to_string(),
+            phase: "finished".to_string(),
+            elapsed_ms: Some(87),
+            is_mutating: true,
+            auto_approved: true,
+            summary: Some("updating notes".to_string()),
+            error: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ContextCompressionStatus {
+            phase: "compact".to_string(),
+            status: "running".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::PlanModeEntered {
+            session_id: "session-life".to_string(),
+            reason: Some("implementation".to_string()),
+            pre_permission_mode: None,
+            entered_at: None,
+            status: None,
+            plan_file_path: Some("plan.md".to_string()),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::SubAgentStarted {
+            child_session_id: "child-life".to_string(),
+            title: Some("review".to_string()),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "read".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "contents".to_string(),
+            },
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolComplete {
+            tool_call_id: "write".to_string(),
+            result: ToolResult {
+                success: true,
+                result: "saved".to_string(),
+            },
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ContextCompressionStatus {
+            phase: "compact".to_string(),
+            status: "completed".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::PlanFileUpdated {
+            session_id: "session-life".to_string(),
+            file_path: "plan-v2.md".to_string(),
+            content_summary: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::PlanModeExited {
+            session_id: "session-life".to_string(),
+            approved: true,
+            plan: None,
+            restored_mode: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::SubAgentCompleted {
+            child_session_id: "child-life".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+
+        assert_eq!(app.chat.run_status.phase, RunPhase::Completed);
+        assert_eq!(app.chat.run_status.tools.len(), 2);
+        assert!(app
+            .chat
+            .run_status
+            .tools
+            .iter()
+            .all(|tool| tool.phase == ToolRunPhase::Completed));
+        assert_eq!(app.chat.run_status.subagent_counts(), (0, 1, 0));
+        assert!(!app.chat.run_status.compression.as_ref().unwrap().active);
+        assert!(!app.chat.run_status.plan.active);
+        assert_eq!(
+            app.chat.run_status.plan.file_path.as_deref(),
+            Some("plan-v2.md")
+        );
+        assert!(!app.chat.streaming);
+        let written = app
+            .chat
+            .messages
+            .iter()
+            .flat_map(|message| &message.tool_calls)
+            .find(|tool| tool.id == "write")
+            .expect("definitive ToolComplete remains visible after terminal lifecycle");
+        assert_eq!(written.result.as_deref(), Some("saved"));
+        for kind in [
+            ActivityKind::Run,
+            ActivityKind::Tool,
+            ActivityKind::Compression,
+            ActivityKind::Plan,
+            ActivityKind::SubAgent,
+        ] {
+            assert!(
+                app.notifications.iter().any(|entry| entry.kind == kind),
+                "missing {kind:?} activity"
+            );
+        }
+        assert!(app
+            .notifications
+            .iter()
+            .filter(|entry| {
+                entry.kind != ActivityKind::Notice
+                    && entry.session_id.as_deref() == Some("session-life")
+            })
+            .all(|entry| entry.run_id.as_deref() == Some("run-life")));
+    }
+
+    #[tokio::test]
+    async fn permission_and_input_waits_survive_unrelated_progress_until_resolution() {
+        let mut app = running_app("session-wait", "run-wait");
+        app.handle_sse_event(AgentEvent::ToolApprovalRequested {
+            tool_call_id: "danger".to_string(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({"cmd": "deploy"}),
+        })
+        .unwrap();
+        assert_eq!(app.active_run_phase(), RunPhase::WaitingForPermission);
+
+        app.handle_sse_event(AgentEvent::ExecutionStarted {
+            run_id: "run-wait".to_string(),
+            session_id: "session-wait".to_string(),
+            started_at: "2026-08-15T05:00:00Z".to_string(),
+        })
+        .unwrap();
+        assert_eq!(app.active_run_phase(), RunPhase::WaitingForPermission);
+
+        app.handle_sse_event(AgentEvent::Token {
+            content: "replayed output".to_string(),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "late".to_string(),
+            tool_name: "read_file".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        assert_eq!(
+            app.active_run_phase(),
+            RunPhase::WaitingForPermission,
+            "progress hid a critical permission wait"
+        );
+
+        app.chat.run_status.resolve_wait();
+        app.handle_sse_event(AgentEvent::NeedClarification {
+            question: "Which target?".to_string(),
+            options: Some(vec!["staging".to_string()]),
+            tool_call_id: Some("question".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: true,
+            source: Some("pause_tool".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.active_run_phase(), RunPhase::WaitingForInput);
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+        assert!(app.chat.streaming);
+        assert_eq!(app.active_run_phase(), RunPhase::WaitingForInput);
+        assert!(app
+            .notifications
+            .iter()
+            .any(|entry| entry.kind == ActivityKind::Input));
+    }
+
+    #[test]
+    fn budget_stop_is_sticky_through_trailing_progress_and_complete() {
+        let mut app = running_app("session-budget", "run-budget");
+        app.handle_sse_event(AgentEvent::BudgetExceeded {
+            kind: "max_tool_calls".to_string(),
+            limit: 3,
+            actual: 4,
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::ToolStart {
+            tool_call_id: "late".to_string(),
+            tool_name: "ignored".to_string(),
+            arguments: serde_json::json!({}),
+        })
+        .unwrap();
+        app.handle_sse_event(AgentEvent::Complete { usage: usage() })
+            .unwrap();
+
+        assert_eq!(app.chat.run_status.phase, RunPhase::BudgetExceeded);
+        assert_eq!(
+            app.chat.run_status.terminal_reason.as_deref(),
+            Some("max_tool_calls: 4/3")
+        );
+        assert!(app.chat.run_status.tools.is_empty());
+        assert!(!app.chat.streaming);
+        assert!(app.chat.messages.last().is_some_and(|message| message
+            .terminal_status
+            .as_deref()
+            .is_some_and(|status| status.contains("budget exceeded"))));
+    }
+
+    #[tokio::test]
+    async fn stop_failure_becomes_a_durable_failed_phase() {
+        let mut app = running_app("session-stop", "run-stop");
+        let turn_id = app.chat.current_turn_id.clone().unwrap();
+        app.handle_event(AppEvent::StopFinished {
+            session_id: "session-stop".to_string(),
+            turn_id,
+            stream_epoch: app.sse_epoch,
+            result: Err("server unreachable".to_string()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.run_status.phase, RunPhase::Failed);
+        assert_eq!(
+            app.chat.run_status.terminal_reason.as_deref(),
+            Some("stop failed: server unreachable")
+        );
+        assert!(!app.chat.streaming);
+        assert!(app.notifications.iter().any(|entry| {
+            entry.kind == ActivityKind::Run && entry.text.contains("stop failed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn connection_retries_do_not_reset_the_active_run() {
+        let mut app = running_app("session-net", "run-net");
+        app.chat.run_status.connection = ConnectionStatus::Online;
+        let (ready_tx, ready_rx) = watch::channel(false);
+        app.sse_ready = Some(ready_rx);
+        app.sse_task = Some(tokio::spawn(std::future::pending()));
+        assert_eq!(
+            app.active_connection_status(),
+            ConnectionStatus::Reconnecting
+        );
+
+        ready_tx.send(true).unwrap();
+        assert_eq!(app.active_connection_status(), ConnectionStatus::Online);
+        app.handle_session_sse_event(SessionSseEvent::TransportFailed {
+            session_id: "session-net".to_string(),
+            stream_epoch: app.sse_epoch,
+            message: "retry budget exhausted".to_string(),
+        })
+        .unwrap();
+        assert_eq!(app.active_connection_status(), ConnectionStatus::Offline);
+        assert_eq!(app.chat.run_status.phase, RunPhase::Running);
+        assert_eq!(app.chat.run_status.run_id.as_deref(), Some("run-net"));
+    }
+
+    #[test]
+    fn background_events_update_only_their_session_and_activity_group() {
+        let mut app = running_app("session-background", "run-background");
+        app.sse_epoch = 9;
+        app.new_session();
+        app.chat.session_id = Some("session-foreground".to_string());
+        app.chat.history_loaded = true;
+
+        app.handle_session_sse_event(SessionSseEvent::Event {
+            session_id: "session-background".to_string(),
+            stream_epoch: 9,
+            event: Box::new(AgentEvent::Complete { usage: usage() }),
+        })
+        .unwrap();
+
+        assert_eq!(app.chat.session_id.as_deref(), Some("session-foreground"));
+        assert_eq!(app.chat.run_status.phase, RunPhase::Idle);
+        let background = app.session_views.get("session-background").unwrap();
+        assert_eq!(background.chat.run_status.phase, RunPhase::Completed);
+        assert_eq!(
+            background.chat.run_status.run_id.as_deref(),
+            Some("run-background")
+        );
+        assert!(app.notifications.iter().any(|entry| {
+            entry.kind == ActivityKind::Run
+                && entry.session_id.as_deref() == Some("session-background")
+                && entry.run_id.as_deref() == Some("run-background")
+        }));
+
+        app.notifications_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("Activity center"), "{text}");
+        assert!(text.contains("session session-back"), "{text}");
+        assert!(text.contains("run run-backgrou"), "{text}");
+    }
+
+    #[test]
+    fn activity_retention_and_transient_toast_expiry_are_independent() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("session-cap".to_string());
+        app.chat.run_status.begin_local();
+        for index in 0..220 {
+            app.record_activity(
+                ActivityKind::Tool,
+                NoticeLevel::Info,
+                format!("activity-{index}"),
+            );
+        }
+        assert_eq!(app.notifications.len(), 200);
+        assert_eq!(app.notifications.first().unwrap().text, "activity-20");
+
+        let now = Instant::now();
+        app.status_message = "temporary toast".to_string();
+        app.refresh_transient_status(now);
+        app.refresh_transient_status(now + Duration::from_secs(6));
+        assert!(app.status_message.is_empty());
+        assert_eq!(app.chat.run_status.phase, RunPhase::Starting);
+        assert_eq!(app.notifications.len(), 200);
+    }
+
+    #[test]
+    fn typed_hud_and_activity_details_are_readable_at_60_80_120_columns() {
+        let mut app = running_app("sess-ui-long", "run-ui-long");
+        app.chat.permission_mode = SessionPermissionMode::Auto;
+        app.chat.run_status.enter_plan(
+            Some("review the implementation".to_string()),
+            Some("plans/644.md".to_string()),
+        );
+        app.chat
+            .run_status
+            .tool_started("tool-ui".to_string(), "write_workspace_file".to_string());
+        app.chat.run_status.tool_lifecycle(
+            "tool-ui".to_string(),
+            "write_workspace_file".to_string(),
+            "running".to_string(),
+            Some(87),
+            true,
+            true,
+            Some("editing".to_string()),
+            None,
+        );
+
+        for width in [60, 80, 120] {
+            let height = if width == 120 { 40 } else { 24 };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal_text(&terminal);
+            for label in ["PERM AUTO", "RUNNING", "ONLINE", "PLAN", "sess-ui-"] {
+                assert!(
+                    text.contains(label),
+                    "{width}-column HUD missing {label:?}:\n{text}"
+                );
+            }
+            assert!(text.contains("tool"), "{width}-column HUD lost activity");
+        }
+
+        app.chat.run_status.wait_for(RunPhase::WaitingForPermission);
+        let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        compact
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let compact_text = terminal_text(&compact);
+        assert!(
+            compact_text.contains("PERMISSION REQUIRED"),
+            "{compact_text}"
+        );
+        assert!(compact_text.contains("ONLINE"), "{compact_text}");
+        app.chat.run_status.resolve_wait();
+
+        app.notifications_visible = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        for value in [
+            "run-ui-long",
+            "write_workspace_file",
+            "plans/644.md",
+            "review the implementation",
+        ] {
+            assert!(
+                text.contains(value),
+                "activity detail missing {value:?}:\n{text}"
+            );
+        }
+
+        app.handle_notifications_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.notifications_visible);
     }
 }
 

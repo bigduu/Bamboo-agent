@@ -9,9 +9,9 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::api::types::PermissionDecisionKind;
 use crate::app::{
-    ActiveQuestion, ActiveQuestionKind, App, CommandPaletteEntry, CommandPaletteHitbox,
-    CommandPaletteTrigger, NoticeLevel, PermissionStage, QuestionOptionHitbox,
-    SessionActivityStatus, SessionPickerMode, Tab,
+    ActiveQuestion, ActiveQuestionKind, ActivityKind, App, CommandPaletteEntry,
+    CommandPaletteHitbox, CommandPaletteTrigger, ConnectionStatus, NoticeLevel, PermissionStage,
+    QuestionOptionHitbox, RunPhase, SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
@@ -203,9 +203,136 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         },
     ));
 
-    // Urgent run/question/error state comes first. Lower-priority model,
-    // tokens and session metadata are appended only while cells remain.
-    if app.chat.streaming {
+    // Typed run state is sticky across transient toasts and moves with the
+    // session context. Legacy/manual states (including older tests and servers)
+    // retain the previous streaming/question fallback until the reducer has
+    // observed a generation.
+    let typed_run = app.chat.run_status.generation > 0
+        || app.chat.run_status.phase != RunPhase::Idle
+        || app.chat.run_status.run_id.is_some();
+    if typed_run {
+        let phase = app.active_run_phase();
+        let run_id = app
+            .chat
+            .run_status
+            .run_id
+            .as_deref()
+            .map(|id| id.chars().take(8).collect::<String>());
+        let phase_text = match phase {
+            RunPhase::Running => {
+                let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
+                format!("{} RUNNING", theme::BRAILLE_SPINNER[tick])
+            }
+            RunPhase::WaitingForInput => "? INPUT REQUIRED".to_string(),
+            RunPhase::WaitingForPermission => "! PERMISSION REQUIRED".to_string(),
+            _ => format!("{} {}", phase.glyph(), phase.label().to_uppercase()),
+        };
+        let phase_text = if let Some(run_id) = run_id {
+            format!("{phase_text} r:{run_id}")
+        } else {
+            phase_text
+        };
+        let phase_style = match phase {
+            RunPhase::Completed => Style::default().fg(colors::success()),
+            RunPhase::WaitingForInput | RunPhase::WaitingForPermission | RunPhase::Stopping => {
+                Style::default()
+                    .fg(colors::warning())
+                    .add_modifier(Modifier::BOLD)
+            }
+            RunPhase::Failed | RunPhase::BudgetExceeded => Style::default()
+                .fg(colors::error())
+                .add_modifier(Modifier::BOLD),
+            RunPhase::Starting | RunPhase::Running => Style::default().fg(colors::tool_running()),
+            RunPhase::Idle | RunPhase::Cancelled => Style::default().fg(colors::inactive()),
+        };
+        items.push((phase_text, phase_style));
+
+        // Keep the connection and other critical badges ahead of verbose
+        // activity so they survive compact clipping.
+        let connection = app.active_connection_status();
+        let connection_style = match connection {
+            ConnectionStatus::Online => Style::default().fg(colors::success()),
+            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting => {
+                Style::default().fg(colors::warning())
+            }
+            ConnectionStatus::Unknown | ConnectionStatus::Offline => {
+                Style::default().fg(colors::error())
+            }
+        };
+        items.push((
+            format!(
+                "{} {}",
+                connection.glyph(),
+                connection.label().to_uppercase()
+            ),
+            connection_style,
+        ));
+
+        if app.chat.plan_mode || app.chat.run_status.plan.active {
+            items.push((
+                "PLAN".to_string(),
+                Style::default()
+                    .fg(colors::warning())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        if let Some(budget) = &app.chat.run_status.budget {
+            items.push((
+                format!("budget {} {}/{}", budget.kind, budget.actual, budget.limit),
+                Style::default()
+                    .fg(colors::error())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        if let Some(tool) = app.chat.run_status.current_tool() {
+            let elapsed = tool
+                .elapsed_ms
+                .map(|elapsed| format!(" {elapsed}ms"))
+                .unwrap_or_default();
+            let flags = match (tool.is_mutating, tool.auto_approved) {
+                (true, true) => " mutating/auto",
+                (true, false) => " mutating",
+                (false, true) => " auto",
+                (false, false) => "",
+            };
+            items.push((
+                format!("tool {}{elapsed}{flags}", tool.name),
+                Style::default().fg(colors::tool_running()),
+            ));
+        }
+
+        if let Some(compression) = app
+            .chat
+            .run_status
+            .compression
+            .as_ref()
+            .filter(|compression| compression.active)
+        {
+            items.push((
+                format!("COMP {}:{}", compression.phase, compression.status),
+                Style::default().fg(colors::warning()),
+            ));
+        }
+
+        let (children_running, children_completed, children_failed) =
+            app.chat.run_status.subagent_counts();
+        if children_running + children_completed + children_failed > 0 {
+            items.push((
+                format!(
+                    "agents {children_running} run/{children_completed} done/{children_failed} fail"
+                ),
+                if children_failed > 0 {
+                    Style::default().fg(colors::error())
+                } else if children_running > 0 {
+                    Style::default().fg(colors::tool_running())
+                } else {
+                    Style::default().fg(colors::success())
+                },
+            ));
+        }
+    } else if app.chat.streaming {
         let tick = app.spinner_tick % theme::BRAILLE_SPINNER.len();
         let spinner = theme::BRAILLE_SPINNER[tick];
         items.push((
@@ -241,7 +368,7 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    if app.chat.plan_mode {
+    if !typed_run && (app.chat.plan_mode || app.chat.run_status.plan.active) {
         items.push((
             "PLAN".to_string(),
             Style::default()
@@ -259,12 +386,26 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    let (connection, connection_style) = if app.connected {
-        ("● ONLINE", Style::default().fg(colors::success()))
-    } else {
-        ("○ OFFLINE", Style::default().fg(colors::error()))
-    };
-    items.push((connection.to_string(), connection_style));
+    if !typed_run {
+        let connection = app.active_connection_status();
+        let connection_style = match connection {
+            ConnectionStatus::Online => Style::default().fg(colors::success()),
+            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting => {
+                Style::default().fg(colors::warning())
+            }
+            ConnectionStatus::Unknown | ConnectionStatus::Offline => {
+                Style::default().fg(colors::error())
+            }
+        };
+        items.push((
+            format!(
+                "{} {}",
+                connection.glyph(),
+                connection.label().to_uppercase()
+            ),
+            connection_style,
+        ));
+    }
 
     if !app.status_message.is_empty() {
         items.push((
@@ -483,6 +624,14 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
     let screen = f.area();
     let popup_width = ((screen.width as u32 * 94 / 100) as u16).max(1);
     let content_width = popup_width.saturating_sub(4) as usize;
+    let has_typed_run = app.chat.run_status.generation > 0
+        || app.chat.run_status.phase != RunPhase::Idle
+        || app.chat.run_status.run_id.is_some();
+    let structured_activity = has_typed_run
+        || app
+            .notifications
+            .iter()
+            .any(|entry| entry.kind != ActivityKind::Notice);
     let mut entries: Vec<Line> = Vec::new();
     {
         let mut push_full_value = |label: &str, value: &str, color| {
@@ -518,6 +667,98 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
             push_full_value("model provider", provider, colors::inactive());
         }
         push_full_value("status", &app.status_message, colors::inactive());
+        if has_typed_run {
+            push_full_value(
+                "run id",
+                app.chat.run_status.run_id.as_deref().unwrap_or("pending"),
+                colors::inactive(),
+            );
+            push_full_value(
+                "run phase",
+                app.active_run_phase().label(),
+                match app.active_run_phase() {
+                    RunPhase::Failed | RunPhase::BudgetExceeded => colors::error(),
+                    RunPhase::WaitingForInput
+                    | RunPhase::WaitingForPermission
+                    | RunPhase::Stopping => colors::warning(),
+                    RunPhase::Completed => colors::success(),
+                    _ => colors::inactive(),
+                },
+            );
+            push_full_value(
+                "connection",
+                app.active_connection_status().label(),
+                colors::inactive(),
+            );
+            if let Some(reason) = app.chat.run_status.terminal_reason.as_deref() {
+                push_full_value("terminal reason", reason, colors::error());
+            }
+            if let Some(tool) = app
+                .chat
+                .run_status
+                .current_tool()
+                .or_else(|| app.chat.run_status.tools.back())
+            {
+                push_full_value("tool id", &tool.id, colors::inactive());
+                push_full_value(
+                    if app.chat.run_status.current_tool().is_some() {
+                        "current tool"
+                    } else {
+                        "last tool"
+                    },
+                    &tool.name,
+                    colors::tool_running(),
+                );
+                if let Some(summary) = tool.summary.as_deref() {
+                    push_full_value("tool activity", summary, colors::inactive());
+                }
+                if let Some(error) = tool.error.as_deref() {
+                    push_full_value("tool error", error, colors::error());
+                }
+            }
+            if let Some(compression) = app.chat.run_status.compression.as_ref() {
+                push_full_value(
+                    "compression",
+                    &format!("{}: {}", compression.phase, compression.status),
+                    if compression.active {
+                        colors::warning()
+                    } else {
+                        colors::inactive()
+                    },
+                );
+            }
+            if let Some(path) = app.chat.run_status.plan.file_path.as_deref() {
+                push_full_value("plan file", path, colors::inactive());
+            }
+            if let Some(reason) = app.chat.run_status.plan.reason.as_deref() {
+                push_full_value("plan reason", reason, colors::inactive());
+            }
+            if let Some(budget) = app.chat.run_status.budget.as_ref() {
+                push_full_value(
+                    "budget stop",
+                    &format!("{}: {}/{}", budget.kind, budget.actual, budget.limit),
+                    colors::error(),
+                );
+            }
+            let (running, completed, failed) = app.chat.run_status.subagent_counts();
+            if running + completed + failed > 0 {
+                push_full_value(
+                    "sub-agents",
+                    &format!("{running} running, {completed} completed, {failed} failed"),
+                    colors::inactive(),
+                );
+            }
+        }
+        if let Some(usage) = app.chat.token_usage.as_ref() {
+            push_full_value(
+                "token usage",
+                &format!(
+                    "{} prompt, {} completion, {} total",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                ),
+                colors::inactive(),
+            );
+        }
         if let Some((id, title)) = &app.pending_delete {
             push_full_value("delete session id", id, colors::error());
             push_full_value("delete session title", title, colors::error());
@@ -630,7 +871,7 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
     if app.notifications.is_empty() && entries.is_empty() {
         entries.push(Line::raw("  (nothing yet)"));
     } else {
-        for n in app.notifications.iter().rev() {
+        let push_entry = |entries: &mut Vec<Line>, n: &crate::app::Notification| {
             let (tag, color) = match n.level {
                 NoticeLevel::Info => ("info", colors::inactive()),
                 NoticeLevel::Warn => ("warn", colors::warning()),
@@ -641,7 +882,17 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
                 NoticeLevel::Warn => "!",
                 NoticeLevel::Error => "x",
             };
-            let prefix = format!("  {} {marker} {tag}  ", n.at.format("%H:%M:%S"));
+            let prefix = if structured_activity {
+                format!(
+                    "  {} {marker} {:<10} ",
+                    n.at.format("%H:%M:%S"),
+                    n.kind.label()
+                )
+            } else {
+                // Keep the long-standing notification-log shape byte-for-byte
+                // when no typed activity exists (including its golden tests).
+                format!("  {} {marker} {tag}  ", n.at.format("%H:%M:%S"))
+            };
             let continuation = " ".repeat(display_width(&prefix));
             let text_width = content_width.saturating_sub(display_width(&prefix)).max(1);
             let wrapped = crate::text::wrapped_lines(&n.text, text_width);
@@ -658,6 +909,62 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
                     Span::styled(line, Style::default().fg(color)),
                 ])
             }));
+        };
+
+        if structured_activity {
+            let mut groups: Vec<(
+                Option<String>,
+                Option<String>,
+                Vec<&crate::app::Notification>,
+            )> = Vec::new();
+            for notification in app.notifications.iter().rev() {
+                let key = (&notification.session_id, &notification.run_id);
+                if let Some((_, _, group)) = groups.iter_mut().find(|(session, run, _)| {
+                    session.as_ref() == key.0.as_ref() && run.as_ref() == key.1.as_ref()
+                }) {
+                    group.push(notification);
+                } else {
+                    groups.push((
+                        notification.session_id.clone(),
+                        notification.run_id.clone(),
+                        vec![notification],
+                    ));
+                }
+            }
+            for (group_index, (session_id, run_id, group)) in groups.into_iter().enumerate() {
+                if group_index > 0 {
+                    entries.push(Line::raw(""));
+                }
+                let session = session_id
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "system".to_string());
+                let run = run_id
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "pending".to_string());
+                let header = format!("session {session} · run {run}");
+                let header_width = content_width.saturating_sub(2).max(1);
+                entries.extend(
+                    crate::text::wrapped_lines(&header, header_width)
+                        .into_iter()
+                        .map(|line| {
+                            Line::from(Span::styled(
+                                format!("  {line}"),
+                                Style::default()
+                                    .fg(colors::brand())
+                                    .add_modifier(Modifier::BOLD),
+                            ))
+                        }),
+                );
+                for notification in group {
+                    push_entry(&mut entries, notification);
+                }
+            }
+        } else {
+            for notification in app.notifications.iter().rev() {
+                push_entry(&mut entries, notification);
+            }
         }
     }
 
@@ -672,7 +979,12 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
     let end = (start + viewport_rows).min(entries.len());
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            " Notifications · rows {}-{} of {}",
+            " {} · rows {}-{} of {}",
+            if structured_activity {
+                "Activity center"
+            } else {
+                "Notifications"
+            },
             if entries.is_empty() { 0 } else { start + 1 },
             end,
             entries.len()
@@ -706,7 +1018,11 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::brand()))
-        .title(" Log ");
+        .title(if structured_activity {
+            " Activity "
+        } else {
+            " Log "
+        });
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
