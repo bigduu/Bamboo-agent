@@ -171,6 +171,111 @@ pub struct GetSessionEnvelope {
     pub session: SessionSummary,
 }
 
+/// Full session projection used by the Sub-agents inspector.  The ordinary
+/// session picker intentionally keeps a smaller DTO; the tree needs the
+/// durable relationship and placement metadata already emitted by the same
+/// server endpoints.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTreeKind {
+    Root,
+    Child,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionTreePlacement {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub host: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct SessionTreeSummary {
+    pub id: String,
+    #[serde(default)]
+    pub kind: SessionTreeKind,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub root_session_id: String,
+    #[serde(default)]
+    pub spawn_depth: u32,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub is_running: bool,
+    #[serde(default)]
+    pub has_pending_question: bool,
+    #[serde(default)]
+    pub running_child_count: u32,
+    #[serde(default)]
+    pub last_run_status: Option<String>,
+    #[serde(default)]
+    pub last_run_error: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_activity_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub resident_name: Option<String>,
+    #[serde(default)]
+    pub placement: SessionTreePlacement,
+}
+
+impl SessionTreeSummary {
+    pub(crate) fn placeholder(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: SessionTreeKind::Unknown,
+            title: String::new(),
+            parent_session_id: None,
+            root_session_id: String::new(),
+            spawn_depth: 0,
+            model: String::new(),
+            is_running: false,
+            has_pending_question: false,
+            running_child_count: 0,
+            last_run_status: None,
+            last_run_error: None,
+            updated_at: None,
+            last_activity_at: None,
+            subagent_type: None,
+            lifecycle: None,
+            resident_name: None,
+            placement: SessionTreePlacement::default(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ListSessionTreeEnvelope {
+    #[serde(default)]
+    pub sessions: Vec<SessionTreeSummary>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct GetSessionTreeEnvelope {
+    pub session: SessionTreeSummary,
+}
+
 // ── Session resume (history + pending question) ──
 
 /// `function` payload of a [`HistoryToolCall`] — mirrors the server's
@@ -1007,6 +1112,44 @@ mod tests {
         assert!(!s.pinned);
         assert_eq!(s.permission_mode, SessionPermissionMode::Default);
         assert!(!s.bypass_permissions);
+    }
+
+    #[test]
+    fn child_tree_projection_preserves_relationship_and_placement_metadata() {
+        let json = r#"{
+            "id":"child-2",
+            "kind":"child",
+            "title":"Review",
+            "parent_session_id":"child-1",
+            "root_session_id":"root",
+            "spawn_depth":2,
+            "model":"gpt-5",
+            "is_running":true,
+            "last_run_error":"old error",
+            "subagent_type":"reviewer",
+            "lifecycle":"resident",
+            "resident_name":"reviewer-a",
+            "placement":{"kind":"ssh","host":"worker.example"}
+        }"#;
+        let session: SessionTreeSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(session.kind, SessionTreeKind::Child);
+        assert_eq!(session.parent_session_id.as_deref(), Some("child-1"));
+        assert_eq!(session.root_session_id, "root");
+        assert_eq!(session.spawn_depth, 2);
+        assert_eq!(session.subagent_type.as_deref(), Some("reviewer"));
+        assert_eq!(session.lifecycle.as_deref(), Some("resident"));
+        assert_eq!(session.resident_name.as_deref(), Some("reviewer-a"));
+        assert_eq!(session.placement.kind, "ssh");
+        assert_eq!(session.placement.host, "worker.example");
+    }
+
+    #[test]
+    fn child_tree_projection_tolerates_missing_legacy_metadata() {
+        let session: SessionTreeSummary = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert_eq!(session.kind, SessionTreeKind::Unknown);
+        assert!(session.parent_session_id.is_none());
+        assert!(session.root_session_id.is_empty());
+        assert!(session.placement.host.is_empty());
     }
 
     #[test]

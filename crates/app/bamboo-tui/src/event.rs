@@ -1,9 +1,10 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    CatalogModel, CommandDetail, CommandListResponse, ListSessionsEnvelope, McpServer,
-    PendingQuestion, PermissionDecisionResponse, PermissionPolicyResponse, ProviderCatalog,
-    Schedule, SessionSummary, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
+    CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
+    ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
+    PermissionPolicyResponse, ProviderCatalog, Schedule, SessionSummary, SessionTreeSummary, Skill,
+    SkillDetail, SubagentSnapshotResponse, ToolInfo,
 };
 use crate::api::{
     PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
@@ -218,6 +219,20 @@ pub enum AppEvent {
         offset: usize,
         observation_epoch: u64,
         result: Loaded<ListSessionsEnvelope>,
+    },
+    /// Relationship-rich detail for the session that opened the Sub-agents
+    /// inspector. It establishes the durable root before pages are reduced.
+    SubagentTreeRootLoaded {
+        epoch: u64,
+        active_session_id: String,
+        result: Loaded<SessionTreeSummary>,
+    },
+    /// One serialized page of the account session index. The tree scans the
+    /// bounded paginated source, then retains only the active root graph.
+    SubagentTreePageLoaded {
+        epoch: u64,
+        offset: usize,
+        result: Loaded<ListSessionTreeEnvelope>,
     },
     /// Fresh session summary + ETag loaded before a rename/pin mutation.
     SessionPickerVersionLoaded {

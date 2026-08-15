@@ -39,6 +39,7 @@ pub(crate) enum ActionContext {
     PermissionRuleConfirm,
     PermissionDeleteConfirm,
     PermissionModeConfirm,
+    SubagentTree,
     SessionPickerBrowse,
     SessionPickerRename,
     SessionPickerPinning,
@@ -47,7 +48,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 30] = [
+    pub(crate) const ALL: [Self; 31] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -73,6 +74,7 @@ impl ActionContext {
         Self::PermissionRuleConfirm,
         Self::PermissionDeleteConfirm,
         Self::PermissionModeConfirm,
+        Self::SubagentTree,
         Self::SessionPickerBrowse,
         Self::SessionPickerRename,
         Self::SessionPickerPinning,
@@ -107,6 +109,7 @@ impl ActionContext {
             Self::PermissionRuleConfirm => "Global permission rule confirmation",
             Self::PermissionDeleteConfirm => "Permission delete",
             Self::PermissionModeConfirm => "Permission mode",
+            Self::SubagentTree => "Sub-agent tree",
             Self::SessionPickerBrowse => "Session picker",
             Self::SessionPickerRename => "Session rename",
             Self::SessionPickerPinning => "Session pin",
@@ -127,6 +130,7 @@ pub(crate) enum ActionId {
     ReopenPendingQuestion,
     OpenModelPicker,
     OpenSessionPicker,
+    OpenSubagentTree,
     StopRun,
     ToggleDetails,
     OpenConfigTab,
@@ -215,6 +219,9 @@ pub(crate) enum ActionId {
     RenameSession,
     ToggleSessionPin,
     LoadMore,
+    ExpandTreeNode,
+    CollapseTreeNode,
+    OpenPendingRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +350,15 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [(Global, "Ctrl+P; Leader p")]
     ),
     spec!(
+        OpenSubagentTree,
+        "Sub-agent tree",
+        "Inspect and navigate the active parent/child session graph",
+        true,
+        Chat,
+        [Global],
+        [(Global, "Leader a")]
+    ),
+    spec!(
         StopRun,
         "Stop active run",
         "Request cancellation of the active agent run",
@@ -460,6 +476,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Skills,
             Config,
             Permissions,
+            SubagentTree,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -476,6 +493,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Skills, "Up"),
             (Config, "Up; k"),
             (Permissions, "Up; k"),
+            (SubagentTree, "Up; k"),
             (SessionPickerBrowse, "Up"),
             (ModelPicker, "Up"),
             (CommandPalette, "Up")
@@ -498,6 +516,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Skills,
             Config,
             Permissions,
+            SubagentTree,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -514,6 +533,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Skills, "Down"),
             (Config, "Down; j"),
             (Permissions, "Down; j"),
+            (SubagentTree, "Down; j"),
             (SessionPickerBrowse, "Down"),
             (ModelPicker, "Down"),
             (CommandPalette, "Down")
@@ -531,6 +551,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             Config,
+            SubagentTree,
             ModelPicker,
             CommandPalette
         ],
@@ -541,6 +562,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "PageUp"),
             (PermissionRuleConfirm, "PageUp"),
             (Config, "PageUp"),
+            (SubagentTree, "PageUp"),
             (ModelPicker, "PageUp"),
             (CommandPalette, "PageUp")
         ]
@@ -557,6 +579,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             Config,
+            SubagentTree,
             ModelPicker,
             CommandPalette
         ],
@@ -567,6 +590,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "PageDown"),
             (PermissionRuleConfirm, "PageDown"),
             (Config, "PageDown"),
+            (SubagentTree, "PageDown"),
             (ModelPicker, "PageDown"),
             (CommandPalette, "PageDown")
         ]
@@ -583,6 +607,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             ConversationBlock,
+            SubagentTree,
             ModelPicker,
             CommandPalette
         ],
@@ -593,6 +618,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "Home"),
             (PermissionRuleConfirm, "Home"),
             (ConversationBlock, "Home"),
+            (SubagentTree, "Home; g g"),
             (ModelPicker, "Home"),
             (CommandPalette, "Home")
         ]
@@ -609,6 +635,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             QuestionInspect,
             PermissionRuleConfirm,
             ConversationBlock,
+            SubagentTree,
             ModelPicker,
             CommandPalette
         ],
@@ -619,6 +646,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (QuestionInspect, "End"),
             (PermissionRuleConfirm, "End"),
             (ConversationBlock, "End"),
+            (SubagentTree, "End; Shift+G"),
             (ModelPicker, "End"),
             (CommandPalette, "End")
         ]
@@ -639,6 +667,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             ScheduleForm,
             Skills,
             Permissions,
+            SubagentTree,
             SessionPickerBrowse,
             SessionPickerRename,
             ModelPicker,
@@ -655,6 +684,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (ScheduleForm, "Enter"),
             (Skills, "Enter"),
             (Permissions, "Enter"),
+            (SubagentTree, "Enter"),
             (SessionPickerBrowse, "Enter"),
             (SessionPickerRename, "Enter"),
             (ModelPicker, "Enter"),
@@ -677,6 +707,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             ConfigEditor,
             Permissions,
             PermissionEditor,
+            SubagentTree,
             SessionPickerBrowse,
             SessionPickerRename,
             SessionPickerPinning,
@@ -694,6 +725,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (ConfigEditor, "Esc"),
             (Permissions, "Esc"),
             (PermissionEditor, "Esc"),
+            (SubagentTree, "Esc; q"),
             (SessionPickerBrowse, "Esc"),
             (SessionPickerRename, "Esc"),
             (SessionPickerPinning, "Esc"),
@@ -733,6 +765,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             Sessions,
             Mcp,
+            SubagentTree,
             SessionPickerBrowse,
             SessionPickerRename,
             SessionPickerPinning,
@@ -744,6 +777,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [
             (Sessions, "r"),
             (Mcp, "r"),
+            (SubagentTree, "r; Ctrl+R"),
             (SessionPickerBrowse, "Ctrl+R"),
             (SessionPickerRename, "Ctrl+R"),
             (SessionPickerPinning, "Ctrl+R"),
@@ -1201,6 +1235,30 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         false,
         [SessionPickerBrowse],
         [(SessionPickerBrowse, "PageDown; ]")]
+    ),
+    spec!(
+        ExpandTreeNode,
+        "Expand tree node",
+        "Expand the selected child-session branch or enter its first child",
+        false,
+        [SubagentTree],
+        [(SubagentTree, "Right; l")]
+    ),
+    spec!(
+        CollapseTreeNode,
+        "Collapse tree node",
+        "Collapse the selected branch or move to its parent",
+        false,
+        [SubagentTree],
+        [(SubagentTree, "Left; h")]
+    ),
+    spec!(
+        OpenPendingRequest,
+        "Open pending child request",
+        "Jump to the exact selected child's clarification or permission request",
+        false,
+        [SubagentTree],
+        [(SubagentTree, "p")]
     ),
 ];
 

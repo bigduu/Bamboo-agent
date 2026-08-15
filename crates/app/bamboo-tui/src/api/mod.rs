@@ -561,6 +561,51 @@ impl BambooClient {
         Ok(envelope.session)
     }
 
+    /// Same paginated session endpoint as [`Self::list_sessions`], decoded
+    /// into the relationship-rich projection used by the child-session tree.
+    pub async fn list_session_tree(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ListSessionTreeEnvelope> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = offset {
+            query.push(("offset", offset.to_string()));
+        }
+        let resp = self
+            .client
+            .get(self.url("/api/v1/sessions"))
+            .query(&query)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("list child-session tree failed ({status}): {body}");
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Relationship-rich detail lookup used to discover the active session's
+    /// durable root before the paginated tree is assembled.
+    pub async fn get_session_tree(&self, session_id: &str) -> Result<SessionTreeSummary> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/sessions/{session_id}")))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get child-session root failed ({status}): {body}");
+        }
+        let envelope: GetSessionTreeEnvelope = resp.json().await?;
+        Ok(envelope.session)
+    }
+
     /// Fetch a session together with its metadata ETag. Rename and pin flows
     /// retain this version while the operator edits, then send it back via
     /// `If-Match` so concurrent updates become a recoverable 412 instead of a
@@ -1347,6 +1392,47 @@ mod tests {
         assert_eq!(approval.version, 6);
         assert_eq!(approval.state, ChildApprovalState::DecisionRecorded);
         assert_eq!(approval.approved, Some(false));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_tree_uses_relationship_detail_and_paginated_session_contracts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut detail_socket, _) = listener.accept().await.unwrap();
+            let detail = read_request(&mut detail_socket).await;
+            assert!(detail.starts_with("GET /api/v1/sessions/child-2 HTTP/1.1"));
+            respond(
+                &mut detail_socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"session":{"id":"child-2","kind":"child","parent_session_id":"child-1","root_session_id":"root","spawn_depth":2,"placement":{"kind":"ssh","host":"worker"}}}"#,
+            )
+            .await;
+
+            let (mut page_socket, _) = listener.accept().await.unwrap();
+            let page = read_request(&mut page_socket).await;
+            assert!(page.starts_with("GET /api/v1/sessions?limit=2&offset=2 HTTP/1.1"));
+            respond(
+                &mut page_socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"sessions":[{"id":"child-2","kind":"child","parent_session_id":"child-1","root_session_id":"root","spawn_depth":2,"placement":{"kind":"ssh","host":"worker"}}],"total":3,"limit":2,"offset":2}"#,
+            )
+            .await;
+        });
+
+        let client = BambooClient::new(&base_url);
+        let detail = client.get_session_tree("child-2").await.unwrap();
+        assert_eq!(detail.parent_session_id.as_deref(), Some("child-1"));
+        assert_eq!(detail.root_session_id, "root");
+        assert_eq!(detail.placement.host, "worker");
+
+        let page = client.list_session_tree(Some(2), Some(2)).await.unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 2);
+        assert_eq!(page.sessions[0].spawn_depth, 2);
         server.await.unwrap();
     }
 
