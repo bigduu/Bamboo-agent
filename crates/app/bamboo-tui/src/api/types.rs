@@ -97,6 +97,11 @@ pub struct SessionSummary {
     pub is_running: bool,
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Child agents that are still running after the parent run has emitted
+    /// its terminal event. The TUI keeps background monitoring alive until
+    /// this reaches zero.
+    #[serde(default)]
+    pub running_child_count: u32,
     #[serde(default)]
     pub last_run_status: Option<String>,
     #[serde(default)]
@@ -912,7 +917,7 @@ mod tests {
                 "has_attachments": false,
                 "is_running": true,
                 "has_pending_question": false,
-                "running_child_count": 0,
+                "running_child_count": 2,
                 "placement": {"kind": "local", "host": "box"}
             },
             {
@@ -957,6 +962,7 @@ mod tests {
         assert_eq!(s1.model, "claude-sonnet-5");
         assert!(s1.is_running);
         assert!(!s1.has_pending_question);
+        assert_eq!(s1.running_child_count, 2);
         assert_eq!(s1.message_count, 12);
         assert!(s1.pinned);
         assert!(s1.last_run_status.is_none());

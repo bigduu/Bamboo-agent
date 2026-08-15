@@ -28,7 +28,10 @@ fn render_with_palette(f: &mut Frame, app: &App) {
 
     // Content area
     match app.tab {
-        crate::app::Tab::Chat => chat::render(f, chunks.content, chunks.input, app),
+        crate::app::Tab::Chat => {
+            chat::render(f, chunks.content, chunks.input, app);
+            layout::render_session_strip(f, chunks.session_strip, app);
+        }
         crate::app::Tab::Sessions => sessions::render(f, chunks.content, app),
         crate::app::Tab::Mcp => mcp::render(f, chunks.content, app),
         crate::app::Tab::Schedules => schedules::render(f, chunks.content, app),

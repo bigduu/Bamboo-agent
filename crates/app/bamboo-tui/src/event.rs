@@ -3,7 +3,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::api::types::{
     CatalogModel, CommandDetail, CommandListResponse, ListSessionsEnvelope, McpServer,
     PendingQuestion, PermissionDecisionResponse, PermissionPolicyResponse, ProviderCatalog,
-    Schedule, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
+    Schedule, SessionSummary, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
 };
 use crate::api::{
     PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
@@ -31,7 +31,10 @@ pub enum AppEvent {
     Resize(u16, u16),
 
     // ── Non-blocking API results (posted by spawned tasks) ──
-    SessionsLoaded(Loaded<ListSessionsEnvelope>),
+    SessionsLoaded {
+        observation_epoch: u64,
+        result: Loaded<ListSessionsEnvelope>,
+    },
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
     SchedulesLoaded(Loaded<Vec<Schedule>>),
@@ -96,6 +99,7 @@ pub enum AppEvent {
     /// A chat turn was created + started. The optimistic assistant turn id
     /// binds this late HTTP result to the draft that originated it.
     ChatStarted {
+        context_id: u64,
         turn_id: String,
         result: Loaded<String>,
     },
@@ -126,7 +130,16 @@ pub enum AppEvent {
     /// report which session failed to open.
     SessionOpened {
         session_id: String,
+        epoch: u64,
         result: Result<OpenedSession, String>,
+    },
+    /// One bounded, periodic status pass for cached sessions whose full SSE
+    /// subscription was evicted. Context id + stream epoch prevent an older
+    /// poll from overwriting a newly resumed/re-subscribed view.
+    BackgroundSessionStatusesLoaded {
+        epoch: u64,
+        observation_epoch: u64,
+        results: Vec<(u64, String, u64, Loaded<SessionSummary>)>,
     },
     /// `Ctrl+Q` with no cached dismissed question found one on the server (or
     /// confirmed there isn't one). Session + epoch bind the async result to
@@ -203,6 +216,7 @@ pub enum AppEvent {
     SessionPickerPageLoaded {
         epoch: u64,
         offset: usize,
+        observation_epoch: u64,
         result: Loaded<ListSessionsEnvelope>,
     },
     /// Fresh session summary + ETag loaded before a rename/pin mutation.
