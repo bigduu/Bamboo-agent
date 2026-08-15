@@ -882,6 +882,9 @@ pub struct ChatState {
     pub current_turn_id: Option<String>,
     pub current_terminal_status: Option<String>,
     pub model: String,
+    /// Stored per-session override. `None` deliberately means provider
+    /// default rather than a client-assumed concrete effort.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Requested/effective permission posture of the open session. These are
     /// persisted in the header even when no approval modal is visible.
     pub permission_mode: SessionPermissionMode,
@@ -979,6 +982,7 @@ impl ChatState {
             current_turn_id: None,
             current_terminal_status: None,
             model: String::new(),
+            reasoning_effort: None,
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             provider: None,
@@ -1280,6 +1284,7 @@ pub struct OpenedSession {
     pub messages: Vec<ChatMessage>,
     pub model: String,
     pub provider: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub project_id: Option<String>,
     pub permission_mode: SessionPermissionMode,
     pub bypass_permissions: bool,
@@ -2902,18 +2907,47 @@ pub struct PermissionModeConfirm {
     pub submitting: bool,
 }
 
-/// In-progress model picker (`Ctrl+O` on the Chat tab). Opens immediately with
-/// `loading: true` and an empty list; the provider-catalog fetch runs off the
-/// event loop and lands via `AppEvent::CatalogLoaded`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModelPickerHitboxKind {
+    Model(usize),
+    Reasoning(Option<ReasoningEffort>),
+    Apply,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelPickerHitbox {
+    pub(crate) kind: ModelPickerHitboxKind,
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) width: u16,
+}
+
+impl ModelPickerHitbox {
+    pub(crate) fn contains(&self, column: u16, row: u16) -> bool {
+        row == self.y && column >= self.x && column < self.x.saturating_add(self.width)
+    }
+}
+
+/// In-progress execution-profile picker (`Ctrl+O` on the Chat tab). Opens
+/// immediately with `loading: true`; catalog capabilities and the active
+/// session's versioned profile are fetched together off the event loop.
 pub struct ModelPicker {
     pub epoch: u64,
+    pub session_id: Option<String>,
+    pub metadata_version: Option<u64>,
     pub models: Vec<CatalogModel>,
     pub visible: Vec<usize>,
     pub query: String,
     pub selected: usize,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Preserve an explicit draft across a conflict-triggered catalog/session
+    /// refresh instead of replacing it with the newly-fetched stored value.
+    pub reasoning_touched: bool,
     pub loading: bool,
     pub applying: bool,
     pub error: Option<String>,
+    pub(crate) hitboxes: RefCell<Vec<ModelPickerHitbox>>,
+    pub(crate) mouse_pressed: Option<ModelPickerHitboxKind>,
 }
 
 impl ModelPicker {
@@ -2921,6 +2955,62 @@ impl ModelPicker {
         self.visible
             .get(self.selected)
             .and_then(|index| self.models.get(*index))
+    }
+
+    pub(crate) fn selected_supports_reasoning(&self) -> bool {
+        self.selected_model()
+            .is_some_and(|model| model.capabilities.supports_reasoning)
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        if effort.is_none() || self.selected_supports_reasoning() {
+            self.reasoning_effort = effort;
+            self.reasoning_touched = true;
+            self.error = None;
+        }
+    }
+
+    fn cycle_reasoning_effort(&mut self, delta: i32) {
+        // An unsupported model can only resolve an existing override back to
+        // provider default. This is deliberate and visible; model navigation
+        // never clears the override behind the operator's back.
+        if !self.selected_supports_reasoning() {
+            self.set_reasoning_effort(None);
+            return;
+        }
+        let choices = [
+            None,
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Xhigh),
+            Some(ReasoningEffort::Max),
+        ];
+        let current = choices
+            .iter()
+            .position(|candidate| *candidate == self.reasoning_effort)
+            .unwrap_or_default();
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else {
+            current.saturating_add(1).min(choices.len() - 1)
+        };
+        self.set_reasoning_effort(choices[next]);
+    }
+
+    pub(crate) fn reasoning_label(&self) -> String {
+        self.reasoning_effort
+            .map(ReasoningEffort::as_str)
+            .unwrap_or("provider default")
+            .to_string()
+    }
+
+    pub(crate) fn hitbox_at(&self, column: u16, row: u16) -> Option<ModelPickerHitboxKind> {
+        self.hitboxes
+            .borrow()
+            .iter()
+            .find(|hitbox| hitbox.contains(column, row))
+            .map(|hitbox| hitbox.kind.clone())
     }
 
     fn refresh_filter(&mut self, preserve: Option<(String, String)>) {
@@ -3290,11 +3380,35 @@ fn model_key(model: &CatalogModel) -> (String, String) {
 
 fn model_search_text(model: &CatalogModel) -> String {
     format!(
-        "{} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         model.display_name,
         model.provider_display_name,
         model.reference.provider,
-        model.reference.model
+        model.reference.model,
+        if model.capabilities.supports_tools {
+            "tools"
+        } else {
+            ""
+        },
+        if model.capabilities.supports_vision {
+            "vision"
+        } else {
+            ""
+        },
+        if model.capabilities.supports_reasoning {
+            "reasoning"
+        } else {
+            ""
+        },
+        if model.capabilities.supports_streaming == Some(true) {
+            "streaming"
+        } else {
+            ""
+        },
+        model
+            .source
+            .map(CatalogModelSource::label)
+            .unwrap_or_default(),
     )
 }
 
@@ -4290,6 +4404,7 @@ impl App {
             .as_ref()
             .map(|model_ref| model_ref.provider.clone())
             .or_else(|| summary.provider.clone());
+        context.chat.reasoning_effort = summary.reasoning_effort;
         context.chat.project_id.clone_from(&summary.project_id);
         context.chat.permission_mode = summary.permission_mode;
         context.chat.bypass_permissions = summary.bypass_permissions;
@@ -5731,6 +5846,7 @@ impl App {
                         self.chat.latest_summary_observation_epoch = epoch;
                         self.chat.model = opened.model;
                         self.chat.provider = opened.provider;
+                        self.chat.reasoning_effort = opened.reasoning_effort;
                         self.chat.project_id = opened.project_id;
                         self.chat.permission_mode = opened.permission_mode;
                         self.chat.bypass_permissions = opened.bypass_permissions;
@@ -6266,27 +6382,87 @@ impl App {
                     }
                 }
             }
-            AppEvent::CatalogLoaded { epoch, result } => {
+            AppEvent::CatalogLoaded {
+                epoch,
+                session_id,
+                result,
+                session,
+            } => {
                 let retry = self.action_key_phrase(
                     ActionContext::ModelPicker,
                     ActionId::Refresh,
                     "retries",
                 );
+                if self.chat.session_id != session_id {
+                    return Ok(());
+                }
+                if !self
+                    .model_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.epoch == epoch && picker.session_id == session_id)
+                {
+                    return Ok(());
+                }
                 let selected_key = self
                     .model_picker
                     .as_ref()
-                    .filter(|picker| picker.epoch == epoch)
+                    .filter(|picker| picker.epoch == epoch && picker.session_id == session_id)
                     .and_then(ModelPicker::selected_model)
                     .map(model_key);
+                let reasoning_touched = self
+                    .model_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.epoch == epoch && picker.reasoning_touched);
+
+                let (profile, profile_error) = match (session_id.as_deref(), session) {
+                    (None, None) => (None, None),
+                    (Some(expected), Some(Ok(versioned))) if versioned.summary.id == expected => {
+                        (Some(versioned), None)
+                    }
+                    (Some(_), Some(Ok(_))) => (
+                        None,
+                        Some(
+                            "Session profile response belonged to a different session".to_string(),
+                        ),
+                    ),
+                    (Some(_), Some(Err(error))) => (
+                        None,
+                        Some(format!("Failed to load session profile: {error} — {retry}")),
+                    ),
+                    (Some(_), None) => (
+                        None,
+                        Some(format!("Session profile was not loaded — {retry}")),
+                    ),
+                    (None, Some(_)) => (
+                        None,
+                        Some("Unexpected session profile for a new chat".to_string()),
+                    ),
+                };
+                if let Some(versioned) = profile.as_ref() {
+                    self.chat.model.clone_from(&versioned.summary.model);
+                    self.chat.provider = versioned
+                        .summary
+                        .model_ref
+                        .as_ref()
+                        .map(|model_ref| model_ref.provider.clone())
+                        .or_else(|| versioned.summary.provider.clone());
+                    self.chat.reasoning_effort = versioned.summary.reasoning_effort;
+                }
                 let Some(picker) = self
                     .model_picker
                     .as_mut()
-                    .filter(|picker| picker.epoch == epoch)
+                    .filter(|picker| picker.epoch == epoch && picker.session_id == session_id)
                 else {
                     return Ok(());
                 };
                 self.model_picker_task = None;
                 picker.loading = false;
+                picker.metadata_version = profile.as_ref().map(|value| value.metadata_version);
+                if !reasoning_touched {
+                    if let Some(versioned) = profile.as_ref() {
+                        picker.reasoning_effort = versioned.summary.reasoning_effort;
+                    }
+                }
                 match result {
                     Ok(mut catalog) => {
                         catalog.models.retain(|model| {
@@ -6316,11 +6492,18 @@ impl App {
                         ));
                     }
                 }
+                if let Some(profile_error) = profile_error {
+                    picker.error = Some(match picker.error.take() {
+                        Some(error) => format!("{error}; {profile_error}"),
+                        None => profile_error,
+                    });
+                }
             }
             AppEvent::ModelPatched {
                 epoch,
                 session_id,
                 model,
+                reasoning_effort,
                 result,
             } => {
                 let retry = self.action_key_phrase(
@@ -6330,11 +6513,10 @@ impl App {
                 );
                 let cancel =
                     self.action_key_phrase(ActionContext::ModelPicker, ActionId::Cancel, "cancels");
-                let Some(picker) = self
-                    .model_picker
-                    .as_mut()
-                    .filter(|picker| picker.epoch == epoch)
-                else {
+                let Some(picker) = self.model_picker.as_mut().filter(|picker| {
+                    picker.epoch == epoch
+                        && picker.session_id.as_deref() == Some(session_id.as_str())
+                }) else {
                     return Ok(());
                 };
                 self.model_picker_task = None;
@@ -6347,11 +6529,39 @@ impl App {
                     return Ok(());
                 }
                 match result {
-                    Ok(()) => self.commit_model_selection(model),
+                    Ok(updated) => {
+                        let provider = updated
+                            .summary
+                            .model_ref
+                            .as_ref()
+                            .map(|model_ref| model_ref.provider.as_str())
+                            .or(updated.summary.provider.as_deref());
+                        if updated.summary.id != session_id
+                            || updated.summary.model != model.reference.model
+                            || provider != Some(model.reference.provider.as_str())
+                            || updated.summary.reasoning_effort != reasoning_effort
+                        {
+                            picker.error = Some(
+                                "Server returned a different execution profile; refresh before retrying"
+                                    .to_string(),
+                            );
+                            picker.metadata_version = None;
+                            return Ok(());
+                        }
+                        picker.metadata_version = Some(updated.metadata_version);
+                        self.commit_model_selection(model, updated.summary.reasoning_effort);
+                    }
                     Err(error) => {
-                        picker.error = Some(format!(
-                            "Failed to update session model: {error} — {retry}; {cancel}"
-                        ));
+                        if error.conflict {
+                            picker.metadata_version = None;
+                            picker.error = Some(format!(
+                                "Session profile changed in another client: {error} — {retry}; {cancel}"
+                            ));
+                        } else {
+                            picker.error = Some(format!(
+                                "Failed to update execution profile: {error} — {retry}; {cancel}"
+                            ));
+                        }
                     }
                 }
             }
@@ -6931,14 +7141,57 @@ impl App {
             return;
         }
 
-        if let Some(picker) = self.model_picker.as_mut() {
-            let delta = match mouse.kind {
-                MouseEventKind::ScrollUp => -3,
-                MouseEventKind::ScrollDown => 3,
-                _ => return,
-            };
-            if !picker.loading && !picker.applying {
-                picker.selected = scroll_selection(picker.selected, picker.visible.len(), delta);
+        if self.model_picker.is_some() {
+            let mut apply = None;
+            {
+                let picker = self.model_picker.as_mut().unwrap();
+                if picker.loading || picker.applying {
+                    return;
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                            -3
+                        } else {
+                            3
+                        };
+                        picker.selected =
+                            scroll_selection(picker.selected, picker.visible.len(), delta);
+                        picker.mouse_pressed = None;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        picker.mouse_pressed = picker.hitbox_at(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let released = picker.hitbox_at(mouse.column, mouse.row);
+                        let pressed = picker.mouse_pressed.take();
+                        if pressed == released {
+                            match released {
+                                Some(ModelPickerHitboxKind::Model(model_index)) => {
+                                    if let Some(visible_index) = picker
+                                        .visible
+                                        .iter()
+                                        .position(|candidate| *candidate == model_index)
+                                    {
+                                        picker.selected = visible_index;
+                                        picker.error = None;
+                                    }
+                                }
+                                Some(ModelPickerHitboxKind::Reasoning(effort)) => {
+                                    picker.set_reasoning_effort(effort);
+                                }
+                                Some(ModelPickerHitboxKind::Apply) => {
+                                    apply = picker.selected_model().cloned();
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    _ => picker.mouse_pressed = None,
+                }
+            }
+            if let Some(model) = apply {
+                self.apply_model(model);
             }
             return;
         }
@@ -9515,6 +9768,7 @@ impl App {
         let existing_session = self.chat.session_id.clone();
         let project_id = self.chat.project_id.clone();
         let provider = self.chat.provider.clone();
+        let reasoning_effort = self.chat.reasoning_effort;
         tokio::spawn(async move {
             let req = ChatRequest {
                 message,
@@ -9522,6 +9776,7 @@ impl App {
                 project_id,
                 model: Some(model),
                 provider,
+                reasoning_effort,
             };
             let result = client
                 .chat(req)
@@ -9643,6 +9898,7 @@ impl App {
         let client = self.client.clone();
         let model = self.chat.model.clone();
         let provider = self.chat.provider.clone();
+        let reasoning_effort = self.chat.reasoning_effort;
         tokio::spawn(async move {
             let execute_session_id = session_id.clone();
             let execute_turn_id = turn_id.clone();
@@ -9675,7 +9931,12 @@ impl App {
             // the handler can finalize `chat.streaming` instead of spinning
             // forever waiting for events behind a run that doesn't exist.
             if let Err(e) = client
-                .execute(&session_id, model.as_deref(), provider.as_deref())
+                .execute(
+                    &session_id,
+                    model.as_deref(),
+                    provider.as_deref(),
+                    reasoning_effort,
+                )
                 .await
             {
                 let _ = tx.send(AppEvent::ExecuteFailed {
@@ -9811,6 +10072,7 @@ impl App {
                 messages: map_history(history.messages),
                 model: summary.model,
                 provider,
+                reasoning_effort: summary.reasoning_effort,
                 project_id: summary.project_id,
                 permission_mode: if summary.permission_mode == SessionPermissionMode::Default
                     && summary.bypass_permissions
@@ -9847,6 +10109,7 @@ impl App {
         self.stash_question_drafts();
         let model = self.chat.model.clone();
         let provider = self.chat.provider.clone();
+        let reasoning_effort = self.chat.reasoning_effort;
         let project_id = self.chat.project_id.clone();
         let expand_tools = self.chat.expand_tools;
         self.prepare_visible_session_switch();
@@ -9867,6 +10130,7 @@ impl App {
         }
         self.chat.model = model;
         self.chat.provider = provider;
+        self.chat.reasoning_effort = reasoning_effort;
         self.chat.project_id = project_id;
         self.chat.expand_tools = expand_tools;
         self.opening_session_id = None;
@@ -13740,13 +14004,19 @@ impl App {
         let epoch = self.picker_epoch;
         self.model_picker = Some(ModelPicker {
             epoch,
+            session_id: self.chat.session_id.clone(),
+            metadata_version: None,
             models: Vec::new(),
             visible: Vec::new(),
             query: String::new(),
             selected: 0,
+            reasoning_effort: self.chat.reasoning_effort,
+            reasoning_touched: false,
             loading: true,
             applying: false,
             error: None,
+            hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed: None,
         });
         self.load_model_catalog(epoch);
     }
@@ -13777,14 +14047,32 @@ impl App {
         if let Some(picker) = self.model_picker.as_mut() {
             picker.loading = true;
             picker.error = None;
+            picker.metadata_version = None;
+            picker.mouse_pressed = None;
         }
         let client = self.client.clone();
+        let session_id = self
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.session_id.clone());
         self.model_picker_task = Some(tokio::spawn(async move {
-            let result = client
-                .get_provider_catalog()
-                .await
-                .map_err(|error| error.to_string());
-            let _ = tx.send(AppEvent::CatalogLoaded { epoch, result });
+            let catalog = client.get_provider_catalog();
+            let (result, session) = if let Some(id) = session_id.as_deref() {
+                let session = client.get_session_versioned(id);
+                let (catalog, session) = tokio::join!(catalog, session);
+                (
+                    catalog.map_err(|error| error.to_string()),
+                    Some(session.map_err(|error| error.to_string())),
+                )
+            } else {
+                (catalog.await.map_err(|error| error.to_string()), None)
+            };
+            let _ = tx.send(AppEvent::CatalogLoaded {
+                epoch,
+                session_id,
+                result,
+                session,
+            });
         }));
     }
 
@@ -13858,6 +14146,16 @@ impl App {
                     self.apply_model(model);
                 }
             }
+            Some(ActionId::PreviousReasoningEffort) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.cycle_reasoning_effort(-1);
+                }
+            }
+            Some(ActionId::NextReasoningEffort) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.cycle_reasoning_effort(1);
+                }
+            }
             Some(ActionId::Cancel) => self.close_model_picker(),
             Some(ActionId::Backspace) => {
                 if let Some(picker) = self.model_picker.as_mut() {
@@ -13866,12 +14164,7 @@ impl App {
                     picker.refresh_filter(preserve);
                 }
             }
-            Some(ActionId::Refresh)
-                if self
-                    .model_picker
-                    .as_ref()
-                    .is_some_and(|picker| !picker.loading && picker.visible.is_empty()) =>
-            {
+            Some(ActionId::Refresh) => {
                 self.reload_model_catalog();
             }
             None => {
@@ -13892,8 +14185,22 @@ impl App {
     /// avoids the old half-applied state where the local badge changed and the
     /// modal closed even though persistence failed.
     fn apply_model(&mut self, model: CatalogModel) {
+        let reasoning_effort = self
+            .model_picker
+            .as_ref()
+            .map(|picker| picker.reasoning_effort)
+            .unwrap_or(self.chat.reasoning_effort);
+        if !model.capabilities.supports_reasoning && reasoning_effort.is_some() {
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some(
+                    "Selected model does not support reasoning; choose provider default before applying"
+                        .to_string(),
+                );
+            }
+            return;
+        }
         let Some(session_id) = self.chat.session_id.clone() else {
-            self.commit_model_selection(model);
+            self.commit_model_selection(model, reasoning_effort);
             return;
         };
         let Some(tx) = self.event_tx.clone() else {
@@ -13905,6 +14212,12 @@ impl App {
         let Some(picker) = self.model_picker.as_mut() else {
             return;
         };
+        let Some(metadata_version) = picker.metadata_version else {
+            picker.error = Some(
+                "Session profile is not loaded; refresh before applying this change".to_string(),
+            );
+            return;
+        };
         picker.applying = true;
         picker.error = None;
         let epoch = picker.epoch;
@@ -13912,13 +14225,18 @@ impl App {
         let client = self.client.clone();
         self.model_picker_task = Some(tokio::spawn(async move {
             let result = client
-                .patch_session_model(&session_id, &model_ref)
-                .await
-                .map_err(|error| error.to_string());
+                .patch_session_execution_profile(
+                    &session_id,
+                    metadata_version,
+                    &model_ref,
+                    reasoning_effort,
+                )
+                .await;
             let _ = tx.send(AppEvent::ModelPatched {
                 epoch,
                 session_id,
                 model,
+                reasoning_effort,
                 result,
             });
         }));
@@ -13946,7 +14264,11 @@ impl App {
         }
     }
 
-    fn commit_model_selection(&mut self, model: CatalogModel) {
+    fn commit_model_selection(
+        &mut self,
+        model: CatalogModel,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) {
         let key = model_key(&model);
         let provider_label = if model.provider_display_name.trim().is_empty() {
             model.reference.provider.clone()
@@ -13958,8 +14280,15 @@ impl App {
         self.recent_models.truncate(MAX_RECENT_MODELS);
         self.chat.model = model.reference.model.clone();
         self.chat.provider = Some(model.reference.provider.clone());
+        self.chat.reasoning_effort = reasoning_effort;
         self.model_picker = None;
-        self.status_message = format!("Model: {} ({provider_label})", model.display_name);
+        let reasoning = reasoning_effort
+            .map(ReasoningEffort::as_str)
+            .unwrap_or("provider default");
+        self.status_message = format!(
+            "Model: {} ({provider_label}) · reasoning {reasoning}",
+            model.display_name
+        );
     }
 }
 
@@ -16742,6 +17071,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -16763,6 +17093,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -16823,6 +17154,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -16845,6 +17177,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -16890,6 +17223,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -16912,6 +17246,7 @@ mod question_tests {
                 messages: Vec::new(),
                 model: "model".to_string(),
                 provider: None,
+                reasoning_effort: None,
                 project_id: None,
                 permission_mode: SessionPermissionMode::Default,
                 bypass_permissions: false,
@@ -17138,14 +17473,14 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                2_521_080_266_750_332_561,
+                18_250_622_092_155_643_324,
                 1_057_473_937_556_339_135,
                 1_502_110_673_089_046_554,
                 14_484_161_115_671_232_577,
                 4_091_854_584_326_177_690,
                 16_229_128_572_274_018_012,
                 10_493_202_686_479_633_261,
-                9_858_505_864_262_550_789,
+                10_935_873_232_087_006_812,
                 8_710_182_394_295_884_107,
                 15_353_719_274_755_616_638,
                 5_239_033_309_572_019_229,
@@ -17944,6 +18279,7 @@ mod question_tests {
             model: String::new(),
             model_ref: None,
             provider: None,
+            reasoning_effort: None,
             is_running: false,
             has_pending_question: false,
             running_child_count: 0,
@@ -20445,6 +20781,7 @@ mod question_tests {
             messages,
             model: "claude-sonnet-5".to_string(),
             provider: None,
+            reasoning_effort: None,
             project_id: None,
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
@@ -23008,19 +23345,46 @@ mod question_tests {
             },
             display_name: display.to_string(),
             provider_display_name: provider_display.to_string(),
+            capabilities: CatalogModelCapabilities::default(),
+            source: None,
         }
+    }
+
+    fn reasoning_model(
+        provider: &str,
+        model: &str,
+        display: &str,
+        provider_display: &str,
+    ) -> CatalogModel {
+        let mut model = catalog_model(provider, model, display, provider_display);
+        model.capabilities = CatalogModelCapabilities {
+            supports_tools: true,
+            supports_vision: true,
+            supports_reasoning: true,
+            supports_streaming: Some(true),
+            max_context_tokens: Some(128_000),
+            max_output_tokens: Some(16_384),
+        };
+        model.source = Some(CatalogModelSource::Upstream);
+        model
     }
 
     fn model_picker(models: Vec<CatalogModel>) -> ModelPicker {
         ModelPicker {
             epoch: 1,
+            session_id: None,
+            metadata_version: None,
             visible: (0..models.len()).collect(),
             models,
             query: String::new(),
             selected: 0,
+            reasoning_effort: None,
+            reasoning_touched: false,
             loading: false,
             applying: false,
             error: None,
+            hitboxes: RefCell::new(Vec::new()),
+            mouse_pressed: None,
         }
     }
 
@@ -23117,6 +23481,7 @@ mod question_tests {
         ]));
         {
             let picker = app.model_picker.as_mut().unwrap();
+            picker.session_id = Some("s1".to_string());
             picker.query = "claude".to_string();
             picker.refresh_filter(None);
             picker.applying = true;
@@ -23132,7 +23497,8 @@ mod question_tests {
                 "Claude Sonnet 5",
                 "Anthropic",
             ),
-            result: Err("offline".to_string()),
+            reasoning_effort: None,
+            result: Err(crate::api::SessionMutationFailure::protocol("offline")),
         })
         .await
         .unwrap();
@@ -23147,11 +23513,95 @@ mod question_tests {
     }
 
     #[tokio::test]
+    async fn model_patch_conflict_preserves_full_draft_and_requires_refresh() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "old-model".to_string();
+        app.chat.provider = Some("old-provider".to_string());
+        app.chat.reasoning_effort = Some(ReasoningEffort::Low);
+        let selected = reasoning_model("openai", "reasoner", "Reasoner", "OpenAI");
+        app.model_picker = Some(model_picker(vec![selected.clone()]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.session_id = Some("s1".to_string());
+            picker.metadata_version = Some(7);
+            picker.query = "reason".to_string();
+            picker.reasoning_effort = Some(ReasoningEffort::Max);
+            picker.reasoning_touched = true;
+            picker.applying = true;
+        }
+
+        app.handle_event(AppEvent::ModelPatched {
+            epoch: 1,
+            session_id: "s1".to_string(),
+            model: selected,
+            reasoning_effort: Some(ReasoningEffort::Max),
+            result: Err(crate::api::SessionMutationFailure::test_conflict(8)),
+        })
+        .await
+        .unwrap();
+
+        let picker = app.model_picker.as_ref().expect("conflict is recoverable");
+        assert_eq!(picker.query, "reason");
+        assert_eq!(picker.reasoning_effort, Some(ReasoningEffort::Max));
+        assert!(picker.reasoning_touched);
+        assert_eq!(picker.metadata_version, None, "stale ETag cannot be reused");
+        assert!(picker.error.as_deref().unwrap().contains("another client"));
+        assert_eq!(app.chat.model, "old-model");
+        assert_eq!(app.chat.provider.as_deref(), Some("old-provider"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[tokio::test]
+    async fn successful_profile_patch_commits_only_the_exact_server_profile() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "old-model".to_string();
+        let selected = reasoning_model("openai", "reasoner", "Reasoner", "OpenAI");
+        app.model_picker = Some(model_picker(vec![selected.clone()]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.session_id = Some("s1".to_string());
+            picker.metadata_version = Some(3);
+            picker.reasoning_effort = Some(ReasoningEffort::High);
+            picker.applying = true;
+        }
+        let mut summary = bare_session("s1");
+        summary.model = "reasoner".to_string();
+        summary.provider = Some("openai".to_string());
+        summary.model_ref = Some(CatalogModelRef {
+            provider: "openai".to_string(),
+            model: "reasoner".to_string(),
+        });
+        summary.reasoning_effort = Some(ReasoningEffort::High);
+
+        app.handle_event(AppEvent::ModelPatched {
+            epoch: 1,
+            session_id: "s1".to_string(),
+            model: selected,
+            reasoning_effort: Some(ReasoningEffort::High),
+            result: Ok(crate::api::VersionedSession {
+                summary,
+                metadata_version: 4,
+            }),
+        })
+        .await
+        .unwrap();
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.chat.model, "reasoner");
+        assert_eq!(app.chat.provider.as_deref(), Some("openai"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::High));
+        assert!(app.status_message.contains("reasoning high"));
+    }
+
+    #[tokio::test]
     async fn session_switch_invalidates_an_in_flight_model_patch() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.session_id = Some("session-a".to_string());
         app.chat.model = "model-a".to_string();
         app.chat.provider = Some("provider-a".to_string());
+        app.chat.reasoning_effort = Some(ReasoningEffort::Low);
         app.model_picker = Some(model_picker(vec![catalog_model(
             "provider-a",
             "selected-for-a",
@@ -23167,6 +23617,7 @@ mod question_tests {
             result: Ok(OpenedSession {
                 model: "model-b".to_string(),
                 provider: Some("provider-b".to_string()),
+                reasoning_effort: Some(ReasoningEffort::Xhigh),
                 ..opened(vec![])
             }),
         })
@@ -23183,7 +23634,11 @@ mod question_tests {
                 "Selected for A",
                 "Provider A",
             ),
-            result: Ok(()),
+            reasoning_effort: None,
+            result: Ok(crate::api::VersionedSession {
+                summary: bare_session("session-a"),
+                metadata_version: 2,
+            }),
         })
         .await
         .unwrap();
@@ -23191,6 +23646,7 @@ mod question_tests {
         assert_eq!(app.chat.session_id.as_deref(), Some("session-b"));
         assert_eq!(app.chat.model, "model-b");
         assert_eq!(app.chat.provider.as_deref(), Some("provider-b"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::Xhigh));
     }
 
     #[test]
@@ -23301,7 +23757,101 @@ mod question_tests {
             "chat.model gets the plain model id, not provider/model"
         );
         assert_eq!(app.chat.provider.as_deref(), Some("anthropic"));
-        assert_eq!(app.status_message, "Model: Claude Sonnet 5 (Anthropic)");
+        assert_eq!(
+            app.status_message,
+            "Model: Claude Sonnet 5 (Anthropic) · reasoning provider default"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_selector_visits_every_canonical_effort_and_clamps() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(vec![reasoning_model(
+            "openai", "reasoner", "Reasoner", "OpenAI",
+        )]));
+
+        let expected = [
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Xhigh),
+            Some(ReasoningEffort::Max),
+        ];
+        for effort in expected {
+            app.handle_model_picker_key(key(KeyCode::Right))
+                .await
+                .unwrap();
+            let picker = app.model_picker.as_ref().unwrap();
+            assert_eq!(picker.reasoning_effort, effort);
+            assert!(picker.reasoning_touched);
+        }
+        app.handle_model_picker_key(key(KeyCode::Right))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().reasoning_effort,
+            Some(ReasoningEffort::Max),
+            "selector clamps at max"
+        );
+        for effort in [
+            Some(ReasoningEffort::Xhigh),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::Low),
+            None,
+        ] {
+            app.handle_model_picker_key(key(KeyCode::Left))
+                .await
+                .unwrap();
+            assert_eq!(app.model_picker.as_ref().unwrap().reasoning_effort, effort);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_model_requires_explicit_default_before_apply() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "reasoner".to_string();
+        app.chat.provider = Some("openai".to_string());
+        app.chat.reasoning_effort = Some(ReasoningEffort::High);
+        app.model_picker = Some(model_picker(vec![catalog_model(
+            "local",
+            "plain-model",
+            "Plain Model",
+            "Local",
+        )]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.reasoning_effort = Some(ReasoningEffort::High);
+        }
+
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        let picker = app
+            .model_picker
+            .as_ref()
+            .expect("unsupported draft stays open");
+        assert_eq!(picker.reasoning_effort, Some(ReasoningEffort::High));
+        assert!(picker
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not support"));
+        assert_eq!(app.chat.model, "reasoner");
+
+        app.handle_model_picker_key(key(KeyCode::Left))
+            .await
+            .unwrap();
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.reasoning_effort, None);
+        assert!(picker.reasoning_touched, "default resolution is explicit");
+        app.handle_model_picker_key(key(KeyCode::Enter))
+            .await
+            .unwrap();
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.chat.model, "plain-model");
+        assert_eq!(app.chat.provider.as_deref(), Some("local"));
+        assert_eq!(app.chat.reasoning_effort, None);
     }
 
     /// `Enter` while the catalog is still loading (empty list) is a no-op —
@@ -23388,12 +23938,14 @@ mod question_tests {
     async fn model_picker_esc_leaves_model_unchanged() {
         let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
         app.chat.model = "old-model".to_string();
+        app.chat.reasoning_effort = Some(ReasoningEffort::Medium);
         app.chat.textarea.input(key(KeyCode::Char('d')));
         app.chat.scroll_offset = 9;
         app.status_message = "Keep model status".to_string();
         app.model_picker = Some(model_picker(vec![catalog_model(
             "openai", "gpt-4.1", "GPT-4.1", "OpenAI",
         )]));
+        app.model_picker.as_mut().unwrap().reasoning_effort = Some(ReasoningEffort::Max);
 
         app.handle_model_picker_key(key(KeyCode::Esc))
             .await
@@ -23401,6 +23953,11 @@ mod question_tests {
 
         assert!(app.model_picker.is_none());
         assert_eq!(app.chat.model, "old-model", "Esc must not change the model");
+        assert_eq!(
+            app.chat.reasoning_effort,
+            Some(ReasoningEffort::Medium),
+            "Esc must not commit the reasoning draft"
+        );
         assert_eq!(app.chat.textarea.lines().join("\n"), "d");
         assert_eq!(app.chat.scroll_offset, 9);
         assert_eq!(app.status_message, "Keep model status");
@@ -23415,7 +23972,9 @@ mod question_tests {
 
         app.handle_event(AppEvent::CatalogLoaded {
             epoch: 1,
+            session_id: None,
             result: Err("connection refused".to_string()),
+            session: None,
         })
         .await
         .unwrap();
@@ -23438,7 +23997,9 @@ mod question_tests {
 
         app.handle_event(AppEvent::CatalogLoaded {
             epoch: 1,
+            session_id: None,
             result: Ok(ProviderCatalog { models: vec![] }),
+            session: None,
         })
         .await
         .unwrap();
@@ -23446,6 +24007,80 @@ mod question_tests {
         let picker = app.model_picker.as_ref().expect("recoverable picker");
         assert!(picker.models.is_empty());
         assert!(picker.error.as_deref().unwrap().contains("No models"));
+    }
+
+    #[tokio::test]
+    async fn catalog_reload_installs_the_versioned_stored_profile() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "stale".to_string();
+        app.model_picker = Some(model_picker(vec![]));
+        app.model_picker.as_mut().unwrap().session_id = Some("s1".to_string());
+        let mut summary = bare_session("s1");
+        summary.model = "reasoner".to_string();
+        summary.model_ref = Some(CatalogModelRef {
+            provider: "openai".to_string(),
+            model: "reasoner".to_string(),
+        });
+        summary.reasoning_effort = Some(ReasoningEffort::Xhigh);
+
+        app.handle_event(AppEvent::CatalogLoaded {
+            epoch: 1,
+            session_id: Some("s1".to_string()),
+            result: Ok(ProviderCatalog {
+                models: vec![reasoning_model("openai", "reasoner", "Reasoner", "OpenAI")],
+            }),
+            session: Some(Ok(crate::api::VersionedSession {
+                summary,
+                metadata_version: 11,
+            })),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.model, "reasoner");
+        assert_eq!(app.chat.provider.as_deref(), Some("openai"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.metadata_version, Some(11));
+        assert_eq!(picker.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        assert_eq!(picker.reasoning_label(), "xhigh");
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_epoch_cannot_overwrite_the_visible_session_profile() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("s1".to_string());
+        app.chat.model = "current".to_string();
+        app.chat.provider = Some("current-provider".to_string());
+        app.chat.reasoning_effort = Some(ReasoningEffort::Low);
+        app.model_picker = Some(model_picker(vec![]));
+        {
+            let picker = app.model_picker.as_mut().unwrap();
+            picker.epoch = 2;
+            picker.session_id = Some("s1".to_string());
+        }
+        let mut stale = bare_session("s1");
+        stale.model = "stale".to_string();
+        stale.provider = Some("stale-provider".to_string());
+        stale.reasoning_effort = Some(ReasoningEffort::Max);
+
+        app.handle_event(AppEvent::CatalogLoaded {
+            epoch: 1,
+            session_id: Some("s1".to_string()),
+            result: Ok(ProviderCatalog::default()),
+            session: Some(Ok(crate::api::VersionedSession {
+                summary: stale,
+                metadata_version: 99,
+            })),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.chat.model, "current");
+        assert_eq!(app.chat.provider.as_deref(), Some("current-provider"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(app.model_picker.as_ref().unwrap().metadata_version, None);
     }
 
     /// A catalog fetch that lands after the picker was already dismissed
@@ -23457,9 +24092,11 @@ mod question_tests {
 
         app.handle_event(AppEvent::CatalogLoaded {
             epoch: 1,
+            session_id: None,
             result: Ok(ProviderCatalog {
                 models: vec![catalog_model("openai", "gpt-4.1", "GPT-4.1", "OpenAI")],
             }),
+            session: None,
         })
         .await
         .unwrap();
@@ -23486,10 +24123,189 @@ mod question_tests {
 
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("GPT-4.1"), "model display name missing");
-        assert!(text.contains("OpenAI"), "provider display name missing");
         assert!(text.contains("openai/gpt-4.1"), "provider/model id missing");
+        assert!(
+            text.contains("capabilities unknown"),
+            "text capability badge missing"
+        );
         assert!(text.contains("Esc cancel"), "narrow footer was clipped");
+    }
+
+    #[test]
+    fn model_picker_exposes_text_capabilities_and_reasoning_at_common_widths() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for width in [60, 80, 120] {
+            let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+            app.model_picker = Some(model_picker(vec![reasoning_model(
+                "oa",
+                "r",
+                "A deliberately very long friendly model name",
+                "A deliberately very long provider display name",
+            )]));
+            let backend = TestBackend::new(width, 28);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            for needle in [
+                "oa/r",
+                "tools",
+                "vision",
+                "reasoning",
+                "Reasoning:",
+                "default",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "Esc cancel",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "{width}-column picker omitted {needle:?}:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_selects_model_reasoning_and_applies_the_profile() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.model_picker = Some(model_picker(vec![
+            catalog_model("local", "plain", "Plain", "Local"),
+            reasoning_model("openai", "reasoner", "Reasoner", "OpenAI"),
+        ]));
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+
+        let hitbox = |app: &App, kind: ModelPickerHitboxKind| {
+            app.model_picker
+                .as_ref()
+                .unwrap()
+                .hitboxes
+                .borrow()
+                .iter()
+                .find(|hitbox| hitbox.kind == kind)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing hitbox {kind:?}"))
+        };
+        let click = |app: &mut App, hitbox: &ModelPickerHitbox| {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column: hitbox.x,
+                    row: hitbox.y,
+                    modifiers: KeyModifiers::empty(),
+                });
+            }
+        };
+
+        let model_hitbox = hitbox(&app, ModelPickerHitboxKind::Model(1));
+        click(&mut app, &model_hitbox);
+        assert_eq!(app.model_picker.as_ref().unwrap().selected, 1);
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let reasoning_hitbox = hitbox(
+            &app,
+            ModelPickerHitboxKind::Reasoning(Some(ReasoningEffort::Max)),
+        );
+        click(&mut app, &reasoning_hitbox);
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().reasoning_effort,
+            Some(ReasoningEffort::Max)
+        );
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let apply_hitbox = hitbox(&app, ModelPickerHitboxKind::Apply);
+        click(&mut app, &apply_hitbox);
+
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.chat.model, "reasoner");
+        assert_eq!(app.chat.provider.as_deref(), Some("openai"));
+        assert_eq!(app.chat.reasoning_effort, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn chat_hud_distinguishes_reasoning_override_from_provider_default() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.model = "reasoner".to_string();
+        app.chat.provider = Some("openai".to_string());
+        app.chat.reasoning_effort = Some(ReasoningEffort::High);
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                crate::ui::layout::render_status_info(frame, area, &app);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("model openai/reasoner"));
+        assert!(text.contains("reasoning high (override)"));
+
+        app.chat.reasoning_effort = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                crate::ui::layout::render_status_info(frame, area, &app);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("reasoning provider default (default)"));
+
+        app.chat.provider = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                crate::ui::layout::render_status_info(frame, area, &app);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("model reasoner"));
+        assert!(text.contains("reasoning provider default (default)"));
     }
 
     #[test]

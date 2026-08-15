@@ -7,15 +7,16 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::api::types::PermissionDecisionKind;
+use crate::api::types::{PermissionDecisionKind, ReasoningEffort};
 use crate::app::{
     ActiveQuestion, ActiveQuestionKind, ActivityKind, App, CommandPaletteEntry,
-    CommandPaletteHitbox, CommandPaletteTrigger, ConnectionStatus, NoticeLevel, PermissionStage,
-    QuestionOptionHitbox, RunPhase, SessionActivityStatus, SessionPickerMode, Tab,
+    CommandPaletteHitbox, CommandPaletteTrigger, ConnectionStatus, ModelPickerHitbox,
+    ModelPickerHitboxKind, NoticeLevel, PermissionStage, QuestionOptionHitbox, RunPhase,
+    SessionActivityStatus, SessionPickerMode, Tab,
 };
 use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
-use crate::ui::sessions::{session_row_line_with_activity, truncate_cells};
+use crate::ui::sessions::session_row_line_with_activity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -415,8 +416,23 @@ pub fn render_status_info(f: &mut Frame, area: Rect, app: &App) {
     }
 
     if !app.chat.model.is_empty() {
+        let model = app
+            .chat
+            .provider
+            .as_deref()
+            .map(|provider| format!("{provider}/{}", app.chat.model))
+            .unwrap_or_else(|| app.chat.model.clone());
         items.push((
-            format!("model {}", app.chat.model),
+            format!("model {model}"),
+            Style::default().fg(colors::inactive()),
+        ));
+        let (reasoning, source) = app
+            .chat
+            .reasoning_effort
+            .map(|effort| (effort.as_str(), "override"))
+            .unwrap_or(("provider default", "default"));
+        items.push((
+            format!("reasoning {reasoning} ({source})"),
             Style::default().fg(colors::inactive()),
         ));
     }
@@ -666,6 +682,19 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
         if let Some(provider) = app.chat.provider.as_deref() {
             push_full_value("model provider", provider, colors::inactive());
         }
+        if let Some(reasoning) = app.chat.reasoning_effort {
+            push_full_value(
+                "reasoning effort",
+                &format!("{} (session override)", reasoning.as_str()),
+                colors::inactive(),
+            );
+        } else if !app.chat.model.is_empty() {
+            push_full_value(
+                "reasoning effort",
+                "provider default (resolved at run time)",
+                colors::inactive(),
+            );
+        }
         push_full_value("status", &app.status_message, colors::inactive());
         if has_typed_run {
             push_full_value(
@@ -799,6 +828,36 @@ pub fn render_notifications(f: &mut Frame, app: &App) {
                 &format!("{}/{}", model.reference.provider, model.reference.model),
                 colors::inactive(),
             );
+            push_full_value(
+                "selected model capabilities",
+                &format!(
+                    "tools={} vision={} reasoning={} streaming={}",
+                    model.capabilities.supports_tools,
+                    model.capabilities.supports_vision,
+                    model.capabilities.supports_reasoning,
+                    model
+                        .capabilities
+                        .supports_streaming
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+                colors::inactive(),
+            );
+            if let Some(picker) = app.model_picker.as_ref() {
+                push_full_value(
+                    "selected reasoning draft",
+                    &format!(
+                        "{} ({})",
+                        picker.reasoning_label(),
+                        if picker.reasoning_effort.is_some() {
+                            "session override"
+                        } else {
+                            "provider default"
+                        }
+                    ),
+                    colors::inactive(),
+                );
+            }
         }
         let current_error = match app.tab {
             Tab::Chat => None,
@@ -2494,6 +2553,8 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     ];
 
     let mut body: Vec<Line> = Vec::new();
+    let mut hitbox_specs: Vec<(ModelPickerHitboxKind, usize, usize, usize)> = Vec::new();
+    picker.hitboxes.borrow_mut().clear();
     if picker.loading && picker.models.is_empty() {
         body.push(Line::raw("  Loading models..."));
         body.push(Line::raw(""));
@@ -2551,7 +2612,7 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             }));
         }
     } else {
-        let max_h = screen.height.min(22);
+        let max_h = screen.height.min(28);
         let total = picker.visible.len();
         let groups = picker
             .visible
@@ -2565,9 +2626,14 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         // border, indicators, action footer, and an optional error. This keeps
         // both the highlighted model and recovery action visible on a short
         // screen even with 100 providers.
+        let profile_rows = 9
+            + usize::from(row_width < 70)
+            + usize::from(
+                picker.reasoning_effort.is_some() && !picker.selected_supports_reasoning(),
+            )
+            + usize::from(picker.error.is_some());
         let line_budget = (max_h as usize)
-            .saturating_sub(2 + header.len() + 2 + usize::from(picker.error.is_some()))
-            .saturating_sub(2)
+            .saturating_sub(2 + header.len() + profile_rows)
             .max(2);
         let selected = picker.selected.min(total.saturating_sub(1));
         let mut start = selected;
@@ -2601,11 +2667,10 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
         }
         let mut previous_group: Option<&str> = None;
         for i in start..end {
-            let Some(m) = picker
-                .visible
-                .get(i)
-                .and_then(|index| picker.models.get(*index))
-            else {
+            let Some(&model_index) = picker.visible.get(i) else {
+                continue;
+            };
+            let Some(m) = picker.models.get(model_index) else {
                 continue;
             };
             let group = groups.get(i).map(String::as_str).unwrap_or("Provider");
@@ -2627,17 +2692,53 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            body.push(Line::from(Span::styled(
-                truncate_cells(
-                    &format!(
-                        "  {marker} {} · {} · {}/{}",
-                        m.display_name,
-                        m.provider_display_name,
-                        m.reference.provider,
-                        m.reference.model,
-                    ),
-                    row_width,
+            let mut badges = Vec::new();
+            if m.capabilities.supports_tools {
+                badges.push("tools");
+            }
+            if m.capabilities.supports_vision {
+                badges.push("vision");
+            }
+            if m.capabilities.supports_reasoning {
+                badges.push("reasoning");
+            }
+            if m.capabilities.supports_streaming == Some(true) {
+                badges.push("streaming");
+            }
+            let badges = if badges.is_empty() {
+                "capabilities unknown".to_string()
+            } else {
+                badges.join(",")
+            };
+            let badge = format!("[{badges}]");
+            let prefix = format!("  {marker} ");
+            // Keep the provider-qualified identity and textual capabilities at
+            // opposite ends of every row. Only the friendly display labels in
+            // the middle are sacrificed on a narrow terminal, so same-named
+            // models remain distinguishable and capability badges never rely
+            // on color or disappear behind a long label.
+            let reserved = display_width(&prefix)
+                .saturating_add(2)
+                .saturating_add(display_width(&badge));
+            let details_width = row_width.saturating_sub(reserved).max(1);
+            let details = clip_cells(
+                &format!(
+                    "{}/{} · {} · {}",
+                    m.reference.provider,
+                    m.reference.model,
+                    m.display_name,
+                    m.provider_display_name,
                 ),
+                details_width,
+            );
+            hitbox_specs.push((
+                ModelPickerHitboxKind::Model(model_index),
+                header.len() + body.len(),
+                0,
+                row_width,
+            ));
+            body.push(Line::from(Span::styled(
+                format!("{prefix}{details}  {badge}"),
                 style,
             )));
         }
@@ -2645,17 +2746,183 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
             body.push(Line::raw(format!("  \u{2193} {} more", total - end)));
         }
         body.push(Line::raw(""));
-        body.push(Line::raw(if picker.applying {
-            "  Applying model...".to_string()
+        if let Some(model) = picker.selected_model() {
+            body.push(Line::from(Span::styled(
+                clip_cells(
+                    &format!(
+                        "  Capabilities: tools {} · vision {} · reasoning {} · streaming {}",
+                        if model.capabilities.supports_tools {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        if model.capabilities.supports_vision {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        if model.capabilities.supports_reasoning {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                        match model.capabilities.supports_streaming {
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                            None => "unknown",
+                        }
+                    ),
+                    row_width,
+                ),
+                Style::default().fg(colors::inactive()),
+            )));
+            let context = model
+                .capabilities
+                .max_context_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let output = model
+                .capabilities
+                .max_output_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let source = model
+                .source
+                .map(|source| source.label())
+                .unwrap_or("unknown");
+            body.push(Line::from(Span::styled(
+                clip_cells(
+                    &format!("  Limits: context {context} · output {output} · source {source}"),
+                    row_width,
+                ),
+                Style::default().fg(colors::subtle()),
+            )));
+        }
+        let reasoning_source = if picker.reasoning_effort.is_some() {
+            "session override"
         } else {
-            format!(
-                "  {}/{} or wheel select · {} apply · {} cancel",
-                app.key_hint(ActionContext::ModelPicker, ActionId::NavigateUp),
-                app.key_hint(ActionContext::ModelPicker, ActionId::NavigateDown),
-                app.key_hint(ActionContext::ModelPicker, ActionId::Activate),
-                app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
-            )
-        }));
+            "provider default"
+        };
+        body.push(Line::from(vec![
+            Span::styled("  Reasoning: ", Style::default().fg(colors::subtle())),
+            Span::styled(
+                format!("{} ({reasoning_source})", picker.reasoning_label()),
+                Style::default()
+                    .fg(colors::inactive())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let choices = [
+            ("default", None),
+            ("low", Some(ReasoningEffort::Low)),
+            ("medium", Some(ReasoningEffort::Medium)),
+            ("high", Some(ReasoningEffort::High)),
+            ("xhigh", Some(ReasoningEffort::Xhigh)),
+            ("max", Some(ReasoningEffort::Max)),
+        ];
+        let reasoning_line = header.len() + body.len();
+        let mut reasoning_spans = vec![Span::raw("  ")];
+        let mut reasoning_x = 2_usize;
+        for (index, (label, effort)) in choices.into_iter().enumerate() {
+            if index > 0 {
+                reasoning_spans.push(Span::raw("  "));
+                reasoning_x += 2;
+            }
+            let selected = picker.reasoning_effort == effort;
+            let text = if selected {
+                format!("[{label}]")
+            } else {
+                label.to_string()
+            };
+            let enabled = effort.is_none() || picker.selected_supports_reasoning();
+            hitbox_specs.push((
+                ModelPickerHitboxKind::Reasoning(effort),
+                reasoning_line,
+                reasoning_x,
+                display_width(&text),
+            ));
+            reasoning_x += display_width(&text);
+            let style = if selected {
+                Style::default()
+                    .fg(if enabled {
+                        colors::brand()
+                    } else {
+                        colors::error()
+                    })
+                    .add_modifier(Modifier::BOLD)
+            } else if enabled {
+                Style::default().fg(colors::inactive())
+            } else {
+                Style::default().fg(colors::subtle())
+            };
+            reasoning_spans.push(Span::styled(text, style));
+        }
+        body.push(Line::from(reasoning_spans));
+        if !picker.selected_supports_reasoning() {
+            body.push(Line::from(Span::styled(
+                clip_cells(
+                    if picker.reasoning_effort.is_some() {
+                        "  Unsupported override: choose default before applying"
+                    } else {
+                        "  Reasoning disabled: selected model does not advertise support"
+                    },
+                    row_width,
+                ),
+                Style::default().fg(if picker.reasoning_effort.is_some() {
+                    colors::error()
+                } else {
+                    colors::subtle()
+                }),
+            )));
+        }
+        body.push(Line::raw(""));
+        if picker.applying {
+            body.push(Line::raw("  Applying execution profile..."));
+            body.push(Line::raw(""));
+        } else {
+            let apply_line = header.len() + body.len();
+            hitbox_specs.push((ModelPickerHitboxKind::Apply, apply_line, 0, row_width));
+            body.push(Line::raw(clip_cells(
+                &format!(
+                    "  {}/{} or wheel/click select · {} or click apply",
+                    app.key_hint(ActionContext::ModelPicker, ActionId::NavigateUp),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::NavigateDown),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::Activate),
+                ),
+                row_width,
+            )));
+            body.push(Line::raw(clip_cells(
+                &format!(
+                    "  {}/{} reasoning{}",
+                    app.key_hint(
+                        ActionContext::ModelPicker,
+                        ActionId::PreviousReasoningEffort
+                    ),
+                    app.key_hint(ActionContext::ModelPicker, ActionId::NextReasoningEffort),
+                    if row_width < 70 {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {} refresh · {} cancel",
+                            app.key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+                            app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+                        )
+                    },
+                ),
+                row_width,
+            )));
+            if row_width < 70 {
+                body.push(Line::raw(clip_cells(
+                    &format!(
+                        "  {} refresh · {} cancel",
+                        app.key_hint(ActionContext::ModelPicker, ActionId::Refresh),
+                        app.key_hint(ActionContext::ModelPicker, ActionId::Cancel),
+                    ),
+                    row_width,
+                )));
+            }
+        }
     }
     if let Some(error) = &picker.error {
         body.push(Line::from(Span::styled(
@@ -2668,6 +2935,22 @@ pub fn render_model_picker(f: &mut Frame, app: &App) {
     lines.extend(body);
     let height = (lines.len() as u16 + 2).min(screen.height);
     let area = centered_rect(92, height, screen);
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    *picker.hitboxes.borrow_mut() = hitbox_specs
+        .into_iter()
+        .filter_map(|(kind, line, x, width)| {
+            if line >= inner_height || x >= inner_width {
+                return None;
+            }
+            Some(ModelPickerHitbox {
+                kind,
+                x: area.x.saturating_add(1).saturating_add(x as u16),
+                y: area.y.saturating_add(1).saturating_add(line as u16),
+                width: width.min(inner_width.saturating_sub(x)) as u16,
+            })
+        })
+        .collect();
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3196,28 +3479,28 @@ mod tests {
                 3_944_301_344_853_503_540,
             ],
             [
-                6_353_706_855_117_373_427,
-                4_949_655_866_133_198_277,
-                10_134_078_088_138_427_242,
-                11_816_528_128_860_418_159,
-                5_878_254_985_531_855_646,
-                12_446_404_274_958_450_273,
+                24_781_587_750_329_806,
+                6_579_436_295_116_943_564,
+                12_089_640_381_617_969_713,
+                6_623_364_059_247_515_612,
+                10_379_221_866_905_049_683,
+                14_888_099_553_530_257_456,
             ],
             [
-                609_548_665_447_335_598,
-                15_455_926_307_789_286_752,
-                15_067_376_218_731_150_667,
-                3_277_314_811_073_656_778,
-                14_631_367_563_638_541_673,
-                11_436_591_821_112_263_934,
+                485_063_884_737_677_656,
+                15_174_020_356_754_305_078,
+                18_098_551_241_095_770_095,
+                2_039_143_840_007_286_998,
+                15_505_883_945_608_060_517,
+                12_608_770_992_754_079_606,
             ],
             [
-                9_618_507_591_432_411_738,
-                18_322_932_115_686_371_420,
-                13_335_556_050_296_598_231,
-                15_586_733_975_648_698_454,
-                14_233_158_507_239_728_005,
-                1_559_304_031_034_526_378,
+                8_481_799_100_690_155_604,
+                14_754_389_782_278_135_326,
+                3_040_738_245_384_578_895,
+                15_188_342_156_374_578_654,
+                16_521_044_070_106_085_221,
+                5_557_511_852_062_544_146,
             ],
         ];
         let mut actual = [[0_u64; 6]; 5];
@@ -3373,7 +3656,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [10_497_738_457_900_557_685, 4_621_970_272_475_212_681,],
+            [16_377_252_346_594_077_601, 9_609_611_161_121_647_853,],
             "complete help-overlay buffer golden changed"
         );
     }

@@ -22,7 +22,8 @@ fn default_title_generated() -> bool {
 // across the CLI and TUI front-ends); re-exported here so the rest of the TUI
 // can keep referring to `crate::api::types::{AgentEvent, ChatRequest, …}`.
 pub use bamboo_client_core::{
-    AgentEvent, ChatRequest, ChatResponse, ExecuteRequest, ExecuteResponse, TokenUsage,
+    AgentEvent, ChatRequest, ChatResponse, ExecuteRequest, ExecuteResponse, ReasoningEffort,
+    TokenUsage,
 };
 
 // ── Command catalog ──
@@ -93,6 +94,10 @@ pub struct SessionSummary {
     pub model_ref: Option<CatalogModelRef>,
     #[serde(default)]
     pub provider: Option<String>,
+    /// Stored per-session override. `None` means the provider default remains
+    /// authoritative; the TUI must not pretend a concrete level was stored.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub is_running: bool,
     #[serde(default)]
@@ -929,11 +934,49 @@ pub struct CatalogModelRef {
     pub model: String,
 }
 
+/// Capability flags and limits declared for one catalog model. Every field is
+/// defaulted so an older server remains readable and unknown support is never
+/// presented as guaranteed support.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogModelCapabilities {
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
+    pub supports_reasoning: bool,
+    #[serde(default)]
+    pub supports_streaming: Option<bool>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogModelSource {
+    Upstream,
+    Static,
+    Manual,
+    #[serde(other)]
+    Unknown,
+}
+
+impl CatalogModelSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Upstream => "upstream",
+            Self::Static => "static",
+            Self::Manual => "manual",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// One entry in `GET /v1/bamboo/provider-catalog`'s `models` array — a
-/// lenient subset of the server's `ProviderModelDescriptor`
-/// (`bamboo-domain::provider_catalog`). `capabilities`/`source`/
-/// `discovered_at` aren't rendered by the picker, so they're ignored on
-/// decode rather than modeled.
+/// lenient projection of the server's `ProviderModelDescriptor`
+/// (`bamboo-domain::provider_catalog`).
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct CatalogModel {
     #[serde(default)]
@@ -942,6 +985,10 @@ pub struct CatalogModel {
     pub display_name: String,
     #[serde(default)]
     pub provider_display_name: String,
+    #[serde(default)]
+    pub capabilities: CatalogModelCapabilities,
+    #[serde(default)]
+    pub source: Option<CatalogModelSource>,
 }
 
 /// Wire shape of `GET /v1/bamboo/provider-catalog`. `providers` isn't
@@ -953,13 +1000,32 @@ pub struct ProviderCatalog {
     pub models: Vec<CatalogModel>,
 }
 
-/// Body of `PATCH /api/v1/sessions/{id}` for the model-picker's exact
-/// provider/model update. The server derives and persists its typed
-/// `model_ref` when both legacy-compatible fields are present.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Body of `PATCH /api/v1/sessions/{id}` for one atomic execution-profile
+/// update. Exactly one of `reasoning_effort` and `clear_reasoning_effort` is
+/// emitted, so model and reasoning cannot become half-applied in the UI.
 #[derive(Serialize, Debug, Clone)]
-pub struct PatchSessionModelRequest {
+pub struct PatchSessionExecutionProfileRequest {
     pub model: String,
     pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_reasoning_effort: bool,
+}
+
+impl PatchSessionExecutionProfileRequest {
+    pub fn new(model: &CatalogModelRef, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        Self {
+            model: model.model.clone(),
+            provider: model.provider.clone(),
+            reasoning_effort,
+            clear_reasoning_effort: reasoning_effort.is_none(),
+        }
+    }
 }
 
 /// Canonical metadata subset used by the session picker's rename/pin actions.
@@ -1456,10 +1522,21 @@ mod tests {
         assert_eq!(envelope.session.model, "claude-sonnet-5");
     }
 
+    #[test]
+    fn session_summary_distinguishes_stored_reasoning_override_from_default() {
+        let stored: SessionSummary =
+            serde_json::from_str(r#"{"id":"s1","model":"reasoner","reasoning_effort":"high"}"#)
+                .unwrap();
+        assert_eq!(stored.reasoning_effort, Some(ReasoningEffort::High));
+
+        let provider_default: SessionSummary =
+            serde_json::from_str(r#"{"id":"s2","model":"reasoner"}"#).unwrap();
+        assert_eq!(provider_default.reasoning_effort, None);
+    }
+
     /// Fixture mirroring the real `GET /v1/bamboo/provider-catalog` response
-    /// (`bamboo-domain::ProviderCatalog`), including fields the picker doesn't
-    /// model (`providers`, `capabilities`, `source`, `updated_at`) — those must
-    /// be ignored, not break deserialization.
+    /// (`bamboo-domain::ProviderCatalog`). Capability/source fields must remain
+    /// typed while unrelated envelope fields stay forward-compatible.
     #[test]
     fn provider_catalog_deserializes_lenient_model_shapes() {
         let json = r#"{
@@ -1471,7 +1548,14 @@ mod tests {
                     "reference": {"provider": "openai", "model": "gpt-4.1"},
                     "display_name": "GPT-4.1",
                     "provider_display_name": "OpenAI",
-                    "capabilities": {"supports_tools": true, "supports_vision": true},
+                    "capabilities": {
+                        "supports_tools": true,
+                        "supports_vision": true,
+                        "supports_reasoning": true,
+                        "supports_streaming": true,
+                        "max_context_tokens": 1048576,
+                        "max_output_tokens": 32768
+                    },
                     "source": "upstream",
                     "discovered_at": "2026-07-01T00:00:00Z"
                 },
@@ -1490,8 +1574,17 @@ mod tests {
         assert_eq!(m0.reference.model, "gpt-4.1");
         assert_eq!(m0.display_name, "GPT-4.1");
         assert_eq!(m0.provider_display_name, "OpenAI");
+        assert!(m0.capabilities.supports_tools);
+        assert!(m0.capabilities.supports_vision);
+        assert!(m0.capabilities.supports_reasoning);
+        assert_eq!(m0.capabilities.supports_streaming, Some(true));
+        assert_eq!(m0.capabilities.max_context_tokens, Some(1_048_576));
+        assert_eq!(m0.capabilities.max_output_tokens, Some(32_768));
+        assert_eq!(m0.source, Some(CatalogModelSource::Upstream));
         let m1 = &catalog.models[1];
         assert_eq!(m1.reference.model, "claude-sonnet-5");
+        assert_eq!(m1.capabilities, CatalogModelCapabilities::default());
+        assert_eq!(m1.source, None);
     }
 
     /// An empty catalog (no providers configured) must still deserialize —
@@ -1504,13 +1597,38 @@ mod tests {
     }
 
     #[test]
-    fn patch_session_model_request_serializes_model_field() {
-        let req = PatchSessionModelRequest {
+    fn patch_session_profile_serializes_override_and_default_distinctly() {
+        let model = CatalogModelRef {
             model: "gpt-4.1".to_string(),
             provider: "openai".to_string(),
         };
+        let req = PatchSessionExecutionProfileRequest::new(&model, Some(ReasoningEffort::Xhigh));
         let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"model":"gpt-4.1","provider":"openai"}"#);
+        assert_eq!(
+            json,
+            r#"{"model":"gpt-4.1","provider":"openai","reasoning_effort":"xhigh"}"#
+        );
+
+        let default = PatchSessionExecutionProfileRequest::new(&model, None);
+        assert_eq!(
+            serde_json::to_string(&default).unwrap(),
+            r#"{"model":"gpt-4.1","provider":"openai","clear_reasoning_effort":true}"#
+        );
+    }
+
+    #[test]
+    fn every_reasoning_effort_uses_the_canonical_wire_value() {
+        let values = ["low", "medium", "high", "xhigh", "max"];
+        for (effort, expected) in ReasoningEffort::ALL.into_iter().zip(values) {
+            assert_eq!(
+                serde_json::to_string(&effort).unwrap(),
+                format!("\"{expected}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ReasoningEffort>(&format!("\"{expected}\"")).unwrap(),
+                effort
+            );
+        }
     }
 
     #[test]

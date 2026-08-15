@@ -355,6 +355,7 @@ mod tests {
             model: String::new(),
             model_ref: None,
             provider: None,
+            reasoning_effort: None,
             is_running: false,
             has_pending_question: false,
             running_child_count: 0,

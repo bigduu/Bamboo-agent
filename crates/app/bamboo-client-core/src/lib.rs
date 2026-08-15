@@ -13,6 +13,33 @@ fn default_allow_custom() -> bool {
     true
 }
 
+/// Provider-agnostic reasoning levels accepted by Bamboo's session and
+/// execute contracts. Keeping this wire enum in the shared client crate makes
+/// every front-end serialize the same canonical lowercase values.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 // ── Chat ──
 
 #[derive(Serialize, Clone, Debug)]
@@ -32,6 +59,10 @@ pub struct ChatRequest {
     /// provider was previously active for a same-named model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Optional execution-profile override. Omission delegates to the
+    /// provider/session default instead of inventing a client-side level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -53,10 +84,12 @@ mod chat_request_tests {
             project_id: Some("project-client".to_string()),
             model: Some("gpt-5".to_string()),
             provider: Some("openai".to_string()),
+            reasoning_effort: Some(super::ReasoningEffort::High),
         })
         .unwrap();
         assert_eq!(value["project_id"], "project-client");
         assert_eq!(value["provider"], "openai");
+        assert_eq!(value["reasoning_effort"], "high");
         assert!(value.get("session_id").is_none());
     }
 }
@@ -69,6 +102,8 @@ pub struct ExecuteRequest {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[cfg(test)]
@@ -80,10 +115,12 @@ mod execute_request_tests {
         let value = serde_json::to_value(ExecuteRequest {
             model: Some("shared".to_string()),
             provider: Some("provider-b".to_string()),
+            reasoning_effort: Some(super::ReasoningEffort::Xhigh),
         })
         .unwrap();
         assert_eq!(value["model"], "shared");
         assert_eq!(value["provider"], "provider-b");
+        assert_eq!(value["reasoning_effort"], "xhigh");
     }
 }
 

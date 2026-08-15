@@ -62,6 +62,10 @@ pub struct ChatTurnInput {
     pub model: String,
     pub model_ref: Option<ProviderModelRef>,
     pub provider: Option<String>,
+    /// Explicit reasoning override used when this chat creates a session.
+    /// Existing sessions remain authoritative; later changes go through the
+    /// session PATCH contract.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub message: String,
     pub system_prompt: Option<String>,
     pub enhance_prompt: Option<String>,
