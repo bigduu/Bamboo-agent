@@ -9,10 +9,95 @@ use crate::app::{
     ToolCallDisplay, CONVERSATION_DETAIL_VIEWPORT,
 };
 use crate::components::markdown;
+use crate::file_change::FileChangeState;
 use crate::keymap::{ActionContext, ActionId};
 use crate::theme::{self, colors};
 
 const COLLAPSED_DETAIL_LINES: usize = 3;
+const COLLAPSED_DIFF_LINES: usize = 4;
+
+fn push_file_change_detail(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    block_id: &str,
+    tc: &ToolCallDisplay,
+    state: &ConversationBlockUiState,
+    focused: bool,
+    width: u16,
+) -> bool {
+    let Some(change) = app.chat.file_change_view(block_id, tc) else {
+        return false;
+    };
+    lines.extend(change.summary_lines(
+        FileChangeState::from_phase(&tc.phase),
+        "   ",
+        width as usize,
+    ));
+
+    let rows = change.rendered_rows(width.saturating_sub(3) as usize, state.diff_wrap);
+    let limit = if state.expanded {
+        CONVERSATION_DETAIL_VIEWPORT
+    } else {
+        COLLAPSED_DIFF_LINES
+    };
+    let max_start = rows.len().saturating_sub(limit);
+    let start = if state.expanded {
+        state.scroll.min(max_start)
+    } else {
+        0
+    };
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("   ↑ {start} earlier diff rows"),
+            Style::default().fg(colors::subtle()),
+        )));
+    }
+    lines.extend(
+        rows.iter()
+            .skip(start)
+            .take(limit)
+            .map(|row| row.styled_line("   ")),
+    );
+    let hidden_after = rows.len().saturating_sub(start + limit);
+    if hidden_after > 0 {
+        lines.push(Line::from(Span::styled(
+            if state.expanded {
+                format!("   ↓ {hidden_after} later diff rows")
+            } else {
+                format!(
+                    "   … {hidden_after} more — focus then {} to inspect",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::Activate)
+                )
+            },
+            Style::default().fg(colors::subtle()),
+        )));
+    }
+    if focused {
+        lines.push(Line::from(Span::styled(
+            if state.expanded {
+                format!(
+                    "   {} collapse · {}/{} scroll · {}/{} hunks · {} {} · {} copy exact diff",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockUp),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::ScrollBlockDown),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::PreviousDiffHunk),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::NextDiffHunk),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::ToggleDiffWrap),
+                    if state.diff_wrap { "clip" } else { "wrap" },
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                )
+            } else {
+                format!(
+                    "   {} expand · {} copy exact diff",
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::Activate),
+                    app.key_hint(ActionContext::ConversationBlock, ActionId::CopyValue),
+                )
+            },
+            Style::default().fg(colors::subtle()),
+        )));
+    }
+    true
+}
 
 /// Render one tool block's bounded inspector. Expansion is per block, and an
 /// expanded block remains bounded; when focused, j/k or PgUp/PgDn changes its
@@ -26,6 +111,10 @@ fn push_tool_detail(
     focused: bool,
     width: u16,
 ) {
+    if push_file_change_detail(lines, app, block_id, tc, state, focused, width) {
+        return;
+    }
+
     // Arguments.
     let args = tc.arguments.trim();
     if !args.is_empty() && args != "null" && args != "{}" {
@@ -541,6 +630,7 @@ mod tests {
             &ConversationBlockUiState {
                 expanded: true,
                 scroll: 0,
+                diff_wrap: true,
             },
             false,
             100,
@@ -577,6 +667,190 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn file_change_payload(truncated: bool) -> String {
+        serde_json::json!({
+            "operation": "Edit",
+            "message": "Edited file",
+            "file_path": "/workspace/界/demo.rs",
+            "workspace": "/workspace/界",
+            "checkpoint": {
+                "created": true,
+                "id": "checkpoint-1",
+                "path": "/checkpoints/demo.rs",
+                "size_bytes": 4
+            },
+            "diagnostics": {"format": "rust", "valid": true},
+            "diff": {
+                "format": "unified",
+                "unified": if truncated {
+                    "--- a/demo.rs\n+++ b/demo.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n... diff truncated (20 more lines)"
+                } else {
+                    "--- a/demo.rs\n+++ b/demo.rs\n@@ -1,1 +1,1 @@\n-old\n+new"
+                },
+                "old_line_count": 1,
+                "new_line_count": 1,
+                "added_lines": 1,
+                "removed_lines": 1,
+                "old_trailing_newline": true,
+                "new_trailing_newline": false,
+                "truncated": truncated
+            }
+        })
+        .to_string()
+    }
+
+    fn tool_detail_text(
+        tool: &ToolCallDisplay,
+        state: &ConversationBlockUiState,
+        width: u16,
+    ) -> String {
+        let app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        let mut lines = Vec::new();
+        push_tool_detail(
+            &mut lines,
+            &app,
+            "test:file-change",
+            tool,
+            state,
+            false,
+            width,
+        );
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn canonical_file_changes_render_specialized_states_and_raw_fallbacks() {
+        let base = ToolCallDisplay {
+            id: "change".to_string(),
+            tool_name: "Edit".to_string(),
+            arguments: r#"{"file_path":"/workspace/界/demo.rs"}"#.to_string(),
+            result: Some(file_change_payload(false)),
+            stream_output: String::new(),
+            error: None,
+            phase: "complete".to_string(),
+        };
+        let state = ConversationBlockUiState {
+            expanded: true,
+            ..Default::default()
+        };
+        let applied = tool_detail_text(&base, &state, 80);
+        for expected in [
+            "APPLIED · Edit · /workspace/界/demo.rs",
+            "+1 added · -1 removed",
+            "checkpoint saved",
+            "diagnostics rust valid",
+            "- old",
+            "+ new",
+        ] {
+            assert!(
+                applied.contains(expected),
+                "missing {expected:?}: {applied}"
+            );
+        }
+        assert!(!applied.contains("\"operation\""));
+
+        let mut proposed = base.clone();
+        proposed.phase = "running".to_string();
+        assert!(tool_detail_text(&proposed, &state, 80).contains("PROPOSED"));
+        let mut failed = base.clone();
+        failed.phase = "error".to_string();
+        assert!(tool_detail_text(&failed, &state, 80).contains("FAILED"));
+        let mut truncated = base.clone();
+        truncated.result = Some(file_change_payload(true));
+        assert!(tool_detail_text(&truncated, &state, 80).contains("TRUNCATED"));
+
+        let malformed = ToolCallDisplay {
+            result: Some("{malformed file result".to_string()),
+            ..base
+        };
+        let fallback = tool_detail_text(&malformed, &state, 80);
+        assert!(fallback.contains("{malformed file result"));
+        assert!(fallback.contains("args:"));
+    }
+
+    #[test]
+    fn file_change_rendering_is_equivalent_for_history_and_live_tools() {
+        use crate::api::types::{HistoryFunctionCall, HistoryMessage, HistoryToolCall};
+        use crate::history::map_history;
+
+        let payload = file_change_payload(false);
+        let mapped = map_history(vec![
+            HistoryMessage {
+                id: "assistant-history".to_string(),
+                role: "assistant".to_string(),
+                tool_calls: Some(vec![HistoryToolCall {
+                    id: "change-1".to_string(),
+                    function: HistoryFunctionCall {
+                        name: "Edit".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            HistoryMessage {
+                role: "tool".to_string(),
+                content: payload.clone(),
+                tool_call_id: Some("change-1".to_string()),
+                tool_success: Some(true),
+                ..Default::default()
+            },
+        ]);
+        let history = &mapped[0].tool_calls[0];
+        let live = ToolCallDisplay {
+            id: "change-1".to_string(),
+            tool_name: "Edit".to_string(),
+            arguments: "{}".to_string(),
+            result: Some(payload),
+            stream_output: String::new(),
+            error: None,
+            phase: "complete".to_string(),
+        };
+        let state = ConversationBlockUiState {
+            expanded: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_detail_text(history, &state, 80),
+            tool_detail_text(&live, &state, 80)
+        );
+    }
+
+    #[test]
+    fn monochrome_diff_rows_stay_textually_distinct_at_supported_widths() {
+        let tool = ToolCallDisplay {
+            id: "change".to_string(),
+            tool_name: "Edit".to_string(),
+            arguments: "{}".to_string(),
+            result: Some(file_change_payload(false)),
+            stream_output: String::new(),
+            error: None,
+            phase: "complete".to_string(),
+        };
+        let state = ConversationBlockUiState {
+            expanded: true,
+            ..Default::default()
+        };
+        crate::theme::with_palette(crate::theme::ThemePalette::NoColor, || {
+            for width in [60, 80, 120] {
+                let rendered = tool_detail_text(&tool, &state, width);
+                assert!(rendered.contains("- old"));
+                assert!(rendered.contains("+ new"));
+                assert!(rendered
+                    .lines()
+                    .all(|line| crate::text::display_width(line) <= width as usize));
+            }
+        });
     }
 
     #[test]
@@ -618,6 +892,7 @@ mod tests {
             ConversationBlockUiState {
                 expanded: true,
                 scroll: 5,
+                diff_wrap: true,
             },
         );
         app.chat.block_ui.insert(
@@ -679,6 +954,7 @@ mod tests {
                 ConversationBlockUiState {
                     expanded: true,
                     scroll: 0,
+                    diff_wrap: true,
                 },
             );
         }

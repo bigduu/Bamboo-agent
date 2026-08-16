@@ -1343,7 +1343,25 @@ fn render_permission_inspector(
         ]),
         sections[0],
     );
-    let value = permission.inspector_text();
+    let mut value = permission
+        .base_inspector_text()
+        .lines()
+        .map(|line| Line::raw(line.to_string()))
+        .collect::<Vec<_>>();
+    if let Some(change) = permission.proposed_file_change() {
+        value.push(Line::raw(""));
+        value.extend(change.summary_lines(
+            crate::file_change::FileChangeState::Proposed,
+            "",
+            sections[1].width as usize,
+        ));
+        value.extend(
+            change
+                .rendered_rows(sections[1].width as usize, true)
+                .iter()
+                .map(|row| row.styled_line("")),
+        );
+    }
     let paragraph = Paragraph::new(value).wrap(Wrap { trim: false });
     let wrapped_count = paragraph.line_count(sections[1].width);
     let max_scroll = u16::try_from(wrapped_count.saturating_sub(sections[1].height as usize))
@@ -1428,6 +1446,12 @@ fn render_permission_question(f: &mut Frame, app: &App, q: &ActiveQuestion) {
         text_width,
         2,
     ));
+    if permission.proposed_file_change().is_some() {
+        details.push(one_line(
+            "file change",
+            "PROPOSED server-supplied unified diff available in inspector",
+        ));
+    }
     details.extend(labelled_preview(
         if permission.tool_arguments_truncated {
             "arguments (bounded, truncated)"
@@ -3656,7 +3680,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [16_377_252_346_594_077_601, 9_609_611_161_121_647_853,],
+            [9_023_054_049_185_338_977, 1_360_325_232_269_958_569,],
             "complete help-overlay buffer golden changed"
         );
     }

@@ -179,6 +179,9 @@ pub(crate) enum ActionId {
     ScrollBlockDown,
     ScrollBlockPageUp,
     ScrollBlockPageDown,
+    PreviousDiffHunk,
+    NextDiffHunk,
+    ToggleDiffWrap,
     CopyValue,
     InspectValue,
     ToggleInspectorPane,
@@ -982,6 +985,30 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [(ConversationBlock, "PageDown")]
     ),
     spec!(
+        PreviousDiffHunk,
+        "Previous diff hunk",
+        "Jump to the previous hunk in the focused file change",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "[")]
+    ),
+    spec!(
+        NextDiffHunk,
+        "Next diff hunk",
+        "Jump to the next hunk in the focused file change",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "]")]
+    ),
+    spec!(
+        ToggleDiffWrap,
+        "Toggle diff wrapping",
+        "Wrap or clip long lines in the focused diff without changing copied content",
+        false,
+        [ConversationBlock],
+        [(ConversationBlock, "w")]
+    ),
+    spec!(
         CopyValue,
         "Copy exact value",
         "Copy the focused value through OSC 52",
@@ -1331,6 +1358,8 @@ impl ActionId {
                 | Self::ScrollBlockDown
                 | Self::ScrollBlockPageUp
                 | Self::ScrollBlockPageDown
+                | Self::PreviousDiffHunk
+                | Self::NextDiffHunk
                 | Self::Backspace
         )
     }
