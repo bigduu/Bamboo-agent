@@ -76,6 +76,7 @@ impl TaskProgressState {
             .map(|item| (item.id.clone(), version))
             .collect();
         self.completed = self.progress.total > 0 && self.progress.completed == self.progress.total;
+        self.completion_summary = None;
         self.task_list = Some(task_list);
         self.loading = false;
         self.error = None;
@@ -130,6 +131,7 @@ impl TaskProgressState {
             .collect();
         self.progress = calculate_progress(&task_list.items);
         self.completed = self.progress.total > 0 && self.progress.completed == self.progress.total;
+        self.completion_summary = None;
         self.task_list = Some(task_list);
         self.loading = false;
         self.error = None;
@@ -170,25 +172,36 @@ impl TaskProgressState {
             title: "Agent Tasks".to_string(),
             ..TaskList::default()
         });
-        let mut incoming = item.unwrap_or_else(|| TaskItem {
-            id: item_id.clone(),
-            description: item_id.clone(),
-            ..TaskItem::default()
-        });
-        incoming.status = status;
         if let Some(existing) = list
             .items
             .iter_mut()
             .find(|existing| existing.id == item_id)
         {
-            *existing = incoming;
+            if let Some(mut incoming) = item {
+                incoming.status = status;
+                *existing = incoming;
+            } else {
+                // Legacy persisted progress frames have no rich item
+                // projection. Preserve the authoritative snapshot details
+                // and apply only the delta fields they actually carry.
+                existing.status = status;
+            }
         } else {
+            let mut incoming = item.unwrap_or_else(|| TaskItem {
+                id: item_id.clone(),
+                description: item_id.clone(),
+                ..TaskItem::default()
+            });
+            incoming.status = status;
             list.items.push(incoming);
         }
         self.version = self.version.max(version);
         self.item_versions.insert(item_id, version);
         self.progress = calculate_progress(&list.items);
         self.completed = self.progress.total > 0 && self.progress.completed == self.progress.total;
+        if !self.completed {
+            self.completion_summary = None;
+        }
         self.loading = false;
         self.error = None;
         ApplyResult::Applied
@@ -210,6 +223,15 @@ impl TaskProgressState {
         }
         if let Some(version) = version {
             self.version = self.version.max(version);
+        }
+        if let Some(list) = self.task_list.as_mut() {
+            for item in &mut list.items {
+                item.status = TaskItemStatus::Completed;
+                if let Some(version) = version {
+                    self.item_versions.insert(item.id.clone(), version);
+                }
+            }
+            self.progress = calculate_progress(&list.items);
         }
         self.completed = true;
         self.completion_summary = Some(format!(
@@ -472,6 +494,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_progress_delta_preserves_existing_task_details() {
+        let mut state = state();
+        let task = &mut state.task_list.as_mut().unwrap().items[0];
+        task.depends_on = vec!["setup".to_string()];
+        task.blockers.push(TaskBlocker {
+            kind: TaskBlockerKind::Dependency,
+            summary: "Waiting for setup".to_string(),
+            waiting_on: Some("setup".to_string()),
+        });
+
+        assert_eq!(
+            state.apply_item(
+                "session-a",
+                "one".to_string(),
+                TaskItemStatus::Blocked,
+                5,
+                None,
+                false,
+            ),
+            ApplyResult::Applied
+        );
+        let task = &state.task_list.as_ref().unwrap().items[0];
+        assert_eq!(task.description, "Task one");
+        assert_eq!(task.depends_on, ["setup"]);
+        assert_eq!(task.blockers[0].waiting_on.as_deref(), Some("setup"));
+    }
+
+    #[test]
     fn nested_and_cyclic_items_are_all_visible() {
         let mut parent = item("parent", TaskItemStatus::InProgress);
         let mut child = item("child", TaskItemStatus::Pending);
@@ -539,6 +589,25 @@ mod tests {
         assert_eq!(
             state.task_list.as_ref().unwrap().items[0].status,
             TaskItemStatus::Completed
+        );
+    }
+
+    #[test]
+    fn completion_event_converges_known_items_and_aggregate_progress() {
+        let mut state = state();
+        assert_eq!(
+            state.apply_completed("session-a", Some(5), 3, 7, false),
+            ApplyResult::Applied
+        );
+        assert_eq!(
+            state.task_list.as_ref().unwrap().items[0].status,
+            TaskItemStatus::Completed
+        );
+        assert_eq!(state.progress.completed, 1);
+        assert_eq!(state.progress.percentage, 100);
+        assert_eq!(
+            state.completion_summary.as_deref(),
+            Some("completed in 3 rounds · 7 tool calls")
         );
     }
 

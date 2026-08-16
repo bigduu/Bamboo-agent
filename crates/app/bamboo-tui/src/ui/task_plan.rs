@@ -158,6 +158,15 @@ fn task_lines(
             clip_cells(evaluation, width.saturating_sub(13))
         )));
     }
+    if let Some(completion) = &state.completion_summary {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Completion: {}",
+                clip_cells(completion, width.saturating_sub(13))
+            ),
+            Style::default().fg(colors::success()),
+        )));
+    }
     if ordered.is_empty() {
         lines.push(Line::from(Span::styled(
             " No task list has been created for this session.",
@@ -185,9 +194,10 @@ fn task_lines(
             format!(" · deps {}", item.depends_on.join(","))
         };
         let prefix = format!(
-            " {}{} {} ",
+            " {}{} {:<11} {}",
             if selected_row { "›" } else { " " },
             status_icon(item.status),
+            task_status_label(item.status),
             indent
         );
         let available = width.saturating_sub(crate::text::display_width(&prefix));
@@ -483,6 +493,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(rendered.contains("Tasks / Plan"));
+            assert!(rendered.contains("blocked"));
             assert!(rendered.contains("waiting on backend contract"));
         }
     }
