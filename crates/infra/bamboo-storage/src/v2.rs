@@ -17,17 +17,23 @@
 //!   boot-fatal and never orphans intact sessions. Directory scanning is used
 //!   only for this recovery path, never in hot paths.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{
+    mpsc, Mutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock,
+};
 use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
@@ -68,6 +74,10 @@ const TOKEN_USAGE_FILE: &str = "token-usage.jsonl";
 const RUNTIME_SIDECAR_MIGRATION_MARKER: &str = ".runtime_sidecar_migrated";
 const SESSION_LIFECYCLE_LOCK_FILE: &str = ".session-lifecycle.lock";
 const SESSION_INDEX_LOCK_FILE: &str = ".sessions-index.lock";
+const SESSION_WRITE_LOCK_DIR: &str = ".session-write-locks";
+const SEARCH_INDEX_REVISION_FILE: &str = ".search-index-revision";
+const PERSISTENCE_METRIC_WINDOW: usize = 1024;
+const SEARCH_INDEX_MAX_ATTEMPTS: usize = 3;
 
 struct SessionIndexFileGuard {
     file: std::fs::File,
@@ -184,6 +194,14 @@ impl Drop for RuntimeTaskTransactionWriteGuard {
 struct RuntimeTaskFirstWritePause {
     reached: std::sync::Arc<tokio::sync::Barrier>,
     release: std::sync::Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+struct FullSavePause {
+    session_id: String,
+    reached: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
 }
 
 impl Drop for SessionIndexFileGuard {
@@ -458,15 +476,539 @@ impl SessionsIndex {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DurationMetricsSnapshot {
+    pub count: u64,
+    pub total_ms: u64,
+    pub last_ms: u64,
+    pub max_ms: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SavePersistenceMetricsSnapshot {
+    pub lock_wait: DurationMetricsSnapshot,
+    pub lock_hold: DurationMetricsSnapshot,
+    pub total: DurationMetricsSnapshot,
+    pub directory_preparation: DurationMetricsSnapshot,
+    pub serialization: DurationMetricsSnapshot,
+    pub filesystem_commit: DurationMetricsSnapshot,
+    pub index_publication: DurationMetricsSnapshot,
+    pub search_enqueue: DurationMetricsSnapshot,
+    pub last_serialized_bytes: usize,
+    pub last_message_count: usize,
+    pub last_index_entry_count: usize,
+}
+
+/// Bounded, aggregate persistence telemetry. Session ids are deliberately not
+/// retained as metric labels; they appear only in structured traces for local
+/// correlation, avoiding unbounded cardinality.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionPersistenceMetricsSnapshot {
+    pub full_save: SavePersistenceMetricsSnapshot,
+    pub runtime_save: SavePersistenceMetricsSnapshot,
+    pub index_lock_wait: DurationMetricsSnapshot,
+    pub index_lock_hold: DurationMetricsSnapshot,
+    pub search_index: DurationMetricsSnapshot,
+    pub create_latency: DurationMetricsSnapshot,
+    pub waiting_saves: usize,
+    pub active_saves: usize,
+    pub pending_search_jobs: usize,
+    pub active_search_jobs: usize,
+}
+
+#[derive(Debug, Default)]
+struct DurationMetrics {
+    count: u64,
+    total_ms: u64,
+    last_ms: u64,
+    max_ms: u64,
+    recent_ms: VecDeque<u64>,
+}
+
+impl DurationMetrics {
+    fn record(&mut self, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.count = self.count.saturating_add(1);
+        self.total_ms = self.total_ms.saturating_add(millis);
+        self.last_ms = millis;
+        self.max_ms = self.max_ms.max(millis);
+        if self.recent_ms.len() == PERSISTENCE_METRIC_WINDOW {
+            self.recent_ms.pop_front();
+        }
+        self.recent_ms.push_back(millis);
+    }
+
+    fn snapshot(&self) -> DurationMetricsSnapshot {
+        let mut samples = self.recent_ms.iter().copied().collect::<Vec<_>>();
+        samples.sort_unstable();
+        let percentile = |percent: usize| {
+            if samples.is_empty() {
+                return 0;
+            }
+            let index = ((samples.len() - 1) * percent).div_ceil(100);
+            samples[index]
+        };
+        DurationMetricsSnapshot {
+            count: self.count,
+            total_ms: self.total_ms,
+            last_ms: self.last_ms,
+            max_ms: self.max_ms,
+            p50_ms: percentile(50),
+            p95_ms: percentile(95),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SavePersistenceMetrics {
+    lock_wait: DurationMetrics,
+    lock_hold: DurationMetrics,
+    total: DurationMetrics,
+    directory_preparation: DurationMetrics,
+    serialization: DurationMetrics,
+    filesystem_commit: DurationMetrics,
+    index_publication: DurationMetrics,
+    search_enqueue: DurationMetrics,
+    last_serialized_bytes: usize,
+    last_message_count: usize,
+    last_index_entry_count: usize,
+}
+
+impl SavePersistenceMetrics {
+    fn snapshot(&self) -> SavePersistenceMetricsSnapshot {
+        SavePersistenceMetricsSnapshot {
+            lock_wait: self.lock_wait.snapshot(),
+            lock_hold: self.lock_hold.snapshot(),
+            total: self.total.snapshot(),
+            directory_preparation: self.directory_preparation.snapshot(),
+            serialization: self.serialization.snapshot(),
+            filesystem_commit: self.filesystem_commit.snapshot(),
+            index_publication: self.index_publication.snapshot(),
+            search_enqueue: self.search_enqueue.snapshot(),
+            last_serialized_bytes: self.last_serialized_bytes,
+            last_message_count: self.last_message_count,
+            last_index_entry_count: self.last_index_entry_count,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PersistenceMetricsState {
+    full_save: SavePersistenceMetrics,
+    runtime_save: SavePersistenceMetrics,
+    index_lock_wait: DurationMetrics,
+    index_lock_hold: DurationMetrics,
+    search_index: DurationMetrics,
+    create_latency: DurationMetrics,
+}
+
+#[derive(Debug, Default)]
+struct SessionPersistenceMetrics {
+    state: std::sync::Mutex<PersistenceMetricsState>,
+    waiting_saves: AtomicUsize,
+    active_saves: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SaveKind {
+    Full,
+    Runtime,
+}
+
+impl SaveKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SaveStageDurations {
+    directory_preparation: Duration,
+    serialization: Duration,
+    filesystem_commit: Duration,
+    index_publication: Duration,
+    search_enqueue: Duration,
+}
+
+impl SessionPersistenceMetrics {
+    fn with_save_mut<T>(
+        &self,
+        kind: SaveKind,
+        f: impl FnOnce(&mut SavePersistenceMetrics) -> T,
+    ) -> T {
+        let mut state = self.state.lock().expect("session persistence metrics lock");
+        match kind {
+            SaveKind::Full => f(&mut state.full_save),
+            SaveKind::Runtime => f(&mut state.runtime_save),
+        }
+    }
+
+    fn record_lock_wait(&self, kind: SaveKind, duration: Duration) {
+        self.with_save_mut(kind, |metrics| metrics.lock_wait.record(duration));
+    }
+
+    fn record_lock_hold(&self, kind: SaveKind, duration: Duration) {
+        self.with_save_mut(kind, |metrics| metrics.lock_hold.record(duration));
+    }
+
+    fn record_save(
+        &self,
+        kind: SaveKind,
+        total: Duration,
+        stages: SaveStageDurations,
+        serialized_bytes: usize,
+        message_count: usize,
+        index_entry_count: usize,
+    ) {
+        self.with_save_mut(kind, |metrics| {
+            metrics.total.record(total);
+            metrics
+                .directory_preparation
+                .record(stages.directory_preparation);
+            metrics.serialization.record(stages.serialization);
+            metrics.filesystem_commit.record(stages.filesystem_commit);
+            metrics.index_publication.record(stages.index_publication);
+            metrics.search_enqueue.record(stages.search_enqueue);
+            metrics.last_serialized_bytes = serialized_bytes;
+            metrics.last_message_count = message_count;
+            metrics.last_index_entry_count = index_entry_count;
+        });
+    }
+
+    fn record_index_lock_wait(&self, duration: Duration) {
+        self.state
+            .lock()
+            .expect("session persistence metrics lock")
+            .index_lock_wait
+            .record(duration);
+    }
+
+    fn record_index_lock_hold(&self, duration: Duration) {
+        self.state
+            .lock()
+            .expect("session persistence metrics lock")
+            .index_lock_hold
+            .record(duration);
+    }
+
+    fn record_search_index(&self, duration: Duration) {
+        self.state
+            .lock()
+            .expect("session persistence metrics lock")
+            .search_index
+            .record(duration);
+    }
+
+    fn record_create_latency(&self, duration: Duration) {
+        self.state
+            .lock()
+            .expect("session persistence metrics lock")
+            .create_latency
+            .record(duration);
+    }
+
+    fn snapshot(
+        &self,
+        pending_search_jobs: usize,
+        active_search_jobs: usize,
+    ) -> SessionPersistenceMetricsSnapshot {
+        let state = self.state.lock().expect("session persistence metrics lock");
+        SessionPersistenceMetricsSnapshot {
+            full_save: state.full_save.snapshot(),
+            runtime_save: state.runtime_save.snapshot(),
+            index_lock_wait: state.index_lock_wait.snapshot(),
+            index_lock_hold: state.index_lock_hold.snapshot(),
+            search_index: state.search_index.snapshot(),
+            create_latency: state.create_latency.snapshot(),
+            waiting_saves: self.waiting_saves.load(Ordering::Relaxed),
+            active_saves: self.active_saves.load(Ordering::Relaxed),
+            pending_search_jobs,
+            active_search_jobs,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionWriteGuard {
+    guard: Option<OwnedMutexGuard<()>>,
+    file: Option<std::fs::File>,
+    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    session_id: String,
+    kind: Option<SaveKind>,
+    acquired: Instant,
+    metrics: Arc<SessionPersistenceMetrics>,
+}
+
+#[derive(Debug)]
+struct WaitingSaveCounter {
+    metrics: Arc<SessionPersistenceMetrics>,
+}
+
+impl Drop for WaitingSaveCounter {
+    fn drop(&mut self) {
+        self.metrics.waiting_saves.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for SessionWriteGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = FileExt::unlock(&file);
+        }
+        self.guard.take();
+        if let Some(kind) = self.kind {
+            self.metrics.active_saves.fetch_sub(1, Ordering::Relaxed);
+            let held = self.acquired.elapsed();
+            self.metrics.record_lock_hold(kind, held);
+            tracing::debug!(
+                target: "bamboo.session_persistence",
+                session_id = %self.session_id,
+                save_type = kind.as_str(),
+                phase = "session_lock_released",
+                lock_hold_ms = held.as_millis() as u64,
+                "session persistence lock released"
+            );
+        }
+        self.locks
+            .remove_if(&self.session_id, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+#[derive(Debug)]
+enum SearchIndexMutation {
+    Upsert {
+        session: Box<Session>,
+        revision_path: PathBuf,
+        expected_revision: String,
+    },
+    Delete {
+        session_id: String,
+        revision_path: PathBuf,
+    },
+}
+
+impl SearchIndexMutation {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Upsert { session, .. } => &session.id,
+            Self::Delete { session_id, .. } => session_id,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingSearchIndexMutation {
+    generation: u64,
+    mutation: SearchIndexMutation,
+}
+
+#[derive(Debug, Default)]
+struct SearchIndexQueueState {
+    pending: HashMap<String, PendingSearchIndexMutation>,
+    order: VecDeque<String>,
+}
+
+#[derive(Debug)]
+struct SearchIndexQueue {
+    state: Arc<std::sync::Mutex<SearchIndexQueueState>>,
+    signal: mpsc::Sender<()>,
+    next_generation: AtomicU64,
+    in_flight: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+}
+
+impl SearchIndexQueue {
+    fn new(index: SessionSearchIndex, metrics: Arc<SessionPersistenceMetrics>) -> Self {
+        let state = Arc::new(std::sync::Mutex::new(SearchIndexQueueState::default()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(Notify::new());
+        // The signal only means "inspect the coalescing map". One buffered
+        // wake-up is sufficient even under a large save burst, so the channel
+        // itself cannot become another unbounded queue.
+        let (signal, mut receiver) = mpsc::channel(1);
+        let worker_state = state.clone();
+        let worker_in_flight = in_flight.clone();
+        let worker_idle = idle.clone();
+        tokio::spawn(async move {
+            while receiver.recv().await.is_some() {
+                loop {
+                    let next = {
+                        let mut state = worker_state.lock().expect("session search queue lock");
+                        let session_id = state.order.pop_front();
+                        let next =
+                            session_id.and_then(|session_id| state.pending.remove(&session_id));
+                        if next.is_some() {
+                            worker_in_flight.fetch_add(1, Ordering::Relaxed);
+                        }
+                        next
+                    };
+                    let Some(job) = next else {
+                        worker_idle.notify_waiters();
+                        break;
+                    };
+
+                    let started = Instant::now();
+                    let session_id = job.mutation.session_id().to_string();
+                    let operation = match &job.mutation {
+                        SearchIndexMutation::Upsert { .. } => "upsert",
+                        SearchIndexMutation::Delete { .. } => "delete",
+                    };
+                    let mut result = Ok(());
+                    for attempt in 1..=SEARCH_INDEX_MAX_ATTEMPTS {
+                        result = match &job.mutation {
+                            SearchIndexMutation::Upsert {
+                                session,
+                                revision_path,
+                                expected_revision,
+                            } => {
+                                index
+                                    .upsert_session_if_current(
+                                        session,
+                                        revision_path,
+                                        expected_revision,
+                                    )
+                                    .await
+                            }
+                            SearchIndexMutation::Delete {
+                                session_id,
+                                revision_path,
+                            } => {
+                                index
+                                    .delete_session_if_source_missing(session_id, revision_path)
+                                    .await
+                            }
+                        };
+                        if result.is_ok() {
+                            break;
+                        }
+                        if attempt < SEARCH_INDEX_MAX_ATTEMPTS {
+                            tokio::time::sleep(Duration::from_millis(25 * attempt as u64)).await;
+                        }
+                    }
+                    let elapsed = started.elapsed();
+                    metrics.record_search_index(elapsed);
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            target: "bamboo.session_persistence",
+                            session_id,
+                            generation = job.generation,
+                            operation,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            %error,
+                            "deferred session search-index mutation failed; startup rebuild will retry"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "bamboo.session_persistence",
+                            session_id,
+                            generation = job.generation,
+                            operation,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "deferred session search-index mutation completed"
+                        );
+                    }
+                    worker_in_flight.fetch_sub(1, Ordering::Relaxed);
+                    worker_idle.notify_waiters();
+                }
+            }
+        });
+        Self {
+            state,
+            signal,
+            next_generation: AtomicU64::new(1),
+            in_flight,
+            idle,
+        }
+    }
+
+    fn enqueue(&self, mutation: SearchIndexMutation) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let session_id = mutation.session_id().to_string();
+        let mut state = self.state.lock().expect("session search queue lock");
+        if !state.pending.contains_key(&session_id) {
+            state.order.push_back(session_id.clone());
+        }
+        state.pending.insert(
+            session_id,
+            PendingSearchIndexMutation {
+                generation,
+                mutation,
+            },
+        );
+        drop(state);
+        if let Err(mpsc::error::TrySendError::Closed(_)) = self.signal.try_send(()) {
+            tracing::error!(
+                target: "bamboo.session_persistence",
+                generation,
+                "session search-index worker stopped unexpectedly"
+            );
+        }
+        generation
+    }
+
+    fn enqueue_upsert(
+        &self,
+        session: &Session,
+        revision_path: PathBuf,
+        expected_revision: String,
+    ) -> u64 {
+        self.enqueue(SearchIndexMutation::Upsert {
+            session: Box::new(session.clone()),
+            revision_path,
+            expected_revision,
+        })
+    }
+
+    fn enqueue_delete(&self, session_id: &str, revision_path: PathBuf) -> u64 {
+        self.enqueue(SearchIndexMutation::Delete {
+            session_id: session_id.to_string(),
+            revision_path,
+        })
+    }
+
+    fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("session search queue lock")
+            .pending
+            .len()
+    }
+
+    async fn flush(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Register before observing the queue. `notify_waiters` does not
+            // retain a permit, so checking first would leave a lost-wakeup
+            // window between the idle observation and `.await`.
+            notified.as_mut().enable();
+            if self.pending_len() == 0 && self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionStoreV2 {
     bamboo_home_dir: PathBuf,
     sessions_dir: PathBuf,
     index_path: PathBuf,
     search_index: SessionSearchIndex,
+    search_index_queue: SearchIndexQueue,
     index: RwLock<SessionsIndex>,
     /// Serializes on-disk index writes (and any multi-step operations that must be atomic-ish).
     write_lock: Mutex<()>,
+    /// Serializes full and runtime-only writes for the same session while
+    /// allowing unrelated session ids to make progress independently.
+    session_write_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    persistence_metrics: Arc<SessionPersistenceMetrics>,
     /// Coordinates destructive target lifecycle transitions with durable inbox
     /// operations. The Tokio lock covers one runtime; the file lock covers
     /// independent Bamboo processes sharing the same data directory.
@@ -485,6 +1027,8 @@ pub struct SessionStoreV2 {
     runtime_task_first_write_pause: std::sync::Mutex<Option<RuntimeTaskFirstWritePause>>,
     #[cfg(test)]
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -752,13 +1296,19 @@ impl SessionStoreV2 {
         // from disk, preserving concurrent live writes.
         drop(index_file_claim);
 
+        let persistence_metrics = Arc::new(SessionPersistenceMetrics::default());
+        let search_index_queue =
+            SearchIndexQueue::new(search_index.clone(), persistence_metrics.clone());
         let storage = Self {
             bamboo_home_dir,
             sessions_dir,
             index_path,
             search_index,
+            search_index_queue,
             index: RwLock::new(index),
             write_lock: Mutex::new(()),
+            session_write_locks: Arc::new(DashMap::new()),
+            persistence_metrics,
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
             runtime_task_recovery_required: AtomicBool::new(false),
@@ -768,6 +1318,8 @@ impl SessionStoreV2 {
             runtime_task_first_write_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            full_save_pause: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -775,6 +1327,7 @@ impl SessionStoreV2 {
         // mkdir/chmod work; journal creation also revalidates it before write.
         storage.ensure_runtime_task_transaction_dir().await?;
         storage.ensure_session_copy_transaction_dir().await?;
+        storage.ensure_session_write_lock_dir().await?;
 
         // Constructor recovery takes the same cross-process exclusive gate as
         // a live commit. A second store can therefore recover an orphan, but
@@ -1119,6 +1672,178 @@ impl SessionStoreV2 {
         &self.search_index
     }
 
+    /// Wait until every search-index mutation accepted before this observation
+    /// has completed or exhausted its bounded retries. Durable session reads do
+    /// not require this; it exists for callers that require search read-after-write.
+    pub async fn flush_search_index(&self) {
+        self.search_index_queue.flush().await;
+    }
+
+    pub fn persistence_metrics(&self) -> SessionPersistenceMetricsSnapshot {
+        self.persistence_metrics.snapshot(
+            self.search_index_queue.pending_len(),
+            self.search_index_queue.in_flight.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn record_session_create_latency(&self, duration: Duration) {
+        self.persistence_metrics.record_create_latency(duration);
+    }
+
+    /// Publish a tiny, atomic revision marker after `session.json` is visible.
+    /// The FTS worker checks this marker while holding SQLite's write
+    /// transaction, so a delayed upsert cannot resurrect a deleted session or
+    /// overwrite a later full save. Directory durability is not required for
+    /// the marker: startup rebuild publishes a fresh revision after a crash.
+    async fn publish_search_revision(&self, abs_dir: &Path) -> io::Result<(PathBuf, String)> {
+        let revision_path = abs_dir.join(SEARCH_INDEX_REVISION_FILE);
+        let revision = Uuid::new_v4().to_string();
+        let tmp = revision_path.with_extension(format!("tmp.{}", Uuid::new_v4()));
+        if let Err(error) = fs::write(&tmp, revision.as_bytes()).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(error);
+        }
+        if let Err(error) = atomic_rename(&tmp, &revision_path).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(error);
+        }
+        Ok((revision_path, revision))
+    }
+
+    async fn acquire_session_write_lock(
+        &self,
+        session_id: &str,
+        kind: SaveKind,
+    ) -> io::Result<SessionWriteGuard> {
+        self.acquire_session_lock(session_id, Some(kind)).await
+    }
+
+    async fn acquire_session_maintenance_lock(
+        &self,
+        session_id: &str,
+    ) -> io::Result<SessionWriteGuard> {
+        self.acquire_session_lock(session_id, None).await
+    }
+
+    async fn open_session_write_lock_file_at(path: PathBuf) -> io::Result<std::fs::File> {
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            FileExt::lock_exclusive(&file)?;
+            Ok(file)
+        })
+        .await
+        .map_err(|error| other_io_error(format!("join session write-lock task: {error}")))?
+    }
+
+    async fn open_session_write_lock_file(&self, session_id: &str) -> io::Result<std::fs::File> {
+        let path = self.session_write_lock_path(session_id);
+        match Self::open_session_write_lock_file_at(path.clone()).await {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.ensure_session_write_lock_dir().await?;
+                Self::open_session_write_lock_file_at(path).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn acquire_session_lock(
+        &self,
+        session_id: &str,
+        kind: Option<SaveKind>,
+    ) -> io::Result<SessionWriteGuard> {
+        validate_session_id(session_id)?;
+        let waiting = kind.map(|_| {
+            self.persistence_metrics
+                .waiting_saves
+                .fetch_add(1, Ordering::Relaxed);
+            WaitingSaveCounter {
+                metrics: self.persistence_metrics.clone(),
+            }
+        });
+        let started = Instant::now();
+        let lock = self
+            .session_write_locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let guard = lock.lock_owned().await;
+        // Construct the self-cleaning guard before awaiting the cross-process
+        // file lock. If this future is cancelled while flock is contended, the
+        // process-local DashMap entry is still reclaimed.
+        let mut session_guard = SessionWriteGuard {
+            guard: Some(guard),
+            file: None,
+            locks: self.session_write_locks.clone(),
+            session_id: session_id.to_string(),
+            kind: None,
+            acquired: Instant::now(),
+            metrics: self.persistence_metrics.clone(),
+        };
+        let file = self.open_session_write_lock_file(session_id).await?;
+        session_guard.file = Some(file);
+        drop(waiting);
+        if let Some(kind) = kind {
+            self.persistence_metrics
+                .active_saves
+                .fetch_add(1, Ordering::Relaxed);
+            let waited = started.elapsed();
+            self.persistence_metrics.record_lock_wait(kind, waited);
+            tracing::debug!(
+                target: "bamboo.session_persistence",
+                session_id,
+                save_type = kind.as_str(),
+                phase = "session_lock_acquired",
+                lock_wait_ms = waited.as_millis() as u64,
+                waiting_saves = self.persistence_metrics.waiting_saves.load(Ordering::Relaxed),
+                "session persistence lock acquired"
+            );
+            session_guard.kind = Some(kind);
+            session_guard.acquired = Instant::now();
+        }
+        Ok(session_guard)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn pause_full_save_before_filesystem_commit_for_test(
+        &self,
+        session_id: &str,
+    ) -> (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
+        let reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *self.full_save_pause.lock().expect("full save pause lock") = Some(FullSavePause {
+            session_id: session_id.to_string(),
+            reached: reached.clone(),
+            release: release.clone(),
+        });
+        (reached, release)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn maybe_pause_full_save_before_filesystem_commit(&self, session_id: &str) {
+        let pause = {
+            let mut configured = self.full_save_pause.lock().expect("full save pause lock");
+            if configured
+                .as_ref()
+                .is_some_and(|pause| pause.session_id == session_id)
+            {
+                configured.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.wait().await;
+            pause.release.wait().await;
+        }
+    }
+
     pub fn bamboo_home_dir(&self) -> &Path {
         &self.bamboo_home_dir
     }
@@ -1246,19 +1971,28 @@ impl SessionStoreV2 {
             index.sessions.keys().cloned().collect::<Vec<_>>()
         };
         for session_id in session_ids {
-            if let Some(session) = self.load_session(&session_id).await? {
+            // Use the same lock order as foreground saves. Serializing the
+            // load+enqueue pair with that session's durable commit prevents a
+            // background rebuild snapshot from being assigned a later queue
+            // generation than a newer foreground save.
+            let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+            let _session_write = self.acquire_session_maintenance_lock(&session_id).await?;
+            if let Some(session) = self.load_session_unlocked(&session_id).await? {
                 if !should_index_session(session.updated_at) {
                     continue;
                 }
-                if let Err(error) = self.search_index.upsert_session(&session).await {
-                    tracing::warn!(
-                        "failed to rebuild search index entry for {}: {}",
-                        session_id,
-                        error
-                    );
-                }
+                let Some(session_path) = self.session_json_path(&session_id).await? else {
+                    continue;
+                };
+                let abs_dir = session_path.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "session path has no parent")
+                })?;
+                let (revision_path, revision) = self.publish_search_revision(abs_dir).await?;
+                self.search_index_queue
+                    .enqueue_upsert(&session, revision_path, revision);
             }
         }
+        self.flush_search_index().await;
         Ok(())
     }
 
@@ -1286,9 +2020,24 @@ impl SessionStoreV2 {
     where
         F: FnOnce(&mut SessionsIndex) -> io::Result<T>,
     {
+        let wait_started = Instant::now();
         let _process = self.write_lock.lock().await;
         let _file = self.lock_index_file_exclusive().await?;
-        self.update_index_under_claim(f).await
+        let waited = wait_started.elapsed();
+        self.persistence_metrics.record_index_lock_wait(waited);
+        let hold_started = Instant::now();
+        let result = self.update_index_under_claim(f).await;
+        let held = hold_started.elapsed();
+        self.persistence_metrics.record_index_lock_hold(held);
+        tracing::debug!(
+            target: "bamboo.session_persistence",
+            phase = "index_published",
+            index_lock_wait_ms = waited.as_millis() as u64,
+            index_lock_hold_ms = held.as_millis() as u64,
+            outcome = if result.is_ok() { "ok" } else { "error" },
+            "session index mutation completed"
+        );
+        result
     }
 
     async fn update_index_under_claim<F, T>(&self, f: F) -> io::Result<T>
@@ -1460,6 +2209,22 @@ impl SessionStoreV2 {
         self.bamboo_home_dir.join(SESSION_COPY_TRANSACTION_DIR)
     }
 
+    fn session_write_lock_dir(&self) -> PathBuf {
+        self.bamboo_home_dir.join(SESSION_WRITE_LOCK_DIR)
+    }
+
+    fn session_write_lock_path(&self, session_id: &str) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(session_id.as_bytes());
+        let mut name = String::with_capacity(digest.len() * 2 + 5);
+        for byte in digest {
+            name.push(HEX[(byte >> 4) as usize] as char);
+            name.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        name.push_str(".lock");
+        self.session_write_lock_dir().join(name)
+    }
+
     fn session_copy_staging_dir(&self, journal: &SessionCopyTransactionJournal) -> PathBuf {
         self.bamboo_home_dir
             .join(format!(".session-copy-{}", journal.transaction_id))
@@ -1491,6 +2256,11 @@ impl SessionStoreV2 {
 
     async fn ensure_session_copy_transaction_dir(&self) -> io::Result<PathBuf> {
         self.ensure_private_transaction_dir(self.session_copy_transaction_dir())
+            .await
+    }
+
+    async fn ensure_session_write_lock_dir(&self) -> io::Result<PathBuf> {
+        self.ensure_private_transaction_dir(self.session_write_lock_dir())
             .await
     }
 
@@ -2349,10 +3119,8 @@ impl SessionStoreV2 {
             // retryable; this in-memory removal closes the local visibility gap.
             self.index.write().await.sessions.remove(&journal.target_id);
         }
-        if let Err(error) = self.search_index.delete_session(&journal.target_id).await {
-            errors.push(format!("search index cleanup: {error}"));
-        }
         let target_dir = self.sessions_dir.join(&journal.target_id);
+        let revision_path = target_dir.join(SEARCH_INDEX_REVISION_FILE);
         let staging_dir = self.session_copy_staging_dir(journal);
         for path in [&target_dir, &staging_dir] {
             match fs::remove_dir_all(path).await {
@@ -2365,6 +3133,8 @@ impl SessionStoreV2 {
                 Err(error) => errors.push(format!("remove {}: {error}", path.display())),
             }
         }
+        self.search_index_queue
+            .enqueue_delete(&journal.target_id, revision_path);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2416,13 +3186,9 @@ impl SessionStoreV2 {
                 Some(has_attachments),
             )
             .await?;
-            if let Err(error) = self.search_index.upsert_session(&target).await {
-                tracing::warn!(
-                    session_id = %target.id,
-                    %error,
-                    "failed to recover copied session search index"
-                );
-            }
+            let (revision_path, revision) = self.publish_search_revision(&target_dir).await?;
+            self.search_index_queue
+                .enqueue_upsert(&target, revision_path, revision);
         } else {
             self.rollback_session_copy_transaction(journal).await?;
         }
@@ -2864,12 +3630,9 @@ impl SessionStoreV2 {
     async fn write_runtime_sidecar(&self, abs_dir: &Path, session: &Session) -> io::Result<()> {
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
-        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
         let bytes =
             serde_json::to_vec_pretty(&snapshot).map_err(|e| other_io_error(e.to_string()))?;
-        fs::write(&tmp, bytes).await?;
-        atomic_rename(&tmp, &path).await?;
-        Ok(())
+        atomic_write(&path, &bytes).await
     }
 
     /// Task CAS/transaction replacement with a file+directory durability
@@ -3327,6 +4090,16 @@ impl SessionStoreV2 {
                     .map(|()| None)
             }
         };
+        let (search_revision_path, search_revision) =
+            match self.publish_search_revision(&target_dir).await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    return self
+                        .fail_session_copy_with_rollback(&journal_path, &journal, error)
+                        .await
+                        .map(|()| None)
+                }
+            };
         let committing = journal_path.with_extension("committing");
         if let Err(error) = atomic_rename(&journal_path, &committing).await {
             return self
@@ -3368,13 +4141,8 @@ impl SessionStoreV2 {
                 .await
                 .map(|()| None);
         }
-        if let Err(error) = self.search_index.upsert_session(&copied).await {
-            tracing::warn!(
-                session_id = %copied.id,
-                %error,
-                "failed to update copied session search index"
-            );
-        }
+        self.search_index_queue
+            .enqueue_upsert(&copied, search_revision_path, search_revision);
         // A retained committed marker is safe: every target-removing lifecycle
         // operation recovers committed copies before it mutates the tree. This
         // marker cleanup is therefore retryable maintenance after the durable
@@ -3538,11 +4306,11 @@ impl SessionStoreV2 {
             .map_err(|error| other_io_error(error.to_string()))?;
         fs::write(&tmp, bytes).await?;
         atomic_rename(&tmp, &path).await?;
+        let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
         self.upsert_index_from_session_inner(&session, rel_path, false, Some(false))
             .await?;
-        if let Err(error) = self.search_index.upsert_session(&session).await {
-            tracing::warn!(session_id, %error, "failed to update cleared session search index");
-        }
+        self.search_index_queue
+            .enqueue_upsert(&session, revision_path, revision);
         Ok(true)
     }
 
@@ -3666,6 +4434,21 @@ impl SessionStoreV2 {
         self.recover_all_runtime_task_transactions_locked().await?;
         self.recover_all_session_copy_transactions_locked().await?;
 
+        let deleted_search_sources = self
+            .index
+            .read()
+            .await
+            .sessions
+            .values()
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    self.abs_path_from_rel(&entry.rel_path)
+                        .join(SEARCH_INDEX_REVISION_FILE),
+                )
+            })
+            .collect::<Vec<_>>();
+
         // Remove the sessions directory entirely.
         let _ = fs::remove_dir_all(&self.sessions_dir).await;
         fs::create_dir_all(&self.sessions_dir).await?;
@@ -3676,7 +4459,12 @@ impl SessionStoreV2 {
             *index = SessionsIndex::empty();
             Ok(())
         })
-        .await
+        .await?;
+        for (session_id, revision_path) in deleted_search_sources {
+            self.search_index_queue
+                .enqueue_delete(&session_id, revision_path);
+        }
+        Ok(())
     }
 
     /// Delete a session. If the session is a root, deletes its entire directory (and all child sessions).
@@ -3721,13 +4509,8 @@ impl SessionStoreV2 {
                     Ok(())
                 })
                 .await?;
-                if let Err(error) = self.search_index.delete_session(session_id).await {
-                    tracing::warn!(
-                        "failed to delete session search index row for {}: {}",
-                        session_id,
-                        error
-                    );
-                }
+                self.search_index_queue
+                    .enqueue_delete(session_id, abs_dir.join(SEARCH_INDEX_REVISION_FILE));
                 Ok(true)
             }
             SessionKind::Root => {
@@ -3735,32 +4518,32 @@ impl SessionStoreV2 {
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = fs::remove_dir_all(&abs_dir).await;
 
-                let to_remove_ids = {
+                let to_remove = {
                     let index = self.index.read().await;
                     index
                         .sessions
                         .values()
                         .filter(|e| e.root_session_id == root_id)
-                        .map(|e| e.id.clone())
+                        .map(|entry| {
+                            (
+                                entry.id.clone(),
+                                self.abs_path_from_rel(&entry.rel_path)
+                                    .join(SEARCH_INDEX_REVISION_FILE),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 };
 
                 self.update_index(|index| {
-                    for id in &to_remove_ids {
+                    for (id, _) in &to_remove {
                         index.sessions.remove(id);
                     }
                     Ok(())
                 })
                 .await?;
 
-                for id in to_remove_ids {
-                    if let Err(error) = self.search_index.delete_session(&id).await {
-                        tracing::warn!(
-                            "failed to delete session search index row for {}: {}",
-                            id,
-                            error
-                        );
-                    }
+                for (id, revision_path) in to_remove {
+                    self.search_index_queue.enqueue_delete(&id, revision_path);
                 }
                 Ok(true)
             }
@@ -3962,42 +4745,8 @@ fn extension_to_mime(ext: &str) -> Option<&'static str> {
     }
 }
 
-#[async_trait::async_trait]
-impl Storage for SessionStoreV2 {
-    async fn save_session(&self, session: &Session) -> io::Result<()> {
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        self.reject_regressing_runtime_task(session).await?;
-        let rel_path = self.ensure_session_dirs(session).await?;
-        let abs_dir = self.abs_path_from_rel(&rel_path);
-        let path = abs_dir.join("session.json");
-
-        // Refresh the runtime sidecar BEFORE session.json. If the process
-        // crashes between the two writes, the sidecar then carries a
-        // control-plane that is at least as fresh as session.json, and the
-        // load-time overlay (sidecar wins for non-message fields) stays correct.
-        // Writing session.json first could leave a stale sidecar that silently
-        // reverts the just-saved control-plane on the next load.
-        self.write_runtime_sidecar(&abs_dir, session).await?;
-
-        let tmp = path.with_extension(format!("json.tmp.{}", Uuid::new_v4()));
-        let bytes =
-            serde_json::to_vec_pretty(session).map_err(|e| other_io_error(e.to_string()))?;
-        fs::write(&tmp, bytes).await?;
-        atomic_rename(&tmp, &path).await?;
-
-        self.upsert_index_from_session(session, rel_path).await?;
-        if let Err(error) = self.search_index.upsert_session(session).await {
-            tracing::warn!(
-                "failed to update session search index for {}: {}",
-                session.id,
-                error
-            );
-        }
-        Ok(())
-    }
-
-    async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
-        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+impl SessionStoreV2 {
+    async fn load_session_unlocked(&self, session_id: &str) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
         let Some(path) = self.session_json_path(session_id).await? else {
             return Ok(None);
@@ -4013,6 +4762,88 @@ impl Storage for SessionStoreV2 {
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
         session.clear_stale_root_token_budget();
         Ok(Some(session))
+    }
+}
+
+#[async_trait::async_trait]
+impl Storage for SessionStoreV2 {
+    async fn save_session(&self, session: &Session) -> io::Result<()> {
+        let total_started = Instant::now();
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        self.reject_regressing_runtime_task(session).await?;
+
+        let mut stages = SaveStageDurations::default();
+        let directory_started = Instant::now();
+        let rel_path = self.ensure_session_dirs(session).await?;
+        let abs_dir = self.abs_path_from_rel(&rel_path);
+        let path = abs_dir.join("session.json");
+        stages.directory_preparation = directory_started.elapsed();
+
+        // Refresh the runtime sidecar BEFORE session.json. If the process
+        // crashes between the two writes, the sidecar then carries a
+        // control-plane that is at least as fresh as session.json, and the
+        // load-time overlay (sidecar wins for non-message fields) stays correct.
+        // Writing session.json first could leave a stale sidecar that silently
+        // reverts the just-saved control-plane on the next load.
+        let serialization_started = Instant::now();
+        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        let session_bytes =
+            serde_json::to_vec_pretty(session).map_err(|e| other_io_error(e.to_string()))?;
+        stages.serialization = serialization_started.elapsed();
+        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+
+        #[cfg(any(test, feature = "test-utils"))]
+        self.maybe_pause_full_save_before_filesystem_commit(&session.id)
+            .await;
+
+        let filesystem_started = Instant::now();
+        durable_atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        durable_atomic_write(&path, &session_bytes).await?;
+        let (revision_path, revision) = self.publish_search_revision(&abs_dir).await?;
+        stages.filesystem_commit = filesystem_started.elapsed();
+
+        let index_started = Instant::now();
+        self.upsert_index_from_session(session, rel_path).await?;
+        stages.index_publication = index_started.elapsed();
+
+        let enqueue_started = Instant::now();
+        let search_generation =
+            self.search_index_queue
+                .enqueue_upsert(session, revision_path, revision);
+        stages.search_enqueue = enqueue_started.elapsed();
+        let index_entry_count = self.index.read().await.sessions.len();
+        let total = total_started.elapsed();
+        self.persistence_metrics.record_save(
+            SaveKind::Full,
+            total,
+            stages,
+            serialized_bytes,
+            session.messages.len(),
+            index_entry_count,
+        );
+        tracing::debug!(
+            target: "bamboo.session_persistence",
+            session_id = %session.id,
+            save_type = "full",
+            phase = "durable_commit",
+            serialized_bytes,
+            message_count = session.messages.len(),
+            index_entry_count,
+            search_generation,
+            total_ms = total.as_millis() as u64,
+            "session durable commit completed; search indexing deferred"
+        );
+        Ok(())
+    }
+
+    async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        self.load_session_unlocked(session_id).await
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -4031,10 +4862,22 @@ impl Storage for SessionStoreV2 {
             // boundary, avoiding a same-instance shared-lock re-entry.
             return self.save_session(session).await;
         };
+        let total_started = Instant::now();
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Runtime)
+            .await?;
         self.reject_regressing_runtime_task(session).await?;
         let abs_dir = self.abs_path_from_rel(&rel);
-        self.write_runtime_sidecar(&abs_dir, session).await?;
+        let mut stages = SaveStageDurations::default();
+        let serialization_started = Instant::now();
+        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
+            .map_err(|error| other_io_error(error.to_string()))?;
+        stages.serialization = serialization_started.elapsed();
+        let filesystem_started = Instant::now();
+        atomic_write(&abs_dir.join(RUNTIME_SIDECAR_FILE), &runtime_bytes).await?;
+        stages.filesystem_commit = filesystem_started.elapsed();
 
         // Workspace and Project ownership are part of the list/index API
         // contract. Runtime updates must therefore be reflected without waiting
@@ -4052,6 +4895,7 @@ impl Storage for SessionStoreV2 {
                 entry.workspace_path != workspace_path || entry.project_id != project_id
             });
         if runtime_index_changed {
+            let index_started = Instant::now();
             self.update_index(|index| {
                 if let Some(entry) = index.sessions.get_mut(&session.id) {
                     entry.workspace_path = workspace_path;
@@ -4060,7 +4904,29 @@ impl Storage for SessionStoreV2 {
                 Ok(())
             })
             .await?;
+            stages.index_publication = index_started.elapsed();
         }
+        let index_entry_count = self.index.read().await.sessions.len();
+        let total = total_started.elapsed();
+        self.persistence_metrics.record_save(
+            SaveKind::Runtime,
+            total,
+            stages,
+            runtime_bytes.len(),
+            session.messages.len(),
+            index_entry_count,
+        );
+        tracing::debug!(
+            target: "bamboo.session_persistence",
+            session_id = %session.id,
+            save_type = "runtime",
+            phase = "durable_commit",
+            serialized_bytes = runtime_bytes.len(),
+            message_count = session.messages.len(),
+            index_entry_count,
+            total_ms = total.as_millis() as u64,
+            "session runtime-state commit completed"
+        );
         Ok(())
     }
 
@@ -5548,6 +6414,253 @@ mod tests {
             "fallback full save must create the session"
         );
         assert_eq!(loaded.unwrap().messages.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_full_save_does_not_block_unrelated_full_save() -> io::Result<()> {
+        let temp = TempDir::new().map_err(io::Error::other)?;
+        let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
+        let paused = session_with_history("convoy-full-a", 2, "run-a");
+        let unrelated = session_with_history("convoy-full-b", 2, "run-b");
+        let (reached, release) =
+            storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
+
+        let paused_store = storage.clone();
+        let paused_save = tokio::spawn(async move { paused_store.save_session(&paused).await });
+        reached.wait().await;
+
+        let unrelated_store = storage.clone();
+        let unrelated_save =
+            tokio::spawn(async move { unrelated_store.save_session(&unrelated).await });
+        tokio::time::timeout(Duration::from_secs(2), unrelated_save)
+            .await
+            .expect("unrelated full save must not wait for paused session")
+            .expect("unrelated full-save task")?;
+
+        release.wait().await;
+        paused_save.await.expect("paused full-save task")?;
+        assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_full_save_does_not_block_unrelated_runtime_save() -> io::Result<()> {
+        let temp = TempDir::new().map_err(io::Error::other)?;
+        let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
+        let paused = session_with_history("convoy-runtime-a", 2, "run-a");
+        let mut unrelated = session_with_history("convoy-runtime-b", 2, "run-b");
+        storage.save_session(&unrelated).await?;
+        unrelated.agent_runtime_state = Some(AgentRuntimeState::new("run-b-next"));
+        let (reached, release) =
+            storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
+
+        let paused_store = storage.clone();
+        let paused_save = tokio::spawn(async move { paused_store.save_session(&paused).await });
+        reached.wait().await;
+
+        let unrelated_store = storage.clone();
+        let unrelated_save =
+            tokio::spawn(async move { unrelated_store.save_runtime_state(&unrelated).await });
+        tokio::time::timeout(Duration::from_secs(2), unrelated_save)
+            .await
+            .expect("unrelated runtime save must not wait for paused session")
+            .expect("unrelated runtime-save task")?;
+
+        release.wait().await;
+        paused_save.await.expect("paused full-save task")?;
+        assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_full_save_serializes_same_session_runtime_save() -> io::Result<()> {
+        let temp = TempDir::new().map_err(io::Error::other)?;
+        let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
+        let paused = session_with_history("same-session-order", 2, "run-a");
+        storage.save_session(&paused).await?;
+        let mut runtime = paused.clone();
+        runtime.agent_runtime_state = Some(AgentRuntimeState::new("run-after-full"));
+        let (reached, release) =
+            storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
+
+        let paused_store = storage.clone();
+        let paused_save = tokio::spawn(async move { paused_store.save_session(&paused).await });
+        reached.wait().await;
+
+        let runtime_store = storage.clone();
+        let mut runtime_save =
+            tokio::spawn(async move { runtime_store.save_runtime_state(&runtime).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut runtime_save)
+                .await
+                .is_err(),
+            "same-session runtime save must wait for the paused full save"
+        );
+
+        release.wait().await;
+        paused_save.await.expect("paused full-save task")?;
+        runtime_save.await.expect("runtime-save task")?;
+        let loaded = storage
+            .load_session("same-session-order")
+            .await?
+            .expect("session remains readable");
+        assert_eq!(
+            loaded
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.run_id.as_str()),
+            Some("run-after-full")
+        );
+        assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn independent_stores_serialize_same_session_without_blocking_other_ids() -> io::Result<()>
+    {
+        let temp = TempDir::new().map_err(io::Error::other)?;
+        let first = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
+        let shared = session_with_history("cross-store-shared", 2, "run-a");
+        first.save_session(&shared).await?;
+        let second = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
+
+        let unrelated = session_with_history("cross-store-unrelated", 2, "run-b");
+        let mut runtime = shared.clone();
+        runtime.agent_runtime_state = Some(AgentRuntimeState::new("run-after-cross-store-full"));
+        let (reached, release) =
+            first.pause_full_save_before_filesystem_commit_for_test(&shared.id);
+
+        let first_save_store = first.clone();
+        let paused = shared.clone();
+        let first_save = tokio::spawn(async move { first_save_store.save_session(&paused).await });
+        reached.wait().await;
+
+        let unrelated_store = second.clone();
+        let unrelated_save =
+            tokio::spawn(async move { unrelated_store.save_session(&unrelated).await });
+        tokio::time::timeout(Duration::from_secs(2), unrelated_save)
+            .await
+            .expect("another store must persist an unrelated id independently")
+            .expect("unrelated cross-store save task")?;
+
+        let cancelled_store = second.clone();
+        let cancelled_runtime = runtime.clone();
+        let cancelled =
+            tokio::spawn(
+                async move { cancelled_store.save_runtime_state(&cancelled_runtime).await },
+            );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancelled.abort();
+        assert!(cancelled.await.is_err(), "contended save must be cancelled");
+        assert_eq!(second.persistence_metrics().waiting_saves, 0);
+        assert!(
+            second.session_write_locks.is_empty(),
+            "cancellation while the file lock is contended must reclaim the local lock entry"
+        );
+
+        let runtime_store = second.clone();
+        let mut runtime_save =
+            tokio::spawn(async move { runtime_store.save_runtime_state(&runtime).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut runtime_save)
+                .await
+                .is_err(),
+            "the cross-process session lock must serialize the same id"
+        );
+
+        release.wait().await;
+        first_save.await.expect("cross-store full-save task")?;
+        runtime_save.await.expect("cross-store runtime-save task")?;
+        let loaded = second
+            .load_session("cross-store-shared")
+            .await?
+            .expect("shared session remains readable");
+        assert_eq!(
+            loaded
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.run_id.as_str()),
+            Some("run-after-cross-store-full")
+        );
+        assert!(first.session_write_locks.is_empty());
+        assert!(second.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_search_index_coalesces_to_latest_session_and_delete() -> io::Result<()> {
+        let (storage, _temp) = create_temp_storage().await?;
+        let mut session = session_with_history("search-generation", 1, "run-a");
+        session.title = "old queued title".to_string();
+        storage.save_session(&session).await?;
+        let stale_session = session.clone();
+        let revision_path = storage
+            .sessions_root_dir()
+            .join(&session.id)
+            .join(SEARCH_INDEX_REVISION_FILE);
+        let stale_revision = fs::read_to_string(&revision_path).await?;
+        session.title = "newest queued title".to_string();
+        session.updated_at = Utc::now() + chrono::Duration::milliseconds(1);
+        storage.save_session(&session).await?;
+        storage.flush_search_index().await;
+
+        storage
+            .search_index()
+            .upsert_session_if_current(&stale_session, &revision_path, &stale_revision)
+            .await?;
+
+        let newest = storage.search_index().search("newest", 10).await?;
+        assert!(newest
+            .iter()
+            .any(|entry| entry.session_id == "search-generation"));
+        let stale = storage.search_index().search("old queued", 10).await?;
+        assert!(stale
+            .iter()
+            .all(|entry| entry.session_id != "search-generation"));
+
+        let current_revision = fs::read_to_string(&revision_path).await?;
+        assert!(
+            storage
+                .delete_session_recursive("search-generation", true)
+                .await?
+        );
+        storage.flush_search_index().await;
+        storage
+            .search_index()
+            .upsert_session_if_current(&session, &revision_path, &current_revision)
+            .await?;
+        let deleted = storage.search_index().search("newest", 10).await?;
+        assert!(deleted
+            .iter()
+            .all(|entry| entry.session_id != "search-generation"));
+
+        session.title = "recreated searchable title".to_string();
+        session.updated_at = Utc::now() + chrono::Duration::milliseconds(2);
+        storage.save_session(&session).await?;
+        storage.flush_search_index().await;
+        storage
+            .search_index()
+            .delete_session_if_source_missing(&session.id, &revision_path)
+            .await?;
+        let recreated = storage.search_index().search("recreated", 10).await?;
+        assert!(recreated
+            .iter()
+            .any(|entry| entry.session_id == "search-generation"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistence_metrics_report_bounded_create_latency_percentiles() -> io::Result<()> {
+        let (storage, _temp) = create_temp_storage().await?;
+        for millis in [10, 20, 30, 40, 50] {
+            storage.record_session_create_latency(Duration::from_millis(millis));
+        }
+        let metrics = storage.persistence_metrics();
+        assert_eq!(metrics.create_latency.count, 5);
+        assert_eq!(metrics.create_latency.p50_ms, 30);
+        assert_eq!(metrics.create_latency.p95_ms, 50);
+        assert_eq!(metrics.create_latency.max_ms, 50);
         Ok(())
     }
 

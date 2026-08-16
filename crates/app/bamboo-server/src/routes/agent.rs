@@ -391,6 +391,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/metrics/memory/timeline",
             web::get().to(agent::metrics::memory_timeline),
         )
+        .route(
+            "/metrics/persistence",
+            web::get().to(agent::metrics::persistence),
+        )
         // Forward metrics routes (API proxy metrics)
         .route(
             "/metrics/forward/summary",

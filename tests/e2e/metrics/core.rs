@@ -95,3 +95,30 @@ async fn test_metrics_daily_endpoint() {
 
     assert!(resp.status().is_success());
 }
+
+#[actix_web::test]
+async fn test_metrics_persistence_endpoint() {
+    let state = crate::e2e::common::create_test_app().await;
+
+    let app = test::init_service(App::new().app_data(state).route(
+        "/api/v1/metrics/persistence",
+        web::get().to(handlers::metrics::persistence),
+    ))
+    .await;
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/metrics/persistence")
+            .to_request(),
+    )
+    .await;
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert!(body["full_save"]["lock_wait"]["p95_ms"].is_u64());
+    assert!(body["runtime_save"]["lock_hold"]["p95_ms"].is_u64());
+    assert!(body["search_index"]["p95_ms"].is_u64());
+    assert!(body["create_latency"]["p95_ms"].is_u64());
+    assert!(body["pending_search_jobs"].is_u64());
+}

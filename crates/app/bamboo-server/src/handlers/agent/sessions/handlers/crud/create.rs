@@ -77,6 +77,27 @@ impl Drop for SessionCreateTraceGuard {
     }
 }
 
+struct SessionCreateLatencyGuard {
+    session_store: std::sync::Arc<bamboo_storage::SessionStoreV2>,
+    started: Instant,
+}
+
+impl SessionCreateLatencyGuard {
+    fn new(session_store: std::sync::Arc<bamboo_storage::SessionStoreV2>) -> Self {
+        Self {
+            session_store,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for SessionCreateLatencyGuard {
+    fn drop(&mut self) {
+        self.session_store
+            .record_session_create_latency(self.started.elapsed());
+    }
+}
+
 /// Sync runtime workspace so tools can resolve the working directory. #480
 /// gives `POST /sessions` the same `workspace_path` semantics as `POST /chat`;
 /// this create path additionally uses its AppState-scoped provider pair so
@@ -136,6 +157,10 @@ pub async fn create_session(
     http_request: HttpRequest,
     req: web::Json<CreateSessionRequest>,
 ) -> Result<HttpResponse> {
+    // Measure the complete HTTP handler attempt, including idempotency claim
+    // wait/recovery, validation, durable persistence, projections, and response
+    // construction. Drop also records cancellation or an early error.
+    let _create_latency = SessionCreateLatencyGuard::new(state.session_store.clone());
     let Some(raw_key) = extract_idempotency_key(&http_request)? else {
         return create_session_once(state.get_ref(), &req, Uuid::new_v4().to_string(), None).await;
     };
@@ -1115,6 +1140,7 @@ async fn create_session_once(
         tracing::info!(
             target: "bamboo.session_create",
             correlation_id,
+            session_id = %id,
             phase = "save_started",
             "session-create durable save started"
         );
@@ -1130,6 +1156,7 @@ async fn create_session_once(
         tracing::info!(
             target: "bamboo.session_create",
             correlation_id,
+            session_id = %id,
             phase = "session_committed",
             save_elapsed_ms = save_started.elapsed().as_millis() as u64,
             outcome = "durable",
@@ -1264,6 +1291,123 @@ mod tests {
             body["session"]["id"].as_str().is_some(),
             "response should carry the created session summary"
         );
+        let persistence = state.session_store.persistence_metrics();
+        assert_eq!(persistence.full_save.total.count, 1);
+        assert_eq!(persistence.create_latency.count, 1);
+    }
+
+    #[actix_web::test]
+    async fn create_session_does_not_wait_for_unrelated_paused_save() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let paused = Session::new("paused-unrelated-save", "test-model");
+        let (reached, release) = state
+            .session_store
+            .pause_full_save_before_filesystem_commit_for_test(&paused.id);
+        let paused_storage = state.storage.clone();
+        let paused_save =
+            actix_web::rt::spawn(async move { paused_storage.save_session(&paused).await });
+        reached.wait().await;
+
+        let request_started = Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/sessions")
+                    .set_json(serde_json::json!({ "title": "Independent create" }))
+                    .to_request(),
+            ),
+        )
+        .await
+        .expect("new-session request must not wait for the unrelated paused save");
+        let elapsed = request_started.elapsed();
+
+        release.wait().await;
+        paused_save
+            .await
+            .expect("paused save task")
+            .expect("paused save succeeds after release");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(elapsed < std::time::Duration::from_secs(5));
+        let body: serde_json::Value = test::read_body_json(response).await;
+        let created_id = body["session"]["id"]
+            .as_str()
+            .expect("created response carries a session id");
+        assert!(state
+            .session_store
+            .get_index_entry(created_id)
+            .await
+            .is_some());
+        let persistence = state.session_store.persistence_metrics();
+        assert_eq!(persistence.create_latency.count, 1);
+        assert!(persistence.create_latency.p50_ms < 5_000);
+        assert!(persistence.create_latency.p95_ms < 5_000);
+        assert!(persistence.create_latency.max_ms < 5_000);
+    }
+
+    #[actix_web::test]
+    async fn concurrent_creates_report_latency_distribution_below_client_timeout() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let paused = Session::new("paused-during-create-workload", "test-model");
+        let (reached, release) = state
+            .session_store
+            .pause_full_save_before_filesystem_commit_for_test(&paused.id);
+        let paused_storage = state.storage.clone();
+        let paused_save =
+            actix_web::rt::spawn(async move { paused_storage.save_session(&paused).await });
+        reached.wait().await;
+
+        let requests = (0..8).map(|index| {
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/sessions")
+                    .set_json(serde_json::json!({
+                        "title": format!("Concurrent create {index}")
+                    }))
+                    .to_request(),
+            )
+        });
+        let started = Instant::now();
+        let responses = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all(requests),
+        )
+        .await
+        .expect("bounded create workload must stay below the Lotus timeout");
+        let elapsed = started.elapsed();
+
+        release.wait().await;
+        paused_save
+            .await
+            .expect("paused save task")
+            .expect("paused save succeeds after release");
+
+        assert!(responses
+            .iter()
+            .all(|response| response.status() == StatusCode::CREATED));
+        assert!(elapsed < std::time::Duration::from_secs(10));
+        let persistence = state.session_store.persistence_metrics();
+        assert_eq!(persistence.create_latency.count, 8);
+        assert!(persistence.create_latency.p50_ms < 10_000);
+        assert!(persistence.create_latency.p95_ms < 10_000);
+        assert!(persistence.create_latency.max_ms < 10_000);
     }
 
     #[actix_web::test]

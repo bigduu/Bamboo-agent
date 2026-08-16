@@ -41,6 +41,11 @@ pub struct SessionSearchIndex {
     db_path: PathBuf,
 }
 
+struct SearchSourceRevision {
+    path: PathBuf,
+    expected: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSearchMatch {
     pub match_type: String,
@@ -99,17 +104,51 @@ impl SessionSearchIndex {
     pub async fn upsert_session(&self, session: &Session) -> std::io::Result<()> {
         let db_path = self.db_path.clone();
         let session = session.clone();
-        task::spawn_blocking(move || upsert_session_db(&db_path, &session))
+        task::spawn_blocking(move || upsert_session_db(&db_path, &session, None))
             .await
             .map_err(|error| to_io_error(format!("session search upsert join error: {error}")))?
+    }
+
+    pub(crate) async fn upsert_session_if_current(
+        &self,
+        session: &Session,
+        revision_path: &Path,
+        expected_revision: &str,
+    ) -> std::io::Result<()> {
+        let db_path = self.db_path.clone();
+        let session = session.clone();
+        let revision = SearchSourceRevision {
+            path: revision_path.to_path_buf(),
+            expected: expected_revision.to_string(),
+        };
+        task::spawn_blocking(move || upsert_session_db(&db_path, &session, Some(&revision)))
+            .await
+            .map_err(|error| {
+                to_io_error(format!("guarded session search upsert join error: {error}"))
+            })?
     }
 
     pub async fn delete_session(&self, session_id: &str) -> std::io::Result<()> {
         let db_path = self.db_path.clone();
         let session_id = session_id.to_string();
-        task::spawn_blocking(move || delete_session_db(&db_path, &session_id))
+        task::spawn_blocking(move || delete_session_db(&db_path, &session_id, None))
             .await
             .map_err(|error| to_io_error(format!("session search delete join error: {error}")))?
+    }
+
+    pub(crate) async fn delete_session_if_source_missing(
+        &self,
+        session_id: &str,
+        revision_path: &Path,
+    ) -> std::io::Result<()> {
+        let db_path = self.db_path.clone();
+        let session_id = session_id.to_string();
+        let revision_path = revision_path.to_path_buf();
+        task::spawn_blocking(move || delete_session_db(&db_path, &session_id, Some(&revision_path)))
+            .await
+            .map_err(|error| {
+                to_io_error(format!("guarded session search delete join error: {error}"))
+            })?
     }
 
     pub async fn prune_stale_sessions(&self) -> std::io::Result<usize> {
@@ -235,16 +274,61 @@ fn init_db(db_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn upsert_session_db(db_path: &Path, session: &Session) -> std::io::Result<()> {
-    if !should_index_session(session.updated_at) {
-        return delete_session_db(db_path, &session.id);
-    }
-
+fn upsert_session_db(
+    db_path: &Path,
+    session: &Session,
+    source_revision: Option<&SearchSourceRevision>,
+) -> std::io::Result<()> {
     let conn = open_db(db_path)?;
     conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
         .map_err(|e| to_io_error(format!("sqlite begin transaction failed: {e}")))?;
 
     let result = (|| {
+        if let Some(source_revision) = source_revision {
+            match std::fs::read_to_string(&source_revision.path) {
+                Ok(current) if current.trim() == source_revision.expected => {}
+                Ok(_) => {
+                    conn.execute_batch("COMMIT;").map_err(|e| {
+                        to_io_error(format!("sqlite commit superseded no-op failed: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    conn.execute_batch("COMMIT;").map_err(|e| {
+                        to_io_error(format!("sqlite commit deleted-source no-op failed: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let indexed_updated_at = conn
+            .query_row(
+                "SELECT updated_at FROM sessions_search WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| to_io_error(format!("sqlite read indexed revision failed: {e}")))?
+            .and_then(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .ok()
+                    .map(|value| value.with_timezone(&Utc))
+            });
+        if indexed_updated_at.is_some_and(|updated_at| updated_at > session.updated_at) {
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| to_io_error(format!("sqlite commit stale no-op failed: {e}")))?;
+            return Ok(());
+        }
+
+        if !should_index_session(session.updated_at) {
+            delete_session_rows(&conn, &session.id)?;
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| to_io_error(format!("sqlite commit expiry delete failed: {e}")))?;
+            return Ok(());
+        }
+
         conn.execute(
             r#"
             INSERT INTO sessions_search (
@@ -351,8 +435,39 @@ fn upsert_session_db(db_path: &Path, session: &Session) -> std::io::Result<()> {
     result
 }
 
-fn delete_session_db(db_path: &Path, session_id: &str) -> std::io::Result<()> {
+fn delete_session_db(
+    db_path: &Path,
+    session_id: &str,
+    required_missing_revision: Option<&Path>,
+) -> std::io::Result<()> {
     let conn = open_db(db_path)?;
+    conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
+        .map_err(|e| to_io_error(format!("sqlite begin delete transaction failed: {e}")))?;
+    let result = (|| {
+        if let Some(revision_path) = required_missing_revision {
+            match std::fs::metadata(revision_path) {
+                Ok(_) => {
+                    conn.execute_batch("COMMIT;").map_err(|e| {
+                        to_io_error(format!("sqlite commit recreated-source no-op failed: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        delete_session_rows(&conn, session_id)?;
+        conn.execute_batch("COMMIT;")
+            .map_err(|e| to_io_error(format!("sqlite commit delete failed: {e}")))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+fn delete_session_rows(conn: &Connection, session_id: &str) -> std::io::Result<()> {
     conn.execute(
         "DELETE FROM sessions_search WHERE session_id = ?1",
         params![session_id],
@@ -389,7 +504,7 @@ fn prune_stale_sessions_db(db_path: &Path) -> std::io::Result<usize> {
         .map_err(|e| to_io_error(format!("sqlite read prune rows failed: {e}")))?;
     let count = ids.len();
     for id in ids {
-        delete_session_db(db_path, &id)?;
+        delete_session_db(db_path, &id, None)?;
     }
     Ok(count)
 }
@@ -769,6 +884,32 @@ mod tests {
             .await
             .expect("post-search")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_index_ignores_superseded_upserts() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.expect("init");
+
+        let mut newest = sample_session();
+        newest.title = "Newest searchable revision".to_string();
+        newest.updated_at = Utc::now();
+        index.upsert_session(&newest).await.expect("newest upsert");
+
+        let mut stale = newest.clone();
+        stale.title = "Superseded searchable revision".to_string();
+        stale.updated_at = newest.updated_at - Duration::days(8);
+        index.upsert_session(&stale).await.expect("stale no-op");
+
+        let newest_matches = index.search("Newest", 10).await.expect("search newest");
+        assert!(newest_matches
+            .iter()
+            .any(|entry| entry.session_id == newest.id));
+        let stale_matches = index.search("Superseded", 10).await.expect("search stale");
+        assert!(stale_matches
+            .iter()
+            .all(|entry| entry.session_id != newest.id));
     }
 
     #[test]
