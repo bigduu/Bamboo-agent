@@ -133,6 +133,207 @@ pub struct ExecuteResponse {
 
 // ── SSE events ──
 
+/// Canonical task lifecycle status shared by HTTP snapshots and SSE deltas.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskItemStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Planning,
+    #[default]
+    Execution,
+    Verification,
+    Handoff,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPriority {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEvidenceKind {
+    #[default]
+    Note,
+    ToolCall,
+    File,
+    Command,
+    Test,
+    Observation,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskEvidence {
+    #[serde(default)]
+    pub kind: TaskEvidenceKind,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub round: Option<u32>,
+    #[serde(default)]
+    pub success: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskBlockerKind {
+    UserInput,
+    Dependency,
+    ToolFailure,
+    External,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskBlocker {
+    #[serde(default)]
+    pub kind: TaskBlockerKind,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub waiting_on: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskTransition {
+    #[serde(default)]
+    pub from_status: TaskItemStatus,
+    #[serde(default)]
+    pub to_status: TaskItemStatus,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub round: Option<u32>,
+    #[serde(default)]
+    pub changed_at: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskItem {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: TaskItemStatus,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default, alias = "activeForm")]
+    pub active_form: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub phase: TaskPhase,
+    #[serde(default)]
+    pub priority: TaskPriority,
+    #[serde(default)]
+    pub completion_criteria: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<TaskEvidence>,
+    #[serde(default)]
+    pub blockers: Vec<TaskBlocker>,
+    #[serde(default)]
+    pub transitions: Vec<TaskTransition>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskList {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub items: Vec<TaskItem>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskProgress {
+    #[serde(default)]
+    pub completed: usize,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub percentage: u8,
+}
+
+/// Read-only response from `GET /api/v1/sessions/{id}/task`.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskListResponse {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub items: Vec<TaskItem>,
+    #[serde(default)]
+    pub progress: TaskProgress,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanModeStatus {
+    #[default]
+    Exploring,
+    Designing,
+    Reviewing,
+    Finalizing,
+    AwaitingApproval,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct PlanModeState {
+    pub entered_at: String,
+    pub pre_permission_mode: String,
+    #[serde(default)]
+    pub plan_file_path: Option<String>,
+    #[serde(default)]
+    pub status: PlanModeStatus,
+}
+
 /// Server-Sent Event payload streamed during an agent run.
 ///
 /// Tagged by a `type` field, snake_cased. This is the superset of variants
@@ -179,6 +380,51 @@ pub enum AgentEvent {
         allow_custom: bool,
         #[serde(default)]
         source: Option<String>,
+    },
+    TaskListUpdated {
+        task_list: TaskList,
+        /// Monotonic persisted task-list generation. Older servers omit it;
+        /// clients then fall back to the snapshot timestamp.
+        #[serde(default)]
+        version: Option<u64>,
+    },
+    TaskListItemProgress {
+        session_id: String,
+        item_id: String,
+        status: TaskItemStatus,
+        tool_calls_count: usize,
+        version: u64,
+        /// Rich item projection for blocker/evidence/transition rendering.
+        /// Optional so critical events persisted by older servers still replay.
+        #[serde(default)]
+        item: Option<TaskItem>,
+    },
+    TaskListCompleted {
+        session_id: String,
+        completed_at: String,
+        total_rounds: u32,
+        total_tool_calls: usize,
+        #[serde(default)]
+        version: Option<u64>,
+    },
+    TaskEvaluationStarted {
+        session_id: String,
+        items_count: usize,
+        #[serde(default)]
+        generation: Option<u64>,
+    },
+    TaskEvaluationCompleted {
+        session_id: String,
+        updates_count: usize,
+        reasoning: String,
+        #[serde(default)]
+        generation: Option<u64>,
+    },
+    TaskEvaluationCancelled {
+        session_id: String,
+        reason: String,
+        #[serde(default)]
+        generation: Option<u64>,
     },
     /// A parent-session tool was stopped at Bamboo's typed permission gate.
     /// The authoritative request contract is fetched from the pending endpoint;
@@ -246,7 +492,7 @@ pub enum AgentEvent {
         #[serde(default)]
         entered_at: Option<String>,
         #[serde(default)]
-        status: Option<String>,
+        status: Option<PlanModeStatus>,
         #[serde(default)]
         plan_file_path: Option<String>,
     },
@@ -263,6 +509,8 @@ pub enum AgentEvent {
         file_path: String,
         #[serde(default)]
         content_summary: Option<String>,
+        #[serde(default)]
+        status: Option<PlanModeStatus>,
     },
     /// Current round for a session. Parent streams may carry this inside a
     /// `SubAgentEvent`, allowing clients to update the exact child row without
@@ -470,6 +718,93 @@ mod clarification_event_tests {
                 version: 0,
                 reason: None,
                 resolved_at: None,
+                ..
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod task_plan_event_tests {
+    use super::{AgentEvent, PlanModeStatus, TaskItemStatus};
+
+    #[test]
+    fn legacy_task_events_default_new_projection_fields() {
+        let updated: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "task_list_updated",
+            "task_list": {
+                "session_id": "root-1",
+                "title": "Tasks",
+                "items": [],
+                "created_at": "2026-08-16T00:00:00Z",
+                "updated_at": "2026-08-16T00:00:01Z"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            updated,
+            AgentEvent::TaskListUpdated { version: None, .. }
+        ));
+
+        let progress: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "task_list_item_progress",
+            "session_id": "root-1",
+            "item_id": "task-1",
+            "status": "blocked",
+            "tool_calls_count": 2,
+            "version": 4
+        }))
+        .unwrap();
+        assert!(matches!(
+            progress,
+            AgentEvent::TaskListItemProgress {
+                status: TaskItemStatus::Blocked,
+                item: None,
+                version: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rich_task_and_plan_events_preserve_live_details() {
+        let progress: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "task_list_item_progress",
+            "session_id": "root-1",
+            "item_id": "task-1",
+            "status": "blocked",
+            "tool_calls_count": 2,
+            "version": 5,
+            "item": {
+                "id": "task-1",
+                "description": "Deploy",
+                "status": "blocked",
+                "blockers": [{
+                    "kind": "external",
+                    "summary": "release gate",
+                    "waiting_on": "human approval"
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            progress,
+            AgentEvent::TaskListItemProgress { item: Some(item), .. }
+                if item.blockers[0].waiting_on.as_deref() == Some("human approval")
+        ));
+
+        let plan: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "plan_file_updated",
+            "session_id": "root-1",
+            "file_path": "/tmp/plan.md",
+            "content_summary": "Ready for review",
+            "status": "awaiting_approval"
+        }))
+        .unwrap();
+        assert!(matches!(
+            plan,
+            AgentEvent::PlanFileUpdated {
+                status: Some(PlanModeStatus::AwaitingApproval),
                 ..
             }
         ));

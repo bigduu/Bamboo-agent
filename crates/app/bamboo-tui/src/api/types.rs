@@ -22,8 +22,9 @@ fn default_title_generated() -> bool {
 // across the CLI and TUI front-ends); re-exported here so the rest of the TUI
 // can keep referring to `crate::api::types::{AgentEvent, ChatRequest, …}`.
 pub use bamboo_client_core::{
-    AgentEvent, ChatRequest, ChatResponse, ExecuteRequest, ExecuteResponse, ReasoningEffort,
-    TokenUsage,
+    AgentEvent, ChatRequest, ChatResponse, ExecuteRequest, ExecuteResponse, PlanModeState,
+    PlanModeStatus, ReasoningEffort, TaskItem, TaskItemStatus, TaskList, TaskListResponse,
+    TaskProgress, TokenUsage,
 };
 
 // ── Command catalog ──
@@ -123,6 +124,9 @@ pub struct SessionSummary {
     /// rendered as bypass even if an older server omitted `permission_mode`.
     #[serde(default)]
     pub bypass_permissions: bool,
+    /// Durable Plan Mode lifecycle, when the session is currently planning.
+    #[serde(default)]
+    pub plan_mode: Option<PlanModeState>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq, Eq)]

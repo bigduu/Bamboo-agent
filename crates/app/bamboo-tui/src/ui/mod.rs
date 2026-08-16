@@ -7,6 +7,7 @@ pub mod schedules;
 pub mod sessions;
 pub mod skills;
 pub mod subagents;
+pub mod task_plan;
 
 use ratatui::Frame;
 
@@ -86,6 +87,10 @@ fn render_with_palette(f: &mut Frame, app: &App) {
 
     if app.subagent_tree.is_some() {
         subagents::render(f, app);
+    }
+
+    if app.task_plan.is_some() {
+        task_plan::render(f, app);
     }
 
     if app.pending_delete.is_some() || app.pending_schedule_delete.is_some() {

@@ -382,6 +382,7 @@ pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolCon
                 file_path,
                 content_summary: plan_content_summary(&result.result)
                     .unwrap_or_else(|| "Plan file updated".to_string()),
+                status: Some(PlanModeStatus::AwaitingApproval),
             })
             .await;
     }

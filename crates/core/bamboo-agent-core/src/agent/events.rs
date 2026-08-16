@@ -36,7 +36,9 @@
 //! ```
 
 use crate::tools::ToolResult;
-use bamboo_domain::{AgentHookPoint, HookResult, PendingQuestionSource, TaskItemStatus, TaskList};
+use bamboo_domain::{
+    AgentHookPoint, HookResult, PendingQuestionSource, TaskItem, TaskItemStatus, TaskList,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -221,6 +223,9 @@ pub enum AgentEvent {
     TaskListUpdated {
         /// Current task list state.
         task_list: TaskList,
+        /// Monotonic persisted task-list generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
     },
 
     /// Emitted when a task item makes progress (delta update).
@@ -235,6 +240,9 @@ pub enum AgentEvent {
         tool_calls_count: usize,
         /// Item version (for optimistic concurrency)
         version: u64,
+        /// Rich item projection for blocker/evidence/transition rendering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<TaskItem>,
     },
 
     /// Emitted when all task items are completed.
@@ -247,6 +255,9 @@ pub enum AgentEvent {
         total_rounds: u32,
         /// Total tool calls made
         total_tool_calls: usize,
+        /// Monotonic persisted task-list generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
     },
 
     /// Emitted when task evaluation starts.
@@ -469,6 +480,9 @@ pub enum AgentEvent {
         file_path: String,
         /// Summary of the plan content (truncated)
         content_summary: String,
+        /// Status after persisting the plan file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<bamboo_domain::PlanModeStatus>,
     },
 
     /// Runner progress update emitted at the start of each agent turn.
@@ -782,7 +796,7 @@ impl AgentEvent {
     /// per-session forwarder instead.
     pub fn session_id(&self) -> Option<&str> {
         match self {
-            AgentEvent::TaskListUpdated { task_list } => Some(task_list.session_id.as_str()),
+            AgentEvent::TaskListUpdated { task_list, .. } => Some(task_list.session_id.as_str()),
             AgentEvent::TaskListItemProgress { session_id, .. }
             | AgentEvent::TaskListCompleted { session_id, .. }
             | AgentEvent::TaskEvaluationStarted { session_id, .. }
@@ -1029,11 +1043,13 @@ mod tests {
     fn task_list_updated_serializes_with_task_names() {
         let event = AgentEvent::TaskListUpdated {
             task_list: sample_task_list(),
+            version: Some(7),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
         assert_eq!(value["type"], "task_list_updated");
         assert!(value.get("task_list").is_some());
+        assert_eq!(value["version"], 7);
         assert!(value.get("todo_list").is_none());
     }
 
@@ -1342,6 +1358,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             file_path: "/tmp/plans/sess-1.md".to_string(),
             content_summary: "Implementation plan for feature X".to_string(),
+            status: Some(bamboo_domain::PlanModeStatus::AwaitingApproval),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");

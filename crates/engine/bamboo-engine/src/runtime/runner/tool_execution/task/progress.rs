@@ -42,5 +42,52 @@ fn build_progress_event(ctx: &TaskLoopContext, session_id: &str) -> Option<Agent
         status: target_item.status.clone(),
         tool_calls_count: target_item.tool_calls.len(),
         version: ctx.version,
+        item: ctx.task_item_snapshot(&target_item.id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::task_context::TaskLoopItem;
+    use bamboo_domain::{TaskBlocker, TaskBlockerKind};
+    use chrono::Utc;
+
+    #[test]
+    fn progress_event_carries_the_rich_item_and_monotonic_version() {
+        let now = Utc::now();
+        let ctx = TaskLoopContext {
+            session_id: "root".to_string(),
+            items: vec![TaskLoopItem {
+                id: "deploy".to_string(),
+                description: "Deploy release".to_string(),
+                status: TaskItemStatus::Blocked,
+                blockers: vec![TaskBlocker {
+                    kind: TaskBlockerKind::External,
+                    summary: "Release approval pending".to_string(),
+                    waiting_on: Some("operator".to_string()),
+                }],
+                ..TaskLoopItem::default()
+            }],
+            active_item_id: Some("deploy".to_string()),
+            current_round: 3,
+            max_rounds: 20,
+            created_at: now,
+            updated_at: now,
+            version: 8,
+            task_list_dirty: false,
+        };
+
+        let event = build_progress_event(&ctx, "child").expect("progress event");
+        assert!(matches!(
+            event,
+            AgentEvent::TaskListItemProgress {
+                session_id,
+                version: 8,
+                item: Some(item),
+                ..
+            } if session_id == "child"
+                && item.blockers[0].waiting_on.as_deref() == Some("operator")
+        ));
+    }
 }

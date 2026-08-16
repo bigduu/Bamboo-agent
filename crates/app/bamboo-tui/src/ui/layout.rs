@@ -3680,7 +3680,7 @@ mod tests {
         }
         assert_eq!(
             fingerprints,
-            [9_023_054_049_185_338_977, 1_360_325_232_269_958_569,],
+            [8_643_330_157_882_708_308, 7_772_966_265_523_513_716,],
             "complete help-overlay buffer golden changed"
         );
     }

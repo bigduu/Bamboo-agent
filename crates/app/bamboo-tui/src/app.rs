@@ -28,6 +28,7 @@ use crate::keymap::{
 };
 use crate::search::ranked_indices;
 use crate::subagents::{SubagentTreeState, SubagentTreeStatus, MAX_SUBAGENT_TREE_SESSIONS};
+use crate::task_plan::{TaskPlanOverlayState, TaskPlanPane, TaskProgressState};
 use crate::ui;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -318,6 +319,200 @@ mod subagent_tree_navigation_tests {
         assert_eq!(
             app.subagent_tree.as_ref().unwrap().nodes["child-a"].round_count,
             Some(3)
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_plan_integration_tests {
+    use super::*;
+
+    fn snapshot(status: TaskItemStatus, version: u64) -> TaskListResponse {
+        TaskListResponse {
+            session_id: "root".to_string(),
+            title: Some("Tasks".to_string()),
+            items: vec![TaskItem {
+                id: "one".to_string(),
+                description: "Ship".to_string(),
+                status,
+                ..TaskItem::default()
+            }],
+            progress: TaskProgress {
+                completed: usize::from(status == TaskItemStatus::Completed),
+                total: 1,
+                percentage: if status == TaskItemStatus::Completed {
+                    100
+                } else {
+                    0
+                },
+            },
+            version,
+            ..TaskListResponse::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_snapshot_is_bound_to_the_exact_session_and_refresh_epoch() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("child".to_string());
+        app.chat.task_progress.begin_refresh("child");
+        app.task_plan_epoch = 4;
+
+        app.handle_event(AppEvent::TaskPlanSnapshotLoaded {
+            epoch: 3,
+            session_id: "child".to_string(),
+            plan_revision: 0,
+            result: Ok((snapshot(TaskItemStatus::Blocked, 6), None)),
+        })
+        .await
+        .unwrap();
+        app.handle_event(AppEvent::TaskPlanSnapshotLoaded {
+            epoch: 4,
+            session_id: "other".to_string(),
+            plan_revision: 0,
+            result: Ok((snapshot(TaskItemStatus::Blocked, 6), None)),
+        })
+        .await
+        .unwrap();
+        assert!(app.chat.task_progress.task_list.is_none());
+
+        app.handle_event(AppEvent::TaskPlanSnapshotLoaded {
+            epoch: 4,
+            session_id: "child".to_string(),
+            plan_revision: 0,
+            result: Ok((
+                snapshot(TaskItemStatus::Blocked, 6),
+                Some(PlanModeState {
+                    entered_at: "2026-08-16T00:00:00Z".to_string(),
+                    pre_permission_mode: "default".to_string(),
+                    plan_file_path: Some("plans/child.md".to_string()),
+                    status: PlanModeStatus::Reviewing,
+                }),
+            )),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.chat.task_progress.owner_session_id.as_deref(),
+            Some("root")
+        );
+        assert_eq!(app.chat.task_progress.version, 6);
+        assert_eq!(
+            app.chat.run_status.plan.status,
+            Some(PlanModeStatus::Reviewing)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_http_plan_snapshot_cannot_reopen_a_plan_closed_by_live_event() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("child".to_string());
+        app.chat.task_progress.begin_refresh("child");
+        app.task_plan_epoch = 4;
+
+        app.handle_sse_event(AgentEvent::PlanModeExited {
+            session_id: "child".to_string(),
+            approved: true,
+            plan: Some("# Approved".to_string()),
+            restored_mode: Some("default".to_string()),
+        })
+        .unwrap();
+        assert_eq!(app.chat.run_status.plan_revision, 1);
+
+        app.handle_event(AppEvent::TaskPlanSnapshotLoaded {
+            epoch: 4,
+            session_id: "child".to_string(),
+            plan_revision: 0,
+            result: Ok((
+                snapshot(TaskItemStatus::Pending, 4),
+                Some(PlanModeState {
+                    entered_at: "2026-08-16T00:00:00Z".to_string(),
+                    pre_permission_mode: "default".to_string(),
+                    plan_file_path: Some("plans/child.md".to_string()),
+                    status: PlanModeStatus::Reviewing,
+                }),
+            )),
+        })
+        .await
+        .unwrap();
+
+        assert!(!app.chat.run_status.plan.active);
+        assert_eq!(
+            app.chat.run_status.plan.last_outcome.as_deref(),
+            Some("approved")
+        );
+        assert_eq!(app.chat.task_progress.version, 4);
+    }
+
+    #[test]
+    fn nested_child_task_delta_updates_only_its_shared_parent_list() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.session_id = Some("root".to_string());
+        app.chat.task_progress.begin_refresh("root");
+        app.chat
+            .task_progress
+            .install_snapshot("root", snapshot(TaskItemStatus::Pending, 1));
+
+        app.handle_sse_event(AgentEvent::SubAgentEvent {
+            child_session_id: "child-a".to_string(),
+            event: Box::new(AgentEvent::TaskListItemProgress {
+                session_id: "child-a".to_string(),
+                item_id: "one".to_string(),
+                status: TaskItemStatus::Completed,
+                tool_calls_count: 1,
+                version: 2,
+                item: None,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.task_progress.task_list.as_ref().unwrap().items[0].status,
+            TaskItemStatus::Completed
+        );
+
+        app.handle_sse_event(AgentEvent::SubAgentEvent {
+            child_session_id: "child-a".to_string(),
+            event: Box::new(AgentEvent::TaskListItemProgress {
+                session_id: "child-b".to_string(),
+                item_id: "one".to_string(),
+                status: TaskItemStatus::Blocked,
+                tool_calls_count: 2,
+                version: 3,
+                item: None,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.task_progress.task_list.as_ref().unwrap().items[0].status,
+            TaskItemStatus::Completed
+        );
+    }
+
+    #[test]
+    fn plan_exit_events_distinguish_approval_from_rejection() {
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.handle_sse_event(AgentEvent::PlanModeExited {
+            session_id: "root".to_string(),
+            approved: false,
+            plan: Some("# Plan".to_string()),
+            restored_mode: Some("default".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.run_status.plan.last_outcome.as_deref(),
+            Some("rejected or exited")
+        );
+
+        app.handle_sse_event(AgentEvent::PlanModeExited {
+            session_id: "root".to_string(),
+            approved: true,
+            plan: Some("# Approved".to_string()),
+            restored_mode: Some("default".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            app.chat.run_status.plan.last_outcome.as_deref(),
+            Some("approved")
         );
     }
 }
@@ -944,6 +1139,8 @@ pub struct ChatState {
     pub provider: Option<String>,
     pub token_usage: Option<TokenUsage>,
     pub plan_mode: bool,
+    /// Authoritative task snapshot plus monotonic live-event reducer state.
+    pub(crate) task_progress: TaskProgressState,
     /// Typed, durable execution state for this exact session context. It moves
     /// with the rest of `ChatState`, so background events can never overwrite
     /// whichever session happens to be visible.
@@ -1040,6 +1237,7 @@ impl ChatState {
             provider: None,
             token_usage: None,
             plan_mode: false,
+            task_progress: TaskProgressState::default(),
             run_status: RunStatusState::default(),
             expand_tools: false,
             sub_agents: Vec::new(),
@@ -1742,6 +1940,11 @@ pub(crate) struct PlanRunStatus {
     pub(crate) active: bool,
     pub(crate) reason: Option<String>,
     pub(crate) file_path: Option<String>,
+    pub(crate) status: Option<PlanModeStatus>,
+    pub(crate) entered_at: Option<String>,
+    pub(crate) pre_permission_mode: Option<String>,
+    pub(crate) content_summary: Option<String>,
+    pub(crate) plan: Option<String>,
     pub(crate) last_outcome: Option<String>,
 }
 
@@ -1780,6 +1983,9 @@ pub(crate) struct RunStatusState {
     pub(crate) tools: VecDeque<RunToolStatus>,
     pub(crate) compression: Option<CompressionRunStatus>,
     pub(crate) plan: PlanRunStatus,
+    /// Increments for every live plan lifecycle event observed by this exact
+    /// session view, guarding it from late HTTP refresh responses.
+    pub(crate) plan_revision: u64,
     pub(crate) budget: Option<BudgetRunStatus>,
     sub_agents: VecDeque<SubAgentRunStatus>,
     /// Recently observed server run ids for this session. A delayed
@@ -2114,26 +2320,69 @@ impl RunStatusState {
         });
     }
 
-    fn enter_plan(&mut self, reason: Option<String>, file_path: Option<String>) {
+    fn enter_plan(
+        &mut self,
+        reason: Option<String>,
+        file_path: Option<String>,
+        status: Option<PlanModeStatus>,
+        entered_at: Option<String>,
+        pre_permission_mode: Option<String>,
+    ) {
+        self.plan_revision = self.plan_revision.wrapping_add(1).max(1);
         self.plan.active = true;
         self.plan.reason = reason;
-        if file_path.is_some() {
-            self.plan.file_path = file_path;
-        }
+        self.plan.file_path = file_path;
+        self.plan.status = status;
+        self.plan.entered_at = entered_at;
+        self.plan.pre_permission_mode = pre_permission_mode;
+        self.plan.content_summary = None;
+        self.plan.plan = None;
         self.plan.last_outcome = None;
     }
 
-    fn exit_plan(&mut self, approved: bool) {
+    fn restore_plan(&mut self, plan: Option<PlanModeState>) {
+        match plan {
+            Some(plan) => {
+                self.plan = PlanRunStatus {
+                    active: true,
+                    file_path: plan.plan_file_path,
+                    status: Some(plan.status),
+                    entered_at: Some(plan.entered_at),
+                    pre_permission_mode: Some(plan.pre_permission_mode),
+                    ..PlanRunStatus::default()
+                };
+            }
+            None => self.plan = PlanRunStatus::default(),
+        }
+    }
+
+    fn exit_plan(&mut self, approved: bool, plan: Option<String>) {
+        self.plan_revision = self.plan_revision.wrapping_add(1).max(1);
         self.plan.active = false;
+        self.plan.status = None;
+        if plan.is_some() {
+            self.plan.plan = plan;
+        }
         self.plan.last_outcome = Some(if approved {
             "approved".to_string()
         } else {
-            "exited".to_string()
+            "rejected or exited".to_string()
         });
     }
 
-    fn update_plan_file(&mut self, file_path: String) {
+    fn update_plan_file(
+        &mut self,
+        file_path: String,
+        content_summary: Option<String>,
+        status: Option<PlanModeStatus>,
+    ) {
+        self.plan_revision = self.plan_revision.wrapping_add(1).max(1);
         self.plan.file_path = Some(file_path);
+        self.plan.content_summary = content_summary;
+        if status.is_some() {
+            self.plan.active = true;
+            self.plan.status = status;
+        }
     }
 
     fn exceed_budget(&mut self, kind: String, limit: u64, actual: u64) -> bool {
@@ -3932,6 +4181,10 @@ pub struct App {
     pub(crate) subagent_tree: Option<SubagentTreeState>,
     subagent_tree_epoch: u64,
     subagent_tree_task: Option<tokio::task::JoinHandle<()>>,
+    /// Read-only task/plan inspector for the active Chat session.
+    pub(crate) task_plan: Option<TaskPlanOverlayState>,
+    task_plan_epoch: u64,
+    task_plan_task: Option<tokio::task::JoinHandle<()>>,
     /// Combined built-in/server command palette (`Ctrl+K` globally or `/` as
     /// the first composer character). It never mutates the composer until a
     /// selection succeeds, so cancellation and every async failure preserve
@@ -4056,6 +4309,9 @@ impl Drop for App {
         if let Some(task) = self.subagent_tree_task.take() {
             task.abort();
         }
+        if let Some(task) = self.task_plan_task.take() {
+            task.abort();
+        }
         for context in self.session_views.values_mut() {
             context.abort_background_work();
         }
@@ -4159,6 +4415,9 @@ impl App {
             subagent_tree: None,
             subagent_tree_epoch: 0,
             subagent_tree_task: None,
+            task_plan: None,
+            task_plan_epoch: 0,
+            task_plan_task: None,
             command_palette: None,
             pending_delete: None,
             pending_schedule_delete: None,
@@ -4365,6 +4624,8 @@ impl App {
             self.pending_delete = None;
         }
         self.close_subagent_tree();
+        self.close_task_plan();
+        self.cancel_task_plan_refresh();
         self.close_session_picker();
         self.close_model_picker();
         self.close_command_palette();
@@ -6040,10 +6301,41 @@ impl App {
                             let question = self.question_from_pending(session_id.clone(), pending);
                             self.pending_question = Some(question);
                         }
+                        self.refresh_task_plan_snapshot(session_id.clone());
                         self.refresh_child_approvals(session_id);
                     }
                     Err(e) => {
                         self.notify(NoticeLevel::Error, format!("Failed to open session: {e}"));
+                    }
+                }
+            }
+            AppEvent::TaskPlanSnapshotLoaded {
+                epoch,
+                session_id,
+                plan_revision,
+                result,
+            } => {
+                if epoch != self.task_plan_epoch
+                    || self.chat.session_id.as_deref() != Some(session_id.as_str())
+                {
+                    return Ok(());
+                }
+                self.task_plan_task = None;
+                match result {
+                    Ok((tasks, plan_mode)) => {
+                        self.chat.task_progress.install_snapshot(&session_id, tasks);
+                        if self.chat.run_status.plan_revision == plan_revision {
+                            self.chat.plan_mode = plan_mode.is_some();
+                            self.chat.run_status.restore_plan(plan_mode);
+                        }
+                    }
+                    Err(error) => {
+                        self.chat
+                            .task_progress
+                            .fail_refresh(&session_id, error.clone());
+                        if self.task_plan.is_some() {
+                            self.status_message = format!("Task/plan refresh failed: {error}");
+                        }
                     }
                 }
             }
@@ -7744,6 +8036,7 @@ impl App {
             || self.pending_delete.is_some()
             || self.pending_schedule_delete.is_some()
             || self.subagent_tree.is_some()
+            || self.task_plan.is_some()
             || self.session_picker.is_some()
             || self.model_picker.is_some()
             || self.command_palette.is_some()
@@ -7807,6 +8100,8 @@ impl App {
             ActionContext::ScheduleDeleteConfirm
         } else if self.subagent_tree.is_some() {
             ActionContext::SubagentTree
+        } else if self.task_plan.is_some() {
+            ActionContext::TaskPlan
         } else if self.session_picker.is_some() {
             self.session_picker_context()
         } else if self.model_picker.is_some() {
@@ -7915,6 +8210,8 @@ impl App {
             picker.error = Some(message.clone());
         } else if let Some(tree) = self.subagent_tree.as_mut() {
             tree.error = Some(message.clone());
+        } else if self.task_plan.is_some() {
+            self.chat.task_progress.error = Some(message.clone());
         }
         self.status_message = message;
     }
@@ -7988,6 +8285,7 @@ impl App {
             ActionId::OpenModelPicker => self.open_model_picker(),
             ActionId::OpenSessionPicker => self.open_session_picker(),
             ActionId::OpenSubagentTree => self.open_subagent_tree(),
+            ActionId::OpenTaskPlan => self.open_task_plan(),
             ActionId::StopRun => self.stop_streaming(),
             ActionId::ToggleDetails => self.toggle_conversation_details(),
             ActionId::OpenConfigTab => {
@@ -8056,6 +8354,7 @@ impl App {
             ActionContext::PermissionRuleConfirm => self.handle_permission_rule_confirm_key(key),
             ActionContext::PermissionModeConfirm => self.handle_permission_mode_confirm_key(key),
             ActionContext::SubagentTree => self.handle_subagent_tree_key(key),
+            ActionContext::TaskPlan => self.handle_task_plan_key(key),
             ActionContext::SessionPickerBrowse
             | ActionContext::SessionPickerRename
             | ActionContext::SessionPickerPinning => self.handle_session_picker_key(key).await?,
@@ -10815,7 +11114,10 @@ impl App {
                     .is_none_or(|question| !question.submitting)
                 {
                     self.reconcile_pending_question_after_stream_connect(session_id.clone());
-                    self.refresh_child_approvals(session_id);
+                    self.refresh_child_approvals(session_id.clone());
+                }
+                if reconnecting && self.routing_background_session.is_none() {
+                    self.refresh_task_plan_snapshot(session_id);
                 }
                 Ok(())
             }
@@ -10850,7 +11152,124 @@ impl App {
         }
     }
 
+    fn reduce_task_event(
+        &mut self,
+        event: &AgentEvent,
+        envelope_session_id: Option<&str>,
+        shared_source: bool,
+    ) -> bool {
+        let Some(active_session_id) = self.chat.session_id.clone() else {
+            return false;
+        };
+        if self.chat.task_progress.requested_session_id.is_none() {
+            self.chat.task_progress.begin_refresh(&active_session_id);
+        }
+        let applied = match event {
+            AgentEvent::TaskListUpdated { task_list, version } => {
+                let source = envelope_session_id.unwrap_or(active_session_id.as_str());
+                self.chat.task_progress.apply_list(
+                    source,
+                    task_list.clone(),
+                    *version,
+                    shared_source,
+                )
+            }
+            AgentEvent::TaskListItemProgress {
+                session_id,
+                item_id,
+                status,
+                version,
+                item,
+                ..
+            } => {
+                if envelope_session_id.is_some_and(|envelope| envelope != session_id) {
+                    return true;
+                }
+                self.chat.task_progress.apply_item(
+                    session_id,
+                    item_id.clone(),
+                    *status,
+                    *version,
+                    item.clone(),
+                    shared_source,
+                )
+            }
+            AgentEvent::TaskListCompleted {
+                session_id,
+                total_rounds,
+                total_tool_calls,
+                version,
+                ..
+            } => {
+                if envelope_session_id.is_some_and(|envelope| envelope != session_id) {
+                    return true;
+                }
+                self.chat.task_progress.apply_completed(
+                    session_id,
+                    *version,
+                    *total_rounds,
+                    *total_tool_calls,
+                    shared_source,
+                )
+            }
+            AgentEvent::TaskEvaluationStarted {
+                session_id,
+                items_count,
+                generation,
+            } => {
+                if envelope_session_id.is_some_and(|envelope| envelope != session_id) {
+                    return true;
+                }
+                self.chat.task_progress.evaluation_started(
+                    session_id,
+                    *items_count,
+                    *generation,
+                    shared_source,
+                )
+            }
+            AgentEvent::TaskEvaluationCompleted {
+                session_id,
+                updates_count,
+                reasoning,
+                generation,
+            } => {
+                if envelope_session_id.is_some_and(|envelope| envelope != session_id) {
+                    return true;
+                }
+                self.chat.task_progress.evaluation_finished(
+                    session_id,
+                    format!("evaluation applied {updates_count} updates · {reasoning}"),
+                    *generation,
+                    shared_source,
+                )
+            }
+            AgentEvent::TaskEvaluationCancelled {
+                session_id,
+                reason,
+                generation,
+            } => {
+                if envelope_session_id.is_some_and(|envelope| envelope != session_id) {
+                    return true;
+                }
+                self.chat.task_progress.evaluation_finished(
+                    session_id,
+                    format!("evaluation cancelled · {reason}"),
+                    *generation,
+                    shared_source,
+                )
+            }
+            _ => return false,
+        };
+        if matches!(applied, crate::task_plan::ApplyResult::Applied) {
+            self.chat.note_update();
+        }
+        true
+    }
+
     fn handle_sse_event(&mut self, event: AgentEvent) -> Result<()> {
+        if self.reduce_task_event(&event, None, false) {
+            return Ok(());
+        }
         match event {
             AgentEvent::Token { content } => {
                 if self.chat.run_status.phase.is_terminal() {
@@ -11666,12 +12085,19 @@ impl App {
             }
             AgentEvent::PlanModeEntered {
                 reason,
+                pre_permission_mode,
+                entered_at,
+                status,
                 plan_file_path,
                 ..
             } => {
-                self.chat
-                    .run_status
-                    .enter_plan(reason.clone(), plan_file_path);
+                self.chat.run_status.enter_plan(
+                    reason.clone(),
+                    plan_file_path,
+                    status,
+                    entered_at,
+                    pre_permission_mode,
+                );
                 self.record_activity(ActivityKind::Plan, NoticeLevel::Info, "Plan mode entered");
                 self.chat.plan_mode = true;
                 self.status_message = format!(
@@ -11682,8 +12108,8 @@ impl App {
                         .unwrap_or_default()
                 );
             }
-            AgentEvent::PlanModeExited { approved, .. } => {
-                self.chat.run_status.exit_plan(approved);
+            AgentEvent::PlanModeExited { approved, plan, .. } => {
+                self.chat.run_status.exit_plan(approved, plan);
                 self.record_activity(
                     ActivityKind::Plan,
                     NoticeLevel::Info,
@@ -11700,8 +12126,15 @@ impl App {
                     "Plan mode exited".to_string()
                 };
             }
-            AgentEvent::PlanFileUpdated { file_path, .. } => {
-                self.chat.run_status.update_plan_file(file_path.clone());
+            AgentEvent::PlanFileUpdated {
+                file_path,
+                content_summary,
+                status,
+                ..
+            } => {
+                self.chat
+                    .run_status
+                    .update_plan_file(file_path.clone(), content_summary, status);
                 self.record_activity(
                     ActivityKind::Plan,
                     NoticeLevel::Info,
@@ -11723,6 +12156,7 @@ impl App {
                 if !identity_matches {
                     return Ok(());
                 }
+                self.reduce_task_event(&event, Some(&child_session_id), true);
                 let parent_session_id = self.chat.session_id.clone();
                 if let (Some(parent_session_id), Some(tree)) =
                     (parent_session_id, self.subagent_tree.as_mut())
@@ -11732,6 +12166,14 @@ impl App {
                         tree.apply_forwarded_event(&child_session_id, &event);
                     }
                 }
+            }
+            AgentEvent::TaskListUpdated { .. }
+            | AgentEvent::TaskListItemProgress { .. }
+            | AgentEvent::TaskListCompleted { .. }
+            | AgentEvent::TaskEvaluationStarted { .. }
+            | AgentEvent::TaskEvaluationCompleted { .. }
+            | AgentEvent::TaskEvaluationCancelled { .. } => {
+                unreachable!("task events are reduced before the main event match")
             }
             AgentEvent::SubAgentStarted {
                 child_session_id,
@@ -13062,6 +13504,135 @@ impl App {
                     });
                 });
             }
+            _ => {}
+        }
+    }
+
+    // ── Task and plan progress (Leader+T) ──
+
+    fn open_task_plan(&mut self) {
+        let Some(session_id) = self.chat.session_id.clone() else {
+            self.status_message =
+                "Start or open a session before inspecting task progress".to_string();
+            return;
+        };
+        self.task_plan = Some(TaskPlanOverlayState::default());
+        self.refresh_task_plan_snapshot(session_id);
+    }
+
+    fn close_task_plan(&mut self) {
+        self.task_plan = None;
+    }
+
+    fn cancel_task_plan_refresh(&mut self) {
+        self.task_plan_epoch = self.task_plan_epoch.wrapping_add(1);
+        if let Some(task) = self.task_plan_task.take() {
+            task.abort();
+        }
+    }
+
+    fn refresh_task_plan_snapshot(&mut self, session_id: String) {
+        if self.chat.session_id.as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        self.cancel_task_plan_refresh();
+        self.task_plan_epoch = self.task_plan_epoch.wrapping_add(1).max(1);
+        let epoch = self.task_plan_epoch;
+        let plan_revision = self.chat.run_status.plan_revision;
+        self.chat.task_progress.begin_refresh(&session_id);
+        let Some(tx) = self.event_tx.clone() else {
+            self.chat.task_progress.fail_refresh(
+                &session_id,
+                "Task refresh is not attached to the event loop".to_string(),
+            );
+            return;
+        };
+        let client = self.client.clone();
+        self.task_plan_task = Some(tokio::spawn(async move {
+            let (tasks, summary) = tokio::join!(
+                client.get_task_list(&session_id),
+                client.get_session(&session_id)
+            );
+            let result = match (tasks, summary) {
+                (Ok(tasks), Ok(summary)) => Ok((tasks, summary.plan_mode)),
+                (Err(error), _) => Err(error.to_string()),
+                (_, Err(error)) => Err(error.to_string()),
+            };
+            let _ = tx.send(AppEvent::TaskPlanSnapshotLoaded {
+                epoch,
+                session_id,
+                plan_revision,
+                result,
+            });
+        }));
+    }
+
+    fn handle_task_plan_key(&mut self, key: KeyEvent) {
+        let action = self.resolve_context_action(ActionContext::TaskPlan, key);
+        let item_count = self.chat.task_progress.ordered_items().len();
+        match action {
+            Some(ActionId::NavigateUp) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    if overlay.pane == TaskPlanPane::Tasks {
+                        overlay.move_selection(-1, item_count);
+                    } else {
+                        overlay.detail_scroll = overlay.detail_scroll.saturating_sub(1);
+                    }
+                }
+            }
+            Some(ActionId::NavigateDown) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    if overlay.pane == TaskPlanPane::Tasks {
+                        overlay.move_selection(1, item_count);
+                    } else {
+                        overlay.detail_scroll = overlay.detail_scroll.saturating_add(1);
+                    }
+                }
+            }
+            Some(ActionId::PageUp) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    if overlay.pane == TaskPlanPane::Tasks {
+                        overlay.move_selection(-8, item_count);
+                    } else {
+                        overlay.detail_scroll = overlay.detail_scroll.saturating_sub(8);
+                    }
+                }
+            }
+            Some(ActionId::PageDown) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    if overlay.pane == TaskPlanPane::Tasks {
+                        overlay.move_selection(8, item_count);
+                    } else {
+                        overlay.detail_scroll = overlay.detail_scroll.saturating_add(8);
+                    }
+                }
+            }
+            Some(ActionId::JumpFirst) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    overlay.selected = 0;
+                    overlay.detail_scroll = 0;
+                }
+            }
+            Some(ActionId::JumpLast) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    if overlay.pane == TaskPlanPane::Tasks {
+                        overlay.selected = item_count.saturating_sub(1);
+                    } else {
+                        overlay.detail_scroll = usize::MAX / 2;
+                    }
+                }
+            }
+            Some(ActionId::ToggleInspectorPane) => {
+                if let Some(overlay) = self.task_plan.as_mut() {
+                    overlay.toggle_pane();
+                }
+            }
+            Some(ActionId::Refresh) => {
+                if let Some(session_id) = self.chat.session_id.clone() {
+                    self.refresh_task_plan_snapshot(session_id);
+                }
+            }
+            Some(ActionId::Cancel) => self.close_task_plan(),
             _ => {}
         }
     }
@@ -17643,6 +18214,12 @@ mod question_tests {
         commands.open_command_palette(CommandPaletteTrigger::Global);
         actual.push(minimum_modal_fingerprint(&commands));
 
+        let mut task_plan = App::new(BambooClient::new("http://127.0.0.1:0"));
+        task_plan.chat.session_id = Some("root".to_string());
+        task_plan.chat.task_progress.begin_refresh("root");
+        task_plan.task_plan = Some(TaskPlanOverlayState::default());
+        actual.push(minimum_modal_fingerprint(&task_plan));
+
         let mut subagents = App::new(BambooClient::new("http://127.0.0.1:0"));
         subagents.chat.session_id = Some("root".to_string());
         let mut root = SessionTreeSummary::placeholder("root");
@@ -17671,7 +18248,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                17_147_369_131_010_514_566,
+                8_245_894_359_903_651_780,
                 1_057_473_937_556_339_135,
                 1_502_110_673_089_046_554,
                 14_484_161_115_671_232_577,
@@ -17680,7 +18257,8 @@ mod question_tests {
                 10_493_202_686_479_633_261,
                 10_935_873_232_087_006_812,
                 8_710_182_394_295_884_107,
-                15_353_719_274_755_616_638,
+                3_584_340_785_452_026_141,
+                199_111_197_660_670_885,
                 5_239_033_309_572_019_229,
                 3_245_283_921_451_133_623,
             ],
@@ -18488,6 +19066,7 @@ mod question_tests {
             pinned: false,
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
+            plan_mode: None,
         }
     }
 
@@ -25503,6 +26082,7 @@ mod run_status_tests {
             session_id: "session-life".to_string(),
             file_path: "plan-v2.md".to_string(),
             content_summary: None,
+            status: Some(PlanModeStatus::AwaitingApproval),
         })
         .unwrap();
         app.handle_sse_event(AgentEvent::PlanModeExited {
@@ -25774,6 +26354,9 @@ mod run_status_tests {
         app.chat.run_status.enter_plan(
             Some("review the implementation".to_string()),
             Some("plans/644.md".to_string()),
+            Some(PlanModeStatus::Reviewing),
+            Some("2026-08-16T00:00:00Z".to_string()),
+            Some("default".to_string()),
         );
         app.chat
             .run_status

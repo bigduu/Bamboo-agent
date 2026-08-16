@@ -40,6 +40,7 @@ pub(crate) enum ActionContext {
     PermissionDeleteConfirm,
     PermissionModeConfirm,
     SubagentTree,
+    TaskPlan,
     SessionPickerBrowse,
     SessionPickerRename,
     SessionPickerPinning,
@@ -48,7 +49,7 @@ pub(crate) enum ActionContext {
 }
 
 impl ActionContext {
-    pub(crate) const ALL: [Self; 31] = [
+    pub(crate) const ALL: [Self; 32] = [
         Self::Chat,
         Self::ConversationBlock,
         Self::Global,
@@ -75,6 +76,7 @@ impl ActionContext {
         Self::PermissionDeleteConfirm,
         Self::PermissionModeConfirm,
         Self::SubagentTree,
+        Self::TaskPlan,
         Self::SessionPickerBrowse,
         Self::SessionPickerRename,
         Self::SessionPickerPinning,
@@ -110,6 +112,7 @@ impl ActionContext {
             Self::PermissionDeleteConfirm => "Permission delete",
             Self::PermissionModeConfirm => "Permission mode",
             Self::SubagentTree => "Sub-agent tree",
+            Self::TaskPlan => "Task and plan progress",
             Self::SessionPickerBrowse => "Session picker",
             Self::SessionPickerRename => "Session rename",
             Self::SessionPickerPinning => "Session pin",
@@ -131,6 +134,7 @@ pub(crate) enum ActionId {
     OpenModelPicker,
     OpenSessionPicker,
     OpenSubagentTree,
+    OpenTaskPlan,
     StopRun,
     ToggleDetails,
     OpenConfigTab,
@@ -364,6 +368,15 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         [(Global, "Leader a")]
     ),
     spec!(
+        OpenTaskPlan,
+        "Task and plan progress",
+        "Inspect the active session's live task tree and plan lifecycle",
+        true,
+        Chat,
+        [Global],
+        [(Global, "Leader t")]
+    ),
+    spec!(
         StopRun,
         "Stop active run",
         "Request cancellation of the active agent run",
@@ -482,6 +495,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Config,
             Permissions,
             SubagentTree,
+            TaskPlan,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -499,6 +513,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Config, "Up; k"),
             (Permissions, "Up; k"),
             (SubagentTree, "Up; k"),
+            (TaskPlan, "Up; k"),
             (SessionPickerBrowse, "Up"),
             (ModelPicker, "Up"),
             (CommandPalette, "Up")
@@ -522,6 +537,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Config,
             Permissions,
             SubagentTree,
+            TaskPlan,
             SessionPickerBrowse,
             ModelPicker,
             CommandPalette
@@ -539,6 +555,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Config, "Down; j"),
             (Permissions, "Down; j"),
             (SubagentTree, "Down; j"),
+            (TaskPlan, "Down; j"),
             (SessionPickerBrowse, "Down"),
             (ModelPicker, "Down"),
             (CommandPalette, "Down")
@@ -557,6 +574,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             PermissionRuleConfirm,
             Config,
             SubagentTree,
+            TaskPlan,
             ModelPicker,
             CommandPalette
         ],
@@ -568,6 +586,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (PermissionRuleConfirm, "PageUp"),
             (Config, "PageUp"),
             (SubagentTree, "PageUp"),
+            (TaskPlan, "PageUp"),
             (ModelPicker, "PageUp"),
             (CommandPalette, "PageUp")
         ]
@@ -585,6 +604,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             PermissionRuleConfirm,
             Config,
             SubagentTree,
+            TaskPlan,
             ModelPicker,
             CommandPalette
         ],
@@ -596,6 +616,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (PermissionRuleConfirm, "PageDown"),
             (Config, "PageDown"),
             (SubagentTree, "PageDown"),
+            (TaskPlan, "PageDown"),
             (ModelPicker, "PageDown"),
             (CommandPalette, "PageDown")
         ]
@@ -613,6 +634,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             PermissionRuleConfirm,
             ConversationBlock,
             SubagentTree,
+            TaskPlan,
             ModelPicker,
             CommandPalette
         ],
@@ -624,6 +646,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (PermissionRuleConfirm, "Home"),
             (ConversationBlock, "Home"),
             (SubagentTree, "Home; g g"),
+            (TaskPlan, "Home; g g"),
             (ModelPicker, "Home"),
             (CommandPalette, "Home")
         ]
@@ -641,6 +664,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             PermissionRuleConfirm,
             ConversationBlock,
             SubagentTree,
+            TaskPlan,
             ModelPicker,
             CommandPalette
         ],
@@ -652,6 +676,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (PermissionRuleConfirm, "End"),
             (ConversationBlock, "End"),
             (SubagentTree, "End; Shift+G"),
+            (TaskPlan, "End; Shift+G"),
             (ModelPicker, "End"),
             (CommandPalette, "End")
         ]
@@ -713,6 +738,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Permissions,
             PermissionEditor,
             SubagentTree,
+            TaskPlan,
             SessionPickerBrowse,
             SessionPickerRename,
             SessionPickerPinning,
@@ -731,6 +757,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Permissions, "Esc"),
             (PermissionEditor, "Esc"),
             (SubagentTree, "Esc; q"),
+            (TaskPlan, "Esc; q"),
             (SessionPickerBrowse, "Esc"),
             (SessionPickerRename, "Esc"),
             (SessionPickerPinning, "Esc"),
@@ -771,6 +798,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             Sessions,
             Mcp,
             SubagentTree,
+            TaskPlan,
             SessionPickerBrowse,
             SessionPickerRename,
             SessionPickerPinning,
@@ -783,6 +811,7 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
             (Sessions, "r"),
             (Mcp, "r"),
             (SubagentTree, "r; Ctrl+R"),
+            (TaskPlan, "r; Ctrl+R"),
             (SessionPickerBrowse, "Ctrl+R"),
             (SessionPickerRename, "Ctrl+R"),
             (SessionPickerPinning, "Ctrl+R"),
@@ -1033,8 +1062,8 @@ pub(crate) static ACTION_SPECS: &[ActionSpec] = &[
         "Toggle inspected value",
         "Switch between the question and selected option",
         false,
-        [QuestionInspect],
-        [(QuestionInspect, "Tab")]
+        [QuestionInspect, TaskPlan],
+        [(QuestionInspect, "Tab"), (TaskPlan, "Tab")]
     ),
     spec!(
         CustomAnswer,

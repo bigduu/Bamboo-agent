@@ -84,9 +84,17 @@ pub(super) async fn maybe_handle_taskwrite(
 
     match persist_shared_task_list(config, session, &shared_session_id, session_id).await {
         TaskPersistenceOutcome::Publish(authoritative_task_list) => {
+            // Persistence may rebase a stale child candidate onto a newer
+            // shared-root generation. Publish the generation paired with the
+            // authoritative snapshot, not the pre-save candidate version.
+            let authoritative_version = session
+                .task_list_version_meta()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(next_version);
             let _ = event_tx
                 .send(AgentEvent::TaskListUpdated {
                     task_list: authoritative_task_list,
+                    version: Some(authoritative_version),
                 })
                 .await;
             reinitialize_task_context(task_context, session, session_id, true);

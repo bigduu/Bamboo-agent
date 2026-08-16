@@ -935,10 +935,14 @@ async fn apply_completed_task_evaluation(
 
             if persisted {
                 state.task_context = staged_task_context;
+                let event_version = new_version.parse::<u64>().ok();
                 session.set_task_list_version_meta(new_version);
                 session.set_task_list(task_list.clone());
                 let _ = event_tx
-                    .send(AgentEvent::TaskListUpdated { task_list })
+                    .send(AgentEvent::TaskListUpdated {
+                        task_list,
+                        version: event_version,
+                    })
                     .await;
             } else {
                 apply_outcome.stale = true;
@@ -6153,7 +6157,7 @@ mod tests {
             .await
             .expect("task update event should be emitted");
         match event {
-            AgentEvent::TaskListUpdated { task_list } => {
+            AgentEvent::TaskListUpdated { task_list, .. } => {
                 assert_eq!(
                     task_list.items[0].status,
                     bamboo_domain::TaskItemStatus::Completed
