@@ -3,8 +3,9 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::api::types::{
     CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
     ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
-    PermissionPolicyResponse, ProviderCatalog, ReasoningEffort, Schedule, SessionSummary,
-    SessionTreeSummary, Skill, SkillDetail, SubagentSnapshotResponse, ToolInfo,
+    PermissionPolicyResponse, PlanModeState, ProviderCatalog, ReasoningEffort, Schedule,
+    SessionSummary, SessionTreeSummary, Skill, SkillDetail, SubagentSnapshotResponse,
+    TaskListResponse, ToolInfo,
 };
 use crate::api::{
     PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
@@ -133,6 +134,16 @@ pub enum AppEvent {
         session_id: String,
         epoch: u64,
         result: Result<OpenedSession, String>,
+    },
+    /// Authoritative task and plan snapshot for the active session. A single
+    /// epoch binds both reads so late responses cannot cross a session switch.
+    TaskPlanSnapshotLoaded {
+        epoch: u64,
+        session_id: String,
+        /// Plan event revision observed when the request started. A late HTTP
+        /// response cannot overwrite a newer live plan event.
+        plan_revision: u64,
+        result: Loaded<(TaskListResponse, Option<PlanModeState>)>,
     },
     /// One bounded, periodic status pass for cached sessions whose full SSE
     /// subscription was evicted. Context id + stream epoch prevent an older

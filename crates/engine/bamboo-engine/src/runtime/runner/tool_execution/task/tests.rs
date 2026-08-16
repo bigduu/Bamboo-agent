@@ -335,7 +335,7 @@ async fn root_taskwrite_uses_control_plane_save_and_preserves_event_and_context_
 
     let event = rx.recv().await.expect("task update event");
     match event {
-        AgentEvent::TaskListUpdated { task_list } => {
+        AgentEvent::TaskListUpdated { task_list, .. } => {
             assert_eq!(task_list.items.len(), 1);
         }
         other => panic!("unexpected event: {other:?}"),
@@ -502,7 +502,10 @@ async fn child_taskwrite_publishes_snapshot_rebased_by_local_save_everywhere() {
         serde_json::to_value(&authoritative_task_list).expect("serialize authority")
     );
     let event_task_list = match rx.recv().await.expect("rebased Task event") {
-        AgentEvent::TaskListUpdated { task_list } => task_list,
+        AgentEvent::TaskListUpdated { task_list, version } => {
+            assert_eq!(version, Some(2));
+            task_list
+        }
         other => panic!("unexpected event: {other:?}"),
     };
     assert_eq!(
@@ -707,7 +710,7 @@ async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_sav
         serde_json::to_value(winner_task_list).expect("serialize winner task list")
     );
     let event_task_list = match rx.recv().await.expect("authoritative Task event") {
-        AgentEvent::TaskListUpdated { task_list } => task_list,
+        AgentEvent::TaskListUpdated { task_list, .. } => task_list,
         other => panic!("unexpected event: {other:?}"),
     };
     assert_eq!(

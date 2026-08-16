@@ -563,6 +563,23 @@ impl BambooClient {
         Ok(envelope.session)
     }
 
+    /// Authoritative read-only task snapshot used on open, reconnect, and
+    /// explicit refresh. Child session IDs are resolved to their shared root
+    /// list by the server.
+    pub async fn get_task_list(&self, session_id: &str) -> Result<TaskListResponse> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/api/v1/sessions/{session_id}/task")))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get task list failed ({status}): {body}");
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Same paginated session endpoint as [`Self::list_sessions`], decoded
     /// into the relationship-rich projection used by the child-session tree.
     pub async fn list_session_tree(
@@ -1458,6 +1475,37 @@ mod tests {
         assert_eq!(page.total, 3);
         assert_eq!(page.offset, 2);
         assert_eq!(page.sessions[0].spawn_depth, 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_snapshot_preserves_version_hierarchy_and_blockers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            assert!(request.starts_with("GET /api/v1/sessions/child-2/task HTTP/1.1"));
+            respond(
+                &mut socket,
+                "200 OK",
+                "\"1\"",
+                r#"{"session_id":"root","title":"Release","items":[{"id":"child","description":"Deploy","status":"blocked","parent_id":"parent","depends_on":["build"],"blockers":[{"kind":"dependency","summary":"Build pending","waiting_on":"build"}]}],"progress":{"completed":0,"total":1,"percentage":0},"version":7,"created_at":"2026-08-16T00:00:00Z","updated_at":"2026-08-16T00:00:01Z"}"#,
+            )
+            .await;
+        });
+
+        let snapshot = BambooClient::new(&base_url)
+            .get_task_list("child-2")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.session_id, "root");
+        assert_eq!(snapshot.version, 7);
+        assert_eq!(snapshot.items[0].parent_id.as_deref(), Some("parent"));
+        assert_eq!(
+            snapshot.items[0].blockers[0].waiting_on.as_deref(),
+            Some("build")
+        );
         server.await.unwrap();
     }
 

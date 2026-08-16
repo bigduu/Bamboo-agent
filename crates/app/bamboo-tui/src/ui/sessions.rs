@@ -365,6 +365,7 @@ mod tests {
             pinned: false,
             permission_mode: crate::api::types::SessionPermissionMode::Default,
             bypass_permissions: false,
+            plan_mode: None,
         }
     }
 

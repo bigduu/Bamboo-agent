@@ -25,6 +25,7 @@ pub(super) async fn finalize_task_context(
                 completed_at: Utc::now(),
                 total_rounds: ctx.current_round + 1, // Convert 0-indexed to 1-indexed for display.
                 total_tool_calls: ctx.items.iter().map(|item| item.tool_calls.len()).sum(),
+                version: Some(ctx.version),
             })
             .await;
     }

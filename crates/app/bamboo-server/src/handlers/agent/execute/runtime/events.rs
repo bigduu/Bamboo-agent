@@ -219,6 +219,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
+            version: Some(1),
         }
     }
 
@@ -488,6 +489,7 @@ mod tests {
             completed_at: Utc::now(),
             total_rounds: 3,
             total_tool_calls: 10,
+            version: Some(2),
         };
         assert!(is_critical_event(&event));
     }

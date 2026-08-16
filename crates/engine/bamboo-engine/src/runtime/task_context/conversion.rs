@@ -39,6 +39,16 @@ fn into_task_item(loop_item: TaskLoopItem) -> TaskItem {
 }
 
 impl TaskLoopContext {
+    /// Clone one loop item into the durable task projection used by SSE
+    /// progress events. Keeping the conversion here prevents the live view
+    /// from drifting from the snapshot representation.
+    pub(crate) fn task_item_snapshot(&self, item_id: &str) -> Option<TaskItem> {
+        self.items
+            .iter()
+            .find(|item| item.id == item_id)
+            .map(clone_loop_item_into_task_item)
+    }
+
     /// Create `TaskLoopContext` from the session's task list.
     pub fn from_session(session: &bamboo_agent_core::Session) -> Option<Self> {
         session.task_list.as_ref().map(|task_list| {

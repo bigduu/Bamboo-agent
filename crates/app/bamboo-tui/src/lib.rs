@@ -27,6 +27,7 @@ mod history;
 mod keymap;
 mod search;
 mod subagents;
+mod task_plan;
 mod text;
 mod theme;
 mod ui;

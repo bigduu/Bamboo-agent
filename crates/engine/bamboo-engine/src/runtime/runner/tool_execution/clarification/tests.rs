@@ -416,10 +416,15 @@ async fn maybe_handle_user_question_tool_persists_exit_plan_file_and_emits_updat
             session_id,
             file_path,
             content_summary,
+            status,
         } => {
             assert_eq!(session_id, "session-exit-plan");
             assert_eq!(file_path, *plan_file_path);
             assert!(content_summary.contains("# Plan") || content_summary.contains("Plan"));
+            assert_eq!(
+                status,
+                Some(bamboo_domain::PlanModeStatus::AwaitingApproval)
+            );
         }
         other => panic!("unexpected second event: {other:?}"),
     }
