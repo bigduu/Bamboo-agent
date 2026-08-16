@@ -172,7 +172,7 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 # tests available; the package feature above separately selects integration
 # tests that must opt in to the scoped env-cache fixture.
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
-bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-storage = { path = "../../infra/bamboo-storage", features = ["test-utils"] }
 
 [[test]]
 name = "env_cache_isolation"

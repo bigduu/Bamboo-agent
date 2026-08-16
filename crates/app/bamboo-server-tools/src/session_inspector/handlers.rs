@@ -247,6 +247,11 @@ pub(super) async fn handle_read_compressed_cache(
     let truncate_chars = truncate_chars.unwrap_or(1200).min(20_000);
     let include_summary = include_summary.unwrap_or(true);
 
+    // Foreground saves deliberately do not wait for FTS. This action promises
+    // the cached SQLite view when it exists, so it is an explicit
+    // read-after-write boundary rather than pushing that latency back into all
+    // session commits.
+    tool.session_store.flush_search_index().await;
     let sqlite_snapshot = tool
         .session_store
         .search_index()
@@ -357,6 +362,9 @@ pub(super) async fn handle_search(
     let max_matches = max_matches.unwrap_or(50).min(200);
 
     if !case_sensitive {
+        // Search is the other explicit consumer that requires the deferred FTS
+        // queue to catch up before deciding whether to use its fallback scan.
+        tool.session_store.flush_search_index().await;
         match tool
             .session_store
             .search_index()

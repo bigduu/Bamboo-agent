@@ -23,6 +23,11 @@ sha2 = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 tracing = "0.1"
 
+[features]
+# Deterministic persistence pause hooks used by higher-layer integration tests.
+# Production builds keep these hooks compiled out.
+test-utils = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
