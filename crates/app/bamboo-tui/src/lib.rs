@@ -22,6 +22,7 @@ mod api;
 mod app;
 mod components;
 mod event;
+mod file_change;
 mod history;
 mod keymap;
 mod search;

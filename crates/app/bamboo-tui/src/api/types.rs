@@ -385,6 +385,11 @@ pub struct PendingQuestion {
     /// bounded resource rather than arbitrary argument payloads.
     #[serde(default)]
     pub tool_arguments: Option<serde_json::Value>,
+    /// Optional, bounded file-change payload computed and supplied separately
+    /// by the server for permission review. This must never be inferred from
+    /// model-authored `tool_arguments` or by reading `file_path` in the TUI.
+    #[serde(default)]
+    pub proposed_file_change: Option<serde_json::Value>,
     /// True when the server bounded a large raw argument payload before
     /// returning it. The exact authorization resource remains available on
     /// `permission_request.resource`; this flag prevents the preview from
@@ -1427,6 +1432,42 @@ mod tests {
                 "command": "git push origin dev",
                 "cwd": "/workspace/repo"
             }))
+        );
+    }
+
+    #[test]
+    fn pending_question_keeps_proposed_file_change_separate_from_model_arguments() {
+        let pending: PendingQuestion = serde_json::from_value(serde_json::json!({
+            "has_pending_question": true,
+            "question": "Allow edit?",
+            "tool_call_id": "edit-1",
+            "tool_name": "Edit",
+            "interaction_kind": "permission",
+            "tool_arguments": {
+                "file_path": "/workspace/demo.rs",
+                "patch": "model-authored patch"
+            },
+            "proposed_file_change": {
+                "operation": "Edit",
+                "file_path": "/workspace/demo.rs",
+                "diff": {"format": "unified", "unified": "bounded"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            pending
+                .tool_arguments
+                .as_ref()
+                .and_then(|value| value.get("patch")),
+            Some(&serde_json::json!("model-authored patch"))
+        );
+        assert_eq!(
+            pending
+                .proposed_file_change
+                .as_ref()
+                .and_then(|value| value.get("operation")),
+            Some(&serde_json::json!("Edit"))
         );
     }
 

@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -106,6 +107,7 @@ mod subagent_tree_navigation_tests {
             ConversationBlockUiState {
                 expanded: true,
                 scroll: 4,
+                diff_wrap: true,
             },
         );
 
@@ -143,7 +145,8 @@ mod subagent_tree_navigation_tests {
             app.chat.block_ui["parent:block"],
             ConversationBlockUiState {
                 expanded: true,
-                scroll: 4
+                scroll: 4,
+                diff_wrap: true,
             }
         );
     }
@@ -199,6 +202,7 @@ mod subagent_tree_navigation_tests {
             interaction_kind: Some(PendingInteractionKind::Clarification),
             permission_request: None,
             tool_arguments: None,
+            proposed_file_change: None,
             tool_arguments_truncated: false,
         };
         child_context.pending_question = Some(ActiveQuestion::from_pending(
@@ -243,6 +247,7 @@ mod subagent_tree_navigation_tests {
             interaction_kind: Some(PendingInteractionKind::Permission),
             permission_request: None,
             tool_arguments: None,
+            proposed_file_change: None,
             tool_arguments_truncated: false,
         };
         app.dismissed_question = Some(ActiveQuestion::from_pending(
@@ -588,6 +593,21 @@ impl ToolCallDisplay {
             self.result.as_deref().unwrap_or_default()
         }
     }
+
+    fn file_change_payload(&self) -> Option<&str> {
+        self.result
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| self.error.as_deref().filter(|value| !value.is_empty()))
+            .or_else(|| (!self.stream_output.is_empty()).then_some(self.stream_output.as_str()))
+    }
+
+    pub(crate) fn parse_file_change(&self) -> Option<crate::file_change::FileChangeView> {
+        crate::file_change::FileChangeView::from_tool_result(
+            &self.tool_name,
+            self.file_change_payload()?,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -693,11 +713,24 @@ pub struct ChatMessage {
     pub terminal_status: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationBlockUiState {
     pub expanded: bool,
     /// First visible detail line for bounded tool/reasoning inspectors.
     pub scroll: usize,
+    /// File-change rows wrap by default. Toggling this clips long rows for a
+    /// dense overview without changing the authoritative copied diff.
+    pub diff_wrap: bool,
+}
+
+impl Default for ConversationBlockUiState {
+    fn default() -> Self {
+        Self {
+            expanded: false,
+            scroll: 0,
+            diff_wrap: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,6 +794,9 @@ impl ConversationBlock<'_> {
             ConversationBlockKind::AssistantMarkdown { content, .. }
             | ConversationBlockKind::Reasoning { content, .. } => (*content).to_string(),
             ConversationBlockKind::ToolCall { tool, .. } => {
+                if let Some(change) = tool.parse_file_change() {
+                    return change.unified().to_string();
+                }
                 let output = tool.display_output();
                 format!(
                     "{}\nargs: {}\n{}{}",
@@ -788,14 +824,19 @@ impl ConversationBlock<'_> {
         }
     }
 
-    fn detail_line_count(&self, width: u16) -> usize {
+    fn detail_line_count(&self, width: u16, diff_wrap: bool) -> usize {
         match &self.kind {
             ConversationBlockKind::Reasoning { content, .. } => {
                 inspector_lines(content, width.saturating_sub(1) as usize).len()
             }
-            ConversationBlockKind::ToolCall { tool, .. } => {
-                inspector_lines(tool.display_output(), width.saturating_sub(3) as usize).len()
-            }
+            ConversationBlockKind::ToolCall { tool, .. } => tool.parse_file_change().map_or_else(
+                || inspector_lines(tool.display_output(), width.saturating_sub(3) as usize).len(),
+                |change| {
+                    change
+                        .rendered_rows(width.saturating_sub(3) as usize, diff_wrap)
+                        .len()
+                },
+            ),
             _ => 0,
         }
     }
@@ -834,6 +875,14 @@ struct InspectorCacheEntry {
     source_len: usize,
     width: usize,
     lines: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FileChangeCacheEntry {
+    source_ptr: usize,
+    source_len: usize,
+    tool_name: String,
+    view: Option<Arc<crate::file_change::FileChangeView>>,
 }
 
 pub struct ChatState {
@@ -915,6 +964,9 @@ pub struct ChatState {
     /// rows so the fixed redraw tick only clones the bounded visible window
     /// instead of re-walking every byte on every frame.
     inspector_cache: RefCell<HashMap<String, InspectorCacheEntry>>,
+    /// Parsing the bounded JSON/unified payload is still too expensive for
+    /// every redraw tick. Cache by stable block id and immutable result buffer.
+    file_change_cache: RefCell<HashMap<String, FileChangeCacheEntry>>,
     #[cfg(test)]
     inspector_cache_builds: Cell<usize>,
     /// IDs installed from a running session's history (or from an intermediate
@@ -997,6 +1049,7 @@ impl ChatState {
             content_height: Cell::new(0),
             content_width: Cell::new(0),
             inspector_cache: RefCell::new(HashMap::new()),
+            file_change_cache: RefCell::new(HashMap::new()),
             #[cfg(test)]
             inspector_cache_builds: Cell::new(0),
             replay_tool_ids: HashSet::new(),
@@ -1036,6 +1089,7 @@ impl ChatState {
         self.block_ui.entry(id).or_insert(ConversationBlockUiState {
             expanded: self.expand_tools,
             scroll: 0,
+            diff_wrap: true,
         });
     }
 
@@ -1086,6 +1140,34 @@ impl ChatState {
             .cloned()
             .collect();
         (total, lines)
+    }
+
+    pub(crate) fn file_change_view(
+        &self,
+        key: &str,
+        tool: &ToolCallDisplay,
+    ) -> Option<Arc<crate::file_change::FileChangeView>> {
+        let payload = tool.file_change_payload()?;
+        let source_ptr = payload.as_ptr() as usize;
+        let source_len = payload.len();
+        let mut cache = self.file_change_cache.borrow_mut();
+        let rebuild = cache.get(key).is_none_or(|entry| {
+            entry.source_ptr != source_ptr
+                || entry.source_len != source_len
+                || entry.tool_name != tool.tool_name
+        });
+        if rebuild {
+            cache.insert(
+                key.to_string(),
+                FileChangeCacheEntry {
+                    source_ptr,
+                    source_len,
+                    tool_name: tool.tool_name.clone(),
+                    view: tool.parse_file_change().map(Arc::new),
+                },
+            );
+        }
+        cache.get(key).and_then(|entry| entry.view.clone())
     }
 
     fn prepare_replay_reconciliation(&mut self) {
@@ -1255,6 +1337,7 @@ impl ChatState {
         self.content_height.set(0);
         self.content_width.set(0);
         self.inspector_cache.borrow_mut().clear();
+        self.file_change_cache.borrow_mut().clear();
         self.clear_replay_reconciliation();
         self.unseen_updates = 0;
         self.current_turn_id = None;
@@ -2269,6 +2352,7 @@ pub struct PermissionQuestion {
     /// rendering must never repeatedly pretty-print an attacker-sized value.
     pub tool_arguments_preview: String,
     pub tool_arguments_truncated: bool,
+    pub(crate) proposed_file_change: Option<Arc<crate::file_change::FileChangeView>>,
     pub stage: PermissionStage,
     pub matcher_selected: usize,
     pub inspect_target: Option<PermissionInspectTarget>,
@@ -2288,7 +2372,7 @@ impl PermissionQuestion {
         }
     }
 
-    pub fn inspector_text(&self) -> String {
+    pub(crate) fn base_inspector_text(&self) -> String {
         let request = &self.request;
         let mut lines = vec![
             format!("request id: {}", request.request_id),
@@ -2370,6 +2454,26 @@ impl PermissionQuestion {
             }
         }
         lines.join("\n")
+    }
+
+    pub(crate) fn proposed_file_change(&self) -> Option<&crate::file_change::FileChangeView> {
+        if !matches!(
+            self.inspect_target,
+            Some(PermissionInspectTarget::Request) | None
+        ) {
+            None
+        } else {
+            self.proposed_file_change.as_deref()
+        }
+    }
+
+    pub fn inspector_text(&self) -> String {
+        let mut text = self.base_inspector_text();
+        if let Some(change) = self.proposed_file_change() {
+            text.push_str("\n\nPROPOSED FILE CHANGE (server-supplied; not yet applied):\n");
+            text.push_str(change.unified());
+        }
+        text
     }
 }
 
@@ -2588,11 +2692,22 @@ impl ActiveQuestion {
                     preview = preview.chars().take(MAX_PREVIEW_CHARS).collect();
                     preview.push('…');
                 }
+                let proposed_file_change = pending
+                    .proposed_file_change
+                    .as_ref()
+                    .and_then(|value| {
+                        crate::file_change::FileChangeView::from_proposed_value(
+                            &request.tool_name,
+                            value,
+                        )
+                    })
+                    .map(Arc::new);
                 ActiveQuestionKind::Permission(PermissionQuestion {
                     request,
                     tool_arguments_preview: preview,
                     tool_arguments_truncated: pending.tool_arguments_truncated
                         || locally_truncated,
+                    proposed_file_change,
                     stage: PermissionStage::Decision,
                     matcher_selected: 0,
                     inspect_target: None,
@@ -7449,11 +7564,17 @@ impl App {
         let Some(id) = self.chat.focused_block.clone() else {
             return;
         };
+        let diff_wrap = self
+            .chat
+            .block_ui
+            .get(&id)
+            .map(|state| state.diff_wrap)
+            .unwrap_or(true);
         let total = self
             .conversation_blocks()
             .into_iter()
             .find(|block| block.id == id)
-            .map(|block| block.detail_line_count(self.chat.content_width.get()))
+            .map(|block| block.detail_line_count(self.chat.content_width.get(), diff_wrap))
             .unwrap_or(0);
         let state = self.chat.block_ui.entry(id).or_default();
         if !state.expanded || total <= CONVERSATION_DETAIL_VIEWPORT {
@@ -7461,6 +7582,75 @@ impl App {
         }
         let max_scroll = total.saturating_sub(CONVERSATION_DETAIL_VIEWPORT);
         state.scroll = (state.scroll as i64 + delta as i64).clamp(0, max_scroll as i64) as usize;
+    }
+
+    fn jump_focused_diff_hunk(&mut self, forward: bool) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let width = self.chat.content_width.get().saturating_sub(3) as usize;
+        let state = self.chat.block_ui.get(&id).cloned().unwrap_or_default();
+        let hunk_offsets = self
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == id)
+            .and_then(|block| match block.kind {
+                ConversationBlockKind::ToolCall { tool, .. } => tool.parse_file_change(),
+                _ => None,
+            })
+            .map(|change| change.hunk_offsets(width, state.diff_wrap));
+        let Some(offsets) = hunk_offsets.filter(|offsets| !offsets.is_empty()) else {
+            self.status_message = "Focused block has no navigable diff hunks".to_string();
+            return;
+        };
+        let (target_index, target) = if forward {
+            offsets
+                .iter()
+                .enumerate()
+                .find(|(_, offset)| **offset > state.scroll)
+                .or_else(|| offsets.last().map(|offset| (offsets.len() - 1, offset)))
+                .expect("non-empty hunk offsets")
+        } else {
+            offsets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, offset)| **offset < state.scroll)
+                .or_else(|| offsets.first().map(|offset| (0, offset)))
+                .expect("non-empty hunk offsets")
+        };
+        let ui_state = self.chat.block_ui.entry(id).or_default();
+        ui_state.expanded = true;
+        // Keep the exact hunk offset even when the renderer clamps the last
+        // viewport. This preserves deterministic previous/next navigation.
+        ui_state.scroll = *target;
+        self.status_message = format!("Diff hunk {}/{}", target_index + 1, offsets.len());
+    }
+
+    fn toggle_focused_diff_wrap(&mut self) {
+        let Some(id) = self.chat.focused_block.clone() else {
+            return;
+        };
+        let is_diff = self
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == id)
+            .is_some_and(|block| match block.kind {
+                ConversationBlockKind::ToolCall { tool, .. } => tool.parse_file_change().is_some(),
+                _ => false,
+            });
+        if !is_diff {
+            self.status_message = "Focused block has no unified diff".to_string();
+            return;
+        }
+        let state = self.chat.block_ui.entry(id).or_default();
+        state.diff_wrap = !state.diff_wrap;
+        state.scroll = 0;
+        self.status_message = if state.diff_wrap {
+            "Diff lines wrap; copied content remains exact".to_string()
+        } else {
+            "Diff lines clipped; press wrap again or copy for exact content".to_string()
+        };
     }
 
     fn activate_focused_conversation_block(&mut self) {
@@ -9697,6 +9887,9 @@ impl App {
             ActionId::ScrollBlockPageDown => {
                 self.scroll_focused_block(CONVERSATION_DETAIL_VIEWPORT as i32)
             }
+            ActionId::PreviousDiffHunk => self.jump_focused_diff_hunk(false),
+            ActionId::NextDiffHunk => self.jump_focused_diff_hunk(true),
+            ActionId::ToggleDiffWrap => self.toggle_focused_diff_wrap(),
             ActionId::ToggleDetails => self.toggle_conversation_details(),
             ActionId::Activate => self.activate_focused_conversation_block(),
             ActionId::CopyValue => self.copy_focused_conversation_block(),
@@ -11243,6 +11436,7 @@ impl App {
                     interaction_kind: Some(PendingInteractionKind::Clarification),
                     permission_request: None,
                     tool_arguments: None,
+                    proposed_file_change: None,
                     tool_arguments_truncated: false,
                 };
                 let mut incoming = self.question_from_pending(session_id, &pending);
@@ -15144,6 +15338,7 @@ mod question_tests {
                     "command": "cargo test --workspace",
                     "timeout_seconds": 120
                 })),
+                proposed_file_change: None,
                 tool_arguments_truncated: false,
             },
             "must-not-be-used".to_string(),
@@ -15756,6 +15951,7 @@ mod question_tests {
                 interaction_kind: Some(PendingInteractionKind::Permission),
                 permission_request: None,
                 tool_arguments: Some(serde_json::json!({"command": "git push"})),
+                proposed_file_change: None,
                 tool_arguments_truncated: false,
             },
             "never-submit".to_string(),
@@ -15793,6 +15989,7 @@ mod question_tests {
                 interaction_kind: None,
                 permission_request: None,
                 tool_arguments: None,
+                proposed_file_change: None,
                 tool_arguments_truncated: false,
             },
             "Approve".to_string(),
@@ -16171,6 +16368,7 @@ mod question_tests {
                     ],
                 )),
                 tool_arguments: Some(serde_json::json!({"command": "cargo test"})),
+                proposed_file_change: None,
                 tool_arguments_truncated: false,
             }),
         })
@@ -17473,7 +17671,7 @@ mod question_tests {
         assert_eq!(
             actual,
             vec![
-                18_250_622_092_155_643_324,
+                17_147_369_131_010_514_566,
                 1_057_473_937_556_339_135,
                 1_502_110_673_089_046_554,
                 14_484_161_115_671_232_577,
@@ -17708,6 +17906,7 @@ mod question_tests {
                 interaction_kind: Some(PendingInteractionKind::Permission),
                 permission_request: Some(current_request),
                 tool_arguments: Some(serde_json::json!({"command": "cargo test"})),
+                proposed_file_change: None,
                 tool_arguments_truncated: false,
             },
             String::new(),
@@ -25956,5 +26155,176 @@ mod auto_serve_tests {
         assert!(text.contains("Start a local"), "offer prompt missing");
         assert!(text.contains("y/Enter start"), "start action missing");
         assert!(text.contains("n/Esc skip"), "skip action missing");
+    }
+}
+
+#[cfg(test)]
+mod file_change_navigation_tests {
+    use super::*;
+
+    fn canonical_change() -> (String, String) {
+        let unified = "--- a/demo.rs\n+++ b/demo.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n@@ -20,1 +20,2 @@\n tail\n+extra".to_string();
+        let payload = serde_json::json!({
+            "operation": "Edit",
+            "message": "Edited file",
+            "file_path": "/workspace/demo.rs",
+            "workspace": "/workspace",
+            "checkpoint": {
+                "created": true,
+                "id": "checkpoint",
+                "path": "/checkpoints/demo.rs",
+                "size_bytes": 4
+            },
+            "diff": {
+                "format": "unified",
+                "unified": unified,
+                "old_line_count": 20,
+                "new_line_count": 21,
+                "added_lines": 2,
+                "removed_lines": 1,
+                "old_trailing_newline": true,
+                "new_trailing_newline": true,
+                "truncated": false
+            }
+        })
+        .to_string();
+        (payload, unified)
+    }
+
+    fn focused_diff_app() -> (App, String, String) {
+        let (payload, unified) = canonical_change();
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.chat.current_turn_id = Some("turn".to_string());
+        app.chat.current_tool_calls.push(ToolCallDisplay {
+            id: "change".to_string(),
+            tool_name: "Edit".to_string(),
+            arguments: "{}".to_string(),
+            result: Some(payload),
+            stream_output: String::new(),
+            error: None,
+            phase: "complete".to_string(),
+        });
+        let block_id = tool_block_id("turn", "change");
+        app.chat.register_block(block_id.clone());
+        app.chat.focused_block = Some(block_id.clone());
+        app.chat.content_width.set(80);
+        (app, block_id, unified)
+    }
+
+    #[test]
+    fn focused_diff_hunks_wrap_and_exact_copy_are_independent() {
+        let (mut app, block_id, unified) = focused_diff_app();
+
+        app.jump_focused_diff_hunk(true);
+        let first = app.chat.block_ui[&block_id].scroll;
+        assert!(first > 0);
+        assert!(app.chat.block_ui[&block_id].expanded);
+        assert_eq!(app.status_message, "Diff hunk 1/2");
+
+        app.jump_focused_diff_hunk(true);
+        let second = app.chat.block_ui[&block_id].scroll;
+        assert!(second > first);
+        assert_eq!(app.status_message, "Diff hunk 2/2");
+
+        app.jump_focused_diff_hunk(false);
+        assert_eq!(app.chat.block_ui[&block_id].scroll, first);
+
+        app.toggle_focused_diff_wrap();
+        assert!(!app.chat.block_ui[&block_id].diff_wrap);
+        assert_eq!(app.chat.block_ui[&block_id].scroll, 0);
+        app.toggle_focused_diff_wrap();
+        assert!(app.chat.block_ui[&block_id].diff_wrap);
+
+        let copied = app
+            .conversation_blocks()
+            .into_iter()
+            .find(|block| block.id == block_id)
+            .unwrap()
+            .copy_text();
+        assert_eq!(copied, unified);
+    }
+
+    #[test]
+    fn permission_diff_requires_complete_server_supplied_payload_and_copies_exact_text() {
+        let (payload, unified) = canonical_change();
+        let canonical: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let request = PermissionRequest {
+            request_id: "request".to_string(),
+            request_generation: "generation".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: Some("/workspace".to_string()),
+            tool_name: "Edit".to_string(),
+            permission_type: PermissionType::WriteFile,
+            resource: "/workspace/demo.rs".to_string(),
+            operation_summary: "edit demo.rs".to_string(),
+            risk_level: RiskLevel::Medium,
+            reason_code: PermissionReasonCode::ConfiguredAlwaysAsk,
+            effective_mode: EffectivePermissionMode::Default,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            policy_revision: 1,
+            matched_rule: None,
+            allowed_decisions: Vec::new(),
+            suggested_matchers: Vec::new(),
+        };
+        let pending = PendingQuestion {
+            has_pending_question: true,
+            question: "Allow edit?".to_string(),
+            options: Some(vec!["Approve".to_string(), "Deny".to_string()]),
+            allow_custom: false,
+            tool_call_id: Some("request".to_string()),
+            tool_name: Some("Edit".to_string()),
+            source: Some("permission".to_string()),
+            interaction_kind: Some(PendingInteractionKind::Permission),
+            permission_request: Some(request),
+            tool_arguments: Some(
+                serde_json::json!({"file_path": "/workspace/demo.rs", "patch": "model text"}),
+            ),
+            proposed_file_change: Some(canonical),
+            tool_arguments_truncated: false,
+        };
+        let mut active = ActiveQuestion::from_pending(
+            "permission:block".to_string(),
+            "session".to_string(),
+            &pending,
+            String::new(),
+        );
+        active.inspecting = true;
+        active.inspect_scroll = u16::MAX;
+        let ActiveQuestionKind::Permission(permission) = &mut active.kind else {
+            panic!("typed permission expected");
+        };
+        permission.inspect_target = Some(PermissionInspectTarget::Request);
+
+        assert!(permission.proposed_file_change().is_some());
+        let exact = permission.inspector_text();
+        assert!(exact.contains("PROPOSED FILE CHANGE"));
+        assert!(exact.ends_with(&unified));
+
+        let mut app = App::new(BambooClient::new("http://127.0.0.1:0"));
+        app.pending_question = Some(active);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("PROPOSED"));
+        assert!(rendered.contains("+ new"));
+
+        let ActiveQuestionKind::Permission(permission) =
+            &mut app.pending_question.as_mut().unwrap().kind
+        else {
+            unreachable!()
+        };
+        permission.proposed_file_change = None;
+        assert!(permission.proposed_file_change().is_none());
+        assert!(!permission.inspector_text().contains("PROPOSED FILE CHANGE"));
     }
 }
