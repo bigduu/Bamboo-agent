@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 
 use super::image_fallback::resolve_image_fallback;
 use super::{ExecuteRequest, ExecuteSyncInfo, ExecuteSyncReason};
@@ -23,10 +23,37 @@ mod validation;
 /// Execute the AI agent on a chat session.
 pub async fn handler(
     state: web::Data<AppState>,
+    http_request: HttpRequest,
     path: web::Path<String>,
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     let session_id = path.into_inner();
+    let prepared = match crate::app_state::mutation_idempotency::prepare(
+        &http_request,
+        "execute",
+        &format!("POST /api/v1/execute/{session_id}"),
+        &*req,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let Some(prepared) = prepared else {
+        return handle_execute(state, session_id, req).await;
+    };
+    let store = state.mutation_idempotency.clone();
+    store
+        .execute(prepared, || handle_execute(state, session_id, req))
+        .await
+}
+
+/// Execute a session for in-process callers that do not cross the HTTP
+/// boundary. HTTP callers should use [`handler`] so an `Idempotency-Key` can
+/// be honored before any durable work starts.
+pub async fn handle_execute(
+    state: web::Data<AppState>,
+    session_id: String,
+    req: web::Json<ExecuteRequest>,
+) -> HttpResponse {
     // Linearize startup ownership against an abandoned-turn reconciliation.
     // Reconciliation holds the same persistence lock through its durable CAS
     // and broadcast; whichever acquires it first becomes the authoritative

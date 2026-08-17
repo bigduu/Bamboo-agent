@@ -24,6 +24,12 @@ POST /api/v1/chat
 
 Create a new chat session or add a message to an existing session.
 
+Supply an optional `Idempotency-Key` header when a client may retry after an
+ambiguous timeout. For 10 minutes, an equivalent retry returns the first
+response without appending the message again. Reusing the key with another
+payload returns `409 idempotency_key_conflict`. Receipts are process-local and
+bounded; omitting the header preserves the normal behavior.
+
 **Request Body:**
 
 ```json
@@ -60,6 +66,11 @@ POST /api/v1/execute/{session_id}
 ```
 
 Start the agent execution loop for a session.
+
+`Idempotency-Key` has the same optional 10-minute replay contract as chat. An
+equivalent retry returns the original status, body, and `run_id` without
+starting another run. The canonical nested route
+`POST /api/v1/sessions/{session_id}/execute` shares the same receipt.
 
 **Path Parameters:**
 

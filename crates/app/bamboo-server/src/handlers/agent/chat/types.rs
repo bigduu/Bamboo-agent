@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
 ///   When absent or empty, the server falls back to its resolved default model
 ///   (issue #480) — the same resolution `GET /api/v1/execute/defaults` reports.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatRequest {
     pub message: String,
     pub session_id: Option<String>,
@@ -55,7 +55,7 @@ pub struct ChatRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatImage {
     pub base64: String,
     #[serde(default)]

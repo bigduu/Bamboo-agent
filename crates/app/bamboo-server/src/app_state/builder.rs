@@ -174,6 +174,8 @@ impl AppState {
         let (session_store, storage) = init_storage(&data_dir).await?;
         let session_create_operations =
             Arc::new(super::session_create_operations::SessionCreateOperationStore::new(&data_dir));
+        let mutation_idempotency =
+            Arc::new(super::mutation_idempotency::MutationIdempotencyStore::default());
         match session_create_operations.prune_expired().await {
             Ok(0) => {}
             Ok(deleted) => tracing::info!(
@@ -1020,6 +1022,7 @@ impl AppState {
             storage,
             session_store,
             session_create_operations,
+            mutation_idempotency,
             project_store,
             project_context_resolver,
             workspace_resolver,

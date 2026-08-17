@@ -241,6 +241,10 @@ pub struct AppState {
     pub(crate) session_create_operations:
         Arc<session_create_operations::SessionCreateOperationStore>,
 
+    /// Short-lived, process-local response receipts for `POST /chat` and
+    /// `POST /execute`. Raw caller keys and request payloads are never stored.
+    pub(crate) mutation_idempotency: Arc<mutation_idempotency::MutationIdempotencyStore>,
+
     /// Authoritative first-class Project registry and shared-resource paths.
     pub project_store: Arc<bamboo_projects::ProjectStore>,
 
@@ -515,6 +519,7 @@ pub mod runner_lifecycle;
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
+pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
