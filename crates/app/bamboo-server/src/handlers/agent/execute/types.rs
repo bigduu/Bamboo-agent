@@ -105,7 +105,7 @@ pub struct ExecuteResponse {
 ///   "model": "claude-3-opus"
 /// }
 /// ```
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ExecuteRequest {
     /// Optional model compatibility fallback for execution.
     #[serde(default)]

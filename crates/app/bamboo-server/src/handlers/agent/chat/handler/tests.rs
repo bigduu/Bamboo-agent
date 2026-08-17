@@ -638,6 +638,77 @@ mod optional_model_e2e {
         assert_eq!(session.model, "gpt-explicit-override");
     }
 
+    /// #733: a retry after the first response is lost must receive the exact
+    /// first response without appending the user message a second time.
+    #[actix_web::test]
+    async fn idempotency_key_replays_chat_without_duplicate_message() {
+        use bamboo_agent_core::Role;
+
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let request = || {
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .insert_header(("Idempotency-Key", "chat-retry-733"))
+                .set_json(serde_json::json!({
+                    "message": "persist exactly once",
+                    "model": "chat-model"
+                }))
+                .to_request()
+        };
+
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = test::read_body(first).await;
+        let replay = test::call_service(&app, request()).await;
+        assert_eq!(replay.status(), StatusCode::CREATED);
+        let replay_body = test::read_body(replay).await;
+        assert_eq!(
+            replay_body, first_body,
+            "retry must replay exact JSON bytes"
+        );
+
+        let response: Value = serde_json::from_slice(&first_body).expect("chat response JSON");
+        let session_id = response["session_id"].as_str().expect("session_id");
+        let session = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load session")
+            .expect("session exists");
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1,
+            "replay must not append a second user message"
+        );
+
+        let conflict = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .insert_header(("Idempotency-Key", "chat-retry-733"))
+                .set_json(serde_json::json!({
+                    "message": "different payload",
+                    "model": "chat-model"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict: Value = test::read_body_json(conflict).await;
+        assert_eq!(conflict["error"]["code"], "idempotency_key_conflict");
+    }
+
     /// No request model AND no server default configured → 400, not a silent
     /// empty-model session.
     #[actix_web::test]

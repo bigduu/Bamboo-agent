@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpRequest, HttpResponse};
 
 use super::{ChatRequest, ChatResponse};
 use crate::app_state::AppState;
@@ -170,7 +170,28 @@ mod tests;
 /// This endpoint accepts a user message and creates or updates a chat session.
 /// After calling this endpoint, use the returned `stream_url` to execute
 /// the agent and receive events.
-pub async fn handler(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> impl Responder {
+pub async fn handler(
+    state: web::Data<AppState>,
+    http_request: HttpRequest,
+    req: web::Json<ChatRequest>,
+) -> HttpResponse {
+    let prepared = match crate::app_state::mutation_idempotency::prepare(
+        &http_request,
+        "chat",
+        "POST /api/v1/chat",
+        &*req,
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let Some(prepared) = prepared else {
+        return handle_chat(state, req).await;
+    };
+    let store = state.mutation_idempotency.clone();
+    store.execute(prepared, || handle_chat(state, req)).await
+}
+
+async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) -> HttpResponse {
     let session_id = request::resolve_session_id(req.session_id.as_deref());
     let (
         existing_session_found,

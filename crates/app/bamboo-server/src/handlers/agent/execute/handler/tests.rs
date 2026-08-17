@@ -175,6 +175,162 @@ fn evaluate_client_sync_allows_missing_pending_question_tool_call_id() {
     );
 }
 
+mod idempotency_e2e {
+    use actix_web::{http::StatusCode, test, web, App};
+    use async_trait::async_trait;
+    use bamboo_agent_core::{Message, Session};
+    use bamboo_llm::{
+        LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelRouter,
+        ProviderRegistry,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    struct BlockingProvider {
+        calls: AtomicUsize,
+        started: Semaphore,
+        release: Semaphore,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                started: Semaphore::new(0),
+                release: Semaphore::new(0),
+            })
+        }
+
+        async fn response(&self) -> Result<LLMStream, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("release semaphore remains open");
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token("completed once".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for BlockingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.response().await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            _options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            self.response().await
+        }
+    }
+
+    async fn state_with_provider(provider: Arc<BlockingProvider>) -> web::Data<AppState> {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider = "openai".to_string();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("execute-model".to_string()),
+            ..Default::default()
+        });
+
+        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
+        let mut state = AppState::new_with_provider(data_dir, config, provider_trait)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_string(), provider as Arc<dyn LLMProvider>);
+        state.provider_registry = Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
+        state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
+        web::Data::new(state)
+    }
+
+    /// #733: execute retries replay the original Accepted response (including
+    /// run_id) instead of entering preparation or spawning another agent loop.
+    #[actix_web::test]
+    async fn idempotency_key_replays_execute_without_duplicate_run() {
+        let provider = BlockingProvider::new();
+        let state = state_with_provider(provider.clone()).await;
+        let session_id = "execute-idempotency-733";
+        let mut session = Session::new(session_id, "execute-model");
+        session.title_generated = true;
+        session.add_message(Message::user("run exactly once"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let request = || {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .insert_header(("Idempotency-Key", "execute-retry-733"))
+                .set_json(serde_json::json!({}))
+                .to_request()
+        };
+
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = test::read_body(first).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.started.acquire(),
+        )
+        .await
+        .expect("agent provider started")
+        .expect("started semaphore remains open")
+        .forget();
+
+        let replay = test::call_service(&app, request()).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay_body = test::read_body(replay).await;
+        assert_eq!(
+            replay_body, first_body,
+            "retry must replay the first run_id"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.agent_runners.read().await.len(), 1);
+
+        let cancel = state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .expect("runner remains registered")
+            .cancel_token
+            .clone();
+        cancel.cancel();
+        provider.release.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[actix_web::test]
 async fn startup_failure_persists_and_broadcasts_for_owned_turn() {
     use actix_web::web;
