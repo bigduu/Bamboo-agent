@@ -2185,20 +2185,38 @@ mod tests {
                             "common": {
                                 "headers": {
                                     "Authorization": "override-header-secret",
-                                    "X-Access-Key": "override-access-key-secret"
+                                    "X-Access-Key": "override-access-key-secret",
+                                    "X-Private-Key": "override-private-key-secret",
+                                    "X-Device-Key": "override-device-key-secret"
                                 },
-                                "body_patch": [{
-                                    "path": "/credential",
-                                    "value": "override-credential-secret"
-                                }]
+                                "body_patch": [
+                                    {
+                                        "path": "/credential",
+                                        "value": "override-credential-secret"
+                                    },
+                                    {
+                                        "path": "/secrets/primary",
+                                        "value": "override-plural-secret"
+                                    }
+                                ]
                             }
                         }))
                         .unwrap(),
                     ),
-                    extra: BTreeMap::from([(
-                        "future_secret".to_string(),
-                        json!("unknown-provider-secret"),
-                    )]),
+                    extra: BTreeMap::from([
+                        (
+                            "future_secret".to_string(),
+                            json!("unknown-provider-secret"),
+                        ),
+                        (
+                            "secrets".to_string(),
+                            json!({"primary": "unknown-provider-plural-secret"}),
+                        ),
+                        (
+                            "api_keys".to_string(),
+                            json!({"primary": "unknown-provider-api-keys-secret"}),
+                        ),
+                    ]),
                     ..OpenAIConfig::default()
                 }),
                 ..ProviderConfigs::default()
@@ -2291,8 +2309,13 @@ mod tests {
             "provider-ciphertext-secret",
             "override-header-secret",
             "override-access-key-secret",
+            "override-private-key-secret",
+            "override-device-key-secret",
             "override-credential-secret",
+            "override-plural-secret",
             "unknown-provider-secret",
+            "unknown-provider-plural-secret",
+            "unknown-provider-api-keys-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",
@@ -2337,8 +2360,13 @@ mod tests {
             "provider-ciphertext-secret",
             "override-header-secret",
             "override-access-key-secret",
+            "override-private-key-secret",
+            "override-device-key-secret",
             "override-credential-secret",
+            "override-plural-secret",
             "unknown-provider-secret",
+            "unknown-provider-plural-secret",
+            "unknown-provider-api-keys-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",

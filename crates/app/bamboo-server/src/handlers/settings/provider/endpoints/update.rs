@@ -230,8 +230,8 @@ mod tests {
             ..Default::default()
         };
         openai.extra.insert(
-            "client_secret".to_string(),
-            serde_json::json!("must-not-enter-extra"),
+            "secrets".to_string(),
+            serde_json::json!({"primary": "must-not-enter-extra"}),
         );
         config.providers_mut().openai = Some(openai);
 
@@ -250,9 +250,9 @@ mod tests {
                 "model": "gpt-test",
                 "request_overrides": {
                     "common": {
-                        "headers": {"X-Access-Key": "must-not-enter-overrides"},
+                        "headers": {"X-Private-Key": "must-not-enter-overrides"},
                         "body_patch": [{
-                            "path": "/credential",
+                            "path": "/secrets/primary",
                             "value": "must-not-enter-overrides"
                         }]
                     }

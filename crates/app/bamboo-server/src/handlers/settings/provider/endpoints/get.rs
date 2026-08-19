@@ -169,6 +169,9 @@ mod tests {
             "enabled": true,
             "api_key_from_env": true,
             "private_key": "instance-private-extra",
+            "secrets": {"primary": "instance-plural-extra"},
+            "api_keys": {"primary": "instance-api-keys-extra"},
+            "tokens": ["instance-tokens-extra"],
             "oauth": {
                 "client_id": "public-client-id",
                 "value": "instance-oauth-extra"
@@ -178,12 +181,15 @@ mod tests {
                     "headers": {
                         "Authorization": "Bearer override-header-secret",
                         "X-Access-Key": "override-access-key-secret",
+                        "X-Private-Key": "override-private-key-secret",
+                        "X-Device-Key": "override-device-key-secret",
                         "X-Api-Key": {"type": "env_ref", "name": "PROJECTED_API_KEY"},
                         "X-Trace": "public-trace"
                     },
                     "body_patch": [
                         {"path": "/api_key", "value": "override-body-secret"},
                         {"path": "/credential", "value": "override-credential-secret"},
+                        {"path": "/secrets/primary", "value": "override-plural-secret"},
                         {"path": "/api_key", "value": {"type": "env_ref", "name": "PROJECTED_API_KEY"}},
                         {"path": "/temperature", "value": 0.2}
                     ]
@@ -251,9 +257,15 @@ mod tests {
             "api_key_from_env",
             "override-header-secret",
             "override-access-key-secret",
+            "override-private-key-secret",
+            "override-device-key-secret",
             "override-body-secret",
             "override-credential-secret",
+            "override-plural-secret",
             "instance-private-extra",
+            "instance-plural-extra",
+            "instance-api-keys-extra",
+            "instance-tokens-extra",
             "instance-oauth-extra",
             "future-client-extra",
         ] {

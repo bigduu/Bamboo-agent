@@ -1301,14 +1301,19 @@ fn credential_token_is_sensitive(token: &str) -> bool {
             | "credential"
             | "credentials"
             | "secret"
+            | "secrets"
             | "token"
             | "password"
+            | "passwords"
             | "private"
             | "access"
             | "ciphertext"
+            | "ciphertexts"
             | "encrypted"
             | "cookie"
+            | "cookies"
             | "passphrase"
+            | "passphrases"
     )
 }
 
@@ -1317,13 +1322,21 @@ fn credential_key_compound_is_sensitive(tokens: &[String]) -> bool {
         matches!(
             (tokens[0].as_str(), tokens[1].as_str()),
             ("api", "key")
+                | ("api", "keys")
                 | ("auth", "key")
+                | ("auth", "keys")
                 | ("access", "key")
+                | ("access", "keys")
                 | ("private", "key")
+                | ("private", "keys")
                 | ("device", "key")
+                | ("device", "keys")
                 | ("secret", "key")
+                | ("secret", "keys")
                 | ("signing", "key")
+                | ("signing", "keys")
                 | ("encryption", "key")
+                | ("encryption", "keys")
         )
     })
 }
@@ -1342,6 +1355,53 @@ fn credential_name_has_terminal_sensitive_tokens(tokens: &[String]) -> bool {
         || (tokens.len() >= 2 && credential_key_compound_is_sensitive(&tokens[tokens.len() - 2..]))
 }
 
+fn normalized_terminal_token_collection(normalized: &str) -> bool {
+    normalized == "tokens"
+        || normalized.ends_with("apitokens")
+        || normalized.ends_with("authtokens")
+        || normalized.ends_with("accesstokens")
+        || normalized.ends_with("bearertokens")
+        || normalized.ends_with("idtokens")
+        || normalized.ends_with("refreshtokens")
+        || normalized.ends_with("sessiontokens")
+}
+
+fn normalized_request_override_credential_name(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "cookie" | "setcookie" | "authentication" | "secret" | "secrets" | "password" | "passwords"
+    ) || normalized.ends_with("authorization")
+        || normalized.ends_with("authkey")
+        || normalized.ends_with("authkeys")
+        || normalized.ends_with("auth")
+        || normalized.contains("apikey")
+        || normalized.ends_with("token")
+        || normalized_terminal_token_collection(normalized)
+        || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
+        || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
+        || normalized.ends_with("accesskey")
+        || normalized.ends_with("accesskeys")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("privatekeys")
+        || normalized.ends_with("devicekey")
+        || normalized.ends_with("devicekeys")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeys")
+        || normalized.ends_with("signingkey")
+        || normalized.ends_with("signingkeys")
+        || normalized.ends_with("encryptionkey")
+        || normalized.ends_with("encryptionkeys")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+        || normalized.ends_with("ciphertext")
+        || normalized.ends_with("ciphertexts")
+        || normalized.ends_with("encrypted")
+        || normalized.ends_with("passphrase")
+        || normalized.ends_with("passphrases")
+}
+
 fn normalized_terminal_credential_name(normalized: &str) -> bool {
     normalized.ends_with("auth")
         || normalized.ends_with("authentication")
@@ -1352,22 +1412,36 @@ fn normalized_terminal_credential_name(normalized: &str) -> bool {
         || normalized.ends_with("credential")
         || normalized.ends_with("credentials")
         || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
         || normalized.ends_with("token")
+        || normalized_terminal_token_collection(normalized)
         || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
         || normalized.ends_with("private")
         || normalized.ends_with("access")
         || normalized.ends_with("ciphertext")
+        || normalized.ends_with("ciphertexts")
         || normalized.ends_with("encrypted")
         || normalized.ends_with("cookie")
+        || normalized.ends_with("cookies")
         || normalized.ends_with("passphrase")
+        || normalized.ends_with("passphrases")
         || normalized.ends_with("apikey")
+        || normalized.ends_with("apikeys")
         || normalized.ends_with("accesskey")
+        || normalized.ends_with("accesskeys")
         || normalized.ends_with("authkey")
+        || normalized.ends_with("authkeys")
         || normalized.ends_with("privatekey")
+        || normalized.ends_with("privatekeys")
         || normalized.ends_with("devicekey")
+        || normalized.ends_with("devicekeys")
         || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeys")
         || normalized.ends_with("signingkey")
+        || normalized.ends_with("signingkeys")
         || normalized.ends_with("encryptionkey")
+        || normalized.ends_with("encryptionkeys")
         || normalized.ends_with("passwordhash")
         || normalized.ends_with("passwordsalt")
         || normalized.ends_with("tokenhash")
@@ -1459,8 +1533,21 @@ fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
     let credential_owned = key.to_ascii_lowercase().ends_with("_encrypted")
         || normalized.ends_with("encrypted")
         || normalized.ends_with("token")
+        || normalized_terminal_token_collection(&normalized)
         || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
         || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+        || normalized.ends_with("apikeys")
+        || normalized.ends_with("accesskeys")
+        || normalized.ends_with("authkeys")
+        || normalized.ends_with("privatekeys")
+        || normalized.ends_with("devicekeys")
+        || normalized.ends_with("secretkeys")
+        || normalized.ends_with("signingkeys")
+        || normalized.ends_with("encryptionkeys")
         || matches!(
             normalized.as_str(),
             "apikey"
@@ -2062,30 +2149,7 @@ fn validate_provider_body_patch(value: &Value) -> Result<(), String> {
 /// values that predate strict validation cannot be returned as plaintext.
 pub fn request_override_body_patch_targets_credential(path: &str) -> bool {
     fn credential_token(segment: &str) -> bool {
-        matches!(
-            segment,
-            "apikey"
-                | "token"
-                | "password"
-                | "secret"
-                | "appsecret"
-                | "clientsecret"
-                | "devicekey"
-                | "privatekey"
-                | "passphrase"
-                | "authorization"
-                | "cookie"
-                | "accesskey"
-                | "authkey"
-                | "credential"
-                | "credentials"
-        ) || segment.ends_with("token")
-            || segment.ends_with("password")
-            || segment.ends_with("secret")
-            || segment.ends_with("accesskey")
-            || segment.ends_with("authkey")
-            || segment.ends_with("credential")
-            || segment.ends_with("credentials")
+        normalized_request_override_credential_name(segment)
     }
 
     let decoded = path.replace("~1", "/").replace("~0", "~");
@@ -2207,20 +2271,7 @@ pub fn request_override_header_is_credential(name: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    matches!(compact.as_str(), "cookie" | "setcookie" | "authentication")
-        || compact.ends_with("authorization")
-        || compact.ends_with("authkey")
-        || compact.ends_with("auth")
-        || compact.contains("apikey")
-        || compact.ends_with("token")
-        || compact.ends_with("sessiontoken")
-        || compact == "secret"
-        || compact.ends_with("secret")
-        || compact == "password"
-        || compact.ends_with("password")
-        || compact.ends_with("accesskey")
-        || compact.ends_with("credential")
-        || compact.ends_with("credentials")
+    normalized_request_override_credential_name(&compact)
 }
 
 fn validate_mcp_headers(headers: &[bamboo_domain::mcp_config::HeaderConfig]) -> Result<(), String> {
@@ -6368,6 +6419,7 @@ mod tests {
     fn provider_api_metadata_scrubber_matches_durable_credential_contexts() {
         let original = json!({
             "headless_auth": true,
+            "max_tokens": 8192,
             "oauth": {
                 "client_id": "public-client",
                 "authorization_url": "https://auth.example.test/authorize",
@@ -6375,10 +6427,16 @@ mod tests {
             },
             "private_key": "private-literal",
             "nested": {"client_secret": "client-literal"},
+            "secrets": {"primary": "plural-container-literal"},
+            "tokens": ["plural-token-literal"],
+            "passwords": {"primary": "plural-password-literal"},
+            "api_keys": {"primary": "plural-api-key-literal"},
             "credential_ref": "provider.work.api_key",
             "headers": {
                 "X-Trace": "public-trace",
                 "X-Access-Key": "header-literal",
+                "X-Private-Key": "private-header-literal",
+                "X-Device-Key": "device-header-literal",
                 "Authorization": {"type": "env_ref", "name": "UPSTREAM_TOKEN"}
             }
         });
@@ -6388,6 +6446,7 @@ mod tests {
         scrub_provider_metadata_credentials(&mut sanitized);
 
         assert_eq!(sanitized["headless_auth"], true);
+        assert_eq!(sanitized["max_tokens"], 8192);
         assert_eq!(sanitized["oauth"]["client_id"], "public-client");
         assert_eq!(
             sanitized["oauth"]["authorization_url"],
@@ -6396,14 +6455,59 @@ mod tests {
         assert!(sanitized["oauth"].get("value").is_none());
         assert!(sanitized.get("private_key").is_none());
         assert!(sanitized["nested"].get("client_secret").is_none());
+        assert!(sanitized.get("secrets").is_none());
+        assert!(sanitized.get("tokens").is_none());
+        assert!(sanitized.get("passwords").is_none());
+        assert!(sanitized.get("api_keys").is_none());
         assert!(sanitized.get("credential_ref").is_none());
         assert_eq!(sanitized["headers"]["X-Trace"], "public-trace");
         assert!(sanitized["headers"].get("X-Access-Key").is_none());
+        assert!(sanitized["headers"].get("X-Private-Key").is_none());
+        assert!(sanitized["headers"].get("X-Device-Key").is_none());
         assert_eq!(
             sanitized["headers"]["Authorization"]["name"],
             "UPSTREAM_TOKEN"
         );
         assert!(provider_metadata_is_secret_free(&sanitized));
+    }
+
+    #[test]
+    fn request_override_credential_classifiers_cover_key_and_plural_forms() {
+        for header in [
+            "X-Private-Key",
+            "X-Device-Key",
+            "X-Secret-Keys",
+            "X-Api-Key-Version",
+        ] {
+            assert!(
+                request_override_header_is_credential(header),
+                "credential header was not classified: {header}"
+            );
+        }
+        for path in [
+            "/secrets/primary",
+            "/private/keys/primary",
+            "/device_keys/0",
+            "/accessKeys/current",
+            "/tokens/0",
+            "/passwords/primary",
+            "/api_keys/primary",
+        ] {
+            assert!(
+                request_override_body_patch_targets_credential(path),
+                "credential body path was not classified: {path}"
+            );
+        }
+        assert!(!request_override_header_is_credential("X-Trace-Id"));
+        assert!(!request_override_body_patch_targets_credential(
+            "/metadata/public_id"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/max_tokens"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/metadata/public_access"
+        ));
     }
 
     fn install_completed_legacy_openai(data_dir: &Path, secret: &str) -> (CredentialRef, u64) {

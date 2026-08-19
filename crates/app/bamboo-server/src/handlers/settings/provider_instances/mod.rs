@@ -767,6 +767,16 @@ mod tests {
             .expect_err("credential-shaped extra must be rejected");
         assert!(matches!(error, AppError::BadRequest(_)));
 
+        for field in ["secrets", "tokens", "passwords", "api_keys"] {
+            let mut plural = create_request("sk-real");
+            plural.config[field] = serde_json::json!({
+                "primary": format!("plural-{field}-literal")
+            });
+            let error = build_instance_from_create(&plural)
+                .expect_err("plural credential container must be rejected");
+            assert!(matches!(error, AppError::BadRequest(_)), "field: {field}");
+        }
+
         let mut recovered = build_instance_from_create(&create_request("sk-real")).unwrap();
         recovered.extra.insert(
             "private_key".to_string(),
@@ -779,10 +789,20 @@ mod tests {
                 "value": "recovered-oauth-literal"
             }),
         );
+        recovered.extra.insert(
+            "secrets".to_string(),
+            serde_json::json!({"primary": "recovered-plural-literal"}),
+        );
+        recovered.extra.insert(
+            "api_keys".to_string(),
+            serde_json::json!({"primary": "recovered-api-keys-literal"}),
+        );
         let response = Value::Object(instance_config_to_api(&recovered));
         let serialized = serde_json::to_string(&response).unwrap();
         assert!(!serialized.contains("recovered-private-literal"));
         assert!(!serialized.contains("recovered-oauth-literal"));
+        assert!(!serialized.contains("recovered-plural-literal"));
+        assert!(!serialized.contains("recovered-api-keys-literal"));
         assert_eq!(response["oauth"]["client_id"], "public-client-id");
     }
 
@@ -828,11 +848,14 @@ mod tests {
                     "headers": {
                         "Authorization": "Bearer response-secret",
                         "X-Access-Key": "access-key-response-secret",
+                        "X-Private-Key": "private-key-response-secret",
+                        "X-Device-Key": "device-key-response-secret",
                         "X-Api-Key": {"type": "env_ref", "name": "SAFE_API_KEY"}
                     },
                     "body_patch": [
                         {"path": "/api_key", "value": "body-response-secret"},
                         {"path": "/credential", "value": "credential-response-secret"},
+                        {"path": "/secrets/primary", "value": "plural-response-secret"},
                         {"path": "/api_key", "value": {"type": "env_ref", "name": "SAFE_API_KEY"}}
                     ]
                 }
@@ -844,8 +867,11 @@ mod tests {
         let serialized = serde_json::to_string(&api).unwrap();
         assert!(!serialized.contains("response-secret"));
         assert!(!serialized.contains("access-key-response-secret"));
+        assert!(!serialized.contains("private-key-response-secret"));
+        assert!(!serialized.contains("device-key-response-secret"));
         assert!(!serialized.contains("body-response-secret"));
         assert!(!serialized.contains("credential-response-secret"));
+        assert!(!serialized.contains("plural-response-secret"));
         assert_eq!(
             api["request_overrides"]["common"]["headers"]["X-Api-Key"]["type"],
             "env_ref"
@@ -864,8 +890,8 @@ mod tests {
         let mut literal = create_request("sk-real");
         literal.config["request_overrides"] = serde_json::json!({
             "common": {
-                "headers": {"X-Access-Key": "literal-access-key"},
-                "body_patch": [{"path": "/credential", "value": "literal-body-key"}]
+                "headers": {"X-Private-Key": "literal-private-key"},
+                "body_patch": [{"path": "/secrets/primary", "value": "literal-body-key"}]
             }
         });
         assert!(matches!(
@@ -882,6 +908,119 @@ mod tests {
             }
         });
         build_instance_from_create(&runtime).expect("runtime credential reference is secret-free");
+    }
+
+    #[actix_web::test]
+    async fn credential_shaped_writes_stay_rejected_after_real_restart_and_read() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("initial app state"),
+        );
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .route("/instances", web::post().to(create_provider_instance))
+                .route("/instances", web::get().to(list_provider_instances)),
+        )
+        .await;
+
+        let attempts = [
+            serde_json::json!({
+                "type": "openai",
+                "config": {
+                    "api_key": "valid-provider-key",
+                    "secrets": {"value": "restart-extra-secret"}
+                }
+            }),
+            serde_json::json!({
+                "type": "openai",
+                "config": {
+                    "api_key": "valid-provider-key",
+                    "request_overrides": {"common": {
+                        "headers": {"X-Private-Key": "restart-header-secret"}
+                    }}
+                }
+            }),
+            serde_json::json!({
+                "type": "openai",
+                "config": {
+                    "api_key": "valid-provider-key",
+                    "request_overrides": {"common": {
+                        "body_patch": [{
+                            "path": "/secrets/primary",
+                            "value": "restart-body-secret"
+                        }]
+                    }}
+                }
+            }),
+        ];
+        for payload in attempts {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/instances")
+                    .set_json(payload)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        }
+        drop(app);
+        drop(state);
+
+        for name in ["config.json", "providers.json", "credentials.json"] {
+            let path = temp_dir.path().join(name);
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for forbidden in [
+                    "restart-extra-secret",
+                    "restart-header-secret",
+                    "restart-body-secret",
+                    "valid-provider-key",
+                ] {
+                    assert!(
+                        !contents.contains(forbidden),
+                        "{name} retained rejected credential material"
+                    );
+                }
+            }
+        }
+
+        let restarted = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("restarted app state"),
+        );
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(restarted)
+                .route("/instances", web::get().to(list_provider_instances)),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/instances")
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body = String::from_utf8(actix_web::test::read_body(response).await.to_vec())
+            .expect("UTF-8 response");
+        for forbidden in [
+            "restart-extra-secret",
+            "restart-header-secret",
+            "restart-body-secret",
+            "valid-provider-key",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "restart response leaked {forbidden}"
+            );
+        }
+        let body: Value = serde_json::from_str(&body).expect("valid response JSON");
+        assert_eq!(body["instances"], serde_json::json!([]));
     }
 
     #[test]
