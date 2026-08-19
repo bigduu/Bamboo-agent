@@ -2591,11 +2591,15 @@ pub struct ToolsConfig {
     /// Tool names that are disabled globally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+
+    /// Preserve tool configuration owned by newer Bamboo versions or plugins.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl ToolsConfig {
     fn is_empty(&self) -> bool {
-        self.disabled.is_empty()
+        self.disabled.is_empty() && self.extra.is_empty()
     }
 }
 
@@ -2605,11 +2609,15 @@ pub struct SkillsConfig {
     /// Skill IDs that are disabled globally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+
+    /// Preserve skill configuration owned by newer Bamboo versions or plugins.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl SkillsConfig {
     fn is_empty(&self) -> bool {
-        self.disabled.is_empty()
+        self.disabled.is_empty() && self.extra.is_empty()
     }
 }
 
@@ -5268,6 +5276,76 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn tools_config_preserves_unknown_keys_across_roundtrip() {
+        let input = serde_json::json!({
+            "disabled": ["bash"],
+            "plugin_runtime": {
+                "timeout_ms": 5_000,
+                "sandbox": true
+            },
+            "future_flag": "enabled"
+        });
+
+        let config: ToolsConfig = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(config.disabled, vec!["bash"]);
+        assert_eq!(config.extra["plugin_runtime"]["timeout_ms"], 5_000);
+        assert_eq!(config.extra["future_flag"], "enabled");
+        assert_eq!(serde_json::to_value(config).unwrap(), input);
+    }
+
+    #[test]
+    fn tools_config_keeps_section_when_only_unknown_keys_present() {
+        let input = serde_json::json!({
+            "tool_extension": {
+                "mode": "strict",
+                "options": ["one", "two"]
+            }
+        });
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools": input.clone()
+        }))
+        .unwrap();
+
+        assert!(config.tools.disabled.is_empty());
+        assert_eq!(config.tools.extra["tool_extension"]["mode"], "strict");
+        assert_eq!(serde_json::to_value(&config).unwrap()["tools"], input);
+
+        let temp_home = TempHome::new();
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(temp_home.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["tools"], input);
+    }
+
+    #[test]
+    fn skills_config_preserves_unknown_keys_across_roundtrip() {
+        let input = serde_json::json!({
+            "external_catalog": {
+                "path": "/opt/bamboo/skills",
+                "refresh": false
+            },
+            "schema_version": 2
+        });
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "skills": input.clone()
+        }))
+        .unwrap();
+        assert!(config.skills.disabled.is_empty());
+        assert_eq!(config.skills.extra["external_catalog"]["refresh"], false);
+        assert_eq!(config.skills.extra["schema_version"], 2);
+        assert_eq!(serde_json::to_value(&config).unwrap()["skills"], input);
+
+        let temp_home = TempHome::new();
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(temp_home.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["skills"], input);
+    }
 
     #[test]
     fn lifecycle_hooks_round_trip_as_a_distinct_top_level_section() {

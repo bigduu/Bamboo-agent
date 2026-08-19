@@ -6266,8 +6266,14 @@ mod tests {
             "server": {"port": 9876},
             "provider": "gemini",
             "features": {"dynamic_model_routing": true},
-            "tools": {"disabled": ["bash"]},
-            "skills": {"disabled": ["private"]},
+            "tools": {
+                "disabled": ["bash"],
+                "future_tool_config": {"nested": true}
+            },
+            "skills": {
+                "disabled": ["private"],
+                "future_skill_config": {"nested": "kept"}
+            },
             "env_vars": [{"name": "VISIBLE", "value": "ok"}],
             "default_work_area": {"path": "/workspace"},
             "access_control": {"password_enabled": true, "password_hash": "hash"},
@@ -6312,6 +6318,8 @@ mod tests {
         assert_eq!(value["server"]["port"], 9876);
         assert_eq!(value["provider"], "gemini");
         assert_eq!(value["tools"]["disabled"][0], "bash");
+        assert_eq!(value["tools"]["future_tool_config"]["nested"], true);
+        assert_eq!(value["skills"]["future_skill_config"]["nested"], "kept");
         assert_eq!(value["default_work_area"]["path"], "/workspace");
         assert_eq!(value["run_budget"]["max_tool_calls"], 4);
         assert_eq!(value["plugin_trust"]["enforcement"], "off");
