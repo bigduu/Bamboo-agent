@@ -10,7 +10,12 @@ pub async fn authenticate_copilot(
     let config = app_state.config.read().await.clone();
     let app_data_dir = app_state.app_data_dir.clone();
 
-    if config.provider != "copilot" {
+    let effective_type = config
+        .provider_instances
+        .get(config.effective_default_provider())
+        .map(|instance| instance.provider_type.as_str())
+        .unwrap_or_else(|| config.effective_default_provider());
+    if effective_type != "copilot" {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "success": false,
             "error": crate::error::error_value("Current provider is not Copilot")

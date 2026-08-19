@@ -4,6 +4,8 @@ use crate::handlers::agent::execute::{ExecuteClientSync, ExecuteSyncInfo, Execut
 
 use bamboo_engine::session_app::types::ServerExecuteSnapshot;
 
+use super::resolve_requested_provider;
+
 fn evaluate_client_sync_adapter(
     client_sync: Option<&ExecuteClientSync>,
     server_snapshot: &ServerExecuteSnapshot,
@@ -34,6 +36,27 @@ fn validate_and_normalize_model_treats_empty_value_as_absent() {
     assert_eq!(
         validate_and_normalize_model(Some("   ")).expect("empty model should normalize"),
         None
+    );
+}
+
+#[test]
+fn requested_provider_fallback_uses_default_provider_instance() {
+    let mut config = bamboo_config::Config::default();
+    let instance = serde_json::from_value(serde_json::json!({
+        "provider_type": "openai",
+        "enabled": true
+    }))
+    .unwrap();
+    config.provider = "anthropic".to_string();
+    config
+        .provider_instances
+        .insert("execute-openai".to_string(), instance);
+    config.default_provider_instance = Some("execute-openai".to_string());
+
+    assert_eq!(resolve_requested_provider(&config, None), "execute-openai");
+    assert_eq!(
+        resolve_requested_provider(&config, Some("explicit")),
+        "explicit"
     );
 }
 

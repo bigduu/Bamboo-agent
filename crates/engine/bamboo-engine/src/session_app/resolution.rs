@@ -3,7 +3,7 @@
 //! gold config, mapped into the snapshot structs the agent loop consumes.
 //!
 //! These resolution rules are load-bearing invariants — the resolved provider
-//! name (session model ref, falling back to `config.provider`) and the global
+//! name (session model ref, falling back to the effective default provider) and the global
 //! (never session-bound) auxiliary model fallback. They were previously
 //! hand-rolled at every spawn/resume site; centralizing them here keeps the
 //! rules consistent by construction. The builder is pure orchestration over the
@@ -40,7 +40,7 @@ pub fn resolve_resume_config_snapshot(
 ) -> ResumeConfigSnapshot {
     let resolved_provider_name = session_effective_model_ref(session)
         .map(|model_ref| model_ref.provider)
-        .unwrap_or_else(|| config.provider.clone());
+        .unwrap_or_else(|| config.effective_default_provider().to_string());
     let resolved_provider_type = resolve_provider_type(config, &resolved_provider_name, registry);
     // Auxiliary models are global (config-derived), never session-bound.
     let areas = resolve_global_area_models(config, &resolved_provider_name, registry);
@@ -74,5 +74,34 @@ pub fn resolve_resume_config_snapshot(
                     .map(String::as_str),
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn session_without_model_ref_resumes_on_effective_default_instance() {
+        let mut config = Config::default();
+        config.provider = "openai".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "model": "claude-instance",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+        let registry = Arc::new(ProviderRegistry::new(HashMap::new(), "work".to_string()));
+        let session = Session::new("resume-instance-default", "claude-instance");
+
+        let resolved = resolve_resume_config_snapshot(&config, &registry, &session, None);
+
+        assert_eq!(resolved.provider_name, "work");
+        assert_eq!(resolved.provider_type.as_deref(), Some("anthropic"));
     }
 }

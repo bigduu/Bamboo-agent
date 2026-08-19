@@ -250,9 +250,38 @@ fn credential_refs_for_scope(
                     }))
             })
             .collect(),
-        ExactTransactionScope::Providers
-        | ExactTransactionScope::Mcp
-        | ExactTransactionScope::ClusterFabric => BTreeSet::new(),
+        ExactTransactionScope::Providers => [
+            config
+                .providers()
+                .openai
+                .as_ref()
+                .and_then(|provider| provider.credential_ref.clone()),
+            config
+                .providers()
+                .anthropic
+                .as_ref()
+                .and_then(|provider| provider.credential_ref.clone()),
+            config
+                .providers()
+                .gemini
+                .as_ref()
+                .and_then(|provider| provider.credential_ref.clone()),
+            config
+                .providers()
+                .bodhi
+                .as_ref()
+                .and_then(|provider| provider.credential_ref.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(
+            config
+                .provider_instances
+                .values()
+                .filter_map(|instance| instance.credential_ref.clone()),
+        )
+        .collect(),
+        ExactTransactionScope::Mcp | ExactTransactionScope::ClusterFabric => BTreeSet::new(),
     }
 }
 
@@ -315,6 +344,18 @@ pub(crate) fn validate_active_section_credential_values(
     let scope = non_cluster_credential_scope(section)?;
     let (active_refs, statuses) =
         semantic_credential_statuses_for_scope(config, scope, credential_lkg);
+    ensure_active_credential_statuses(&active_refs, &statuses)
+}
+
+pub(crate) fn validate_provider_credential_values(
+    config: &crate::Config,
+    credential_lkg: &crate::credential_store::CredentialDocumentLkg,
+) -> ConfigStoreResult<()> {
+    let (active_refs, statuses) = semantic_credential_statuses_for_scope(
+        config,
+        ExactTransactionScope::Providers,
+        credential_lkg,
+    );
     ensure_active_credential_statuses(&active_refs, &statuses)
 }
 

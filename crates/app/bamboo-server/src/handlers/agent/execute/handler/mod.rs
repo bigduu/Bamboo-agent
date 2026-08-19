@@ -105,12 +105,12 @@ pub async fn handle_execute(
         config_snapshot.disabled_tool_names().into_iter().collect();
     let disabled_skill_ids_vec: Vec<String> =
         config_snapshot.disabled_skill_ids().into_iter().collect();
-    let requested_provider = req
+    let explicit_provider = req
         .model_ref
         .as_ref()
         .map(|model_ref| model_ref.provider.as_str())
-        .or(req.provider.as_deref())
-        .unwrap_or(config_snapshot.provider.as_str());
+        .or(req.provider.as_deref());
+    let requested_provider = resolve_requested_provider(&config_snapshot, explicit_provider);
 
     let requested_provider_type = resolve_provider_type(
         &config_snapshot,
@@ -301,6 +301,13 @@ pub async fn handle_execute(
             bad_request_error_response(error)
         }
     }
+}
+
+fn resolve_requested_provider<'a>(
+    config: &'a bamboo_config::Config,
+    explicit_provider: Option<&'a str>,
+) -> &'a str {
+    explicit_provider.unwrap_or_else(|| config.effective_default_provider())
 }
 
 async fn fail_pending_startup(

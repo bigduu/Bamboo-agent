@@ -801,7 +801,9 @@ impl AgentRuntime {
                 .or_else(|| config.get_task_summary_model()),
             background_model_provider,
             summarization_model_provider,
-            provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
+            provider_name: Some(
+                provider_name.unwrap_or_else(|| config.effective_default_provider().to_string()),
+            ),
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,

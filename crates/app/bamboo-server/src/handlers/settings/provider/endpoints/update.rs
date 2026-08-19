@@ -23,6 +23,16 @@ pub(super) async fn handle_update_provider_config(
     let new_config = match app_state
         .update_config_with_provider_credentials(
             move |config| {
+                // This guard must run against the transaction-current snapshot,
+                // not a lock released before the mutation begins: a concurrent
+                // canonical migration must never leave a window where this
+                // legacy write is acknowledged and then discarded.
+                if is_instance_native(config) {
+                    return Err(AppError::BadRequest(
+                        "The legacy provider endpoint is read-only after provider-instance migration; use /v1/bamboo/config/provider-settings (revisioned) or /v1/bamboo/settings/provider-instances"
+                            .to_string(),
+                    ));
+                }
                 let current = config.clone();
                 let new_config = apply_provider_patch(&current, patch_obj, &api_key_intents)?;
                 validate_provider_config(&new_config)?;
@@ -53,6 +63,13 @@ pub(super) async fn handle_update_provider_config(
         "success": true,
         "provider": new_config.provider
     })))
+}
+
+fn is_instance_native(config: &Config) -> bool {
+    config
+        .default_provider_instance
+        .as_ref()
+        .is_some_and(|id| config.provider_instances.contains_key(id))
 }
 
 fn build_provider_patch(payload: &UpdateProviderRequest) -> serde_json::Map<String, Value> {
@@ -110,8 +127,76 @@ fn bad_request_response(message: String) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::build_provider_patch;
+    use super::{build_provider_patch, is_instance_native};
+    use crate::app_state::AppState;
     use crate::handlers::settings::provider::types::UpdateProviderRequest;
+    use actix_web::{test as actix_test, web, App};
+    use bamboo_config::{Config, ProviderInstanceConfig};
+
+    fn instance(provider_type: &str) -> ProviderInstanceConfig {
+        serde_json::from_value(serde_json::json!({
+            "provider_type": provider_type,
+            "enabled": true
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_update_is_rejected_only_for_resolved_instance_authority() {
+        let mut native = Config::default();
+        native
+            .provider_instances
+            .insert("work".to_string(), instance("openai"));
+        native.default_provider_instance = Some("work".to_string());
+        assert!(is_instance_native(&native));
+
+        let mut hybrid = native;
+        hybrid.default_provider_instance = Some("anthropic".to_string());
+        assert!(
+            !is_instance_native(&hybrid),
+            "a real legacy-default hybrid remains writable during the compatibility window"
+        );
+    }
+
+    #[actix_web::test]
+    async fn legacy_post_returns_bad_request_without_mutating_instance_native_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        {
+            let mut config = state.config.write().await;
+            let mut work = instance("openai");
+            work.api_key = "sk-work".to_string();
+            work.model = Some("instance-model".to_string());
+            config.provider_instances.insert("work".to_string(), work);
+            config.default_provider_instance = Some("work".to_string());
+        }
+        let app = actix_test::init_service(App::new().app_data(state.clone()).route(
+            "/provider",
+            web::post().to(super::handle_update_provider_config),
+        ))
+        .await;
+
+        let response = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::post()
+                .uri("/provider")
+                .set_json(serde_json::json!({
+                    "provider": "openai",
+                    "providers": {"openai": {"model": "legacy-write"}}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(actix_test::read_body(response).await.to_vec()).unwrap();
+        assert!(body.contains("provider-settings"));
+        assert_eq!(
+            state.config.read().await.provider_instances["work"]
+                .model
+                .as_deref(),
+            Some("instance-model")
+        );
+    }
 
     #[test]
     fn build_provider_patch_sets_provider_and_providers_fields() {

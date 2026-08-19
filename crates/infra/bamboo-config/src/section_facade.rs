@@ -1567,11 +1567,28 @@ fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
         )?;
     }
     for instance in value.provider_instances.values() {
+        let from_environment = match instance
+            .extra
+            .get(crate::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY)
+        {
+            Some(Value::Bool(true))
+                if matches!(instance.provider_type.as_str(), "openai" | "anthropic" | "gemini") =>
+            {
+                true
+            }
+            Some(Value::Bool(false)) | None => false,
+            Some(_) => {
+                return Err(
+                    "provider instance api_key_from_env must be a boolean and is only supported for openai, anthropic, or gemini"
+                        .to_string(),
+                )
+            }
+        };
         validate_provider_credential(
             &instance.api_key,
             instance.api_key_encrypted.as_deref(),
             instance.credential_ref.as_ref(),
-            false,
+            from_environment,
         )?;
     }
     let serialized = serde_json::to_value(value)
@@ -2999,7 +3016,8 @@ fn preflight_legacy_root_sections(
     input: &StrictPlanningInput,
     overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<()> {
-    let sanitized_config = scrub_preflight_config_secrets(&input.config)?;
+    let mut sanitized_config = scrub_preflight_config_secrets(&input.config)?;
+    crate::materialize_legacy_provider_instances(&mut sanitized_config);
     let projection = SectionProjection::from_config(&sanitized_config, input.model_limits.clone())?;
     let mut sections =
         project_legacy_raw_sections(&input.root_raw, None, &input.authoritative_sidecars)?;
@@ -3715,12 +3733,13 @@ fn plan_config_facade_layout_with_broker(
             continue;
         }
         let StrictPlanningInput {
-            config,
+            mut config,
             root_raw,
             model_limits,
             broker,
             authoritative_sidecars,
         } = input;
+        crate::materialize_legacy_provider_instances(&mut config);
         let mut projection = SectionProjection::from_config(&config, model_limits)?;
         let mut broker_raw = None;
         if include_broker {
@@ -3751,12 +3770,13 @@ fn plan_config_facade_compound_layout(
     let source_hashes = migration_source_hashes(data_dir)?;
     let overrides = &credential_plan.source_overrides;
     let StrictPlanningInput {
-        config,
+        mut config,
         root_raw,
         model_limits,
         broker,
         authoritative_sidecars,
     } = load_strict_planning_input_with_overrides(data_dir, Some(overrides))?;
+    crate::materialize_legacy_provider_instances(&mut config);
     let mut projection = SectionProjection::from_config(&config, model_limits)?;
     let mut broker_raw = None;
     if include_broker {
@@ -5042,6 +5062,39 @@ pub struct ConfigFacade {
     startup_legacy_root: Mutex<Option<LegacyRootReconciliationOutcome>>,
 }
 
+#[cfg(test)]
+type ProviderAuthorityMigrationTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+fn provider_authority_migration_test_hooks(
+) -> &'static Mutex<HashMap<PathBuf, ProviderAuthorityMigrationTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, ProviderAuthorityMigrationTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_provider_authority_migration_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    provider_authority_migration_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_provider_authority_migration_test_hook(data_dir: &Path) {
+    if let Some(hook) = provider_authority_migration_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook();
+    }
+}
+
 impl ConfigFacade {
     pub fn open(data_dir: impl AsRef<Path>) -> ConfigStoreResult<Self> {
         Self::open_stable(data_dir.as_ref(), |_| {})
@@ -5188,7 +5241,110 @@ impl ConfigFacade {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
         }
+        facade.materialize_legacy_provider_authority()?;
         Ok(facade)
+    }
+
+    /// Adopt a legacy or hybrid provider selection into the authoritative
+    /// provider-instance representation after the modular facade exists.
+    ///
+    /// The fresh durable envelope is the only mutation base: degraded LKG or
+    /// backup reads cannot authorize a repair write, and the content-aware CAS
+    /// catches raw-file races that do not advance the revision. Initial section
+    /// splitting uses the compound journal instead and normally makes this an
+    /// idempotent no-op on first open.
+    fn materialize_legacy_provider_authority(&self) -> ConfigStoreResult<bool> {
+        crate::credential_migration::with_provider_mcp_migration_lock(&self.data_dir, || {
+            crate::ensure_provider_mcp_migration_ready(&self.data_dir)?;
+            if !section_layout_is_active(&self.data_dir)? {
+                return Err(layout_not_committed());
+            }
+            if read_legacy_reconciliation_record(&self.data_dir)?.is_some_and(|record| {
+                !record.committed.is_empty()
+                    || !record.planned.is_empty()
+                    || !record.rejected.is_empty()
+            }) {
+                // Preserve exact legacy-root publication events. Advancing the
+                // provider revision before those events are acknowledged would
+                // turn a valid rN handoff into an apparent stale conflict. The
+                // next open after acknowledgement retries this idempotently.
+                return Ok(false);
+            }
+
+            for attempt in 0..2 {
+                let (mut durable_config, durable_envelope) =
+                    load_durable_effective_section_snapshot_under_migration_lock(
+                        &self.data_dir,
+                        SectionId::Providers,
+                    )?;
+                if !crate::materialize_legacy_provider_instances(&mut durable_config) {
+                    return Ok(false);
+                }
+                if durable_envelope.status != SectionStatus::Healthy
+                    || durable_envelope.source_kind != SectionSourceKind::File
+                {
+                    tracing::warn!(
+                        status = ?durable_envelope.status,
+                        source = ?durable_envelope.source_kind,
+                        "provider-instance authority migration deferred: durable provider base is unavailable"
+                    );
+                    return Ok(false);
+                }
+
+                let store = CredentialStore::open(&self.data_dir);
+                let (credential_lkg, _, credential_health) =
+                    store.snapshot_with_health_unchecked()?;
+                if credential_health.status != SectionStatus::Healthy
+                    || credential_health.source != SectionSourceKind::File
+                {
+                    tracing::warn!(
+                        status = ?credential_health.status,
+                        source = ?credential_health.source,
+                        "provider-instance authority migration deferred: credential base is unavailable"
+                    );
+                    return Ok(false);
+                }
+                if let Err(error) = crate::credential_migration::validate_provider_credential_values(
+                    &durable_config,
+                    &credential_lkg,
+                ) {
+                    tracing::warn!(
+                        error = %error,
+                        "provider-instance authority migration deferred: active credential is unavailable"
+                    );
+                    return Ok(false);
+                }
+
+                let durable: ProvidersSection = serde_json::from_value(durable_envelope.data)?;
+                let candidate =
+                    SectionProjection::from_config(&durable_config, ModelLimitsSection::default())?
+                        .providers;
+                validate_providers(&candidate).map_err(crate::ConfigStoreError::Validation)?;
+
+                #[cfg(test)]
+                run_provider_authority_migration_test_hook(&self.data_dir);
+
+                match self
+                    .registry
+                    .providers
+                    .commit_from_durable_base_with_envelope(
+                        durable_envelope.revision,
+                        &durable,
+                        candidate,
+                    ) {
+                    Ok(_) => return Ok(true),
+                    Err(crate::ConfigStoreError::Conflict { .. }) if attempt == 0 => {
+                        // A raw editor may win without advancing the envelope
+                        // revision. Normalize/adopt that exact winner, then
+                        // recompute migration once from the fresh bytes. A
+                        // second conflict remains fail-closed.
+                        let _ = self.registry.reload_if_changed(SectionId::Providers);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("bounded provider authority migration loop always returns")
+        })
     }
 
     pub fn registry(&self) -> &Arc<SectionRegistry> {
@@ -6036,6 +6192,435 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn install_completed_legacy_openai(data_dir: &Path, secret: &str) -> (CredentialRef, u64) {
+        let facade = ConfigFacade::open_or_migrate(data_dir).unwrap();
+        let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
+        let store = CredentialStore::open(data_dir);
+        let credential_revision = store.revision().unwrap();
+        store
+            .replace(
+                reference.clone(),
+                secret,
+                CredentialSource::Migrated,
+                credential_revision,
+            )
+            .unwrap();
+
+        let expected_revision = facade.registry().providers.snapshot().revision;
+        let mut providers = ProvidersSection {
+            provider: Some("openai".to_string()),
+            ..ProvidersSection::default()
+        };
+        providers.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(reference.clone()),
+            model: Some("gpt-legacy".to_string()),
+            ..crate::OpenAIConfig::default()
+        });
+        let event = facade
+            .registry()
+            .providers
+            .commit(expected_revision, providers)
+            .unwrap();
+        let ConfigSectionEvent::Changed { revision, .. } = event else {
+            panic!("provider commit should advance the revision")
+        };
+        (reference, revision)
+    }
+
+    #[test]
+    fn initial_split_materializes_provider_instance_without_copying_plaintext() {
+        let _key = crate::encryption::set_test_encryption_key([201; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "openai",
+                "providers": {
+                    "openai": {
+                        "api_key": "initial-split-secret",
+                        "model": "gpt-legacy"
+                    }
+                }
+            }),
+        );
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = facade
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.data["default_provider_instance"], json!("openai"));
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            json!("provider.openai.api_key")
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert_no_plaintext_in_persistent_files(dir.path(), &["initial-split-secret"]);
+
+        let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "initial-split-secret"
+        );
+        let revision = envelope.revision;
+        drop(facade);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let after = restarted
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(after.revision, revision, "restart must be idempotent");
+        assert_eq!(
+            after.data["provider_instances"]["openai"]["model"],
+            json!("gpt-legacy")
+        );
+        let runtime = Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            runtime.provider_instances["openai"].api_key,
+            "initial-split-secret"
+        );
+    }
+
+    #[test]
+    fn completed_facade_materializes_legacy_provider_with_exact_revision_and_restart() {
+        let _key = crate::encryption::set_test_encryption_key([202; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "completed-facade-secret");
+
+        let migrated = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = migrated
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.revision, legacy_revision + 1);
+        assert_eq!(envelope.data["default_provider_instance"], json!("openai"));
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            json!(reference.as_str())
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert_no_plaintext_in_persistent_files(dir.path(), &["completed-facade-secret"]);
+        drop(migrated);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            restarted.registry().providers.snapshot().revision,
+            legacy_revision + 1
+        );
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "completed-facade-secret"
+        );
+    }
+
+    #[test]
+    fn completed_facade_preserves_nondefault_legacy_aliases_with_explicit_default() {
+        let _key = crate::encryption::set_test_encryption_key([212; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let openai_ref = CredentialRef::parse("provider.openai.api_key").unwrap();
+        let anthropic_ref = CredentialRef::parse("provider.anthropic.api_key").unwrap();
+        let (credential_revision, _) = store
+            .replace(
+                openai_ref.clone(),
+                "hybrid-openai-secret",
+                CredentialSource::Migrated,
+                store.revision().unwrap(),
+            )
+            .unwrap();
+        store
+            .replace(
+                anthropic_ref.clone(),
+                "hybrid-anthropic-secret",
+                CredentialSource::Migrated,
+                credential_revision,
+            )
+            .unwrap();
+
+        let expected_revision = facade.registry().providers.snapshot().revision;
+        let mut providers = ProvidersSection {
+            provider: Some("work".to_string()),
+            default_provider_instance: Some("work".to_string()),
+            ..ProvidersSection::default()
+        };
+        providers.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot",
+                "enabled": true,
+                "model": "gpt-work"
+            }))
+            .unwrap(),
+        );
+        providers.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(openai_ref.clone()),
+            model: Some("gpt-legacy".to_string()),
+            ..crate::OpenAIConfig::default()
+        });
+        providers.providers.anthropic = Some(crate::AnthropicConfig {
+            credential_ref: Some(anthropic_ref.clone()),
+            model: Some("claude-legacy".to_string()),
+            ..crate::AnthropicConfig::default()
+        });
+        let event = facade
+            .registry()
+            .providers
+            .commit(expected_revision, providers)
+            .unwrap();
+        let ConfigSectionEvent::Changed {
+            revision: hybrid_revision,
+            ..
+        } = event
+        else {
+            panic!("hybrid provider commit should advance the revision")
+        };
+        drop(facade);
+
+        let migrated = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = migrated
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.revision, hybrid_revision + 1);
+        assert_eq!(envelope.data["default_provider_instance"], "work");
+        assert_eq!(
+            envelope.data["provider_instances"]["work"]["model"],
+            "gpt-work"
+        );
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            openai_ref.as_str()
+        );
+        assert_eq!(
+            envelope.data["provider_instances"]["anthropic"]["credential_ref"],
+            anthropic_ref.as_str()
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert!(envelope.data.get("anthropic").is_none());
+        assert_no_plaintext_in_persistent_files(
+            dir.path(),
+            &["hybrid-openai-secret", "hybrid-anthropic-secret"],
+        );
+        let migrated_revision = envelope.revision;
+        drop(migrated);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            restarted.registry().providers.snapshot().revision,
+            migrated_revision,
+            "the explicit-default hybrid migration must be idempotent"
+        );
+        assert_eq!(
+            store.resolve(&openai_ref).unwrap().unwrap().expose(),
+            "hybrid-openai-secret"
+        );
+        assert_eq!(
+            store.resolve(&anthropic_ref).unwrap().unwrap().expose(),
+            "hybrid-anthropic-secret"
+        );
+    }
+
+    #[test]
+    fn completed_migration_rebases_once_on_same_revision_editor_winner() {
+        let _key = crate::encryption::set_test_encryption_key([203; 32]);
+        let dir = TempDir::new().unwrap();
+        let (_, legacy_revision) = install_completed_legacy_openai(dir.path(), "cas-race-secret");
+        let providers_path = dir.path().join("providers.json");
+        let hook_path = providers_path.clone();
+        set_provider_authority_migration_test_hook(dir.path(), move || {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+            document["data"]["openai"]["model"] = json!("editor-same-revision");
+            write_json(&hook_path, &document);
+        });
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(&providers_path).unwrap()).unwrap();
+        assert_eq!(
+            document["data"]["provider_instances"]["openai"]["model"],
+            json!("editor-same-revision")
+        );
+        assert_eq!(document["revision"], legacy_revision + 2);
+        assert!(document["data"].get("openai").is_none());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision + 2
+        );
+    }
+
+    #[test]
+    fn degraded_instance_native_provider_lkg_remains_readable() {
+        let _key = crate::encryption::set_test_encryption_key([204; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "openai",
+                "providers": {"openai": {"api_key": "native-lkg-secret"}}
+            }),
+        );
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate
+            .provider_instances
+            .get_mut("openai")
+            .unwrap()
+            .model = Some("gpt-native-lkg".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, candidate)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            b"corrupt provider authority",
+        )
+        .unwrap();
+        drop(facade);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!reopened.materialize_legacy_provider_authority().unwrap());
+        let snapshot = reopened.registry().providers.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Degraded);
+        assert!(snapshot.data.provider_instances.contains_key("openai"));
+        assert_eq!(
+            reopened
+                .effective_config()
+                .default_provider_instance
+                .as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn degraded_legacy_provider_lkg_defers_migration_without_losing_readability() {
+        let _key = crate::encryption::set_test_encryption_key([205; 32]);
+        let dir = TempDir::new().unwrap();
+        install_completed_legacy_openai(dir.path(), "legacy-lkg-secret");
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate.providers.openai.as_mut().unwrap().model = Some("gpt-newer".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, candidate)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            b"corrupt provider authority",
+        )
+        .unwrap();
+        drop(facade);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!reopened.materialize_legacy_provider_authority().unwrap());
+        let snapshot = reopened.registry().providers.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Degraded);
+        assert!(snapshot.data.provider_instances.is_empty());
+        assert_eq!(snapshot.data.provider.as_deref(), Some("openai"));
+        assert!(snapshot.data.providers.openai.is_some());
+    }
+
+    #[test]
+    fn degraded_credential_lkg_defers_completed_provider_migration() {
+        let _key = crate::encryption::set_test_encryption_key([207; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "credential-lkg-one");
+        let store = CredentialStore::open(dir.path());
+        let credential_revision = store.revision().unwrap();
+        store
+            .replace(
+                reference,
+                "credential-lkg-two",
+                CredentialSource::User,
+                credential_revision,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            b"corrupt credential authority",
+        )
+        .unwrap();
+
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!facade.materialize_legacy_provider_authority().unwrap());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision
+        );
+        assert!(facade
+            .registry()
+            .providers
+            .snapshot()
+            .data
+            .provider_instances
+            .is_empty());
+        assert_eq!(
+            facade.registry().credentials.health().status,
+            SectionStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn pending_legacy_publication_defers_provider_authority_revision() {
+        let _key = crate::encryption::set_test_encryption_key([206; 32]);
+        let dir = TempDir::new().unwrap();
+        let (_, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "pending-publication-secret");
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let record = LegacyRootReconciliationRecord {
+            version: LEGACY_ROOT_RECONCILIATION_VERSION,
+            root_sha256: "1".repeat(64),
+            complete: true,
+            committed: BTreeMap::from([(
+                "providers".to_string(),
+                LegacyRootCommittedPublication {
+                    revision: legacy_revision,
+                    candidate_sha256: "2".repeat(64),
+                    runtime_degraded: false,
+                },
+            )]),
+            planned: BTreeMap::new(),
+            rejected: Vec::new(),
+            unknown_fields: 0,
+        };
+        crate::credential_migration::with_provider_mcp_migration_lock(dir.path(), || {
+            write_legacy_reconciliation_record(dir.path(), &record)
+        })
+        .unwrap();
+
+        assert!(!facade.materialize_legacy_provider_authority().unwrap());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision
+        );
+        assert!(facade
+            .registry()
+            .providers
+            .snapshot()
+            .data
+            .provider_instances
+            .is_empty());
     }
 
     #[test]

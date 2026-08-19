@@ -202,9 +202,7 @@ async fn resolve_gold_provider_and_model(
 ) -> Result<GoldAuxiliaryTarget, String> {
     // Resolve fast model eagerly for the fallback chain.
     let config_snapshot = state.config().read().await.clone();
-    let provider_name = session_effective_model_ref(session)
-        .map(|r| r.provider.clone())
-        .unwrap_or_else(|| config_snapshot.provider.clone());
+    let provider_name = gold_provider_name(&config_snapshot, session);
     let stream_timeout = config_snapshot.stream_timeout;
     let configured_limit = crate::runtime::config::normalize_auxiliary_evaluation_max_concurrency(
         config_snapshot
@@ -317,6 +315,12 @@ async fn resolve_gold_provider_and_model(
     ))
 }
 
+fn gold_provider_name(config: &bamboo_config::Config, session: &Session) -> String {
+    session_effective_model_ref(session)
+        .map(|r| r.provider.clone())
+        .unwrap_or_else(|| config.effective_default_provider().to_string())
+}
+
 fn gold_auxiliary_target(
     provider: Arc<dyn LLMProvider>,
     model: String,
@@ -344,4 +348,28 @@ fn normalize_lightweight_reasoning_effort(
         ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
         other => other,
     })
+}
+
+#[cfg(test)]
+mod provider_selection_tests {
+    use super::gold_provider_name;
+    use bamboo_agent_core::Session;
+
+    #[test]
+    fn gold_provider_fallback_uses_default_provider_instance() {
+        let mut config = bamboo_config::Config::default();
+        let instance = serde_json::from_value(serde_json::json!({
+            "provider_type": "anthropic",
+            "enabled": true
+        }))
+        .unwrap();
+        config.provider = "openai".to_string();
+        config
+            .provider_instances
+            .insert("gold-anthropic".to_string(), instance);
+        config.default_provider_instance = Some("gold-anthropic".to_string());
+        let session = Session::new("gold-provider-instance", "model");
+
+        assert_eq!(gold_provider_name(&config, &session), "gold-anthropic");
+    }
 }

@@ -154,6 +154,14 @@ pub struct ProviderInstanceSettingsData {
     /// Anthropic-compatible upstream opt-in introduced by #520.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_replay_always: Option<bool>,
+    /// Anthropic maximum output tokens retained from the legacy provider
+    /// contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Copilot device-flow browser behavior retained from the legacy provider
+    /// contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless_auth: Option<bool>,
 }
 
 fn provider_instance_enabled_default() -> bool {
@@ -199,6 +207,13 @@ impl ProviderInstanceSettingsData {
                         .and_then(Value::as_bool)
                 })
                 .flatten(),
+            max_tokens: (instance.provider_type == "anthropic")
+                .then(|| instance.extra.get("max_tokens").and_then(Value::as_u64))
+                .flatten()
+                .and_then(|value| u32::try_from(value).ok()),
+            headless_auth: (instance.provider_type == "copilot")
+                .then(|| instance.extra.get("headless_auth").and_then(Value::as_bool))
+                .flatten(),
         }
     }
 
@@ -218,6 +233,12 @@ impl ProviderInstanceSettingsData {
                 bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
                 json!(explicit_prompt_cache),
             );
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            extra.insert("max_tokens".to_string(), json!(max_tokens));
+        }
+        if let Some(headless_auth) = self.headless_auth {
+            extra.insert("headless_auth".to_string(), json!(headless_auth));
         }
         ProviderInstanceConfig {
             provider_type: self.provider_type,
@@ -272,7 +293,7 @@ pub async fn get_provider_section(
     let _io = app_state.config_io_lock.lock().await;
     let config = app_state.config.read().await.clone();
     let data = json!({
-        "active_provider": config.provider,
+        "active_provider": config.effective_default_provider(),
         "providers": provider_diagnostics(&config),
         "defaults": config.defaults,
         "features": config.features,
@@ -300,13 +321,17 @@ pub async fn get_provider_settings_section(
     macro_rules! builtin_status {
         ($name:literal, $field:ident, $from_env:expr) => {
             if let Some(provider) = config.providers().$field.as_ref() {
+                let environment_bound = $from_env;
+                let runtime_configured =
+                    !provider.api_key.trim().is_empty() || provider.api_key_encrypted.is_some();
                 builtin_status.insert(
                     $name.to_string(),
                     serde_json::to_value(provider_credential_status(
                         &app_state,
                         provider.credential_ref.as_ref(),
-                        $from_env,
-                        !provider.api_key.trim().is_empty() || provider.api_key_encrypted.is_some(),
+                        environment_bound,
+                        environment_bound && !provider.api_key.trim().is_empty(),
+                        runtime_configured,
                     )?)?,
                 );
             }
@@ -343,12 +368,14 @@ pub async fn get_provider_settings_section(
 
     let mut instance_status = Map::new();
     for (id, instance) in &config.provider_instances {
+        let environment_bound = bamboo_config::provider_instance_api_key_from_env(instance);
         instance_status.insert(
             id.clone(),
             serde_json::to_value(provider_credential_status(
                 &app_state,
                 instance.credential_ref.as_ref(),
-                false,
+                environment_bound,
+                bamboo_config::provider_instance_environment_override_active(instance),
                 !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some(),
             )?)?,
         );
@@ -446,6 +473,7 @@ pub async fn put_provider_settings_section(
                 candidate,
                 &credential_changes.provider_instances,
             )?;
+            validate_provider_settings_default(candidate)?;
             bamboo_llm::validate_provider_config(candidate).map_err(|error| {
                 ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
             })?;
@@ -762,7 +790,7 @@ fn sanitized_provider_instance_metadata(
     Ok(value)
 }
 
-fn scrub_unsafe_request_override_literals(value: &mut Value) {
+pub(crate) fn scrub_unsafe_request_override_literals(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(headers) = object.get_mut("headers").and_then(Value::as_object_mut) {
@@ -800,9 +828,18 @@ fn scrub_unsafe_request_override_literals(value: &mut Value) {
 fn provider_credential_status(
     app_state: &AppState,
     credential_ref: Option<&bamboo_config::CredentialRef>,
-    from_environment: bool,
+    environment_bound: bool,
+    environment_active: bool,
     runtime_configured: bool,
 ) -> Result<ProviderCredentialStatusView, AppError> {
+    if environment_active {
+        return Ok(ProviderCredentialStatusView {
+            credential_ref: credential_ref.map(|reference| reference.as_str().to_string()),
+            configured: true,
+            source: Some("environment".to_string()),
+            updated_at: None,
+        });
+    }
     if let Some(reference) = credential_ref {
         let status = app_state
             .credential_store
@@ -823,8 +860,11 @@ fn provider_credential_status(
     }
     Ok(ProviderCredentialStatusView {
         credential_ref: None,
-        configured: from_environment || runtime_configured,
-        source: if from_environment {
+        // An env marker records a binding, not availability. Without an active
+        // variable or a stored fallback, stale in-memory plaintext cannot make
+        // the instance appear configured.
+        configured: !environment_bound && runtime_configured,
+        source: if environment_bound {
             Some("environment".to_string())
         } else if runtime_configured {
             Some("migrated".to_string())
@@ -844,6 +884,30 @@ fn provider_exists(providers: &ProviderConfigs, name: &str) -> bool {
         "bodhi" => providers.bodhi.is_some(),
         _ => false,
     }
+}
+
+fn validate_provider_settings_default(
+    candidate: &bamboo_config::Config,
+) -> Result<(), ConfigSectionMutationError> {
+    let Some(default_id) = candidate.default_provider_instance.as_deref() else {
+        if candidate.provider_instances.is_empty()
+            || provider_exists(candidate.providers(), &candidate.provider)
+        {
+            return Ok(());
+        }
+        return Err(ConfigSectionMutationError::Invalid(format!(
+            "provider instances require a default_provider_instance_id when legacy provider '{}' is not configured",
+            candidate.provider
+        )));
+    };
+    if candidate.provider_instances.contains_key(default_id)
+        || provider_exists(candidate.providers(), default_id)
+    {
+        return Ok(());
+    }
+    Err(ConfigSectionMutationError::Invalid(format!(
+        "default provider instance '{default_id}' has no matching provider instance or legacy provider configuration"
+    )))
 }
 
 fn retain_provider_settings_server_owned_fields(
@@ -900,6 +964,8 @@ fn retain_provider_settings_server_owned_fields(
                         key.as_str(),
                         "target_provider"
                             | "thinking_replay_always"
+                            | "max_tokens"
+                            | "headless_auth"
                             | bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
                     )
                 })
@@ -996,6 +1062,9 @@ fn apply_provider_instance_credential_changes(
                 ProviderCredentialChange::Replace { value } if !value.trim().is_empty() => {
                     instance.api_key = value.clone();
                     instance.api_key_encrypted = None;
+                    instance
+                        .extra
+                        .remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
                 }
                 ProviderCredentialChange::Replace { .. } => {
                     return Err(ConfigSectionMutationError::Invalid(format!(
@@ -1005,6 +1074,9 @@ fn apply_provider_instance_credential_changes(
                 ProviderCredentialChange::Clear => {
                     instance.api_key.clear();
                     instance.api_key_encrypted = None;
+                    instance
+                        .extra
+                        .remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
                 }
             },
             None if matches!(change, ProviderCredentialChange::Clear) => {}
@@ -1049,6 +1121,16 @@ fn validate_provider_instance_shape(
         if instance.thinking_replay_always.is_some() && instance.provider_type != "anthropic" {
             return Err(format!(
                 "thinking_replay_always is only accepted for anthropic provider instance '{id}'"
+            ));
+        }
+        if instance.max_tokens.is_some() && instance.provider_type != "anthropic" {
+            return Err(format!(
+                "max_tokens is only accepted for anthropic provider instance '{id}'"
+            ));
+        }
+        if instance.headless_auth.is_some() && instance.provider_type != "copilot" {
+            return Err(format!(
+                "headless_auth is only accepted for copilot provider instance '{id}'"
             ));
         }
         if instance.explicit_prompt_cache.is_some() && instance.provider_type != "openai" {
@@ -1880,6 +1962,31 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::time::Duration;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn server(id: &str, transport: TransportConfig) -> McpServerConfig {
         McpServerConfig {
             id: id.to_string(),
@@ -1892,6 +1999,83 @@ mod tests {
             allowed_tools: vec!["read".to_string()],
             denied_tools: vec!["delete".to_string()],
         }
+    }
+
+    #[actix_web::test]
+    async fn provider_instance_credential_intent_clears_environment_marker() {
+        let mut config = bamboo_config::Config::default();
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "api_key_from_env": true
+        }))
+        .unwrap();
+        instance.api_key = "sk-runtime-env".to_string();
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+
+        apply_provider_instance_credential_changes(
+            &mut config,
+            &BTreeMap::from([(
+                "work".to_string(),
+                ProviderCredentialChange::Replace {
+                    value: "sk-user".to_string(),
+                },
+            )]),
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &config.provider_instances["work"]
+        ));
+
+        config
+            .provider_instances
+            .get_mut("work")
+            .unwrap()
+            .extra
+            .insert(
+                bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.to_string(),
+                json!(true),
+            );
+        apply_provider_instance_credential_changes(
+            &mut config,
+            &BTreeMap::from([("work".to_string(), ProviderCredentialChange::Clear)]),
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &config.provider_instances["work"]
+        ));
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_default_rejects_dangling_builtin_alias() {
+        let mut config = bamboo_config::Config::default();
+        *config.providers_mut() = ProviderConfigs::default();
+        config.default_provider_instance = Some("copilot".to_string());
+        assert!(matches!(
+            validate_provider_settings_default(&config),
+            Err(ConfigSectionMutationError::Invalid(_))
+        ));
+
+        config.providers_mut().copilot = Some(Default::default());
+        validate_provider_settings_default(&config)
+            .expect("an actual legacy stanza keeps the hybrid alias valid");
+
+        config.default_provider_instance = None;
+        config.provider = "anthropic".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            validate_provider_settings_default(&config),
+            Err(ConfigSectionMutationError::Invalid(_))
+        ));
     }
 
     fn editable_provider_settings() -> Value {
@@ -3119,6 +3303,144 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn provider_settings_environment_status_tracks_runtime_availability() {
+        let _lock = bamboo_config::test_support::env_cache_lock_acquire();
+        let _openai = EnvVarGuard::set(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-openai-environment"),
+        );
+        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        {
+            let mut config = state.config.write().await;
+            for (id, provider_type, api_key) in [
+                ("available", "openai", "sk-runtime-openai-environment"),
+                ("missing", "gemini", "stale-runtime-value"),
+            ] {
+                let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
+                    "provider_type": provider_type,
+                    "enabled": true,
+                    "api_key_from_env": true
+                }))
+                .unwrap();
+                instance.api_key = api_key.to_string();
+                config.provider_instances.insert(id.to_string(), instance);
+            }
+        }
+        let app = test::init_service(App::new().app_data(state).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["data"]["credential_status"]["provider_instances"]["available"]["configured"],
+            true
+        );
+        assert_eq!(
+            body["data"]["credential_status"]["provider_instances"]["missing"]["configured"],
+            false
+        );
+        for id in ["available", "missing"] {
+            assert_eq!(
+                body["data"]["credential_status"]["provider_instances"][id]["source"],
+                "environment"
+            );
+            assert!(body["data"]["provider_instances"][id]
+                .get("api_key_from_env")
+                .is_none());
+        }
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_environment_override_precedes_and_falls_back_to_stored_ref() {
+        let _lock = bamboo_config::test_support::env_cache_lock_acquire();
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6a; 32]);
+        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", Some("sk-runtime-openai-override"));
+        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let credential_ref =
+            CredentialRef::parse("provider.work.api_key").expect("valid credential ref");
+        state
+            .credential_store
+            .replace(
+                credential_ref.clone(),
+                "sk-stored-fallback",
+                bamboo_config::CredentialSource::Migrated,
+                0,
+            )
+            .unwrap();
+        {
+            let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key_from_env": true,
+                "credential_ref": credential_ref.as_str()
+            }))
+            .unwrap();
+            instance.api_key = "sk-runtime-openai-override".to_string();
+            let mut config = state.config.write().await;
+            config
+                .provider_instances
+                .insert("work".to_string(), instance);
+            config.default_provider_instance = Some("work".to_string());
+        }
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        let active = &body["data"]["credential_status"]["provider_instances"]["work"];
+        assert_eq!(active["configured"], true);
+        assert_eq!(active["source"], "environment");
+        assert_eq!(active["credential_ref"], credential_ref.as_str());
+
+        std::env::remove_var("BAMBOO_OPENAI_API_KEY");
+        state
+            .config
+            .write()
+            .await
+            .provider_instances
+            .get_mut("work")
+            .unwrap()
+            .api_key = "sk-stored-fallback".to_string();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        let fallback = &body["data"]["credential_status"]["provider_instances"]["work"];
+        assert_eq!(fallback["configured"], true);
+        assert_eq!(fallback["source"], "migrated");
+        assert!(fallback["updated_at"].is_string());
+    }
+
+    #[actix_web::test]
     async fn provider_instance_runtime_fields_are_explicit_editable_and_preserve_unknown_metadata()
     {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
@@ -3152,6 +3474,13 @@ mod tests {
                     "provider_type": "anthropic",
                     "label": "GLM compatible",
                     "thinking_replay_always": true,
+                    "max_tokens": 8192,
+                    "enabled": false
+                },
+                "copilot-cli": {
+                    "provider_type": "copilot",
+                    "label": "Copilot CLI",
+                    "headless_auth": true,
                     "enabled": false
                 },
                 "openai-proxy": {
@@ -3200,6 +3529,14 @@ mod tests {
             true
         );
         assert_eq!(
+            created["data"]["provider_instances"]["glm-compat"]["max_tokens"],
+            8192
+        );
+        assert_eq!(
+            created["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
+            true
+        );
+        assert_eq!(
             created["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
             false
         );
@@ -3218,6 +3555,8 @@ mod tests {
         let mut updated = created["data"].clone();
         updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
         updated["provider_instances"]["glm-compat"]["thinking_replay_always"] = json!(false);
+        updated["provider_instances"]["glm-compat"]["max_tokens"] = json!(4096);
+        updated["provider_instances"]["copilot-cli"]["headless_auth"] = json!(false);
         updated["provider_instances"]["openai-proxy"]["explicit_prompt_cache"] = json!(true);
         let updated = test::call_service(
             &app,
@@ -3241,6 +3580,14 @@ mod tests {
             false
         );
         assert_eq!(
+            updated["data"]["provider_instances"]["glm-compat"]["max_tokens"],
+            4096
+        );
+        assert_eq!(
+            updated["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
+            false
+        );
+        assert_eq!(
             updated["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
             true
         );
@@ -3259,6 +3606,14 @@ mod tests {
                 false
             );
             assert_eq!(
+                config.provider_instances["glm-compat"].extra["max_tokens"],
+                4096
+            );
+            assert_eq!(
+                config.provider_instances["copilot-cli"].extra["headless_auth"],
+                false
+            );
+            assert_eq!(
                 config.provider_instances["openai-proxy"].extra
                     [bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY],
                 true
@@ -3274,6 +3629,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("thinking_replay_always");
+        removed["provider_instances"]["glm-compat"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_tokens");
+        removed["provider_instances"]["copilot-cli"]
+            .as_object_mut()
+            .unwrap()
+            .remove("headless_auth");
         removed["provider_instances"]["openai-proxy"]
             .as_object_mut()
             .unwrap()
@@ -3293,6 +3656,8 @@ mod tests {
         assert!(
             removed["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"].is_null()
         );
+        assert!(removed["data"]["provider_instances"]["glm-compat"]["max_tokens"].is_null());
+        assert!(removed["data"]["provider_instances"]["copilot-cli"]["headless_auth"].is_null());
         assert!(
             removed["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"]
                 .is_null()
@@ -3309,6 +3674,12 @@ mod tests {
             assert!(!config.provider_instances["glm-compat"]
                 .extra
                 .contains_key("thinking_replay_always"));
+            assert!(!config.provider_instances["glm-compat"]
+                .extra
+                .contains_key("max_tokens"));
+            assert!(!config.provider_instances["copilot-cli"]
+                .extra
+                .contains_key("headless_auth"));
             assert!(!config.provider_instances["openai-proxy"]
                 .extra
                 .contains_key(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY));
@@ -3320,6 +3691,8 @@ mod tests {
             ("bodhi-proxy", "target_provider", json!("copilot")),
             ("glm-compat", "target_provider", json!("openai")),
             ("glm-compat", "explicit_prompt_cache", json!(false)),
+            ("openai-proxy", "max_tokens", json!(4096)),
+            ("openai-proxy", "headless_auth", json!(true)),
         ] {
             let mut invalid = removed["data"].clone();
             invalid["provider_instances"][id][field] = value;

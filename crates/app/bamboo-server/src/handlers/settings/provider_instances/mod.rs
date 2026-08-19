@@ -128,10 +128,12 @@ fn instance_config_to_api(instance: &ProviderInstanceConfig) -> Map<String, Valu
         );
     }
     if let Some(request_overrides) = &instance.request_overrides {
-        config.insert(
-            "request_overrides".to_string(),
-            serde_json::to_value(request_overrides).expect("request_overrides should serialize"),
+        let mut value =
+            serde_json::to_value(request_overrides).expect("request_overrides should serialize");
+        crate::handlers::settings::bamboo_config::scrub_unsafe_request_override_literals(
+            &mut value,
         );
+        config.insert("request_overrides".to_string(), value);
     }
 
     for (key, value) in &instance.extra {
@@ -203,7 +205,13 @@ fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), App
         }
     }
 
-    if instance.provider_type != "copilot" && instance.api_key.trim().is_empty() {
+    if instance.enabled
+        && instance.provider_type != "copilot"
+        && instance.api_key.trim().is_empty()
+        && instance.api_key_encrypted.is_none()
+        && instance.credential_ref.is_none()
+        && !bamboo_config::provider_instance_api_key_from_env(instance)
+    {
         return Err(AppError::BadRequest(
             "api_key is required for non-copilot providers".to_string(),
         ));
@@ -224,6 +232,7 @@ fn build_instance_from_create(
     let mut obj = config_value_as_object(payload.config.clone())?;
     obj.remove("api_key_encrypted");
     obj.remove("credential_ref");
+    obj.remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
     obj.insert(
         "provider_type".to_string(),
         Value::String(payload.provider_type.clone()),
@@ -293,8 +302,12 @@ fn apply_instance_update(
     if let Some(config_patch) = payload.config.clone() {
         let mut patch_obj = config_value_as_object(config_patch)?;
 
-        if let Some(api_key) = patch_obj.get("api_key").and_then(|v| v.as_str()) {
-            if config_manager::is_masked_api_key(api_key) {
+        let clear_runtime_env_marker = match patch_obj.get("api_key") {
+            Some(Value::Null) => {
+                patch_obj.insert("api_key".to_string(), Value::String(String::new()));
+                true
+            }
+            Some(Value::String(api_key)) if config_manager::is_masked_api_key(api_key) => {
                 if existing.api_key.trim().is_empty() {
                     patch_obj.remove("api_key");
                 } else {
@@ -303,14 +316,27 @@ fn apply_instance_update(
                         Value::String(existing.api_key.clone()),
                     );
                 }
+                false
             }
-        }
+            Some(Value::String(_)) => true,
+            Some(_) => {
+                return Err(AppError::BadRequest(
+                    "api_key must be a string, null, or the masked placeholder".to_string(),
+                ));
+            }
+            None => false,
+        };
 
         patch_obj.remove("provider_type");
         patch_obj.remove("label");
         patch_obj.remove("enabled");
         patch_obj.remove("api_key_encrypted");
         patch_obj.remove("credential_ref");
+        patch_obj.remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
+
+        if clear_runtime_env_marker {
+            obj.remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
+        }
 
         for (key, value) in patch_obj {
             obj.insert(key, value);
@@ -326,6 +352,47 @@ fn apply_instance_update(
         .map_err(|e| AppError::BadRequest(format!("Invalid provider instance config: {e}")))?;
     validate_instance_config(&updated)?;
     Ok(updated)
+}
+
+fn legacy_provider_alias_exists(config: &bamboo_config::Config, target_id: &str) -> bool {
+    match target_id {
+        "openai" => config.providers().openai.is_some(),
+        "anthropic" => config.providers().anthropic.is_some(),
+        "gemini" => config.providers().gemini.is_some(),
+        "copilot" => config.providers().copilot.is_some(),
+        "bodhi" => config.providers().bodhi.is_some(),
+        _ => false,
+    }
+}
+
+fn validate_default_target(
+    config: &bamboo_config::Config,
+    target_id: &str,
+) -> Result<(), AppError> {
+    if let Some(instance) = config.provider_instances.get(target_id) {
+        if !instance.enabled {
+            return Err(AppError::BadRequest(format!(
+                "Cannot set '{target_id}' as default: provider instance is disabled"
+            )));
+        }
+        return Ok(());
+    }
+    if legacy_provider_alias_exists(config, target_id) {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "Cannot set '{target_id}' as default: no provider instance or legacy provider configuration exists"
+    )))
+}
+
+fn next_enabled_instance_id(config: &bamboo_config::Config) -> Option<String> {
+    config
+        .provider_instances
+        .iter()
+        .filter(|(_, instance)| instance.enabled)
+        .map(|(id, _)| id)
+        .min()
+        .cloned()
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────
@@ -370,7 +437,8 @@ pub async fn create_provider_instance(
                         instance_id
                     )));
                 }
-                let should_set_default = config.default_provider_instance.is_none();
+                let should_set_default =
+                    config.default_provider_instance.is_none() && instance_config.enabled;
                 config
                     .provider_instances
                     .insert(instance_id.clone(), instance_config.clone());
@@ -499,7 +567,7 @@ pub async fn delete_provider_instance(
                     )));
                 }
                 if config.default_provider_instance.as_deref() == Some(&instance_id_for_closure) {
-                    config.default_provider_instance = None;
+                    config.default_provider_instance = next_enabled_instance_id(config);
                 }
                 Ok(())
             },
@@ -529,14 +597,7 @@ pub async fn set_default_provider_instance(
     let new_config = app_state
         .update_config(
             move |config| {
-                let is_instance = config.provider_instances.contains_key(&target_id);
-                let is_legacy_type = AVAILABLE_PROVIDERS.contains(&target_id.as_str());
-                if !is_instance && !is_legacy_type {
-                    return Err(AppError::BadRequest(format!(
-                        "Cannot set '{}' as default: not a known provider instance or type",
-                        target_id
-                    )));
-                }
+                validate_default_target(config, &target_id)?;
                 config.default_provider_instance = Some(target_id.clone());
                 Ok(())
             },
@@ -656,6 +717,178 @@ mod tests {
         assert_eq!(api["api_key"], "****...****");
         assert!(!api.contains_key("credential_ref"));
         assert!(!api.contains_key("api_key_encrypted"));
+    }
+
+    #[test]
+    fn api_reports_environment_binding_as_configured_only_when_runtime_key_is_available() {
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "api_key_from_env": true
+        }))
+        .unwrap();
+        instance.api_key.clear();
+
+        let api = instance_config_to_api(&instance);
+        assert!(!api.contains_key("api_key"));
+        assert_eq!(api["api_key_from_env"], true);
+        validate_instance_config(&instance).expect("env marker satisfies runtime credential shape");
+
+        instance.api_key = "sk-runtime-env".to_string();
+        let api = instance_config_to_api(&instance);
+        assert_eq!(api["api_key"], "****...****");
+    }
+
+    #[test]
+    fn api_scrubs_sensitive_request_override_literals() {
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "request_overrides": {
+                "common": {
+                    "headers": {
+                        "Authorization": "Bearer response-secret",
+                        "X-Api-Key": {"type": "env_ref", "name": "SAFE_API_KEY"}
+                    },
+                    "body_patch": [
+                        {"path": "/api_key", "value": "body-response-secret"},
+                        {"path": "/api_key", "value": {"type": "env_ref", "name": "SAFE_API_KEY"}}
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let api = Value::Object(instance_config_to_api(&instance));
+        let serialized = serde_json::to_string(&api).unwrap();
+        assert!(!serialized.contains("response-secret"));
+        assert!(!serialized.contains("body-response-secret"));
+        assert_eq!(
+            api["request_overrides"]["common"]["headers"]["X-Api-Key"]["type"],
+            "env_ref"
+        );
+        assert_eq!(
+            api["request_overrides"]["common"]["body_patch"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn api_key_intent_clears_environment_ownership_but_mask_retains_it() {
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "api_key_from_env": true
+        }))
+        .unwrap();
+        instance.api_key = "sk-from-runtime-env".to_string();
+
+        let masked = apply_instance_update(
+            &instance,
+            &UpdateInstanceRequest {
+                label: Some("Renamed".to_string()),
+                enabled: None,
+                config: Some(serde_json::json!({"api_key": "****...****"})),
+            },
+        )
+        .unwrap();
+        assert!(bamboo_config::provider_instance_api_key_from_env(&masked));
+        assert_eq!(masked.api_key, "sk-from-runtime-env");
+
+        let replaced = apply_instance_update(
+            &instance,
+            &UpdateInstanceRequest {
+                label: None,
+                enabled: None,
+                config: Some(serde_json::json!({"api_key": "sk-user-owned"})),
+            },
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &replaced
+        ));
+        assert_eq!(replaced.api_key, "sk-user-owned");
+
+        let cleared = apply_instance_update(
+            &instance,
+            &UpdateInstanceRequest {
+                label: None,
+                enabled: Some(false),
+                config: Some(serde_json::json!({"api_key": null})),
+            },
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(&cleared));
+        assert!(cleared.api_key.is_empty());
+    }
+
+    #[test]
+    fn create_does_not_accept_client_owned_environment_marker() {
+        let request = CreateInstanceRequest {
+            provider_type: "openai".to_string(),
+            label: None,
+            enabled: None,
+            config: serde_json::json!({
+                "api_key": "sk-user-owned",
+                "api_key_from_env": true
+            }),
+        };
+        let instance = build_instance_from_create(&request).unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &instance
+        ));
+    }
+
+    #[test]
+    fn default_target_requires_real_enabled_instance_or_real_legacy_alias() {
+        let mut config = bamboo_config::Config::default();
+        *config.providers_mut() = bamboo_config::ProviderConfigs::default();
+        assert!(matches!(
+            validate_default_target(&config, "openai"),
+            Err(AppError::BadRequest(_))
+        ));
+
+        config.providers_mut().openai = Some(Default::default());
+        validate_default_target(&config, "openai").expect("real hybrid alias remains compatible");
+
+        let mut disabled: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": false
+        }))
+        .unwrap();
+        disabled.api_key = "sk-disabled".to_string();
+        config
+            .provider_instances
+            .insert("disabled".to_string(), disabled);
+        assert!(matches!(
+            validate_default_target(&config, "disabled"),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_default_selects_next_enabled_instance_deterministically() {
+        let mut config = bamboo_config::Config::default();
+        for (id, enabled) in [("z-last", true), ("a-first", true), ("disabled", false)] {
+            let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+                "provider_type": "copilot",
+                "enabled": enabled
+            }))
+            .unwrap();
+            instance.enabled = enabled;
+            config.provider_instances.insert(id.to_string(), instance);
+        }
+        assert_eq!(
+            next_enabled_instance_id(&config).as_deref(),
+            Some("a-first")
+        );
+        config.provider_instances.remove("a-first");
+        assert_eq!(next_enabled_instance_id(&config).as_deref(), Some("z-last"));
+        config.provider_instances.remove("z-last");
+        assert!(next_enabled_instance_id(&config).is_none());
     }
 
     // A provider-instance secret is committed to credentials.json before its

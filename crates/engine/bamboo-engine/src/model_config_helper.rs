@@ -114,7 +114,30 @@ pub fn get_default_model_for_provider(
     config: &Config,
     provider_name: &str,
 ) -> Result<String, LLMError> {
-    match provider_name.trim() {
+    let provider_name = provider_name.trim();
+    if let Some(instance) = config.provider_instances.get(provider_name) {
+        if !instance.enabled {
+            return Err(LLMError::Auth(format!(
+                "Provider instance '{provider_name}' is disabled"
+            )));
+        }
+        if let Some(model) = instance
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            return Ok(model.to_string());
+        }
+        if instance.provider_type == "copilot" {
+            return Ok("gpt-4o".to_string());
+        }
+        return Err(LLMError::Auth(format!(
+            "Model must be specified for provider instance '{provider_name}'"
+        )));
+    }
+
+    match provider_name {
         "copilot" => {
             let provider_model = config
                 .providers()
@@ -163,7 +186,7 @@ pub fn get_default_model_for_provider(
 /// Get the default model for the current provider from config.
 /// Returns an error if no model is configured.
 pub fn get_default_model_from_config(config: &Config) -> Result<String, LLMError> {
-    get_default_model_for_provider(config, config.provider.as_str())
+    get_default_model_for_provider(config, config.effective_default_provider())
 }
 
 /// Get the schedule auto-execute model for the current provider from config.
@@ -178,13 +201,26 @@ pub fn get_schedule_model_from_config(config: &Config) -> Result<String, LLMErro
         .ok_or_else(|| {
             LLMError::Auth(format!(
                 "No fast/default model configured for provider '{}'",
-                config.provider
+                config.effective_default_provider()
             ))
         })
 }
 
 /// Get the fast/cheap model for a specific provider from config.
 pub fn get_fast_model_for_provider(config: &Config, provider_name: &str) -> Option<String> {
+    if let Some(instance) = config.provider_instances.get(provider_name.trim()) {
+        if !instance.enabled {
+            return None;
+        }
+        return instance
+            .fast_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| get_default_model_for_provider(config, provider_name).ok());
+    }
+
     let fast = match provider_name.trim() {
         "openai" => config
             .providers()
@@ -252,7 +288,7 @@ pub fn get_task_summary_model_from_config(config: &Config) -> Result<String, LLM
     config.get_task_summary_model().ok_or_else(|| {
         LLMError::Auth(format!(
             "No task summary model configured for provider '{}'",
-            config.provider
+            config.effective_default_provider()
         ))
     })
 }
@@ -265,7 +301,7 @@ pub fn get_memory_background_model_from_config(config: &Config) -> Result<String
     config.get_memory_background_model().ok_or_else(|| {
         LLMError::Auth(format!(
             "No background memory model configured for provider '{}'",
-            config.provider
+            config.effective_default_provider()
         ))
     })
 }
@@ -278,7 +314,7 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
     config.get_vision_model().ok_or_else(|| {
         LLMError::Auth(format!(
             "No model configured for provider '{}'",
-            config.provider
+            config.effective_default_provider()
         ))
     })
 }
@@ -396,7 +432,20 @@ pub fn resolve_vision_model(
             }
         }
     }
-    let model_name = config.get_vision_model()?;
+    let model_name = if let Some(instance) = config.provider_instances.get(provider_name) {
+        if !instance.enabled {
+            return None;
+        }
+        instance
+            .vision_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| get_default_model_for_provider(config, provider_name).ok())?
+    } else {
+        config.get_vision_model()?
+    };
     let provider = provider_registry.get(provider_name)?;
     Some(ResolvedModel {
         provider,
@@ -685,6 +734,82 @@ mod tests {
         let result = get_default_model_from_config(&config);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "gpt-4o");
+    }
+
+    #[test]
+    fn instance_models_are_authoritative_over_stale_legacy_slot() {
+        let mut config = test_config! {
+            provider: "openai".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    api_key: "legacy".to_string(),
+                    model: Some("gpt-stale".to_string()),
+                    fast_model: Some("gpt-stale-fast".to_string()),
+                    vision_model: Some("gpt-stale-vision".to_string()),
+                    ..OpenAIConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+        };
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "model": "gpt-instance",
+                "fast_model": "gpt-instance-fast",
+                "vision_model": "gpt-instance-vision",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        assert_eq!(
+            get_default_model_from_config(&config).unwrap(),
+            "gpt-instance"
+        );
+        assert_eq!(
+            get_fast_model_for_provider(&config, "work").as_deref(),
+            Some("gpt-instance-fast")
+        );
+        assert_eq!(
+            get_schedule_model_from_config(&config).unwrap(),
+            "gpt-instance-fast"
+        );
+        assert_eq!(
+            get_vision_model_from_config(&config).unwrap(),
+            "gpt-instance-vision"
+        );
+    }
+
+    #[test]
+    fn disabled_instance_model_does_not_fall_back_to_legacy_provider() {
+        let mut config = test_config! {
+            provider: "openai".to_string(),
+            providers: ProviderConfigs {
+                openai: Some(OpenAIConfig {
+                    model: Some("gpt-stale".to_string()),
+                    ..OpenAIConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+        };
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "model": "gpt-instance",
+                "enabled": false
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        let error = get_default_model_from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled"));
+        assert!(get_fast_model_for_provider(&config, "work").is_none());
     }
 
     #[test]
