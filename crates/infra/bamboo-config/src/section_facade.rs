@@ -1303,6 +1303,7 @@ fn credential_token_is_sensitive(token: &str) -> bool {
             | "secret"
             | "secrets"
             | "token"
+            | "tokens"
             | "password"
             | "passwords"
             | "private"
@@ -1314,6 +1315,25 @@ fn credential_token_is_sensitive(token: &str) -> bool {
             | "cookies"
             | "passphrase"
             | "passphrases"
+    )
+}
+
+/// Token-count and token-budget fields are ordinary request metadata, not
+/// credential containers. Keep this an exact allowlist: an unknown plural
+/// `*_tokens` name is fail-closed because providers commonly use such fields
+/// for bearer/session credential collections.
+fn normalized_public_token_metadata_name(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "budgettokens"
+            | "contextwindowtokens"
+            | "maxcompletiontokens"
+            | "maxcontexttokens"
+            | "maxinputtokens"
+            | "maxoutputtokens"
+            | "maxprompttokens"
+            | "maxtokens"
+            | "maxtotaltokens"
     )
 }
 
@@ -1356,14 +1376,7 @@ fn credential_name_has_terminal_sensitive_tokens(tokens: &[String]) -> bool {
 }
 
 fn normalized_terminal_token_collection(normalized: &str) -> bool {
-    normalized == "tokens"
-        || normalized.ends_with("apitokens")
-        || normalized.ends_with("authtokens")
-        || normalized.ends_with("accesstokens")
-        || normalized.ends_with("bearertokens")
-        || normalized.ends_with("idtokens")
-        || normalized.ends_with("refreshtokens")
-        || normalized.ends_with("sessiontokens")
+    normalized.ends_with("tokens") && !normalized_public_token_metadata_name(normalized)
 }
 
 fn normalized_request_override_credential_name(normalized: &str) -> bool {
@@ -1472,12 +1485,15 @@ fn credential_metadata_container_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
         return false;
     }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
+        return false;
+    }
     let tokens = credential_key_tokens(key);
     let tokenized_metadata = credential_name_has_sensitive_tokens(&tokens)
         && tokens
             .last()
             .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
-    let normalized = normalized_credential_key(key);
     let normalized_metadata = SAFE_CREDENTIAL_METADATA_SUFFIXES.iter().any(|suffix| {
         normalized
             .strip_suffix(suffix)
@@ -1488,7 +1504,8 @@ fn credential_metadata_container_key(key: &str) -> bool {
 
 fn credential_public_metadata_key(key: &str) -> bool {
     let normalized = normalized_credential_key(key);
-    SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&normalized.as_str())
+    normalized_public_token_metadata_name(&normalized)
+        || SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&normalized.as_str())
         || credential_key_tokens(key)
             .last()
             .is_some_and(|token| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&token.as_str()))
@@ -1498,16 +1515,24 @@ fn credential_context_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
         return false;
     }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
+        return false;
+    }
     let tokens = credential_key_tokens(key);
     let tokenized_context = credential_name_has_sensitive_tokens(&tokens)
         && !tokens
             .last()
             .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
-    tokenized_context || normalized_credential_context_name(&normalized_credential_key(key))
+    tokenized_context || normalized_credential_context_name(&normalized)
 }
 
 fn credential_literal_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
+        return false;
+    }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
         return false;
     }
     let tokens = credential_key_tokens(key);
@@ -1522,7 +1547,7 @@ fn credential_literal_key(key: &str) -> bool {
             NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES.contains(&suffix.as_str())
                 && credential_name_has_sensitive_tokens(&tokens[..tokens.len().saturating_sub(1)])
         });
-    tokenized_literal || normalized_credential_context_name(&normalized_credential_key(key))
+    tokenized_literal || normalized_credential_context_name(&normalized)
 }
 
 fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
@@ -6420,6 +6445,7 @@ mod tests {
         let original = json!({
             "headless_auth": true,
             "max_tokens": 8192,
+            "max_output_tokens": 4096,
             "oauth": {
                 "client_id": "public-client",
                 "authorization_url": "https://auth.example.test/authorize",
@@ -6429,6 +6455,7 @@ mod tests {
             "nested": {"client_secret": "client-literal"},
             "secrets": {"primary": "plural-container-literal"},
             "tokens": ["plural-token-literal"],
+            "client_tokens": ["client-token-literal"],
             "passwords": {"primary": "plural-password-literal"},
             "api_keys": {"primary": "plural-api-key-literal"},
             "credential_ref": "provider.work.api_key",
@@ -6447,6 +6474,7 @@ mod tests {
 
         assert_eq!(sanitized["headless_auth"], true);
         assert_eq!(sanitized["max_tokens"], 8192);
+        assert_eq!(sanitized["max_output_tokens"], 4096);
         assert_eq!(sanitized["oauth"]["client_id"], "public-client");
         assert_eq!(
             sanitized["oauth"]["authorization_url"],
@@ -6457,6 +6485,7 @@ mod tests {
         assert!(sanitized["nested"].get("client_secret").is_none());
         assert!(sanitized.get("secrets").is_none());
         assert!(sanitized.get("tokens").is_none());
+        assert!(sanitized.get("client_tokens").is_none());
         assert!(sanitized.get("passwords").is_none());
         assert!(sanitized.get("api_keys").is_none());
         assert!(sanitized.get("credential_ref").is_none());
@@ -6477,6 +6506,9 @@ mod tests {
             "X-Private-Key",
             "X-Device-Key",
             "X-Secret-Keys",
+            "X-Client-Tokens",
+            "X-Service-Tokens",
+            "X-Provider-Tokens",
             "X-Api-Key-Version",
         ] {
             assert!(
@@ -6490,6 +6522,9 @@ mod tests {
             "/device_keys/0",
             "/accessKeys/current",
             "/tokens/0",
+            "/client_tokens/0",
+            "/service_tokens/current",
+            "/provider_tokens/primary",
             "/passwords/primary",
             "/api_keys/primary",
         ] {
@@ -6504,6 +6539,9 @@ mod tests {
         ));
         assert!(!request_override_body_patch_targets_credential(
             "/max_tokens"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/max_output_tokens"
         ));
         assert!(!request_override_body_patch_targets_credential(
             "/metadata/public_access"

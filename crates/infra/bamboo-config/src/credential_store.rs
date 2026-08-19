@@ -382,6 +382,39 @@ impl CredentialStore {
         Ok((health.revision, status))
     }
 
+    /// Return secret-free status while proving that an active credential can
+    /// be decrypted with the current runtime key.
+    ///
+    /// Ordinary status/list APIs intentionally describe durable metadata and
+    /// therefore report a present entry as configured without decrypting it.
+    /// Runtime-facing provider projections need a stronger contract: a stale
+    /// ciphertext left by a machine/key change must not be advertised as a
+    /// usable credential. Decryption happens under the same document lock and
+    /// the plaintext is dropped before this method returns.
+    pub fn status_with_crypto_validation(
+        &self,
+        credential_ref: &CredentialRef,
+    ) -> ConfigStoreResult<CredentialStatus> {
+        reject_internal_recovery_ref(credential_ref)?;
+        self.with_transaction_lock(|| {
+            let document = self.load_document()?;
+            Ok(match document.entries.get(credential_ref) {
+                Some(entry) => CredentialStatus {
+                    credential_ref: credential_ref.clone(),
+                    configured: crate::encryption::decrypt(&entry.ciphertext).is_ok(),
+                    source: entry.source,
+                    updated_at: Some(entry.updated_at),
+                },
+                None => CredentialStatus {
+                    credential_ref: credential_ref.clone(),
+                    configured: false,
+                    source: CredentialSource::User,
+                    updated_at: None,
+                },
+            })
+        })
+    }
+
     pub fn status_with_health(
         &self,
         credential_ref: &CredentialRef,
@@ -3236,6 +3269,39 @@ mod tests {
         assert_eq!(revision, 2);
         assert!(!status.configured);
         assert!(store.resolve(&reference).unwrap().is_none());
+    }
+
+    #[test]
+    fn crypto_validated_status_rejects_missing_and_undecryptable_entries() {
+        let key = crate::encryption::set_test_encryption_key([0x7a; 32]);
+        let dir = TempDir::new().unwrap();
+        let store = CredentialStore::open(dir.path());
+        let configured = credential_ref("provider_instance", "work", "api_key").unwrap();
+        let missing = credential_ref("provider_instance", "missing", "api_key").unwrap();
+        store
+            .replace(
+                configured.clone(),
+                "sk-runtime-valid",
+                CredentialSource::Migrated,
+                0,
+            )
+            .unwrap();
+
+        let status = store.status_with_crypto_validation(&configured).unwrap();
+        assert!(status.configured);
+        assert_eq!(status.source, CredentialSource::Migrated);
+        assert!(
+            !store
+                .status_with_crypto_validation(&missing)
+                .unwrap()
+                .configured
+        );
+
+        drop(key);
+        let _wrong_key = crate::encryption::set_test_encryption_key([0x7b; 32]);
+        let status = store.status_with_crypto_validation(&configured).unwrap();
+        assert!(!status.configured);
+        assert_eq!(status.source, CredentialSource::Migrated);
     }
 
     #[test]

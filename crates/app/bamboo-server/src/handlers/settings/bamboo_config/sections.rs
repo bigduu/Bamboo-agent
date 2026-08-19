@@ -858,7 +858,7 @@ fn provider_credential_status(
     if let Some(reference) = credential_ref {
         let status = app_state
             .credential_store
-            .status(reference)
+            .status_with_crypto_validation(reference)
             .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
         let source = status.configured.then_some(match status.source {
             bamboo_config::CredentialSource::User => "user",
@@ -2187,7 +2187,8 @@ mod tests {
                                     "Authorization": "override-header-secret",
                                     "X-Access-Key": "override-access-key-secret",
                                     "X-Private-Key": "override-private-key-secret",
-                                    "X-Device-Key": "override-device-key-secret"
+                                    "X-Device-Key": "override-device-key-secret",
+                                    "X-Client-Tokens": "override-client-tokens-secret"
                                 },
                                 "body_patch": [
                                     {
@@ -2197,6 +2198,10 @@ mod tests {
                                     {
                                         "path": "/secrets/primary",
                                         "value": "override-plural-secret"
+                                    },
+                                    {
+                                        "path": "/client_tokens/0",
+                                        "value": "override-client-token-body-secret"
                                     }
                                 ]
                             }
@@ -2215,6 +2220,10 @@ mod tests {
                         (
                             "api_keys".to_string(),
                             json!({"primary": "unknown-provider-api-keys-secret"}),
+                        ),
+                        (
+                            "client_tokens".to_string(),
+                            json!(["unknown-provider-client-token-secret"]),
                         ),
                     ]),
                     ..OpenAIConfig::default()
@@ -2311,11 +2320,14 @@ mod tests {
             "override-access-key-secret",
             "override-private-key-secret",
             "override-device-key-secret",
+            "override-client-tokens-secret",
+            "override-client-token-body-secret",
             "override-credential-secret",
             "override-plural-secret",
             "unknown-provider-secret",
             "unknown-provider-plural-secret",
             "unknown-provider-api-keys-secret",
+            "unknown-provider-client-token-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",
@@ -2362,11 +2374,14 @@ mod tests {
             "override-access-key-secret",
             "override-private-key-secret",
             "override-device-key-secret",
+            "override-client-tokens-secret",
+            "override-client-token-body-secret",
             "override-credential-secret",
             "override-plural-secret",
             "unknown-provider-secret",
             "unknown-provider-plural-secret",
             "unknown-provider-api-keys-secret",
+            "unknown-provider-client-token-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",
@@ -2675,7 +2690,6 @@ mod tests {
 
     #[actix_web::test]
     async fn provider_settings_round_trip_is_full_cas_and_credentials_are_explicit_and_redacted() {
-        let _key = bamboo_config::encryption::set_test_encryption_key([0x70; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let app = test::init_service(

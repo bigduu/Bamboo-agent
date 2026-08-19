@@ -47,14 +47,24 @@ pub fn provider_instance_environment_override_active(instance: &ProviderInstance
     if !provider_instance_api_key_from_env(instance) {
         return false;
     }
-    let Some(env_var) = standard_provider_api_key_env(&instance.provider_type) else {
+    provider_api_key_environment_override_active(&instance.provider_type, &instance.api_key)
+}
+
+/// Whether a provider key currently matches its standard environment override.
+///
+/// Compatibility projections use this without fabricating a temporary
+/// [`ProviderInstanceConfig`]. A persisted environment binding alone is not
+/// active: the variable must still be present and equal the hydrated runtime
+/// value.
+pub fn provider_api_key_environment_override_active(provider_type: &str, api_key: &str) -> bool {
+    let Some(env_var) = standard_provider_api_key_env(provider_type) else {
         return false;
     };
     let Ok(value) = crate::runtime_env_var(env_var) else {
         return false;
     };
     let value = value.trim();
-    !value.is_empty() && instance.api_key.trim() == value
+    !value.is_empty() && api_key.trim() == value
 }
 
 fn copy_runtime_env_marker(

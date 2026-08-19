@@ -15,7 +15,8 @@ pub(super) async fn handle_get_provider_config(
 ) -> Result<HttpResponse, AppError> {
     let config = app_state.config.read().await.clone();
     let provider = legacy_active_provider_type(&config);
-    let masked_providers = legacy_provider_response_view(&config)?;
+    let masked_providers =
+        legacy_provider_response_view(&config, Some(&app_state.credential_store))?;
 
     let response = ProviderConfigResponse {
         provider,
@@ -45,9 +46,12 @@ fn legacy_active_provider_type(config: &Config) -> String {
 /// the generic config redactor: the projected provider may be ref-backed even
 /// though the durable legacy slot no longer exists, and a credential reference
 /// is itself server-owned metadata that old clients must never receive.
-fn legacy_provider_response_view(config: &Config) -> Result<Value, AppError> {
+fn legacy_provider_response_view(
+    config: &Config,
+    credential_store: Option<&bamboo_config::CredentialStore>,
+) -> Result<Value, AppError> {
     let mut view = bamboo_config::legacy_provider_compatibility_view(config);
-    let configured = legacy_provider_configured(&view);
+    let configured = legacy_provider_configured(&view, credential_store);
     clear_legacy_provider_credentials(&mut view);
     let mut value = serde_json::to_value(view)?;
     scrub_unsafe_request_override_literals(&mut value);
@@ -111,28 +115,53 @@ fn scrub_legacy_credential_metadata(value: &mut Value) {
     }
 }
 
-fn legacy_provider_configured(providers: &ProviderConfigs) -> Vec<(&'static str, bool)> {
+fn legacy_provider_configured(
+    providers: &ProviderConfigs,
+    credential_store: Option<&bamboo_config::CredentialStore>,
+) -> Vec<(&'static str, bool)> {
     macro_rules! configured {
-        ($provider:expr) => {
+        ($provider_type:literal, $provider:expr) => {
             $provider.as_ref().is_some_and(|provider| {
                 // This endpoint reports the live compatibility view. A
                 // durable ref or env binding without a successfully hydrated
                 // runtime value must not be rendered as a configured mask.
-                !provider.api_key.trim().is_empty()
+                if provider.api_key_from_env
+                    && bamboo_config::provider_api_key_environment_override_active(
+                        $provider_type,
+                        &provider.api_key,
+                    )
+                {
+                    true
+                } else if let (Some(store), Some(reference)) =
+                    (credential_store, provider.credential_ref.as_ref())
+                {
+                    store
+                        .status_with_crypto_validation(reference)
+                        .is_ok_and(|status| status.configured)
+                } else {
+                    !provider.api_key_from_env && !provider.api_key.trim().is_empty()
+                }
             })
         };
     }
 
     vec![
-        ("openai", configured!(providers.openai)),
-        ("anthropic", configured!(providers.anthropic)),
-        ("gemini", configured!(providers.gemini)),
+        ("openai", configured!("openai", providers.openai)),
+        ("anthropic", configured!("anthropic", providers.anthropic)),
+        ("gemini", configured!("gemini", providers.gemini)),
         (
             "bodhi",
-            providers
-                .bodhi
-                .as_ref()
-                .is_some_and(|provider| !provider.api_key.trim().is_empty()),
+            providers.bodhi.as_ref().is_some_and(|provider| {
+                if let (Some(store), Some(reference)) =
+                    (credential_store, provider.credential_ref.as_ref())
+                {
+                    store
+                        .status_with_crypto_validation(reference)
+                        .is_ok_and(|status| status.configured)
+                } else {
+                    !provider.api_key.trim().is_empty()
+                }
+            }),
         ),
     ]
 }
@@ -172,6 +201,7 @@ mod tests {
             "secrets": {"primary": "instance-plural-extra"},
             "api_keys": {"primary": "instance-api-keys-extra"},
             "tokens": ["instance-tokens-extra"],
+            "client_tokens": ["instance-client-tokens-extra"],
             "oauth": {
                 "client_id": "public-client-id",
                 "value": "instance-oauth-extra"
@@ -183,6 +213,7 @@ mod tests {
                         "X-Access-Key": "override-access-key-secret",
                         "X-Private-Key": "override-private-key-secret",
                         "X-Device-Key": "override-device-key-secret",
+                        "X-Client-Tokens": "override-client-tokens-secret",
                         "X-Api-Key": {"type": "env_ref", "name": "PROJECTED_API_KEY"},
                         "X-Trace": "public-trace"
                     },
@@ -190,6 +221,7 @@ mod tests {
                         {"path": "/api_key", "value": "override-body-secret"},
                         {"path": "/credential", "value": "override-credential-secret"},
                         {"path": "/secrets/primary", "value": "override-plural-secret"},
+                        {"path": "/client_tokens/0", "value": "override-client-token-body-secret"},
                         {"path": "/api_key", "value": {"type": "env_ref", "name": "PROJECTED_API_KEY"}},
                         {"path": "/temperature", "value": 0.2}
                     ]
@@ -206,6 +238,17 @@ mod tests {
 
     #[test]
     fn legacy_get_projection_uses_default_instance_type_and_leaks_no_credential_metadata() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6f; 32]);
+        let credential_dir = tempfile::tempdir().expect("credential tempdir");
+        let credential_store = bamboo_config::CredentialStore::open(credential_dir.path());
+        credential_store
+            .replace(
+                CredentialRef::parse("provider.work.api_key").expect("valid credential reference"),
+                "stored-provider-secret",
+                bamboo_config::CredentialSource::Migrated,
+                0,
+            )
+            .expect("store provider credential");
         let mut config = Config::default();
         config.provider = "anthropic".to_string();
         config
@@ -226,7 +269,8 @@ mod tests {
         );
 
         assert_eq!(legacy_active_provider_type(&config), "openai");
-        let value = legacy_provider_response_view(&config).expect("projection");
+        let value =
+            legacy_provider_response_view(&config, Some(&credential_store)).expect("projection");
         assert_eq!(value["openai"]["api_key"], "****...****");
         assert_eq!(value["openai"]["model"], "gpt-work");
         assert_eq!(value["openai"]["oauth"]["client_id"], "public-client-id");
@@ -247,6 +291,7 @@ mod tests {
         let serialized = serde_json::to_string(&value).unwrap();
         for forbidden in [
             "sk-runtime-plaintext",
+            "stored-provider-secret",
             "runtime-ciphertext",
             "provider.work.api_key",
             "credential_ref",
@@ -259,6 +304,8 @@ mod tests {
             "override-access-key-secret",
             "override-private-key-secret",
             "override-device-key-secret",
+            "override-client-tokens-secret",
+            "override-client-token-body-secret",
             "override-body-secret",
             "override-credential-secret",
             "override-plural-secret",
@@ -266,6 +313,7 @@ mod tests {
             "instance-plural-extra",
             "instance-api-keys-extra",
             "instance-tokens-extra",
+            "instance-client-tokens-extra",
             "instance-oauth-extra",
             "future-client-extra",
         ] {
@@ -278,10 +326,13 @@ mod tests {
 
     #[test]
     fn legacy_get_projection_does_not_mask_an_unavailable_environment_binding() {
+        let _openai_env =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
         let mut config = Config::default();
         let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
             "provider_type": "openai",
             "enabled": true,
+            "api_key": "stale-runtime-environment-key",
             "api_key_from_env": true,
             "credential_ref": "provider.missing.api_key"
         }))
@@ -291,10 +342,11 @@ mod tests {
             .insert("missing".to_string(), instance);
         config.default_provider_instance = Some("missing".to_string());
 
-        let value = legacy_provider_response_view(&config).expect("projection");
+        let value = legacy_provider_response_view(&config, None).expect("projection");
         assert!(value["openai"].get("api_key").is_none());
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains("****...****"));
         assert!(!serialized.contains("provider.missing.api_key"));
+        assert!(!serialized.contains("stale-runtime-environment-key"));
     }
 }
