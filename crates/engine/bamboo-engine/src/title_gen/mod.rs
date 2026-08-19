@@ -208,13 +208,7 @@ async fn try_llm_title(
 ) -> Result<String, String> {
     // Determine provider name (session-aware, with global config fallback) and resolve fast model.
     let config_snapshot = { state.config().read().await.clone() };
-    let provider_name = if let Some(ref m) = session.model_ref {
-        m.provider.clone()
-    } else if let Some(p) = session.provider_name() {
-        p
-    } else {
-        config_snapshot.provider.clone()
-    };
+    let provider_name = title_provider_name(&config_snapshot, session);
 
     let resolved = crate::model_config_helper::resolve_fast_model(
         &config_snapshot,
@@ -268,6 +262,16 @@ async fn try_llm_title(
     timeout(Duration::from_secs(TITLE_GEN_TIMEOUT_SECS), fut)
         .await
         .map_err(|_| "title-gen LLM timeout".to_string())?
+}
+
+fn title_provider_name(config: &bamboo_config::Config, session: &Session) -> String {
+    if let Some(ref m) = session.model_ref {
+        m.provider.clone()
+    } else if let Some(p) = session.provider_name() {
+        p
+    } else {
+        config.effective_default_provider().to_string()
+    }
 }
 
 /// Trim, take first line, strip leading/trailing quotes/punctuation,

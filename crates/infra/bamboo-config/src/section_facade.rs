@@ -964,7 +964,7 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
         credential_context: CredentialScanContext,
     ) -> Result<(), String> {
         if credential_context != CredentialScanContext::None
-            && is_nonliteral_runtime_template(value)
+            && request_override_value_is_nonliteral_runtime_template(value)
         {
             return Ok(());
         }
@@ -1065,9 +1065,11 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
                         if normalized_key == "headers" {
                             if let Some(headers) = value.as_object() {
                                 for (name, expression) in headers {
-                                    if is_credential_header(name)
+                                    if request_override_header_is_credential(name)
                                         && !value_is_empty(expression)
-                                        && !is_nonliteral_runtime_template(expression)
+                                        && !request_override_value_is_nonliteral_runtime_template(
+                                            expression,
+                                        )
                                     {
                                         return Err(format!(
                                             "credential header {name} must not contain a literal"
@@ -1299,14 +1301,39 @@ fn credential_token_is_sensitive(token: &str) -> bool {
             | "credential"
             | "credentials"
             | "secret"
+            | "secrets"
             | "token"
+            | "tokens"
             | "password"
+            | "passwords"
             | "private"
             | "access"
             | "ciphertext"
+            | "ciphertexts"
             | "encrypted"
             | "cookie"
+            | "cookies"
             | "passphrase"
+            | "passphrases"
+    )
+}
+
+/// Token-count and token-budget fields are ordinary request metadata, not
+/// credential containers. Keep this an exact allowlist: an unknown plural
+/// `*_tokens` name is fail-closed because providers commonly use such fields
+/// for bearer/session credential collections.
+fn normalized_public_token_metadata_name(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "budgettokens"
+            | "contextwindowtokens"
+            | "maxcompletiontokens"
+            | "maxcontexttokens"
+            | "maxinputtokens"
+            | "maxoutputtokens"
+            | "maxprompttokens"
+            | "maxtokens"
+            | "maxtotaltokens"
     )
 }
 
@@ -1315,13 +1342,21 @@ fn credential_key_compound_is_sensitive(tokens: &[String]) -> bool {
         matches!(
             (tokens[0].as_str(), tokens[1].as_str()),
             ("api", "key")
+                | ("api", "keys")
                 | ("auth", "key")
+                | ("auth", "keys")
                 | ("access", "key")
+                | ("access", "keys")
                 | ("private", "key")
+                | ("private", "keys")
                 | ("device", "key")
+                | ("device", "keys")
                 | ("secret", "key")
+                | ("secret", "keys")
                 | ("signing", "key")
+                | ("signing", "keys")
                 | ("encryption", "key")
+                | ("encryption", "keys")
         )
     })
 }
@@ -1340,6 +1375,46 @@ fn credential_name_has_terminal_sensitive_tokens(tokens: &[String]) -> bool {
         || (tokens.len() >= 2 && credential_key_compound_is_sensitive(&tokens[tokens.len() - 2..]))
 }
 
+fn normalized_terminal_token_collection(normalized: &str) -> bool {
+    normalized.ends_with("tokens") && !normalized_public_token_metadata_name(normalized)
+}
+
+fn normalized_request_override_credential_name(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "cookie" | "setcookie" | "authentication" | "secret" | "secrets" | "password" | "passwords"
+    ) || normalized.ends_with("authorization")
+        || normalized.ends_with("authkey")
+        || normalized.ends_with("authkeys")
+        || normalized.ends_with("auth")
+        || normalized.contains("apikey")
+        || normalized.ends_with("token")
+        || normalized_terminal_token_collection(normalized)
+        || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
+        || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
+        || normalized.ends_with("accesskey")
+        || normalized.ends_with("accesskeys")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("privatekeys")
+        || normalized.ends_with("devicekey")
+        || normalized.ends_with("devicekeys")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeys")
+        || normalized.ends_with("signingkey")
+        || normalized.ends_with("signingkeys")
+        || normalized.ends_with("encryptionkey")
+        || normalized.ends_with("encryptionkeys")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+        || normalized.ends_with("ciphertext")
+        || normalized.ends_with("ciphertexts")
+        || normalized.ends_with("encrypted")
+        || normalized.ends_with("passphrase")
+        || normalized.ends_with("passphrases")
+}
+
 fn normalized_terminal_credential_name(normalized: &str) -> bool {
     normalized.ends_with("auth")
         || normalized.ends_with("authentication")
@@ -1350,22 +1425,36 @@ fn normalized_terminal_credential_name(normalized: &str) -> bool {
         || normalized.ends_with("credential")
         || normalized.ends_with("credentials")
         || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
         || normalized.ends_with("token")
+        || normalized_terminal_token_collection(normalized)
         || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
         || normalized.ends_with("private")
         || normalized.ends_with("access")
         || normalized.ends_with("ciphertext")
+        || normalized.ends_with("ciphertexts")
         || normalized.ends_with("encrypted")
         || normalized.ends_with("cookie")
+        || normalized.ends_with("cookies")
         || normalized.ends_with("passphrase")
+        || normalized.ends_with("passphrases")
         || normalized.ends_with("apikey")
+        || normalized.ends_with("apikeys")
         || normalized.ends_with("accesskey")
+        || normalized.ends_with("accesskeys")
         || normalized.ends_with("authkey")
+        || normalized.ends_with("authkeys")
         || normalized.ends_with("privatekey")
+        || normalized.ends_with("privatekeys")
         || normalized.ends_with("devicekey")
+        || normalized.ends_with("devicekeys")
         || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeys")
         || normalized.ends_with("signingkey")
+        || normalized.ends_with("signingkeys")
         || normalized.ends_with("encryptionkey")
+        || normalized.ends_with("encryptionkeys")
         || normalized.ends_with("passwordhash")
         || normalized.ends_with("passwordsalt")
         || normalized.ends_with("tokenhash")
@@ -1396,12 +1485,15 @@ fn credential_metadata_container_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
         return false;
     }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
+        return false;
+    }
     let tokens = credential_key_tokens(key);
     let tokenized_metadata = credential_name_has_sensitive_tokens(&tokens)
         && tokens
             .last()
             .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
-    let normalized = normalized_credential_key(key);
     let normalized_metadata = SAFE_CREDENTIAL_METADATA_SUFFIXES.iter().any(|suffix| {
         normalized
             .strip_suffix(suffix)
@@ -1412,7 +1504,8 @@ fn credential_metadata_container_key(key: &str) -> bool {
 
 fn credential_public_metadata_key(key: &str) -> bool {
     let normalized = normalized_credential_key(key);
-    SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&normalized.as_str())
+    normalized_public_token_metadata_name(&normalized)
+        || SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&normalized.as_str())
         || credential_key_tokens(key)
             .last()
             .is_some_and(|token| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&token.as_str()))
@@ -1422,16 +1515,24 @@ fn credential_context_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
         return false;
     }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
+        return false;
+    }
     let tokens = credential_key_tokens(key);
     let tokenized_context = credential_name_has_sensitive_tokens(&tokens)
         && !tokens
             .last()
             .is_some_and(|suffix| SAFE_CREDENTIAL_METADATA_SUFFIXES.contains(&suffix.as_str()));
-    tokenized_context || normalized_credential_context_name(&normalized_credential_key(key))
+    tokenized_context || normalized_credential_context_name(&normalized)
 }
 
 fn credential_literal_key(key: &str) -> bool {
     if credential_reference_metadata_key(key) {
+        return false;
+    }
+    let normalized = normalized_credential_key(key);
+    if normalized_public_token_metadata_name(&normalized) {
         return false;
     }
     let tokens = credential_key_tokens(key);
@@ -1446,7 +1547,7 @@ fn credential_literal_key(key: &str) -> bool {
             NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES.contains(&suffix.as_str())
                 && credential_name_has_sensitive_tokens(&tokens[..tokens.len().saturating_sub(1)])
         });
-    tokenized_literal || normalized_credential_context_name(&normalized_credential_key(key))
+    tokenized_literal || normalized_credential_context_name(&normalized)
 }
 
 fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
@@ -1457,8 +1558,21 @@ fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
     let credential_owned = key.to_ascii_lowercase().ends_with("_encrypted")
         || normalized.ends_with("encrypted")
         || normalized.ends_with("token")
+        || normalized_terminal_token_collection(&normalized)
         || normalized.ends_with("password")
+        || normalized.ends_with("passwords")
         || normalized.ends_with("secret")
+        || normalized.ends_with("secrets")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+        || normalized.ends_with("apikeys")
+        || normalized.ends_with("accesskeys")
+        || normalized.ends_with("authkeys")
+        || normalized.ends_with("privatekeys")
+        || normalized.ends_with("devicekeys")
+        || normalized.ends_with("secretkeys")
+        || normalized.ends_with("signingkeys")
+        || normalized.ends_with("encryptionkeys")
         || matches!(
             normalized.as_str(),
             "apikey"
@@ -1479,6 +1593,157 @@ fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
         && !boolean_secret_metadata
         && !boolean_configured_metadata
         && !value_is_empty(value)
+}
+
+/// Remove credential authority and literal credential material from provider
+/// metadata before it crosses a compatibility API boundary.
+///
+/// Provider `extra` maps are intentionally forward compatible, so older
+/// binaries can carry fields they do not understand. That also means an API
+/// response cannot assume an unknown field is public metadata. This scrubber
+/// mirrors the durable section classifier, including credential contexts such
+/// as `{ "oauth": { "value": ... } }`, while retaining explicit runtime
+/// templates and public metadata such as OAuth URLs, client ids, modes, and
+/// status booleans.
+///
+/// Credential references are server-owned authority and are removed even
+/// though they are safe to persist in the modular config.
+pub fn scrub_provider_metadata_credentials(value: &mut Value) {
+    fn walk(value: &mut Value, credential_context: CredentialScanContext) -> bool {
+        if credential_context != CredentialScanContext::None
+            && request_override_value_is_nonliteral_runtime_template(value)
+        {
+            return false;
+        }
+
+        match value {
+            Value::Object(object) => {
+                let keys = object.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    let Some(child) = object.get_mut(&key) else {
+                        continue;
+                    };
+                    let normalized = normalized_credential_key(&key);
+                    let reference_metadata = credential_reference_metadata_key(&key);
+
+                    if reference_metadata
+                        || key_contains_literal_credential_material(&key, child)
+                        || (credential_context != CredentialScanContext::None
+                            && NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES
+                                .contains(&normalized.as_str())
+                            && !value_is_empty(child))
+                    {
+                        object.remove(&key);
+                        continue;
+                    }
+
+                    let child_keys_are_identifiers = matches!(
+                        normalized.as_str(),
+                        "headers" | "providerinstances" | "credentialrefs"
+                    ) || normalized.ends_with("credentialrefs");
+                    let key_context = if child.is_object() || child.is_array() {
+                        credential_context_key(&key)
+                    } else {
+                        credential_literal_key(&key)
+                    };
+                    let key_metadata_context = (child.is_object() || child.is_array())
+                        && credential_metadata_container_key(&key);
+                    let child_context = if credential_context == CredentialScanContext::Strong
+                        && credential_public_metadata_key(&key)
+                    {
+                        CredentialScanContext::Adjacent
+                    } else if credential_context == CredentialScanContext::Strong || key_context {
+                        CredentialScanContext::Strong
+                    } else if credential_context == CredentialScanContext::Adjacent
+                        || key_metadata_context
+                    {
+                        CredentialScanContext::Adjacent
+                    } else {
+                        CredentialScanContext::None
+                    };
+
+                    if child_keys_are_identifiers {
+                        match child {
+                            Value::Object(entries) if normalized == "headers" => {
+                                let names = entries.keys().cloned().collect::<Vec<_>>();
+                                for name in names {
+                                    let remove = entries.get_mut(&name).is_some_and(|expression| {
+                                        (request_override_header_is_credential(&name)
+                                            && !value_is_empty(expression)
+                                            && !request_override_value_is_nonliteral_runtime_template(
+                                                expression,
+                                            ))
+                                            || walk(expression, credential_context)
+                                    });
+                                    if remove {
+                                        entries.remove(&name);
+                                    }
+                                }
+                            }
+                            Value::Object(entries) => {
+                                let names = entries.keys().cloned().collect::<Vec<_>>();
+                                for name in names {
+                                    let remove = entries
+                                        .get_mut(&name)
+                                        .is_some_and(|entry| walk(entry, child_context));
+                                    if remove {
+                                        entries.remove(&name);
+                                    }
+                                }
+                            }
+                            Value::Array(entries) => {
+                                let mut index = 0;
+                                while index < entries.len() {
+                                    if walk(&mut entries[index], child_context) {
+                                        entries.remove(index);
+                                    } else {
+                                        index += 1;
+                                    }
+                                }
+                            }
+                            _ => {
+                                if walk(child, child_context) {
+                                    object.remove(&key);
+                                }
+                            }
+                        }
+                    } else if walk(child, child_context) {
+                        object.remove(&key);
+                    }
+                }
+                false
+            }
+            Value::Array(values) => {
+                let mut index = 0;
+                while index < values.len() {
+                    if walk(&mut values[index], credential_context) {
+                        values.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
+                false
+            }
+            Value::String(value) => {
+                (credential_context == CredentialScanContext::Strong && !value.trim().is_empty())
+                    || url::Url::parse(value)
+                        .ok()
+                        .is_some_and(|url| !url.username().is_empty() || url.password().is_some())
+            }
+            Value::Number(_) => credential_context == CredentialScanContext::Strong,
+            Value::Bool(_) | Value::Null => false,
+        }
+    }
+
+    let _ = walk(value, CredentialScanContext::None);
+}
+
+/// Return whether provider metadata contains no API-visible credential
+/// authority or literal credential material.
+pub fn provider_metadata_is_secret_free(value: &Value) -> bool {
+    let mut sanitized = value.clone();
+    scrub_provider_metadata_credentials(&mut sanitized);
+    sanitized == *value
 }
 
 fn validate_configured_reference_coherence(
@@ -1567,11 +1832,28 @@ fn validate_providers(value: &ProvidersSection) -> Result<(), String> {
         )?;
     }
     for instance in value.provider_instances.values() {
+        let from_environment = match instance
+            .extra
+            .get(crate::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY)
+        {
+            Some(Value::Bool(true))
+                if matches!(instance.provider_type.as_str(), "openai" | "anthropic" | "gemini") =>
+            {
+                true
+            }
+            Some(Value::Bool(false)) | None => false,
+            Some(_) => {
+                return Err(
+                    "provider instance api_key_from_env must be a boolean and is only supported for openai, anthropic, or gemini"
+                        .to_string(),
+                )
+            }
+        };
         validate_provider_credential(
             &instance.api_key,
             instance.api_key_encrypted.as_deref(),
             instance.credential_ref.as_ref(),
-            false,
+            from_environment,
         )?;
     }
     let serialized = serde_json::to_value(value)
@@ -1785,7 +2067,9 @@ fn validate_request_scope_override(value: &Value) -> Result<(), String> {
             .ok_or_else(|| "provider request override headers must be an object".to_string())?;
         for (name, expression) in headers {
             validate_template_expression_shape(expression)?;
-            if is_credential_header(name) && !is_nonliteral_runtime_template(expression) {
+            if request_override_header_is_credential(name)
+                && !request_override_value_is_nonliteral_runtime_template(expression)
+            {
                 return Err(format!(
                     "provider request override {name} must not contain a literal credential"
                 ));
@@ -1870,13 +2154,13 @@ fn validate_provider_body_patch(value: &Value) -> Result<(), String> {
             return Err("provider request body patch operation is invalid".to_string());
         }
     }
-    if !body_patch_targets_credential(path) {
+    if !request_override_body_patch_targets_credential(path) {
         return Ok(());
     }
     let Some(value) = patch.get("value") else {
         return Ok(());
     };
-    if !is_nonliteral_runtime_template(value) {
+    if !request_override_value_is_nonliteral_runtime_template(value) {
         return Err(format!(
             "provider request body patch {path} must not contain literal credential material"
         ));
@@ -1884,32 +2168,13 @@ fn validate_provider_body_patch(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn body_patch_targets_credential(path: &str) -> bool {
+/// Whether a request-override body path targets credential-shaped material.
+///
+/// API projections use the same classifier as the durable validator so legacy
+/// values that predate strict validation cannot be returned as plaintext.
+pub fn request_override_body_patch_targets_credential(path: &str) -> bool {
     fn credential_token(segment: &str) -> bool {
-        matches!(
-            segment,
-            "apikey"
-                | "token"
-                | "password"
-                | "secret"
-                | "appsecret"
-                | "clientsecret"
-                | "devicekey"
-                | "privatekey"
-                | "passphrase"
-                | "authorization"
-                | "cookie"
-                | "accesskey"
-                | "authkey"
-                | "credential"
-                | "credentials"
-        ) || segment.ends_with("token")
-            || segment.ends_with("password")
-            || segment.ends_with("secret")
-            || segment.ends_with("accesskey")
-            || segment.ends_with("authkey")
-            || segment.ends_with("credential")
-            || segment.ends_with("credentials")
+        normalized_request_override_credential_name(segment)
     }
 
     let decoded = path.replace("~1", "/").replace("~0", "~");
@@ -1930,7 +2195,9 @@ fn body_patch_targets_credential(path: &str) -> bool {
             .any(|pair| credential_token(&format!("{}{}", pair[0], pair[1])))
 }
 
-fn is_nonliteral_runtime_template(value: &Value) -> bool {
+/// Whether a request-override expression resolves only from a validated
+/// runtime source and contains no literal fallback credential.
+pub fn request_override_value_is_nonliteral_runtime_template(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -2020,26 +2287,16 @@ fn runtime_format_has_no_secret_literal(template: &str) -> bool {
     found_runtime_value && safe_literal
 }
 
-fn is_credential_header(name: &str) -> bool {
+/// Whether a request-override header name is credential-shaped.
+///
+/// Kept public so API response redaction and durable validation cannot drift.
+pub fn request_override_header_is_credential(name: &str) -> bool {
     let compact = name
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    matches!(compact.as_str(), "cookie" | "setcookie" | "authentication")
-        || compact.ends_with("authorization")
-        || compact.ends_with("authkey")
-        || compact.ends_with("auth")
-        || compact.contains("apikey")
-        || compact.ends_with("token")
-        || compact.ends_with("sessiontoken")
-        || compact == "secret"
-        || compact.ends_with("secret")
-        || compact == "password"
-        || compact.ends_with("password")
-        || compact.ends_with("accesskey")
-        || compact.ends_with("credential")
-        || compact.ends_with("credentials")
+    normalized_request_override_credential_name(&compact)
 }
 
 fn validate_mcp_headers(headers: &[bamboo_domain::mcp_config::HeaderConfig]) -> Result<(), String> {
@@ -2999,7 +3256,8 @@ fn preflight_legacy_root_sections(
     input: &StrictPlanningInput,
     overrides: Option<&StrictSourceOverrides>,
 ) -> ConfigStoreResult<()> {
-    let sanitized_config = scrub_preflight_config_secrets(&input.config)?;
+    let mut sanitized_config = scrub_preflight_config_secrets(&input.config)?;
+    crate::materialize_legacy_provider_instances(&mut sanitized_config);
     let projection = SectionProjection::from_config(&sanitized_config, input.model_limits.clone())?;
     let mut sections =
         project_legacy_raw_sections(&input.root_raw, None, &input.authoritative_sidecars)?;
@@ -3715,12 +3973,13 @@ fn plan_config_facade_layout_with_broker(
             continue;
         }
         let StrictPlanningInput {
-            config,
+            mut config,
             root_raw,
             model_limits,
             broker,
             authoritative_sidecars,
         } = input;
+        crate::materialize_legacy_provider_instances(&mut config);
         let mut projection = SectionProjection::from_config(&config, model_limits)?;
         let mut broker_raw = None;
         if include_broker {
@@ -3751,12 +4010,13 @@ fn plan_config_facade_compound_layout(
     let source_hashes = migration_source_hashes(data_dir)?;
     let overrides = &credential_plan.source_overrides;
     let StrictPlanningInput {
-        config,
+        mut config,
         root_raw,
         model_limits,
         broker,
         authoritative_sidecars,
     } = load_strict_planning_input_with_overrides(data_dir, Some(overrides))?;
+    crate::materialize_legacy_provider_instances(&mut config);
     let mut projection = SectionProjection::from_config(&config, model_limits)?;
     let mut broker_raw = None;
     if include_broker {
@@ -5042,6 +5302,39 @@ pub struct ConfigFacade {
     startup_legacy_root: Mutex<Option<LegacyRootReconciliationOutcome>>,
 }
 
+#[cfg(test)]
+type ProviderAuthorityMigrationTestHook = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(test)]
+fn provider_authority_migration_test_hooks(
+) -> &'static Mutex<HashMap<PathBuf, ProviderAuthorityMigrationTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, ProviderAuthorityMigrationTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_provider_authority_migration_test_hook(
+    data_dir: &Path,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    provider_authority_migration_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_provider_authority_migration_test_hook(data_dir: &Path) {
+    if let Some(hook) = provider_authority_migration_test_hooks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(data_dir)
+    {
+        hook();
+    }
+}
+
 impl ConfigFacade {
     pub fn open(data_dir: impl AsRef<Path>) -> ConfigStoreResult<Self> {
         Self::open_stable(data_dir.as_ref(), |_| {})
@@ -5188,7 +5481,116 @@ impl ConfigFacade {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
         }
+        facade.materialize_legacy_provider_authority()?;
         Ok(facade)
+    }
+
+    /// Adopt a legacy or hybrid provider selection into the authoritative
+    /// provider-instance representation after the modular facade exists.
+    ///
+    /// The fresh durable envelope is the only mutation base: degraded LKG or
+    /// backup reads cannot authorize a repair write, and the content-aware CAS
+    /// catches raw-file races that do not advance the revision. Initial section
+    /// splitting uses the compound journal instead and normally makes this an
+    /// idempotent no-op on first open.
+    fn materialize_legacy_provider_authority(&self) -> ConfigStoreResult<bool> {
+        crate::credential_migration::with_provider_mcp_migration_lock(&self.data_dir, || {
+            crate::ensure_provider_mcp_migration_ready(&self.data_dir)?;
+            if !section_layout_is_active(&self.data_dir)? {
+                return Err(layout_not_committed());
+            }
+            if read_legacy_reconciliation_record(&self.data_dir)?.is_some_and(|record| {
+                !record.committed.is_empty()
+                    || !record.planned.is_empty()
+                    || !record.rejected.is_empty()
+            }) {
+                // Preserve exact legacy-root publication events. Advancing the
+                // provider revision before those events are acknowledged would
+                // turn a valid rN handoff into an apparent stale conflict. The
+                // next open after acknowledgement retries this idempotently.
+                return Ok(false);
+            }
+
+            for attempt in 0..2 {
+                let (mut durable_config, durable_envelope) =
+                    load_durable_effective_section_snapshot_under_migration_lock(
+                        &self.data_dir,
+                        SectionId::Providers,
+                    )?;
+                if !crate::materialize_legacy_provider_instances(&mut durable_config) {
+                    // Another facade/process may have published the migration
+                    // after this facade opened but before it acquired the
+                    // shared lock. The durable no-op is authoritative; adopt
+                    // that exact winner before returning so startup never
+                    // exposes the stale legacy generation until a watcher tick.
+                    let _ = self.registry.reload_if_changed(SectionId::Providers);
+                    return Ok(false);
+                }
+                if durable_envelope.status != SectionStatus::Healthy
+                    || durable_envelope.source_kind != SectionSourceKind::File
+                {
+                    tracing::warn!(
+                        status = ?durable_envelope.status,
+                        source = ?durable_envelope.source_kind,
+                        "provider-instance authority migration deferred: durable provider base is unavailable"
+                    );
+                    return Ok(false);
+                }
+
+                let store = CredentialStore::open(&self.data_dir);
+                let (credential_lkg, _, credential_health) =
+                    store.snapshot_with_health_unchecked()?;
+                if credential_health.status != SectionStatus::Healthy
+                    || credential_health.source != SectionSourceKind::File
+                {
+                    tracing::warn!(
+                        status = ?credential_health.status,
+                        source = ?credential_health.source,
+                        "provider-instance authority migration deferred: credential base is unavailable"
+                    );
+                    return Ok(false);
+                }
+                if let Err(error) = crate::credential_migration::validate_provider_credential_values(
+                    &durable_config,
+                    &credential_lkg,
+                ) {
+                    tracing::warn!(
+                        error = %error,
+                        "provider-instance authority migration deferred: active credential is unavailable"
+                    );
+                    return Ok(false);
+                }
+
+                let durable: ProvidersSection = serde_json::from_value(durable_envelope.data)?;
+                let candidate =
+                    SectionProjection::from_config(&durable_config, ModelLimitsSection::default())?
+                        .providers;
+                validate_providers(&candidate).map_err(crate::ConfigStoreError::Validation)?;
+
+                #[cfg(test)]
+                run_provider_authority_migration_test_hook(&self.data_dir);
+
+                match self
+                    .registry
+                    .providers
+                    .commit_from_durable_base_with_envelope(
+                        durable_envelope.revision,
+                        &durable,
+                        candidate,
+                    ) {
+                    Ok(_) => return Ok(true),
+                    Err(crate::ConfigStoreError::Conflict { .. }) if attempt == 0 => {
+                        // A raw editor may win without advancing the envelope
+                        // revision. Normalize/adopt that exact winner, then
+                        // recompute migration once from the fresh bytes. A
+                        // second conflict remains fail-closed.
+                        let _ = self.registry.reload_if_changed(SectionId::Providers);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("bounded provider authority migration loop always returns")
+        })
     }
 
     pub fn registry(&self) -> &Arc<SectionRegistry> {
@@ -6036,6 +6438,602 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn provider_api_metadata_scrubber_matches_durable_credential_contexts() {
+        let original = json!({
+            "headless_auth": true,
+            "max_tokens": 8192,
+            "max_output_tokens": 4096,
+            "oauth": {
+                "client_id": "public-client",
+                "authorization_url": "https://auth.example.test/authorize",
+                "value": "oauth-literal"
+            },
+            "private_key": "private-literal",
+            "nested": {"client_secret": "client-literal"},
+            "secrets": {"primary": "plural-container-literal"},
+            "tokens": ["plural-token-literal"],
+            "client_tokens": ["client-token-literal"],
+            "passwords": {"primary": "plural-password-literal"},
+            "api_keys": {"primary": "plural-api-key-literal"},
+            "credential_ref": "provider.work.api_key",
+            "headers": {
+                "X-Trace": "public-trace",
+                "X-Access-Key": "header-literal",
+                "X-Private-Key": "private-header-literal",
+                "X-Device-Key": "device-header-literal",
+                "Authorization": {"type": "env_ref", "name": "UPSTREAM_TOKEN"}
+            }
+        });
+        assert!(!provider_metadata_is_secret_free(&original));
+
+        let mut sanitized = original;
+        scrub_provider_metadata_credentials(&mut sanitized);
+
+        assert_eq!(sanitized["headless_auth"], true);
+        assert_eq!(sanitized["max_tokens"], 8192);
+        assert_eq!(sanitized["max_output_tokens"], 4096);
+        assert_eq!(sanitized["oauth"]["client_id"], "public-client");
+        assert_eq!(
+            sanitized["oauth"]["authorization_url"],
+            "https://auth.example.test/authorize"
+        );
+        assert!(sanitized["oauth"].get("value").is_none());
+        assert!(sanitized.get("private_key").is_none());
+        assert!(sanitized["nested"].get("client_secret").is_none());
+        assert!(sanitized.get("secrets").is_none());
+        assert!(sanitized.get("tokens").is_none());
+        assert!(sanitized.get("client_tokens").is_none());
+        assert!(sanitized.get("passwords").is_none());
+        assert!(sanitized.get("api_keys").is_none());
+        assert!(sanitized.get("credential_ref").is_none());
+        assert_eq!(sanitized["headers"]["X-Trace"], "public-trace");
+        assert!(sanitized["headers"].get("X-Access-Key").is_none());
+        assert!(sanitized["headers"].get("X-Private-Key").is_none());
+        assert!(sanitized["headers"].get("X-Device-Key").is_none());
+        assert_eq!(
+            sanitized["headers"]["Authorization"]["name"],
+            "UPSTREAM_TOKEN"
+        );
+        assert!(provider_metadata_is_secret_free(&sanitized));
+    }
+
+    #[test]
+    fn request_override_credential_classifiers_cover_key_and_plural_forms() {
+        for header in [
+            "X-Private-Key",
+            "X-Device-Key",
+            "X-Secret-Keys",
+            "X-Client-Tokens",
+            "X-Service-Tokens",
+            "X-Provider-Tokens",
+            "X-Api-Key-Version",
+        ] {
+            assert!(
+                request_override_header_is_credential(header),
+                "credential header was not classified: {header}"
+            );
+        }
+        for path in [
+            "/secrets/primary",
+            "/private/keys/primary",
+            "/device_keys/0",
+            "/accessKeys/current",
+            "/tokens/0",
+            "/client_tokens/0",
+            "/service_tokens/current",
+            "/provider_tokens/primary",
+            "/passwords/primary",
+            "/api_keys/primary",
+        ] {
+            assert!(
+                request_override_body_patch_targets_credential(path),
+                "credential body path was not classified: {path}"
+            );
+        }
+        assert!(!request_override_header_is_credential("X-Trace-Id"));
+        assert!(!request_override_body_patch_targets_credential(
+            "/metadata/public_id"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/max_tokens"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/max_output_tokens"
+        ));
+        assert!(!request_override_body_patch_targets_credential(
+            "/metadata/public_access"
+        ));
+    }
+
+    fn install_completed_legacy_openai(data_dir: &Path, secret: &str) -> (CredentialRef, u64) {
+        let facade = ConfigFacade::open_or_migrate(data_dir).unwrap();
+        let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
+        let store = CredentialStore::open(data_dir);
+        let credential_revision = store.revision().unwrap();
+        store
+            .replace(
+                reference.clone(),
+                secret,
+                CredentialSource::Migrated,
+                credential_revision,
+            )
+            .unwrap();
+
+        let expected_revision = facade.registry().providers.snapshot().revision;
+        let mut providers = ProvidersSection {
+            provider: Some("openai".to_string()),
+            ..ProvidersSection::default()
+        };
+        providers.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(reference.clone()),
+            model: Some("gpt-legacy".to_string()),
+            ..crate::OpenAIConfig::default()
+        });
+        let event = facade
+            .registry()
+            .providers
+            .commit(expected_revision, providers)
+            .unwrap();
+        let ConfigSectionEvent::Changed { revision, .. } = event else {
+            panic!("provider commit should advance the revision")
+        };
+        (reference, revision)
+    }
+
+    #[test]
+    fn initial_split_materializes_provider_instance_without_copying_plaintext() {
+        let _key = crate::encryption::set_test_encryption_key([201; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "openai",
+                "providers": {
+                    "openai": {
+                        "api_key": "initial-split-secret",
+                        "model": "gpt-legacy"
+                    }
+                }
+            }),
+        );
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = facade
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.data["default_provider_instance"], json!("openai"));
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            json!("provider.openai.api_key")
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert_no_plaintext_in_persistent_files(dir.path(), &["initial-split-secret"]);
+
+        let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "initial-split-secret"
+        );
+        let revision = envelope.revision;
+        drop(facade);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let after = restarted
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(after.revision, revision, "restart must be idempotent");
+        assert_eq!(
+            after.data["provider_instances"]["openai"]["model"],
+            json!("gpt-legacy")
+        );
+        let runtime = Config::from_data_dir_without_publish(Some(dir.path().to_path_buf()));
+        assert_eq!(
+            runtime.provider_instances["openai"].api_key,
+            "initial-split-secret"
+        );
+    }
+
+    #[test]
+    fn completed_facade_materializes_legacy_provider_with_exact_revision_and_restart() {
+        let _key = crate::encryption::set_test_encryption_key([202; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "completed-facade-secret");
+
+        let migrated = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = migrated
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.revision, legacy_revision + 1);
+        assert_eq!(envelope.data["default_provider_instance"], json!("openai"));
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            json!(reference.as_str())
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert_no_plaintext_in_persistent_files(dir.path(), &["completed-facade-secret"]);
+        drop(migrated);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            restarted.registry().providers.snapshot().revision,
+            legacy_revision + 1
+        );
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "completed-facade-secret"
+        );
+    }
+
+    #[test]
+    fn concurrent_facades_publish_one_legacy_provider_migration_generation() {
+        let _key = crate::encryption::set_test_encryption_key([213; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "concurrent-facade-secret");
+        let facades = [
+            std::sync::Arc::new(ConfigFacade::open(dir.path()).unwrap()),
+            std::sync::Arc::new(ConfigFacade::open(dir.path()).unwrap()),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = facades
+            .into_iter()
+            .map(|facade| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let _thread_key = crate::encryption::set_test_encryption_key([213; 32]);
+                    barrier.wait();
+                    facade.materialize_legacy_provider_authority().unwrap();
+                    let snapshot = facade.registry().providers.snapshot();
+                    (
+                        snapshot.revision,
+                        snapshot.status,
+                        snapshot.source_kind,
+                        snapshot.last_error.clone(),
+                        snapshot.data.default_provider_instance.clone(),
+                        snapshot.data.provider_instances.contains_key("openai"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("facade thread"))
+            .collect::<Vec<_>>();
+        for (revision, status, source, last_error, default_id, has_instance) in &results {
+            assert_eq!(
+                *revision,
+                legacy_revision + 1,
+                "concurrent facade results: {results:?}"
+            );
+            assert_eq!(*status, SectionStatus::Healthy);
+            assert_eq!(*source, SectionSourceKind::File);
+            assert!(last_error.is_none());
+            assert_eq!(default_id.as_deref(), Some("openai"));
+            assert!(*has_instance);
+        }
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-facade-secret"
+        );
+        assert_no_plaintext_in_persistent_files(dir.path(), &["concurrent-facade-secret"]);
+    }
+
+    #[test]
+    fn completed_facade_preserves_nondefault_legacy_aliases_with_explicit_default() {
+        let _key = crate::encryption::set_test_encryption_key([212; 32]);
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let store = CredentialStore::open(dir.path());
+        let openai_ref = CredentialRef::parse("provider.openai.api_key").unwrap();
+        let anthropic_ref = CredentialRef::parse("provider.anthropic.api_key").unwrap();
+        let (credential_revision, _) = store
+            .replace(
+                openai_ref.clone(),
+                "hybrid-openai-secret",
+                CredentialSource::Migrated,
+                store.revision().unwrap(),
+            )
+            .unwrap();
+        store
+            .replace(
+                anthropic_ref.clone(),
+                "hybrid-anthropic-secret",
+                CredentialSource::Migrated,
+                credential_revision,
+            )
+            .unwrap();
+
+        let expected_revision = facade.registry().providers.snapshot().revision;
+        let mut providers = ProvidersSection {
+            provider: Some("work".to_string()),
+            default_provider_instance: Some("work".to_string()),
+            ..ProvidersSection::default()
+        };
+        providers.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot",
+                "enabled": true,
+                "model": "gpt-work"
+            }))
+            .unwrap(),
+        );
+        providers.providers.openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(openai_ref.clone()),
+            model: Some("gpt-legacy".to_string()),
+            ..crate::OpenAIConfig::default()
+        });
+        providers.providers.anthropic = Some(crate::AnthropicConfig {
+            credential_ref: Some(anthropic_ref.clone()),
+            model: Some("claude-legacy".to_string()),
+            ..crate::AnthropicConfig::default()
+        });
+        let event = facade
+            .registry()
+            .providers
+            .commit(expected_revision, providers)
+            .unwrap();
+        let ConfigSectionEvent::Changed {
+            revision: hybrid_revision,
+            ..
+        } = event
+        else {
+            panic!("hybrid provider commit should advance the revision")
+        };
+        drop(facade);
+
+        let migrated = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let envelope = migrated
+            .registry()
+            .envelope_value(SectionId::Providers)
+            .unwrap();
+        assert_eq!(envelope.revision, hybrid_revision + 1);
+        assert_eq!(envelope.data["default_provider_instance"], "work");
+        assert_eq!(
+            envelope.data["provider_instances"]["work"]["model"],
+            "gpt-work"
+        );
+        assert_eq!(
+            envelope.data["provider_instances"]["openai"]["credential_ref"],
+            openai_ref.as_str()
+        );
+        assert_eq!(
+            envelope.data["provider_instances"]["anthropic"]["credential_ref"],
+            anthropic_ref.as_str()
+        );
+        assert!(envelope.data.get("provider").is_none());
+        assert!(envelope.data.get("openai").is_none());
+        assert!(envelope.data.get("anthropic").is_none());
+        assert_no_plaintext_in_persistent_files(
+            dir.path(),
+            &["hybrid-openai-secret", "hybrid-anthropic-secret"],
+        );
+        let migrated_revision = envelope.revision;
+        drop(migrated);
+
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(
+            restarted.registry().providers.snapshot().revision,
+            migrated_revision,
+            "the explicit-default hybrid migration must be idempotent"
+        );
+        assert_eq!(
+            store.resolve(&openai_ref).unwrap().unwrap().expose(),
+            "hybrid-openai-secret"
+        );
+        assert_eq!(
+            store.resolve(&anthropic_ref).unwrap().unwrap().expose(),
+            "hybrid-anthropic-secret"
+        );
+    }
+
+    #[test]
+    fn completed_migration_rebases_once_on_same_revision_editor_winner() {
+        let _key = crate::encryption::set_test_encryption_key([203; 32]);
+        let dir = TempDir::new().unwrap();
+        let (_, legacy_revision) = install_completed_legacy_openai(dir.path(), "cas-race-secret");
+        let providers_path = dir.path().join("providers.json");
+        let hook_path = providers_path.clone();
+        set_provider_authority_migration_test_hook(dir.path(), move || {
+            let mut document: Value =
+                serde_json::from_slice(&std::fs::read(&hook_path).unwrap()).unwrap();
+            document["data"]["openai"]["model"] = json!("editor-same-revision");
+            write_json(&hook_path, &document);
+        });
+
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(&providers_path).unwrap()).unwrap();
+        assert_eq!(
+            document["data"]["provider_instances"]["openai"]["model"],
+            json!("editor-same-revision")
+        );
+        assert_eq!(document["revision"], legacy_revision + 2);
+        assert!(document["data"].get("openai").is_none());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision + 2
+        );
+    }
+
+    #[test]
+    fn degraded_instance_native_provider_lkg_remains_readable() {
+        let _key = crate::encryption::set_test_encryption_key([204; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            &json!({
+                "provider": "openai",
+                "providers": {"openai": {"api_key": "native-lkg-secret"}}
+            }),
+        );
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate
+            .provider_instances
+            .get_mut("openai")
+            .unwrap()
+            .model = Some("gpt-native-lkg".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, candidate)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            b"corrupt provider authority",
+        )
+        .unwrap();
+        drop(facade);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!reopened.materialize_legacy_provider_authority().unwrap());
+        let snapshot = reopened.registry().providers.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Degraded);
+        assert!(snapshot.data.provider_instances.contains_key("openai"));
+        assert_eq!(
+            reopened
+                .effective_config()
+                .default_provider_instance
+                .as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn degraded_legacy_provider_lkg_defers_migration_without_losing_readability() {
+        let _key = crate::encryption::set_test_encryption_key([205; 32]);
+        let dir = TempDir::new().unwrap();
+        install_completed_legacy_openai(dir.path(), "legacy-lkg-secret");
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate.providers.openai.as_mut().unwrap().model = Some("gpt-newer".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, candidate)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("providers.json"),
+            b"corrupt provider authority",
+        )
+        .unwrap();
+        drop(facade);
+
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!reopened.materialize_legacy_provider_authority().unwrap());
+        let snapshot = reopened.registry().providers.snapshot();
+        assert_eq!(snapshot.status, SectionStatus::Degraded);
+        assert!(snapshot.data.provider_instances.is_empty());
+        assert_eq!(snapshot.data.provider.as_deref(), Some("openai"));
+        assert!(snapshot.data.providers.openai.is_some());
+    }
+
+    #[test]
+    fn degraded_credential_lkg_defers_completed_provider_migration() {
+        let _key = crate::encryption::set_test_encryption_key([207; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "credential-lkg-one");
+        let store = CredentialStore::open(dir.path());
+        let credential_revision = store.revision().unwrap();
+        store
+            .replace(
+                reference,
+                "credential-lkg-two",
+                CredentialSource::User,
+                credential_revision,
+            )
+            .unwrap();
+        std::fs::write(
+            dir.path().join("credentials.json"),
+            b"corrupt credential authority",
+        )
+        .unwrap();
+
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        assert!(!facade.materialize_legacy_provider_authority().unwrap());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision
+        );
+        assert!(facade
+            .registry()
+            .providers
+            .snapshot()
+            .data
+            .provider_instances
+            .is_empty());
+        assert_eq!(
+            facade.registry().credentials.health().status,
+            SectionStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn pending_legacy_publication_defers_provider_authority_revision() {
+        let _key = crate::encryption::set_test_encryption_key([206; 32]);
+        let dir = TempDir::new().unwrap();
+        let (_, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "pending-publication-secret");
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let record = LegacyRootReconciliationRecord {
+            version: LEGACY_ROOT_RECONCILIATION_VERSION,
+            root_sha256: "1".repeat(64),
+            complete: true,
+            committed: BTreeMap::from([(
+                "providers".to_string(),
+                LegacyRootCommittedPublication {
+                    revision: legacy_revision,
+                    candidate_sha256: "2".repeat(64),
+                    runtime_degraded: false,
+                },
+            )]),
+            planned: BTreeMap::new(),
+            rejected: Vec::new(),
+            unknown_fields: 0,
+        };
+        crate::credential_migration::with_provider_mcp_migration_lock(dir.path(), || {
+            write_legacy_reconciliation_record(dir.path(), &record)
+        })
+        .unwrap();
+
+        assert!(!facade.materialize_legacy_provider_authority().unwrap());
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            legacy_revision
+        );
+        assert!(facade
+            .registry()
+            .providers
+            .snapshot()
+            .data
+            .provider_instances
+            .is_empty());
     }
 
     #[test]
@@ -13558,7 +14556,7 @@ fn raw_reconciliation_secret_material_is_forbidden_with_context(
         path: &mut Vec<String>,
     ) -> bool {
         if credential_context != CredentialScanContext::None
-            && is_nonliteral_runtime_template(value)
+            && request_override_value_is_nonliteral_runtime_template(value)
         {
             return false;
         }
@@ -13594,9 +14592,11 @@ fn raw_reconciliation_secret_material_is_forbidden_with_context(
                                 let mut forbidden = false;
                                 for (name, expression) in entries {
                                     path.push(name.clone());
-                                    forbidden = if is_credential_header(name) {
+                                    forbidden = if request_override_header_is_credential(name) {
                                         !value_is_empty(expression)
-                                            && !is_nonliteral_runtime_template(expression)
+                                            && !request_override_value_is_nonliteral_runtime_template(
+                                                expression,
+                                            )
                                     } else {
                                         walk(section, expression, identifier_context, path)
                                     };

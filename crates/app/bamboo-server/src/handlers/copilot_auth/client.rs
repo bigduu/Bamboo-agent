@@ -8,6 +8,17 @@ use bamboo_llm::providers::{copilot::auth::CopilotAuthHandler, CopilotProvider};
 use bamboo_llm::Config;
 
 pub(super) fn resolve_headless_auth(config: &Config) -> bool {
+    if let Some(instance) = config
+        .provider_instances
+        .get(config.effective_default_provider())
+        .filter(|instance| instance.provider_type == "copilot")
+    {
+        return instance
+            .extra
+            .get("headless_auth")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(config.headless_auth);
+    }
     config
         .providers()
         .copilot

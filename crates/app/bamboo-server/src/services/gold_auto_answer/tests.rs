@@ -221,15 +221,21 @@ fn build_pending_session(
 async fn gold_auto_answer_conclusion_with_options_full_loop() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let mut config = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-    config.provider = String::new();
+    config.provider = "test-provider".to_string();
     config.features.provider_model_ref = true;
     let provider = ScriptedProvider::new("ok.");
     let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-    let mut app_state =
-        AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
-            .await
-            .expect("app state");
-    app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+    let mut app_state = AppState::new_with_provider(
+        temp_dir.path().to_path_buf(),
+        config,
+        provider_trait.clone(),
+    )
+    .await
+    .expect("app state");
+    app_state.provider_registry = Arc::new(ProviderRegistry::new(
+        HashMap::from([("test-provider".to_string(), provider_trait)]),
+        "test-provider".to_string(),
+    ));
     app_state.provider_router = Arc::new(ProviderModelRouter::new(
         app_state.provider_registry.clone(),
     ));
@@ -319,15 +325,21 @@ async fn gold_auto_answer_exit_plan_mode_full_loop() {
 
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let mut config = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-    config.provider = String::new();
+    config.provider = "test-provider".to_string();
     config.features.provider_model_ref = true;
     let provider = ScriptedProvider::new("Approve (Default mode)");
     let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-    let mut app_state =
-        AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
-            .await
-            .expect("app state");
-    app_state.provider_registry = Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+    let mut app_state = AppState::new_with_provider(
+        temp_dir.path().to_path_buf(),
+        config,
+        provider_trait.clone(),
+    )
+    .await
+    .expect("app state");
+    app_state.provider_registry = Arc::new(ProviderRegistry::new(
+        HashMap::from([("test-provider".to_string(), provider_trait)]),
+        "test-provider".to_string(),
+    ));
     app_state.provider_router = Arc::new(ProviderModelRouter::new(
         app_state.provider_registry.clone(),
     ));

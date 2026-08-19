@@ -477,6 +477,13 @@ impl Config {
                 instance.api_key_encrypted = None;
                 continue;
             }
+            if crate::provider_instance_api_key_from_env(instance) {
+                // Runtime environment keys are never converted into durable
+                // ciphertext. The metadata marker is enough to re-inject the
+                // standard provider env var after the next restart.
+                instance.api_key_encrypted = None;
+                continue;
+            }
             let api_key = instance.api_key.trim();
             // Empty plaintext → preserve existing ciphertext (see
             // refresh_provider_api_keys_encrypted). #268.
@@ -495,6 +502,10 @@ impl Config {
     pub fn ensure_provider_instance_credentials_isolated(&mut self) -> Result<()> {
         for (id, instance) in &mut self.provider_instances {
             if instance.credential_ref.is_some() {
+                instance.api_key_encrypted = None;
+                continue;
+            }
+            if crate::provider_instance_api_key_from_env(instance) {
                 instance.api_key_encrypted = None;
                 continue;
             }

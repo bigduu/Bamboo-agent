@@ -174,11 +174,26 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     );
     let reloaded = bamboo_config::Config::from_data_dir_without_env(Some(data_dir.clone()));
     assert_eq!(
-        reloaded.providers().openai.as_ref().unwrap().api_key,
-        "sk-test-key"
+        reloaded.default_provider_instance.as_deref(),
+        Some("openai")
     );
+    let reloaded_openai = reloaded
+        .provider_instances
+        .get("openai")
+        .expect("legacy provider should materialize as the authoritative instance");
+    assert_eq!(reloaded_openai.api_key, "sk-test-key");
+    assert_eq!(
+        reloaded_openai
+            .credential_ref
+            .as_ref()
+            .map(|reference| reference.as_str()),
+        Some("provider.openai.api_key")
+    );
+    assert!(reloaded.providers().openai.is_none());
 
-    // Attempt to inject api_key_encrypted via permissive endpoint - must be ignored.
+    // Attempt to inject api_key_encrypted via the permissive endpoint after
+    // legacy materialization. It must be ignored without resurrecting the
+    // retired type-keyed alias.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
@@ -200,13 +215,17 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     }
     let providers = config_document_data(&providers_document);
     let openai_ref_after = providers
-        .get("openai")
+        .get("provider_instances")
+        .and_then(|instances| instances.get("openai"))
         .and_then(|o| o.get("credential_ref"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     assert_eq!(openai_ref_after, openai_ref_before);
-    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    assert!(providers.get("openai").is_none());
+    assert!(providers["provider_instances"]["openai"]
+        .get("api_key_encrypted")
+        .is_none());
 
     // Ensure the permissive endpoint merges without clobbering prior provider/setup state.
     let req = test::TestRequest::get()
@@ -243,10 +262,13 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let providers_document = read_config_json(&providers_path);
     let providers = config_document_data(&providers_document);
     assert_eq!(
-        providers["openai"]["credential_ref"], "provider.openai.api_key",
+        providers["provider_instances"]["openai"]["credential_ref"], "provider.openai.api_key",
         "metadata-only updates must preserve the existing credential ref"
     );
-    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    assert!(providers.get("openai").is_none());
+    assert!(providers["provider_instances"]["openai"]
+        .get("api_key_encrypted")
+        .is_none());
 }
 
 #[actix_web::test]

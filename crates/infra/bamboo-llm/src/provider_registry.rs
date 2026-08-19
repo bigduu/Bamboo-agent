@@ -2,15 +2,18 @@
 //!
 //! Supports two modes:
 //! 1. **Legacy** — keyed by provider type name (e.g. `"openai"`, `"anthropic"`).
-//! 2. **Instance-keyed** — keyed by instance id (e.g. `"openai-work"`, `"anthropic-personal"`),
-//!    with legacy providers automatically synthesized as default instances.
+//! 2. **Instance-keyed** — keyed by instance id (e.g. `"openai-work"`, `"anthropic-personal"`).
+//!
+//! Instance configuration is authoritative in the second mode. A narrow
+//! synthesized-legacy branch remains only for hybrid configurations whose
+//! default still names a legacy alias during the Lotus migration window.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::provider::{LLMError, LLMProvider};
-use crate::provider_factory::create_provider_by_name;
+use crate::provider_factory::{create_provider_by_name, create_provider_from_instance};
 use bamboo_config::Config;
 use bamboo_config::ProviderInstanceConfig;
 use bamboo_domain::poison::PoisonRecover;
@@ -67,9 +70,8 @@ impl ProviderRegistry {
     /// Create a registry by initializing every configured provider.
     ///
     /// When `config.provider_instances` is non-empty, each instance is initialized
-    /// by translating the instance config into the shape expected by
-    /// [`create_provider_by_name`]. Legacy providers are also included as
-    /// synthesized instances (via [`bamboo_config::synthesize_legacy_instances`]).
+    /// directly from its native configuration. Legacy providers are included only
+    /// as a compatibility seam for non-overlapping hybrid aliases.
     ///
     /// Providers that fail to initialize (missing API key, auth failure, etc.)
     /// are skipped with a warning log rather than aborting the entire startup.
@@ -178,7 +180,6 @@ impl ProviderRegistry {
         let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
         let mut metadata: HashMap<String, ProviderMetadata> = HashMap::new();
 
-        // Build a synthetic config per instance and create the provider.
         for (instance_id, instance) in &config.provider_instances {
             if !instance.enabled {
                 tracing::info!(instance_id, "Provider instance disabled, skipping");
@@ -219,46 +220,54 @@ impl ProviderRegistry {
             }
         }
 
-        // Also synthesize legacy providers that don't overlap with explicit instances.
-        let legacy = bamboo_config::synthesize_legacy_instances(config);
-        for (instance_id, instance_cfg) in legacy {
-            if !instance_cfg.enabled {
-                continue;
-            }
-            if providers.contains_key(&instance_id) {
-                continue; // explicit instance takes precedence
-            }
+        // Narrow compatibility seam for #780-era hybrid configs: the effective
+        // default may still name a legacy alias while other native instances
+        // exist. Never synthesize unrelated stale aliases, and never shadow an
+        // explicit instance with the same id.
+        {
+            let legacy_default_id = config.effective_default_provider();
+            let instance_cfg = (!config.provider_instances.contains_key(legacy_default_id))
+                .then(|| {
+                    bamboo_config::synthesize_legacy_instances(config)
+                        .into_iter()
+                        .find_map(|(id, instance)| (id == legacy_default_id).then_some(instance))
+                })
+                .flatten()
+                .filter(|instance| instance.enabled);
 
-            match Self::create_instance_provider(config, &instance_cfg, app_data_dir.clone()).await
-            {
-                Ok(provider) => {
-                    tracing::info!(
-                        instance_id,
-                        provider_type = &instance_cfg.provider_type,
-                        "Legacy provider instance synthesized"
-                    );
-                    providers.insert(instance_id.clone(), provider);
-                    metadata.insert(
-                        instance_id.clone(),
-                        ProviderMetadata {
-                            id: instance_id,
-                            provider_type: instance_cfg.provider_type.clone(),
-                            display_name: instance_cfg
-                                .label
-                                .clone()
-                                .filter(|label| !label.trim().is_empty())
-                                .unwrap_or_else(|| {
-                                    display_name_for_provider_type(&instance_cfg.provider_type)
-                                }),
-                        },
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        instance_id,
-                        error = %e,
-                        "Legacy provider instance failed to initialize"
-                    );
+            if let Some(instance_cfg) = instance_cfg {
+                match Self::create_instance_provider(config, &instance_cfg, app_data_dir.clone())
+                    .await
+                {
+                    Ok(provider) => {
+                        tracing::info!(
+                            instance_id = legacy_default_id,
+                            provider_type = &instance_cfg.provider_type,
+                            "Legacy default alias synthesized for hybrid compatibility"
+                        );
+                        providers.insert(legacy_default_id.to_string(), provider);
+                        metadata.insert(
+                            legacy_default_id.to_string(),
+                            ProviderMetadata {
+                                id: legacy_default_id.to_string(),
+                                provider_type: instance_cfg.provider_type.clone(),
+                                display_name: instance_cfg
+                                    .label
+                                    .clone()
+                                    .filter(|label| !label.trim().is_empty())
+                                    .unwrap_or_else(|| {
+                                        display_name_for_provider_type(&instance_cfg.provider_type)
+                                    }),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            instance_id = legacy_default_id,
+                            error = %e,
+                            "Hybrid legacy default alias failed to initialize"
+                        );
+                    }
                 }
             }
         }
@@ -272,18 +281,14 @@ impl ProviderRegistry {
 
     /// Create a single provider from a [`ProviderInstanceConfig`].
     ///
-    /// This works by building a temporary [`Config`] that has the instance's
-    /// credentials projected into the legacy provider slot, then delegating
-    /// to [`create_provider_by_name`].
+    /// The instance remains the runtime authority; no legacy config slot is
+    /// populated as an intermediate representation.
     async fn create_instance_provider(
         base_config: &Config,
         instance: &ProviderInstanceConfig,
         app_data_dir: PathBuf,
     ) -> Result<Arc<dyn LLMProvider>, LLMError> {
-        let mut temp_config = base_config.clone();
-        // Project the instance's credentials into the legacy provider slots.
-        apply_instance_to_config(&mut temp_config, instance);
-        create_provider_by_name(&temp_config, &instance.provider_type, app_data_dir).await
+        create_provider_from_instance(base_config, instance, app_data_dir).await
     }
 
     /// Get a provider by name or instance id.
@@ -361,119 +366,6 @@ impl ProviderRegistry {
     pub fn set_default(&self, key: String) {
         *self.default_provider.write().recover_poison() = key;
     }
-}
-
-/// Project an instance's credentials into the legacy `Config` provider slots
-/// so that `create_provider_by_name` can consume them.
-fn apply_instance_to_config(config: &mut Config, instance: &ProviderInstanceConfig) {
-    let providers = config.providers_mut();
-    match instance.provider_type.as_str() {
-        "openai" => {
-            let extra = instance
-                .extra
-                .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
-                .map(|value| {
-                    std::iter::once((
-                        bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
-                        value.clone(),
-                    ))
-                    .collect()
-                })
-                .unwrap_or_default();
-            providers.openai = Some(bamboo_config::OpenAIConfig {
-                api_key: instance.api_key.clone(),
-                // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
-                // override, so it may be persisted normally. #253.
-                api_key_from_env: false,
-                api_key_encrypted: instance.api_key_encrypted.clone(),
-                credential_ref: None,
-                base_url: instance.base_url.clone(),
-                model: instance.model.clone(),
-                fast_model: instance.fast_model.clone(),
-                vision_model: instance.vision_model.clone(),
-                reasoning_effort: instance.reasoning_effort,
-                responses_only_models: instance.responses_only_models.clone(),
-                request_overrides: instance.request_overrides.clone(),
-                extra,
-            });
-        }
-        "anthropic" => {
-            providers.anthropic = Some(bamboo_config::AnthropicConfig {
-                api_key: instance.api_key.clone(),
-                // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
-                // override, so it may be persisted normally. #253.
-                api_key_from_env: false,
-                api_key_encrypted: instance.api_key_encrypted.clone(),
-                credential_ref: None,
-                base_url: instance.base_url.clone(),
-                model: instance.model.clone(),
-                fast_model: instance.fast_model.clone(),
-                vision_model: instance.vision_model.clone(),
-                max_tokens: None,
-                reasoning_effort: instance.reasoning_effort,
-                request_overrides: instance.request_overrides.clone(),
-                // Anthropic-compatible upstreams (e.g. GLM) that require
-                // unconditional `thinking`-block presence opt in via this
-                // instance's `extra.thinking_replay_always` (#520); real
-                // Anthropic must never set it.
-                thinking_replay_always: instance
-                    .extra
-                    .get("thinking_replay_always")
-                    .and_then(|v| v.as_bool()),
-                extra: Default::default(),
-            });
-        }
-        "gemini" => {
-            providers.gemini = Some(bamboo_config::GeminiConfig {
-                api_key: instance.api_key.clone(),
-                // Key comes from the provider instance, not a BAMBOO_*_API_KEY env
-                // override, so it may be persisted normally. #253.
-                api_key_from_env: false,
-                api_key_encrypted: instance.api_key_encrypted.clone(),
-                credential_ref: None,
-                base_url: instance.base_url.clone(),
-                model: instance.model.clone(),
-                fast_model: instance.fast_model.clone(),
-                vision_model: instance.vision_model.clone(),
-                reasoning_effort: instance.reasoning_effort,
-                request_overrides: instance.request_overrides.clone(),
-                extra: Default::default(),
-            });
-        }
-        "copilot" => {
-            // Copilot uses device auth; just set the model overrides.
-            let existing = providers.copilot.take();
-            providers.copilot = Some(bamboo_config::CopilotConfig {
-                enabled: true,
-                headless_auth: existing.as_ref().map(|c| c.headless_auth).unwrap_or(false),
-                model: instance.model.clone(),
-                fast_model: instance.fast_model.clone(),
-                vision_model: instance.vision_model.clone(),
-                reasoning_effort: instance.reasoning_effort,
-                responses_only_models: instance.responses_only_models.clone(),
-                request_overrides: instance.request_overrides.clone(),
-                extra: Default::default(),
-            });
-        }
-        "bodhi" => {
-            providers.bodhi = Some(bamboo_config::BodhiConfig {
-                api_key: instance.api_key.clone(),
-                api_key_encrypted: instance.api_key_encrypted.clone(),
-                credential_ref: None,
-                base_url: instance.base_url.clone(),
-                target_provider: instance
-                    .extra
-                    .get("target_provider")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                reasoning_effort: instance.reasoning_effort,
-                extra: Default::default(),
-            });
-        }
-        _ => {}
-    }
-    // Set provider type so create_provider_by_name targets the right one.
-    config.provider = instance.provider_type.clone();
 }
 
 fn display_name_for_provider_type(id: &str) -> String {
@@ -614,117 +506,101 @@ mod tests {
         assert_eq!(registry.default_provider_name(), "new-default");
     }
 
-    #[test]
-    fn test_apply_instance_to_config_openai() {
+    #[tokio::test]
+    async fn explicit_instance_failure_does_not_fall_back_to_stale_legacy_alias() {
+        let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        let mut extra = std::collections::BTreeMap::new();
-        extra.insert(
-            bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
-            serde_json::json!(false),
-        );
-        let instance = ProviderInstanceConfig {
-            provider_type: "openai".to_string(),
-            label: Some("Test OpenAI".to_string()),
-            api_key: "sk-instance-key".to_string(),
-            api_key_encrypted: None,
-            credential_ref: None,
-            base_url: Some("https://custom.api.com/v1".to_string()),
-            model: Some("gpt-4o".to_string()),
-            fast_model: Some("gpt-4o-mini".to_string()),
-            vision_model: None,
-            reasoning_effort: None,
-            responses_only_models: vec![],
-            request_overrides: None,
-            enabled: true,
-            extra,
+        *config.providers_mut() = bamboo_config::ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: "sk-stale-legacy".to_string(),
+                ..OpenAIConfig::default()
+            }),
+            ..Default::default()
         };
-
-        apply_instance_to_config(&mut config, &instance);
-
-        let openai = config
-            .providers()
-            .openai
-            .as_ref()
-            .expect("openai should be set");
-        assert_eq!(openai.api_key, "sk-instance-key");
-        assert_eq!(
-            openai.base_url.as_deref(),
-            Some("https://custom.api.com/v1")
+        config.provider_instances.insert(
+            "openai".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": "",
+                "enabled": true
+            }))
+            .unwrap(),
         );
-        assert_eq!(openai.model.as_deref(), Some("gpt-4o"));
-        assert!(!openai.explicit_prompt_cache_enabled());
-        assert_eq!(config.provider, "openai");
+        config.default_provider_instance = Some("openai".to_string());
+
+        let registry = ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert!(registry.get("openai").is_none());
+        assert!(registry.get_default().is_none());
     }
 
-    /// Issue #520: an Anthropic provider instance's `extra.thinking_replay_always`
-    /// (the GLM-style anthropic-compat opt-in) must project through to the
-    /// legacy `AnthropicConfig` slot `create_provider_by_name` reads.
-    #[test]
-    fn test_apply_instance_to_config_anthropic_projects_thinking_replay_always() {
+    #[tokio::test]
+    async fn hybrid_legacy_default_alias_remains_resolvable_without_other_stale_aliases() {
+        let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        let mut extra = std::collections::BTreeMap::new();
-        extra.insert(
-            "thinking_replay_always".to_string(),
-            serde_json::json!(true),
-        );
-        let instance = ProviderInstanceConfig {
-            provider_type: "anthropic".to_string(),
-            label: Some("GLM compat".to_string()),
-            api_key: "glm-key".to_string(),
-            api_key_encrypted: None,
-            credential_ref: None,
-            base_url: Some("https://glm.example.com/anthropic".to_string()),
-            model: Some("glm-4.6".to_string()),
-            fast_model: None,
-            vision_model: None,
-            reasoning_effort: None,
-            responses_only_models: vec![],
-            request_overrides: None,
-            enabled: true,
-            extra,
+        *config.providers_mut() = bamboo_config::ProviderConfigs {
+            openai: Some(OpenAIConfig {
+                api_key: "sk-legacy-default".to_string(),
+                ..OpenAIConfig::default()
+            }),
+            anthropic: Some(bamboo_config::AnthropicConfig {
+                api_key: "sk-stale-anthropic".to_string(),
+                ..bamboo_config::AnthropicConfig::default()
+            }),
+            ..Default::default()
         };
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": "sk-work",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".to_string());
 
-        apply_instance_to_config(&mut config, &instance);
+        let registry = ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
 
-        let anthropic = config
-            .providers()
-            .anthropic
-            .as_ref()
-            .expect("anthropic should be set");
-        assert_eq!(anthropic.thinking_replay_always, Some(true));
+        assert_eq!(registry.default_provider_name(), "openai");
+        assert!(registry.get_default().is_some());
+        assert!(registry.get("work").is_some());
+        assert!(registry.get("anthropic").is_none());
     }
 
-    /// Without the `extra.thinking_replay_always` key at all, the projected
-    /// config must leave it `None` — `create_provider_by_name` then defaults
-    /// to `false`, the safe real-Anthropic behavior (#520).
-    #[test]
-    fn test_apply_instance_to_config_anthropic_defaults_thinking_replay_always_to_none() {
+    #[tokio::test]
+    async fn hybrid_legacy_provider_fallback_without_explicit_default_remains_resolvable() {
+        let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
-        let instance = ProviderInstanceConfig {
-            provider_type: "anthropic".to_string(),
-            label: None,
-            api_key: "sk-ant-key".to_string(),
-            api_key_encrypted: None,
-            credential_ref: None,
-            base_url: None,
-            model: None,
-            fast_model: None,
-            vision_model: None,
-            reasoning_effort: None,
-            responses_only_models: vec![],
-            request_overrides: None,
-            enabled: true,
-            extra: Default::default(),
+        config.provider = "anthropic".to_string();
+        *config.providers_mut() = bamboo_config::ProviderConfigs {
+            anthropic: Some(bamboo_config::AnthropicConfig {
+                api_key: "sk-legacy-default".to_string(),
+                ..bamboo_config::AnthropicConfig::default()
+            }),
+            ..Default::default()
         };
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "api_key": "sk-work",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
 
-        apply_instance_to_config(&mut config, &instance);
+        let registry = ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
 
-        let anthropic = config
-            .providers()
-            .anthropic
-            .as_ref()
-            .expect("anthropic should be set");
-        assert_eq!(anthropic.thinking_replay_always, None);
+        assert_eq!(registry.default_provider_name(), "anthropic");
+        assert!(registry.get_default().is_some());
+        assert!(registry.get("work").is_some());
     }
 
     /// A poisoned lock must not brick the registry: every subsequent operation

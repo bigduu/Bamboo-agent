@@ -63,8 +63,8 @@ default. The full field list of `Config`:
 | `provider` | `String` | Default provider name. Default `"anthropic"`. |
 | `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...); only consulted when `features.provider_model_ref` is on. |
 | `providers` | `ProviderConfigs` | Legacy single-instance-per-type provider configs. See [Providers](#providers). |
-| `provider_instances` | `HashMap<String, ProviderInstanceConfig>` | Multi-instance provider configs, keyed by an id you choose (e.g. two Anthropic keys under different labels). Takes precedence over `providers` when non-empty. |
-| `default_provider_instance` | `Option<String>` | Which `provider_instances` entry is the default; overrides legacy `provider` when set. |
+| `provider_instances` | `HashMap<String, ProviderInstanceConfig>` | Authoritative provider configs, keyed by a stable routing id (e.g. two Anthropic keys under different labels). Runtime construction, model resolution, model discovery and child-agent credential scoping read these entries directly. |
+| `default_provider_instance` | `Option<String>` | Which enabled `provider_instances` entry is the default. A missing id is accepted only as a temporary hybrid reference to a real legacy provider stanza. |
 | `server` | `ServerConfig` | HTTP bind/port/TLS. See [Server](#server). |
 | `keyword_masking` | `KeywordMaskingConfig` | Outbound-body secret scrubbing. See [Keyword masking](#keyword-masking). |
 | `anthropic_model_mapping` / `gemini_model_mapping` | `{ mappings: HashMap<String,String> }` | Alias an OpenAI-shaped model id (e.g. `"gemini-pro"`) to the real upstream model id for that provider's compat endpoint. |
@@ -100,8 +100,9 @@ not part of Bamboo Issue #597.
 
 ## Providers
 
-Two shapes coexist; a fresh `bamboo init` writes the legacy single-instance
-`providers` shape, which is simplest for one key per provider:
+`provider_instances` is the durable and runtime authority. The legacy
+single-instance `providers` shape remains readable during the Lotus #177
+client-migration window:
 
 ```json
 {
@@ -135,8 +136,21 @@ affinity hint that can improve routing to a matching prefix; it does not
 guarantee a cache hit. `request_overrides` body patches run afterward, so an
 operator may replace the generated key or remove `prompt_cache_key` entirely.
 
-For more than one instance of a provider type (e.g. two separate Anthropic
-keys/workspaces), use `provider_instances` instead:
+The server idempotently materializes a usable selected legacy provider into
+`provider_instances` when it opens the modular configuration. Built-in provider
+type names become stable instance ids (`openai`, `anthropic`, and so on), the
+selected id becomes `default_provider_instance`, and provider-specific fields
+such as Anthropic `max_tokens` / `thinking_replay_always`, Copilot
+`headless_auth`, and Bodhi `target_provider` are retained. Existing credential
+references are reused; plaintext is never copied into `providers.json`.
+Migration commits use the provider-section revision and the configuration
+facade's recoverable transaction protocol. Reopening an already migrated
+configuration is a byte/revision no-op. If the provider or credential authority
+is degraded, a legacy reconciliation is pending, or the exact base revision has
+changed, migration does not overwrite that state; startup retains the readable
+last-known-good/hybrid view and retries on a later safe open.
+
+For one or more provider accounts, the canonical shape is:
 
 ```json
 {
@@ -150,8 +164,31 @@ keys/workspaces), use `provider_instances` instead:
 
 `provider_instances` entries have the same field set as the legacy stanzas
 plus `provider_type` (which of the five kinds this is) and `enabled` (default
-`true`). When `provider_instances` is non-empty it takes precedence over
-`providers`/`provider` as the routing source.
+`true`). An explicit instance id always wins over a same-named legacy alias,
+including when that instance is disabled or invalid; Bamboo never silently
+resurrects the stale alias. A temporary hybrid may keep a legacy default id
+only when a real stanza with that id still exists. Other instance-native paths
+do not re-project instances into global legacy slots.
+
+`BAMBOO_PROVIDER` may select an exact instance id. A built-in type value selects
+the lexicographically first enabled instance of that type, making multi-account
+startup deterministic. `BAMBOO_OPENAI_API_KEY`,
+`BAMBOO_ANTHROPIC_API_KEY`, and `BAMBOO_GEMINI_API_KEY` hydrate only instances
+marked for the standard environment override; they do not recreate legacy
+slots. Legacy-materialized instances keep that binding so the historical
+precedence remains stable: a present environment key wins, while a migrated
+credential reference remains the fallback after the variable is removed. The
+persisted marker records only the binding, never the secret. An environment-only
+instance with no stored fallback reports `configured: false` and
+`source: "environment"` whenever the variable is absent.
+
+Use the revisioned `GET/PUT /v1/bamboo/config/provider-settings` contract or the
+provider-instance CRUD endpoints for writes. The deprecated
+`GET /v1/bamboo/settings/provider` remains a secret-free, type-keyed projection
+for older clients. Its matching POST returns `400` after the default resolves
+to a native instance, rather than acknowledging a legacy write that the
+canonicalizer would discard. This compatibility boundary can be removed after
+Lotus #177 migrates its remaining callers.
 
 ## Server
 

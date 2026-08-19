@@ -474,7 +474,31 @@ pub(super) fn provider_validation_issue(
     config: &Config,
     fallback_error: String,
 ) -> (&'static str, String) {
-    match config.provider.as_str() {
+    let effective = config.effective_default_provider();
+    if let Some(instance) = config.provider_instances.get(effective) {
+        let configured = instance.provider_type == "copilot"
+            || !instance.api_key.trim().is_empty()
+            || instance.api_key_encrypted.is_some()
+            || instance.credential_ref.is_some()
+            || bamboo_config::provider_instance_environment_override_active(instance);
+        let message = format!(
+            "{} API key is required for provider instance '{effective}'",
+            match instance.provider_type.as_str() {
+                "openai" => "OpenAI",
+                "anthropic" => "Anthropic",
+                "gemini" => "Gemini",
+                "bodhi" => "Bodhi",
+                _ => "Provider",
+            }
+        );
+        return if configured {
+            ("provider_instances", fallback_error)
+        } else {
+            ("provider_instances", message)
+        };
+    }
+
+    match effective {
         "openai" => provider_issue(
             config
                 .providers()

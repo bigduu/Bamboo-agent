@@ -85,3 +85,25 @@ fn first_user_text_stays_empty_until_a_text_turn_exists() {
 
     assert!(first_user_text(&session).is_none());
 }
+
+#[test]
+fn title_provider_fallback_uses_default_provider_instance() {
+    let mut config = bamboo_config::Config::default();
+    let instance = serde_json::from_value(serde_json::json!({
+        "provider_type": "openai",
+        "enabled": true
+    }))
+    .unwrap();
+    config.provider = "anthropic".to_string();
+    config
+        .provider_instances
+        .insert("work-openai".to_string(), instance);
+    config.default_provider_instance = Some("work-openai".to_string());
+    let session = Session::new("title-provider-instance", "model");
+
+    assert_eq!(
+        title_provider_name(&config, &session),
+        "work-openai",
+        "title generation must route through the instance authority"
+    );
+}
