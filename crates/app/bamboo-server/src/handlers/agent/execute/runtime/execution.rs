@@ -152,6 +152,21 @@ pub(crate) fn make_disabled_filter_resolver(
 }
 
 pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
+    let session_model_ref = session_effective_model_ref(&args.session);
+    let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
+        (Some(_), Some(provider)) => Some(provider),
+        (Some(model_ref), None) => {
+            tracing::error!(
+                session_id = %args.session_id,
+                provider = %model_ref.provider,
+                model = %model_ref.model,
+                "session has an explicit provider target without a pre-resolved provider; refusing to fall back"
+            );
+            return;
+        }
+        (None, provider) => provider,
+    };
+
     if let Some(config) = args.state.permission_checker.permission_config() {
         config.set_session_workspace(args.session_id.clone(), args.session.workspace.clone());
         if let Err(error) =
@@ -168,22 +183,6 @@ pub(crate) fn spawn_agent_execution(mut args: SpawnAgentExecution) {
 
     let selected_skill_ids = session_state::selected_skill_ids_for_session(&args.session);
     let selected_skill_mode = session_state::selected_skill_mode_for_session(&args.session);
-    let provider_override = session_effective_model_ref(&args.session)
-        .and_then(|model_ref| match args.state.provider_router.route(&model_ref) {
-            Ok(provider) => Some(provider),
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %args.session_id,
-                    provider = %model_ref.provider,
-                    model = %model_ref.model,
-                    error = %error,
-                    "failed to resolve provider override for session execution; falling back to runtime provider"
-                );
-                None
-            }
-        })
-        .or(args.provider_override);
-
     let auxiliary_model_resolver = make_auxiliary_model_resolver(&args.state, &args.provider_name);
 
     // The resolved provider name is the authoritative routing key; thread it into

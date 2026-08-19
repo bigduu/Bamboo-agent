@@ -78,6 +78,86 @@ pub fn resolve_provider_type(
         .or_else(|| Some(trimmed.to_string()))
 }
 
+/// Resolve an exact runtime routing key from either an instance id or a
+/// built-in provider type used by legacy clients/sessions.
+///
+/// Exact instance ids always win, including disabled or failed instances: in
+/// those cases resolution fails closed instead of silently selecting another
+/// account. A built-in type selects the enabled default instance of that type,
+/// then the lexicographically first enabled instance, matching the model-fetch
+/// compatibility contract. The selected instance must exist in the live
+/// registry; constructor/auth failures are never replaced by the process-wide
+/// default provider.
+pub fn resolve_provider_routing_key(
+    config: &Config,
+    requested_provider: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<String, LLMError> {
+    let requested = requested_provider.trim();
+    if requested.is_empty() {
+        return Err(LLMError::Auth("provider routing key is empty".to_string()));
+    }
+
+    let require_live = |routing_key: &str| {
+        provider_registry
+            .get(routing_key)
+            .map(|_| routing_key.to_string())
+            .ok_or_else(|| {
+                LLMError::Auth(format!(
+                    "Provider '{routing_key}' is configured but unavailable"
+                ))
+            })
+    };
+
+    if let Some(instance) = config.provider_instances.get(requested) {
+        if !instance.enabled {
+            return Err(LLMError::Auth(format!(
+                "Provider instance '{requested}' is disabled"
+            )));
+        }
+        return require_live(requested);
+    }
+
+    // Legacy and hybrid aliases are registered under their exact type key.
+    if provider_registry.get(requested).is_some() {
+        return Ok(requested.to_string());
+    }
+
+    if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested) {
+        return Err(LLMError::Auth(format!(
+            "Unknown provider instance or type '{requested}'"
+        )));
+    }
+
+    if let Some(default_id) = config.default_provider_instance.as_deref() {
+        if let Some(instance) = config.provider_instances.get(default_id) {
+            if instance.provider_type == requested {
+                if !instance.enabled {
+                    return Err(LLMError::Auth(format!(
+                        "Default provider instance '{default_id}' is disabled"
+                    )));
+                }
+                return require_live(default_id);
+            }
+        }
+    }
+
+    let mut matching_ids = config
+        .provider_instances
+        .iter()
+        .filter(|(_, instance)| instance.enabled && instance.provider_type == requested)
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    matching_ids.sort_unstable();
+    if let Some(instance_id) = matching_ids.first() {
+        return require_live(instance_id);
+    }
+
+    Err(LLMError::Auth(format!(
+        "No enabled provider instance is available for type '{requested}'"
+    )))
+}
+
 pub fn parse_session_gold_config(session_gold_config_json: Option<&str>) -> Option<GoldConfig> {
     let raw = session_gold_config_json?.trim();
     if raw.is_empty() {
@@ -706,6 +786,88 @@ mod tests {
         let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
         providers.insert("openai".to_string(), Arc::new(NoopProvider));
         Arc::new(ProviderRegistry::new(providers, "openai".to_string()))
+    }
+
+    fn registry_with_provider_ids(ids: &[&str], default: &str) -> Arc<ProviderRegistry> {
+        let providers = ids
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    Arc::new(NoopProvider) as Arc<dyn LLMProvider>,
+                )
+            })
+            .collect();
+        Arc::new(ProviderRegistry::new(providers, default.to_string()))
+    }
+
+    #[test]
+    fn provider_type_alias_resolves_to_matching_default_instance() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work-openai".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.provider_instances.insert(
+            "main-anthropic".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("main-anthropic".to_string());
+        let registry =
+            registry_with_provider_ids(&["main-anthropic", "work-openai"], "main-anthropic");
+
+        assert_eq!(
+            resolve_provider_routing_key(&config, "openai", &registry).unwrap(),
+            "work-openai"
+        );
+        assert_eq!(
+            resolve_provider_routing_key(&config, "anthropic", &registry).unwrap(),
+            "main-anthropic"
+        );
+    }
+
+    #[test]
+    fn provider_type_alias_uses_lexical_instance_but_exact_unavailable_id_fails_closed() {
+        let mut config = Config::default();
+        for id in ["z-openai", "a-openai"] {
+            config.provider_instances.insert(
+                id.to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type": "openai",
+                    "enabled": true
+                }))
+                .unwrap(),
+            );
+        }
+        config.provider_instances.insert(
+            "openai".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": false
+            }))
+            .unwrap(),
+        );
+        let registry = registry_with_provider_ids(&["a-openai", "z-openai"], "a-openai");
+
+        let error = resolve_provider_routing_key(&config, "openai", &registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled"));
+
+        config.provider_instances.remove("openai");
+        assert_eq!(
+            resolve_provider_routing_key(&config, "openai", &registry).unwrap(),
+            "a-openai"
+        );
+        assert!(resolve_provider_routing_key(&config, "typo", &registry).is_err());
     }
 
     #[test]

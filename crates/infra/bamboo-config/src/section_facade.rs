@@ -964,7 +964,7 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
         credential_context: CredentialScanContext,
     ) -> Result<(), String> {
         if credential_context != CredentialScanContext::None
-            && is_nonliteral_runtime_template(value)
+            && request_override_value_is_nonliteral_runtime_template(value)
         {
             return Ok(());
         }
@@ -1065,9 +1065,11 @@ fn validate_ordinary_section_json(value: &Value) -> ConfigStoreResult<()> {
                         if normalized_key == "headers" {
                             if let Some(headers) = value.as_object() {
                                 for (name, expression) in headers {
-                                    if is_credential_header(name)
+                                    if request_override_header_is_credential(name)
                                         && !value_is_empty(expression)
-                                        && !is_nonliteral_runtime_template(expression)
+                                        && !request_override_value_is_nonliteral_runtime_template(
+                                            expression,
+                                        )
                                     {
                                         return Err(format!(
                                             "credential header {name} must not contain a literal"
@@ -1481,6 +1483,157 @@ fn key_contains_literal_credential_material(key: &str, value: &Value) -> bool {
         && !value_is_empty(value)
 }
 
+/// Remove credential authority and literal credential material from provider
+/// metadata before it crosses a compatibility API boundary.
+///
+/// Provider `extra` maps are intentionally forward compatible, so older
+/// binaries can carry fields they do not understand. That also means an API
+/// response cannot assume an unknown field is public metadata. This scrubber
+/// mirrors the durable section classifier, including credential contexts such
+/// as `{ "oauth": { "value": ... } }`, while retaining explicit runtime
+/// templates and public metadata such as OAuth URLs, client ids, modes, and
+/// status booleans.
+///
+/// Credential references are server-owned authority and are removed even
+/// though they are safe to persist in the modular config.
+pub fn scrub_provider_metadata_credentials(value: &mut Value) {
+    fn walk(value: &mut Value, credential_context: CredentialScanContext) -> bool {
+        if credential_context != CredentialScanContext::None
+            && request_override_value_is_nonliteral_runtime_template(value)
+        {
+            return false;
+        }
+
+        match value {
+            Value::Object(object) => {
+                let keys = object.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    let Some(child) = object.get_mut(&key) else {
+                        continue;
+                    };
+                    let normalized = normalized_credential_key(&key);
+                    let reference_metadata = credential_reference_metadata_key(&key);
+
+                    if reference_metadata
+                        || key_contains_literal_credential_material(&key, child)
+                        || (credential_context != CredentialScanContext::None
+                            && NORMALIZED_CREDENTIAL_PAYLOAD_SUFFIXES
+                                .contains(&normalized.as_str())
+                            && !value_is_empty(child))
+                    {
+                        object.remove(&key);
+                        continue;
+                    }
+
+                    let child_keys_are_identifiers = matches!(
+                        normalized.as_str(),
+                        "headers" | "providerinstances" | "credentialrefs"
+                    ) || normalized.ends_with("credentialrefs");
+                    let key_context = if child.is_object() || child.is_array() {
+                        credential_context_key(&key)
+                    } else {
+                        credential_literal_key(&key)
+                    };
+                    let key_metadata_context = (child.is_object() || child.is_array())
+                        && credential_metadata_container_key(&key);
+                    let child_context = if credential_context == CredentialScanContext::Strong
+                        && credential_public_metadata_key(&key)
+                    {
+                        CredentialScanContext::Adjacent
+                    } else if credential_context == CredentialScanContext::Strong || key_context {
+                        CredentialScanContext::Strong
+                    } else if credential_context == CredentialScanContext::Adjacent
+                        || key_metadata_context
+                    {
+                        CredentialScanContext::Adjacent
+                    } else {
+                        CredentialScanContext::None
+                    };
+
+                    if child_keys_are_identifiers {
+                        match child {
+                            Value::Object(entries) if normalized == "headers" => {
+                                let names = entries.keys().cloned().collect::<Vec<_>>();
+                                for name in names {
+                                    let remove = entries.get_mut(&name).is_some_and(|expression| {
+                                        (request_override_header_is_credential(&name)
+                                            && !value_is_empty(expression)
+                                            && !request_override_value_is_nonliteral_runtime_template(
+                                                expression,
+                                            ))
+                                            || walk(expression, credential_context)
+                                    });
+                                    if remove {
+                                        entries.remove(&name);
+                                    }
+                                }
+                            }
+                            Value::Object(entries) => {
+                                let names = entries.keys().cloned().collect::<Vec<_>>();
+                                for name in names {
+                                    let remove = entries
+                                        .get_mut(&name)
+                                        .is_some_and(|entry| walk(entry, child_context));
+                                    if remove {
+                                        entries.remove(&name);
+                                    }
+                                }
+                            }
+                            Value::Array(entries) => {
+                                let mut index = 0;
+                                while index < entries.len() {
+                                    if walk(&mut entries[index], child_context) {
+                                        entries.remove(index);
+                                    } else {
+                                        index += 1;
+                                    }
+                                }
+                            }
+                            _ => {
+                                if walk(child, child_context) {
+                                    object.remove(&key);
+                                }
+                            }
+                        }
+                    } else if walk(child, child_context) {
+                        object.remove(&key);
+                    }
+                }
+                false
+            }
+            Value::Array(values) => {
+                let mut index = 0;
+                while index < values.len() {
+                    if walk(&mut values[index], credential_context) {
+                        values.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
+                false
+            }
+            Value::String(value) => {
+                (credential_context == CredentialScanContext::Strong && !value.trim().is_empty())
+                    || url::Url::parse(value)
+                        .ok()
+                        .is_some_and(|url| !url.username().is_empty() || url.password().is_some())
+            }
+            Value::Number(_) => credential_context == CredentialScanContext::Strong,
+            Value::Bool(_) | Value::Null => false,
+        }
+    }
+
+    let _ = walk(value, CredentialScanContext::None);
+}
+
+/// Return whether provider metadata contains no API-visible credential
+/// authority or literal credential material.
+pub fn provider_metadata_is_secret_free(value: &Value) -> bool {
+    let mut sanitized = value.clone();
+    scrub_provider_metadata_credentials(&mut sanitized);
+    sanitized == *value
+}
+
 fn validate_configured_reference_coherence(
     object: &serde_json::Map<String, Value>,
 ) -> Result<(), String> {
@@ -1802,7 +1955,9 @@ fn validate_request_scope_override(value: &Value) -> Result<(), String> {
             .ok_or_else(|| "provider request override headers must be an object".to_string())?;
         for (name, expression) in headers {
             validate_template_expression_shape(expression)?;
-            if is_credential_header(name) && !is_nonliteral_runtime_template(expression) {
+            if request_override_header_is_credential(name)
+                && !request_override_value_is_nonliteral_runtime_template(expression)
+            {
                 return Err(format!(
                     "provider request override {name} must not contain a literal credential"
                 ));
@@ -1887,13 +2042,13 @@ fn validate_provider_body_patch(value: &Value) -> Result<(), String> {
             return Err("provider request body patch operation is invalid".to_string());
         }
     }
-    if !body_patch_targets_credential(path) {
+    if !request_override_body_patch_targets_credential(path) {
         return Ok(());
     }
     let Some(value) = patch.get("value") else {
         return Ok(());
     };
-    if !is_nonliteral_runtime_template(value) {
+    if !request_override_value_is_nonliteral_runtime_template(value) {
         return Err(format!(
             "provider request body patch {path} must not contain literal credential material"
         ));
@@ -1901,7 +2056,11 @@ fn validate_provider_body_patch(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn body_patch_targets_credential(path: &str) -> bool {
+/// Whether a request-override body path targets credential-shaped material.
+///
+/// API projections use the same classifier as the durable validator so legacy
+/// values that predate strict validation cannot be returned as plaintext.
+pub fn request_override_body_patch_targets_credential(path: &str) -> bool {
     fn credential_token(segment: &str) -> bool {
         matches!(
             segment,
@@ -1947,7 +2106,9 @@ fn body_patch_targets_credential(path: &str) -> bool {
             .any(|pair| credential_token(&format!("{}{}", pair[0], pair[1])))
 }
 
-fn is_nonliteral_runtime_template(value: &Value) -> bool {
+/// Whether a request-override expression resolves only from a validated
+/// runtime source and contains no literal fallback credential.
+pub fn request_override_value_is_nonliteral_runtime_template(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -2037,7 +2198,10 @@ fn runtime_format_has_no_secret_literal(template: &str) -> bool {
     found_runtime_value && safe_literal
 }
 
-fn is_credential_header(name: &str) -> bool {
+/// Whether a request-override header name is credential-shaped.
+///
+/// Kept public so API response redaction and durable validation cannot drift.
+pub fn request_override_header_is_credential(name: &str) -> bool {
     let compact = name
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
@@ -5278,6 +5442,12 @@ impl ConfigFacade {
                         SectionId::Providers,
                     )?;
                 if !crate::materialize_legacy_provider_instances(&mut durable_config) {
+                    // Another facade/process may have published the migration
+                    // after this facade opened but before it acquired the
+                    // shared lock. The durable no-op is authoritative; adopt
+                    // that exact winner before returning so startup never
+                    // exposes the stale legacy generation until a watcher tick.
+                    let _ = self.registry.reload_if_changed(SectionId::Providers);
                     return Ok(false);
                 }
                 if durable_envelope.status != SectionStatus::Healthy
@@ -6194,6 +6364,48 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
     }
 
+    #[test]
+    fn provider_api_metadata_scrubber_matches_durable_credential_contexts() {
+        let original = json!({
+            "headless_auth": true,
+            "oauth": {
+                "client_id": "public-client",
+                "authorization_url": "https://auth.example.test/authorize",
+                "value": "oauth-literal"
+            },
+            "private_key": "private-literal",
+            "nested": {"client_secret": "client-literal"},
+            "credential_ref": "provider.work.api_key",
+            "headers": {
+                "X-Trace": "public-trace",
+                "X-Access-Key": "header-literal",
+                "Authorization": {"type": "env_ref", "name": "UPSTREAM_TOKEN"}
+            }
+        });
+        assert!(!provider_metadata_is_secret_free(&original));
+
+        let mut sanitized = original;
+        scrub_provider_metadata_credentials(&mut sanitized);
+
+        assert_eq!(sanitized["headless_auth"], true);
+        assert_eq!(sanitized["oauth"]["client_id"], "public-client");
+        assert_eq!(
+            sanitized["oauth"]["authorization_url"],
+            "https://auth.example.test/authorize"
+        );
+        assert!(sanitized["oauth"].get("value").is_none());
+        assert!(sanitized.get("private_key").is_none());
+        assert!(sanitized["nested"].get("client_secret").is_none());
+        assert!(sanitized.get("credential_ref").is_none());
+        assert_eq!(sanitized["headers"]["X-Trace"], "public-trace");
+        assert!(sanitized["headers"].get("X-Access-Key").is_none());
+        assert_eq!(
+            sanitized["headers"]["Authorization"]["name"],
+            "UPSTREAM_TOKEN"
+        );
+        assert!(provider_metadata_is_secret_free(&sanitized));
+    }
+
     fn install_completed_legacy_openai(data_dir: &Path, secret: &str) -> (CredentialRef, u64) {
         let facade = ConfigFacade::open_or_migrate(data_dir).unwrap();
         let reference = CredentialRef::parse("provider.openai.api_key").unwrap();
@@ -6325,6 +6537,65 @@ mod tests {
                 .expose(),
             "completed-facade-secret"
         );
+    }
+
+    #[test]
+    fn concurrent_facades_publish_one_legacy_provider_migration_generation() {
+        let _key = crate::encryption::set_test_encryption_key([213; 32]);
+        let dir = TempDir::new().unwrap();
+        let (reference, legacy_revision) =
+            install_completed_legacy_openai(dir.path(), "concurrent-facade-secret");
+        let facades = [
+            std::sync::Arc::new(ConfigFacade::open(dir.path()).unwrap()),
+            std::sync::Arc::new(ConfigFacade::open(dir.path()).unwrap()),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = facades
+            .into_iter()
+            .map(|facade| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let _thread_key = crate::encryption::set_test_encryption_key([213; 32]);
+                    barrier.wait();
+                    facade.materialize_legacy_provider_authority().unwrap();
+                    let snapshot = facade.registry().providers.snapshot();
+                    (
+                        snapshot.revision,
+                        snapshot.status,
+                        snapshot.source_kind,
+                        snapshot.last_error.clone(),
+                        snapshot.data.default_provider_instance.clone(),
+                        snapshot.data.provider_instances.contains_key("openai"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("facade thread"))
+            .collect::<Vec<_>>();
+        for (revision, status, source, last_error, default_id, has_instance) in &results {
+            assert_eq!(
+                *revision,
+                legacy_revision + 1,
+                "concurrent facade results: {results:?}"
+            );
+            assert_eq!(*status, SectionStatus::Healthy);
+            assert_eq!(*source, SectionSourceKind::File);
+            assert!(last_error.is_none());
+            assert_eq!(default_id.as_deref(), Some("openai"));
+            assert!(*has_instance);
+        }
+        assert_eq!(
+            CredentialStore::open(dir.path())
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "concurrent-facade-secret"
+        );
+        assert_no_plaintext_in_persistent_files(dir.path(), &["concurrent-facade-secret"]);
     }
 
     #[test]
@@ -14143,7 +14414,7 @@ fn raw_reconciliation_secret_material_is_forbidden_with_context(
         path: &mut Vec<String>,
     ) -> bool {
         if credential_context != CredentialScanContext::None
-            && is_nonliteral_runtime_template(value)
+            && request_override_value_is_nonliteral_runtime_template(value)
         {
             return false;
         }
@@ -14179,9 +14450,11 @@ fn raw_reconciliation_secret_material_is_forbidden_with_context(
                                 let mut forbidden = false;
                                 for (name, expression) in entries {
                                     path.push(name.clone());
-                                    forbidden = if is_credential_header(name) {
+                                    forbidden = if request_override_header_is_credential(name) {
                                         !value_is_empty(expression)
-                                            && !is_nonliteral_runtime_template(expression)
+                                            && !request_override_value_is_nonliteral_runtime_template(
+                                                expression,
+                                            )
                                     } else {
                                         walk(section, expression, identifier_context, path)
                                     };

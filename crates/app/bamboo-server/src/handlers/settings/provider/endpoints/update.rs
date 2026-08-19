@@ -110,6 +110,69 @@ fn apply_provider_patch(
 }
 
 fn validate_provider_config(config: &Config) -> Result<(), AppError> {
+    let providers = config.providers();
+    let request_overrides = [
+        providers
+            .openai
+            .as_ref()
+            .and_then(|provider| provider.request_overrides.as_ref()),
+        providers
+            .anthropic
+            .as_ref()
+            .and_then(|provider| provider.request_overrides.as_ref()),
+        providers
+            .gemini
+            .as_ref()
+            .and_then(|provider| provider.request_overrides.as_ref()),
+        providers
+            .copilot
+            .as_ref()
+            .and_then(|provider| provider.request_overrides.as_ref()),
+    ];
+    for request_overrides in request_overrides.into_iter().flatten() {
+        let original = serde_json::to_value(request_overrides).map_err(|error| {
+            AppError::BadRequest(format!("Invalid provider request_overrides: {error}"))
+        })?;
+        let mut sanitized = original.clone();
+        crate::handlers::settings::bamboo_config::scrub_unsafe_request_override_literals(
+            &mut sanitized,
+        );
+        if sanitized != original {
+            return Err(AppError::BadRequest(
+                "Invalid configuration: provider request_overrides contain literal credential material"
+                    .to_string(),
+            ));
+        }
+    }
+    let mut extra_maps = vec![&providers.extra];
+    if let Some(provider) = &providers.openai {
+        extra_maps.push(&provider.extra);
+    }
+    if let Some(provider) = &providers.anthropic {
+        extra_maps.push(&provider.extra);
+    }
+    if let Some(provider) = &providers.gemini {
+        extra_maps.push(&provider.extra);
+    }
+    if let Some(provider) = &providers.copilot {
+        extra_maps.push(&provider.extra);
+    }
+    if let Some(provider) = &providers.bodhi {
+        extra_maps.push(&provider.extra);
+    }
+    if extra_maps.into_iter().any(|extra| {
+        !bamboo_config::provider_metadata_is_secret_free(&Value::Object(
+            extra
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ))
+    }) {
+        return Err(AppError::BadRequest(
+            "Invalid configuration: provider metadata contains credential material outside api_key"
+                .to_string(),
+        ));
+    }
     if let Err(error) = bamboo_llm::validate_provider_config(config) {
         return Err(AppError::BadRequest(format!(
             "Invalid configuration: {error}"
@@ -127,7 +190,7 @@ fn bad_request_response(message: String) -> HttpResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_provider_patch, is_instance_native};
+    use super::{build_provider_patch, is_instance_native, validate_provider_config, AppError};
     use crate::app_state::AppState;
     use crate::handlers::settings::provider::types::UpdateProviderRequest;
     use actix_web::{test as actix_test, web, App};
@@ -156,6 +219,52 @@ mod tests {
             !is_instance_native(&hybrid),
             "a real legacy-default hybrid remains writable during the compatibility window"
         );
+    }
+
+    #[test]
+    fn legacy_provider_write_rejects_credential_shaped_extra() {
+        let mut config = Config::default();
+        let mut openai = bamboo_config::OpenAIConfig {
+            api_key: "sk-provider".to_string(),
+            model: Some("gpt-test".to_string()),
+            ..Default::default()
+        };
+        openai.extra.insert(
+            "client_secret".to_string(),
+            serde_json::json!("must-not-enter-extra"),
+        );
+        config.providers_mut().openai = Some(openai);
+
+        assert!(matches!(
+            validate_provider_config(&config),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_provider_write_rejects_literal_request_override_credentials() {
+        let mut config = Config::default();
+        config.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key": "sk-provider",
+                "model": "gpt-test",
+                "request_overrides": {
+                    "common": {
+                        "headers": {"X-Access-Key": "must-not-enter-overrides"},
+                        "body_patch": [{
+                            "path": "/credential",
+                            "value": "must-not-enter-overrides"
+                        }]
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            validate_provider_config(&config),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[actix_web::test]

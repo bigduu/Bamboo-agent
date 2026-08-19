@@ -11,7 +11,8 @@ use bamboo_agent_core::AgentEvent;
 use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
-    resolve_gold_config, resolve_provider_type, GOLD_CONFIG_METADATA_KEY,
+    resolve_gold_config, resolve_provider_routing_key, resolve_provider_type,
+    GOLD_CONFIG_METADATA_KEY,
 };
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
@@ -19,7 +20,7 @@ use bamboo_engine::session_app::approval_replay::{
     PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
-use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
 use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
@@ -96,11 +97,46 @@ impl ResumeExecutionPort for AppStateResumeRef {
             return;
         }
 
-        let model = session.model.clone();
-        let resolved_provider_name = session_effective_model_ref(&session)
-            .map(|model_ref| model_ref.provider)
-            .unwrap_or(config.provider_name);
         let config_snapshot = self.0.config.read().await.clone();
+        let model = session.model.clone();
+        let session_model_ref = session_effective_model_ref(&session);
+        let requested_provider = session_model_ref
+            .as_ref()
+            .map(|model_ref| model_ref.provider.as_str())
+            .unwrap_or(config.provider_name.as_str());
+        let resolved_provider_name = match resolve_provider_routing_key(
+            &config_snapshot,
+            requested_provider,
+            &self.0.provider_registry,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                tracing::error!(
+                    %session_id,
+                    provider = requested_provider,
+                    %error,
+                    "resume provider target is unavailable; refusing to fall back"
+                );
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
+        if let Some(mut model_ref) = session_model_ref {
+            model_ref.provider = resolved_provider_name.clone();
+            persist_model_ref(&mut session, &model_ref);
+        }
+        let provider_override = match self.0.provider_registry.get(&resolved_provider_name) {
+            Some(provider) => provider,
+            None => {
+                tracing::error!(
+                    %session_id,
+                    provider = %resolved_provider_name,
+                    "resume provider disappeared after resolution; refusing to fall back"
+                );
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
         let resolved_provider_type = resolve_provider_type(
             &config_snapshot,
             &resolved_provider_name,
@@ -215,7 +251,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     execution_reservation,
                     is_child_session,
                     provider_name: resolved_provider_name,
-                    provider_override: None,
+                    provider_override: Some(provider_override.clone()),
                     model_roster,
                     reasoning_effort,
                     reasoning_effort_source,
@@ -470,7 +506,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 execution_reservation,
                 is_child_session,
                 provider_name: resolved_provider_name,
-                provider_override: None,
+                provider_override: Some(provider_override),
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source,

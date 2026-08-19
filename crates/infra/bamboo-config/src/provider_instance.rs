@@ -50,7 +50,7 @@ pub fn provider_instance_environment_override_active(instance: &ProviderInstance
     let Some(env_var) = standard_provider_api_key_env(&instance.provider_type) else {
         return false;
     };
-    let Ok(value) = std::env::var(env_var) else {
+    let Ok(value) = crate::runtime_env_var(env_var) else {
         return false;
     };
     let value = value.trim();
@@ -356,7 +356,7 @@ fn standard_provider_api_key_env(provider_type: &str) -> Option<&'static str> {
 
 fn standard_provider_api_key_env_is_available(provider_type: &str) -> bool {
     standard_provider_api_key_env(provider_type)
-        .and_then(|env_var| std::env::var(env_var).ok())
+        .and_then(|env_var| crate::runtime_env_var(env_var).ok())
         .is_some_and(|value| !value.trim().is_empty())
 }
 
@@ -583,31 +583,6 @@ fn compatibility_extra(
 mod tests {
     use super::*;
     use crate::config::Config;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let previous = std::env::var_os(key);
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     /// Build a test config with explicit empty providers/instances. (Since #38,
     /// `Config::default()` is in-memory only — no filesystem/env bleed — so the
@@ -939,10 +914,13 @@ mod tests {
 
     #[test]
     fn env_owned_legacy_key_migrates_as_marker_without_secret_material() {
-        let _lock = crate::test_support::env_cache_lock_acquire();
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", None);
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
-        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", Some("runtime-only"));
+        let _openai = crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini = crate::test_support::override_runtime_env_var(
+            "BAMBOO_GEMINI_API_KEY",
+            Some("runtime-only"),
+        );
         let mut config = clean_test_config();
         config.provider = "gemini".to_string();
         *config.providers_mut() = ProviderConfigs {
@@ -965,10 +943,10 @@ mod tests {
 
     #[test]
     fn materialized_legacy_ref_keeps_environment_override_and_stored_fallback() {
-        let _lock = crate::test_support::env_cache_lock_acquire();
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", None);
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
-        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let openai = crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini = crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let mut config = clean_test_config();
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {
@@ -990,7 +968,7 @@ mod tests {
             &config.provider_instances["openai"]
         ));
 
-        std::env::set_var("BAMBOO_OPENAI_API_KEY", "sk-runtime-override");
+        openai.replace(Some("sk-runtime-override"));
         config.apply_runtime_env_overrides();
         assert_eq!(
             config.provider_instances["openai"].api_key,
@@ -1000,7 +978,7 @@ mod tests {
             &config.provider_instances["openai"]
         ));
 
-        std::env::remove_var("BAMBOO_OPENAI_API_KEY");
+        openai.replace(None);
         config.provider_instances.get_mut("openai").unwrap().api_key =
             "sk-stored-fallback".to_string();
         config.apply_runtime_env_overrides();
@@ -1015,10 +993,12 @@ mod tests {
 
     #[test]
     fn nonselected_environment_only_provider_is_materialized_and_hydrated() {
-        let _lock = crate::test_support::env_cache_lock_acquire();
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", None);
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", Some("sk-ant-runtime"));
-        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let _openai = crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic = crate::test_support::override_runtime_env_var(
+            "BAMBOO_ANTHROPIC_API_KEY",
+            Some("sk-ant-runtime"),
+        );
+        let _gemini = crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let mut config = clean_test_config();
         config.provider = "openai".to_string();
         config.providers.openai = Some(OpenAIConfig {

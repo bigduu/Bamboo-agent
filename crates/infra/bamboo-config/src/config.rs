@@ -3681,7 +3681,7 @@ impl Config {
         // mode the override may name either an exact instance id or a provider
         // type. Type matches are ordered by instance id so the result is
         // deterministic even for a multi-account configuration.
-        if let Ok(provider) = std::env::var("BAMBOO_PROVIDER") {
+        if let Ok(provider) = crate::runtime_env_var("BAMBOO_PROVIDER") {
             let provider = provider.trim().to_string();
             if !provider.is_empty() {
                 self.provider = provider.clone();
@@ -3739,7 +3739,7 @@ impl Config {
         // config.json. The `api_key_from_env` flag keeps `refresh_provider_api_keys_encrypted`
         // from re-encrypting these keys into `api_key_encrypted` on a later save,
         // so an env key is never persisted to disk. (#253)
-        if let Ok(key) = std::env::var("BAMBOO_OPENAI_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_OPENAI_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
                 if self.provider_instances.is_empty() {
@@ -3754,7 +3754,7 @@ impl Config {
                 }
             }
         }
-        if let Ok(key) = std::env::var("BAMBOO_ANTHROPIC_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_ANTHROPIC_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
                 if self.provider_instances.is_empty() {
@@ -3769,7 +3769,7 @@ impl Config {
                 }
             }
         }
-        if let Ok(key) = std::env::var("BAMBOO_GEMINI_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_GEMINI_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
                 if self.provider_instances.is_empty() {
@@ -8141,11 +8141,16 @@ mod tests {
 
     #[test]
     fn runtime_env_overrides_select_and_hydrate_only_marked_instances() {
-        let _lock = env_lock_acquire();
-        let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "openai");
-        let _openai_key = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", "sk-runtime-env-instance");
-        let _anthropic_key = EnvVarGuard::unset("BAMBOO_ANTHROPIC_API_KEY");
-        let _gemini_key = EnvVarGuard::unset("BAMBOO_GEMINI_API_KEY");
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("openai"));
+        let _openai_key = crate::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-env-instance"),
+        );
+        let _anthropic_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
 
         let mut config = Config::default();
         *config.providers_mut() = ProviderConfigs::default();
@@ -8192,11 +8197,14 @@ mod tests {
 
     #[test]
     fn runtime_provider_override_prefers_exact_instance_id() {
-        let _lock = env_lock_acquire();
-        let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "personal");
-        let _openai_key = EnvVarGuard::unset("BAMBOO_OPENAI_API_KEY");
-        let _anthropic_key = EnvVarGuard::unset("BAMBOO_ANTHROPIC_API_KEY");
-        let _gemini_key = EnvVarGuard::unset("BAMBOO_GEMINI_API_KEY");
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("personal"));
+        let _openai_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let mut config = Config::default();
         for id in ["work", "personal"] {
             config.provider_instances.insert(
@@ -8381,8 +8389,15 @@ mod tests {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", "sk-ant-from-env");
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", "sk-oai-from-env");
+        let _anthropic = crate::test_support::override_runtime_env_var(
+            "BAMBOO_ANTHROPIC_API_KEY",
+            Some("sk-ant-from-env"),
+        );
+        let _openai = crate::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-oai-from-env"),
+        );
+        let _gemini = crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
 
         // No config.json on disk → the providers are created from the env keys
         // alone (#253: deploy without a plaintext api_key in a mounted file).
@@ -8580,7 +8595,8 @@ mod tests {
 
         let _port = EnvVarGuard::set("BAMBOO_PORT", "9999");
         let _bind = EnvVarGuard::set("BAMBOO_BIND", "192.168.1.1");
-        let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "openai");
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("openai"));
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
         assert_eq!(config.server.port, 9999);

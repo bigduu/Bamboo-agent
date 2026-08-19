@@ -80,6 +80,70 @@ pub mod test_support {
         /// own snapshot without racing unrelated server `AppState` publishers.
         static ENV_VARS_CACHE_OVERRIDE_FOR_TESTS:
             RefCell<Option<EnvVarsCacheSnapshot>> = const { RefCell::new(None) };
+
+        /// Scoped runtime environment overrides for tests that exercise config
+        /// loading. Process-wide `set_var` would otherwise leak transient
+        /// provider credentials and selectors into unrelated parallel tests.
+        static RUNTIME_ENV_OVERRIDES_FOR_TESTS:
+            RefCell<HashMap<&'static str, Option<String>>> = RefCell::new(HashMap::new());
+    }
+
+    /// Restores the previous thread-local runtime environment override when
+    /// its scope ends.
+    #[must_use = "keep the guard alive for the full runtime-env test scope"]
+    pub struct RuntimeEnvOverrideGuard {
+        key: &'static str,
+        previous: Option<Option<String>>,
+        _same_thread: PhantomData<Rc<()>>,
+    }
+
+    impl RuntimeEnvOverrideGuard {
+        /// Replace the in-scope value without exposing it process-wide.
+        pub fn replace(&self, value: Option<&str>) {
+            RUNTIME_ENV_OVERRIDES_FOR_TESTS.with(|overrides| {
+                overrides
+                    .borrow_mut()
+                    .insert(self.key, value.map(str::to_string));
+            });
+        }
+    }
+
+    impl Drop for RuntimeEnvOverrideGuard {
+        fn drop(&mut self) {
+            RUNTIME_ENV_OVERRIDES_FOR_TESTS.with(|overrides| {
+                let mut overrides = overrides.borrow_mut();
+                match self.previous.take() {
+                    Some(previous) => {
+                        overrides.insert(self.key, previous);
+                    }
+                    None => {
+                        overrides.remove(self.key);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Override one runtime environment variable only for the current test
+    /// thread. `None` explicitly hides a real process environment value.
+    pub fn override_runtime_env_var(
+        key: &'static str,
+        value: Option<&str>,
+    ) -> RuntimeEnvOverrideGuard {
+        let previous = RUNTIME_ENV_OVERRIDES_FOR_TESTS.with(|overrides| {
+            overrides
+                .borrow_mut()
+                .insert(key, value.map(str::to_string))
+        });
+        RuntimeEnvOverrideGuard {
+            key,
+            previous,
+            _same_thread: PhantomData,
+        }
+    }
+
+    pub(crate) fn current_runtime_env_override(key: &str) -> Option<Option<String>> {
+        RUNTIME_ENV_OVERRIDES_FOR_TESTS.with(|overrides| overrides.borrow().get(key).cloned())
     }
 
     /// Restores the previous test-only env snapshot when its scope ends.
@@ -166,4 +230,12 @@ pub mod test_support {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+pub(crate) fn runtime_env_var(name: &str) -> Result<String, std::env::VarError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(value) = test_support::current_runtime_env_override(name) {
+        return value.ok_or(std::env::VarError::NotPresent);
+    }
+    std::env::var(name)
 }

@@ -437,6 +437,18 @@ pub async fn put_provider_settings_section(
                 credential_status: _,
             } = data;
 
+            for (id, instance) in &provider_instances {
+                let Some(existing) = current.provider_instances.get(id) else {
+                    continue;
+                };
+                if existing.provider_type != instance.provider_type {
+                    return Err(ConfigSectionMutationError::Invalid(format!(
+                        "provider_type for existing provider instance '{id}' cannot be changed from '{}' to '{}'; create a new provider instance instead",
+                        existing.provider_type, instance.provider_type
+                    )));
+                }
+            }
+
             let instance_native = default_provider_instance_id
                 .as_ref()
                 .is_some_and(|id| provider_instances.contains_key(id));
@@ -795,7 +807,10 @@ pub(crate) fn scrub_unsafe_request_override_literals(value: &mut Value) {
         Value::Object(object) => {
             if let Some(headers) = object.get_mut("headers").and_then(Value::as_object_mut) {
                 headers.retain(|name, expression| {
-                    !is_sensitive_header_name(name) || is_external_template_reference(expression)
+                    !bamboo_config::request_override_header_is_credential(name)
+                        || bamboo_config::request_override_value_is_nonliteral_runtime_template(
+                            expression,
+                        )
                 });
             }
             if let Some(patches) = object.get_mut("body_patch").and_then(Value::as_array_mut) {
@@ -806,10 +821,10 @@ pub(crate) fn scrub_unsafe_request_override_literals(value: &mut Value) {
                     !patch
                         .get("path")
                         .and_then(Value::as_str)
-                        .is_some_and(is_sensitive_override_path)
-                        || patch
-                            .get("value")
-                            .is_none_or(is_external_template_reference)
+                        .is_some_and(bamboo_config::request_override_body_patch_targets_credential)
+                        || patch.get("value").is_none_or(
+                            bamboo_config::request_override_value_is_nonliteral_runtime_template,
+                        )
                 });
             }
             for value in object.values_mut() {
@@ -917,7 +932,7 @@ fn retain_provider_settings_server_owned_fields(
     // Unknown forward-compatible metadata is intentionally not exposed by the
     // network DTO because its contents cannot be classified as non-secret.
     // Preserve it from the process-owned snapshot just like credential refs.
-    candidate.providers_mut().extra = current.providers().extra.clone();
+    candidate.providers_mut().extra = secret_free_provider_extra(&current.providers().extra);
     macro_rules! retain_env_provider {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (
@@ -928,7 +943,7 @@ fn retain_provider_settings_server_owned_fields(
                 candidate.api_key_encrypted = current.api_key_encrypted.clone();
                 candidate.credential_ref = current.credential_ref.clone();
                 candidate.api_key_from_env = current.api_key_from_env;
-                candidate.extra = current.extra.clone();
+                candidate.extra = secret_free_provider_extra(&current.extra);
             }
         };
     }
@@ -942,13 +957,13 @@ fn retain_provider_settings_server_owned_fields(
         candidate.api_key = current.api_key.clone();
         candidate.api_key_encrypted = current.api_key_encrypted.clone();
         candidate.credential_ref = current.credential_ref.clone();
-        candidate.extra = current.extra.clone();
+        candidate.extra = secret_free_provider_extra(&current.extra);
     }
     if let (Some(current), Some(candidate)) = (
         current.providers().copilot.as_ref(),
         candidate.providers_mut().copilot.as_mut(),
     ) {
-        candidate.extra = current.extra.clone();
+        candidate.extra = secret_free_provider_extra(&current.extra);
     }
     for (id, instance) in &mut candidate.provider_instances {
         if let Some(current) = current.provider_instances.get(id) {
@@ -969,10 +984,29 @@ fn retain_provider_settings_server_owned_fields(
                             | bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
                     )
                 })
+                .filter(|(key, value)| {
+                    bamboo_config::provider_metadata_is_secret_free(&Value::Object(
+                        std::iter::once(((*key).clone(), (*value).clone())).collect(),
+                    ))
+                })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             instance.extra.extend(editable_extra);
         }
+    }
+}
+
+fn secret_free_provider_extra(extra: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut value = Value::Object(
+        extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    bamboo_config::scrub_provider_metadata_credentials(&mut value);
+    match value {
+        Value::Object(extra) => extra.into_iter().collect(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -1199,7 +1233,9 @@ fn reject_sensitive_header_literals(value: &Value) -> Result<(), String> {
         return Ok(());
     };
     for (name, expression) in headers {
-        if is_sensitive_header_name(name) && !is_external_template_reference(expression) {
+        if bamboo_config::request_override_header_is_credential(name)
+            && !bamboo_config::request_override_value_is_nonliteral_runtime_template(expression)
+        {
             return Err(format!(
                 "sensitive request override header '{name}' must use an env_ref or generated value"
             ));
@@ -1216,11 +1252,11 @@ fn reject_sensitive_body_patch_literals(value: &Value) -> Result<(), String> {
         let sensitive_path = patch
             .get("path")
             .and_then(Value::as_str)
-            .is_some_and(is_sensitive_override_path);
+            .is_some_and(bamboo_config::request_override_body_patch_targets_credential);
         if sensitive_path
-            && patch
-                .get("value")
-                .is_some_and(|value| !is_external_template_reference(value))
+            && patch.get("value").is_some_and(|value| {
+                !bamboo_config::request_override_value_is_nonliteral_runtime_template(value)
+            })
         {
             return Err(
                 "sensitive request override body values must use an env_ref or generated value"
@@ -1229,47 +1265,6 @@ fn reject_sensitive_body_patch_literals(value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn is_sensitive_header_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
-    [
-        "authorization",
-        "api-key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn is_sensitive_override_path(path: &str) -> bool {
-    let normalized = path.to_ascii_lowercase();
-    [
-        "api_key",
-        "api-key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "authorization",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn is_external_template_reference(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    matches!(
-        object.get("type").and_then(Value::as_str),
-        Some("env_ref") | Some("generated")
-    ) && object.get("fallback").is_none_or(Value::is_null)
 }
 
 fn deserialize_provider_candidate<'de, D>(deserializer: D) -> Result<ProviderConfigs, D::Error>
@@ -1962,31 +1957,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::time::Duration;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let previous = std::env::var_os(key);
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     fn server(id: &str, transport: TransportConfig) -> McpServerConfig {
         McpServerConfig {
             id: id.to_string(),
@@ -2212,7 +2182,16 @@ mod tests {
                     model: Some("diagnostic-model".to_string()),
                     request_overrides: Some(
                         serde_json::from_value(json!({
-                            "common": {"headers": {"Authorization": "override-header-secret"}}
+                            "common": {
+                                "headers": {
+                                    "Authorization": "override-header-secret",
+                                    "X-Access-Key": "override-access-key-secret"
+                                },
+                                "body_patch": [{
+                                    "path": "/credential",
+                                    "value": "override-credential-secret"
+                                }]
+                            }
                         }))
                         .unwrap(),
                     ),
@@ -2311,6 +2290,8 @@ mod tests {
             "provider-plaintext-secret",
             "provider-ciphertext-secret",
             "override-header-secret",
+            "override-access-key-secret",
+            "override-credential-secret",
             "unknown-provider-secret",
             "provider-url-secret",
             "query-secret",
@@ -2355,6 +2336,8 @@ mod tests {
             "provider-plaintext-secret",
             "provider-ciphertext-secret",
             "override-header-secret",
+            "override-access-key-secret",
+            "override-credential-secret",
             "unknown-provider-secret",
             "provider-url-secret",
             "query-secret",
@@ -3209,7 +3192,119 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn hybrid_legacy_default_provider_settings_preserve_builtin_alias() {
+    async fn provider_settings_rejects_provider_type_change_for_existing_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let secret = "immutable-provider-type-secret";
+
+        let created = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "openai",
+                        "providers": {},
+                        "defaults": null,
+                        "features": {},
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "openai",
+                                "model": "gpt-instance",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "work"
+                    },
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "replace", "value": secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = created.status();
+        let body = String::from_utf8(test::read_body(created).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {body}"
+        );
+        let created: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["revision"], 1);
+        let credential_ref = created["data"]["credential_status"]["provider_instances"]["work"]
+            ["credential_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let providers_before = std::fs::read(dir.path().join("providers.json")).unwrap();
+        let credentials_before = std::fs::read(dir.path().join("credentials.json")).unwrap();
+
+        let mut changed = created["data"].clone();
+        changed["provider_instances"]["work"]["provider_type"] = json!("anthropic");
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": changed
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let rejected_body = String::from_utf8(test::read_body(rejected).await.to_vec()).unwrap();
+        assert!(rejected_body.contains(
+            "provider_type for existing provider instance 'work' cannot be changed from 'openai' to 'anthropic'"
+        ));
+
+        let current = state.config.read().await;
+        let work = &current.provider_instances["work"];
+        assert_eq!(work.provider_type, "openai");
+        assert_eq!(work.api_key, secret);
+        assert_eq!(
+            work.credential_ref.as_ref().map(|value| value.as_str()),
+            Some(credential_ref.as_str())
+        );
+        drop(current);
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            providers_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            credentials_before
+        );
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["revision"], 1);
+        assert_eq!(
+            response["data"]["provider_instances"]["work"]["provider_type"],
+            "openai"
+        );
+    }
+
+    #[actix_web::test]
+    async fn hybrid_legacy_default_provider_settings_preserves_alias_until_restart_migration() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
@@ -3291,26 +3386,32 @@ mod tests {
             Some("openai")
         );
         assert!(restarted_config.provider_instances.contains_key("work"));
+        assert_eq!(restarted_config.provider_instances.len(), 2);
         assert_eq!(
             restarted_config
-                .providers()
-                .openai
-                .as_ref()
-                .unwrap()
+                .provider_instances
+                .get("openai")
+                .expect("restart materializes the legacy default")
                 .api_key,
             legacy_secret
         );
+        assert_eq!(
+            restarted_config.provider_instances["openai"].provider_type,
+            "openai"
+        );
+        assert!(restarted_config.providers().openai.is_none());
     }
 
     #[actix_web::test]
     async fn provider_settings_environment_status_tracks_runtime_availability() {
-        let _lock = bamboo_config::test_support::env_cache_lock_acquire();
-        let _openai = EnvVarGuard::set(
+        let _openai = bamboo_config::test_support::override_runtime_env_var(
             "BAMBOO_OPENAI_API_KEY",
             Some("sk-runtime-openai-environment"),
         );
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
-        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let _anthropic =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         {
@@ -3365,17 +3466,20 @@ mod tests {
 
     #[actix_web::test]
     async fn provider_settings_environment_override_precedes_and_falls_back_to_stored_ref() {
-        let _lock = bamboo_config::test_support::env_cache_lock_acquire();
         let _key = bamboo_config::encryption::set_test_encryption_key([0x6a; 32]);
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", Some("sk-runtime-openai-override"));
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", None);
-        let _gemini = EnvVarGuard::set("BAMBOO_GEMINI_API_KEY", None);
+        let openai = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-openai-override"),
+        );
+        let _anthropic =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
         let dir = tempfile::tempdir().unwrap();
-        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let facade = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
         let credential_ref =
             CredentialRef::parse("provider.work.api_key").expect("valid credential ref");
-        state
-            .credential_store
+        bamboo_config::CredentialStore::open(dir.path())
             .replace(
                 credential_ref.clone(),
                 "sk-stored-fallback",
@@ -3383,21 +3487,32 @@ mod tests {
                 0,
             )
             .unwrap();
-        {
-            let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
-                "provider_type": "openai",
-                "enabled": true,
-                "api_key_from_env": true,
-                "credential_ref": credential_ref.as_str()
-            }))
+        let snapshot = facade.registry().providers.snapshot();
+        let mut providers = snapshot.data.as_ref().clone();
+        let instance: ProviderInstanceConfig = serde_json::from_value(json!({
+            "provider_type": "openai",
+            "model": "gpt-env-restart",
+            "enabled": true,
+            "api_key_from_env": true,
+            "credential_ref": credential_ref.as_str()
+        }))
+        .unwrap();
+        providers
+            .provider_instances
+            .insert("work".to_string(), instance);
+        providers.default_provider_instance = Some("work".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, providers)
             .unwrap();
-            instance.api_key = "sk-runtime-openai-override".to_string();
-            let mut config = state.config.write().await;
-            config
-                .provider_instances
-                .insert("work".to_string(), instance);
-            config.default_provider_instance = Some("work".to_string());
-        }
+        drop(facade);
+
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert_eq!(
+            state.config.read().await.provider_instances["work"].api_key,
+            "sk-runtime-openai-override"
+        );
         let app = test::init_service(App::new().app_data(state.clone()).route(
             "/provider-settings",
             web::get().to(get_provider_settings_section),
@@ -3417,15 +3532,19 @@ mod tests {
         assert_eq!(active["source"], "environment");
         assert_eq!(active["credential_ref"], credential_ref.as_str());
 
-        std::env::remove_var("BAMBOO_OPENAI_API_KEY");
-        state
-            .config
-            .write()
-            .await
-            .provider_instances
-            .get_mut("work")
-            .unwrap()
-            .api_key = "sk-stored-fallback".to_string();
+        drop(app);
+        drop(state);
+        openai.replace(None);
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert_eq!(
+            state.config.read().await.provider_instances["work"].api_key,
+            "sk-stored-fallback"
+        );
+        let app = test::init_service(App::new().app_data(state).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
         let response = test::call_service(
             &app,
             test::TestRequest::get()
@@ -3551,6 +3670,16 @@ mod tests {
             .unwrap()
             .extra
             .insert("future_server_field".to_string(), json!(hidden_value));
+        let recovered_secret = "recovered-provider-extra-secret";
+        state
+            .config
+            .write()
+            .await
+            .provider_instances
+            .get_mut("bodhi-proxy")
+            .unwrap()
+            .extra
+            .insert("client_secret".to_string(), json!(recovered_secret));
 
         let mut updated = created["data"].clone();
         updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
@@ -3569,6 +3698,7 @@ mod tests {
         assert!(updated.status().is_success());
         let updated_body = String::from_utf8(test::read_body(updated).await.to_vec()).unwrap();
         assert!(!updated_body.contains(hidden_value));
+        assert!(!updated_body.contains(recovered_secret));
         let updated: Value = serde_json::from_str(&updated_body).unwrap();
         assert_eq!(updated["revision"], 2);
         assert_eq!(
@@ -3597,6 +3727,9 @@ mod tests {
                 config.provider_instances["bodhi-proxy"].extra["future_server_field"],
                 hidden_value
             );
+            assert!(!config.provider_instances["bodhi-proxy"]
+                .extra
+                .contains_key("client_secret"));
             assert_eq!(
                 config.provider_instances["bodhi-proxy"].extra["target_provider"],
                 "anthropic"

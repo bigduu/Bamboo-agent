@@ -6,7 +6,7 @@ use crate::app_state::AppState;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
     get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
-    resolve_provider_type,
+    resolve_provider_routing_key, resolve_provider_type,
 };
 
 use self::response::{
@@ -110,11 +110,34 @@ pub async fn handle_execute(
         .as_ref()
         .map(|model_ref| model_ref.provider.as_str())
         .or(req.provider.as_deref());
-    let requested_provider = resolve_requested_provider(&config_snapshot, explicit_provider);
+    let requested_provider_alias = resolve_requested_provider(&config_snapshot, explicit_provider);
+    let requested_provider = match resolve_provider_routing_key(
+        &config_snapshot,
+        requested_provider_alias,
+        &state.provider_registry,
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            let detail = format!("provider routing failed: {error}");
+            fail_pending_startup(
+                &state,
+                &session_id,
+                startup_turn_id.as_deref(),
+                &detail,
+                &mut startup_guard,
+            )
+            .await;
+            return if explicit_provider.is_some() {
+                bad_request_error_response(detail)
+            } else {
+                internal_server_error_response(detail)
+            };
+        }
+    };
 
     let requested_provider_type = resolve_provider_type(
         &config_snapshot,
-        requested_provider,
+        &requested_provider,
         &state.provider_registry,
     );
     // Auxiliary (non-chat) models are global: resolved from config for the
@@ -122,20 +145,20 @@ pub async fn handle_execute(
     // fast/background/summarization trio.
     let areas = resolve_global_area_models(
         &config_snapshot,
-        requested_provider,
+        &requested_provider,
         &state.provider_registry,
     );
 
     let config = bamboo_engine::session_app::types::ExecutionConfigSnapshot {
-        default_model: get_default_model_for_provider(&config_snapshot, requested_provider).ok(),
+        default_model: get_default_model_for_provider(&config_snapshot, &requested_provider).ok(),
         default_model_ref: config_snapshot.defaults.as_ref().map(|d| d.chat.clone()),
         default_reasoning_effort: get_reasoning_effort_for_provider(
             &config_snapshot,
-            requested_provider,
+            &requested_provider,
         ),
         disabled_tools: disabled_tools_vec.clone(),
         disabled_skill_ids: disabled_skill_ids_vec.clone(),
-        provider_name: requested_provider.to_string(),
+        provider_name: requested_provider.clone(),
         provider_type: requested_provider_type.clone(),
         fast_model: areas.fast.as_ref().map(|m| m.model_name.clone()),
         fast_model_ref: areas.fast_ref.clone(),
@@ -148,11 +171,16 @@ pub async fn handle_execute(
         provider_model_ref_enabled: config_snapshot.features.provider_model_ref,
     };
 
+    let mut request_model_ref = req.model_ref.clone();
+    if let Some(model_ref) = &mut request_model_ref {
+        model_ref.provider = requested_provider.clone();
+    }
+    let request_provider = req.provider.as_ref().map(|_| requested_provider.clone());
     let input = bamboo_engine::session_app::types::ExecuteInput {
         session_id: session_id.clone(),
         request_model: req.model.clone(),
-        request_model_ref: req.model_ref.clone(),
-        request_provider: req.provider.clone(),
+        request_model_ref,
+        request_provider,
         request_reasoning_effort: req.reasoning_effort,
         request_skill_mode: req.skill_mode.clone(),
         client_sync: req.client_sync.as_ref().map(|cs| {

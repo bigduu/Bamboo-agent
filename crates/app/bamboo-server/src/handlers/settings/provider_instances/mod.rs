@@ -136,11 +136,16 @@ fn instance_config_to_api(instance: &ProviderInstanceConfig) -> Map<String, Valu
         config.insert("request_overrides".to_string(), value);
     }
 
-    for (key, value) in &instance.extra {
-        if key == "api_key_encrypted" {
-            continue;
-        }
-        config.insert(key.clone(), value.clone());
+    let mut public_extra = Value::Object(
+        instance
+            .extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    bamboo_config::scrub_provider_metadata_credentials(&mut public_extra);
+    if let Value::Object(public_extra) = public_extra {
+        config.extend(public_extra);
     }
 
     config
@@ -187,6 +192,21 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
     validate_provider_type(&instance.provider_type)?;
 
+    if let Some(request_overrides) = &instance.request_overrides {
+        let original = serde_json::to_value(request_overrides).map_err(|error| {
+            AppError::BadRequest(format!("Invalid provider request_overrides: {error}"))
+        })?;
+        let mut sanitized = original.clone();
+        crate::handlers::settings::bamboo_config::scrub_unsafe_request_override_literals(
+            &mut sanitized,
+        );
+        if sanitized != original {
+            return Err(AppError::BadRequest(
+                "provider request_overrides contain literal credential material".to_string(),
+            ));
+        }
+    }
+
     if let Some(value) = instance
         .extra
         .get(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY)
@@ -214,6 +234,19 @@ fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), App
     {
         return Err(AppError::BadRequest(
             "api_key is required for non-copilot providers".to_string(),
+        ));
+    }
+
+    let extra = Value::Object(
+        instance
+            .extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    if !bamboo_config::provider_metadata_is_secret_free(&extra) {
+        return Err(AppError::BadRequest(
+            "provider instance config contains credential material outside api_key".to_string(),
         ));
     }
 
@@ -285,7 +318,23 @@ fn apply_instance_update(
     existing: &ProviderInstanceConfig,
     payload: &UpdateInstanceRequest,
 ) -> Result<ProviderInstanceConfig, AppError> {
-    let mut merged = instance_to_patchable_value(existing)?;
+    // Never preserve a credential-shaped field from a recovered legacy/LKG
+    // `extra` map. It is not part of the credential authority and old clients
+    // cannot safely round-trip it.
+    let mut sanitized_existing = existing.clone();
+    let mut public_extra = Value::Object(
+        sanitized_existing
+            .extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    bamboo_config::scrub_provider_metadata_credentials(&mut public_extra);
+    sanitized_existing.extra = match public_extra {
+        Value::Object(extra) => extra.into_iter().collect(),
+        _ => Default::default(),
+    };
+    let mut merged = instance_to_patchable_value(&sanitized_existing)?;
     let Some(obj) = merged.as_object_mut() else {
         return Err(AppError::InternalError(anyhow::anyhow!(
             "Serialized provider instance was not a JSON object"
@@ -708,6 +757,36 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_extra_cannot_write_or_echo_credential_material() {
+        let mut request = create_request("sk-real");
+        request.config["private_key"] = Value::String("private-extra-literal".to_string());
+        request.config["nested"] = serde_json::json!({
+            "client_secret": "client-extra-literal"
+        });
+        let error = build_instance_from_create(&request)
+            .expect_err("credential-shaped extra must be rejected");
+        assert!(matches!(error, AppError::BadRequest(_)));
+
+        let mut recovered = build_instance_from_create(&create_request("sk-real")).unwrap();
+        recovered.extra.insert(
+            "private_key".to_string(),
+            Value::String("recovered-private-literal".to_string()),
+        );
+        recovered.extra.insert(
+            "oauth".to_string(),
+            serde_json::json!({
+                "client_id": "public-client-id",
+                "value": "recovered-oauth-literal"
+            }),
+        );
+        let response = Value::Object(instance_config_to_api(&recovered));
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert!(!serialized.contains("recovered-private-literal"));
+        assert!(!serialized.contains("recovered-oauth-literal"));
+        assert_eq!(response["oauth"]["client_id"], "public-client-id");
+    }
+
+    #[test]
     fn api_reports_ref_backed_instance_as_configured_without_exposing_ref() {
         let mut instance = build_instance_from_create(&create_request("sk-real")).unwrap();
         instance.api_key.clear();
@@ -748,10 +827,12 @@ mod tests {
                 "common": {
                     "headers": {
                         "Authorization": "Bearer response-secret",
+                        "X-Access-Key": "access-key-response-secret",
                         "X-Api-Key": {"type": "env_ref", "name": "SAFE_API_KEY"}
                     },
                     "body_patch": [
                         {"path": "/api_key", "value": "body-response-secret"},
+                        {"path": "/credential", "value": "credential-response-secret"},
                         {"path": "/api_key", "value": {"type": "env_ref", "name": "SAFE_API_KEY"}}
                     ]
                 }
@@ -762,7 +843,9 @@ mod tests {
         let api = Value::Object(instance_config_to_api(&instance));
         let serialized = serde_json::to_string(&api).unwrap();
         assert!(!serialized.contains("response-secret"));
+        assert!(!serialized.contains("access-key-response-secret"));
         assert!(!serialized.contains("body-response-secret"));
+        assert!(!serialized.contains("credential-response-secret"));
         assert_eq!(
             api["request_overrides"]["common"]["headers"]["X-Api-Key"]["type"],
             "env_ref"
@@ -774,6 +857,31 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn create_rejects_literal_request_override_credentials() {
+        let mut literal = create_request("sk-real");
+        literal.config["request_overrides"] = serde_json::json!({
+            "common": {
+                "headers": {"X-Access-Key": "literal-access-key"},
+                "body_patch": [{"path": "/credential", "value": "literal-body-key"}]
+            }
+        });
+        assert!(matches!(
+            build_instance_from_create(&literal),
+            Err(AppError::BadRequest(_))
+        ));
+
+        let mut runtime = create_request("sk-real");
+        runtime.config["request_overrides"] = serde_json::json!({
+            "common": {
+                "headers": {
+                    "X-Access-Key": {"type": "env_ref", "name": "UPSTREAM_ACCESS_KEY"}
+                }
+            }
+        });
+        build_instance_from_create(&runtime).expect("runtime credential reference is secret-free");
     }
 
     #[test]

@@ -83,6 +83,10 @@ fn legacy_provider_response_view(config: &Config) -> Result<Value, AppError> {
 /// future provider cannot accidentally expose its credential authority through
 /// this deprecated compatibility endpoint.
 fn scrub_legacy_credential_metadata(value: &mut Value) {
+    // `ProviderConfigs` flattens unknown metadata. Reuse the same conservative
+    // classifier as durable config validation so recovered legacy/LKG values
+    // cannot expose private_key/client_secret or nested credential payloads.
+    bamboo_config::scrub_provider_metadata_credentials(value);
     match value {
         Value::Object(object) => {
             object.retain(|key, _| {
@@ -164,15 +168,22 @@ mod tests {
             "model": "gpt-work",
             "enabled": true,
             "api_key_from_env": true,
+            "private_key": "instance-private-extra",
+            "oauth": {
+                "client_id": "public-client-id",
+                "value": "instance-oauth-extra"
+            },
             "request_overrides": {
                 "common": {
                     "headers": {
                         "Authorization": "Bearer override-header-secret",
+                        "X-Access-Key": "override-access-key-secret",
                         "X-Api-Key": {"type": "env_ref", "name": "PROJECTED_API_KEY"},
                         "X-Trace": "public-trace"
                     },
                     "body_patch": [
                         {"path": "/api_key", "value": "override-body-secret"},
+                        {"path": "/credential", "value": "override-credential-secret"},
                         {"path": "/api_key", "value": {"type": "env_ref", "name": "PROJECTED_API_KEY"}},
                         {"path": "/temperature", "value": 0.2}
                     ]
@@ -202,7 +213,8 @@ mod tests {
                 "nested": {
                     "api_key_encrypted": "future-ciphertext",
                     "credential_ref": "provider.future.api_key",
-                    "api_key_from_env": true
+                    "api_key_from_env": true,
+                    "client_secret": "future-client-extra"
                 }
             }),
         );
@@ -211,6 +223,7 @@ mod tests {
         let value = legacy_provider_response_view(&config).expect("projection");
         assert_eq!(value["openai"]["api_key"], "****...****");
         assert_eq!(value["openai"]["model"], "gpt-work");
+        assert_eq!(value["openai"]["oauth"]["client_id"], "public-client-id");
         assert!(value["openai"]["request_overrides"]["common"]["headers"]
             .get("Authorization")
             .is_none());
@@ -237,7 +250,12 @@ mod tests {
             "provider.future.api_key",
             "api_key_from_env",
             "override-header-secret",
+            "override-access-key-secret",
             "override-body-secret",
+            "override-credential-secret",
+            "instance-private-extra",
+            "instance-oauth-extra",
+            "future-client-extra",
         ] {
             assert!(
                 !serialized.contains(forbidden),
