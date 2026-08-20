@@ -98,6 +98,7 @@ where
 #[derive(Default)]
 struct DrainState {
     calls: AtomicUsize,
+    completed: AtomicUsize,
     started: Notify,
     release: Notify,
 }
@@ -106,6 +107,7 @@ async fn blocking_drain_handler(state: web::Data<DrainState>) -> HttpResponse {
     state.calls.fetch_add(1, Ordering::SeqCst);
     state.started.notify_one();
     state.release.notified().await;
+    state.completed.fetch_add(1, Ordering::SeqCst);
     HttpResponse::Ok().body("completed-current-request")
 }
 
@@ -210,10 +212,26 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect pipelined keep-alive client");
+    // Complete one request on the connection that will carry active and queued
+    // work. This is the connection-local lifecycle barrier used by Actix's own
+    // graceful-drain regression: it proves that the dispatcher has completed a
+    // full request/response cycle and entered keep-alive before shutdown races
+    // with the next pipelined request.
+    stream
+        .write_all(b"GET /idle HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .expect("establish active keep-alive connection");
+    let active_idle_response = read_http_response_head(&mut stream).await;
+    assert!(
+        active_idle_response.starts_with(b"HTTP/1.1 200"),
+        "unexpected active-connection warmup response: {}",
+        String::from_utf8_lossy(&active_idle_response)
+    );
+
     stream
         .write_all(
             b"GET /current HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n\
-              GET /queued HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+              GET /queued HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
         )
         .await
         .expect("buffer two HTTP requests");
@@ -278,6 +296,11 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
             .windows(b"completed-current-request".len())
             .any(|window| window == b"completed-current-request"),
         "the in-flight request must complete before the connection drains"
+    );
+    assert_eq!(
+        state.completed.load(Ordering::SeqCst),
+        1,
+        "the in-flight handler must finish exactly once before its response drains"
     );
     assert_eq!(
         state.calls.load(Ordering::SeqCst),
@@ -351,11 +374,11 @@ async fn rustls_server_is_http11_secure_wss_and_never_negotiates_h2() {
     let mut unsafe_alpn = rustls.clone();
     unsafe_alpn.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let (unsafe_listener, _) = test_listener();
-    let unsafe_error =
-        match build_h1_server(|| App::new(), vec![unsafe_listener], 1, Some(unsafe_alpn)) {
-            Ok(_) => panic!("an H1 dispatcher must reject a config that advertises h2"),
-            Err(error) => error,
-        };
+    let unsafe_error = match build_h1_server(App::new, vec![unsafe_listener], 1, Some(unsafe_alpn))
+    {
+        Ok(_) => panic!("an H1 dispatcher must reject a config that advertises h2"),
+        Err(error) => error,
+    };
     assert_eq!(unsafe_error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(unsafe_error.to_string().contains("only ALPN http/1.1"));
 
