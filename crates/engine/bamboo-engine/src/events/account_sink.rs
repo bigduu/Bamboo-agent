@@ -958,16 +958,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
         let invalid = config_invalid("mcp", 7);
-        sink.record(None, &invalid);
-        sink.record(None, &invalid);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(sink.record_confirmed(None, &invalid).await);
+        assert!(sink.record_confirmed(None, &invalid).await);
         assert_eq!(journal::read_since(sink.events_dir(), 0).unwrap().len(), 1);
         drop(sink);
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let restarted = AccountEventSink::new(dir.path().to_path_buf()).unwrap();
-        restarted.record(None, &invalid);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(restarted.record_confirmed(None, &invalid).await);
         assert_eq!(
             journal::read_since(restarted.events_dir(), 0)
                 .unwrap()
@@ -976,10 +973,17 @@ mod tests {
             "same failure stays deduped after watcher/sink restart"
         );
 
-        restarted.record(None, &config_recovered("mcp", 7));
-        restarted.record(None, &invalid);
-        restarted.record(None, &config_changed("mcp", 7));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            restarted
+                .record_confirmed(None, &config_recovered("mcp", 7))
+                .await
+        );
+        assert!(restarted.record_confirmed(None, &invalid).await);
+        assert!(
+            restarted
+                .record_confirmed(None, &config_changed("mcp", 7))
+                .await
+        );
         let events = journal::read_since(restarted.events_dir(), 0).unwrap();
         assert_eq!(events.len(), 4);
         assert!(matches!(
