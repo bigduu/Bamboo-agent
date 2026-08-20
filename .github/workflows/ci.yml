@@ -264,7 +264,10 @@ jobs:
         # discovery path — a bare root-level `audit.toml` is NOT picked up),
         # where each entry carries a justification and a re-check trigger
         # instead of being a silent, undocumented flag (bamboo-agent#254).
-        run: cargo audit
+        # Deny every other warning as well as vulnerabilities so a newly
+        # introduced unsound, unmaintained, or yanked dependency cannot leave
+        # this required security job green without an explicit review.
+        run: cargo audit --deny warnings
 
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
