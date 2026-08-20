@@ -45,10 +45,9 @@ pub use model_mapping::*;
 pub use paths::*;
 pub use provider_configs::ProviderConfigsModule;
 pub use provider_instance::{
-    legacy_provider_compatibility_view, materialize_legacy_provider_instances,
-    provider_api_key_environment_override_active, provider_instance_api_key_from_env,
-    provider_instance_environment_override_active, synthesize_legacy_instances,
-    PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
+    materialize_legacy_provider_instances, provider_api_key_environment_override_active,
+    provider_instance_api_key_from_env, provider_instance_environment_override_active,
+    synthesize_legacy_instances, PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY,
 };
 pub use section_facade::*;
 pub use settings::PermissionMode;

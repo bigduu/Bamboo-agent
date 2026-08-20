@@ -258,18 +258,6 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::diagnose_permission),
         )
         .route(
-            "/bamboo/settings/provider",
-            web::get().to(settings::get_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider",
-            web::post().to(settings::update_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider/models",
-            web::post().to(settings::fetch_provider_models),
-        )
-        .route(
             "/bamboo/settings/reload",
             web::post().to(settings::reload_provider_config),
         )

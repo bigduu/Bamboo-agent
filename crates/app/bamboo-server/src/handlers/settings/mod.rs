@@ -48,10 +48,7 @@ pub use permission::{
     create_permission_rule, delete_permission_rule, diagnose_permission, get_permission_ask_rules,
     get_permission_policy, update_permission_ask_rules, update_permission_rule,
 };
-pub use provider::{
-    fetch_catalog_models, fetch_provider_models, get_provider_catalog, get_provider_config,
-    reload_provider_config, update_provider_config, UpdateProviderRequest,
-};
+pub use provider::{fetch_catalog_models, get_provider_catalog, reload_provider_config};
 pub use provider_instances::{
     create_provider_instance, delete_provider_instance, list_provider_instances,
     set_default_provider_instance, update_provider_instance,

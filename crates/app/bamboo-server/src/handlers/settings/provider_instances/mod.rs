@@ -1116,7 +1116,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn credential_recovery_failures_are_unconfigured_across_provider_apis() {
+    async fn credential_recovery_failures_are_unconfigured_across_canonical_provider_apis() {
         let _openai_env =
             bamboo_config::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
         let encryption_key = bamboo_config::encryption::set_test_encryption_key([0x7c; 32]);
@@ -1180,11 +1180,7 @@ mod tests {
                         crate::handlers::settings::bamboo_config::get_provider_settings_section,
                     ),
                 )
-                .route("/instances", web::get().to(list_provider_instances))
-                .route(
-                    "/legacy",
-                    web::get().to(crate::handlers::settings::provider::get_provider_config),
-                ),
+                .route("/instances", web::get().to(list_provider_instances)),
         )
         .await;
 
@@ -1221,21 +1217,6 @@ mod tests {
             assert!(instance["config"].get("api_key").is_none());
             assert!(instance["config"].get("credential_ref").is_none());
         }
-
-        let legacy = actix_web::test::call_service(
-            &app,
-            actix_web::test::TestRequest::get()
-                .uri("/legacy")
-                .to_request(),
-        )
-        .await;
-        assert!(legacy.status().is_success());
-        let legacy: Value = actix_web::test::read_body_json(legacy).await;
-        assert!(legacy["providers"]["openai"].get("api_key").is_none());
-        assert!(serde_json::to_string(&legacy)
-            .unwrap()
-            .find("****...****")
-            .is_none());
     }
 
     #[test]
