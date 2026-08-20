@@ -606,7 +606,7 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
 
 fn parse_range(value: &str, prefix: char) -> Option<(usize, usize)> {
     let value = value.strip_prefix(prefix)?;
-    let (start, count) = value.split_once(',').map_or((value, "1"), |parts| parts);
+    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
     Some((start.parse().ok()?, count.parse().ok()?))
 }
 

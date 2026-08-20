@@ -1105,7 +1105,7 @@ pub(super) async fn execute_llm_stream(
         Err(failure) => {
             let appended = append_interrupted_assistant_output(
                 session,
-                failure.partial_output,
+                *failure.partial_output,
                 &failure.error,
             );
             if appended {

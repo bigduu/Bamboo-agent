@@ -224,7 +224,9 @@ impl From<&bamboo_agent_core::tools::PartialToolCall> for PartialToolCallSnapsho
 /// interrupted assistant record instead of losing already-visible output.
 pub(crate) struct StreamHandlingFailure {
     pub error: AgentError,
-    pub partial_output: InterruptedStreamOutput,
+    /// Failures are already the cold path; boxing the three-buffer snapshot
+    /// keeps this error small without changing the preserved fragment data.
+    pub partial_output: Box<InterruptedStreamOutput>,
 }
 
 pub async fn consume_llm_stream(
