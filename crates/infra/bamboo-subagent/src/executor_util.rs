@@ -267,12 +267,11 @@ mod tests {
 
     use serde_json::{json, Value};
 
-    #[cfg(unix)]
-    use super::ETXTBSY_RAW_OS_ERROR;
     use super::{
         build_rehydrated_turn, render_history_preamble, retry_on_etxtbsy, write_json_atomic,
-        ETXTBSY_RETRY_ATTEMPTS,
     };
+    #[cfg(unix)]
+    use super::{ETXTBSY_RAW_OS_ERROR, ETXTBSY_RETRY_ATTEMPTS};
 
     struct DropMarker(Arc<AtomicBool>);
 
