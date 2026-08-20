@@ -109,6 +109,11 @@ async fn blocking_drain_handler(state: web::Data<DrainState>) -> HttpResponse {
     HttpResponse::Ok().body("completed-current-request")
 }
 
+async fn queued_drain_handler(state: web::Data<DrainState>) -> HttpResponse {
+    state.calls.fetch_add(1, Ordering::SeqCst);
+    HttpResponse::Ok().body("unexpected-queued-request")
+}
+
 #[actix_web::test]
 async fn graceful_stop_closes_idle_keep_alive_connection_without_worker_timeout() {
     let (listener, port) = test_listener();
@@ -170,7 +175,12 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
         move || {
             App::new()
                 .app_data(web::Data::from(state_for_factory.clone()))
-                .route("/drain", web::get().to(blocking_drain_handler))
+                .route(
+                    "/idle",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                )
+                .route("/current", web::get().to(blocking_drain_handler))
+                .route("/queued", web::get().to(queued_drain_handler))
         },
         vec![listener],
         1,
@@ -180,13 +190,30 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
     let handle = server.handle();
     let join = tokio::spawn(server);
 
+    // Keep a second connection idle so its prompt EOF is an observable barrier
+    // proving that the graceful-drain signal reached this worker's H1
+    // dispatchers before the active request is released.
+    let mut idle_stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect idle keep-alive client");
+    idle_stream
+        .write_all(b"GET /idle HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .expect("send idle keep-alive request");
+    let idle_response = read_http_response_head(&mut idle_stream).await;
+    assert!(
+        idle_response.starts_with(b"HTTP/1.1 200"),
+        "unexpected idle HTTP response: {}",
+        String::from_utf8_lossy(&idle_response)
+    );
+
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect pipelined keep-alive client");
     stream
         .write_all(
-            b"GET /drain HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n\
-              GET /drain HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            b"GET /current HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n\
+              GET /queued HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
         .await
         .expect("buffer two HTTP requests");
@@ -194,25 +221,47 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
         .await
         .expect("current request starts before timeout");
 
-    // `stop(true)` queues the server command before returning its completion
-    // future. Give the worker a scheduling turn to deliver the drain signal
-    // while the first request remains in flight and the second is buffered.
-    let graceful_stop = handle.stop(true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut graceful_stop = tokio::spawn(async move { handle.stop(true).await });
+
+    let mut trailing = [0_u8; 1];
+    let idle_connection_closed =
+        tokio::time::timeout(Duration::from_secs(3), idle_stream.read(&mut trailing)).await;
+
     state.release.notify_one();
 
-    if tokio::time::timeout(Duration::from_secs(3), graceful_stop)
-        .await
-        .is_err()
-    {
-        join.abort();
-        let _ = join.await;
-        panic!("graceful stop started a buffered request or waited for worker timeout");
+    // Read concurrently with the server's stop future. This gives the in-flight
+    // response room to drain before the connection is closed and lets an old,
+    // unwired dispatcher expose an incorrectly started queued response.
+    let active_response = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.map(|_| response)
+    })
+    .await;
+
+    // Always release client-held sockets before awaiting shutdown completion so
+    // a failing regression cannot strand Actix workers until their long default
+    // shutdown timeout.
+    drop((idle_stream, stream));
+
+    let graceful_stop_result =
+        tokio::time::timeout(Duration::from_secs(3), &mut graceful_stop).await;
+    if graceful_stop_result.is_err() {
+        graceful_stop.abort();
+        let _ = graceful_stop.await;
     }
 
-    let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
-        .await
+    let mut join = join;
+    let server_join_result = tokio::time::timeout(Duration::from_secs(3), &mut join).await;
+    if server_join_result.is_err() {
+        join.abort();
+        let _ = join.await;
+    }
+
+    assert!(
+        matches!(idle_connection_closed, Ok(Ok(0))),
+        "idle keep-alive connection did not close after the drain signal: {idle_connection_closed:?}"
+    );
+    let response = active_response
         .expect("drained connection closes after current response")
         .expect("read drained HTTP response");
     assert_eq!(
@@ -235,9 +284,14 @@ async fn graceful_stop_finishes_current_request_without_starting_buffered_reques
         1,
         "the buffered request must not enter the application service"
     );
-    join.await
-        .expect("server task joins")
-        .expect("server exits cleanly");
+    assert!(
+        matches!(graceful_stop_result, Ok(Ok(()))),
+        "graceful stop did not complete cleanly: {graceful_stop_result:?}"
+    );
+    assert!(
+        matches!(server_join_result, Ok(Ok(Ok(())))),
+        "server did not exit cleanly: {server_join_result:?}"
+    );
 }
 
 #[actix_web::test]
