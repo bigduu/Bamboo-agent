@@ -14,10 +14,11 @@ fn configure_macos_test_unwinding() {
     // large and otherwise emits an oversized-__eh_frame warning on every test
     // link. Disable compact-unwind synthesis for this library package's
     // directly linked artifacts. `rustc-link-arg-tests` does not cover a
-    // library's own `#[cfg(test)]` harness, while the general form does. Cargo
-    // does not attach it to the rlib, so downstream dev/release binaries do not
-    // inherit it. The linker keeps __eh_frame, preserving Rust panic unwinding,
-    // backtraces, and line-table debugging.
+    // library's own `#[cfg(test)]` harness, while the general form does. The
+    // argument has no final-link effect while rustc creates the rlib and Cargo
+    // does not propagate it to consumer links, so downstream dev/release
+    // binaries do not inherit it. The linker keeps __eh_frame, preserving Rust
+    // panic unwinding, backtraces, and line-table debugging.
     println!("cargo:rustc-link-arg=-Wl,-no_compact_unwind");
 }
 

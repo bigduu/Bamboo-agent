@@ -179,8 +179,9 @@ bamboo/
   `bamboo-server` lib-test. The library package's directly linked test/example
   artifacts disable Apple's compact-unwind table because the crate's DWARF
   unwind records exceed that format's 16 MiB offset limit. DWARF unwinding and
-  line tables remain enabled for panic backtraces and debugging; the rlib and
-  downstream dev/release binaries are unchanged.
+  line tables remain enabled for panic backtraces and debugging. The flag has
+  no final-link effect while creating the rlib and is not propagated to
+  downstream dev/release binaries.
 
 ### Documentation Guidelines
 
