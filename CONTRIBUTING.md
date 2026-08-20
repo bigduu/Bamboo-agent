@@ -175,6 +175,13 @@ bamboo/
 - Include edge cases in tests
 - Use `#[tokio::test]` for async tests
 - Use `tempfile` for tests that need file system access
+- On macOS, use `scripts/run-macos-server-lib-tests.sh` for the monolithic
+  `bamboo-server` lib-test. The library package's directly linked test/example
+  artifacts disable Apple's compact-unwind table because the crate's DWARF
+  unwind records exceed that format's 16 MiB offset limit. DWARF unwinding and
+  line tables remain enabled for panic backtraces and debugging. The flag has
+  no final-link effect while creating the rlib and is not propagated to
+  downstream dev/release binaries.
 
 ### Documentation Guidelines
 

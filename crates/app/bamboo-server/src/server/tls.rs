@@ -167,6 +167,33 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[cfg(target_os = "macos")]
+    #[inline(never)]
+    fn capture_test_backtrace() -> std::backtrace::Backtrace {
+        std::backtrace::Backtrace::force_capture()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_test_link_keeps_dwarf_backtraces() {
+        // The macOS platform fixture links this crate's monolithic lib-test,
+        // whose build disables only compact-unwind synthesis. Exercise a real
+        // stack walk so the CI guard also proves that the retained __eh_frame
+        // records remain usable for test debugging.
+        let backtrace = capture_test_backtrace();
+        assert_eq!(
+            backtrace.status(),
+            std::backtrace::BacktraceStatus::Captured
+        );
+        assert!(
+            backtrace
+                .to_string()
+                .lines()
+                .any(|line| !line.trim().is_empty()),
+            "captured backtrace should contain at least one frame"
+        );
+    }
+
     #[test]
     fn build_rustls_config_errors_on_missing_cert_file() {
         let tls = TlsConfig {
