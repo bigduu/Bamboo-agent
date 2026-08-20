@@ -72,6 +72,11 @@ where
     }
 
     let mut builder = ServerBuilder::default().workers(workers);
+    // Bamboo constructs `HttpService` directly to keep inbound transports on
+    // HTTP/1.1. Unlike `actix_web::HttpServer`, a custom service is not wired
+    // to actix-server's drain notification automatically, so preserve that
+    // connection-level contract explicitly for every listener factory.
+    let graceful_shutdown_signal = builder.graceful_shutdown_signal();
 
     for (index, listener) in listeners.into_iter().enumerate() {
         let addr = listener.local_addr()?;
@@ -82,13 +87,19 @@ where
         builder = match &tls {
             Some(tls_config) => {
                 let tls_config = tls_config.clone();
+                let shutdown_signal = graceful_shutdown_signal.clone();
                 builder.listen(name, listener, move || {
+                    let shutdown_signal = shutdown_signal.clone();
                     let app_config = app_config(true, host.clone(), addr);
                     let app = app_factory()
                         .into_factory()
                         .map_err(|err| err.into().error_response());
 
                     HttpService::build()
+                        .graceful_shutdown_signal(move || {
+                            let shutdown_signal = shutdown_signal.clone();
+                            async move { shutdown_signal.notified().await }
+                        })
                         .secure()
                         .local_addr(addr)
                         .client_disconnect_timeout(Duration::from_secs(1))
@@ -96,18 +107,26 @@ where
                         .rustls_0_23(tls_config.clone())
                 })?
             }
-            None => builder.listen(name, listener, move || {
-                let app_config = app_config(false, host.clone(), addr);
-                let app = app_factory()
-                    .into_factory()
-                    .map_err(|err| err.into().error_response());
+            None => {
+                let shutdown_signal = graceful_shutdown_signal.clone();
+                builder.listen(name, listener, move || {
+                    let shutdown_signal = shutdown_signal.clone();
+                    let app_config = app_config(false, host.clone(), addr);
+                    let app = app_factory()
+                        .into_factory()
+                        .map_err(|err| err.into().error_response());
 
-                HttpService::build()
-                    .local_addr(addr)
-                    .client_disconnect_timeout(Duration::from_secs(1))
-                    .h1(map_config(app, move |_| app_config.clone()))
-                    .tcp()
-            })?,
+                    HttpService::build()
+                        .graceful_shutdown_signal(move || {
+                            let shutdown_signal = shutdown_signal.clone();
+                            async move { shutdown_signal.notified().await }
+                        })
+                        .local_addr(addr)
+                        .client_disconnect_timeout(Duration::from_secs(1))
+                        .h1(map_config(app, move |_| app_config.clone()))
+                        .tcp()
+                })?
+            }
         };
     }
 
