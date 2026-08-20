@@ -125,7 +125,12 @@ jobs:
       - name: Verify OpenSSL
         run: openssl version
 
+      - name: Run TLS fixture tests (macOS unwind guard)
+        if: runner.os == 'macOS'
+        run: scripts/run-macos-server-lib-tests.sh
+
       - name: Run TLS fixture tests
+        if: runner.os != 'macOS'
         run: cargo test --locked -p bamboo-server --lib server::tls::tests -- --nocapture
 
   e2e-test:
