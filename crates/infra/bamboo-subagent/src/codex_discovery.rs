@@ -9,6 +9,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::executor_util::retry_on_etxtbsy;
+
 /// The oldest Codex CLI schema Bamboo intentionally supports.
 pub const MIN_CODEX_VERSION: (u64, u64, u64) = (0, 144, 0);
 
@@ -193,9 +195,16 @@ async fn verify_help_surface(
 
 async fn command_output(binary: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let command_label = format!("'{} {}'", binary.display(), args.join(" "));
-    let mut command = Command::new(binary);
-    command.args(args).kill_on_drop(true);
-    tokio::time::timeout(PREFLIGHT_COMMAND_TIMEOUT, command.output())
+    // Keep the timeout outside the complete retry future. Five transient spawn
+    // attempts therefore share one 10-second budget instead of multiplying it.
+    tokio::time::timeout(
+        PREFLIGHT_COMMAND_TIMEOUT,
+        retry_on_etxtbsy(|| {
+            let mut command = Command::new(binary);
+            command.args(args).kill_on_drop(true);
+            async move { command.output().await }
+        }),
+    )
         .await
         .map_err(|_| {
             format!(
