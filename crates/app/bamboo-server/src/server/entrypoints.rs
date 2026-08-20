@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use actix_files as fs;
 use actix_web::{
     dev::{fn_service, ServiceRequest, ServiceResponse},
-    web, App, HttpResponse, HttpServer,
+    web, App, HttpResponse,
 };
 use tracing::{error, info};
 
+use super::h1::build_h1_server;
 use super::listeners::{build_bind_listeners, build_desktop_listeners, resolve_worker_count};
 use super::tls::build_rustls_config;
 use crate::app_state::AppState;
@@ -108,7 +109,7 @@ pub async fn run(bamboo_home_dir: PathBuf, port: u16) -> Result<(), String> {
 
 /// Like [`run`], but terminates TLS itself when `tls` is `Some` (#181).
 ///
-/// Desktop loopback callers pass `None` and get the unchanged plaintext path.
+/// Desktop loopback callers pass `None` and get the unchanged plaintext H1 path.
 pub async fn run_with_tls(
     bamboo_home_dir: PathBuf,
     port: u16,
@@ -182,7 +183,7 @@ pub async fn run_with_tls(
 
     // Fail-fast: when TLS is configured, build the rustls config up front so a
     // bad/missing cert refuses startup instead of silently falling back to
-    // plaintext. `None` → unchanged plaintext path.
+    // plaintext. `None` → unchanged plaintext H1 path.
     let rustls_cfg = match &tls {
         Some(tls) => Some(build_rustls_config(tls)?),
         None => None,
@@ -190,19 +191,8 @@ pub async fn run_with_tls(
 
     let listeners = build_desktop_listeners(port)?;
 
-    let mut http = HttpServer::new(app_factory).workers(workers);
-    for (idx, listener) in listeners.into_iter().enumerate() {
-        http = match &rustls_cfg {
-            Some(cfg) => http
-                .listen_rustls_0_23(listener, cfg.clone())
-                .map_err(|e| format!("Failed to attach TLS listener #{idx}: {e}"))?,
-            None => http
-                .listen(listener)
-                .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?,
-        };
-    }
-
-    let server = http.run();
+    let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
+        .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
 
     let scheme = if rustls_cfg.is_some() {
         "https"
@@ -285,7 +275,7 @@ pub async fn run_with_bind_and_static(
 }
 
 /// Like [`run_with_bind_and_static`], but terminates TLS itself when `tls` is
-/// `Some` (#181). When `None`, the plaintext `.listen()` path is unchanged.
+/// `Some` (#181). When `None`, the plaintext HTTP/1.1 path is unchanged.
 pub async fn run_with_bind_and_static_tls(
     bamboo_home_dir: PathBuf,
     port: u16,
@@ -384,7 +374,7 @@ pub async fn run_with_bind_and_static_tls(
 
     // Fail-fast: build the rustls config before binding so a bad/missing cert
     // refuses startup rather than silently downgrading to plaintext. `None` →
-    // unchanged plaintext path (desktop/loopback behavior preserved). #181.
+    // unchanged plaintext H1 path (desktop/loopback behavior preserved). #181.
     let rustls_cfg = match &tls {
         Some(tls) => Some(build_rustls_config(tls)?),
         None => None,
@@ -392,19 +382,8 @@ pub async fn run_with_bind_and_static_tls(
 
     let listeners = build_bind_listeners(bind, port)?;
 
-    let mut http = HttpServer::new(app_factory).workers(workers);
-    for (idx, listener) in listeners.into_iter().enumerate() {
-        http = match &rustls_cfg {
-            Some(cfg) => http
-                .listen_rustls_0_23(listener, cfg.clone())
-                .map_err(|e| format!("Failed to attach TLS listener #{idx}: {e}"))?,
-            None => http
-                .listen(listener)
-                .map_err(|e| format!("Failed to attach listener #{idx}: {e}"))?,
-        };
-    }
-
-    let server = http.run();
+    let server = build_h1_server(app_factory, listeners, workers, rustls_cfg.clone())
+        .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
 
     let scheme = if rustls_cfg.is_some() {
         "https"
