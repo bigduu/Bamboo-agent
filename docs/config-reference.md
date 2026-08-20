@@ -101,8 +101,9 @@ not part of Bamboo Issue #597.
 ## Providers
 
 `provider_instances` is the durable and runtime authority. The legacy
-single-instance `providers` shape remains readable during the Lotus #177
-client-migration window:
+single-instance `provider` / `providers` shape remains accepted as a
+serde/migration compatibility input, most importantly so older installations
+can be materialized into provider instances safely on cold start:
 
 ```json
 {
@@ -183,12 +184,13 @@ instance with no stored fallback reports `configured: false` and
 `source: "environment"` whenever the variable is absent.
 
 Use the revisioned `GET/PUT /v1/bamboo/config/provider-settings` contract or the
-provider-instance CRUD endpoints for writes. The deprecated
-`GET /v1/bamboo/settings/provider` remains a secret-free, type-keyed projection
-for older clients. Its matching POST returns `400` after the default resolves
-to a native instance, rather than acknowledging a legacy write that the
-canonicalizer would discard. This compatibility boundary can be removed after
-Lotus #177 migrates its remaining callers.
+provider-instance CRUD endpoints for settings, and
+`POST /v1/bamboo/provider-catalog/fetch-models` for live model discovery. The
+legacy `GET/POST /v1/bamboo/settings/provider` and
+`POST /v1/bamboo/settings/provider/models` routes are no longer registered;
+older clients receive `404` and must migrate to the canonical contracts. This
+HTTP retirement does not remove the on-disk compatibility input described
+above.
 
 ## Server
 

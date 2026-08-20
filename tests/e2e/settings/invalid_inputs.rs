@@ -23,28 +23,6 @@ async fn test_save_workflow_with_invalid_name() {
 }
 
 #[actix_web::test]
-async fn test_update_provider_with_invalid_provider() {
-    let state = crate::e2e::common::create_test_app().await;
-
-    let app = test::init_service(App::new().app_data(state).route(
-        "/v1/bamboo/settings/provider",
-        web::post().to(settings::update_provider_config),
-    ))
-    .await;
-
-    let req = test::TestRequest::post()
-        .uri("/v1/bamboo/settings/provider")
-        .set_json(json!({
-            "provider": "invalid-provider-name",
-            "providers": {}
-        }))
-        .to_request();
-
-    let resp = test::call_service(&app, req).await;
-    assert!(resp.status().is_client_error() || resp.status().is_success());
-}
-
-#[actix_web::test]
 async fn test_delete_nonexistent_workflow() {
     let state = crate::e2e::common::create_test_app().await;
 
