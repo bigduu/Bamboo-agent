@@ -15,10 +15,12 @@
 //! alive keeps the tunnel + worker up; `shutdown`/`shutdown_with_timeout`
 //! signal the remote worker and POLL for it to exit — keeping the session and
 //! reverse tunnel up throughout, so an in-flight reply can drain through it —
-//! before hard-killing and disconnecting (session-bound lifetime, like the
-//! system-ssh path — true survive-restart durability is a later phase). #489.
+//! before a bounded hard-kill fallback, reverse-listener cancellation, active
+//! forwarding drain, and disconnect (session-bound lifetime, like the system-ssh
+//! path — true survive-restart durability is a later phase). #489.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +32,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::deploy::{
     agent_argv, broker_port, broker_scheme, sh_quote, AgentDeployment, DeployedAgent, Deployer,
@@ -42,6 +44,12 @@ use crate::error::{BrokerError, BrokerResult};
 /// [`RusshHandle::shutdown_with_timeout`]. Short enough to notice a fast exit
 /// promptly, long enough not to hammer the SSH connection with exec requests.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Once the remote worker is gone and the server has acknowledged cancellation
+/// of the reverse listener, allow already-accepted forwarding tasks to flush
+/// their final bytes before disconnecting the SSH session. This is a separate,
+/// short bound because the worker already consumed its explicit grace window.
+const FORWARDED_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Decrypted SSH credentials for the russh path (the fabric layer decrypts the
 /// at-rest ciphertext before constructing the deployer).
@@ -117,12 +125,17 @@ impl RusshDeployer {
     /// Connect + host-key TOFU + authenticate, returning the live session.
     /// `broker_local` is only used to bridge reverse-tunnel connections (unused
     /// during preflight, where no `tcpip_forward` is requested).
-    async fn connect_and_auth(&self, broker_local: String) -> BrokerResult<Handle<FabricHandler>> {
+    async fn connect_and_auth(
+        &self,
+        broker_local: String,
+        forwarded_connections: Arc<ForwardedConnections>,
+    ) -> BrokerResult<Handle<FabricHandler>> {
         let config = Arc::new(client::Config::default());
         let handler = FabricHandler {
             expected: self.expected_fingerprint.clone(),
             observed: self.observed.clone(),
             broker_local,
+            forwarded_connections,
         };
         let mut session = client::connect(config, (self.host.as_str(), self.port), handler)
             .await
@@ -174,6 +187,53 @@ struct FabricHandler {
     observed: Arc<Mutex<Option<String>>>,
     /// Local broker address to bridge forwarded connections to (`127.0.0.1:9600`).
     broker_local: String,
+    forwarded_connections: Arc<ForwardedConnections>,
+}
+
+/// Tracks forwarding tasks independently from the russh session task. An SSH
+/// channel can still have bytes buffered after the remote worker exits; dropping
+/// the session at that point truncates the worker's final broker frame.
+#[derive(Default)]
+struct ForwardedConnections {
+    active: AtomicUsize,
+    changed: Notify,
+}
+
+impl ForwardedConnections {
+    fn track(self: &Arc<Self>) -> ForwardedConnectionGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ForwardedConnectionGuard(self.clone())
+    }
+
+    async fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Create the waiter before checking the count. The final guard uses
+            // `notify_one`, which retains a permit even if this future has not
+            // been polled yet, so the check/await boundary cannot miss it.
+            let changed = self.changed.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+struct ForwardedConnectionGuard(Arc<ForwardedConnections>);
+
+impl Drop for ForwardedConnectionGuard {
+    fn drop(&mut self) {
+        let previous = self.0.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "forwarded connection count underflow");
+        if previous == 1 {
+            // `notify_one` stores a permit if the waiter has not been polled
+            // yet, avoiding the missed-wakeup window of `notify_waiters`.
+            self.0.changed.notify_one();
+        }
+    }
 }
 
 impl client::Handler for FabricHandler {
@@ -208,7 +268,9 @@ impl client::Handler for FabricHandler {
         reply.accept().await;
         // A worker on the remote dialed the tunnel mouth; splice it to the broker.
         let broker = self.broker_local.clone();
+        let connection = self.forwarded_connections.track();
         tokio::spawn(async move {
+            let _connection = connection;
             match TcpStream::connect(&broker).await {
                 Ok(mut tcp) => {
                     let mut stream = channel.into_stream();
@@ -225,7 +287,8 @@ impl client::Handler for FabricHandler {
 
 /// Live remote handle: owns the `russh` session (keeping the tunnel + worker
 /// alive). `shutdown`/`shutdown_with_timeout` signal the worker by id, poll for
-/// its exit through the still-open tunnel, then hard-kill + disconnect (#489).
+/// its exit through the still-open tunnel, then hard-kill if needed, drain
+/// accepted forwarding tasks, and disconnect (#489).
 struct RusshHandle {
     session: Mutex<Option<Handle<FabricHandler>>>,
     worker_id: String,
@@ -233,6 +296,8 @@ struct RusshHandle {
     /// token). Removed on shutdown, and — being globally unique — the safest
     /// `pkill` anchor (the truncated worker_id can substring-collide across nodes).
     remote_spec_path: Option<String>,
+    broker_port: u32,
+    forwarded_connections: Arc<ForwardedConnections>,
 }
 
 #[async_trait]
@@ -244,8 +309,8 @@ impl RemoteDeployment for RusshHandle {
     /// signal, severing the graceful drain #488 added mid-reply. Fix: signal,
     /// then POLL the remote for the worker's exit — keeping the session/tunnel
     /// alive — for up to `timeout` (mirrors `DeployedAgent::shutdown_with_timeout`'s
-    /// local-process SIGTERM-then-poll pattern), THEN hard-kill as a fallback
-    /// and only then disconnect.
+    /// local-process SIGTERM-then-poll pattern), THEN hard-kill as a fallback,
+    /// cancel the listener, flush accepted forwarding tasks, and disconnect.
     async fn shutdown_with_timeout(&self, timeout: Duration) {
         let Some(session) = self.session.lock().await.take() else {
             return;
@@ -253,26 +318,25 @@ impl RemoteDeployment for RusshHandle {
         // Anchored on the unique spec path when present — the truncated
         // worker_id can substring-collide across nodes.
         let kill_anchor = self.remote_spec_path.as_deref().unwrap_or(&self.worker_id);
+        let process_pattern = exact_process_argument_pattern(kill_anchor);
 
         // 1. SIGTERM (pkill's default signal): give the worker's own shutdown
         //    handler a chance to drain cleanly, same as the local-process path.
-        let term_cmd = format!("pkill -f {}", sh_quote(kill_anchor));
-        if let Ok(channel) = session.channel_open_session().await {
-            let _ = channel.exec(false, term_cmd).await;
-        }
+        let term_cmd = format!("pkill -f {}", sh_quote(&process_pattern));
+        let _ = exec_capture(&session, &term_cmd).await;
 
         // 2. Poll for the worker's exit within the grace window. The session
         //    (and therefore the reverse tunnel) stays open the entire time, so
         //    a reply the worker is still draining through it can complete.
         //    Best-effort: a poll that errors (e.g. a transient exec hiccup) is
         //    treated as "still alive" rather than aborting the wait early.
-        poll_until_exited(
+        let exited = poll_until_exited(
             || async {
                 exec_capture(
                     &session,
                     &format!(
                         "pgrep -f {} >/dev/null 2>&1 && echo 1 || echo 0",
-                        sh_quote(kill_anchor)
+                        sh_quote(&process_pattern)
                     ),
                 )
                 .await
@@ -284,15 +348,51 @@ impl RemoteDeployment for RusshHandle {
         )
         .await;
 
-        // 3. Hard-kill fallback (harmless no-op if it already exited above) +
-        //    remove the creds-bearing spec file, THEN disconnect — only now is
-        //    the reverse tunnel torn down.
-        let mut cmd = format!("pkill -9 -f {}", sh_quote(kill_anchor));
-        if let Some(spec) = &self.remote_spec_path {
-            cmd.push_str(&format!("; rm -f {}", sh_quote(spec)));
+        // 3. Hard-kill fallback when the grace window expired. Wait for the
+        //    command channel to close so cancellation cannot race ahead of it.
+        if !exited {
+            let _ = exec_capture(
+                &session,
+                &format!("pkill -9 -f {}", sh_quote(&process_pattern)),
+            )
+            .await;
         }
-        if let Ok(channel) = session.channel_open_session().await {
-            let _ = channel.exec(false, cmd).await;
+
+        // 4. Stop accepting new reverse connections, then wait for every
+        //    already-accepted copy task to flush. The cancellation acknowledgement
+        //    is the ordering barrier: once it arrives, no earlier forwarded-open
+        //    message remains unaccounted for by `forwarded_connections`.
+        let drain_deadline = tokio::time::Instant::now() + FORWARDED_CONNECTION_DRAIN_TIMEOUT;
+        match tokio::time::timeout_at(
+            drain_deadline,
+            session.cancel_tcpip_forward("127.0.0.1", self.broker_port),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("cancel russh reverse tunnel failed during shutdown: {error}");
+            }
+            Err(_) => {
+                tracing::warn!("cancel russh reverse tunnel timed out during shutdown");
+            }
+        }
+        let remaining_drain = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !self
+            .forwarded_connections
+            .wait_for_idle(remaining_drain)
+            .await
+        {
+            tracing::warn!(
+                timeout_ms = FORWARDED_CONNECTION_DRAIN_TIMEOUT.as_millis() as u64,
+                "russh reverse tunnel still had active connections at the drain deadline"
+            );
+        }
+
+        // 5. Remove the creds-bearing spec file, then disconnect. The uploaded
+        //    worker binary intentionally remains reusable on a durable host.
+        if let Some(spec) = &self.remote_spec_path {
+            let _ = exec_capture(&session, &format!("rm -f {}", sh_quote(spec))).await;
         }
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "", "")
@@ -330,15 +430,40 @@ fn transport(msg: impl std::fmt::Display) -> BrokerError {
     BrokerError::Transport(msg.to_string())
 }
 
+/// Build a POSIX ERE that matches `literal` as one complete process argument.
+/// Besides avoiding substring collisions, the boundary wrapper prevents the
+/// `pgrep`/`pkill` command itself from matching its own pattern argument (the
+/// literal inside that argument is adjacent to regex syntax, not whitespace).
+fn exact_process_argument_pattern(literal: &str) -> String {
+    if literal.is_empty() {
+        // Never turn an invalid empty worker identity into a process-wide match.
+        return "a^".to_string();
+    }
+    let mut escaped = String::with_capacity(literal.len());
+    for ch in literal.chars() {
+        if matches!(
+            ch,
+            '.' | '[' | ']' | '\\' | '*' | '^' | '$' | '(' | ')' | '+' | '?' | '{' | '}' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    format!("(^|[[:space:]]){escaped}([[:space:]]|$)")
+}
+
 #[async_trait]
 impl Deployer for RusshDeployer {
     async fn deploy(&self, d: &AgentDeployment) -> BrokerResult<DeployedAgent> {
         let bport = broker_port(&d.broker_endpoint)
             .ok_or_else(|| transport(format!("no broker port in '{}'", d.broker_endpoint)))?;
         let broker_local = format!("127.0.0.1:{bport}");
+        let forwarded_connections = Arc::new(ForwardedConnections::default());
 
         // 1–2. Connect + host-key TOFU + authenticate.
-        let session = self.connect_and_auth(broker_local).await?;
+        let session = self
+            .connect_and_auth(broker_local, forwarded_connections.clone())
+            .await?;
 
         // 3. Upload the binary (hash-skip) + chmod +x.
         if let Some(spec) = &self.upload {
@@ -407,6 +532,8 @@ impl Deployer for RusshDeployer {
                 session: Mutex::new(Some(session)),
                 worker_id: d.id.clone(),
                 remote_spec_path,
+                broker_port: bport as u32,
+                forwarded_connections,
             }),
         ))
     }
@@ -414,7 +541,9 @@ impl Deployer for RusshDeployer {
     /// Connect + auth + `uname -s -m`, then disconnect. No deploy, no tunnel —
     /// proves the node is reachable and the stored credentials work.
     async fn preflight(&self) -> BrokerResult<String> {
-        let session = self.connect_and_auth(String::new()).await?;
+        let session = self
+            .connect_and_auth(String::new(), Arc::new(ForwardedConnections::default()))
+            .await?;
         let uname = exec_capture(&session, "uname -s -m").await?;
         let _ = session
             .disconnect(russh::Disconnect::ByApplication, "", "")
@@ -423,7 +552,9 @@ impl Deployer for RusshDeployer {
     }
 
     async fn tail_log(&self, log_path: &str, lines: usize) -> BrokerResult<String> {
-        let session = self.connect_and_auth(String::new()).await?;
+        let session = self
+            .connect_and_auth(String::new(), Arc::new(ForwardedConnections::default()))
+            .await?;
         let out = exec_capture(
             &session,
             &format!("tail -n {lines} {} 2>/dev/null || true", sh_quote(log_path)),
@@ -703,10 +834,58 @@ mod tests {
         assert!(parse_private_key("not a key", None).is_err());
     }
 
+    #[test]
+    fn process_pattern_is_argument_bounded_and_escapes_posix_ere_syntax() {
+        assert_eq!(exact_process_argument_pattern(""), "a^");
+        assert_eq!(
+            exact_process_argument_pattern("node.alpha+[1]"),
+            r"(^|[[:space:]])node\.alpha\+\[1\]([[:space:]]|$)"
+        );
+        let command = format!(
+            "pgrep -f {}",
+            sh_quote(&exact_process_argument_pattern("node.alpha+[1]"))
+        );
+        assert!(command.contains("node\\.alpha"));
+        assert!(
+            !command.contains(" node.alpha+[1] "),
+            "the probe command must not contain an unbounded literal that can match itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_connection_tracker_waits_until_the_last_copy_finishes() {
+        let tracker = Arc::new(ForwardedConnections::default());
+        let connection = tracker.track();
+        let waiting_tracker = tracker.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiting_tracker.wait_for_idle(Duration::from_secs(1)).await },
+            );
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "an active forwarded connection must hold the drain barrier"
+        );
+        drop(connection);
+        assert!(waiter.await.expect("drain waiter task"));
+    }
+
+    #[tokio::test]
+    async fn forwarded_connection_tracker_has_a_bounded_deadline() {
+        let tracker = Arc::new(ForwardedConnections::default());
+        let _connection = tracker.track();
+        assert!(
+            !tracker.wait_for_idle(Duration::from_millis(20)).await,
+            "a stuck forwarding task must not make shutdown unbounded"
+        );
+    }
+
     // #489: `poll_until_exited` backs `RusshHandle::shutdown_with_timeout`'s
     // grace-window wait. It can't be exercised against a real remote without a
-    // live SSH session (see `tests/russh_live.rs`, gated behind
-    // `BAMBOO_RUSSH_LIVE=1`), so these tests drive it directly with a fake
+    // live SSH session (see the ignored `tests/russh_live.rs`, which the
+    // hermetic `scripts/run-russh-live.sh` fixture drives in protected CI), so
+    // these tests drive it directly with a fake
     // liveness check instead — the polling/timeout behavior is identical
     // either way, since `poll_until_exited` doesn't know or care that the real
     // liveness check is an SSH `pgrep` exec.
