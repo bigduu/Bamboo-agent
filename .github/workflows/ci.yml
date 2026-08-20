@@ -64,6 +64,10 @@ jobs:
       - name: Run integration tests
         run: cargo test --tests
 
+      - name: Run real SSH/SFTP transport test
+        timeout-minutes: 10
+        run: scripts/run-russh-live.sh
+
       - name: Build examples
         # Compile-only (no network/config needed): guards `examples/*.rs` —
         # and the README SDK snippet each one's doc comment mirrors — against
