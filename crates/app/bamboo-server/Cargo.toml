@@ -43,11 +43,24 @@ bamboo-projects = { path = "../../infra/bamboo-projects" }
 # server-side DTO that could drift from the wire record).
 bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 
-# Web framework
-# `rustls-0_23` enables actix-web's TLS bind/listen against rustls 0.23
-# (`bind_rustls_0_23` / `listen_rustls_0_23`) for the v2 self-terminated TLS
-# face (#181). Without it the `*_rustls_0_23` methods do not exist.
-actix-web = { version = "4", features = ["rustls-0_23"] }
+# Web framework. Preserve Actix's ordinary default surface except inbound
+# HTTP/2. Actix 4's `http2` feature still resolves vulnerable `h2 0.3`; Bamboo's
+# public WSS contract uses HTTP/1.1 Upgrade and is served by the explicit H1
+# builder in `server/h1.rs` (#849).
+actix-web = { version = "4", default-features = false, features = [
+    "macros",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+    "cookies",
+    "unicode",
+    "compat",
+    "ws",
+] }
+actix-http = { version = "3", default-features = false, features = ["rustls-0_23"] }
+actix-server = "2"
+actix-service = "2"
+socket2 = "0.6"
 actix-cors = "0.7"
 actix-files = "0.6"
 # v2-P1 (#181): the `GET /v2/stream` unified WebSocket multiplex. `actix-ws`
@@ -159,12 +172,8 @@ tokio-test = "0.4"
 mockall = "0.15"
 http = "1"
 actix-rt = "2"
-# v2-P1 (#187): live WS integration harness for `GET /v2/stream`. `awc` is
-# actix's own HTTP+WS client, so it composes with the actix-web 4 server already
-# in-tree (one runtime, one ws codec) and drives a real loopback `ws://` upgrade.
-# `actix-codec` names the `Framed` half `awc::ws connect()` returns.
-awc = { version = "3", features = ["rustls-0_23"] }
-actix-codec = "0.5"
+native-tls = { version = "0.2", features = ["alpn"] }
+tokio-native-tls = "0.3"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 # Existing server unit tests use bamboo-config's encryption and transaction

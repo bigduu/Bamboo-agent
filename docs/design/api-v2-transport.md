@@ -105,7 +105,7 @@ pub struct ServerConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
 
-    /// v2: TLS 配置。两者都给 → bind_rustls;缺省 → 裸 bind(桌面 loopback 不受影响)。
+    /// v2: TLS 配置。两者都给 → Rustls H1;缺省 → 明文 H1(桌面 loopback 不受影响)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 
@@ -135,18 +135,25 @@ pub struct TlsConfig {
 }
 ```
 
-### 3.3 接入点(4 处一行换)
+### 3.3 接入点(当前实现)
 
-**客户端面(actix-web)**——`HttpServer::new(...).bind(addr)` → `.bind_rustls(addr, config)`:
+**客户端面(actix-web)**——4 个启动入口统一通过
+`server/h1.rs::build_h1_server` 构建服务：明文监听器使用
+`HttpService::build().h1(...).tcp()`，TLS 监听器使用
+`HttpService::build().secure().h1(...).rustls_0_23(...)`。`web_service.rs`
+与 `entrypoints.rs` 不再各自选择 Actix 的高层 `bind/listen_rustls` 方法，
+因此中间件、路由、worker 数、IPv4/IPv6 listener 与关闭生命周期仍由同一
+app factory 驱动，而协议选择只有一个权威位置。
 
-| 文件:行 | 现状 | v2 |
-|---|---|---|
-| `server/web_service.rs:79` | `.bind(&listen_addr)` | `.bind_rustls(&listen_addr, rustls_cfg)`(当 `server.tls` 存在) |
-| `server/web_service.rs:163` | `.bind(&listen_addr)` | 同上 |
-| `server/entrypoints.rs:148` | `HttpServer::new(...).workers(..)` 后 `.bind` | 同上 |
-| `server/entrypoints.rs:293` | 同上 | 同上 |
+> **入站协议边界（#849）**：Bamboo 的 HTTP/WSS face 明确只支持 HTTP/1.1。
+> Actix Web 4 的高层 Rustls feature 会强制启用仍依赖 `h2 0.3` 的 HTTP/2
+> feature，该版本受 RUSTSEC-2026-0258 影响。Bamboo 的统一 WebSocket face
+> 使用 HTTP/1.1 Upgrade，因此禁用入站 HTTP/2 不影响 WSS 合同；provider、
+> MCP 等出站 Reqwest 客户端继续使用已修复的 `h2 0.4` HTTP/2 栈。不得通过
+> audit ignore 或本地 fork 绕过此边界。
 
-统一在一处构建 `RustlsConfig`:
+统一在 `server/tls.rs` 构建 `rustls::ServerConfig`，并把 ALPN 固定为
+`http/1.1`：
 
 ```rust
 fn build_rustls(tls: &TlsConfig) -> Result<actix_web::rustls::server::ServerConfig, String> {
@@ -154,10 +161,14 @@ fn build_rustls(tls: &TlsConfig) -> Result<actix_web::rustls::server::ServerConf
         .collect::<Result<Vec<_>, _>>().map_err(|e| format!("read cert: {e}"))?;
     let key = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(File::open(&tls.key_file)?))
         .next().ok_or("no key in key_file")??;
-    let cfg = actix_web::rustls::server::ServerConfig::builder()
+    let provider = Arc::new(ring::default_provider());
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("rustls versions: {e}"))?
         .with_no_client_auth()
         .with_single_cert(certs, key.into())
         .map_err(|e| format!("rustls config: {e}"))?;
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(cfg)
 }
 ```
@@ -165,8 +176,8 @@ fn build_rustls(tls: &TlsConfig) -> Result<actix_web::rustls::server::ServerConf
 **判定逻辑**(复用 `listeners.rs` 既有双模式):
 
 ```
-server.tls 给齐 → bind_rustls(0.0.0.0:port)        // 公网暴露模式
-server.tls 缺省 → bind(127.0.0.1:port)             // 桌面 loopback 模式(行为不变)
+server.tls 给齐 → Rustls + HTTP/1.1(0.0.0.0:port)  // 公网暴露模式
+server.tls 缺省 → 明文 HTTP/1.1(127.0.0.1:port)    // 桌面 loopback 模式(行为不变)
 ```
 
 桌面本地开发 `server.tls` 缺省,**零行为回退**;公网部署补两张 PEM 即可。
@@ -202,7 +213,9 @@ let ws = accept_async(tls_stream).await?;
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
-# actix-web 的 rustls feature 已内建
+# client face 通过 actix-http 的 H1 Rustls service，actix-web 不启用 http2
+actix-http = { version = "3", default-features = false, features = ["rustls-0_23"] }
+actix-server = "2"
 ```
 
 ---
@@ -494,7 +507,7 @@ WS 标准 RFC 7692 扩展,握手自动协商。对 JSON 文本通常 −60~80%�
 
 ### v2-P1 — TLS + 客户端面 WSS
 
-- `ServerConfig.tls` + 手动证书;4 处 `bind`→`bind_rustls`;broker `accept_async` 套 `TlsAcceptor`。
+- `ServerConfig.tls` + 手动证书;4 个入口统一进入 H1/Rustls builder;broker `accept_async` 套 `TlsAcceptor`。
 - `GET /v2/stream` 单 WSS 入口;`feed` + `agent.{sid}` + `control` channel;cursor 续传。
 - **验收**:公网 `wss://` 桌面+移动端跑通;断线重连 cursor 补漏无丢无重;`/v1` 桌面 loopback 不变。
 
