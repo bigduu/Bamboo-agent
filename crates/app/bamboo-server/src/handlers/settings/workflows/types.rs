@@ -27,6 +27,37 @@ pub struct MigrateWorkflowResponse {
     pub catalog_revision: u64,
 }
 
+/// Server-resolved writable layer for cloning one immutable builtin bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneWorkflowTarget {
+    Project,
+    User,
+}
+
+/// Clone requests carry the exact catalog identity observed by the client.
+/// Bamboo rejects a stale revision/source instead of copying a newer bundle.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneWorkflowRequest {
+    pub source: bamboo_skills::WorkflowSource,
+    pub revision: u64,
+    pub target: CloneWorkflowTarget,
+    /// Required for `project`, optional for `user`. The server resolves Project
+    /// identity and paths from this durable session; no client path is accepted.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CloneWorkflowResponse {
+    pub workflow_id: String,
+    pub target: CloneWorkflowTarget,
+    pub source_preserved: bool,
+    pub catalog_revision: u64,
+    pub entry: bamboo_skills::WorkflowCatalogEntry,
+}
+
 /// Workflow list item for API responses.
 #[derive(Serialize)]
 pub(super) struct WorkflowListItem {

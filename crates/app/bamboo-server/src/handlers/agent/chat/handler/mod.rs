@@ -162,6 +162,204 @@ fn project_context_error_response(
     }
 }
 
+fn workflow_selection_error_response(
+    diagnostic: bamboo_skills::WorkflowActivationDiagnostic,
+) -> HttpResponse {
+    use bamboo_skills::WorkflowActivationErrorCode;
+
+    let (status, code) = match diagnostic.code {
+        WorkflowActivationErrorCode::RevisionMissing => (
+            actix_web::http::StatusCode::CONFLICT,
+            "workflow_revision_missing",
+        ),
+        WorkflowActivationErrorCode::RevisionMismatch => (
+            actix_web::http::StatusCode::CONFLICT,
+            "workflow_revision_mismatch",
+        ),
+        WorkflowActivationErrorCode::SourceMismatch => (
+            actix_web::http::StatusCode::CONFLICT,
+            "workflow_source_mismatch",
+        ),
+        WorkflowActivationErrorCode::ManualOnly => (
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "workflow_manual_only",
+        ),
+        WorkflowActivationErrorCode::InvalidSelection => (
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "workflow_selection_invalid",
+        ),
+        WorkflowActivationErrorCode::SnapshotUnavailable => (
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            "workflow_snapshot_unavailable",
+        ),
+        WorkflowActivationErrorCode::SnapshotTooLarge => (
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "workflow_snapshot_too_large",
+        ),
+        WorkflowActivationErrorCode::ProviderFailed
+        | WorkflowActivationErrorCode::ProviderOutputInvalid => (
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "workflow_context_invalid",
+        ),
+    };
+    HttpResponse::build(status).json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": code,
+            "message": diagnostic.message,
+            "recoverable": diagnostic.recoverable
+        }
+    }))
+}
+
+async fn pin_explicit_workflow_candidate(
+    state: &AppState,
+    session: &mut bamboo_agent_core::Session,
+    selection: &bamboo_skills::WorkflowSelection,
+    disabled_skill_ids: &std::collections::BTreeSet<String>,
+) -> Result<String, HttpResponse> {
+    let selected_ids = [selection.id.clone()];
+    // Resolve into an isolated staging activation. A stale/invalid request must
+    // never replace or release the activation currently serving this session.
+    // The staged bytes become durable authority only after the session save;
+    // execute then restores them under the canonical session id.
+    let staging_activation_id = format!("{}:chat-candidate:{}", session.id, uuid::Uuid::new_v4());
+    let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+    let resolved_project = state
+        .project_context_resolver
+        .resolve(session, workspace.as_deref())
+        .await
+        .map_err(project_context_error_response)?;
+    let (store, activation) = if let Some(context) = resolved_project {
+        let store = state
+            .skill_manager
+            .store_for_project_workspace(
+                &context.project.id,
+                &context.project.home,
+                context.workspace.as_deref(),
+            )
+            .await
+            .map_err(|error| {
+                crate::error::json_error(
+                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Workflow catalog is unavailable: {error}"),
+                )
+            })?;
+        let activation = state
+            .skill_manager
+            .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
+                &context.project.id,
+                &context.project.home,
+                context.workspace.as_deref(),
+                &staging_activation_id,
+                disabled_skill_ids,
+                Some(&selected_ids),
+                None,
+                None,
+                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await;
+        (store, activation)
+    } else if let Some(workspace) = workspace.as_deref() {
+        let store = state
+            .skill_manager
+            .store_for_workspace(Some(workspace))
+            .await
+            .map_err(|error| {
+                crate::error::json_error(
+                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Workflow catalog is unavailable: {error}"),
+                )
+            })?;
+        let activation = state
+            .skill_manager
+            .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
+                workspace,
+                &staging_activation_id,
+                disabled_skill_ids,
+                Some(&selected_ids),
+                None,
+                None,
+                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await;
+        (store, activation)
+    } else {
+        let store = state
+            .skill_manager
+            .store_for_workspace(None)
+            .await
+            .map_err(|error| {
+                crate::error::json_error(
+                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Workflow catalog is unavailable: {error}"),
+                )
+            })?;
+        let activation = state
+            .skill_manager
+            .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                &staging_activation_id,
+                disabled_skill_ids,
+                Some(&selected_ids),
+                None,
+                None,
+                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await;
+        (store, activation)
+    };
+    let activation = match activation {
+        Ok(activation) => activation,
+        Err(error) => {
+            let _ = state
+                .skill_manager
+                .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
+                .await;
+            return Err(workflow_selection_error_response(
+                bamboo_skills::WorkflowActivationDiagnostic {
+                    code: bamboo_skills::WorkflowActivationErrorCode::RevisionMissing,
+                    message: format!(
+                        "selected workflow could not be pinned at its catalog revision: {error}"
+                    ),
+                    recoverable: true,
+                },
+            ));
+        }
+    };
+    let snapshot = match store
+        .export_activation_snapshot(&staging_activation_id)
+        .await
+    {
+        Some(snapshot) => snapshot,
+        None => {
+            let _ = state
+                .skill_manager
+                .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
+                .await;
+            return Err(workflow_selection_error_response(
+                bamboo_skills::WorkflowActivationDiagnostic {
+                    code: bamboo_skills::WorkflowActivationErrorCode::SnapshotUnavailable,
+                    message: "selected workflow snapshot could not be retained".to_string(),
+                    recoverable: true,
+                },
+            ));
+        }
+    };
+    if let Err(diagnostic) = bamboo_skills::persist_explicit_workflow_candidate(
+        &mut session.metadata,
+        selection,
+        &activation,
+        &snapshot,
+    ) {
+        let _ = state
+            .skill_manager
+            .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
+            .await;
+        return Err(workflow_selection_error_response(diagnostic));
+    }
+    Ok(staging_activation_id)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -585,8 +783,44 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     {
         return project_context_error_response(error);
     }
+    let staged_workflow_activation = if let Some(selection) = req.workflow_selection.as_ref() {
+        let disabled_skill_ids = config_snapshot.disabled_skill_ids();
+        let staging_id = match pin_explicit_workflow_candidate(
+            state.as_ref(),
+            &mut session,
+            selection,
+            &disabled_skill_ids,
+        )
+        .await
+        {
+            Ok(staging_id) => staging_id,
+            Err(response) => return response,
+        };
+        Some(staging_id)
+    } else {
+        None
+    };
     if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
+        if let Some(staging_id) = staged_workflow_activation.as_deref() {
+            let _ = state
+                .skill_manager
+                .release_activation_for_workspace(staging_id, None)
+                .await;
+        }
         return response;
+    }
+    if let Some(staging_id) = staged_workflow_activation.as_deref() {
+        // The durable exact snapshot now owns the next execution. Remove any
+        // prior live activation only after that commit, then drop staging. A
+        // subsequent execute restores from the persisted candidate bytes.
+        let _ = state
+            .skill_manager
+            .release_activation_for_workspace(&session.id, None)
+            .await;
+        let _ = state
+            .skill_manager
+            .release_activation_for_workspace(staging_id, None)
+            .await;
     }
     sync_runtime_workspace(
         state.as_ref(),

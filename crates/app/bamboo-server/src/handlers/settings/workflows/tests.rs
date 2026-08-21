@@ -118,6 +118,143 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
 }
 
 #[actix_web::test]
+async fn builtin_clone_to_user_is_exact_read_only_and_never_overwrites() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let review = state
+        .skill_manager
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let payload = serde_json::json!({
+        "source": "builtin",
+        "revision": review.revision,
+        "target": "user",
+        "session_id": "ignored-for-user-target"
+    });
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&payload)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["entry"]["source"], "user");
+    assert_eq!(body["entry"]["id"], "review");
+    assert_eq!(body["source_preserved"], true);
+    let clone = data.path().join("skills/review/SKILL.md");
+    let builtin = data.path().join("skills-builtin-v1/review/SKILL.md");
+    assert!(clone.is_file());
+    assert!(
+        builtin.is_file(),
+        "read-only builtin source must remain intact"
+    );
+    let cloned_before = std::fs::read(&clone).expect("clone bytes");
+    assert!(!data.path().join("skills/.review.clone-v1.json").exists());
+
+    let conflict = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&payload)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(conflict.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(&clone).expect("clone remains"),
+        cloned_before,
+        "repeat clone must not overwrite an editable user bundle"
+    );
+}
+
+#[actix_web::test]
+async fn builtin_clone_to_project_uses_durable_session_identity_not_a_client_path() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Clone Project", None)
+        .expect("create Project");
+    let mut session = bamboo_agent_core::Session::new("project-clone-session", "model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.save_and_cache_session(&mut session).await;
+    let store = state
+        .skill_manager
+        .store_for_project_workspace(
+            &project.id,
+            &state.project_store.paths().project_home(&project.id),
+            Some(workspace.path()),
+        )
+        .await
+        .expect("Project Workflow store");
+    let review = store
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(serde_json::json!({
+                "source": "builtin",
+                "revision": review.revision,
+                "target": "project",
+                "session_id": "project-clone-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["entry"]["source"], "project");
+    assert!(state
+        .project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills/review/SKILL.md")
+        .is_file());
+    assert!(
+        !data.path().join("skills/review/SKILL.md").exists(),
+        "Project clone must not fall back to the user layer"
+    );
+}
+
+#[actix_web::test]
 async fn assigned_project_workflow_catalog_reports_workspace_then_project_sources() {
     let data = tempfile::tempdir().expect("data dir");
     let workspace = tempfile::tempdir().expect("workspace");
@@ -584,6 +721,83 @@ async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
     })
     .await;
     assert!(bridged.is_ok(), "workflow.changed must reach account feed");
+}
+
+#[actix_web::test]
+async fn instruction_skill_changed_invalid_and_recovered_reach_account_feed() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let skill_dir = data.path().join("skills/library-refresh");
+    tokio::fs::create_dir_all(&skill_dir)
+        .await
+        .expect("skill dir");
+    let skill_file = skill_dir.join("SKILL.md");
+    let valid = "---\nname: library-refresh\ndescription: Refresh the Workflow Library.\n---\n\nRefresh it.\n";
+
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("create instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("reload created Skill");
+    tokio::fs::write(&skill_file, "---\nname: [\n")
+        .await
+        .expect("corrupt instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish invalid LKG Skill");
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("recover instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish recovered Skill");
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut changed = false;
+        let mut invalid = false;
+        let mut recovered = false;
+        while !(changed && invalid && recovered) {
+            let event = account_events.recv().await.expect("account event");
+            match &event.event {
+                bamboo_agent_core::AgentEvent::WorkflowChanged { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    changed = true
+                }
+                bamboo_agent_core::AgentEvent::WorkflowInvalid { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    invalid = true
+                }
+                bamboo_agent_core::AgentEvent::WorkflowRecovered { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    recovered = true
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "instruction catalog transitions must invalidate Workflow clients"
+    );
 }
 
 #[actix_web::test]

@@ -98,15 +98,29 @@ pub async fn get_session(
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count = running_child_count;
 
+            // Load the authoritative session once for both its ETag and the
+            // public-safe active Workflow identity. The index deliberately
+            // does not mirror this richer lifecycle object.
+            let durable_session = state.storage.load_session(&session_id).await.ok().flatten();
+            summary.active_workflow = durable_session.as_ref().and_then(|session| {
+                session
+                    .metadata
+                    .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+                    .and_then(|raw| match serde_json::from_str(raw) {
+                        Ok(active) => Some(active),
+                        Err(error) => {
+                            tracing::warn!(
+                                %session_id,
+                                %error,
+                                "ignoring malformed active Workflow metadata in session detail"
+                            );
+                            None
+                        }
+                    })
+            });
             // Surface the session ETag (`metadata_version`) so clients can send
             // it back as `If-Match` on metadata writes (optimistic concurrency).
-            let etag = state
-                .storage
-                .load_session(&session_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.metadata_version);
+            let etag = durable_session.map(|session| session.metadata_version);
 
             let mut response = HttpResponse::Ok();
             if let Some(version) = etag {
@@ -273,5 +287,63 @@ mod pagination_http_tests {
         assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(body["error"]["message"], "Session not found");
         assert_eq!(body["session_id"], "does-not-exist");
+    }
+
+    #[actix_web::test]
+    async fn session_detail_restores_public_active_workflow_but_list_stays_lightweight() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("workflow-session", "model");
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "id": "review",
+                "source": "builtin",
+                "revision": 7,
+                "kind": "instruction",
+                "args": {"focus": "security"},
+                "invoked_by": "user",
+                "activated_at": "2026-08-21T00:00:00Z",
+                "status": "active",
+                "context_fingerprint": "sha256:test"
+            })
+            .to_string(),
+        );
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let list: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert!(list["sessions"][0].get("active_workflow").is_none());
+
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/workflow-session")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["active_workflow"]["id"], "review");
+        assert_eq!(detail["session"]["active_workflow"]["source"], "builtin");
+        assert_eq!(
+            detail["session"]["active_workflow"]["args"]["focus"],
+            "security"
+        );
+        assert!(detail["session"]["active_workflow"].get("prompt").is_none());
     }
 }

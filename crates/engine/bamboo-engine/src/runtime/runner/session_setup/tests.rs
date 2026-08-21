@@ -377,6 +377,94 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
 }
 
 #[tokio::test]
+async fn pre_execute_explicit_snapshot_restores_after_restart_without_suspended_runtime() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    };
+    let first = Arc::new(SkillManager::with_config(config.clone()));
+    first.initialize().await.expect("initialize first manager");
+    let review = first
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == "review" && entry.winner)
+        .expect("review entry");
+    let selected_ids = [review.id.clone()];
+    let activation = first
+        .resolve_and_pin_activation_for_request_with_mode_and_budget(
+            "pre-execute-restart",
+            &std::collections::BTreeSet::new(),
+            Some(&selected_ids),
+            None,
+            None,
+            bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .await
+        .expect("pin first process candidate");
+    let snapshot = first
+        .store()
+        .export_activation_snapshot("pre-execute-restart")
+        .await
+        .expect("export candidate");
+    let selection = bamboo_skills::WorkflowSelection {
+        id: review.id,
+        source: review.source,
+        revision: review.revision,
+        args: serde_json::json!({}),
+    };
+    let mut session = Session::new("pre-execute-restart", "model");
+    session.metadata.insert(
+        bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+        serde_json::to_string(&selection).expect("selection JSON"),
+    );
+    bamboo_skills::persist_explicit_workflow_candidate(
+        &mut session.metadata,
+        &selection,
+        &activation,
+        &snapshot,
+    )
+    .expect("persist candidate");
+    first
+        .release_activation_for_workspace("pre-execute-restart", None)
+        .await
+        .expect("simulate process exit");
+    drop(first);
+
+    let restarted = Arc::new(SkillManager::with_config(config));
+    restarted
+        .initialize()
+        .await
+        .expect("initialize restarted manager");
+    let loop_config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(restarted.clone()),
+        selected_skill_ids: Some(selected_ids.to_vec()),
+        ..Default::default()
+    };
+    let loaded = super::skill_context::load_skill_context(
+        &loop_config,
+        &session,
+        "pre-execute-restart",
+        "Review this change",
+        false,
+    )
+    .await
+    .expect("restore chat-boundary candidate without suspended runtime");
+    assert_eq!(loaded.selected_skill_ids, vec!["review"]);
+    assert_eq!(loaded.skill_revisions["review"], selection.revision);
+    assert!(
+        restarted
+            .store()
+            .activation_was_restored("pre-execute-restart")
+            .await,
+        "restart must use durable pinned bytes, not silently re-resolve live catalog"
+    );
+}
+
+#[tokio::test]
 async fn session_setup_requires_model_issued_load_for_one_explicit_skill() {
     let directory = tempfile::tempdir().expect("tempdir");
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {

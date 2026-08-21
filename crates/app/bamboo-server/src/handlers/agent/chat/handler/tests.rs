@@ -8,6 +8,105 @@ use bamboo_engine::session_app::chat::{
     resolve_selected_skill_ids, resolve_workspace_path,
 };
 
+#[actix_web::test]
+async fn typed_workflow_candidate_is_pinned_exactly_and_stale_revision_fails_closed() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = crate::AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+    let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+    let review = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "review" && entry.winner)
+        .expect("builtin review catalog entry");
+    let selection = bamboo_skills::WorkflowSelection {
+        id: review.id.clone(),
+        source: review.source,
+        revision: review.revision,
+        args: serde_json::json!({}),
+    };
+    let mut session = Session::new("typed-review", "model");
+    let staging_id = super::pin_explicit_workflow_candidate(
+        &state,
+        &mut session,
+        &selection,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .expect("pin exact typed Workflow");
+
+    let snapshot: bamboo_skills::SkillActivationSnapshot = serde_json::from_str(
+        session
+            .metadata
+            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
+            .expect("durable pre-execute snapshot"),
+    )
+    .expect("snapshot contract");
+    assert_eq!(snapshot.skills.len(), 1);
+    assert_eq!(snapshot.skills["review"].revision, review.revision);
+    assert_eq!(
+        session
+            .metadata
+            .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+            .map(String::as_str),
+        Some("explicit")
+    );
+    let request_identity = serde_json::to_string(&selection).expect("selection JSON");
+    assert!(!request_identity.contains(&review.description));
+    assert!(!request_identity.contains("prompt"));
+
+    state
+        .skill_manager
+        .release_activation_for_workspace(&staging_id, None)
+        .await
+        .expect("release exact candidate");
+
+    let existing_ids = ["plan".to_string()];
+    let existing = state
+        .skill_manager
+        .resolve_and_pin_activation_for_request_with_mode_and_budget(
+            "typed-review-stale",
+            &std::collections::BTreeSet::new(),
+            Some(&existing_ids),
+            None,
+            None,
+            bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .await
+        .expect("existing live activation");
+    let mut stale_session = Session::new("typed-review-stale", "model");
+    let stale = bamboo_skills::WorkflowSelection {
+        revision: review.revision + 1,
+        ..selection
+    };
+    let response = super::pin_explicit_workflow_candidate(
+        &state,
+        &mut stale_session,
+        &stale,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .expect_err("stale revision must fail before chat persistence");
+    assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    assert!(!stale_session
+        .metadata
+        .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY));
+    assert!(stale_session.messages.is_empty());
+    let retained = state
+        .skill_manager
+        .pinned_activation_for_workspace("typed-review-stale", None)
+        .await
+        .expect("inspect existing activation")
+        .expect("failed request must retain existing activation");
+    assert_eq!(
+        retained.descriptor.skill_revisions,
+        existing.descriptor.skill_revisions
+    );
+    assert_eq!(retained.skills[0].id, "plan");
+}
+
 /// Regression: `/goal off` and `/goal clear` must clear the stale runtime
 /// `goal.state` (status / continuation budget / double-check eval history).
 /// Previously the cleanup was gated behind `should_resume`, so only

@@ -80,6 +80,12 @@ pub struct SessionSummary {
     /// Lets the frontend render plan-mode UI without loading full session history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bamboo_domain::PlanModeState>,
+    /// Public-safe durable workflow identity restored from the authoritative
+    /// session metadata. List rows intentionally leave this empty; the detail
+    /// endpoint hydrates it from `session.json` so browser refreshes do not
+    /// depend on an already-consumed account-feed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workflow: Option<bamboo_skills::ActiveWorkflow>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -157,6 +163,7 @@ impl SessionSummary {
             resident_name: entry.resident_name,
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions
@@ -588,6 +595,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -638,6 +646,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -775,6 +784,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };

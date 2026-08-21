@@ -450,8 +450,11 @@ impl AppState {
         // owns handles to both maps.
         spawn_session_map_cleanup_task(agent_runners.clone(), session_event_senders.clone(), None);
 
-        // Bridge global workflow catalog transitions onto the same durable account feed used by
-        // SSE and v2 WebSocket clients. Catalog events are account-scoped (no session id).
+        // Bridge both instruction-Skill and orchestration catalog transitions
+        // onto the same durable account feed used by SSE and v2 WebSocket
+        // clients. The product-level Workflow Library unifies both kinds, so a
+        // change to either namespace must invalidate clients immediately.
+        // Catalog events are account-scoped (no session id).
         {
             let mut workflow_events = skill_manager.store().subscribe_workflow_catalog();
             let account_sink = account_sink.clone();
@@ -465,9 +468,6 @@ impl AppState {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
-                    if !event.public_workflow {
-                        continue;
-                    }
                     let event = match event.kind {
                         bamboo_skills::WorkflowCatalogEventKind::Changed => {
                             AgentEvent::WorkflowChanged {

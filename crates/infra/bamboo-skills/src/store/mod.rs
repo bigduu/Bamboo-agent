@@ -1454,7 +1454,7 @@ impl SkillStore {
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
-        *skill_catalog_guard = next_skill_catalog;
+        *skill_catalog_guard = next_skill_catalog.clone();
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
         *workflow_resources_guard = resolved_workflow_resources;
@@ -1468,6 +1468,11 @@ impl SkillStore {
         drop(roots_guard);
         drop(skills_guard);
         drop(_snapshot_guard);
+        self.publish_catalog_events(
+            &previous_skill_catalog,
+            &next_skill_catalog,
+            &skill_definition_changed,
+        );
         self.publish_catalog_events(
             &previous_catalog,
             &next_catalog,
@@ -3735,7 +3740,7 @@ mod tests {
     use crate::store::storage::write_skill_file;
     use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
-    use crate::{SkillManager, WorkflowSource, WorkflowStatus};
+    use crate::{SkillManager, WorkflowCatalogEventKind, WorkflowSource, WorkflowStatus};
 
     #[test]
     fn agents_skill_precedence_is_below_bamboo_global_and_above_plugin() {
@@ -4566,7 +4571,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn invalid_skill_reload_retains_lkg_without_workflow_events() {
+    async fn invalid_skill_reload_retains_lkg_and_publishes_sanitized_lifecycle_events() {
         const PRIVATE_FIELD: &str = "private-lkg-frontmatter-field";
         const PRIVATE_INSTRUCTIONS: &str = "Private LKG replacement instructions";
         let directory = tempfile::tempdir().expect("tempdir");
@@ -4605,10 +4610,11 @@ Use this skill for testing.
         assert!(!public_error.contains(PRIVATE_FIELD));
         assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
         assert!(!public_error.contains(root.to_string_lossy().as_ref()));
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let invalid_event = events.try_recv().expect("instruction invalid event");
+        assert_eq!(invalid_event.workflow_id, "steady");
+        assert_eq!(invalid_event.kind, WorkflowCatalogEventKind::Invalid);
+        assert!(!invalid_event.public_workflow);
+        assert_eq!(invalid_event.scope, "global");
 
         write_skill(
             root.parent().expect("skills root"),
@@ -4627,10 +4633,11 @@ Use this skill for testing.
                 .description,
             "recovered"
         );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let recovered_event = events.try_recv().expect("instruction recovered event");
+        assert_eq!(recovered_event.workflow_id, "steady");
+        assert_eq!(recovered_event.kind, WorkflowCatalogEventKind::Recovered);
+        assert!(!recovered_event.public_workflow);
+        assert_eq!(recovered_event.scope, "global");
     }
 
     #[tokio::test]
@@ -5327,10 +5334,14 @@ Use this skill for testing.
         })
         .await
         .expect("workspace watcher publication");
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("workspace catalog event bridge")
+            .expect("workspace catalog event");
+        assert_eq!(event.workflow_id, "only-one");
+        assert_eq!(event.kind, WorkflowCatalogEventKind::Changed);
+        assert!(!event.public_workflow);
+        assert!(event.scope.starts_with("workspace:"));
         let untouched = second_store.skill_catalog_snapshot().await;
         assert!(updated.revision > first.revision);
         assert_eq!(untouched.revision, second.revision);
