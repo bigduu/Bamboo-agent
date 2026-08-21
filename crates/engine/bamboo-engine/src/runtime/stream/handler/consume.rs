@@ -111,7 +111,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
             _ = cancel_token.cancelled() => {
                 return Err(StreamHandlingFailure {
                     error: AgentError::Cancelled,
-                    partial_output: state.into_interrupted_output(),
+                    partial_output: Box::new(state.into_interrupted_output()),
                 });
             },
             next = stream.next() => match next {
@@ -135,7 +135,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
                         last_transport_at,
                         last_semantic_at,
                     ),
-                    partial_output: state.into_interrupted_output(),
+                    partial_output: Box::new(state.into_interrupted_output()),
                 });
             }
         };
@@ -160,7 +160,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
                         last_transport_at,
                         last_semantic_at,
                     ),
-                    partial_output: state.into_interrupted_output(),
+                    partial_output: Box::new(state.into_interrupted_output()),
                 });
             }
         }
@@ -170,7 +170,7 @@ pub(super) async fn consume_llm_stream_internal_with_partial(
         {
             return Err(StreamHandlingFailure {
                 error,
-                partial_output: state.into_interrupted_output(),
+                partial_output: Box::new(state.into_interrupted_output()),
             });
         }
     }

@@ -2062,17 +2062,27 @@ esac
         );
     }
 
+    async fn auto_powershell_runtime_is_available() -> bool {
+        match Command::new("pwsh").arg("--version").output().await {
+            Ok(output) => output.status.success(),
+            Err(error) if error.kind() == ErrorKind::NotFound => Command::new("powershell")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PSVersionTable.PSVersion",
+                ])
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success()),
+            Err(_) => false,
+        }
+    }
+
     #[tokio::test]
     async fn powershell_script_executes_when_a_system_runtime_is_installed() {
-        let pwsh_available = Command::new("pwsh").arg("--version").output().await.is_ok();
-        let windows_powershell_available = Command::new("powershell")
-            .arg("-NoLogo")
-            .arg("-Command")
-            .arg("$PSVersionTable.PSVersion")
-            .output()
-            .await
-            .is_ok();
-        if !pwsh_available && !windows_powershell_available {
+        if !auto_powershell_runtime_is_available().await {
             return;
         }
 
@@ -2089,7 +2099,11 @@ $null = [Console]::In.ReadToEnd()
             LifecycleHookEvent::SessionStart,
             path,
             LifecycleScriptRunner::Auto,
-            3_000,
+            // PowerShell cold starts can exceed a few seconds on a loaded CI
+            // runner. Keep this functional contract below the 60-second
+            // production default without coupling it to the dedicated
+            // millisecond-scale timeout and process-cleanup regressions.
+            30_000,
             None,
         );
 
