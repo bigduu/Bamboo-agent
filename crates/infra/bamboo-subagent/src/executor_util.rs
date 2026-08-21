@@ -3,11 +3,66 @@
 //! use these helpers so transcript rendering and atomic state writes do not
 //! drift between Claude Code and Codex.
 
+use std::future::Future;
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, Command};
+
+const ETXTBSY_RETRY_ATTEMPTS: usize = 5;
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(unix)]
+const ETXTBSY_RAW_OS_ERROR: i32 = 26;
+
+/// Retry a process operation when Unix reports `ETXTBSY` ("text file busy").
+///
+/// Parallel test threads can briefly inherit another thread's write file
+/// descriptor across `fork`, making an otherwise closed executable fail its
+/// first `exec`. Production wrappers can hit the same race while being
+/// atomically replaced. Only raw Unix error 26 is retryable; every other error
+/// remains fail-fast. The operation is awaited inline, so a caller's timeout or
+/// cancellation remains an overall bound and cannot leave a retry task behind.
+pub(crate) async fn retry_on_etxtbsy<T, Operation, OperationFuture>(
+    mut operation: Operation,
+) -> io::Result<T>
+where
+    Operation: FnMut() -> OperationFuture,
+    OperationFuture: Future<Output = io::Result<T>>,
+{
+    for attempt in 0..ETXTBSY_RETRY_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_etxtbsy(&error) && attempt + 1 < ETXTBSY_RETRY_ATTEMPTS => {
+                tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the bounded retry loop always returns on its final attempt")
+}
+
+/// Build and spawn a Tokio child with the shared bounded `ETXTBSY` policy.
+pub async fn spawn_with_etxtbsy_retry(
+    mut build: impl FnMut() -> io::Result<Command>,
+) -> io::Result<Child> {
+    retry_on_etxtbsy(|| std::future::ready(build().and_then(|mut command| command.spawn()))).await
+}
+
+fn is_etxtbsy(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(ETXTBSY_RAW_OS_ERROR)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
 
 /// Fallback history cap shared by external CLI executors: retain the newest
 /// roughly 40 messages and no more than roughly 24k characters.
@@ -204,9 +259,107 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
+    use std::io;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use serde_json::{json, Value};
 
-    use super::{build_rehydrated_turn, render_history_preamble, write_json_atomic};
+    use super::{
+        build_rehydrated_turn, render_history_preamble, retry_on_etxtbsy, write_json_atomic,
+    };
+    #[cfg(unix)]
+    use super::{ETXTBSY_RAW_OS_ERROR, ETXTBSY_RETRY_ATTEMPTS};
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn etxtbsy_retry_recovers_after_transient_errors() {
+        let attempts = AtomicUsize::new(0);
+        let value = retry_on_etxtbsy(|| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(io::Error::from_raw_os_error(ETXTBSY_RAW_OS_ERROR))
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn etxtbsy_retry_returns_the_final_error_after_the_bound() {
+        let attempts = AtomicUsize::new(0);
+        let error = retry_on_etxtbsy(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            future::ready(Err::<(), _>(io::Error::from_raw_os_error(
+                ETXTBSY_RAW_OS_ERROR,
+            )))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(ETXTBSY_RAW_OS_ERROR));
+        assert_eq!(attempts.load(Ordering::SeqCst), ETXTBSY_RETRY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn etxtbsy_retry_fails_fast_for_other_errors() {
+        let attempts = AtomicUsize::new(0);
+        let error = retry_on_etxtbsy(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            future::ready(Err::<(), _>(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn caller_timeout_cancels_the_in_flight_retry_operation() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_operation = dropped.clone();
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            retry_on_etxtbsy(|| {
+                let marker = DropMarker(dropped_by_operation.clone());
+                async move {
+                    let _marker = marker;
+                    future::pending::<io::Result<()>>().await
+                }
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the caller timeout should remain authoritative"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancelling the retry future must drop its in-flight operation"
+        );
+    }
 
     #[test]
     fn rehydration_is_bounded_oldest_first_and_excludes_current_assignment() {
