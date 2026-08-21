@@ -54,28 +54,13 @@ where
 {
     if !workspace.exists() {
         if let Some(config) = root_config() {
-            let root = canonicalize_best_effort(&config.root);
-            let candidate = canonicalize_best_effort(&workspace);
-            if candidate.starts_with(&root) {
-                if let Err(error) = std::fs::create_dir_all(&candidate) {
-                    tracing::warn!(
-                        path = %candidate.display(),
-                        workspace_root = %root.display(),
-                        workspace_source = source,
-                        %error,
-                        "failed to materialize validated workspace"
-                    );
-                }
-            } else {
-                // A configured default may disappear after preview. Never
-                // recreate a missing arbitrary path outside the authoritative
-                // root; emit enough non-secret context to diagnose the race.
+            if let Err(error) = materialize_workspace_under_root(&workspace, &config.root) {
                 tracing::warn!(
-                    path = %candidate.display(),
-                    workspace_root = %root.display(),
+                    path = %workspace.display(),
+                    workspace_root = %config.root.display(),
                     workspace_source = source,
-                    "validated workspace is missing outside the workspace root; \
-                     refusing to recreate it"
+                    %error,
+                    "failed to materialize validated workspace"
                 );
             }
         }
@@ -90,6 +75,21 @@ where
     );
     evict_oldest_if_needed(store, MAX_TRACKED_WORKSPACES);
     workspace
+}
+
+fn materialize_workspace_under_root(workspace: &Path, root: &Path) -> std::io::Result<PathBuf> {
+    let root = canonicalize_best_effort(root);
+    let candidate = canonicalize_best_effort(workspace);
+    if !candidate.starts_with(&root) {
+        // A configured default may disappear after preview. Never recreate a
+        // missing arbitrary path outside the authoritative root.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "validated workspace is outside the authoritative workspace root",
+        ));
+    }
+    std::fs::create_dir_all(&candidate)?;
+    Ok(candidate)
 }
 
 /// Resolve the final path that [`set_workspace`] would store without mutating
@@ -356,6 +356,26 @@ impl WorkspaceResolver {
             &config.root,
             config.confine,
         ))
+    }
+
+    /// Materialize a trusted, already-previewed workspace without publishing
+    /// it into the runtime session registry.
+    ///
+    /// Transactional request paths use this before reading a workspace-scoped
+    /// catalog. Publication remains deferred until the corresponding session
+    /// checkpoint is durable. Missing paths outside this resolver's
+    /// authoritative root are rejected rather than recreated.
+    pub fn materialize_resolved_workspace(&self, workspace: &Path) -> std::io::Result<PathBuf> {
+        if workspace.exists() {
+            return Ok(workspace.to_path_buf());
+        }
+        let config = self.workspace_root_config().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "workspace root is unavailable for materialization",
+            )
+        })?;
+        materialize_workspace_under_root(workspace, &config.root)
     }
 
     /// Publish a previously validated candidate through this instance's root.
@@ -834,6 +854,41 @@ mod tests {
         assert!(!confined.exists(), "confinement preview must not create");
         resolver.publish_resolved_workspace("instance-confined", confined.clone(), "request");
         assert!(confined.is_dir());
+    }
+
+    #[test]
+    fn instance_resolver_can_materialize_without_publishing_runtime_state() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let root = state_dir.path().join("workspaces");
+        let resolver = WorkspaceResolver::new(|| None, {
+            let root = root.clone();
+            move || WorkspaceRootConfig {
+                root: root.clone(),
+                confine: false,
+            }
+        });
+        let session_id = "materialize-without-publication";
+        let fallback = resolver
+            .preview_session_fallback(session_id)
+            .expect("instance fallback");
+
+        let materialized = resolver
+            .materialize_resolved_workspace(&fallback)
+            .expect("materialize trusted fallback");
+
+        assert_eq!(materialized, canonicalize_best_effort(&fallback));
+        assert!(materialized.is_dir());
+        assert!(
+            peek_workspace(session_id).is_none(),
+            "catalog preparation must not publish a pre-commit workspace"
+        );
+
+        let outside = state_dir.path().join("outside/missing");
+        let error = resolver
+            .materialize_resolved_workspace(&outside)
+            .expect_err("missing path outside the authority root must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!outside.exists());
     }
 
     #[test]

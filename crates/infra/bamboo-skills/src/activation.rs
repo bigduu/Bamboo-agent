@@ -62,8 +62,10 @@ pub enum WorkflowActivationStatus {
     Deactivated,
 }
 
-/// Durable, public-safe active workflow metadata. The immutable payload is
-/// stored separately under [`ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY`].
+/// Durable runtime activation metadata. This includes caller arguments and
+/// dynamic provider context and must not be serialized directly at a public
+/// API boundary. The immutable bundle payload is stored separately under
+/// [`ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActiveWorkflow {
     pub id: String,
@@ -240,6 +242,13 @@ pub fn persist_explicit_workflow_candidate(
             WorkflowActivationErrorCode::InvalidSelection,
             &format!("workflow arguments do not match the catalog schema: {error}"),
             true,
+        ));
+    }
+    if let Err(error) = bamboo_domain::reject_instruction_secret_material(&selection.args) {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::InvalidSelection,
+            &format!("workflow arguments contain unsupported credential material: {error}"),
+            false,
         ));
     }
     let Some(snapshot_entry) = snapshot.skills.get(&selection.id) else {
@@ -602,6 +611,7 @@ mod tests {
             ),
         );
         let candidate = SkillActivationSnapshot {
+            resource_scope_fingerprint: "sha256:test-scope".to_string(),
             catalog_revision: 41,
             selected_skill_mode: None,
             skills,
@@ -667,6 +677,7 @@ mod tests {
     fn activation_rejects_selected_workflow_over_durable_limit_atomically() {
         let selected = entry("oversized", 11);
         let snapshot = SkillActivationSnapshot {
+            resource_scope_fingerprint: "sha256:test-scope".to_string(),
             catalog_revision: 52,
             selected_skill_mode: None,
             skills: BTreeMap::from([(
@@ -746,6 +757,7 @@ mod tests {
             descriptor,
         };
         let snapshot = SkillActivationSnapshot {
+            resource_scope_fingerprint: "sha256:test-scope".to_string(),
             catalog_revision: 71,
             selected_skill_mode: Some("explicit".to_string()),
             skills: BTreeMap::from([(

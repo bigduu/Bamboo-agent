@@ -5,7 +5,8 @@ use std::sync::Arc;
 use actix_web::{http::StatusCode, web, HttpResponse};
 use bamboo_skills::legacy::LegacyWorkflowMigrationOutcome;
 use bamboo_skills::{
-    LegacyWorkflowMigrationStatus, SkillStore, WorkflowCatalogEntry, WorkflowSource, WorkflowStatus,
+    LegacyWorkflowMigrationStatus, SkillStore, WorkflowCatalogEntry, WorkflowCatalogSnapshot,
+    WorkflowSource, WorkflowStatus,
 };
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
@@ -24,6 +25,51 @@ use super::validation::is_safe_workflow_name;
 fn legacy_workflow_io_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+pub(crate) mod clone_scope_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Semaphore;
+
+    pub(crate) struct CloneScopeHook {
+        pub(crate) reached: Semaphore,
+        pub(crate) resume: Semaphore,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<CloneScopeHook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<CloneScopeHook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn install(session_id: &str) -> Arc<CloneScopeHook> {
+        let hook = Arc::new(CloneScopeHook {
+            reached: Semaphore::new(0),
+            resume: Semaphore::new(0),
+        });
+        hooks()
+            .lock()
+            .expect("clone scope hooks lock")
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(crate) async fn pause_after_authoritative_scope(session_id: &str) {
+        let hook = hooks()
+            .lock()
+            .expect("clone scope hooks lock")
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.add_permits(1);
+            hook.resume
+                .acquire()
+                .await
+                .expect("clone scope test barrier remains open")
+                .forget();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -52,9 +98,17 @@ async fn resolve_workflow_scope(
         .load_session(session_id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
+    resolve_workflow_scope_from_session(app_state, session_id, &session).await
+}
+
+async fn resolve_workflow_scope_from_session(
+    app_state: &AppState,
+    session_id: &str,
+    session: &bamboo_agent_core::Session,
+) -> Result<ResolvedWorkflowScope, AppError> {
     let project_id =
         match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
-            &session,
+            session,
         ) {
             bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
                 Some(project_id)
@@ -89,9 +143,14 @@ async fn resolve_workflow_scope(
         }
     })?;
     let project_home = if let Some(project_id) = project_id.as_ref() {
-        app_state.project_store.get(project_id).map_err(|error| {
+        let project = app_state.project_store.get(project_id).map_err(|error| {
             AppError::BadRequest(format!("Assigned Project is unavailable: {error}"))
         })?;
+        if project.status != bamboo_domain::ProjectStatus::Active {
+            return Err(AppError::Forbidden(format!(
+                "Session '{session_id}' is assigned to archived Project '{project_id}'"
+            )));
+        }
         Some(app_state.project_store.paths().project_home(project_id))
     } else {
         None
@@ -157,10 +216,21 @@ pub async fn list_workflow_catalog(
     query: web::Query<WorkflowCatalogQuery>,
 ) -> Result<HttpResponse, AppError> {
     let scope = resolve_workflow_scope(&app_state, query.session_id.as_deref()).await?;
-    let snapshot = scope.store.workflow_catalog_snapshot().await;
+    let (skill_catalog, workflow_catalog) = scope.store.command_catalog_snapshots().await;
+    let mut entries = skill_catalog.entries;
+    entries.extend(
+        workflow_catalog
+            .entries
+            .into_iter()
+            .filter(WorkflowCatalogEntry::is_public_workflow),
+    );
+    let snapshot = WorkflowCatalogSnapshot {
+        revision: skill_catalog.revision.max(workflow_catalog.revision),
+        entries,
+    };
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
-        .json(snapshot.public_workflows()))
+        .json(snapshot))
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -216,7 +286,7 @@ async fn confined_skills_dir(root: &Path) -> Result<PathBuf, AppError> {
 
 fn clone_bundle_files(
     bundle: &bamboo_skills::store::builtin::BuiltinSkillBundle,
-) -> Result<BTreeMap<String, Vec<u8>>, AppError> {
+) -> Result<BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile>, AppError> {
     let mut files = bundle
         .files
         .iter()
@@ -224,17 +294,26 @@ fn clone_bundle_files(
         .collect::<BTreeMap<_, _>>();
     let markdown = bamboo_skills::store::parser::render_skill_markdown(&bundle.skill)
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
-    files.insert("SKILL.md".to_string(), markdown.into_bytes());
+    files.insert(
+        "SKILL.md".to_string(),
+        bamboo_skills::store::builtin::BuiltinSkillFile {
+            bytes: markdown.into_bytes(),
+            executable: false,
+        },
+    );
     Ok(files)
 }
 
-fn clone_bundle_digest(files: &BTreeMap<String, Vec<u8>>) -> String {
+fn clone_bundle_digest(
+    files: &BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile>,
+) -> String {
     let mut digest = Sha256::new();
-    for (path, bytes) in files {
+    for (path, file) in files {
         digest.update((path.len() as u64).to_le_bytes());
         digest.update(path.as_bytes());
-        digest.update((bytes.len() as u64).to_le_bytes());
-        digest.update(bytes);
+        digest.update([u8::from(file.executable)]);
+        digest.update((file.bytes.len() as u64).to_le_bytes());
+        digest.update(&file.bytes);
     }
     hex::encode(digest.finalize())
 }
@@ -268,10 +347,9 @@ fn ensure_clone_parent(root: &Path, relative: &Path) -> Result<(), ClonePublicat
         current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(ClonePublicationError::Conflict(format!(
-                    "clone target '{}' is not a real directory",
-                    current.display()
-                )));
+                return Err(ClonePublicationError::Conflict(
+                    "clone target resource parent is not a real directory".to_string(),
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -286,7 +364,7 @@ fn ensure_clone_parent(root: &Path, relative: &Path) -> Result<(), ClonePublicat
 fn write_clone_file(
     target_root: &Path,
     relative: &str,
-    bytes: &[u8],
+    embedded: &bamboo_skills::store::builtin::BuiltinSkillFile,
 ) -> Result<(), ClonePublicationError> {
     let relative_path = checked_clone_relative_path(relative)?;
     ensure_clone_parent(target_root, &relative_path)?;
@@ -296,16 +374,16 @@ fn write_clone_file(
         .create_new(true)
         .open(&target)
     {
-        Ok(mut file) => {
+        Ok(mut output) => {
             use std::io::Write;
-            file.write_all(bytes)?;
-            file.sync_all()?;
+            output.write_all(&embedded.bytes)?;
+            output.sync_all()?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = std::fs::symlink_metadata(&target)?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || std::fs::read(&target)? != bytes
+                || std::fs::read(&target)? != embedded.bytes
             {
                 return Err(ClonePublicationError::Conflict(format!(
                     "clone target resource '{relative}' already exists with different content"
@@ -315,9 +393,12 @@ fn write_clone_file(
         Err(error) => return Err(error.into()),
     }
     #[cfg(unix)]
-    if relative.starts_with("scripts/") {
+    {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(if embedded.executable { 0o755 } else { 0o644 }),
+        )?;
         std::fs::File::open(&target)?.sync_all()?;
     }
     Ok(())
@@ -334,7 +415,7 @@ fn sync_clone_directory(path: &Path) -> Result<(), ClonePublicationError> {
 fn verify_clone_tree(
     target: &Path,
     workflow_id: &str,
-    files: &BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile>,
 ) -> Result<(), ClonePublicationError> {
     let mut actual = BTreeMap::new();
     for entry in walkdir::WalkDir::new(target).follow_links(false) {
@@ -354,7 +435,22 @@ fn verify_clone_tree(
                 .map_err(|error| ClonePublicationError::Internal(error.to_string()))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            actual.insert(relative, std::fs::read(entry.path())?);
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(entry.path())?.permissions().mode() & 0o111 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = files
+                .get(&relative)
+                .is_some_and(|expected| expected.executable);
+            actual.insert(
+                relative,
+                bamboo_skills::store::builtin::BuiltinSkillFile {
+                    bytes: std::fs::read(entry.path())?,
+                    executable,
+                },
+            );
         } else if !entry.file_type().is_dir() {
             return Err(ClonePublicationError::Conflict(
                 "Workflow clone target contains a non-regular resource".to_string(),
@@ -435,6 +531,12 @@ fn publish_clone_marker(
         Ok(_) => {
             // No authoritative marker or target exists while the clone lock is
             // held, so this can only be an uncommitted pre-rename crash remnant.
+            let partial = std::fs::read(&temporary)?;
+            if !marker_bytes.starts_with(&partial) {
+                return Err(ClonePublicationError::Conflict(
+                    "Workflow clone temporary marker contains divergent data".to_string(),
+                ));
+            }
             std::fs::remove_file(&temporary)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -448,7 +550,14 @@ fn publish_clone_marker(
     marker_file.write_all(marker_bytes)?;
     marker_file.sync_all()?;
     drop(marker_file);
-    std::fs::rename(&temporary, marker_path)?;
+    if let Err(error) = rename_noreplace(&temporary, marker_path) {
+        if std::fs::symlink_metadata(marker_path).is_ok() {
+            return Err(ClonePublicationError::Conflict(
+                "Workflow clone recovery marker appeared concurrently".to_string(),
+            ));
+        }
+        return Err(error.into());
+    }
     sync_clone_directory(skills_dir)?;
     Ok(())
 }
@@ -457,8 +566,119 @@ fn publish_builtin_clone_blocking(
     skills_dir: &Path,
     workflow_id: &str,
     source_revision: u64,
-    files: &BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile>,
 ) -> Result<(), ClonePublicationError> {
+    publish_builtin_clone_blocking_with_before_publish(
+        skills_dir,
+        workflow_id,
+        source_revision,
+        files,
+        |_| {},
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both C strings are owned for the duration of the call. renameat2
+    // performs the publication atomically and RENAME_NOREPLACE makes a
+    // check-to-rename target race fail instead of replacing user content.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both pointers reference live C strings and RENAME_EXCL is the
+    // Darwin atomic no-replace primitive.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
+    // Passing zero flags deliberately omits MOVEFILE_REPLACE_EXISTING, so a
+    // concurrent destination is never overwritten (unlike std::fs::rename).
+    let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory publication is unavailable on this platform",
+    ))
+}
+
+fn publish_builtin_clone_blocking_with_before_publish<F>(
+    skills_dir: &Path,
+    workflow_id: &str,
+    source_revision: u64,
+    files: &BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile>,
+    before_publish: F,
+) -> Result<(), ClonePublicationError>
+where
+    F: FnOnce(&Path),
+{
     let skill_markdown = files.get("SKILL.md").ok_or_else(|| {
         ClonePublicationError::Internal("embedded Workflow bundle is missing SKILL.md".to_string())
     })?;
@@ -530,11 +750,7 @@ fn publish_builtin_clone_blocking(
             FileExt::unlock(&lock)?;
             return Ok(());
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if !marker_exists {
-                publish_clone_marker(skills_dir, workflow_id, &marker_path, &marker_bytes)?;
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
 
@@ -544,6 +760,20 @@ fn publish_builtin_clone_blocking(
     // to discard and rebuild; clients never observe a partial Workflow bundle.
     let staging_parent = clone_staging_parent(skills_dir)?;
     let staging = staging_parent.join(format!("{workflow_id}.clone-v1"));
+    if !marker_exists {
+        match std::fs::symlink_metadata(&staging) {
+            Ok(_) => {
+                return Err(ClonePublicationError::Conflict(
+                    "Workflow clone found unclaimed staging data; refusing to overwrite it"
+                        .to_string(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                publish_clone_marker(skills_dir, workflow_id, &marker_path, &marker_bytes)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     match std::fs::symlink_metadata(&staging) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(ClonePublicationError::Conflict(
@@ -555,13 +785,21 @@ fn publish_builtin_clone_blocking(
         Err(error) => return Err(error.into()),
     }
     std::fs::create_dir(&staging)?;
-    for (relative, bytes) in files.iter().filter(|(path, _)| path.as_str() != "SKILL.md") {
-        write_clone_file(&staging, relative, bytes)?;
+    for (relative, file) in files.iter().filter(|(path, _)| path.as_str() != "SKILL.md") {
+        write_clone_file(&staging, relative, file)?;
     }
     write_clone_file(&staging, "SKILL.md", skill_markdown)?;
     verify_clone_tree(&staging, workflow_id, files)?;
     sync_clone_tree_directories(&staging)?;
-    std::fs::rename(&staging, &target)?;
+    before_publish(&target);
+    if let Err(error) = rename_noreplace(&staging, &target) {
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return Err(ClonePublicationError::Conflict(format!(
+                "Workflow '{workflow_id}' appeared in the target layer while cloning"
+            )));
+        }
+        return Err(error.into());
+    }
     sync_clone_directory(skills_dir)?;
     verify_clone_tree(&target, workflow_id, files)?;
     std::fs::remove_file(&marker_path)?;
@@ -612,11 +850,35 @@ pub async fn clone_workflow(
             "session_id is required for a Project clone".to_string(),
         ));
     }
-    let scope_session_id = match payload.target {
-        CloneWorkflowTarget::Project => payload.session_id.as_deref(),
-        CloneWorkflowTarget::User => None,
+    // A Project clone derives its destination exclusively from the current
+    // durable session. Hold the same per-session lock used by Project/Workspace
+    // PATCH through the final publication and catalog reload: a reassignment
+    // can therefore happen wholly before or wholly after this clone, never in
+    // the scope-resolution -> filesystem-publication gap.
+    let (scope_guard, scope) = match payload.target {
+        CloneWorkflowTarget::Project => {
+            let session_id = payload
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .expect("Project session_id was validated above");
+            let guard = app_state.persistence.acquire_lock(session_id).await;
+            let session = app_state
+                .persistence
+                .storage()
+                .load_session(session_id)
+                .await
+                .map_err(AppError::StorageError)?
+                .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
+            let scope =
+                resolve_workflow_scope_from_session(&app_state, session_id, &session).await?;
+            #[cfg(test)]
+            clone_scope_test_hooks::pause_after_authoritative_scope(session_id).await;
+            (Some(guard), scope)
+        }
+        CloneWorkflowTarget::User => (None, resolve_workflow_scope(&app_state, None).await?),
     };
-    let scope = resolve_workflow_scope(&app_state, scope_session_id).await?;
     scope
         .store
         .reload()
@@ -681,12 +943,16 @@ pub async fn clone_workflow(
     let publish_skills_dir = skills_dir.clone();
     let publish_id = workflow_id.clone();
     let revision = payload.revision;
-    match tokio::task::spawn_blocking(move || {
-        publish_builtin_clone_blocking(&publish_skills_dir, &publish_id, revision, &files)
+    let (publication, scope_guard) = tokio::task::spawn_blocking(move || {
+        let publication =
+            publish_builtin_clone_blocking(&publish_skills_dir, &publish_id, revision, &files);
+        // Keep Project/Workspace reassignment serialized even if the request
+        // future is cancelled while this non-cancellable filesystem task runs.
+        (publication, scope_guard)
     })
     .await
-    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
-    {
+    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    match publication {
         Ok(()) => {}
         Err(ClonePublicationError::Conflict(message)) => {
             return Ok(crate::error::json_error(StatusCode::CONFLICT, message));
@@ -711,6 +977,11 @@ pub async fn clone_workflow(
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
     let (skill_catalog, workflow_catalog) = scope.store.command_catalog_snapshots().await;
+    // On the ordinary path retain the returned guard through both catalog
+    // reloads and the correlated response snapshot. On request cancellation,
+    // the blocking task owns it until publication finishes and then dropping
+    // the unobserved output releases it.
+    drop(scope_guard);
     let target_source = match payload.target {
         CloneWorkflowTarget::Project => WorkflowSource::Project,
         CloneWorkflowTarget::User => WorkflowSource::User,
@@ -755,7 +1026,15 @@ pub async fn migrate_workflow(
     if session_id.is_empty() {
         return Err(AppError::BadRequest("session_id is required".to_string()));
     }
-    let scope = resolve_workflow_scope(&app_state, Some(session_id)).await?;
+    let _scope_guard = app_state.persistence.acquire_lock(session_id).await;
+    let session = app_state
+        .persistence
+        .storage()
+        .load_session(session_id)
+        .await
+        .map_err(AppError::StorageError)?
+        .ok_or_else(|| AppError::NotFound(format!("Session '{session_id}'")))?;
+    let scope = resolve_workflow_scope_from_session(&app_state, session_id, &session).await?;
     let workspace = scope.workspace.as_ref().ok_or_else(|| {
         AppError::BadRequest("Legacy workflow migration requires a session workspace".to_string())
     })?;
@@ -1113,16 +1392,36 @@ fn legacy_response() -> actix_web::HttpResponseBuilder {
 mod clone_publication_tests {
     use super::*;
 
-    fn resumable_files() -> BTreeMap<String, Vec<u8>> {
+    fn embedded_file(
+        bytes: &[u8],
+        executable: bool,
+    ) -> bamboo_skills::store::builtin::BuiltinSkillFile {
+        bamboo_skills::store::builtin::BuiltinSkillFile {
+            bytes: bytes.to_vec(),
+            executable,
+        }
+    }
+
+    fn resumable_files() -> BTreeMap<String, bamboo_skills::store::builtin::BuiltinSkillFile> {
         BTreeMap::from([
             (
                 "SKILL.md".to_string(),
-                b"---\nid: resumable\nname: Resumable\ndescription: exact recovery\n---\n\nInstructions\n"
-                    .to_vec(),
+                embedded_file(
+                    b"---\nid: resumable\nname: Resumable\ndescription: exact recovery\n---\n\nInstructions\n",
+                    false,
+                ),
             ),
             (
                 "references/contract.txt".to_string(),
-                b"immutable contract\n".to_vec(),
+                embedded_file(b"immutable contract\n", false),
+            ),
+            (
+                "scripts/run.sh".to_string(),
+                embedded_file(b"#!/bin/sh\nexit 0\n", true),
+            ),
+            (
+                "scripts/helpers.py".to_string(),
+                embedded_file(b"HELPER = True\n", false),
             ),
         ])
     }
@@ -1144,10 +1443,104 @@ mod clone_publication_tests {
 
         assert_eq!(
             std::fs::read(skills_dir.join("resumable/SKILL.md")).expect("published definition"),
-            files["SKILL.md"]
+            files["SKILL.md"].bytes
         );
         assert!(!skills_dir.join(".resumable.clone-v1.json.tmp").exists());
         assert!(!skills_dir.join(".resumable.clone-v1.json").exists());
+    }
+
+    #[test]
+    fn builtin_clone_preserves_divergent_temporary_marker_data() {
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let skills_dir = temporary.path().join("skills");
+        std::fs::create_dir(&skills_dir).expect("skills directory");
+        let temporary_marker = skills_dir.join(".resumable.clone-v1.json.tmp");
+        std::fs::write(&temporary_marker, b"unrelated writer data").expect("divergent marker data");
+
+        let error = publish_builtin_clone_blocking(&skills_dir, "resumable", 7, &resumable_files())
+            .expect_err("divergent hidden data must never be deleted as a crash remnant");
+
+        assert!(matches!(error, ClonePublicationError::Conflict(_)));
+        assert_eq!(
+            std::fs::read(&temporary_marker).expect("divergent marker remains"),
+            b"unrelated writer data"
+        );
+        assert!(!skills_dir.join(".resumable.clone-v1.json").exists());
+        assert!(!skills_dir.join("resumable").exists());
+    }
+
+    #[test]
+    fn builtin_clone_preserves_staging_without_an_authoritative_marker() {
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let skills_dir = temporary.path().join("skills");
+        std::fs::create_dir(&skills_dir).expect("skills directory");
+        let staging = temporary
+            .path()
+            .join(".workflow-clone-staging/resumable.clone-v1");
+        std::fs::create_dir_all(&staging).expect("unclaimed staging");
+        let sentinel = staging.join("user-sentinel.txt");
+        std::fs::write(&sentinel, b"must remain").expect("unclaimed staging data");
+
+        let error = publish_builtin_clone_blocking(&skills_dir, "resumable", 7, &resumable_files())
+            .expect_err("staging without a durable marker is not server-owned");
+
+        assert!(matches!(error, ClonePublicationError::Conflict(_)));
+        assert_eq!(
+            std::fs::read(&sentinel).expect("unclaimed staging remains"),
+            b"must remain"
+        );
+        assert!(!skills_dir.join(".resumable.clone-v1.json").exists());
+        assert!(!skills_dir.join("resumable").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_clone_preserves_and_verifies_executable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let skills_dir = temporary.path().join("skills");
+        std::fs::create_dir(&skills_dir).expect("skills directory");
+        let files = resumable_files();
+        publish_builtin_clone_blocking(&skills_dir, "resumable", 7, &files)
+            .expect("publish exact modes");
+        let target = skills_dir.join("resumable");
+        assert_ne!(
+            std::fs::metadata(target.join("scripts/run.sh"))
+                .expect("script metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(target.join("scripts/helpers.py"))
+                .expect("helper metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+
+        let marker = ClonePublicationMarker {
+            schema: 1,
+            workflow_id: "resumable".to_string(),
+            source_revision: 7,
+            digest: clone_bundle_digest(&files),
+        };
+        std::fs::write(
+            skills_dir.join(".resumable.clone-v1.json"),
+            serde_json::to_vec(&marker).expect("marker JSON"),
+        )
+        .expect("recovery marker");
+        std::fs::set_permissions(
+            target.join("scripts/helpers.py"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("inject mode drift");
+        let error = publish_builtin_clone_blocking(&skills_dir, "resumable", 7, &files)
+            .expect_err("mode drift must not be accepted as exact recovery");
+        assert!(matches!(error, ClonePublicationError::Conflict(_)));
     }
 
     #[test]
@@ -1183,11 +1576,11 @@ mod clone_publication_tests {
 
         assert_eq!(
             std::fs::read(target.join("SKILL.md")).expect("published definition"),
-            files["SKILL.md"]
+            files["SKILL.md"].bytes
         );
         assert_eq!(
             std::fs::read(target.join("references/contract.txt")).expect("published resource"),
-            files["references/contract.txt"]
+            files["references/contract.txt"].bytes
         );
         assert!(!skills_dir.join(".resumable.clone-v1.json").exists());
         assert!(!staging.exists());
@@ -1211,5 +1604,83 @@ mod clone_publication_tests {
             std::fs::read(target.join("SKILL.md")).expect("definition after retry"),
             before
         );
+    }
+
+    #[test]
+    fn builtin_clone_does_not_replace_directory_created_during_publish() {
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let skills_dir = temporary.path().join("skills");
+        std::fs::create_dir(&skills_dir).expect("skills directory");
+        let files = resumable_files();
+        let target = skills_dir.join("resumable");
+
+        let error = publish_builtin_clone_blocking_with_before_publish(
+            &skills_dir,
+            "resumable",
+            7,
+            &files,
+            |publish_target| std::fs::create_dir(publish_target).expect("racing target"),
+        )
+        .expect_err("racing target must win without replacement");
+
+        assert!(matches!(error, ClonePublicationError::Conflict(_)));
+        assert!(target.is_dir());
+        assert!(std::fs::read_dir(&target)
+            .expect("racing directory")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn clone_publication_never_replaces_a_concurrent_marker() {
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let staging = temporary.path().join("marker.tmp");
+        let marker = temporary.path().join("marker.json");
+        std::fs::write(&staging, b"server marker").expect("staging marker");
+        std::fs::write(&marker, b"concurrent writer").expect("racing marker");
+
+        rename_noreplace(&staging, &marker).expect_err("existing marker must win");
+
+        assert_eq!(
+            std::fs::read(&marker).expect("racing marker remains"),
+            b"concurrent writer"
+        );
+        assert_eq!(
+            std::fs::read(&staging).expect("server staging remains recoverable"),
+            b"server marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_clone_does_not_replace_symlink_created_during_publish() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary clone root");
+        let skills_dir = temporary.path().join("skills");
+        std::fs::create_dir(&skills_dir).expect("skills directory");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside directory");
+        let files = resumable_files();
+        let target = skills_dir.join("resumable");
+
+        let error = publish_builtin_clone_blocking_with_before_publish(
+            &skills_dir,
+            "resumable",
+            7,
+            &files,
+            |publish_target| symlink(&outside, publish_target).expect("racing symlink"),
+        )
+        .expect_err("racing symlink must win without replacement");
+
+        assert!(matches!(error, ClonePublicationError::Conflict(_)));
+        assert!(std::fs::symlink_metadata(&target)
+            .expect("racing target")
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_dir(&outside)
+            .expect("outside directory")
+            .next()
+            .is_none());
     }
 }

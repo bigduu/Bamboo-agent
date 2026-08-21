@@ -107,6 +107,66 @@ async fn typed_workflow_candidate_is_pinned_exactly_and_stale_revision_fails_clo
     assert_eq!(retained.skills[0].id, "plan");
 }
 
+#[actix_web::test]
+async fn typed_workflow_capacity_failure_is_sanitized_and_retryable() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = crate::AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+    let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+    let review = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "review" && entry.winner)
+        .expect("builtin review");
+    for index in 0..256 {
+        state
+            .skill_manager
+            .pin_current_activation_for_workspace(
+                &format!("capacity-{index}"),
+                None,
+                &["plan".to_string()],
+                None,
+            )
+            .await
+            .expect("fill activation capacity");
+    }
+    let selection = bamboo_skills::WorkflowSelection {
+        id: review.id.clone(),
+        source: review.source,
+        revision: review.revision,
+        args: serde_json::json!({}),
+    };
+    let mut session = Session::new("capacity-overflow", "model");
+    let response = super::pin_explicit_workflow_candidate(
+        &state,
+        &mut session,
+        &selection,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
+    .expect_err("capacity exhaustion must fail closed");
+    assert_eq!(
+        response.status(),
+        actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let body = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("response body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(body["error"]["code"], "workflow_snapshot_unavailable");
+    assert_eq!(
+        body["error"]["message"],
+        "Workflow catalog is temporarily unavailable; retry the request"
+    );
+    let rendered = body.to_string();
+    assert!(!rendered.contains("capacity"));
+    assert!(!rendered.contains(temp_dir.path().to_string_lossy().as_ref()));
+    assert!(session.metadata.is_empty());
+    assert!(session.messages.is_empty());
+}
+
 /// Regression: `/goal off` and `/goal clear` must clear the stale runtime
 /// `goal.state` (status / continuation budget / double-check eval history).
 /// Previously the cleanup was gated behind `should_resume`, so only
@@ -454,10 +514,84 @@ mod optional_model_e2e {
     use crate::routes::configure_routes;
     use crate::AppState;
 
+    const CONCURRENCY_ASSERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
     async fn new_state() -> web::Data<AppState> {
         let temp_dir = tempdir().expect("tempdir").keep();
         bamboo_config::paths::init_bamboo_dir(temp_dir.clone());
         web::Data::new(AppState::new(temp_dir).await.expect("app state"))
+    }
+
+    async fn seed_active_instruction_workflow(
+        state: &web::Data<AppState>,
+        session_id: &str,
+        workflow_id: &str,
+    ) -> bamboo_skills::WorkflowSelection {
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == workflow_id && entry.winner)
+            .expect("builtin instruction Workflow")
+            .clone();
+        let selection = bamboo_skills::WorkflowSelection {
+            id: entry.id.clone(),
+            source: entry.source,
+            revision: entry.revision,
+            args: serde_json::json!({}),
+        };
+        let ids = [entry.id.clone()];
+        let activation = state
+            .skill_manager
+            .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                session_id,
+                &std::collections::BTreeSet::new(),
+                Some(&ids),
+                None,
+                None,
+                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .expect("pin canonical live activation");
+        let snapshot = state
+            .skill_manager
+            .store()
+            .export_activation_snapshot(session_id)
+            .await
+            .expect("export canonical activation snapshot");
+        let mut session = Session::new(session_id, "test-model");
+        session.metadata.insert(
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).expect("selection JSON"),
+        );
+        bamboo_skills::persist_explicit_workflow_candidate(
+            &mut session.metadata,
+            &selection,
+            &activation,
+            &snapshot,
+        )
+        .expect("persist exact candidate");
+        bamboo_skills::record_loaded_workflow_activation(
+            &mut session.metadata,
+            workflow_id,
+            format!("sha256:{workflow_id}"),
+        )
+        .expect("publish active Workflow");
+        state.save_and_cache_session(&mut session).await;
+        selection
+    }
+
+    fn workflow_runtime_metadata(session: &Session) -> std::collections::BTreeMap<String, String> {
+        session
+            .metadata
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("workflow.")
+                    || key.starts_with("skill_runtime_")
+                    || key.as_str() == "selected_skill_ids"
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     struct BlockingTitleProvider {
@@ -989,8 +1123,9 @@ mod optional_model_e2e {
                 .to_request(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let status = response.status();
         let body: Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
         assert_eq!(body["error"]["code"], "workspace_invalid");
         assert!(state
             .storage
@@ -1388,8 +1523,23 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
-    async fn user_prompt_submit_block_returns_reason_and_persists_no_user_message() {
+    async fn user_prompt_submit_block_preserves_existing_workflow_and_persists_no_user_message() {
         let state = new_state().await;
+        let session_id = "blocked-user-prompt";
+        seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load seeded session")
+            .expect("seeded session");
+        let expected_workflow_metadata = workflow_runtime_metadata(&before);
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
         {
             let mut config = state.config.write().await;
             config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
@@ -1417,22 +1567,29 @@ mod optional_model_e2e {
             test::TestRequest::post()
                 .uri("/api/v1/chat")
                 .set_json(serde_json::json!({
-                    "session_id": "blocked-user-prompt",
+                    "session_id": session_id,
                     "message": "must not persist",
-                    "model": "test-model"
+                    "model": "test-model",
+                    "workflow_selection": {
+                        "id": review.id,
+                        "source": review.source,
+                        "revision": review.revision,
+                        "args": {}
+                    }
                 }))
                 .to_request(),
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let status = response.status();
         let body: Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
         assert!(body.to_string().contains("prompt rejected by policy"));
         assert_eq!(body["hook_event"], "UserPromptSubmit");
 
         let session = state
             .storage
-            .load_session("blocked-user-prompt")
+            .load_session(session_id)
             .await
             .expect("load")
             .expect("prepared session is persisted for hook observability");
@@ -1447,5 +1604,449 @@ mod optional_model_e2e {
                 .map(|state| state.checkpoints.len()),
             Some(1)
         );
+        assert_eq!(
+            workflow_runtime_metadata(&session),
+            expected_workflow_metadata,
+            "rejected typed selection must not disturb durable Workflow authority"
+        );
+        let live = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .expect("inspect canonical activation")
+            .expect("existing activation remains pinned");
+        assert_eq!(live.skills.len(), 1);
+        assert_eq!(live.skills[0].id, "plan");
+    }
+
+    #[actix_web::test]
+    async fn image_rejection_preserves_existing_workflow_and_persists_no_user_message() {
+        let state = new_state().await;
+        let session_id = "rejected-image-workflow";
+        seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load seeded session")
+            .expect("seeded session");
+        let expected_workflow_metadata = workflow_runtime_metadata(&before);
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "must not persist",
+                    "model": "test-model",
+                    "workflow_selection": {
+                        "id": review.id,
+                        "source": review.source,
+                        "revision": review.revision,
+                        "args": {}
+                    },
+                    "images": [{
+                        "base64": "not-valid-base64%%%",
+                        "type": "image/png"
+                    }]
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let after = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("reload session")
+            .expect("session remains");
+        assert!(after
+            .messages
+            .iter()
+            .all(|message| !matches!(message.role, bamboo_agent_core::Role::User)));
+        assert_eq!(
+            workflow_runtime_metadata(&after),
+            expected_workflow_metadata,
+            "failed attachment must not publish speculative Workflow metadata"
+        );
+        let live = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .expect("inspect canonical activation")
+            .expect("existing activation remains pinned");
+        assert_eq!(live.skills[0].id, "plan");
+    }
+
+    #[actix_web::test]
+    async fn running_session_rejects_typed_workflow_replacement_without_mutation() {
+        let state = new_state().await;
+        let session_id = "running-workflow-replacement";
+        seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load seeded session")
+            .expect("seeded session");
+        let expected_workflow_metadata = workflow_runtime_metadata(&before);
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let mut runner = crate::app_state::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Running;
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), runner);
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "must wait",
+                    "model": "test-model",
+                    "workflow_selection": {
+                        "id": review.id,
+                        "source": review.source,
+                        "revision": review.revision,
+                        "args": {}
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["code"],
+            "workflow_activation_running_conflict"
+        );
+        let after = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("reload session")
+            .expect("session remains");
+        assert_eq!(
+            workflow_runtime_metadata(&after),
+            expected_workflow_metadata
+        );
+        assert!(after.messages.is_empty());
+        let live = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .expect("inspect canonical activation")
+            .expect("existing activation remains pinned");
+        assert_eq!(live.skills[0].id, "plan");
+    }
+
+    #[actix_web::test]
+    async fn runner_reserved_during_typed_chat_rejects_commit_without_mutation() {
+        let state = new_state().await;
+        let session_id = "workflow-reserved-before-commit";
+        seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let before = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load seeded session")
+            .expect("seeded session");
+        let expected_workflow_metadata = workflow_runtime_metadata(&before);
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let barrier = super::super::install_workflow_commit_test_barrier(session_id);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "must lose the reservation race",
+                    "model": "test-model",
+                    "workflow_selection": {
+                        "id": review.id,
+                        "source": review.source,
+                        "revision": review.revision,
+                        "args": {}
+                    }
+                }))
+                .to_request(),
+        );
+        tokio::pin!(response);
+
+        let reached = barrier.reached.acquire();
+        tokio::pin!(reached);
+        let reached_permit = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            tokio::select! {
+                permit = &mut reached => permit.expect("workflow commit barrier remains open"),
+                early = &mut response => panic!(
+                    "typed chat completed before the commit barrier: {}",
+                    early.status()
+                ),
+            }
+        })
+        .await
+        .expect("typed chat reaches the deterministic pre-commit barrier");
+        reached_permit.forget();
+
+        let mut runner = crate::app_state::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Pending;
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), runner);
+        barrier.resume.add_permits(1);
+
+        let response = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, &mut response)
+            .await
+            .expect("typed chat rejects the newly reserved runner");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["code"],
+            "workflow_activation_running_conflict"
+        );
+
+        let after = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("reload session")
+            .expect("session remains");
+        assert_eq!(
+            workflow_runtime_metadata(&after),
+            expected_workflow_metadata,
+            "a late runner reservation must leave durable Workflow authority unchanged"
+        );
+        assert!(after
+            .messages
+            .iter()
+            .all(|message| !matches!(message.role, bamboo_agent_core::Role::User)));
+        let live = state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .expect("inspect canonical activation")
+            .expect("existing activation remains pinned");
+        assert_eq!(live.skills[0].id, "plan");
+    }
+
+    #[actix_web::test]
+    async fn cancelled_typed_chat_finishes_the_committed_pin_handoff() {
+        let state = new_state().await;
+        let session_id = "workflow-cancelled-after-save";
+        seed_active_instruction_workflow(&state, session_id, "plan").await;
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let barrier = super::super::install_workflow_post_save_test_barrier(session_id);
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
+                    .set_json(serde_json::json!({
+                        "session_id": session_id,
+                        "message": "commit despite response cancellation",
+                        "model": "test-model",
+                        "workflow_selection": {
+                            "id": review.id,
+                            "source": review.source,
+                            "revision": review.revision,
+                            "args": {}
+                        }
+                    }))
+                    .to_request(),
+            );
+            tokio::pin!(response);
+            let reached = barrier.reached.acquire();
+            tokio::pin!(reached);
+            let reached_permit = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+                tokio::select! {
+                    permit = &mut reached => permit.expect("post-save barrier remains open"),
+                    early = &mut response => panic!(
+                        "typed chat completed before the post-save barrier: {}",
+                        early.status()
+                    ),
+                }
+            })
+            .await
+            .expect("typed chat reaches the deterministic post-save barrier");
+            reached_permit.forget();
+
+            let live_before_handoff = state
+                .skill_manager
+                .pinned_activation_for_workspace(session_id, None)
+                .await
+                .expect("inspect old canonical pin")
+                .expect("old activation remains until durable save returns");
+            assert_eq!(live_before_handoff.skills[0].id, "plan");
+            // Dropping the Actix response future simulates a disconnected
+            // client. The detached commit task must retain both locks and
+            // finish cache/feed/pin publication.
+        }
+        barrier.resume.add_permits(1);
+
+        let event = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            loop {
+                let event = feed.recv().await.expect("account feed remains open");
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::MessageAppended { session_id: id, .. }
+                        if id == session_id
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("detached typed commit publishes its durable message");
+        assert!(matches!(
+            event.event,
+            bamboo_agent_core::AgentEvent::MessageAppended { .. }
+        ));
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("reload committed session")
+            .expect("committed session");
+        let selection: bamboo_skills::WorkflowSelection = serde_json::from_str(
+            persisted
+                .metadata
+                .get(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY)
+                .expect("committed typed selection"),
+        )
+        .expect("selection JSON");
+        assert_eq!(selection.id, "review");
+        assert!(persisted.messages.iter().any(|message| {
+            matches!(message.role, bamboo_agent_core::Role::User)
+                && message.content == "commit despite response cancellation"
+        }));
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_workspace(session_id, None)
+            .await
+            .expect("inspect released canonical pin")
+            .is_none());
+        let guard = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("detached commit releases the persistence lock");
+        drop(guard);
+    }
+
+    #[actix_web::test]
+    async fn typed_instruction_secret_args_fail_before_any_session_or_prompt_persistence() {
+        const SECRET_MARKER: &str = "sk-instruction-secret-must-never-persist";
+        let state = new_state().await;
+        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
+        let review = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "review" && entry.winner)
+            .expect("builtin review Workflow");
+        let session_id = "secret-workflow-args";
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id": session_id,
+                    "message": "review this",
+                    "model": "test-model",
+                    "workflow_selection": {
+                        "id": review.id,
+                        "source": review.source,
+                        "revision": review.revision,
+                        "args": {"scope": SECRET_MARKER}
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "workflow_selection_invalid");
+        assert!(!body.to_string().contains(SECRET_MARKER));
+        assert!(state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load rejected session")
+            .is_none());
+        assert!(state.sessions.get(session_id).is_none());
+        let durable_files = walkdir::WalkDir::new(&state.app_data_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .collect::<Vec<_>>();
+        assert!(durable_files.iter().all(|bytes| !bytes
+            .windows(SECRET_MARKER.len())
+            .any(|window| window == SECRET_MARKER.as_bytes())));
     }
 }

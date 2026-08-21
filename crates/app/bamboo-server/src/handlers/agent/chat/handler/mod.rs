@@ -44,14 +44,23 @@ fn sync_runtime_workspace(
 /// non-reentrant lock again. A plain storage save is safe because the chat
 /// transaction owns the lock from its authoritative reload through its final
 /// message checkpoint.
+async fn persist_and_cache_session_locked(
+    state: &AppState,
+    session: &bamboo_agent_core::Session,
+) -> std::io::Result<()> {
+    state.persistence.storage().save_session(session).await?;
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+    );
+    Ok(())
+}
+
 async fn save_and_cache_session_locked(
     state: &AppState,
     session: &bamboo_agent_core::Session,
 ) -> Result<(), HttpResponse> {
-    state
-        .persistence
-        .storage()
-        .save_session(session)
+    persist_and_cache_session_locked(state, session)
         .await
         .map_err(|error| {
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -59,12 +68,35 @@ async fn save_and_cache_session_locked(
                     "Failed to persist chat session: {error}"
                 ))
             }))
-        })?;
-    state.sessions.insert(
-        session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        })
+}
+
+fn publish_committed_chat(state: &web::Data<AppState>, session: &bamboo_agent_core::Session) {
+    if let Some(message) = session.messages.last() {
+        state.account_sink.record(
+            Some(&session.id),
+            &bamboo_agent_core::AgentEvent::MessageAppended {
+                session_id: session.id.clone(),
+                message_id: message.id.clone(),
+                role: message.role.clone(),
+                content: message.content.clone(),
+                created_at: message.created_at,
+            },
+        );
+    }
+
+    tracing::debug!(
+        "[{}] Chat turn persisted: messages={}, last_role={:?} -> client should now POST /execute",
+        session.id,
+        session.messages.len(),
+        session
+            .messages
+            .last()
+            .map(|message| format!("{:?}", message.role)),
     );
-    Ok(())
+    if !session.title_generated {
+        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session.id.clone());
+    }
 }
 
 fn project_context_error_response(
@@ -212,6 +244,15 @@ fn workflow_selection_error_response(
     }))
 }
 
+fn workflow_catalog_unavailable_response(error: &bamboo_skills::SkillError) -> HttpResponse {
+    tracing::error!(%error, "failed to pin typed workflow catalog revision");
+    workflow_selection_error_response(bamboo_skills::WorkflowActivationDiagnostic {
+        code: bamboo_skills::WorkflowActivationErrorCode::SnapshotUnavailable,
+        message: "Workflow catalog is temporarily unavailable; retry the request".to_string(),
+        recoverable: true,
+    })
+}
+
 async fn pin_explicit_workflow_candidate(
     state: &AppState,
     session: &mut bamboo_agent_core::Session,
@@ -239,12 +280,7 @@ async fn pin_explicit_workflow_candidate(
                 context.workspace.as_deref(),
             )
             .await
-            .map_err(|error| {
-                crate::error::json_error(
-                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Workflow catalog is unavailable: {error}"),
-                )
-            })?;
+            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
         let activation = state
             .skill_manager
             .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
@@ -261,16 +297,22 @@ async fn pin_explicit_workflow_candidate(
             .await;
         (store, activation)
     } else if let Some(workspace) = workspace.as_deref() {
+        // A session-scoped fallback is previewed without filesystem mutation.
+        // Materialize it before opening the workspace catalog, but do not
+        // publish it into runtime state until the base session checkpoint is
+        // durable below. The resolver refuses to recreate missing paths
+        // outside its authoritative root.
+        state
+            .workspace_resolver
+            .materialize_resolved_workspace(workspace)
+            .map_err(|error| {
+                workflow_catalog_unavailable_response(&bamboo_skills::SkillError::Io(error))
+            })?;
         let store = state
             .skill_manager
             .store_for_workspace(Some(workspace))
             .await
-            .map_err(|error| {
-                crate::error::json_error(
-                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Workflow catalog is unavailable: {error}"),
-                )
-            })?;
+            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
         let activation = state
             .skill_manager
             .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
@@ -289,12 +331,7 @@ async fn pin_explicit_workflow_candidate(
             .skill_manager
             .store_for_workspace(None)
             .await
-            .map_err(|error| {
-                crate::error::json_error(
-                    actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Workflow catalog is unavailable: {error}"),
-                )
-            })?;
+            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
         let activation = state
             .skill_manager
             .resolve_and_pin_activation_for_request_with_mode_and_budget(
@@ -315,15 +352,7 @@ async fn pin_explicit_workflow_candidate(
                 .skill_manager
                 .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
                 .await;
-            return Err(workflow_selection_error_response(
-                bamboo_skills::WorkflowActivationDiagnostic {
-                    code: bamboo_skills::WorkflowActivationErrorCode::RevisionMissing,
-                    message: format!(
-                        "selected workflow could not be pinned at its catalog revision: {error}"
-                    ),
-                    recoverable: true,
-                },
-            ));
+            return Err(workflow_catalog_unavailable_response(&error));
         }
     };
     let snapshot = match store
@@ -358,6 +387,237 @@ async fn pin_explicit_workflow_candidate(
         return Err(workflow_selection_error_response(diagnostic));
     }
     Ok(staging_activation_id)
+}
+
+struct StagedWorkflowActivation {
+    activation_id: String,
+    metadata_upserts: Vec<(String, String)>,
+    metadata_removals: Vec<String>,
+    skill_manager: std::sync::Arc<bamboo_skills::SkillManager>,
+    cleanup_armed: bool,
+}
+
+impl Drop for StagedWorkflowActivation {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        let skill_manager = self.skill_manager.clone();
+        let activation_id = self.activation_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let _cleanup = handle.spawn(async move {
+                    if let Err(error) = skill_manager
+                        .release_activation_for_workspace(&activation_id, None)
+                        .await
+                    {
+                        tracing::error!(
+                            %activation_id,
+                            %error,
+                            "failed to release abandoned staged Workflow activation"
+                        );
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::error!(
+                    activation_id = %self.activation_id,
+                    %error,
+                    "runtime unavailable while releasing staged Workflow activation"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkflowMetadataCheckpoint {
+    entries: std::collections::HashMap<String, String>,
+}
+
+impl WorkflowMetadataCheckpoint {
+    fn capture(session: Option<&bamboo_agent_core::Session>) -> Self {
+        let entries = session
+            .into_iter()
+            .flat_map(|session| session.metadata.iter())
+            .filter(|(key, _)| workflow_transaction_metadata_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Self { entries }
+    }
+
+    fn restore(&self, session: &mut bamboo_agent_core::Session) {
+        session
+            .metadata
+            .retain(|key, _| !workflow_transaction_metadata_key(key));
+        session.metadata.extend(self.entries.clone());
+    }
+}
+
+fn workflow_transaction_metadata_key(key: &str) -> bool {
+    key.starts_with("workflow.")
+        || key.starts_with("skill_runtime_")
+        || matches!(key, "selected_skill_ids" | "skill_mode")
+}
+
+fn workflow_runner_is_active(runner: Option<&crate::app_state::AgentRunner>) -> bool {
+    runner.is_some_and(|runner| {
+        matches!(
+            runner.status,
+            crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
+        )
+    })
+}
+
+fn workflow_activation_running_conflict_response(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "workflow_activation_running_conflict",
+            "message": "A running or starting session cannot replace its active Workflow"
+        },
+        "session_id": session_id,
+    }))
+}
+
+#[cfg(test)]
+struct WorkflowCommitTestBarrier {
+    reached: tokio::sync::Semaphore,
+    resume: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for WorkflowCommitTestBarrier {
+    fn default() -> Self {
+        Self {
+            reached: tokio::sync::Semaphore::new(0),
+            resume: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+static WORKFLOW_COMMIT_TEST_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WorkflowCommitTestBarrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static WORKFLOW_POST_SAVE_TEST_BARRIERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WorkflowCommitTestBarrier>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn install_workflow_commit_test_barrier(
+    session_id: &str,
+) -> std::sync::Arc<WorkflowCommitTestBarrier> {
+    let barrier = std::sync::Arc::new(WorkflowCommitTestBarrier::default());
+    WORKFLOW_COMMIT_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session_id.to_string(), barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_workflow_commit_test_barrier(session_id: &str) {
+    let barrier = WORKFLOW_COMMIT_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session_id);
+    if let Some(barrier) = barrier {
+        barrier.reached.add_permits(1);
+        barrier
+            .resume
+            .acquire()
+            .await
+            .expect("workflow commit test barrier remains open")
+            .forget();
+    }
+}
+
+#[cfg(test)]
+fn install_workflow_post_save_test_barrier(
+    session_id: &str,
+) -> std::sync::Arc<WorkflowCommitTestBarrier> {
+    let barrier = std::sync::Arc::new(WorkflowCommitTestBarrier::default());
+    WORKFLOW_POST_SAVE_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session_id.to_string(), barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_workflow_post_save_test_barrier(session_id: &str) {
+    let barrier = WORKFLOW_POST_SAVE_TEST_BARRIERS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(session_id);
+    if let Some(barrier) = barrier {
+        barrier.reached.add_permits(1);
+        barrier
+            .resume
+            .acquire()
+            .await
+            .expect("workflow post-save test barrier remains open")
+            .forget();
+    }
+}
+
+impl StagedWorkflowActivation {
+    fn between(
+        activation_id: String,
+        current: &std::collections::HashMap<String, String>,
+        candidate: &std::collections::HashMap<String, String>,
+        skill_manager: std::sync::Arc<bamboo_skills::SkillManager>,
+    ) -> Self {
+        let metadata_upserts = candidate
+            .iter()
+            .filter(|(key, value)| {
+                workflow_transaction_metadata_key(key) && current.get(*key) != Some(*value)
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let metadata_removals = current
+            .keys()
+            .filter(|key| workflow_transaction_metadata_key(key) && !candidate.contains_key(*key))
+            .cloned()
+            .collect();
+        Self {
+            activation_id,
+            metadata_upserts,
+            metadata_removals,
+            skill_manager,
+            cleanup_armed: true,
+        }
+    }
+
+    fn apply(&self, metadata: &mut std::collections::HashMap<String, String>) {
+        for key in &self.metadata_removals {
+            metadata.remove(key);
+        }
+        for (key, value) in &self.metadata_upserts {
+            metadata.insert(key.clone(), value.clone());
+        }
+    }
+
+    async fn release(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        match self
+            .skill_manager
+            .release_activation_for_workspace(&self.activation_id, None)
+            .await
+        {
+            Ok(()) => self.cleanup_armed = false,
+            Err(error) => tracing::error!(
+                activation_id = %self.activation_id,
+                %error,
+                "failed to release staged Workflow activation"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +888,7 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         return project_context_error_response(error);
     }
     let workspace_was_explicit = req.workspace_path.is_some();
+    let requested_workflow_selection = req.workflow_selection.clone();
     let mut input = bamboo_engine::session_app::types::ChatTurnInput {
         session_id: session_id.clone(),
         project_id: effective_project_id,
@@ -646,8 +907,15 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             .then(|| project_preflight.workspace_path_meta())
             .flatten(),
         default_workspace_path: configured_default_workspace,
-        selected_skill_ids: req.selected_skill_ids.clone(),
-        workflow_selection: req.workflow_selection.clone(),
+        selected_skill_ids: if requested_workflow_selection.is_some() {
+            None
+        } else {
+            req.selected_skill_ids.clone()
+        },
+        // A typed selection is resolved into a separate candidate below. The
+        // authoritative session must retain its current activation until every
+        // fallible hook, attachment and message write in this request succeeds.
+        workflow_selection: None,
         orchestration_opt_in: req.orchestration_opt_in,
         copilot_conclusion_with_options_enhancement_enabled: req
             .copilot_conclusion_with_options_enhancement_enabled,
@@ -659,6 +927,20 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     // same lock and therefore cannot slip between the second load and a stale
     // chat snapshot save.
     let persistence_guard = state.persistence.acquire_lock(&session_id).await;
+    // Reject an already-running session before doing catalog or hook work. A
+    // second check immediately before publication below closes the race with a
+    // reservation that appears while this request is being prepared.
+    if requested_workflow_selection.is_some() {
+        let runners = state.agent_runners.read().await;
+        let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
+        let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
+            state.as_ref(),
+            &session_id,
+        );
+        if runner_is_active || startup_is_active {
+            return workflow_activation_running_conflict_response(&session_id);
+        }
+    }
     let authoritative_session = match state.persistence.storage().load_session(&session_id).await {
         Ok(session) => session,
         Err(error) => {
@@ -669,6 +951,8 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
             );
         }
     };
+    let workflow_metadata_checkpoint =
+        WorkflowMetadataCheckpoint::capture(authoritative_session.as_ref());
     let authoritative_workspace_present = authoritative_session.as_ref().is_some_and(|session| {
         session.workspace_path_meta().is_some()
             && session
@@ -783,44 +1067,51 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     {
         return project_context_error_response(error);
     }
-    let staged_workflow_activation = if let Some(selection) = req.workflow_selection.as_ref() {
-        let disabled_skill_ids = config_snapshot.disabled_skill_ids();
-        let staging_id = match pin_explicit_workflow_candidate(
-            state.as_ref(),
-            &mut session,
-            selection,
-            &disabled_skill_ids,
-        )
-        .await
-        {
-            Ok(staging_id) => staging_id,
-            Err(response) => return response,
+    let mut staged_workflow_activation =
+        if let Some(selection) = requested_workflow_selection.as_ref() {
+            let mut candidate = session.clone();
+            if let Err(error) = bamboo_engine::session_app::chat::resolve_workflow_selection(
+                &mut candidate,
+                Some(selection),
+                req.selected_skill_ids.as_deref(),
+                &req.message,
+            ) {
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": crate::error::error_value(error.to_string())
+                }));
+            }
+            let disabled_skill_ids = config_snapshot.disabled_skill_ids();
+            let staging_id = match pin_explicit_workflow_candidate(
+                state.as_ref(),
+                &mut candidate,
+                selection,
+                &disabled_skill_ids,
+            )
+            .await
+            {
+                Ok(staging_id) => staging_id,
+                Err(response) => return response,
+            };
+            Some(StagedWorkflowActivation::between(
+                staging_id,
+                &session.metadata,
+                &candidate.metadata,
+                state.skill_manager.clone(),
+            ))
+        } else {
+            None
         };
-        Some(staging_id)
-    } else {
-        None
-    };
-    if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-        if let Some(staging_id) = staged_workflow_activation.as_deref() {
-            let _ = state
-                .skill_manager
-                .release_activation_for_workspace(staging_id, None)
-                .await;
+    // Publish the prepared checkpoint without any speculative Workflow
+    // normalization. The in-memory turn keeps those changes for a successful
+    // final commit, while every rejected/failing path continues to expose the
+    // exact pre-request Workflow authority.
+    let mut durable_base = session.clone();
+    workflow_metadata_checkpoint.restore(&mut durable_base);
+    if let Err(response) = save_and_cache_session_locked(state.as_ref(), &durable_base).await {
+        if let Some(staging) = staged_workflow_activation.as_mut() {
+            staging.release().await;
         }
         return response;
-    }
-    if let Some(staging_id) = staged_workflow_activation.as_deref() {
-        // The durable exact snapshot now owns the next execution. Remove any
-        // prior live activation only after that commit, then drop staging. A
-        // subsequent execute restores from the persisted candidate bytes.
-        let _ = state
-            .skill_manager
-            .release_activation_for_workspace(&session.id, None)
-            .await;
-        let _ = state
-            .skill_manager
-            .release_activation_for_workspace(staging_id, None)
-            .await;
     }
     sync_runtime_workspace(
         state.as_ref(),
@@ -851,7 +1142,11 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     {
         Ok(message) => message,
         Err(reason) => {
+            if let Some(staging) = staged_workflow_activation.as_mut() {
+                staging.release().await;
+            }
             // Persist the hook checkpoint but never the rejected user message.
+            workflow_metadata_checkpoint.restore(&mut session);
             if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
                 return response;
             }
@@ -872,9 +1167,39 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
         // Goal metadata writers acquire the same per-session lock and load the
         // latest durable session themselves. The prepared checkpoint is
         // already durable, so hand ownership over before invoking them.
+        if let Some(staging) = staged_workflow_activation.as_mut() {
+            staging.release().await;
+        }
         drop(persistence_guard);
         return handle_goal_command(state.as_ref(), &session_id, &goal_cmd).await;
     }
+
+    #[cfg(test)]
+    wait_at_workflow_commit_test_barrier(&session_id).await;
+
+    // A typed activation replaces both durable Workflow metadata and the
+    // session-id keyed immutable skill pin. Re-check after all fallible hook
+    // work, then retain the runners read guard through attachment persistence,
+    // the final session save and pin handoff. The persistence lock linearizes
+    // HTTP execute startup; the runners guard closes reservation races from
+    // resume, schedule and connect entry points.
+    let workflow_commit_guard = if staged_workflow_activation.is_some() {
+        let runners = state.agent_runners.clone().read_owned().await;
+        let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
+        let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
+            state.as_ref(),
+            &session_id,
+        );
+        if runner_is_active || startup_is_active {
+            if let Some(staging) = staged_workflow_activation.as_mut() {
+                staging.release().await;
+            }
+            return workflow_activation_running_conflict_response(&session_id);
+        }
+        Some(runners)
+    } else {
+        None
+    };
 
     // Image handling stays in the handler layer (depends on AppState attachment reader).
     if let Err(response) = images::append_user_message(
@@ -885,46 +1210,74 @@ async fn handle_chat(state: web::Data<AppState>, req: web::Json<ChatRequest>) ->
     )
     .await
     {
+        if let Some(staging) = staged_workflow_activation.as_mut() {
+            staging.release().await;
+        }
         return response;
     }
 
-    // Re-save to persist image attachments (if any).
-    if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-        return response;
-    }
+    if let Some(mut staging) = staged_workflow_activation {
+        staging.apply(&mut session.metadata);
+        let commit_state = state.clone();
+        let commit_session_id = session_id.clone();
+        let commit = tokio::spawn(async move {
+            // These owned guards make the exact save -> pin handoff
+            // cancellation-resistant. Dropping the caller's HTTP future only
+            // detaches this task; it cannot expose committed B metadata while
+            // the session-id pin still serves A.
+            let _persistence_guard = persistence_guard;
+            let _workflow_commit_guard = workflow_commit_guard;
+            if let Err(error) =
+                persist_and_cache_session_locked(commit_state.as_ref(), &session).await
+            {
+                staging.release().await;
+                return Err(error.to_string());
+            }
+            #[cfg(test)]
+            wait_at_workflow_post_save_test_barrier(&commit_session_id).await;
 
-    // Publish the user message onto the account change feed so other clients
-    // see it without reloading history. The feed seq becomes the message's
-    // delta coordinate for `GET /history?since`.
-    if let Some(msg) = session.messages.last() {
-        state.account_sink.record(
-            Some(&session_id),
-            &bamboo_agent_core::AgentEvent::MessageAppended {
-                session_id: session_id.clone(),
-                message_id: msg.id.clone(),
-                role: msg.role.clone(),
-                content: msg.content.clone(),
-                created_at: msg.created_at,
-            },
-        );
-    }
-
-    tracing::debug!(
-        "[{}] Chat turn persisted: messages={}, last_role={:?} -> client should now POST /execute",
-        session_id,
-        session.messages.len(),
-        session.messages.last().map(|m| format!("{:?}", m.role)),
-    );
-    let should_generate_title = !session.title_generated;
-    drop(persistence_guard);
-
-    // Start title generation immediately after the user message is durable.
-    // This is intentionally independent of POST /execute and assistant-stream
-    // completion. Failed/no-text attempts leave the lifecycle pending, so a
-    // later durable user message can retry; the in-flight guard deduplicates
-    // overlapping chat requests.
-    if should_generate_title {
-        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.clone());
+            // The durable user turn and exact snapshot now own the next
+            // execution. Only now may the prior live activation be released.
+            if let Err(error) = commit_state
+                .skill_manager
+                .release_activation_for_workspace(&commit_session_id, None)
+                .await
+            {
+                tracing::error!(
+                    session_id = %commit_session_id,
+                    %error,
+                    "failed to release prior Workflow activation after commit"
+                );
+            }
+            staging.release().await;
+            publish_committed_chat(&commit_state, &session);
+            Ok::<(), String>(())
+        });
+        match commit.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "Failed to persist chat session: {error}"
+                    ))
+                }));
+            }
+            Err(error) => {
+                tracing::error!(%error, "typed Workflow chat commit task failed");
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to commit typed Workflow chat",
+                );
+            }
+        }
+    } else {
+        // Re-save to persist image attachments (if any).
+        if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
+            return response;
+        }
+        drop(workflow_commit_guard);
+        publish_committed_chat(&state, &session);
+        drop(persistence_guard);
     }
 
     HttpResponse::Created().json(ChatResponse {

@@ -5,7 +5,8 @@ use actix_web::{web, HttpResponse, Result};
 use crate::app_state::AppState;
 
 use super::super::super::types::{
-    GetSessionResponse, ListSessionsQuery, ListSessionsResponse, SessionSummary,
+    GetSessionResponse, ListSessionsQuery, ListSessionsResponse, SessionActiveWorkflow,
+    SessionSummary,
 };
 use super::running::{is_session_running, running_session_ids};
 
@@ -101,31 +102,78 @@ pub async fn get_session(
             // Load the authoritative session once for both its ETag and the
             // public-safe active Workflow identity. The index deliberately
             // does not mirror this richer lifecycle object.
-            let durable_session = state.storage.load_session(&session_id).await.ok().flatten();
-            summary.active_workflow = durable_session.as_ref().and_then(|session| {
-                session
-                    .metadata
-                    .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
-                    .and_then(|raw| match serde_json::from_str(raw) {
-                        Ok(active) => Some(active),
-                        Err(error) => {
+            let durable_session = match state.storage.load_session(&session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    tracing::warn!(
+                        %session_id,
+                        "session index entry has no authoritative durable session"
+                    );
+                    return Ok(HttpResponse::NotFound().json(serde_json::json!({
+                        "error": crate::error::error_value("Session not found"),
+                        "session_id": session_id
+                    })));
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %session_id,
+                        %error,
+                        "failed to load authoritative session detail"
+                    );
+                    return Ok(crate::error::json_error(
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to load session detail",
+                    ));
+                }
+            };
+            let selected_catalog = durable_session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY)
+                .and_then(|raw| {
+                    serde_json::from_str::<Vec<bamboo_skills::WorkflowCatalogEntry>>(raw)
+                        .map_err(|error| {
                             tracing::warn!(
                                 %session_id,
                                 %error,
-                                "ignoring malformed active Workflow metadata in session detail"
+                                "ignored invalid pinned workflow catalog metadata in session detail"
                             );
-                            None
-                        }
-                    })
-            });
+                        })
+                        .ok()
+                })
+                .unwrap_or_default();
+            summary.active_workflow = match durable_session
+                .metadata
+                .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            {
+                Some(raw) => match serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw) {
+                    Ok(active) => {
+                        let entry = selected_catalog.iter().find(|entry| {
+                            entry.id == active.id
+                                && entry.source == active.source
+                                && entry.revision == active.revision
+                        });
+                        Some(SessionActiveWorkflow::from_active(active, entry))
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %session_id,
+                            %error,
+                            "active Workflow metadata is malformed in authoritative session detail"
+                        );
+                        return Ok(crate::error::json_error(
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to load active Workflow state",
+                        ));
+                    }
+                },
+                None => None,
+            };
             // Surface the session ETag (`metadata_version`) so clients can send
             // it back as `If-Match` on metadata writes (optimistic concurrency).
-            let etag = durable_session.map(|session| session.metadata_version);
+            let etag = durable_session.metadata_version;
 
             let mut response = HttpResponse::Ok();
-            if let Some(version) = etag {
-                response.insert_header((actix_web::http::header::ETAG, format!("\"{version}\"")));
-            }
+            response.insert_header((actix_web::http::header::ETAG, format!("\"{etag}\"")));
             Ok(response.json(GetSessionResponse { session: summary }))
         }
         None => Ok(HttpResponse::NotFound().json(serde_json::json!({
@@ -310,8 +358,36 @@ mod pagination_http_tests {
                 "invoked_by": "user",
                 "activated_at": "2026-08-21T00:00:00Z",
                 "status": "active",
-                "context_fingerprint": "sha256:test"
+                "context_fingerprint": "sha256:test",
+                "dynamic_context": [{
+                    "provider_id": "private-provider",
+                    "tool": "context",
+                    "provenance": "private",
+                    "generated_at": "2026-08-21T00:00:00Z",
+                    "expires_at": null,
+                    "status": "active",
+                    "stop_on_failure": false,
+                    "content": "secret dynamic provider output"
+                }]
             })
+            .to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY.to_string(),
+            serde_json::json!([{
+                "id": "review",
+                "name": "Review changes",
+                "description": "Pinned public metadata",
+                "kind": "instruction",
+                "source": "builtin",
+                "revision": 7,
+                "version": "3",
+                "invocation_policy": {"automatic": true, "explicit": true},
+                "argument_schema": {"type": "object"},
+                "status": "valid",
+                "legacy": false,
+                "winner": true
+            }])
             .to_string(),
         );
         state.save_and_cache_session(&mut session).await;
@@ -339,11 +415,113 @@ mod pagination_http_tests {
         )
         .await;
         assert_eq!(detail["session"]["active_workflow"]["id"], "review");
-        assert_eq!(detail["session"]["active_workflow"]["source"], "builtin");
         assert_eq!(
-            detail["session"]["active_workflow"]["args"]["focus"],
-            "security"
+            detail["session"]["active_workflow"]["name"],
+            "Review changes"
         );
-        assert!(detail["session"]["active_workflow"].get("prompt").is_none());
+        assert_eq!(detail["session"]["active_workflow"]["source"], "builtin");
+        assert_eq!(detail["session"]["active_workflow"]["version"], "3");
+        let active = &detail["session"]["active_workflow"];
+        assert_eq!(active["kind"], "instruction");
+        assert_eq!(active["invoked_by"], "user");
+        assert!(active.get("args").is_none());
+        assert!(active.get("context_fingerprint").is_none());
+        assert!(active.get("dynamic_context").is_none());
+        assert!(!detail
+            .to_string()
+            .contains("secret dynamic provider output"));
+    }
+
+    #[actix_web::test]
+    async fn session_detail_fails_closed_when_durable_load_fails() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("broken-session-detail", "model");
+        state.save_and_cache_session(&mut session).await;
+        let entry = state
+            .session_store
+            .get_index_entry("broken-session-detail")
+            .await
+            .expect("durable index entry");
+        let session_json = temp_dir.path().join(entry.rel_path).join("session.json");
+        tokio::fs::remove_file(&session_json)
+            .await
+            .expect("remove durable session file");
+        tokio::fs::create_dir(&session_json)
+            .await
+            .expect("inject unreadable session path");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/broken-session-detail")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .is_none());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["message"], "Failed to load session detail");
+        assert!(!body
+            .to_string()
+            .contains(&session_json.to_string_lossy()[..]));
+    }
+
+    #[actix_web::test]
+    async fn session_detail_fails_closed_for_malformed_active_workflow_metadata() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("malformed-active-workflow", "model");
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            r#"{"id":"private-id","args":{"api_key":"must-not-echo"}"#.to_string(),
+        );
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(App::new().app_data(state).configure(configure_routes)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/malformed-active-workflow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .is_none());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "Failed to load active Workflow state"
+        );
+        assert!(!body.to_string().contains("must-not-echo"));
+        assert!(!body.to_string().contains("private-id"));
     }
 }

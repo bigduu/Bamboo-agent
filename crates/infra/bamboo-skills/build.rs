@@ -13,6 +13,18 @@ const BUILTIN_SKILL_WHITELIST: &[&str] = &[
     "skill-creator",
 ];
 
+// Git executable bits are not represented consistently in a Windows checkout.
+// Keep the embedded permission contract explicit and platform-independent.
+const BUILTIN_EXECUTABLE_FILES: &[&str] = &[
+    "skill-creator/scripts/aggregate_benchmark.py",
+    "skill-creator/scripts/generate_report.py",
+    "skill-creator/scripts/improve_description.py",
+    "skill-creator/scripts/package_skill.py",
+    "skill-creator/scripts/quick_validate.py",
+    "skill-creator/scripts/run_eval.py",
+    "skill-creator/scripts/run_loop.py",
+];
+
 fn is_builtin_skill_enabled(name: &str) -> bool {
     BUILTIN_SKILL_WHITELIST.contains(&name)
 }
@@ -80,16 +92,26 @@ fn main() -> io::Result<()> {
 
     files.sort();
 
+    for executable in BUILTIN_EXECUTABLE_FILES {
+        if !files.iter().any(|path| to_unix_path(path) == *executable) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("builtin executable manifest references missing file '{executable}'"),
+            ));
+        }
+    }
+
     writeln!(
         file,
-        "pub static BUILTIN_SKILL_FILES: &[(&str, &[u8])] = &["
+        "pub static BUILTIN_SKILL_FILES: &[(&str, &[u8], bool)] = &["
     )?;
     for relative in files {
         let relative_unix = to_unix_path(&relative);
+        let executable = BUILTIN_EXECUTABLE_FILES.contains(&relative_unix.as_str());
         writeln!(
             file,
-            "    (\"{relative}\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../../builtin_skills/{relative}\"))),",
-            relative = relative_unix
+            "    (\"{relative}\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../../builtin_skills/{relative}\")), {executable}),",
+            relative = relative_unix,
         )?;
     }
     writeln!(file, "];")?;
