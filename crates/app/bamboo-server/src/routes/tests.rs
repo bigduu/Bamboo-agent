@@ -98,31 +98,36 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
     // A representative sample spanning every route group registered by
     // `bamboo_routes_scope` (commands / settings / skills / tools / workspace /
     // copilot / provider-catalog / provider-instances / cluster nodes).
-    let relative_paths = [
-        "/commands",
-        "/bamboo/workflows",
-        "/sessions/session/workflow-runs",
-        "/sessions/session/workflow-runs/example",
-        "/bamboo/setup/status",
-        "/bamboo/config",
-        "/bamboo/config/notifications",
-        "/bamboo/config/connect",
-        "/bamboo/access/status",
-        "/bamboo/model-limits/defaults",
-        "/bamboo/tools",
-        "/bamboo/env-vars",
-        "/skills",
-        "/skills/available-tools",
-        "/workspace/recent",
-        "/bamboo/provider-catalog",
-        "/bamboo/settings/provider-instances",
-        "/bamboo/settings/nodes",
+    let relative_routes = [
+        ("GET", "/commands"),
+        ("GET", "/bamboo/workflows"),
+        ("POST", "/bamboo/workflow-catalog/builtin-workflow/clone"),
+        ("GET", "/sessions/session/workflow-runs"),
+        ("GET", "/sessions/session/workflow-runs/example"),
+        ("GET", "/bamboo/setup/status"),
+        ("GET", "/bamboo/config"),
+        ("GET", "/bamboo/config/notifications"),
+        ("GET", "/bamboo/config/connect"),
+        ("GET", "/bamboo/access/status"),
+        ("GET", "/bamboo/model-limits/defaults"),
+        ("GET", "/bamboo/tools"),
+        ("GET", "/bamboo/env-vars"),
+        ("GET", "/skills"),
+        ("GET", "/skills/available-tools"),
+        ("GET", "/workspace/recent"),
+        ("GET", "/bamboo/provider-catalog"),
+        ("GET", "/bamboo/settings/provider-instances"),
+        ("GET", "/bamboo/settings/nodes"),
     ];
 
-    for relative in relative_paths {
+    for (method, relative) in relative_routes {
         for prefix in ["/api/v1", "/v1"] {
             let uri = format!("{prefix}{relative}");
-            let req = test::TestRequest::get()
+            let request = match method {
+                "POST" => test::TestRequest::post(),
+                _ => test::TestRequest::get(),
+            };
+            let req = request
                 .uri(&uri)
                 .insert_header((header::HOST, "localhost:9562"))
                 .to_request();
@@ -130,7 +135,7 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
             assert_ne!(
                 resp.status(),
                 StatusCode::NOT_FOUND,
-                "expected {uri} to be registered (alias parity, #251 finding 1)"
+                "expected {method} {uri} to be registered (alias parity, #251 finding 1)"
             );
         }
     }

@@ -31,6 +31,39 @@ migrated bundle remains manual-only. The catalog reports the canonical winner
 as `migration_status: "migrated"` and retains the legacy adapter as a shadowed
 diagnostic.
 
+Product clients build one metadata-only Workflow Library from instruction,
+orchestration, and legacy entries returned by
+`GET /api/v1/bamboo/workflow-catalog`. `GET /api/v1/commands` remains the
+separate compatibility surface for slash commands, MCP tools, goals, and other
+non-Workflow palette actions. Neither endpoint returns Workflow instructions
+or resource bytes. Changes, invalid definitions, and LKG recovery in either
+Workflow namespace publish `workflow.changed`, `workflow.invalid`, or
+`workflow.recovered` on the account feed; the 30-second client cache is only a
+fallback when the event stream is unavailable.
+
+Versioned builtins are read-only. A client may clone one exact builtin through
+`POST /api/v1/bamboo/workflow-catalog/<id>/clone` with
+`{"source":"builtin","revision":<n>,"target":"user"}` or target
+`"project"` plus a trusted `session_id`. Bamboo resolves every destination
+from server-owned state, writes the bundle outside the scanned skills tree,
+fsyncs it, and atomically renames it into place. A stale source, existing
+override, divergent recovery marker, symlink, or client filesystem path is
+rejected; the builtin is never changed. Interrupted publications resume only
+when their source revision and content digest still match.
+
+Explicit instruction activation uses the typed `POST /api/v1/chat` field
+`workflow_selection: {id, source, revision, args}`. The request never carries
+expanded instructions. Bamboo validates arguments, pins the exact immutable
+bundle before acknowledging the chat turn, and persists the candidate snapshot
+with the session so a restart between chat and execute cannot substitute a
+newer revision. Stale or missing identities fail before the user message is
+committed. `GET /api/v1/sessions/<id>` returns the public-safe
+`active_workflow` identity after activation; arguments, context fingerprints,
+dynamic provider output, and immutable bundle bytes remain server-internal.
+List rows remain lightweight. Project or Workspace reassignment atomically
+clears the old scoped activation, and a persisted bundle snapshot is accepted
+after restart only by the exact resource scope that produced it.
+
 [Claude Code Skills and legacy custom-command compatibility](https://code.claude.com/docs/en/slash-commands)
 remain rooted in `.claude/skills` and `<workspace>/.claude/commands`; Bamboo
 does not introduce or label a `.claude/workflows` convention. Repository

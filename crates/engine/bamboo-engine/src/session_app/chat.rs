@@ -9,7 +9,9 @@ use bamboo_skills::selection::normalize_selected_skill_ids;
 use bamboo_skills::{
     ActiveWorkflow, WorkflowActivationStatus, WorkflowSelection, ACTIVE_WORKFLOW_METADATA_KEY,
     ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY, WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
-    WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY, WORKFLOW_SELECTION_METADATA_KEY,
+    WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY, WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+    WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY, WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY,
+    WORKFLOW_SELECTION_METADATA_KEY,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -493,6 +495,28 @@ pub fn resolve_workflow_selection(
         return Ok(());
     }
 
+    // A typed chat candidate is durable authority for the next execute, even
+    // when another ordinary message is appended before execution starts.
+    // Keep its visible selected id aligned with the retained immutable
+    // snapshot; only an explicit replacement/deactivation may cancel it.
+    if let Some(pending) = session
+        .metadata
+        .get(WORKFLOW_SELECTION_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok())
+        .filter(|_| {
+            session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                .is_some_and(|source| source == "explicit")
+                && session.metadata.contains_key(
+                    bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+                )
+        })
+    {
+        persist_selected_skill_ids_metadata(session, Some(&[pending.id]));
+        return Ok(());
+    }
+
     if let Some(active) = session
         .metadata
         .get(ACTIVE_WORKFLOW_METADATA_KEY)
@@ -537,6 +561,67 @@ fn deactivate_active_workflow(session: &mut Session) {
 pub fn clear_skill_runtime_state(session: &mut Session) {
     session.metadata.remove(SKILL_RUNTIME_LOADED_KEY);
     session.metadata.remove(SKILL_RUNTIME_LAST_KEY);
+}
+
+/// Remove every workflow authority tied to the session's previous
+/// Project/workspace publication. Callers must persist this mutation before
+/// releasing the corresponding in-memory pin.
+pub fn clear_workflow_authority_for_resource_scope_change(session: &mut Session) -> bool {
+    let active_identity = session
+        .metadata
+        .get(ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<ActiveWorkflow>(raw).ok())
+        .map(|active| (active.id, active.revision))
+        .or_else(|| {
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok())
+                .map(|selection| (selection.id, selection.revision))
+        });
+    let had_authority = active_identity.is_some()
+        || session.selected_skill_ids().is_some()
+        || session.metadata.keys().any(|key| {
+            key.starts_with("skill_runtime_")
+                || matches!(
+                    key.as_str(),
+                    WORKFLOW_SELECTION_METADATA_KEY
+                        | ACTIVE_WORKFLOW_METADATA_KEY
+                        | ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY
+                        | WORKFLOW_CONTEXT_CACHE_METADATA_KEY
+                        | WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY
+                        | WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY
+                )
+        });
+
+    session.metadata.retain(|key, _| {
+        !key.starts_with("skill_runtime_")
+            && !matches!(
+                key.as_str(),
+                WORKFLOW_SELECTION_METADATA_KEY
+                    | ACTIVE_WORKFLOW_METADATA_KEY
+                    | ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY
+                    | WORKFLOW_ACTIVATION_EVENT_METADATA_KEY
+                    | WORKFLOW_CONTEXT_CACHE_METADATA_KEY
+                    | WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY
+                    | WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY
+            )
+    });
+    session.clear_selected_skill_ids();
+    if let Some((workflow_id, revision)) = active_identity {
+        session.metadata.insert(
+            WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "type": "workflow.deactivated",
+                "workflow_id": workflow_id,
+                "revision": revision,
+                "reason": "resource_scope_changed",
+                "deactivated_at": chrono::Utc::now(),
+            })
+            .to_string(),
+        );
+    }
+    had_authority
 }
 
 fn persist_selected_skill_ids_metadata(
@@ -1046,6 +1131,47 @@ mod tests {
             Some(vec!["review".to_string()])
         );
         assert!(session.metadata.contains_key(ACTIVE_WORKFLOW_METADATA_KEY));
+    }
+
+    #[test]
+    fn pending_typed_workflow_survives_an_ordinary_chat_before_execute() {
+        let mut session = Session::new("pending-selection", "model");
+        let selection = WorkflowSelection {
+            id: "review".to_string(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: 7,
+            args: serde_json::json!({}),
+        };
+        session.metadata.insert(
+            WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).expect("selection json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(),
+            "opaque durable snapshot".to_string(),
+        );
+
+        resolve_workflow_selection(&mut session, None, None, "one more detail")
+            .expect("retain pending selection");
+
+        assert_eq!(
+            session.selected_skill_ids(),
+            Some(vec!["review".to_string()])
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok()),
+            Some(selection)
+        );
+        assert!(session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY));
     }
 
     #[test]

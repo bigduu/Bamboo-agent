@@ -30,6 +30,12 @@ mod patch_test_hooks {
         HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    fn scope_commit_hooks() -> &'static Mutex<HashMap<String, Arc<PermissionInterleaveHook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<PermissionInterleaveHook>>>> =
+            OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
     pub(super) fn install(session_id: &str) -> Arc<PermissionInterleaveHook> {
         let hook = Arc::new(PermissionInterleaveHook {
             reached: Notify::new(),
@@ -46,6 +52,29 @@ mod patch_test_hooks {
         let hook = hooks()
             .lock()
             .expect("permission interleave hooks lock")
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    pub(super) fn install_scope_commit(session_id: &str) -> Arc<PermissionInterleaveHook> {
+        let hook = Arc::new(PermissionInterleaveHook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        scope_commit_hooks()
+            .lock()
+            .expect("scope commit hooks lock")
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause_after_scope_save(session_id: &str) {
+        let hook = scope_commit_hooks()
+            .lock()
+            .expect("scope commit hooks lock")
             .remove(session_id);
         if let Some(hook) = hook {
             hook.reached.notify_one();
@@ -246,7 +275,7 @@ pub async fn patch_session(
                 "session_id": session_id,
             })));
         };
-        let _guard = state.persistence.acquire_lock(&session_id).await;
+        let guard = state.persistence.acquire_lock(&session_id).await;
         if is_session_running(&state, &session_id).await
             || crate::handlers::agent::events::execute_startup_is_in_flight(
                 state.as_ref(),
@@ -447,6 +476,10 @@ pub async fn patch_session(
                             bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
                         )));
         if membership_changed || workspace_changed {
+            let workflow_scope_changed =
+                bamboo_engine::session_app::chat::clear_workflow_authority_for_resource_scope_change(
+                    &mut session,
+                );
             match target.as_ref() {
                 Some(project_id) if membership_changed => {
                     session.set_project_id_meta(project_id.to_string())
@@ -486,40 +519,81 @@ pub async fn patch_session(
                 return Ok(project_context_error_response(error));
             }
 
-            state
-                .persistence
-                .storage()
-                .save_session(&session)
-                .await
-                .map_err(|error| {
-                    crate::error::json_internal_server_error(format!(
-                        "Failed to save Project/Workspace update: {error}"
-                    ))
-                })?;
-            state.sessions.insert(
-                session_id.clone(),
-                std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
-            );
-            if let Some(workspace) = session
-                .workspace_path_meta()
-                .map(std::path::PathBuf::from)
-                .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
-            {
-                state.workspace_resolver.publish_resolved_workspace(
-                    &session_id,
-                    workspace,
-                    "session_metadata_patch",
+            let commit_state = state.clone();
+            let commit_session_id = session_id.clone();
+            session = match tokio::spawn(async move {
+                // A disconnected PATCH caller must not expose a new durable
+                // resource scope while leaving the cache, event feed or old
+                // immutable Workflow pin behind. The detached task owns the
+                // session lock through the complete post-commit publication.
+                let _guard = guard;
+                if let Err(error) = commit_state
+                    .persistence
+                    .storage()
+                    .save_session(&session)
+                    .await
+                {
+                    tracing::error!(
+                        session_id = %commit_session_id,
+                        %error,
+                        "failed to save Project/Workspace update"
+                    );
+                    return Err("Failed to save Project/Workspace update");
+                }
+                #[cfg(test)]
+                patch_test_hooks::pause_after_scope_save(&commit_session_id).await;
+                if workflow_scope_changed {
+                    if let Err(error) = commit_state
+                        .skill_manager
+                        .release_activation_for_workspace(&commit_session_id, None)
+                        .await
+                    {
+                        tracing::error!(
+                            session_id = %commit_session_id,
+                            %error,
+                            "failed to release prior Workflow activation after scope change"
+                        );
+                    }
+                }
+                commit_state.sessions.insert(
+                    commit_session_id.clone(),
+                    std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
                 );
-            }
-            state.account_sink.record(
-                Some(&session_id),
-                &bamboo_agent_core::AgentEvent::SessionProjectUpdated {
-                    session_id: session_id.clone(),
-                    project_id: target.as_ref().map(ToString::to_string),
-                    workspace_path: session.workspace_path_meta(),
-                    metadata_version: session.metadata_version,
-                },
-            );
+                if let Some(workspace) = session
+                    .workspace_path_meta()
+                    .map(std::path::PathBuf::from)
+                    .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
+                {
+                    commit_state.workspace_resolver.publish_resolved_workspace(
+                        &commit_session_id,
+                        workspace,
+                        "session_metadata_patch",
+                    );
+                }
+                commit_state.account_sink.record(
+                    Some(&commit_session_id),
+                    &bamboo_agent_core::AgentEvent::SessionProjectUpdated {
+                        session_id: commit_session_id.clone(),
+                        project_id: session.project_id_meta(),
+                        workspace_path: session.workspace_path_meta(),
+                        metadata_version: session.metadata_version,
+                    },
+                );
+                Ok::<bamboo_agent_core::Session, &'static str>(session)
+            })
+            .await
+            {
+                Ok(Ok(session)) => session,
+                Ok(Err(message)) => {
+                    return Err(crate::error::json_internal_server_error(message));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Project/Workspace commit task failed");
+                    return Err(crate::error::json_internal_server_error(
+                        "Failed to commit Project/Workspace update",
+                    ));
+                }
+            };
         }
         // Preserve a valid CAS token for any lower-risk fields included in the
         // same PATCH. A real metadata change bumped it; an idempotent request
@@ -820,6 +894,8 @@ mod tests {
 
     use crate::routes::configure_routes;
     use crate::AppState;
+
+    const CONCURRENCY_ASSERT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     async fn new_state() -> web::Data<AppState> {
         let temp_dir = tempdir().expect("tempdir").keep();
@@ -1406,6 +1482,107 @@ mod tests {
         );
     }
 
+    async fn seed_active_workflow_authority(
+        state: &web::Data<AppState>,
+        session_id: &str,
+        project_id: &bamboo_domain::ProjectId,
+        workspace: &Path,
+    ) -> bamboo_skills::SkillActivationSnapshot {
+        let project_home = state.project_store.paths().project_home(project_id);
+        let store = state
+            .skill_manager
+            .store_for_project_workspace(project_id, &project_home, Some(workspace))
+            .await
+            .expect("project workflow store");
+        store
+            .pin_current_activation(session_id, &["plan".to_string()], None)
+            .await
+            .expect("pin active workflow");
+        let snapshot = store
+            .export_activation_snapshot(session_id)
+            .await
+            .expect("durable workflow snapshot");
+        let entry = snapshot.skills.get("plan").expect("plan snapshot");
+        let selection = bamboo_skills::WorkflowSelection {
+            id: "plan".to_string(),
+            source: entry.catalog_entry.source.clone(),
+            revision: entry.revision,
+            args: serde_json::json!({"depth": "full"}),
+        };
+        let active = bamboo_skills::ActiveWorkflow {
+            id: selection.id.clone(),
+            source: selection.source.clone(),
+            revision: selection.revision,
+            kind: entry.catalog_entry.kind,
+            args: selection.args.clone(),
+            invoked_by: bamboo_skills::WorkflowInvokedBy::User,
+            activated_at: chrono::Utc::now(),
+            status: bamboo_skills::WorkflowActivationStatus::Active,
+            diagnostic: None,
+            context_fingerprint: Some("scope-a-context".to_string()),
+            dynamic_context: Vec::new(),
+        };
+        let mut session = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load seeded session")
+            .expect("seeded session");
+        session.metadata.insert(
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).expect("selection json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::to_string(&active).expect("active json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.to_string(),
+            serde_json::to_string(&bamboo_skills::DurableWorkflowActivation {
+                active,
+                snapshot: snapshot.clone(),
+            })
+            .expect("durable json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(),
+            serde_json::to_string(&snapshot).expect("candidate json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY.to_string(),
+            "scope-a-cache".to_string(),
+        );
+        session.set_selected_skill_ids(vec!["plan".to_string()]);
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("persist workflow authority");
+        state.sessions.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        );
+        snapshot
+    }
+
+    fn assert_workflow_authority_cleared(session: &bamboo_agent_core::Session) {
+        assert!(session.selected_skill_ids().is_none());
+        for key in [
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+            bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+        ] {
+            assert!(!session.metadata.contains_key(key), "stale key: {key}");
+        }
+        assert!(session
+            .metadata
+            .get(bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY)
+            .is_some_and(|event| event.contains("resource_scope_changed")));
+    }
+
     #[actix_web::test]
     async fn patch_with_matching_if_match_succeeds_and_bumps_etag() {
         let state = new_state().await;
@@ -1936,6 +2113,314 @@ mod tests {
         );
         assert_eq!(persisted.metadata_version, 0);
         drop(startup_guard);
+    }
+
+    #[actix_web::test]
+    async fn project_reassignment_atomically_clears_old_workflow_scope_and_pin() {
+        let state = new_state().await;
+        let workspace_a = tempdir().expect("workspace A");
+        let workspace_b = tempdir().expect("workspace B");
+        let project_a = state
+            .project_store
+            .create_with_project_path(
+                "Project A",
+                None,
+                workspace_a.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project A");
+        let project_b = state
+            .project_store
+            .create_with_project_path(
+                "Project B",
+                None,
+                workspace_b.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project B");
+        let session_id = "project-workflow-scope-change";
+        seed_session(
+            &state,
+            session_id,
+            Some(&project_a.id),
+            Some(workspace_a.path()),
+        )
+        .await;
+        let old_snapshot =
+            seed_active_workflow_authority(&state, session_id, &project_a.id, workspace_a.path())
+                .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({
+                    "project_id": project_b.id,
+                    "workspace_path": workspace_b.path(),
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load reassigned session")
+            .expect("reassigned session");
+        assert_workflow_authority_cleared(&persisted);
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(project_b.id.as_str())
+        );
+        let old_pin = state
+            .skill_manager
+            .pinned_activation_for_project_workspace(
+                &project_a.id,
+                &state.project_store.paths().project_home(&project_a.id),
+                Some(workspace_a.path()),
+                session_id,
+            )
+            .await
+            .expect("inspect old pin");
+        assert!(old_pin.is_none(), "old Project pin must be released");
+        let new_store = state
+            .skill_manager
+            .store_for_project_workspace(
+                &project_b.id,
+                &state.project_store.paths().project_home(&project_b.id),
+                Some(workspace_b.path()),
+            )
+            .await
+            .expect("new Project store");
+        assert!(new_store
+            .restore_activation_snapshot(session_id, old_snapshot)
+            .await
+            .expect_err("Project A bytes cannot restore in Project B")
+            .to_string()
+            .contains("resource scope mismatch"));
+
+        let restarted = bamboo_storage::SessionStoreV2::new(state.app_data_dir.clone())
+            .await
+            .expect("restart storage");
+        let restarted_session = restarted
+            .load_session(session_id)
+            .await
+            .expect("restart load")
+            .expect("restart session");
+        assert_workflow_authority_cleared(&restarted_session);
+    }
+
+    #[actix_web::test]
+    async fn cancelled_project_reassignment_finishes_scope_and_pin_publication() {
+        let state = new_state().await;
+        let workspace_a = tempdir().expect("workspace A");
+        let workspace_b = tempdir().expect("workspace B");
+        let project_a = state
+            .project_store
+            .create_with_project_path(
+                "Cancellation Project A",
+                None,
+                workspace_a.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project A");
+        let project_b = state
+            .project_store
+            .create_with_project_path(
+                "Cancellation Project B",
+                None,
+                workspace_b.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Project B");
+        let session_id = "cancelled-project-workflow-scope-change";
+        seed_session(
+            &state,
+            session_id,
+            Some(&project_a.id),
+            Some(workspace_a.path()),
+        )
+        .await;
+        seed_active_workflow_authority(&state, session_id, &project_a.id, workspace_a.path()).await;
+        let hook = super::patch_test_hooks::install_scope_commit(session_id);
+        let mut feed = state.account_sink.subscribe();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::IF_MATCH, "\"0\""))
+                    .set_json(serde_json::json!({
+                        "project_id": project_b.id,
+                        "workspace_path": workspace_b.path(),
+                    }))
+                    .to_request(),
+            );
+            tokio::pin!(response);
+            let reached = hook.reached.notified();
+            tokio::pin!(reached);
+            tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+                tokio::select! {
+                    () = &mut reached => {}
+                    early = &mut response => panic!(
+                        "Project PATCH completed before the post-save barrier: {}",
+                        early.status()
+                    ),
+                }
+            })
+            .await
+            .expect("Project PATCH reaches the deterministic post-save barrier");
+
+            let old_pin = state
+                .skill_manager
+                .pinned_activation_for_project_workspace(
+                    &project_a.id,
+                    &state.project_store.paths().project_home(&project_a.id),
+                    Some(workspace_a.path()),
+                    session_id,
+                )
+                .await
+                .expect("inspect old pin before handoff");
+            assert!(old_pin.is_some());
+            // Cancelling the response future must not cancel the detached
+            // durable post-commit publication that still owns the session lock.
+        }
+        hook.resume.notify_one();
+
+        let event = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            loop {
+                let event = feed.recv().await.expect("account feed remains open");
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::SessionProjectUpdated { session_id: id, .. }
+                        if id == session_id
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("detached Project commit publishes its correlated event");
+        assert!(matches!(
+            event.event,
+            bamboo_agent_core::AgentEvent::SessionProjectUpdated { .. }
+        ));
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load committed reassignment")
+            .expect("committed session");
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            Some(project_b.id.as_str())
+        );
+        assert_workflow_authority_cleared(&persisted);
+        assert!(state
+            .skill_manager
+            .pinned_activation_for_project_workspace(
+                &project_a.id,
+                &state.project_store.paths().project_home(&project_a.id),
+                Some(workspace_a.path()),
+                session_id,
+            )
+            .await
+            .expect("inspect released old pin")
+            .is_none());
+        let cached = state.sessions.get(session_id).expect("published cache");
+        assert_eq!(
+            cached.read().project_id_meta().as_deref(),
+            Some(project_b.id.as_str())
+        );
+        drop(cached);
+        let guard = tokio::time::timeout(
+            CONCURRENCY_ASSERT_TIMEOUT,
+            state.persistence.acquire_lock(session_id),
+        )
+        .await
+        .expect("detached Project commit releases the session lock");
+        drop(guard);
+    }
+
+    #[actix_web::test]
+    async fn workspace_switch_clears_old_workflow_scope_and_pin() {
+        let state = new_state().await;
+        let workspace_a = tempdir().expect("workspace A");
+        let workspace_b = tempdir().expect("workspace B");
+        let project = state
+            .project_store
+            .create_with_project_path(
+                "Workspace Scope Project",
+                None,
+                workspace_a.path().to_string_lossy(),
+                vec![binding(workspace_b.path())],
+            )
+            .expect("Project");
+        let session_id = "workspace-workflow-scope-change";
+        seed_session(
+            &state,
+            session_id,
+            Some(&project.id),
+            Some(workspace_a.path()),
+        )
+        .await;
+        seed_active_workflow_authority(&state, session_id, &project.id, workspace_a.path()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{session_id}"))
+                .insert_header((header::IF_MATCH, "\"0\""))
+                .set_json(serde_json::json!({"workspace_path": workspace_b.path()}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("load switched session")
+            .expect("switched session");
+        assert_workflow_authority_cleared(&persisted);
+        assert_eq!(
+            persisted.workspace_path_meta().as_deref(),
+            Some(display(workspace_b.path()).as_str())
+        );
+        let old_pin = state
+            .skill_manager
+            .pinned_activation_for_project_workspace(
+                &project.id,
+                &state.project_store.paths().project_home(&project.id),
+                Some(workspace_a.path()),
+                session_id,
+            )
+            .await
+            .expect("inspect old workspace pin");
+        assert!(old_pin.is_none(), "old workspace pin must be released");
     }
 
     #[actix_web::test]

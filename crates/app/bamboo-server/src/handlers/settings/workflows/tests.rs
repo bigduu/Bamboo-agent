@@ -23,7 +23,7 @@ async fn assert_legacy_endpoint_success(context: &str, response: actix_web::dev:
 }
 
 #[actix_web::test]
-async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_metadata() {
+async fn workflow_catalog_unifies_instruction_and_orchestration_metadata_without_bodies() {
     let data = tempfile::tempdir().expect("data dir");
     let skill = data.path().join("skills/review");
     tokio::fs::create_dir_all(&skill).await.expect("skill dir");
@@ -54,7 +54,7 @@ async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_
             .await
             .expect("app state"),
     );
-    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
         "/catalog",
         actix_web::web::get().to(super::list_workflow_catalog),
     ))
@@ -64,12 +64,102 @@ async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_
         .to_request();
     let body = actix_web::test::call_and_read_body(&app, request).await;
     let text = std::str::from_utf8(&body).expect("utf8 response");
-    assert!(!text.contains("Reviews changes"));
+    assert!(text.contains("Reviews changes"));
+    assert!(text.contains("\"kind\":\"instruction\""));
     assert!(text.contains("Deploys changes"));
+    assert!(text.contains("\"kind\":\"orchestration\""));
     assert!(text.contains("\"revision\""));
     assert!(!text.contains("TOP SECRET INSTRUCTIONS"));
     assert!(!text.contains("WORKFLOW SECRET BODY"));
     assert!(!text.contains("SKILL.md"));
+    let initial: serde_json::Value = serde_json::from_slice(&body).expect("catalog json");
+    let review = initial["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("review entry");
+    assert_eq!(review["source"], "user");
+    assert_eq!(review["status"], "valid");
+    assert!(review["shadowed_candidates"]
+        .as_array()
+        .expect("shadowed candidates")
+        .iter()
+        .any(|candidate| candidate["source"] == "builtin"));
+
+    const PRIVATE_INVALID_FIELD: &str = "private_invalid_catalog_field";
+    const PRIVATE_INVALID_BODY: &str = "PRIVATE INVALID REPLACEMENT BODY";
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: changed too early\n{PRIVATE_INVALID_FIELD}: secret\n---\n{PRIVATE_INVALID_BODY}\n"
+        ),
+    )
+    .await
+    .expect("break instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("invalid publication stays isolated");
+    let invalid: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let invalid_review = invalid["entries"]
+        .as_array()
+        .expect("invalid entries")
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("invalid review remains visible");
+    assert_eq!(invalid_review["status"], "invalid");
+    assert_eq!(invalid_review["description"], "Reviews changes");
+    assert!(invalid_review["last_error"].is_string());
+    let rendered = invalid_review.to_string();
+    assert!(!rendered.contains(PRIVATE_INVALID_FIELD));
+    assert!(!rendered.contains(PRIVATE_INVALID_BODY));
+    assert!(!rendered.contains(data.path().to_string_lossy().as_ref()));
+    assert!(invalid_review["shadowed_candidates"]
+        .as_array()
+        .expect("invalid shadowed candidates")
+        .iter()
+        .any(|candidate| candidate["source"] == "builtin"));
+
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Recovered review\n---\nRECOVERED PRIVATE BODY\n",
+    )
+    .await
+    .expect("repair instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("recovered publication");
+    let recovered: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let recovered_review = recovered["entries"]
+        .as_array()
+        .expect("recovered entries")
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("recovered review");
+    assert_eq!(recovered_review["status"], "valid");
+    assert_eq!(recovered_review["description"], "Recovered review");
+    assert!(recovered_review.get("last_error").is_none());
+    assert!(!recovered_review
+        .to_string()
+        .contains("RECOVERED PRIVATE BODY"));
 }
 
 #[actix_web::test]
@@ -115,6 +205,336 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
         .expect("catalog entries")
         .iter()
         .any(|entry| entry["id"] == "global-review"));
+}
+
+#[actix_web::test]
+async fn builtin_clone_to_user_is_exact_read_only_and_never_overwrites() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let review = state
+        .skill_manager
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let payload = serde_json::json!({
+        "source": "builtin",
+        "revision": review.revision,
+        "target": "user",
+        "session_id": "ignored-for-user-target"
+    });
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&payload)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["entry"]["source"], "user");
+    assert_eq!(body["entry"]["id"], "review");
+    assert_eq!(body["source_preserved"], true);
+    let clone = data.path().join("skills/review/SKILL.md");
+    let builtin = data.path().join("skills-builtin-v1/review/SKILL.md");
+    assert!(clone.is_file());
+    assert!(
+        builtin.is_file(),
+        "read-only builtin source must remain intact"
+    );
+    let cloned_before = std::fs::read(&clone).expect("clone bytes");
+    assert!(!data.path().join("skills/.review.clone-v1.json").exists());
+
+    let conflict = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&payload)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(conflict.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(&clone).expect("clone remains"),
+        cloned_before,
+        "repeat clone must not overwrite an editable user bundle"
+    );
+}
+
+#[actix_web::test]
+async fn builtin_clone_to_project_uses_durable_session_identity_not_a_client_path() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Clone Project", None)
+        .expect("create Project");
+    let mut session = bamboo_agent_core::Session::new("project-clone-session", "model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.save_and_cache_session(&mut session).await;
+    let store = state
+        .skill_manager
+        .store_for_project_workspace(
+            &project.id,
+            &state.project_store.paths().project_home(&project.id),
+            Some(workspace.path()),
+        )
+        .await
+        .expect("Project Workflow store");
+    let review = store
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(serde_json::json!({
+                "source": "builtin",
+                "revision": review.revision,
+                "target": "project",
+                "session_id": "project-clone-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["entry"]["source"], "project");
+    assert!(state
+        .project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills/review/SKILL.md")
+        .is_file());
+    assert!(
+        !data.path().join("skills/review/SKILL.md").exists(),
+        "Project clone must not fall back to the user layer"
+    );
+}
+
+#[actix_web::test]
+async fn builtin_clone_rejects_archived_project_without_writing() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create_with_project_path(
+            "Archived Clone Project",
+            None,
+            workspace.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .expect("create Project");
+    state
+        .project_store
+        .archive(&project.id, project.revision)
+        .expect("archive Project");
+    let mut session = bamboo_agent_core::Session::new("archived-clone-session", "model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    session.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        bamboo_engine::project_context::WorkspaceSource::Explicit
+            .as_str()
+            .to_string(),
+    );
+    state.save_and_cache_session(&mut session).await;
+    let review = state
+        .skill_manager
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(serde_json::json!({
+                "source": "builtin",
+                "revision": review.revision,
+                "target": "project",
+                "session_id": session.id,
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::FORBIDDEN);
+    assert!(!state
+        .project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills/review")
+        .exists());
+}
+
+#[actix_web::test]
+async fn project_clone_serializes_scope_resolution_and_reassignment_through_publication() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace_a = tempfile::tempdir().expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("workspace B");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project_a = state
+        .project_store
+        .create_with_project_path(
+            "Clone Project A",
+            None,
+            workspace_a.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .expect("Project A");
+    let project_b = state
+        .project_store
+        .create_with_project_path(
+            "Clone Project B",
+            None,
+            workspace_b.path().to_string_lossy(),
+            Vec::new(),
+        )
+        .expect("Project B");
+    let session_id = "clone-reassignment-race";
+    let mut session = bamboo_agent_core::Session::new(session_id, "model");
+    session.set_project_id_meta(project_a.id.to_string());
+    session.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+    session.metadata.insert(
+        bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        bamboo_engine::project_context::WorkspaceSource::Explicit
+            .as_str()
+            .to_string(),
+    );
+    state.save_and_cache_session(&mut session).await;
+    let review = state
+        .skill_manager
+        .store()
+        .skill_catalog_snapshot()
+        .await
+        .entries
+        .into_iter()
+        .find(|entry| {
+            entry.id == "review" && entry.source == bamboo_skills::WorkflowSource::Builtin
+        })
+        .expect("builtin review");
+    let hook = super::handlers::clone_scope_test_hooks::install(session_id);
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let clone_request = actix_web::test::TestRequest::post()
+        .uri("/api/v1/bamboo/workflow-catalog/review/clone")
+        .set_json(serde_json::json!({
+            "source": "builtin",
+            "revision": review.revision,
+            "target": "project",
+            "session_id": session_id,
+        }))
+        .to_request();
+    let clone = actix_web::test::call_service(&app, clone_request);
+    let reassign = async {
+        hook.reached
+            .acquire()
+            .await
+            .expect("clone scope barrier remains open")
+            .forget();
+        let patch_request = actix_web::test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .insert_header((actix_web::http::header::IF_MATCH, "\"0\""))
+            .set_json(serde_json::json!({
+                "project_id": project_b.id,
+                "workspace_path": workspace_b.path(),
+            }))
+            .to_request();
+        let mut patch = Box::pin(actix_web::test::call_service(&app, patch_request));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), patch.as_mut())
+                .await
+                .is_err(),
+            "Project PATCH must wait while clone owns the session authority lock"
+        );
+        hook.resume.add_permits(1);
+        patch.await
+    };
+    let (clone_response, patch_response) = futures::join!(clone, reassign);
+
+    assert_eq!(
+        clone_response.status(),
+        actix_web::http::StatusCode::CREATED
+    );
+    assert_eq!(patch_response.status(), actix_web::http::StatusCode::OK);
+    assert!(state
+        .project_store
+        .paths()
+        .project_home(&project_a.id)
+        .join("skills/review/SKILL.md")
+        .is_file());
+    assert!(!state
+        .project_store
+        .paths()
+        .project_home(&project_b.id)
+        .join("skills/review")
+        .exists());
+    let persisted = state
+        .storage
+        .load_session(session_id)
+        .await
+        .expect("load reassigned session")
+        .expect("session");
+    assert_eq!(
+        persisted.project_id_meta().as_deref(),
+        Some(project_b.id.as_str())
+    );
 }
 
 #[actix_web::test]
@@ -234,10 +654,7 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
         bamboo_agent_core::Session::new("cross-project-workflow-session", "test-model");
     session.set_project_id_meta(session_project.id.to_string());
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
-    state.sessions.insert(
-        session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
-    );
+    state.save_and_cache_session(&mut session).await;
 
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -310,10 +727,7 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     );
     let mut session = bamboo_agent_core::Session::new("legacy-migration-session", "test-model");
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
-    state.sessions.insert(
-        session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
-    );
+    state.save_and_cache_session(&mut session).await;
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(state.clone())
@@ -414,12 +828,19 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
             .to_request(),
     )
     .await;
-    let source_workflow = after["entries"]
-        .as_array()
-        .expect("catalog entries")
+    let entries = after["entries"].as_array().expect("catalog entries");
+    let migrated_workflow = entries
         .iter()
-        .find(|entry| entry["id"] == "daily-report")
+        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "migrated")
+        .expect("migrated instruction Workflow entry");
+    let source_workflow = entries
+        .iter()
+        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "available")
         .expect("source Workflow entry");
+    assert_ne!(
+        migrated_workflow["revision"], source_workflow["revision"],
+        "id/source/revision remains an unambiguous typed catalog identity"
+    );
     assert_eq!(source_workflow["migration_status"], "available");
     assert!(source_workflow.get("shadowed_candidates").is_none());
 }
@@ -442,10 +863,7 @@ async fn global_legacy_workflow_advertised_as_available_migrates_into_session_wo
     );
     let mut session = bamboo_agent_core::Session::new("global-migration-session", "test-model");
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
-    state.sessions.insert(
-        session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
-    );
+    state.save_and_cache_session(&mut session).await;
     let app = actix_web::test::init_service(
         actix_web::App::new()
             .app_data(state.clone())
@@ -524,6 +942,82 @@ async fn global_legacy_workflow_advertised_as_available_migrates_into_session_wo
 }
 
 #[actix_web::test]
+async fn legacy_migration_reloads_durable_workspace_after_waiting_for_reassignment() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace_a = tempfile::tempdir().expect("workspace A");
+    let workspace_b = tempfile::tempdir().expect("workspace B");
+    let global_workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&global_workflows).expect("global workflows");
+    std::fs::write(
+        global_workflows.join("durable-scope.md"),
+        "---\ndescription: Durable scope migration.\n---\nUse the current workspace.\n",
+    )
+    .expect("global legacy workflow");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session_id = "migration-durable-scope";
+    let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+    session.set_workspace_path_meta(workspace_a.path().to_string_lossy().into_owned());
+    state.save_and_cache_session(&mut session).await;
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/migrate",
+        actix_web::web::post().to(super::migrate_workflow),
+    ))
+    .await;
+
+    let guard = state.persistence.acquire_lock(session_id).await;
+    let migration = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/durable-scope/migrate")
+            .set_json(serde_json::json!({"session_id": session_id}))
+            .to_request(),
+    );
+    tokio::pin!(migration);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut migration)
+            .await
+            .is_err(),
+        "migration must wait for the session authority lock"
+    );
+
+    let mut reassigned = state
+        .persistence
+        .storage()
+        .load_session(session_id)
+        .await
+        .expect("load authoritative session")
+        .expect("session");
+    reassigned.set_workspace_path_meta(workspace_b.path().to_string_lossy().into_owned());
+    state
+        .persistence
+        .storage()
+        .save_session(&reassigned)
+        .await
+        .expect("persist reassignment while owning lock");
+    // Deliberately leave the memory cache pointing at workspace A. The
+    // migration must reload durable authority after it acquires the lock.
+    drop(guard);
+
+    let response = migration.await;
+    assert!(response.status().is_success());
+    assert!(workspace_b
+        .path()
+        .join(".bamboo/skills/durable-scope/SKILL.md")
+        .is_file());
+    assert!(
+        !workspace_a
+            .path()
+            .join(".bamboo/skills/durable-scope")
+            .exists(),
+        "stale cache scope must never receive the migrated bundle"
+    );
+}
+
+#[actix_web::test]
 async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
     let data = tempfile::tempdir().expect("data dir");
     let state = actix_web::web::Data::new(
@@ -584,6 +1078,83 @@ async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
     })
     .await;
     assert!(bridged.is_ok(), "workflow.changed must reach account feed");
+}
+
+#[actix_web::test]
+async fn instruction_skill_changed_invalid_and_recovered_reach_account_feed() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let skill_dir = data.path().join("skills/library-refresh");
+    tokio::fs::create_dir_all(&skill_dir)
+        .await
+        .expect("skill dir");
+    let skill_file = skill_dir.join("SKILL.md");
+    let valid = "---\nname: library-refresh\ndescription: Refresh the Workflow Library.\n---\n\nRefresh it.\n";
+
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("create instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("reload created Skill");
+    tokio::fs::write(&skill_file, "---\nname: [\n")
+        .await
+        .expect("corrupt instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish invalid LKG Skill");
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("recover instruction Skill");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish recovered Skill");
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut changed = false;
+        let mut invalid = false;
+        let mut recovered = false;
+        while !(changed && invalid && recovered) {
+            let event = account_events.recv().await.expect("account event");
+            match &event.event {
+                bamboo_agent_core::AgentEvent::WorkflowChanged { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    changed = true
+                }
+                bamboo_agent_core::AgentEvent::WorkflowInvalid { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    invalid = true
+                }
+                bamboo_agent_core::AgentEvent::WorkflowRecovered { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    recovered = true
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "instruction catalog transitions must invalidate Workflow clients"
+    );
 }
 
 #[actix_web::test]

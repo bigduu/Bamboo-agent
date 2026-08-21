@@ -429,12 +429,13 @@ impl WorkflowRunEngine {
         self.enforce_ceilings(&compiled.definition.budgets)?;
         let definition_value = serde_json::to_value(&compiled.definition)
             .map_err(|error| WorkflowRunError::Preflight(error.to_string()))?;
-        reject_secret_material_in_definition(&definition_value)
+        bamboo_domain::reject_secret_material_in_definition(&definition_value)
             .map_err(WorkflowRunError::Preflight)?;
         compiled
             .validate_input(&request.args)
             .map_err(WorkflowRunError::InvalidInput)?;
-        reject_secret_material(&request.args).map_err(WorkflowRunError::InvalidInput)?;
+        bamboo_domain::reject_secret_material(&request.args)
+            .map_err(WorkflowRunError::InvalidInput)?;
         let allowed_capabilities = request
             .allowed_capabilities
             .into_iter()
@@ -746,7 +747,8 @@ impl WorkflowRunEngine {
         let serialized = serde_json::to_value(bundle).map_err(|_| {
             WorkflowRunError::Preflight("workflow bundle is not serializable".into())
         })?;
-        reject_secret_material_in_definition(&serialized).map_err(WorkflowRunError::Preflight)?;
+        bamboo_domain::reject_secret_material_in_definition(&serialized)
+            .map_err(WorkflowRunError::Preflight)?;
         let mut stack = vec![(root.id.clone(), root.revision, Vec::<String>::new())];
         let mut visited = BTreeSet::new();
         while let Some((id, revision, path)) = stack.pop() {
@@ -1430,7 +1432,7 @@ impl RunContext {
             Err(error) => Err(error),
         };
         let result = result.and_then(|output| {
-            reject_secret_material(&output)
+            bamboo_domain::reject_secret_material(&output)
                 .map(|()| output)
                 .map_err(|message| failure(WorkflowFailureCode::InvalidOutput, message, false))
         });
@@ -2304,91 +2306,6 @@ fn parse_tool_result(result: ToolResult) -> Result<Value, WorkflowFailure> {
     }
     Ok(serde_json::from_str(&result.result).unwrap_or(Value::String(result.result)))
 }
-fn reject_secret_material(value: &Value) -> Result<(), String> {
-    reject_secret_material_inner(value, false)
-}
-
-fn reject_secret_material_in_definition(value: &Value) -> Result<(), String> {
-    reject_secret_material_inner(value, true)
-}
-
-fn reject_secret_material_inner(value: &Value, allow_bindings: bool) -> Result<(), String> {
-    fn walk(value: &Value, key: Option<&str>, allow_bindings: bool) -> Result<(), String> {
-        if value.as_object().is_some_and(|object| {
-            object.len() == 1
-                && object
-                    .get("$secret")
-                    .and_then(Value::as_str)
-                    .is_some_and(|handle| !handle.trim().is_empty())
-        }) {
-            return Ok(());
-        }
-        let safe_binding = allow_bindings
-            && serde_json::from_value::<ValueRef>(value.clone())
-                .is_ok_and(|reference| !matches!(reference, ValueRef::Literal { .. }));
-        if key.is_some_and(|key| {
-            let normalized = key
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
-            matches!(
-                normalized.as_str(),
-                "secret"
-                    | "token"
-                    | "password"
-                    | "credential"
-                    | "credentials"
-                    | "apikey"
-                    | "accesskey"
-                    | "accesstoken"
-                    | "secretkey"
-                    | "privatekey"
-            )
-        }) && !safe_binding
-        {
-            return Err("secret-bearing fields are not accepted by workflow runs".to_string());
-        }
-        if value.as_str().is_some_and(|value| {
-            let trimmed = value.trim();
-            trimmed.starts_with("capability://")
-                || trimmed.starts_with("Bearer ")
-                || trimmed.starts_with("sk-")
-                || trimmed.starts_with("ghp_")
-                || trimmed.starts_with("github_pat_")
-        }) {
-            // No production capability resolver is part of #578. Treating an
-            // arbitrary caller string as an opaque handle would be an injection
-            // channel, so handles and common raw credential forms fail closed.
-            return Err("opaque credential handles are not enabled for workflows".to_string());
-        }
-        match value {
-            Value::Object(object) => {
-                for (key, value) in object {
-                    if key == "properties" {
-                        let properties = value.as_object().ok_or_else(|| {
-                            "workflow schema properties must be an object".to_string()
-                        })?;
-                        for schema in properties.values() {
-                            walk(schema, None, allow_bindings)?;
-                        }
-                    } else {
-                        walk(value, Some(key), allow_bindings)?;
-                    }
-                }
-            }
-            Value::Array(array) => {
-                for value in array {
-                    walk(value, None, allow_bindings)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    walk(value, None, allow_bindings)
-}
-
 fn contains_secret_handle(value: &Value) -> bool {
     match value {
         Value::Object(object) => {

@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -338,6 +339,11 @@ pub struct SkillActivationDescriptor {
 /// revision after a server restart without consulting a newer catalog.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SkillActivationSnapshot {
+    /// Opaque identity of the global/Project/workspace publication that owns
+    /// these bytes. Durable snapshots must never be replayed in another
+    /// resource scope after a session is reassigned.
+    #[serde(default)]
+    pub resource_scope_fingerprint: String,
     pub catalog_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_skill_mode: Option<String>,
@@ -896,6 +902,60 @@ pub struct SkillStore {
 }
 
 impl SkillStore {
+    /// Return an opaque, restart-stable identity for this resource
+    /// publication. No filesystem path is persisted in the snapshot.
+    pub fn resource_scope_fingerprint(&self) -> String {
+        fn update_path(hasher: &mut Sha256, path: &Path) {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let bytes = canonical.as_os_str().as_bytes();
+                hasher.update(b"unix\0");
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                let units = canonical.as_os_str().encode_wide().collect::<Vec<_>>();
+                hasher.update(b"windows-utf16\0");
+                hasher.update((units.len() as u64).to_be_bytes());
+                for unit in units {
+                    hasher.update(unit.to_le_bytes());
+                }
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"bamboo.skill-resource-scope.v1\0");
+        update_path(&mut hasher, &self.config.skills_dir);
+        match (
+            self.project_home_dir.as_deref(),
+            self.workspace_overlay_dir.as_deref(),
+        ) {
+            (Some(project_home), workspace) => {
+                hasher.update(b"project\0");
+                update_path(&mut hasher, project_home);
+                if let Some(workspace) = workspace {
+                    hasher.update(b"workspace\0");
+                    update_path(&mut hasher, workspace);
+                }
+            }
+            (None, Some(workspace)) => {
+                hasher.update(b"workspace\0");
+                update_path(&mut hasher, workspace);
+            }
+            (None, None) => hasher.update(b"global\0"),
+        }
+        if let Some(mode) = self.effective_mode(None) {
+            hasher.update(b"mode\0");
+            hasher.update((mode.len() as u64).to_be_bytes());
+            hasher.update(mode.as_bytes());
+        }
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+
     fn normalize_mode(raw_mode: Option<&str>) -> Option<String> {
         let raw = raw_mode?.trim();
         if raw.is_empty() {
@@ -1454,7 +1514,7 @@ impl SkillStore {
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
-        *skill_catalog_guard = next_skill_catalog;
+        *skill_catalog_guard = next_skill_catalog.clone();
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
         *workflow_resources_guard = resolved_workflow_resources;
@@ -1468,6 +1528,11 @@ impl SkillStore {
         drop(roots_guard);
         drop(skills_guard);
         drop(_snapshot_guard);
+        self.publish_catalog_events(
+            &previous_skill_catalog,
+            &next_skill_catalog,
+            &skill_definition_changed,
+        );
         self.publish_catalog_events(
             &previous_catalog,
             &next_catalog,
@@ -2082,6 +2147,7 @@ impl SkillStore {
         let activations = self.pinned_activations.read().await;
         let activation = activations.by_id.get(activation_id)?;
         Some(SkillActivationSnapshot {
+            resource_scope_fingerprint: self.resource_scope_fingerprint(),
             catalog_revision: activation.catalog_revision,
             selected_skill_mode: activation.selected_skill_mode.clone(),
             skills: activation
@@ -2116,6 +2182,14 @@ impl SkillStore {
         const MAX_DURABLE_ACTIVATION_BYTES: usize = 512 * 1024;
         const MAX_DURABLE_ACTIVATION_SKILLS: usize = 32;
         const MAX_DURABLE_ACTIVATION_RESOURCES: usize = 1_024;
+        let expected_scope = self.resource_scope_fingerprint();
+        if snapshot.resource_scope_fingerprint.is_empty()
+            || snapshot.resource_scope_fingerprint != expected_scope
+        {
+            return Err(SkillError::Validation(
+                "persisted workflow activation resource scope mismatch".to_string(),
+            ));
+        }
         if snapshot.skills.is_empty() {
             return Err(SkillError::Validation(
                 "persisted workflow activation is empty".to_string(),
@@ -2414,19 +2488,19 @@ impl SkillStore {
     }
 
     /// Release a session pin without depending on its workspace still existing.
-    /// Session IDs are unique across scopes, so clearing the root and every cached
-    /// workspace store is both safe and robust to deleted/unmounted projects.
+    /// Session IDs are unique across scopes, so clearing the root and every
+    /// cached workspace, Project/workspace, and mode store is both safe and
+    /// robust to reassignment or deleted/unmounted resources.
     pub async fn release_activation_across_cached_scopes(&self, activation_id: &str) {
         self.release_activation(activation_id).await;
-        let workspace_stores = self
-            .workspace_stores
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for store in workspace_stores {
+        let mut pending = self.cached_dependent_stores().await;
+        let mut visited = HashSet::new();
+        while let Some(store) = pending.pop() {
+            if !visited.insert(store.store_token) {
+                continue;
+            }
             store.release_activation(activation_id).await;
+            pending.extend(store.cached_dependent_stores().await);
         }
     }
 
@@ -3080,21 +3154,19 @@ impl SkillStore {
             let skill_id = bundle.skill.id.clone();
             write_skill_file(&builtin_skills_dir, &bundle.skill).await?;
 
-            for (relative_path, content) in bundle.files {
+            for (relative_path, file) in bundle.files {
                 let full_path = builtin_skills_dir.join(&skill_id).join(&relative_path);
                 if let Some(parent) = full_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                tokio::fs::write(&full_path, content).await?;
-                // Make script files executable on Unix
+                tokio::fs::write(&full_path, file.bytes).await?;
+                // Reproduce the embedded Git permission contract exactly.
                 #[cfg(unix)]
                 {
-                    if relative_path.starts_with("scripts/") {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = tokio::fs::metadata(&full_path).await?.permissions();
-                        perms.set_mode(0o755);
-                        tokio::fs::set_permissions(&full_path, perms).await?;
-                    }
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = if file.executable { 0o755 } else { 0o644 };
+                    tokio::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(mode))
+                        .await?;
                 }
             }
         }
@@ -3735,7 +3807,7 @@ mod tests {
     use crate::store::storage::write_skill_file;
     use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
-    use crate::{SkillManager, WorkflowSource, WorkflowStatus};
+    use crate::{SkillManager, WorkflowCatalogEventKind, WorkflowSource, WorkflowStatus};
 
     #[test]
     fn agents_skill_precedence_is_below_bamboo_global_and_above_plugin() {
@@ -3847,12 +3919,24 @@ mod tests {
         write_skill_file(skills_dir, &bundle.skill)
             .await
             .expect("legacy SKILL.md");
-        for (relative, bytes) in &bundle.files {
+        for (relative, file) in &bundle.files {
             let path = skills_dir.join(&bundle.skill.id).join(relative);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).await.expect("legacy parent");
             }
-            fs::write(path, bytes).await.expect("legacy resource");
+            fs::write(&path, &file.bytes)
+                .await
+                .expect("legacy resource");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(if file.executable { 0o755 } else { 0o644 }),
+                )
+                .await
+                .expect("legacy resource mode");
+            }
         }
     }
 
@@ -4006,6 +4090,48 @@ Use this skill for testing.
                 .source,
             WorkflowSource::Builtin
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn historical_all_scripts_executable_builtin_is_still_migrated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let bundle = load_builtin_skill_bundles()
+            .expect("builtin bundles")
+            .into_iter()
+            .find(|bundle| bundle.skill.id == "skill-creator")
+            .expect("skill creator");
+        materialize_legacy_builtin(&skills_dir, &bundle).await;
+        for relative in bundle
+            .files
+            .keys()
+            .filter(|relative| relative.starts_with("scripts/"))
+        {
+            fs::set_permissions(
+                skills_dir.join("skill-creator").join(relative),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .await
+            .expect("historical executable mode");
+        }
+
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            ..Default::default()
+        });
+        store.initialize().await.expect("initialize");
+
+        assert!(
+            !skills_dir.join("skill-creator").exists(),
+            "known historical generator output must not shadow versioned builtins"
+        );
+        assert!(directory
+            .path()
+            .join("data/legacy-builtins-v1/skill-creator")
+            .exists());
     }
 
     #[tokio::test]
@@ -4566,7 +4692,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn invalid_skill_reload_retains_lkg_without_workflow_events() {
+    async fn invalid_skill_reload_retains_lkg_and_publishes_sanitized_lifecycle_events() {
         const PRIVATE_FIELD: &str = "private-lkg-frontmatter-field";
         const PRIVATE_INSTRUCTIONS: &str = "Private LKG replacement instructions";
         let directory = tempfile::tempdir().expect("tempdir");
@@ -4605,10 +4731,11 @@ Use this skill for testing.
         assert!(!public_error.contains(PRIVATE_FIELD));
         assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
         assert!(!public_error.contains(root.to_string_lossy().as_ref()));
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let invalid_event = events.try_recv().expect("instruction invalid event");
+        assert_eq!(invalid_event.workflow_id, "steady");
+        assert_eq!(invalid_event.kind, WorkflowCatalogEventKind::Invalid);
+        assert!(!invalid_event.public_workflow);
+        assert_eq!(invalid_event.scope, "global");
 
         write_skill(
             root.parent().expect("skills root"),
@@ -4627,10 +4754,11 @@ Use this skill for testing.
                 .description,
             "recovered"
         );
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let recovered_event = events.try_recv().expect("instruction recovered event");
+        assert_eq!(recovered_event.workflow_id, "steady");
+        assert_eq!(recovered_event.kind, WorkflowCatalogEventKind::Recovered);
+        assert!(!recovered_event.public_workflow);
+        assert_eq!(recovered_event.scope, "global");
     }
 
     #[tokio::test]
@@ -5327,10 +5455,14 @@ Use this skill for testing.
         })
         .await
         .expect("workspace watcher publication");
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("workspace catalog event bridge")
+            .expect("workspace catalog event");
+        assert_eq!(event.workflow_id, "only-one");
+        assert_eq!(event.kind, WorkflowCatalogEventKind::Changed);
+        assert!(!event.public_workflow);
+        assert!(event.scope.starts_with("workspace:"));
         let untouched = second_store.skill_catalog_snapshot().await;
         assert!(updated.revision > first.revision);
         assert_eq!(untouched.revision, second.revision);
@@ -5537,6 +5669,65 @@ Use this skill for testing.
         assert!(store.activation_descriptor("active-0").await.is_some());
         assert!(store
             .activation_descriptor("restore-over-capacity")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_restore_rejects_another_resource_scope_and_legacy_unscoped_bytes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("data/skills");
+        let workspace_a = directory.path().join("workspace-a");
+        let workspace_b = directory.path().join("workspace-b");
+        fs::create_dir_all(&workspace_a).await.expect("workspace A");
+        fs::create_dir_all(&workspace_b).await.expect("workspace B");
+        write_skill(
+            &workspace_a.join(".bamboo/skills"),
+            "private-a",
+            "private",
+            "A-only instructions",
+        )
+        .await
+        .expect("workspace A skill");
+
+        let store_a = SkillStore::new(SkillStoreConfig {
+            skills_dir: skills_dir.clone(),
+            project_dir: Some(workspace_a),
+            active_mode: None,
+        });
+        store_a.initialize().await.expect("initialize A");
+        store_a
+            .pin_current_activation("scope-a", &["private-a".to_string()], None)
+            .await
+            .expect("pin A");
+        let snapshot = store_a
+            .export_activation_snapshot("scope-a")
+            .await
+            .expect("snapshot A");
+        assert!(snapshot.resource_scope_fingerprint.starts_with("sha256:"));
+
+        let store_b = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            project_dir: Some(workspace_b),
+            active_mode: None,
+        });
+        store_b.initialize().await.expect("initialize B");
+        let mismatch = store_b
+            .restore_activation_snapshot("scope-b", snapshot.clone())
+            .await
+            .expect_err("scope A bytes must not restore in B");
+        assert!(mismatch.to_string().contains("resource scope mismatch"));
+        assert!(store_b.activation_descriptor("scope-b").await.is_none());
+
+        let mut legacy = snapshot;
+        legacy.resource_scope_fingerprint.clear();
+        let legacy_error = store_a
+            .restore_activation_snapshot("legacy-unscoped", legacy)
+            .await
+            .expect_err("unscoped legacy bytes fail closed");
+        assert!(legacy_error.to_string().contains("resource scope mismatch"));
+        assert!(store_a
+            .activation_descriptor("legacy-unscoped")
             .await
             .is_none());
     }

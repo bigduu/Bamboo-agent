@@ -7,9 +7,15 @@ use crate::types::{SkillError, SkillResult};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinSkillFile {
+    pub bytes: Vec<u8>,
+    pub executable: bool,
+}
+
 pub struct BuiltinSkillBundle {
     pub skill: crate::types::SkillDefinition,
-    pub files: HashMap<String, Vec<u8>>,
+    pub files: HashMap<String, BuiltinSkillFile>,
 }
 
 /// Archive the pre-catalog global materialization only when every file proves
@@ -28,7 +34,10 @@ pub async fn archive_exact_legacy_materialization(
     let mut expected = bundle.files.clone();
     expected.insert(
         "SKILL.md".to_string(),
-        render_skill_markdown(&bundle.skill)?.into_bytes(),
+        BuiltinSkillFile {
+            bytes: render_skill_markdown(&bundle.skill)?.into_bytes(),
+            executable: false,
+        },
     );
     let mut actual = HashMap::new();
     for entry in walkdir::WalkDir::new(&legacy_root).follow_links(false) {
@@ -49,10 +58,33 @@ pub async fn archive_exact_legacy_materialization(
             Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
             Err(_) => return Ok(false),
         };
-        actual.insert(relative, tokio::fs::read(entry.path()).await?);
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(entry.path())?.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = expected
+            .get(&relative)
+            .is_some_and(|expected| expected.executable);
+        actual.insert(
+            relative,
+            BuiltinSkillFile {
+                bytes: tokio::fs::read(entry.path()).await?,
+                executable,
+            },
+        );
     }
 
-    if actual != expected {
+    // Releases predating the embedded mode manifest made every file below
+    // `scripts/` executable. Recognize that exact historical generator output
+    // as Bamboo-owned too, while still preserving any byte or unrelated mode
+    // customization as a user override.
+    let mut historical_expected = expected.clone();
+    for (relative, file) in &mut historical_expected {
+        file.executable = relative.starts_with("scripts/");
+    }
+    if actual != expected && actual != historical_expected {
         return Ok(false);
     }
 
@@ -81,7 +113,7 @@ pub async fn archive_exact_legacy_materialization(
 fn discover_skill_roots() -> Vec<String> {
     let mut roots = BUILTIN_SKILL_FILES
         .iter()
-        .filter_map(|(path, _)| path.strip_suffix("/SKILL.md"))
+        .filter_map(|(path, _, _)| path.strip_suffix("/SKILL.md"))
         .map(str::to_string)
         .collect::<Vec<_>>();
 
@@ -102,27 +134,28 @@ pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
         return Ok(bundles);
     }
 
-    let mut grouped: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
-    for (path, bytes) in BUILTIN_SKILL_FILES {
+    let mut grouped: HashMap<String, Vec<(String, Vec<u8>, bool)>> = HashMap::new();
+    for (path, bytes, executable) in BUILTIN_SKILL_FILES {
         if let Some(root) = roots.iter().find(|root| {
             let prefix = format!("{}/", root);
             path.starts_with(&prefix)
         }) {
             let prefix = format!("{}/", root);
             if let Some(relative_path) = path.strip_prefix(&prefix) {
-                grouped
-                    .entry(root.clone())
-                    .or_default()
-                    .push((relative_path.to_string(), bytes.to_vec()));
+                grouped.entry(root.clone()).or_default().push((
+                    relative_path.to_string(),
+                    bytes.to_vec(),
+                    *executable,
+                ));
             }
         }
     }
 
     for (skill_root, files) in grouped {
         let mut skill_markdown: Option<String> = None;
-        let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut assets: HashMap<String, BuiltinSkillFile> = HashMap::new();
 
-        for (relative_path, bytes) in files {
+        for (relative_path, bytes, executable) in files {
             if relative_path == "SKILL.md" {
                 let raw = String::from_utf8(bytes).map_err(|error| {
                     SkillError::Validation(format!(
@@ -132,7 +165,7 @@ pub fn load_builtin_skill_bundles() -> SkillResult<Vec<BuiltinSkillBundle>> {
                 })?;
                 skill_markdown = Some(raw.replace("<SKILLS_DIR>", &skills_dir_display));
             } else {
-                assets.insert(relative_path, bytes);
+                assets.insert(relative_path, BuiltinSkillFile { bytes, executable });
             }
         }
 
@@ -199,6 +232,27 @@ mod tests {
             .contains_key("eval-viewer/generate_review.py"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn embedded_builtin_executable_manifest_matches_repository_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../builtin_skills");
+        for (relative, _, embedded_executable) in super::BUILTIN_SKILL_FILES {
+            let source = root.join(relative);
+            let source_executable = std::fs::metadata(&source)
+                .unwrap_or_else(|error| panic!("{}: {error}", source.display()))
+                .permissions()
+                .mode()
+                & 0o111
+                != 0;
+            assert_eq!(
+                *embedded_executable, source_executable,
+                "embedded mode drift for {relative}"
+            );
+        }
+    }
+
     #[test]
     fn builtin_personal_assistant_bundle_carries_assistant_tool_refs() {
         let bundles = load_builtin_skill_bundles().expect("load builtin bundles");
@@ -247,7 +301,9 @@ mod tests {
                 bundle
                     .files
                     .get("agents/bamboo.yaml")
-                    .unwrap_or_else(|| panic!("{id} needs Bamboo metadata")),
+                    .unwrap_or_else(|| panic!("{id} needs Bamboo metadata"))
+                    .bytes
+                    .as_slice(),
             )
             .expect("utf8 Bamboo metadata");
             let bamboo_metadata: serde_yaml::Value =
@@ -267,7 +323,9 @@ mod tests {
                 bundle
                     .files
                     .get("evals/trigger-evals.json")
-                    .unwrap_or_else(|| panic!("{id} needs trigger evals")),
+                    .unwrap_or_else(|| panic!("{id} needs trigger evals"))
+                    .bytes
+                    .as_slice(),
             )
             .expect("valid trigger evals");
             assert!(
@@ -315,7 +373,9 @@ mod tests {
                 bundle
                     .files
                     .get("evals/scenarios.json")
-                    .unwrap_or_else(|| panic!("{id} needs scenario evals")),
+                    .unwrap_or_else(|| panic!("{id} needs scenario evals"))
+                    .bytes
+                    .as_slice(),
             )
             .expect("valid scenario evals");
             let kinds = scenarios
