@@ -1,14 +1,14 @@
-//! Shared, metadata-only boundary for fresh builtin Workflow clone publication.
+//! Shared, metadata-only boundary for builtin Workflow clone publication.
 //!
 //! The server owns the write protocol. Discovery only consumes this sealed
-//! receipt to decide whether a target directory may be catalog-visible. Crash
-//! recovery, retirement and delete/reclone epochs deliberately live in the
-//! follow-up recovery slice rather than this fresh-publication contract.
+//! journal to decide whether a target directory may be catalog-visible. Each
+//! bounded epoch is recoverable until completion, abort, or retirement.
 
 use serde::{Deserialize, Serialize};
 
 pub const CLONE_MARKER_SCHEMA: u8 = 1;
 pub const MAX_CLONE_MARKER_BYTES: usize = 64 * 1024;
+pub const MAX_CLONE_MARKER_RECORDS: usize = 8;
 pub const MAX_CLONE_BUNDLE_FILES: usize = 1024;
 pub const MAX_CLONE_BUNDLE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_CLONE_RELATIVE_PATH_BYTES: usize = 1024;
@@ -23,8 +23,11 @@ pub struct CloneNodeIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum ClonePublicationPhase {
     Prepared,
+    StageBound,
     Staged,
     Complete,
+    Aborted,
+    Retired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,10 +58,19 @@ impl ClonePublicationMarker {
                 ClonePublicationPhase::Prepared => {
                     self.stage_identity.is_none() && self.target_identity.is_none()
                 }
+                ClonePublicationPhase::StageBound => {
+                    self.stage_identity.is_some() && self.target_identity.is_none()
+                }
                 ClonePublicationPhase::Staged => {
                     self.stage_identity.is_some() && self.target_identity.is_none()
                 }
                 ClonePublicationPhase::Complete => {
+                    self.stage_identity.is_some()
+                        && self.target_identity.is_some()
+                        && self.stage_identity == self.target_identity
+                }
+                ClonePublicationPhase::Aborted => self.target_identity.is_none(),
+                ClonePublicationPhase::Retired => {
                     self.stage_identity.is_some()
                         && self.target_identity.is_some()
                         && self.stage_identity == self.target_identity
@@ -71,6 +83,121 @@ impl ClonePublicationMarker {
             .then_some(self.target_identity)
             .flatten()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloneMarkerJournal {
+    pub records: Vec<ClonePublicationMarker>,
+    pub partial: Vec<u8>,
+}
+
+impl CloneMarkerJournal {
+    pub fn current(&self) -> Option<&ClonePublicationMarker> {
+        self.records.last()
+    }
+}
+
+fn same_epoch(left: &ClonePublicationMarker, right: &ClonePublicationMarker) -> bool {
+    left.schema == right.schema
+        && left.workflow_id == right.workflow_id
+        && left.source_revision == right.source_revision
+        && left.source_content_digest == right.source_content_digest
+        && left.bundle_digest == right.bundle_digest
+        && left.staging_name == right.staging_name
+}
+
+fn valid_transition(previous: &ClonePublicationMarker, next: &ClonePublicationMarker) -> bool {
+    if previous == next {
+        return true;
+    }
+    if !same_epoch(previous, next) {
+        return false;
+    }
+    match (previous.phase, next.phase) {
+        (ClonePublicationPhase::Prepared, ClonePublicationPhase::StageBound) => {
+            next.stage_identity.is_some() && next.target_identity.is_none()
+        }
+        (ClonePublicationPhase::StageBound, ClonePublicationPhase::Staged) => {
+            previous.stage_identity == next.stage_identity && next.target_identity.is_none()
+        }
+        (ClonePublicationPhase::Staged, ClonePublicationPhase::Complete) => {
+            previous.stage_identity == next.stage_identity
+                && next.target_identity == next.stage_identity
+        }
+        (
+            ClonePublicationPhase::Prepared
+            | ClonePublicationPhase::StageBound
+            | ClonePublicationPhase::Staged,
+            ClonePublicationPhase::Aborted,
+        ) => previous.stage_identity == next.stage_identity && next.target_identity.is_none(),
+        (ClonePublicationPhase::Complete, ClonePublicationPhase::Retired) => {
+            previous.stage_identity == next.stage_identity
+                && previous.target_identity == next.target_identity
+        }
+        (ClonePublicationPhase::Aborted, ClonePublicationPhase::Prepared) => {
+            next.stage_identity.is_none() && next.target_identity.is_none()
+        }
+        (
+            ClonePublicationPhase::Aborted,
+            ClonePublicationPhase::StageBound | ClonePublicationPhase::Staged,
+        ) => previous.stage_identity == next.stage_identity && next.target_identity.is_none(),
+        _ => false,
+    }
+}
+
+/// Parse one bounded publication epoch. Records are newline-delimited so a
+/// crash can leave only a recoverable final prefix; the last complete record
+/// remains authoritative until that suffix is completed exactly.
+pub fn parse_clone_marker_journal(bytes: &[u8], workflow_id: &str) -> Option<CloneMarkerJournal> {
+    if bytes.len() > MAX_CLONE_MARKER_BYTES {
+        return None;
+    }
+
+    if !bytes.contains(&b'\n') {
+        if let Ok(record) = serde_json::from_slice::<ClonePublicationMarker>(bytes) {
+            return (record.validate_for(workflow_id)).then_some(CloneMarkerJournal {
+                records: vec![record],
+                partial: Vec::new(),
+            });
+        }
+        return Some(CloneMarkerJournal {
+            records: Vec::new(),
+            partial: bytes.to_vec(),
+        });
+    }
+
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut records = Vec::new();
+    for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_slice::<ClonePublicationMarker>(line).ok()?;
+        if !record.validate_for(workflow_id)
+            || records
+                .last()
+                .is_some_and(|previous| !valid_transition(previous, &record))
+        {
+            return None;
+        }
+        records.push(record);
+    }
+    if records.len() > MAX_CLONE_MARKER_RECORDS {
+        return None;
+    }
+    Some(CloneMarkerJournal {
+        records,
+        partial: bytes[complete_len..].to_vec(),
+    })
+}
+
+pub fn clone_marker_record_bytes(marker: &ClonePublicationMarker) -> Option<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(marker).ok()?;
+    bytes.push(b'\n');
+    (bytes.len() <= MAX_CLONE_MARKER_BYTES).then_some(bytes)
 }
 
 pub fn clone_marker_name(workflow_id: &str) -> String {
@@ -152,7 +279,11 @@ mod tests {
             staging_name: "txn-12345678-1234-1234-1234-123456789abc".to_string(),
             phase,
             stage_identity: (phase != ClonePublicationPhase::Prepared).then_some(identity),
-            target_identity: (phase == ClonePublicationPhase::Complete).then_some(identity),
+            target_identity: matches!(
+                phase,
+                ClonePublicationPhase::Complete | ClonePublicationPhase::Retired
+            )
+            .then_some(identity),
         }
     }
 
@@ -160,8 +291,11 @@ mod tests {
     fn marker_phase_contract_is_strict_and_generation_bound() {
         for phase in [
             ClonePublicationPhase::Prepared,
+            ClonePublicationPhase::StageBound,
             ClonePublicationPhase::Staged,
             ClonePublicationPhase::Complete,
+            ClonePublicationPhase::Aborted,
+            ClonePublicationPhase::Retired,
         ] {
             assert!(marker(phase).validate_for("review"));
         }
@@ -170,5 +304,19 @@ mod tests {
         malformed.target_identity = None;
         assert!(!malformed.validate_for("review"));
         assert!(!marker(ClonePublicationPhase::Complete).validate_for("other"));
+    }
+
+    #[test]
+    fn journal_keeps_the_last_complete_transition_and_a_partial_suffix() {
+        let prepared = marker(ClonePublicationPhase::Prepared);
+        let stage_bound = marker(ClonePublicationPhase::StageBound);
+        let mut bytes = clone_marker_record_bytes(&prepared).unwrap();
+        bytes.extend(clone_marker_record_bytes(&stage_bound).unwrap());
+        let complete = clone_marker_record_bytes(&marker(ClonePublicationPhase::Staged)).unwrap();
+        bytes.extend(&complete[..complete.len() / 2]);
+
+        let journal = parse_clone_marker_journal(&bytes, "review").expect("journal");
+        assert_eq!(journal.records, vec![prepared, stage_bound]);
+        assert!(!journal.partial.is_empty());
     }
 }

@@ -3,8 +3,11 @@ use std::sync::Arc;
 
 use actix_web::{http::StatusCode, web, HttpResponse};
 use bamboo_skills::catalog::workflow_catalog_content_digest;
+use bamboo_skills::clone_publication::clone_marker_name;
 use bamboo_skills::legacy::LegacyWorkflowMigrationOutcome;
-use bamboo_skills::store::builtin::{builtin_clone_files, load_builtin_skill_bundles};
+use bamboo_skills::store::builtin::{
+    builtin_clone_files, builtin_workflow_catalog_entry, load_builtin_skill_bundles,
+};
 use bamboo_skills::{
     LegacyWorkflowMigrationStatus, SkillStore, WorkflowCatalogEntry, WorkflowCatalogSnapshot,
     WorkflowSource, WorkflowStatus,
@@ -355,8 +358,9 @@ fn unique_winner<'a>(
 
 /// Publish one exact builtin Workflow into the canonical Project or user layer.
 ///
-/// This endpoint is intentionally fresh-publication-only. Recovery, marker
-/// retirement and delete/reclone are owned by #874.
+/// Interrupted exact transactions resume from their durable marker. A deleted
+/// completed generation retires before a bounded no-replace epoch rollover;
+/// existing or replacement targets are never adopted or overwritten.
 pub async fn clone_workflow(
     app_state: web::Data<AppState>,
     workflow_id: web::Path<String>,
@@ -397,14 +401,8 @@ pub async fn clone_workflow(
         ));
     }
     let source_catalog = combined_catalog_snapshot(&scope.store).await;
-    let source_entry = match unique_winner(&source_catalog, &workflow_id) {
-        Ok(Some(entry)) => entry.clone(),
-        Ok(None) => {
-            return Ok(fixed_clone_error(
-                StatusCode::NOT_FOUND,
-                "Workflow is not available",
-            ));
-        }
+    let catalog_winner = match unique_winner(&source_catalog, &workflow_id) {
+        Ok(entry) => entry.cloned(),
         Err(()) => {
             return Ok(fixed_clone_error(
                 StatusCode::CONFLICT,
@@ -412,16 +410,6 @@ pub async fn clone_workflow(
             ));
         }
     };
-    if source_entry.source != WorkflowSource::Builtin
-        || source_entry.status != WorkflowStatus::Valid
-        || source_entry.revision != payload.revision
-        || source_entry.content_digest != payload.content_digest
-    {
-        return Ok(fixed_clone_error(
-            StatusCode::CONFLICT,
-            "Workflow clone selection is stale or shadowed",
-        ));
-    }
 
     let bundles = match load_builtin_skill_bundles() {
         Ok(bundles) => bundles,
@@ -442,15 +430,57 @@ pub async fn clone_workflow(
             "Workflow clone source is not an embedded bundle",
         ));
     };
-    let source_digest = workflow_catalog_content_digest(
-        &source_entry,
-        Some(&bundle.skill),
-        bundle
-            .files
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
-    );
-    if source_digest != source_entry.content_digest {
+    let source_entry = match builtin_workflow_catalog_entry(&bundle, payload.revision) {
+        Ok(entry) => entry,
+        Err(error) => {
+            tracing::error!(%error, "failed to rebuild builtin Workflow catalog identity");
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Builtin Workflow identity is unavailable",
+            ));
+        }
+    };
+    if source_entry.revision != payload.revision
+        || source_entry.content_digest != payload.content_digest
+    {
+        return Ok(fixed_clone_error(
+            StatusCode::CONFLICT,
+            "Workflow clone selection is stale or shadowed",
+        ));
+    }
+    let winner_is_exact_builtin = catalog_winner.as_ref().is_some_and(|entry| {
+        entry.source == WorkflowSource::Builtin
+            && entry.status == WorkflowStatus::Valid
+            && entry.revision == payload.revision
+            && entry.content_digest == payload.content_digest
+    });
+    if !winner_is_exact_builtin {
+        let marker = scope
+            .trusted_root
+            .join("skills")
+            .join(clone_marker_name(&workflow_id));
+        match tokio::fs::symlink_metadata(&marker).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(fixed_clone_error(
+                    if catalog_winner.is_some() {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                    "Workflow clone selection is stale or shadowed",
+                ));
+            }
+            Err(error) => {
+                tracing::error!(%error, workflow_id, "failed to inspect Workflow clone recovery marker");
+                return Ok(fixed_clone_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Workflow clone publication failed",
+                ));
+            }
+        }
+    }
+    if source_entry.source != WorkflowSource::Builtin {
         tracing::error!(
             workflow_id,
             "builtin Workflow catalog identity diverged from embedded bytes"

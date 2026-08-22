@@ -283,20 +283,29 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
     } else {
         "agents/bamboo.yaml"
     };
-    let raw = tokio::fs::read_to_string(&path)
+    let raw = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("{display_name}: {error}"))?;
+    parse_bundle_metadata_bytes(display_name, &raw, path.ends_with("workflow.yaml"))
+}
+
+pub(crate) fn parse_bundle_metadata_bytes(
+    display_name: &str,
+    raw: &[u8],
+    is_workflow_definition: bool,
+) -> Result<BundleMetadata, String> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|_| format!("{display_name}: metadata is not valid UTF-8"))?;
     let metadata: BambooWorkflowMetadata =
-        serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
-    let is_workflow_definition = path.ends_with("workflow.yaml");
+        serde_yaml::from_str(raw).map_err(|error| public_yaml_error(display_name, error))?;
     if is_workflow_definition {
         if metadata.workflow_schema.is_some() {
-            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_str(&raw)
+            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_str(raw)
                 .map_err(|error| public_yaml_error(display_name, error))?;
             bamboo_domain::CompiledWorkflow::compile(definition.clone())
                 .map_err(|error| public_validation_error(display_name, error))?;
         } else {
-            let definition: bamboo_domain::WorkflowDefinition = serde_yaml::from_str(&raw)
+            let definition: bamboo_domain::WorkflowDefinition = serde_yaml::from_str(raw)
                 .map_err(|error| public_yaml_error(display_name, error))?;
             definition
                 .validate()
@@ -318,7 +327,7 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
     }
     if is_workflow_definition && metadata.workflow_schema.is_some() {
         let definition: bamboo_domain::WorkflowRunDefinition =
-            serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
+            serde_yaml::from_str(raw).map_err(|error| public_yaml_error(display_name, error))?;
         result.version = definition.workflow_schema.to_string();
         result.argument_schema = definition.input_schema.clone();
         result.definition_revision = Some(definition.revision);
