@@ -1641,6 +1641,7 @@ fn attach_durable_instruction_workflow(session: &mut Session) {
         kind: bamboo_skills::WorkflowKind::Instruction,
         source: bamboo_skills::WorkflowSource::Builtin,
         revision: WORKFLOW_REVISION,
+        content_digest: "compression-workflow-digest".to_string(),
         version: "1.0.0".to_string(),
         invocation_policy: serde_json::json!({"manual": true}),
         argument_schema: serde_json::json!({"type": "object"}),

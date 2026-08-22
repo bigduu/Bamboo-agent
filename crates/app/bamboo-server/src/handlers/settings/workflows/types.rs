@@ -1,5 +1,40 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloneWorkflowTarget {
+    Project,
+    User,
+}
+
+/// Exact metadata-only selection for cloning one immutable builtin Workflow.
+///
+/// The request never accepts prompt/resource bytes or a caller-supplied path.
+/// Project publication is derived from the durable Session identity.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneWorkflowRequest {
+    pub source: bamboo_skills::WorkflowSource,
+    pub revision: u64,
+    pub content_digest: String,
+    pub target: CloneWorkflowTarget,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct CloneWorkflowResponse {
+    pub workflow_id: String,
+    pub target: CloneWorkflowTarget,
+    pub source_preserved: bool,
+    pub source_revision: u64,
+    pub source_content_digest: String,
+    pub published_source: bamboo_skills::WorkflowSource,
+    pub published_revision: u64,
+    pub published_content_digest: String,
+    pub catalog_revision: u64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct WorkflowCatalogQuery {
     #[serde(default)]

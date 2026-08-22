@@ -1,5 +1,24 @@
 use super::validation::is_safe_workflow_name;
 
+async fn builtin_selection(
+    store: &bamboo_skills::SkillStore,
+    workflow_id: &str,
+) -> bamboo_skills::WorkflowCatalogEntry {
+    store.reload().await.expect("reload builtin catalog");
+    let (skills, workflows) = store.command_catalog_snapshots().await;
+    skills
+        .entries
+        .into_iter()
+        .chain(workflows.entries)
+        .find(|entry| {
+            entry.id == workflow_id
+                && entry.winner
+                && entry.source == bamboo_skills::WorkflowSource::Builtin
+                && entry.status == bamboo_skills::WorkflowStatus::Valid
+        })
+        .expect("exact builtin winner")
+}
+
 const MAX_LEGACY_FAILURE_BODY_BYTES: usize = 2 * 1024;
 
 /// Preserve the endpoint's actual status and response body when a success
@@ -204,6 +223,208 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
         .expect("catalog entries")
         .iter()
         .any(|entry| entry["id"] == "global-review"));
+}
+
+#[actix_web::test]
+async fn user_builtin_clone_is_exact_private_and_fresh_only() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let store = state
+        .skill_manager
+        .store_for_workspace(None)
+        .await
+        .expect("global store");
+    let source = builtin_selection(&store, "review").await;
+    let bundles =
+        bamboo_skills::store::builtin::load_builtin_skill_bundles().expect("builtin bundles");
+    let bundle = bundles
+        .iter()
+        .find(|bundle| bundle.skill.id == "review")
+        .expect("review bundle");
+    let expected =
+        bamboo_skills::store::builtin::builtin_clone_files(bundle).expect("exact clone files");
+    let request_json = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision,
+        "content_digest": source.content_digest.clone(),
+        "target": "user"
+    });
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let body = actix_web::test::read_body(response).await;
+    let text = std::str::from_utf8(&body).expect("UTF-8 response");
+    assert_eq!(status, actix_web::http::StatusCode::CREATED, "{text}");
+    assert!(!text.contains(&bundle.skill.prompt));
+    assert!(!text.contains(data.path().to_string_lossy().as_ref()));
+    assert!(!text.contains("SKILL.md"));
+    assert!(!text.contains("dynamic_context"));
+    let receipt: serde_json::Value = serde_json::from_slice(&body).expect("clone receipt");
+    assert_eq!(receipt["workflow_id"], "review");
+    assert_eq!(receipt["target"], "user");
+    assert_eq!(receipt["published_source"], "user");
+    assert_eq!(receipt["source_preserved"], true);
+    assert_eq!(receipt["source_content_digest"], source.content_digest);
+    assert!(receipt["published_content_digest"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+
+    let target = data.path().join("skills/review");
+    for (relative, file) in &expected {
+        assert_eq!(
+            std::fs::read(target.join(relative)).expect("published resource"),
+            file.bytes
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(target.join(relative))
+                .expect("published metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, if file.executable { 0o755 } else { 0o644 });
+        }
+    }
+    let before = std::fs::read(target.join("SKILL.md")).expect("published SKILL.md");
+    let repeated = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(repeated.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(target.join("SKILL.md")).expect("unchanged clone"),
+        before
+    );
+}
+
+#[actix_web::test]
+async fn project_builtin_clone_uses_durable_session_project_authority() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Clone Project", None)
+        .expect("create Project");
+    let mut session = bamboo_agent_core::Session::new("project-clone-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist Project Session");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+    );
+    let project_home = state.project_store.paths().project_home(&project.id);
+    let store = state
+        .skill_manager
+        .store_for_project_workspace(&project.id, &project_home, None)
+        .await
+        .expect("Project store");
+    let source = builtin_selection(&store, "plan").await;
+    let request_json = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision,
+        "content_digest": source.content_digest,
+        "target": "project",
+        "session_id": "project-clone-session"
+    });
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/plan/clone")
+            .set_json(request_json)
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let bytes = actix_web::test::read_body(response).await;
+    let visible = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, actix_web::http::StatusCode::CREATED, "{visible}");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("clone response");
+    assert_eq!(body["target"], "project");
+    assert_eq!(body["published_source"], "project");
+    assert!(project_home.join("skills/plan/SKILL.md").is_file());
+    assert!(!data.path().join("skills/plan").exists());
+}
+
+#[actix_web::test]
+async fn stale_builtin_clone_selection_has_zero_publication_side_effects() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let store = state
+        .skill_manager
+        .store_for_workspace(None)
+        .await
+        .expect("global store");
+    let source = builtin_selection(&store, "debug").await;
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    for request in [
+        serde_json::json!({
+            "source": "builtin",
+            "revision": source.revision + 1,
+            "content_digest": source.content_digest.clone(),
+            "target": "user"
+        }),
+        serde_json::json!({
+            "source": "builtin",
+            "revision": source.revision,
+            "content_digest": "0".repeat(64),
+            "target": "user"
+        }),
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/catalog/debug/clone")
+                .set_json(request)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    }
+    assert!(!data.path().join("skills/debug").exists());
+    assert!(!data.path().join("skills/.debug.clone-v1.json").exists());
+    assert!(!data.path().join(".workflow-clone-txn").exists());
 }
 
 #[actix_web::test]

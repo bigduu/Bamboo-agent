@@ -558,6 +558,7 @@ mod tests {
             kind: WorkflowKind::Instruction,
             source: WorkflowSource::Project,
             revision,
+            content_digest: "test-digest".to_string(),
             version: "1".to_string(),
             invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
             argument_schema: serde_json::json!({"type": "object"}),

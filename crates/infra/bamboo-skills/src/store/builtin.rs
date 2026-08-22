@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use sha2::{Digest, Sha256};
 
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillError, SkillResult};
@@ -10,6 +12,56 @@ include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 pub struct BuiltinSkillBundle {
     pub skill: crate::types::SkillDefinition,
     pub files: HashMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltinSkillFile {
+    pub bytes: Vec<u8>,
+    pub executable: bool,
+}
+
+/// Exact, sorted file tree used by fresh clone publication. `SKILL.md` is
+/// rendered from the parsed embedded definition so the copied bytes match the
+/// canonical builtin materialization rather than a caller-provided body.
+pub fn builtin_clone_files(
+    bundle: &BuiltinSkillBundle,
+) -> SkillResult<BTreeMap<String, BuiltinSkillFile>> {
+    let mut files = bundle
+        .files
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.clone(),
+                BuiltinSkillFile {
+                    bytes: bytes.clone(),
+                    executable: path.starts_with("scripts/"),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    files.insert(
+        "SKILL.md".to_string(),
+        BuiltinSkillFile {
+            bytes: render_skill_markdown(&bundle.skill)?.into_bytes(),
+            executable: false,
+        },
+    );
+    Ok(files)
+}
+
+/// Stable identity for the exact bytes and Unix executable class copied by the
+/// publication protocol. Framing keeps path/content boundaries unambiguous.
+pub fn builtin_clone_bundle_digest(files: &BTreeMap<String, BuiltinSkillFile>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo.workflow-clone-bundle.v1\0");
+    for (path, file) in files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update([u8::from(file.executable)]);
+        digest.update((file.bytes.len() as u64).to_be_bytes());
+        digest.update(&file.bytes);
+    }
+    hex::encode(digest.finalize())
 }
 
 /// Archive the pre-catalog global materialization only when every file proves
