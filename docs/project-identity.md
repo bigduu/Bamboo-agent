@@ -64,9 +64,12 @@ override them. Deterministic workflows remain `workflow.yaml` files inside skill
 bundles—there is no standalone Project `workflows/` directory.
 
 For repository compatibility only, a Workspace may contain legacy read-only
-`.bamboo/workflows/*.md` sources. They can be explicitly cloned into that
-Workspace's `.bamboo/skills/` directory; migration never creates a Project-home
-`workflows/` directory or writes legacy content into Project storage.
+`.bamboo/workflows/*.md` sources. An assigned Project session explicitly
+migrates such a source into the Project home's canonical `skills/` layer; an
+unassigned legacy session retains the bounded Workspace `.bamboo/skills/`
+fallback. Migration never creates a Project-home `workflows/` directory,
+never modifies the source, and records the relative `original_source` plus the
+`lotus-119-complete` compatibility removal boundary in the migrated bundle.
 
 Project memory and Dream data are stored in
 `projects/<id>/memory/v1`. Assigned sessions never derive a write scope from a

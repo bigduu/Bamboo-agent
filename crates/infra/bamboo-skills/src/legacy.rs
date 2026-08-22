@@ -1,6 +1,6 @@
 //! Non-destructive, idempotent adapters for pre-catalog workflow formats.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,7 +18,13 @@ use crate::types::SkillDefinition;
 use crate::types::{SkillError, SkillResult};
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const MAX_LEGACY_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_LEGACY_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub const LEGACY_WORKFLOW_SOURCE_REMOVAL_BOUNDARY: &str = "lotus-119-complete";
+
+pub struct PreparedLegacyWorkflowMigration {
+    pub files: BTreeMap<String, crate::store::builtin::BuiltinSkillFile>,
+    pub manual_only: bool,
+}
 
 fn migration_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -105,16 +111,20 @@ fn public_legacy_error(error: &SkillError) -> String {
     }
 }
 
-async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>> {
-    let metadata_bytes = tokio::fs::metadata(path).await?.len() as usize;
+async fn read_bounded_file_with_identity(
+    path: &Path,
+    max_bytes: usize,
+) -> SkillResult<(Vec<u8>, Option<crate::clone_publication::CloneNodeIdentity>)> {
+    let mut file = open_skill_file_no_follow(path).await?;
+    let metadata_bytes = file.metadata().await?.len() as usize;
     if metadata_bytes > max_bytes {
         return Err(SkillError::Storage(format!(
             "legacy workflow exceeds per-file limit ({metadata_bytes} > {max_bytes} bytes)"
         )));
     }
-    let file = open_skill_file_no_follow(path).await?;
     let mut bytes = Vec::with_capacity(metadata_bytes.min(max_bytes));
-    file.take(max_bytes.saturating_add(1) as u64)
+    (&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .await?;
     if bytes.len() > max_bytes {
@@ -123,7 +133,13 @@ async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>
             bytes.len()
         )));
     }
-    Ok(bytes)
+    let file = file.into_std().await;
+    let identity = crate::clone_publication::std_file_identity(&file);
+    Ok((bytes, identity))
+}
+
+async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>> {
+    Ok(read_bounded_file_with_identity(path, max_bytes).await?.0)
 }
 
 /// Read one legacy Workflow source without following symlinks and with the
@@ -132,6 +148,33 @@ pub async fn read_legacy_markdown_workflow(path: &Path) -> SkillResult<String> {
     let bytes = read_bounded_file(path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
     String::from_utf8(bytes)
         .map_err(|_| SkillError::Validation("legacy workflow is not valid UTF-8".to_string()))
+}
+
+/// Read one legacy Workflow through a no-follow handle and return the stable
+/// file identity bound to the bytes. Windows uses the handle volume/file ID;
+/// Unix uses device/inode identity.
+pub async fn read_legacy_markdown_workflow_with_identity(
+    path: &Path,
+) -> SkillResult<(String, crate::clone_publication::CloneNodeIdentity)> {
+    let (bytes, identity) =
+        read_bounded_file_with_identity(path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
+    let identity = identity.ok_or_else(|| {
+        SkillError::Storage("legacy workflow file identity is unavailable".to_string())
+    })?;
+    let content = String::from_utf8(bytes)
+        .map_err(|_| SkillError::Validation("legacy workflow is not valid UTF-8".to_string()))?;
+    Ok((content, identity))
+}
+
+/// Open a no-follow handle solely to bind a catalog selection to one durable
+/// source generation before its bytes are consumed.
+pub async fn legacy_markdown_source_identity(
+    path: &Path,
+) -> SkillResult<crate::clone_publication::CloneNodeIdentity> {
+    let file = open_skill_file_no_follow(path).await?.into_std().await;
+    crate::clone_publication::std_file_identity(&file).ok_or_else(|| {
+        SkillError::Storage("legacy workflow file identity is unavailable".to_string())
+    })
 }
 
 fn validate_legacy_description(description: &str) -> SkillResult<()> {
@@ -143,6 +186,19 @@ fn validate_legacy_description(description: &str) -> SkillResult<()> {
     if description.len() > 1024 {
         return Err(SkillError::Validation(
             "Legacy workflow description is too long".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_legacy_source_identity(source_identity: &str) -> SkillResult<()> {
+    if source_identity.trim().is_empty()
+        || source_identity.starts_with('/')
+        || source_identity.contains("..")
+        || source_identity.contains('\\')
+    {
+        return Err(SkillError::Validation(
+            "legacy workflow source identity must be a safe relative path".to_string(),
         ));
     }
     Ok(())
@@ -203,6 +259,101 @@ fn parse_legacy_markdown_adapter(
         prompt,
         tool_refs: Vec::new(),
     })
+}
+
+/// Render one already-read legacy markdown source into its immutable canonical
+/// bundle. Publication remains the caller's responsibility so HTTP migration
+/// can reuse the atomic no-replace clone transaction.
+pub fn prepare_legacy_markdown_workflow(
+    source: &Path,
+    source_identity: &str,
+    id: &str,
+    content: &str,
+    source_catalog_identity: Option<(u64, &str)>,
+    description_override: Option<&str>,
+) -> SkillResult<PreparedLegacyWorkflowMigration> {
+    if !is_valid_skill_id(id) {
+        return Err(SkillError::InvalidId(id.to_string()));
+    }
+    validate_legacy_source_identity(source_identity)?;
+
+    let mut skill = parse_legacy_markdown_adapter(source, id, content)?;
+    let mut manual_only = skill
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("legacy_manual_only"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if let Some(description) = description_override
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+    {
+        validate_legacy_description(description)?;
+        skill.description = description.to_string();
+        manual_only = false;
+    }
+    let mut migration_metadata = serde_json::json!({
+        "legacy_migration": true,
+        "legacy_manual_only": manual_only,
+        "legacy_name": source.file_stem().and_then(|value| value.to_str()).unwrap_or(id),
+        "original_source": source_identity,
+        "legacy_migration_description_override": description_override
+            .map(str::trim)
+            .filter(|description| !description.is_empty()),
+        "legacy_source_removal_boundary": LEGACY_WORKFLOW_SOURCE_REMOVAL_BOUNDARY,
+        "format": "workspace_workflow_markdown"
+    });
+    if let Some((source_revision, source_content_digest)) = source_catalog_identity {
+        let metadata = migration_metadata
+            .as_object_mut()
+            .expect("legacy migration metadata is an object");
+        metadata.insert(
+            "legacy_source_revision".to_string(),
+            serde_json::Value::from(source_revision),
+        );
+        metadata.insert(
+            "legacy_source_content_digest".to_string(),
+            serde_json::Value::from(source_content_digest),
+        );
+    }
+    skill.metadata = Some(migration_metadata);
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        "SKILL.md".to_string(),
+        crate::store::builtin::BuiltinSkillFile {
+            bytes: render_skill_markdown(&skill)?.into_bytes(),
+            executable: false,
+        },
+    );
+    if manual_only {
+        files.insert(
+            "agents/bamboo.yaml".to_string(),
+            crate::store::builtin::BuiltinSkillFile {
+                bytes: b"version: '1'\ninvocation_policy:\n  explicit: true\n  automatic: false\n"
+                    .to_vec(),
+                executable: false,
+            },
+        );
+    }
+    Ok(PreparedLegacyWorkflowMigration { files, manual_only })
+}
+
+/// Rebuild the exact catalog digest of already-read source bytes. The handler
+/// compares this with the accepted catalog entry immediately before any target
+/// publication, making a selection/read replacement a deterministic conflict.
+pub fn legacy_markdown_catalog_content_digest(
+    entry: &crate::catalog::WorkflowCatalogEntry,
+    source: &Path,
+    id: &str,
+    content: &str,
+) -> SkillResult<String> {
+    let definition = parse_legacy_markdown_adapter(source, id, content)?;
+    Ok(crate::catalog::workflow_catalog_content_digest(
+        entry,
+        Some(&definition),
+        std::iter::empty::<(&str, &[u8])>(),
+    ))
 }
 
 /// Discover legacy markdown workflows without modifying their source directory.
@@ -488,44 +639,21 @@ pub async fn migrate_legacy_markdown_workflow(
     description_override: Option<&str>,
 ) -> SkillResult<LegacyWorkflowMigrationOutcome> {
     let _guard = migration_lock().lock().await;
-    if !is_valid_skill_id(id) {
-        return Err(SkillError::InvalidId(id.to_string()));
-    }
-    if source_identity.trim().is_empty()
-        || source_identity.starts_with('/')
-        || source_identity.contains("..")
-        || source_identity.contains('\\')
-    {
-        return Err(SkillError::Validation(
-            "legacy workflow source identity must be a safe relative path".to_string(),
-        ));
-    }
     let bytes = read_bounded_file(source, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
     let content = String::from_utf8(bytes)
         .map_err(|_| SkillError::Validation("legacy workflow is not UTF-8".to_string()))?;
-    let mut skill = parse_legacy_markdown_adapter(source, id, &content)?;
-    let mut placeholder = skill
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("legacy_manual_only"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    if let Some(description) = description_override
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        validate_legacy_description(description)?;
-        skill.description = description.to_string();
-        placeholder = false;
-    }
-    skill.metadata = Some(serde_json::json!({
-        "legacy_migration": true,
-        "legacy_manual_only": placeholder,
-        "legacy_name": source.file_stem().and_then(|value| value.to_str()).unwrap_or(id),
-        "original_source": source_identity,
-        "format": "workspace_workflow_markdown"
-    }));
-    let rendered = render_skill_markdown(&skill)?;
+    let prepared = prepare_legacy_markdown_workflow(
+        source,
+        source_identity,
+        id,
+        &content,
+        None,
+        description_override,
+    )?;
+    let rendered = prepared
+        .files
+        .get("SKILL.md")
+        .expect("prepared legacy migration always contains SKILL.md");
 
     tokio::fs::create_dir_all(skills_dir).await?;
     if tokio::fs::symlink_metadata(skills_dir)
@@ -553,7 +681,7 @@ pub async fn migrate_legacy_markdown_workflow(
                 SkillError::Validation("existing Skill bundle is not UTF-8".to_string())
             })?;
             if is_owned_legacy_migration(&existing, &target, source_identity) {
-                ensure_manual_only_policy(&target_dir, placeholder).await?;
+                ensure_manual_only_policy(&target_dir, prepared.manual_only).await?;
                 return Ok(LegacyWorkflowMigrationOutcome::AlreadyMigrated);
             }
             return Ok(LegacyWorkflowMigrationOutcome::Conflict);
@@ -572,7 +700,7 @@ pub async fn migrate_legacy_markdown_workflow(
     let result = async {
         let (temporary, mut file) = unique_staging_file(&target_dir, "SKILL.md").await?;
         let write_result = async {
-            file.write_all(rendered.as_bytes()).await?;
+            file.write_all(&rendered.bytes).await?;
             file.flush().await?;
             file.sync_all().await?;
             drop(file);
@@ -581,7 +709,7 @@ pub async fn migrate_legacy_markdown_workflow(
         .await;
         let _ = tokio::fs::remove_file(&temporary).await;
         write_result?;
-        ensure_manual_only_policy(&target_dir, placeholder).await
+        ensure_manual_only_policy(&target_dir, prepared.manual_only).await
     }
     .await;
     if let Err(error) = result {
@@ -830,6 +958,11 @@ pub struct YamlMigrationDiagnostic {
     pub message: String,
 }
 
+const MAPPABLE_YAML_DIAGNOSTIC: &str =
+    "Legacy orchestration can be copied verbatim without changing execution semantics";
+const UNMAPPABLE_YAML_DIAGNOSTIC: &str =
+    "Legacy orchestration is invalid or cannot be mapped without changing execution semantics";
+
 /// Inspect old WorkflowDefinition YAML without writing or changing execution semantics.
 pub async fn diagnose_legacy_yaml_workflows(dir: &Path) -> Vec<YamlMigrationDiagnostic> {
     let mut diagnostics = Vec::new();
@@ -851,13 +984,11 @@ pub async fn diagnose_legacy_yaml_workflows(dir: &Path) -> Vec<YamlMigrationDiag
     paths.sort();
     for path in paths {
         let result = async {
-            let raw = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|e| e.to_string())?;
+            let raw = read_bounded_file(&path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
             let definition: bamboo_domain::WorkflowDefinition =
-                serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
-            definition.validate()?;
-            Ok::<_, String>(definition.id)
+                serde_yaml::from_slice(&raw).map_err(SkillError::from)?;
+            definition.validate().map_err(SkillError::Validation)?;
+            Ok::<_, SkillError>(definition.id)
         }
         .await;
         match result {
@@ -865,13 +996,13 @@ pub async fn diagnose_legacy_yaml_workflows(dir: &Path) -> Vec<YamlMigrationDiag
                 source: path,
                 workflow_id: Some(id),
                 can_map_to_bundle: true,
-                message: "Can be copied verbatim to workflow.yaml; execution remains owned by the orchestration runtime".to_string(),
+                message: MAPPABLE_YAML_DIAGNOSTIC.to_string(),
             }),
-            Err(error) => diagnostics.push(YamlMigrationDiagnostic {
+            Err(_) => diagnostics.push(YamlMigrationDiagnostic {
                 source: path,
                 workflow_id: None,
                 can_map_to_bundle: false,
-                message: error,
+                message: UNMAPPABLE_YAML_DIAGNOSTIC.to_string(),
             }),
         }
     }
@@ -947,18 +1078,21 @@ pub async fn migrate_legacy_yaml_workflows(
                         }
                         Err(error) => {
                             diagnostic.can_map_to_bundle = false;
-                            diagnostic.message = error.to_string();
+                            tracing::warn!(%error, "failed to publish legacy workflow.yaml");
+                            diagnostic.message = UNMAPPABLE_YAML_DIAGNOSTIC.to_string();
                         }
                     }
                 }
                 Err(error) => {
                     diagnostic.can_map_to_bundle = false;
-                    diagnostic.message = error.to_string();
+                    tracing::warn!(%error, "failed to stage legacy workflow.yaml");
+                    diagnostic.message = UNMAPPABLE_YAML_DIAGNOSTIC.to_string();
                 }
             },
             Err(error) => {
                 diagnostic.can_map_to_bundle = false;
-                diagnostic.message = error.to_string();
+                tracing::warn!(%error, "failed to read legacy workflow.yaml");
+                diagnostic.message = UNMAPPABLE_YAML_DIAGNOSTIC.to_string();
             }
         }
     }
@@ -1057,13 +1191,58 @@ mod tests {
         )
             .await
             .expect("safe yaml");
-        tokio::fs::write(temp.path().join("unsafe.yaml"), "id: unsafe\nsteps: []\n")
+        let unsafe_source = temp.path().join("unsafe.yaml");
+        let unsafe_bytes = b"id: unsafe\ndescription: PRIVATE-DIAGNOSTIC-SENTINEL\nsteps: []\n";
+        tokio::fs::write(&unsafe_source, unsafe_bytes)
             .await
             .expect("unsafe yaml");
         let diagnostics = diagnose_legacy_yaml_workflows(temp.path()).await;
         assert_eq!(diagnostics.len(), 2);
         assert!(diagnostics.iter().any(|item| item.can_map_to_bundle));
-        assert!(diagnostics.iter().any(|item| !item.can_map_to_bundle));
+        let invalid = diagnostics
+            .iter()
+            .find(|item| !item.can_map_to_bundle)
+            .expect("invalid diagnostic");
+        assert_eq!(invalid.message, UNMAPPABLE_YAML_DIAGNOSTIC);
+        assert!(!invalid.message.contains("PRIVATE-DIAGNOSTIC-SENTINEL"));
+        assert!(!invalid.message.contains("unsafe.yaml"));
+        assert_eq!(
+            tokio::fs::read(&unsafe_source)
+                .await
+                .expect("source remains"),
+            unsafe_bytes
+        );
+    }
+
+    #[test]
+    fn legacy_catalog_digest_binds_the_selected_source_bytes() {
+        let source = Path::new("workflows/review.md");
+        let selected = "---\ndescription: Review the selected change.\n---\nReview A.\n";
+        let replacement = "---\ndescription: Review the selected change.\n---\nReview B.\n";
+        let definition =
+            parse_legacy_markdown_adapter(source, "review", selected).expect("selected definition");
+        let mut entry = crate::catalog::entry_from_skill(
+            &definition,
+            SkillDirectorySource::Global,
+            7,
+            crate::catalog::BundleMetadata::default(),
+        );
+        entry.content_digest = crate::catalog::workflow_catalog_content_digest(
+            &entry,
+            Some(&definition),
+            std::iter::empty::<(&str, &[u8])>(),
+        );
+
+        assert_eq!(
+            legacy_markdown_catalog_content_digest(&entry, source, "review", selected)
+                .expect("selected digest"),
+            entry.content_digest
+        );
+        assert_ne!(
+            legacy_markdown_catalog_content_digest(&entry, source, "review", replacement)
+                .expect("replacement digest"),
+            entry.content_digest
+        );
     }
 
     #[tokio::test]
@@ -1259,6 +1438,10 @@ mod tests {
             .await
             .expect("migrated Skill");
         assert!(migrated.contains("legacy_migration: true"));
+        assert!(migrated.contains("original_source: .bamboo/workflows/review.md"));
+        assert!(migrated.contains(&format!(
+            "legacy_source_removal_boundary: {LEGACY_WORKFLOW_SOURCE_REMOVAL_BOUNDARY}"
+        )));
         assert!(migrated.contains("Review exactly this way."));
         assert!(skills.join("review/agents/bamboo.yaml").exists());
 
