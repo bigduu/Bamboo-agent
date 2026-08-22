@@ -493,6 +493,28 @@ pub fn resolve_workflow_selection(
         return Ok(());
     }
 
+    // A typed chat candidate is durable authority for the next execute, even
+    // when another ordinary message is appended before execution starts.
+    // Keep its visible selected id aligned with the retained immutable
+    // snapshot; only an explicit replacement/deactivation may cancel it.
+    if let Some(pending) = session
+        .metadata
+        .get(WORKFLOW_SELECTION_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok())
+        .filter(|_| {
+            session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                .is_some_and(|source| source == "explicit")
+                && session.metadata.contains_key(
+                    bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+                )
+        })
+    {
+        persist_selected_skill_ids_metadata(session, Some(&[pending.id]));
+        return Ok(());
+    }
+
     if let Some(active) = session
         .metadata
         .get(ACTIVE_WORKFLOW_METADATA_KEY)
@@ -1046,6 +1068,47 @@ mod tests {
             Some(vec!["review".to_string()])
         );
         assert!(session.metadata.contains_key(ACTIVE_WORKFLOW_METADATA_KEY));
+    }
+
+    #[test]
+    fn pending_typed_workflow_survives_an_ordinary_chat_before_execute() {
+        let mut session = Session::new("pending-selection", "model");
+        let selection = WorkflowSelection {
+            id: "review".to_string(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: 7,
+            args: serde_json::json!({}),
+        };
+        session.metadata.insert(
+            WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).expect("selection json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(),
+            "opaque durable snapshot".to_string(),
+        );
+
+        resolve_workflow_selection(&mut session, None, None, "one more detail")
+            .expect("retain pending selection");
+
+        assert_eq!(
+            session.selected_skill_ids(),
+            Some(vec!["review".to_string()])
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok()),
+            Some(selection)
+        );
+        assert!(session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY));
     }
 
     #[test]
