@@ -584,6 +584,11 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
         bamboo_agent_core::Session::new("cross-project-workflow-session", "test-model");
     session.set_project_id_meta(session_project.id.to_string());
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist cross-Project Session");
     state.sessions.insert(
         session.id.clone(),
         std::sync::Arc::new(parking_lot::RwLock::new(session)),
@@ -635,7 +640,7 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
 }
 
 #[actix_web::test]
-async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_idempotent() {
+async fn project_legacy_workflow_migration_is_exact_non_destructive_and_idempotent() {
     let data = tempfile::tempdir().expect("data dir");
     let workspace = tempfile::tempdir().expect("workspace");
     let legacy_dir = workspace.path().join(".bamboo/workflows");
@@ -646,20 +651,39 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     let protected_source = legacy_dir.join("protected.md");
     std::fs::write(&protected_source, "Legacy source must remain.\n")
         .expect("protected legacy workflow");
-    let protected_target = workspace.path().join(".bamboo/skills/protected/SKILL.md");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create_with_bindings(
+            "Legacy Migration Project",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("create Project");
+    let project_home = state.project_store.paths().project_home(&project.id);
+    let protected_target = project_home.join("skills/protected/SKILL.md");
     std::fs::create_dir_all(protected_target.parent().expect("protected target parent"))
         .expect("protected target dir");
     let protected_skill =
         "---\nname: protected\ndescription: Existing canonical Skill\n---\nKeep this target.\n";
     std::fs::write(&protected_target, protected_skill).expect("protected target");
 
-    let state = actix_web::web::Data::new(
-        crate::app_state::AppState::new(data.path().to_path_buf())
-            .await
-            .expect("app state"),
-    );
     let mut session = bamboo_agent_core::Session::new("legacy-migration-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
     state.sessions.insert(
         session.id.clone(),
         std::sync::Arc::new(parking_lot::RwLock::new(session)),
@@ -727,25 +751,60 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     assert_eq!(first["source_preserved"], true);
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 
-    let target = workspace.path().join(".bamboo/skills/daily-report");
+    let target = project_home.join("skills/daily-report");
     let migrated = std::fs::read_to_string(target.join("SKILL.md")).expect("migrated Skill");
     assert!(migrated.contains("legacy_migration: true"));
     assert!(migrated.contains(".bamboo/workflows/daily-report.md"));
+    assert!(migrated.contains("legacy_source_removal_boundary: lotus-119-complete"));
     assert!(!migrated.contains(workspace.path().to_string_lossy().as_ref()));
     assert!(migrated.contains("Summarize today's changes."));
     assert!(target.join("agents/bamboo.yaml").exists());
+    assert!(
+        !workspace
+            .path()
+            .join(".bamboo/skills/daily-report")
+            .exists(),
+        "assigned Project migration must publish to Project home"
+    );
+
+    let edited = migrated.replace("Summarize today's changes.", "USER EDITED INSTRUCTIONS");
+    std::fs::write(target.join("SKILL.md"), &edited).expect("edit migrated target");
 
     let second = actix_web::test::call_service(&app, migrate()).await;
     assert!(second.status().is_success());
     let second: serde_json::Value = actix_web::test::read_body_json(second).await;
     assert_eq!(second["outcome"], "already_migrated");
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "idempotent retry must not rewrite the editable target"
+    );
+
+    let mismatched_source = edited.replace(
+        "original_source: .bamboo/workflows/daily-report.md",
+        "original_source: .bamboo/workflows/another-report.md",
+    );
+    assert_ne!(
+        mismatched_source, edited,
+        "fixture must change source identity"
+    );
+    std::fs::write(target.join("SKILL.md"), &mismatched_source)
+        .expect("change migration source identity");
+    let non_exact = actix_web::test::call_service(&app, migrate()).await;
+    assert_eq!(non_exact.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        mismatched_source,
+        "non-exact repeat must not rewrite the editable target"
+    );
+    std::fs::write(target.join("SKILL.md"), &edited).expect("restore exact migration fixture");
 
     let store = state
         .skill_manager
-        .store_for_workspace(Some(workspace.path()))
+        .store_for_project_workspace(&project.id, &project_home, Some(workspace.path()))
         .await
-        .expect("workspace SkillStore");
+        .expect("Project SkillStore");
     let skill_catalog = store.skill_catalog_snapshot().await;
     let migrated_skill = skill_catalog
         .entries
@@ -765,24 +824,41 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
     )
     .await;
     let entries = after["entries"].as_array().expect("catalog entries");
-    let migrated_workflow = entries
+    let same_id = entries
         .iter()
-        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "migrated")
-        .expect("migrated instruction entry");
-    let source_workflow = entries
-        .iter()
-        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "available")
-        .expect("source Workflow entry");
-    assert_ne!(
-        migrated_workflow["revision"], source_workflow["revision"],
-        "same-id instruction and source entries keep distinct typed revisions"
+        .filter(|entry| entry["id"] == "daily-report")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_id.len(),
+        1,
+        "public catalog must not duplicate migration"
     );
-    assert_eq!(source_workflow["migration_status"], "available");
-    assert!(source_workflow.get("shadowed_candidates").is_none());
+    let migrated_workflow = same_id[0];
+    assert_eq!(migrated_workflow["migration_status"], "migrated");
+    assert_eq!(migrated_workflow["source"], "project");
+    assert!(migrated_workflow["shadowed_candidates"]
+        .as_array()
+        .expect("preserved source diagnostic")
+        .iter()
+        .any(|candidate| candidate["migration_status"] == "available"));
+
+    let changed_source = "# Daily report\n\nUse changed source instructions.\n";
+    std::fs::write(&source, changed_source).expect("change legacy source after migration");
+    let changed_repeat = actix_web::test::call_service(&app, migrate()).await;
+    assert_eq!(
+        changed_repeat.status(),
+        actix_web::http::StatusCode::CONFLICT
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), changed_source);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "changed source repeat must preserve the editable target"
+    );
 }
 
 #[actix_web::test]
-async fn global_legacy_workflow_advertised_as_available_migrates_into_session_workspace() {
+async fn global_legacy_workflow_migrates_into_canonical_user_skills() {
     let data = tempfile::tempdir().expect("data dir");
     let workspace = tempfile::tempdir().expect("workspace");
     let global_workflows = data.path().join("workflows");
@@ -799,6 +875,11 @@ async fn global_legacy_workflow_advertised_as_available_migrates_into_session_wo
     );
     let mut session = bamboo_agent_core::Session::new("global-migration-session", "test-model");
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
     state.sessions.insert(
         session.id.clone(),
         std::sync::Arc::new(parking_lot::RwLock::new(session)),
@@ -849,12 +930,18 @@ async fn global_legacy_workflow_advertised_as_available_migrates_into_session_wo
     assert_eq!(body["source_preserved"], true);
     assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
 
-    let target = workspace
-        .path()
-        .join(".bamboo/skills/global-review/SKILL.md");
+    let target = data.path().join("skills/global-review/SKILL.md");
     let migrated = std::fs::read_to_string(&target).expect("migrated Skill");
     assert!(migrated.contains("workflows/global-review.md"));
+    assert!(migrated.contains("legacy_source_removal_boundary: lotus-119-complete"));
     assert!(!migrated.contains(data.path().to_string_lossy().as_ref()));
+    assert!(
+        !workspace
+            .path()
+            .join(".bamboo/skills/global-review")
+            .exists(),
+        "global migration must not create a workspace copy"
+    );
     let scoped = state
         .skill_manager
         .store_for_workspace(Some(workspace.path()))
@@ -878,6 +965,55 @@ async fn global_legacy_workflow_advertised_as_available_migrates_into_session_wo
         .unwrap(),
         std::fs::canonicalize(&source).unwrap()
     );
+}
+
+#[actix_web::test]
+async fn replacing_legacy_source_after_selection_conflicts_without_target_mutation() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&workflows).expect("global workflows");
+    let source = workflows.join("raced-review.md");
+    let selected = "---\ndescription: Review the selected bytes.\n---\nSELECTED BODY\n";
+    let replacement = "---\ndescription: Review replacement bytes.\n---\nREPLACEMENT BODY\n";
+    std::fs::write(&source, selected).expect("selected source");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session = bamboo_agent_core::Session::new("raced-migration-session", "test-model");
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
+
+    let original = workflows.join("raced-review.selected.md");
+    let response = super::handlers::migrate_workflow_with_source_hook(
+        state,
+        "raced-review".to_string(),
+        super::MigrateWorkflowRequest {
+            session_id: "raced-migration-session".to_string(),
+            description: None,
+        },
+        |selected_path| {
+            std::fs::rename(selected_path, &original).expect("retain selected generation");
+            std::fs::write(selected_path, replacement).expect("install replacement generation");
+        },
+    )
+    .await
+    .expect("migration response");
+
+    assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), selected);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), replacement);
+    assert!(!data.path().join("skills/raced-review").exists());
+    assert!(!data
+        .path()
+        .join("skills/.raced-review.clone-v1.json")
+        .exists());
+    assert!(!data.path().join(".workflow-clone-txn").exists());
 }
 
 #[actix_web::test]

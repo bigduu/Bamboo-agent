@@ -41,8 +41,8 @@ pub struct WorkflowCatalogQuery {
     pub session_id: Option<String>,
 }
 
-/// Request body for explicitly cloning a read-only legacy workflow into the
-/// current session workspace's canonical Skill directory.
+/// Request body for explicitly migrating a read-only legacy workflow into the
+/// canonical user or assigned-Project Skill layer selected by the source.
 #[derive(Debug, Default, Deserialize)]
 pub struct MigrateWorkflowRequest {
     /// Trusted session used to resolve the Project/workspace publication scope.

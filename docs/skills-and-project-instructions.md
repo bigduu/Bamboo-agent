@@ -32,15 +32,26 @@ If a completed clone directory is later deleted, Bamboo records `retired`
 before starting a bounded replacement epoch; a different directory generation
 at the public name is never retired, adopted, or deleted.
 
-Migration is an explicit clone through
+Migration is an explicit transaction through
 `POST /api/v1/bamboo/workflow-catalog/<id>/migrate`, using a trusted session id
-to select the current workspace. It creates
-`<workspace>/.bamboo/skills/<id>/SKILL.md`, never modifies or deletes the
-legacy source, never overwrites an existing target, and is idempotent. The
-optional request `description` replaces the placeholder; otherwise the
-migrated bundle remains manual-only. The catalog reports the canonical winner
-as `migration_status: "migrated"` and retains the legacy adapter as a shadowed
-diagnostic.
+to resolve the source and canonical target layer. A user source under
+`${BAMBOO_DATA_DIR}/workflows` migrates to `${BAMBOO_DATA_DIR}/skills`; a
+Workspace legacy source owned by an assigned Project migrates to that
+Project's `skills` directory. Unassigned legacy sessions retain the bounded
+Workspace `.bamboo/skills` compatibility target. Publication reuses the same
+private staging, fsync, and atomic no-replace transaction as builtin clone.
+
+The source is never modified or deleted by migration, an existing target is
+never overwritten, and an exact repeat returns `already_migrated` without
+rewriting later user edits. Migrated `SKILL.md` metadata records
+`original_source`, the accepted source revision/content digest, and
+`legacy_source_removal_boundary: lotus-119-complete`. That boundary means the
+source compatibility path may be removed only after `bigduu/Lotus#119` is
+complete and consumers have moved to the canonical catalog; this endpoint
+does not remove it. The optional request `description` replaces the
+placeholder, otherwise the bundle remains manual-only. The public catalog
+reports one canonical `migration_status: "migrated"` entry and retains the
+read-only adapter only as a shadowed diagnostic, never as a duplicate row.
 
 [Claude Code Skills and legacy custom-command compatibility](https://code.claude.com/docs/en/slash-commands)
 remain rooted in `.claude/skills` and `<workspace>/.claude/commands`; Bamboo
