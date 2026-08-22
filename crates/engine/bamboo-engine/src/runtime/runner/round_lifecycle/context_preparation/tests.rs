@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    maybe_apply_host_context_compression, prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
+    build_compression_context_blocks, emit_context_pressure_notification,
+    enforce_model_context_ledger_retention, maybe_apply_host_context_compression,
+    prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
@@ -1622,6 +1624,69 @@ fn activate_plan_mode(session: &mut Session) {
     });
 }
 
+fn attach_durable_instruction_workflow(session: &mut Session) {
+    const WORKFLOW_ID: &str = "compression-workflow-872";
+    const WORKFLOW_REVISION: u64 = 7;
+
+    let definition = bamboo_skills::SkillDefinition::new(
+        WORKFLOW_ID,
+        "Compression Workflow",
+        "Private durable workflow used by the compression regression",
+        "WORKFLOW_PRIVATE_INSTRUCTION_872",
+    );
+    let catalog_entry = bamboo_skills::WorkflowCatalogEntry {
+        id: WORKFLOW_ID.to_string(),
+        name: "Compression Workflow".to_string(),
+        description: "Private durable workflow used by the compression regression".to_string(),
+        kind: bamboo_skills::WorkflowKind::Instruction,
+        source: bamboo_skills::WorkflowSource::Builtin,
+        revision: WORKFLOW_REVISION,
+        version: "1.0.0".to_string(),
+        invocation_policy: serde_json::json!({"manual": true}),
+        argument_schema: serde_json::json!({"type": "object"}),
+        status: bamboo_skills::WorkflowStatus::Valid,
+        legacy: false,
+        migration_status: None,
+        last_error: None,
+        winner: true,
+        shadowed_candidates: Vec::new(),
+    };
+    let mut skills = BTreeMap::new();
+    skills.insert(
+        WORKFLOW_ID.to_string(),
+        bamboo_skills::SkillActivationSnapshotEntry {
+            definition,
+            catalog_entry,
+            revision: WORKFLOW_REVISION,
+            resources: BTreeMap::new(),
+        },
+    );
+    let durable = bamboo_skills::DurableWorkflowActivation {
+        active: bamboo_skills::ActiveWorkflow {
+            id: WORKFLOW_ID.to_string(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: WORKFLOW_REVISION,
+            kind: bamboo_skills::WorkflowKind::Instruction,
+            args: serde_json::json!({"private_scope": "WORKFLOW_PRIVATE_ARG_872"}),
+            invoked_by: bamboo_skills::WorkflowInvokedBy::User,
+            activated_at: chrono::Utc::now(),
+            status: bamboo_skills::WorkflowActivationStatus::Active,
+            diagnostic: None,
+            context_fingerprint: Some("workflow-context-fingerprint-872".to_string()),
+            dynamic_context: Vec::new(),
+        },
+        snapshot: bamboo_skills::SkillActivationSnapshot {
+            catalog_revision: 11,
+            selected_skill_mode: None,
+            skills,
+        },
+    };
+    session.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.to_string(),
+        serde_json::to_string(&durable).expect("serialize durable workflow fixture"),
+    );
+}
+
 #[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
@@ -1742,6 +1807,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 async fn pre_turn_host_context_compression_includes_available_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
     activate_plan_mode(&mut session);
+    attach_durable_instruction_workflow(&mut session);
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 5000,
         max_output_tokens: 200,
@@ -1795,6 +1861,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
+    assert!(session.messages.iter().all(|message| {
+        !message.content.contains("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            && !message.content.contains("WORKFLOW_PRIVATE_ARG_872")
+    }));
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
@@ -1817,6 +1887,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     .expect("pre-turn host compression should run");
 
     assert!(applied, "expected pre-turn compression to be applied");
+    assert!(session.messages.iter().all(|message| {
+        !message.content.contains("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            && !message.content.contains("WORKFLOW_PRIVATE_ARG_872")
+    }));
 
     let requests = requests
         .lock()
@@ -1829,11 +1903,37 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
 
     assert!(prompt.contains("## Compression Context Blocks"));
     assert!(prompt.contains("type: task_snapshot"));
+    assert!(prompt.contains("type: workflow_runtime"));
     assert!(prompt.contains("type: plan_mode_state"));
     assert!(prompt.contains("type: plan_runtime_state"));
     assert!(prompt.contains("Current Task List"));
     assert!(prompt.contains("Plan Mode State"));
     assert!(prompt.contains("Durable Plan Execution Context"));
+    assert_eq!(
+        prompt.matches("WORKFLOW_PRIVATE_INSTRUCTION_872").count(),
+        1
+    );
+    assert_eq!(prompt.matches("WORKFLOW_PRIVATE_ARG_872").count(), 1);
+
+    let workflow_blocks = build_compression_context_blocks(&session, None)
+        .into_iter()
+        .filter(|block| block.block_type == ContextBlockType::WorkflowRuntime)
+        .collect::<Vec<_>>();
+    assert_eq!(workflow_blocks.len(), 1);
+    assert_eq!(
+        workflow_blocks[0]
+            .content
+            .matches("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            .count(),
+        1
+    );
+    assert_eq!(
+        workflow_blocks[0]
+            .content
+            .matches("WORKFLOW_PRIVATE_ARG_872")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

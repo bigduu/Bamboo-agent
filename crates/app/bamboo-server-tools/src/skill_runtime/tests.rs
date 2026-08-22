@@ -22,6 +22,42 @@ use bamboo_agent_core::Session;
 use bamboo_llm::Config;
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 
+fn public_load_skill_receipt(result: &ToolResult) -> serde_json::Value {
+    let value: serde_json::Value =
+        serde_json::from_str(&result.result).expect("load_skill receipt JSON");
+    let keys = value
+        .as_object()
+        .expect("load_skill receipt object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "activation_status",
+            "kind",
+            "revision",
+            "skill_id",
+            "source",
+        ]),
+        "load_skill must expose only its typed public receipt"
+    );
+    for private_key in [
+        "instructions",
+        "skill_base_dir",
+        "resource_files",
+        "dynamic_context",
+        "allowed_tools",
+        "args",
+    ] {
+        assert!(
+            value.get(private_key).is_none(),
+            "public load_skill receipt exposed {private_key}: {value:#}"
+        );
+    }
+    value
+}
+
 #[tokio::test]
 async fn real_runner_auto_load_skill_survives_final_save_and_restart() {
     use bamboo_agent_core::storage::AttachmentReader;
@@ -79,6 +115,12 @@ metadata:
 RUNNER_RUNTIME_INSTRUCTIONS"#,
     )
     .expect("skill");
+    std::fs::create_dir_all(skill_dir.join("references")).expect("resource directory");
+    std::fs::write(
+        skill_dir.join("references/private.txt"),
+        "RUNNER_PRIVATE_RESOURCE_SENTINEL",
+    )
+    .expect("private workflow resource");
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: directory.path().join("skills"),
         ..Default::default()
@@ -147,7 +189,7 @@ RUNNER_RUNTIME_INSTRUCTIONS"#,
         "Please use RUNNER_AUTO_REVIEW_NEEDLE",
     ));
     repo.save(&mut session).await.expect("seed session");
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(128);
     agent
         .execute(
             &mut session,
@@ -189,6 +231,46 @@ RUNNER_RUNTIME_INSTRUCTIONS"#,
             .as_ref()
             .is_some_and(|calls| calls.iter().any(|call| call.function.name == "load_skill"))
     }));
+    let durable_messages = serde_json::to_string(&saved.messages).expect("durable messages");
+    let private_root = directory.path().to_string_lossy().into_owned();
+    for private in [
+        "RUNNER_RUNTIME_INSTRUCTIONS",
+        "RUNNER_PRIVATE_RESOURCE_SENTINEL",
+        private_root.as_str(),
+        "skill_base_dir",
+        "resource_files",
+        "dynamic_context",
+    ] {
+        assert!(
+            !durable_messages.contains(private),
+            "durable/public history leaked {private}: {durable_messages}"
+        );
+    }
+    let mut tool_complete = None;
+    while let Ok(event) = event_rx.try_recv() {
+        if let bamboo_agent_core::AgentEvent::ToolComplete { result, .. } = event {
+            tool_complete = Some(result);
+        }
+    }
+    let tool_complete = tool_complete.expect("ToolComplete event");
+    let receipt = public_load_skill_receipt(&tool_complete);
+    assert_eq!(receipt["skill_id"], "runner-review");
+    assert_eq!(receipt["activation_status"], "active");
+    let tool_complete_json =
+        serde_json::to_string(&tool_complete).expect("serialized ToolComplete result");
+    for private in [
+        "RUNNER_RUNTIME_INSTRUCTIONS",
+        "RUNNER_PRIVATE_RESOURCE_SENTINEL",
+        private_root.as_str(),
+        "skill_base_dir",
+        "resource_files",
+        "dynamic_context",
+    ] {
+        assert!(
+            !tool_complete_json.contains(private),
+            "live ToolComplete leaked {private}: {tool_complete_json}"
+        );
+    }
 
     let requests = provider.requests.lock().await;
     let second = serde_json::to_string(&requests[1]).expect("second request");
@@ -535,14 +617,8 @@ Use the dynamic context."#,
         else {
             panic!("load must complete")
         };
-        let payload: serde_json::Value =
-            serde_json::from_str(&result.result).expect("payload json");
+        let payload = public_load_skill_receipt(&result);
         assert_eq!(payload["activation_status"], "active");
-        assert!(payload["dynamic_context"][0]["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("[REDACTED]")
-                && !content.contains("super-secret-output")));
-        assert!(payload["dynamic_context"][0]["diagnostic"].is_object());
     }
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
@@ -570,6 +646,16 @@ Use the dynamic context."#,
         .expect("bounded cache metadata");
     assert!(!cache.contains("input.txt"));
     assert!(!cache.contains("super-secret-output"));
+    let active = saved
+        .metadata
+        .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+        .expect("durable private activation metadata");
+    assert!(active.dynamic_context[0].content.contains("[REDACTED]"));
+    assert!(!active.dynamic_context[0]
+        .content
+        .contains("super-secret-output"));
+    assert!(active.dynamic_context[0].diagnostic.is_some());
 
     let production_session_id = "dynamic-context-production-authority";
     let mut production_session = Session::new(production_session_id, "model");
@@ -610,14 +696,8 @@ Use the dynamic context."#,
     else {
         panic!("production load completes")
     };
-    let production: serde_json::Value =
-        serde_json::from_str(&production.result).expect("production payload");
+    let production = public_load_skill_receipt(&production);
     assert_eq!(production["activation_status"], "active");
-    assert_eq!(
-        production["dynamic_context"][0]["provenance"],
-        "typed_authority_unavailable"
-    );
-    assert_eq!(production["dynamic_context"][0]["content"], "");
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls_before);
     let production_saved = repo
         .storage()
@@ -628,6 +708,16 @@ Use the dynamic context."#,
     assert!(production_saved
         .metadata
         .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    let production_active = production_saved
+        .metadata
+        .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+        .expect("private production activation");
+    assert_eq!(
+        production_active.dynamic_context[0].provenance,
+        "typed_authority_unavailable"
+    );
+    assert_eq!(production_active.dynamic_context[0].content, "");
     assert!(!production_saved
         .metadata
         .contains_key(bamboo_skills::WORKFLOW_CONTEXT_CACHE_METADATA_KEY));
@@ -680,16 +770,26 @@ Use the dynamic context."#,
     else {
         panic!("typed authority load completes")
     };
-    let typed: serde_json::Value =
-        serde_json::from_str(&typed.result).expect("typed authority payload");
+    let typed = public_load_skill_receipt(&typed);
     assert_eq!(typed["activation_status"], "active");
+    let typed_saved = repo
+        .storage()
+        .load_session(typed_session_id)
+        .await
+        .expect("load typed authority session")
+        .expect("typed authority session remains durable");
+    let typed_active = typed_saved
+        .metadata
+        .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
+        .expect("private typed activation");
     assert_eq!(
-        typed["dynamic_context"][0]["provenance"],
+        typed_active.dynamic_context[0].provenance,
         "registered_tool_permission_checked"
     );
-    assert!(typed["dynamic_context"][0]["content"]
-        .as_str()
-        .is_some_and(|content| content.contains("workspace input")));
+    assert!(typed_active.dynamic_context[0]
+        .content
+        .contains("workspace input"));
     assert_eq!(permission_config.policy_revision(), 41);
 }
 
@@ -820,8 +920,7 @@ Plan must block this provider before dispatch."#,
     else {
         panic!("Plan+Auto read provider must not return a pause")
     };
-    let plan_read_payload: serde_json::Value =
-        serde_json::from_str(&plan_read_result.result).expect("Plan+Auto read payload");
+    let plan_read_payload = public_load_skill_receipt(&plan_read_result);
     assert_eq!(plan_read_payload["activation_status"], "degraded");
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert!(!provider.saw_bypass.load(Ordering::SeqCst));
@@ -851,19 +950,28 @@ Plan must block this provider before dispatch."#,
     else {
         panic!("invalid mutating provider metadata must not return a pause")
     };
-    let invalid_write_payload: serde_json::Value =
-        serde_json::from_str(&invalid_write_result.result)
-            .expect("invalid mutating provider payload");
+    let invalid_write_payload = public_load_skill_receipt(&invalid_write_result);
     assert_eq!(invalid_write_payload["activation_status"], "degraded");
+    let invalid_write_session = storage
+        .load_session(session_id)
+        .await
+        .expect("load invalid provider session")
+        .expect("invalid provider session remains durable");
+    let invalid_write_context = invalid_write_session
+        .metadata
+        .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<bamboo_skills::DynamicContextBlock>>(raw).ok())
+        .expect("private invalid provider diagnostic");
     assert_eq!(
-        invalid_write_payload["dynamic_context"][0]["provenance"],
+        invalid_write_context[0].provenance,
         "invalid_workflow_metadata"
     );
     assert!(
-        invalid_write_payload["dynamic_context"][0]["diagnostic"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("invalid")),
-        "unexpected invalid metadata diagnostic: {invalid_write_payload:#}"
+        invalid_write_context[0]
+            .diagnostic
+            .as_ref()
+            .is_some_and(|diagnostic| diagnostic.message.contains("invalid")),
+        "unexpected invalid metadata diagnostic: {invalid_write_context:#?}"
     );
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
@@ -1236,8 +1344,9 @@ async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_c
     else {
         panic!("load_skill should complete")
     };
-    let loaded: serde_json::Value = serde_json::from_str(&loaded.result).expect("load result");
-    assert_eq!(loaded["instructions"], "review N");
+    let loaded = public_load_skill_receipt(&loaded);
+    assert_eq!(loaded["skill_id"], "review-demo");
+    assert_eq!(loaded["activation_status"], "active");
     let ToolOutcome::Completed(resource) = read_tool
         .invoke(
             serde_json::json!({
@@ -1644,7 +1753,7 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
     storage.save_session(&session_one).await.expect("save one");
     storage.save_session(&session_two).await.expect("save two");
     let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
-    let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
+    let repo = bamboo_engine::SessionRepository::new(sessions, storage.clone(), persistence);
     let config = Arc::new(RwLock::new(Config::default()));
     let load_tool = LoadSkillTool::new(skill_manager.clone(), config.clone(), repo.clone());
     let read_tool = ReadSkillResourceTool::new(skill_manager, config, repo);
@@ -1685,17 +1794,31 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         else {
             panic!("load_skill should complete")
         };
-        let loaded: serde_json::Value =
-            serde_json::from_str(&loaded.result).expect("load result json");
-        assert_eq!(loaded["instructions"], expected_instructions);
-        let expected_workspace =
-            std::fs::canonicalize(expected_workspace).expect("canonical workspace");
-        let skill_root = loaded["skill_base_dir"].as_str().expect("skill root");
-        assert!(
-            skill_root.starts_with(expected_workspace.to_string_lossy().as_ref()),
-            "runtime root {skill_root} must stay under {}",
-            expected_workspace.display()
+        let loaded = public_load_skill_receipt(&loaded);
+        assert_eq!(loaded["skill_id"], "shared-workflow");
+        let durable = storage
+            .load_session(session_id)
+            .await
+            .expect("load workspace activation")
+            .expect("workspace activation remains durable")
+            .metadata
+            .get(bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY)
+            .and_then(|raw| {
+                serde_json::from_str::<bamboo_skills::DurableWorkflowActivation>(raw).ok()
+            })
+            .expect("private workspace activation snapshot");
+        assert_eq!(
+            durable
+                .snapshot
+                .skills
+                .get("shared-workflow")
+                .expect("workspace activation entry")
+                .definition
+                .prompt,
+            expected_instructions
         );
+        let _expected_workspace =
+            std::fs::canonicalize(expected_workspace).expect("canonical workspace");
         if session_id == "workspace-session-one" {
             std::fs::remove_dir_all(&workspace_one)
                 .expect("delete workspace after immutable activation is loaded");

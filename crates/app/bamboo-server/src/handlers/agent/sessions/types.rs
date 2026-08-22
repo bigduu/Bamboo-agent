@@ -7,6 +7,44 @@ use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
 use bamboo_engine::model_config_helper::parse_session_gold_config;
 
+/// Minimal public workflow lifecycle identity. Durable activation metadata also
+/// contains the immutable arguments, context fingerprint and dynamic provider
+/// output used by the runtime; none of those payloads belong in a session
+/// summary response.
+#[derive(Debug, Serialize)]
+pub struct SessionActiveWorkflow {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub source: bamboo_skills::WorkflowSource,
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub kind: bamboo_skills::WorkflowKind,
+    pub invoked_by: bamboo_skills::WorkflowInvokedBy,
+    pub activated_at: chrono::DateTime<chrono::Utc>,
+    pub status: bamboo_skills::WorkflowActivationStatus,
+}
+
+impl SessionActiveWorkflow {
+    pub fn from_active(
+        active: bamboo_skills::ActiveWorkflow,
+        catalog_entry: Option<&bamboo_skills::WorkflowCatalogEntry>,
+    ) -> Self {
+        Self {
+            id: active.id,
+            name: catalog_entry.map(|entry| entry.name.clone()),
+            source: active.source,
+            revision: active.revision,
+            version: catalog_entry.map(|entry| entry.version.clone()),
+            kind: active.kind,
+            invoked_by: active.invoked_by,
+            activated_at: active.activated_at,
+            status: active.status,
+        }
+    }
+}
+
 /// Deserialize an explicitly-present nullable Project id while preserving the
 /// distinction between an absent field (`None`, no-op) and JSON `null`
 /// (`Some(None)`, explicit unassign).
@@ -80,6 +118,12 @@ pub struct SessionSummary {
     /// Lets the frontend render plan-mode UI without loading full session history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bamboo_domain::PlanModeState>,
+    /// Public-safe durable workflow identity restored from the authoritative
+    /// session metadata. List rows intentionally leave this empty; the detail
+    /// endpoint hydrates it from `session.json` so browser refreshes do not
+    /// depend on an already-consumed account-feed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workflow: Option<SessionActiveWorkflow>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -157,6 +201,7 @@ impl SessionSummary {
             resident_name: entry.resident_name,
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions
@@ -588,6 +633,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -638,6 +684,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -775,6 +822,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
