@@ -1454,7 +1454,7 @@ impl SkillStore {
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
-        *skill_catalog_guard = next_skill_catalog;
+        *skill_catalog_guard = next_skill_catalog.clone();
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
         *workflow_resources_guard = resolved_workflow_resources;
@@ -1468,6 +1468,11 @@ impl SkillStore {
         drop(roots_guard);
         drop(skills_guard);
         drop(_snapshot_guard);
+        self.publish_catalog_events(
+            &previous_skill_catalog,
+            &next_skill_catalog,
+            &skill_definition_changed,
+        );
         self.publish_catalog_events(
             &previous_catalog,
             &next_catalog,
@@ -2527,8 +2532,7 @@ impl SkillStore {
                 workflow_id: entry.id.clone(),
                 revision: next.revision,
                 kind,
-                public_workflow: entry.is_public_workflow()
-                    || old.is_some_and(WorkflowCatalogEntry::is_public_workflow),
+                public_workflow: true,
                 scope: "global".to_string(),
             });
         }
@@ -2542,7 +2546,7 @@ impl SkillStore {
                 workflow_id: removed.id.clone(),
                 revision: next.revision,
                 kind: WorkflowCatalogEventKind::Changed,
-                public_workflow: removed.is_public_workflow(),
+                public_workflow: true,
                 scope: "global".to_string(),
             });
         }
@@ -3735,7 +3739,7 @@ mod tests {
     use crate::store::storage::write_skill_file;
     use crate::store::storage::SkillDirectorySource;
     use crate::types::SkillStoreConfig;
-    use crate::{SkillManager, WorkflowSource, WorkflowStatus};
+    use crate::{SkillManager, WorkflowCatalogEventKind, WorkflowSource, WorkflowStatus};
 
     #[test]
     fn agents_skill_precedence_is_below_bamboo_global_and_above_plugin() {
@@ -4566,7 +4570,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn invalid_skill_reload_retains_lkg_without_workflow_events() {
+    async fn instruction_change_invalid_and_recovered_events_follow_atomic_publication() {
         const PRIVATE_FIELD: &str = "private-lkg-frontmatter-field";
         const PRIVATE_INSTRUCTIONS: &str = "Private LKG replacement instructions";
         let directory = tempfile::tempdir().expect("tempdir");
@@ -4581,6 +4585,25 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
         let mut events = store.subscribe_workflow_catalog();
 
+        write_skill(
+            root.parent().expect("skills root"),
+            "steady",
+            "updated",
+            "Updated prompt",
+        )
+        .await
+        .expect("update skill");
+        store.reload().await.expect("changed reload");
+        let changed_event = events.try_recv().expect("instruction changed event");
+        assert_eq!(changed_event.workflow_id, "steady");
+        assert_eq!(changed_event.kind, WorkflowCatalogEventKind::Changed);
+        assert!(changed_event.public_workflow);
+        assert_eq!(changed_event.scope, "global");
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
         fs::write(
             root.join("SKILL.md"),
             format!(
@@ -4591,7 +4614,7 @@ Use this skill for testing.
             .expect("break skill");
         store.reload().await.expect("invalid reload is isolated");
         let skill = store.get_skill("steady").await.expect("LKG retained");
-        assert_eq!(skill.description, "original");
+        assert_eq!(skill.description, "updated");
         let invalid = store
             .skill_catalog_snapshot()
             .await
@@ -4605,6 +4628,12 @@ Use this skill for testing.
         assert!(!public_error.contains(PRIVATE_FIELD));
         assert!(!public_error.contains(PRIVATE_INSTRUCTIONS));
         assert!(!public_error.contains(root.to_string_lossy().as_ref()));
+        let invalid_event = events.try_recv().expect("instruction invalid event");
+        assert_eq!(invalid_event.workflow_id, "steady");
+        assert_eq!(invalid_event.kind, WorkflowCatalogEventKind::Invalid);
+        assert!(invalid_event.public_workflow);
+        assert!(invalid_event.revision > changed_event.revision);
+        assert_eq!(invalid_event.scope, "global");
         assert!(matches!(
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -4627,6 +4656,12 @@ Use this skill for testing.
                 .description,
             "recovered"
         );
+        let recovered_event = events.try_recv().expect("instruction recovered event");
+        assert_eq!(recovered_event.workflow_id, "steady");
+        assert_eq!(recovered_event.kind, WorkflowCatalogEventKind::Recovered);
+        assert!(recovered_event.public_workflow);
+        assert!(recovered_event.revision > invalid_event.revision);
+        assert_eq!(recovered_event.scope, "global");
         assert!(matches!(
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -5327,6 +5362,14 @@ Use this skill for testing.
         })
         .await
         .expect("workspace watcher publication");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("workspace catalog event bridge")
+            .expect("workspace catalog event");
+        assert_eq!(event.workflow_id, "only-one");
+        assert_eq!(event.kind, WorkflowCatalogEventKind::Changed);
+        assert!(event.public_workflow);
+        assert!(event.scope.starts_with("workspace:"));
         assert!(matches!(
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)

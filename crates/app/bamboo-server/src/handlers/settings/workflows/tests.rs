@@ -23,7 +23,7 @@ async fn assert_legacy_endpoint_success(context: &str, response: actix_web::dev:
 }
 
 #[actix_web::test]
-async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_metadata() {
+async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
     let data = tempfile::tempdir().expect("data dir");
     let skill = data.path().join("skills/review");
     tokio::fs::create_dir_all(&skill).await.expect("skill dir");
@@ -54,7 +54,7 @@ async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_
             .await
             .expect("app state"),
     );
-    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
         "/catalog",
         actix_web::web::get().to(super::list_workflow_catalog),
     ))
@@ -64,12 +64,101 @@ async fn workflow_catalog_excludes_instruction_skills_and_returns_orchestration_
         .to_request();
     let body = actix_web::test::call_and_read_body(&app, request).await;
     let text = std::str::from_utf8(&body).expect("utf8 response");
-    assert!(!text.contains("Reviews changes"));
+    assert!(text.contains("Reviews changes"));
+    assert!(text.contains("\"kind\":\"instruction\""));
     assert!(text.contains("Deploys changes"));
+    assert!(text.contains("\"kind\":\"orchestration\""));
     assert!(text.contains("\"revision\""));
     assert!(!text.contains("TOP SECRET INSTRUCTIONS"));
     assert!(!text.contains("WORKFLOW SECRET BODY"));
     assert!(!text.contains("SKILL.md"));
+
+    let initial: serde_json::Value = serde_json::from_slice(&body).expect("catalog json");
+    let entries = initial["entries"].as_array().expect("catalog entries");
+    let review = entries
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("instruction entry");
+    assert_eq!(review["source"], "user");
+    assert_eq!(review["status"], "valid");
+    assert!(review["shadowed_candidates"]
+        .as_array()
+        .expect("safe shadow diagnostics")
+        .iter()
+        .any(|candidate| candidate["source"] == "builtin"));
+    let deploy = entries
+        .iter()
+        .find(|entry| entry["id"] == "deploy")
+        .expect("orchestration entry");
+    assert_eq!(deploy["status"], "valid");
+
+    const PRIVATE_INVALID_FIELD: &str = "private_invalid_catalog_field";
+    const PRIVATE_INVALID_BODY: &str = "PRIVATE INVALID REPLACEMENT BODY";
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: changed too early\n{PRIVATE_INVALID_FIELD}: secret\n---\n{PRIVATE_INVALID_BODY}\n"
+        ),
+    )
+    .await
+    .expect("break instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("invalid publication stays isolated");
+    let invalid: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let invalid_entries = invalid["entries"].as_array().expect("invalid entries");
+    let invalid_review = invalid_entries
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("invalid instruction remains visible through LKG");
+    assert_eq!(invalid_review["status"], "invalid");
+    assert_eq!(invalid_review["description"], "Reviews changes");
+    assert!(invalid_review["last_error"].is_string());
+    let rendered = invalid_review.to_string();
+    assert!(!rendered.contains(PRIVATE_INVALID_FIELD));
+    assert!(!rendered.contains(PRIVATE_INVALID_BODY));
+    assert!(!rendered.contains(data.path().to_string_lossy().as_ref()));
+    assert!(invalid_entries
+        .iter()
+        .any(|entry| entry["id"] == "deploy" && entry["status"] == "valid"));
+
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Recovered review\n---\nRECOVERED PRIVATE BODY\n",
+    )
+    .await
+    .expect("repair instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("recovered publication");
+    let recovered: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let recovered_review = recovered["entries"]
+        .as_array()
+        .expect("recovered entries")
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("recovered instruction");
+    assert_eq!(recovered_review["status"], "valid");
+    assert_eq!(recovered_review["description"], "Recovered review");
+    assert!(!recovered.to_string().contains("RECOVERED PRIVATE BODY"));
 }
 
 #[actix_web::test]
@@ -414,12 +503,19 @@ async fn workspace_legacy_workflow_migration_is_explicit_non_destructive_and_ide
             .to_request(),
     )
     .await;
-    let source_workflow = after["entries"]
-        .as_array()
-        .expect("catalog entries")
+    let entries = after["entries"].as_array().expect("catalog entries");
+    let migrated_workflow = entries
         .iter()
-        .find(|entry| entry["id"] == "daily-report")
+        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "migrated")
+        .expect("migrated instruction entry");
+    let source_workflow = entries
+        .iter()
+        .find(|entry| entry["id"] == "daily-report" && entry["migration_status"] == "available")
         .expect("source Workflow entry");
+    assert_ne!(
+        migrated_workflow["revision"], source_workflow["revision"],
+        "same-id instruction and source entries keep distinct typed revisions"
+    );
     assert_eq!(source_workflow["migration_status"], "available");
     assert!(source_workflow.get("shadowed_candidates").is_none());
 }
@@ -584,6 +680,80 @@ async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
     })
     .await;
     assert!(bridged.is_ok(), "workflow.changed must reach account feed");
+}
+
+#[actix_web::test]
+async fn instruction_catalog_lifecycle_reaches_the_durable_account_feed_in_order() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let skill_dir = data.path().join("skills/library-refresh");
+    tokio::fs::create_dir_all(&skill_dir)
+        .await
+        .expect("skill dir");
+    let skill_file = skill_dir.join("SKILL.md");
+    let valid = "---\nname: library-refresh\ndescription: Refresh the Workflow Library.\n---\nRefresh it.\n";
+
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("create instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish changed instruction");
+    tokio::fs::write(&skill_file, "---\nname: [\n")
+        .await
+        .expect("invalidate instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish invalid LKG instruction");
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("recover instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish recovered instruction");
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut kinds = Vec::new();
+        while kinds.len() < 3 {
+            let event = account_events.recv().await.expect("account event");
+            match &event.event {
+                bamboo_agent_core::AgentEvent::WorkflowChanged { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("changed")
+                }
+                bamboo_agent_core::AgentEvent::WorkflowInvalid { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("invalid")
+                }
+                bamboo_agent_core::AgentEvent::WorkflowRecovered { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("recovered")
+                }
+                _ => {}
+            }
+        }
+        kinds
+    })
+    .await
+    .expect("instruction catalog events reach the account feed");
+    assert_eq!(observed, ["changed", "invalid", "recovered"]);
 }
 
 #[actix_web::test]

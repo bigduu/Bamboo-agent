@@ -128,8 +128,9 @@ pub struct WorkflowCatalogEvent {
     pub workflow_id: String,
     pub revision: u64,
     pub kind: WorkflowCatalogEventKind,
-    /// Whether this transition belongs to the public Workflow identity rather
-    /// than to an instruction-only Skill sharing the internal catalog.
+    /// Compatibility discriminator for consumers predating the unified
+    /// instruction and orchestration Workflow catalog. Newly published catalog
+    /// events always set this; legacy decoded events default to `false`.
     #[serde(default)]
     pub public_workflow: bool,
     /// `global`, `project:<id>`, or an opaque `workspace:<hash>`; never an

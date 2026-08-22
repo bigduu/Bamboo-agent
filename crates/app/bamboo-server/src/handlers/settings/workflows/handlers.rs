@@ -1,6 +1,6 @@
 use actix_web::{http::StatusCode, web, HttpResponse};
 use bamboo_skills::legacy::LegacyWorkflowMigrationOutcome;
-use bamboo_skills::LegacyWorkflowMigrationStatus;
+use bamboo_skills::{LegacyWorkflowMigrationStatus, WorkflowCatalogEntry, WorkflowCatalogSnapshot};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -55,7 +55,7 @@ pub async fn list_workflow_catalog(
     app_state: web::Data<AppState>,
     query: web::Query<WorkflowCatalogQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let snapshot = if let Some(session_id) = query
+    let store = if let Some(session_id) = query
         .session_id
         .as_deref()
         .map(str::trim)
@@ -111,37 +111,50 @@ pub async fn list_workflow_catalog(
             let project_home = app_state.project_store.paths().project_home(&project_id);
             app_state
                 .skill_manager
-                .workflow_catalog_for_project_workspace(
-                    &project_id,
-                    &project_home,
-                    workspace.as_deref(),
-                )
+                .store_for_project_workspace(&project_id, &project_home, workspace.as_deref())
                 .await
                 .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
         } else if let Some(workspace) = workspace.as_ref() {
             app_state
                 .skill_manager
-                .store()
-                .workflow_catalog_for_workspace(workspace)
+                .store_for_workspace(Some(workspace))
                 .await
                 .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
         } else {
             app_state
                 .skill_manager
-                .store()
-                .workflow_catalog_snapshot()
+                .store_for_workspace(None)
                 .await
+                .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
         }
     } else {
         app_state
             .skill_manager
-            .store()
-            .workflow_catalog_snapshot()
+            .store_for_workspace(None)
             .await
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+    };
+
+    // Instruction Skills and orchestration definitions are independent
+    // activation namespaces, but they form one product-level Workflow
+    // Library. Clone both metadata-only snapshots while the store holds one
+    // publication guard, then expose only the public Workflow side of the
+    // orchestration/legacy namespace.
+    let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+    let mut entries = skill_catalog.entries;
+    entries.extend(
+        workflow_catalog
+            .entries
+            .into_iter()
+            .filter(WorkflowCatalogEntry::is_public_workflow),
+    );
+    let snapshot = WorkflowCatalogSnapshot {
+        revision: skill_catalog.revision.max(workflow_catalog.revision),
+        entries,
     };
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
-        .json(snapshot.public_workflows()))
+        .json(snapshot))
 }
 
 /// Clone one read-only global/workspace/plugin legacy workflow into the trusted
