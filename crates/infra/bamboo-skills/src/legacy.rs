@@ -260,6 +260,9 @@ pub fn prepare_legacy_markdown_workflow(
         "legacy_manual_only": manual_only,
         "legacy_name": source.file_stem().and_then(|value| value.to_str()).unwrap_or(id),
         "original_source": source_identity,
+        "legacy_migration_description_override": description_override
+            .map(str::trim)
+            .filter(|description| !description.is_empty()),
         "legacy_source_removal_boundary": LEGACY_WORKFLOW_SOURCE_REMOVAL_BOUNDARY,
         "format": "workspace_workflow_markdown"
     });

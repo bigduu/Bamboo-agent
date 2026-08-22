@@ -915,51 +915,11 @@ where
         }
     };
 
-    if let Some(migrated) = skill_catalog.entries.iter().find(|entry| {
+    let existing_migration = skill_catalog.entries.iter().find(|entry| {
         entry.id == workflow_id
             && entry.source == published_source
             && entry.migration_status == Some(LegacyWorkflowMigrationStatus::Migrated)
-    }) {
-        let exact_migration = store
-            .get_skill(&workflow_id)
-            .await
-            .ok()
-            .is_some_and(|skill| {
-                skill.metadata.as_ref().is_some_and(|metadata| {
-                    metadata
-                        .get("legacy_migration")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && metadata
-                            .get("original_source")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(source_identity.as_str())
-                        && metadata
-                            .get("legacy_source_content_digest")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(accepted.content_digest.as_str())
-                })
-            });
-        if exact_migration {
-            return Ok(HttpResponse::Ok()
-                .insert_header(("Cache-Control", "no-store"))
-                .json(MigrateWorkflowResponse {
-                    workflow_id,
-                    outcome: LegacyWorkflowMigrationOutcome::AlreadyMigrated,
-                    source_preserved: true,
-                    catalog_revision: skill_catalog.revision.max(workflow_catalog.revision),
-                }));
-        }
-        tracing::warn!(
-            workflow_id,
-            source = ?migrated.source,
-            "legacy migration target source identity is inconsistent"
-        );
-        return Ok(crate::error::json_error(
-            StatusCode::CONFLICT,
-            "Workflow migration conflicts with an existing target Skill",
-        ));
-    }
+    });
 
     let target_rank = |source| match source {
         WorkflowSource::Builtin => 0,
@@ -968,9 +928,11 @@ where
         WorkflowSource::Project => 3,
         WorkflowSource::Workspace => 4,
     };
-    if skill_catalog.entries.iter().any(|entry| {
-        entry.id == workflow_id && target_rank(entry.source) >= target_rank(published_source)
-    }) {
+    if existing_migration.is_none()
+        && skill_catalog.entries.iter().any(|entry| {
+            entry.id == workflow_id && target_rank(entry.source) >= target_rank(published_source)
+        })
+    {
         return Ok(crate::error::json_error(
             StatusCode::CONFLICT,
             "Workflow migration conflicts with an existing target Skill",
@@ -1029,6 +991,64 @@ where
         payload.description.as_deref(),
     )
     .map_err(|_| AppError::BadRequest("Legacy workflow cannot be migrated".to_string()))?;
+    if let Some(migrated) = existing_migration {
+        let requested_description = payload
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty());
+        let exact_migration = store
+            .get_skill(&workflow_id)
+            .await
+            .ok()
+            .is_some_and(|skill| {
+                skill.metadata.as_ref().is_some_and(|metadata| {
+                    let description_matches = match requested_description {
+                        Some(description) => {
+                            metadata
+                                .get("legacy_migration_description_override")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(description)
+                        }
+                        None => metadata
+                            .get("legacy_migration_description_override")
+                            .is_some_and(serde_json::Value::is_null),
+                    };
+                    metadata
+                        .get("legacy_migration")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && metadata
+                            .get("original_source")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(source_identity.as_str())
+                        && metadata
+                            .get("legacy_source_content_digest")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(accepted.content_digest.as_str())
+                        && description_matches
+                })
+            });
+        if exact_migration {
+            return Ok(HttpResponse::Ok()
+                .insert_header(("Cache-Control", "no-store"))
+                .json(MigrateWorkflowResponse {
+                    workflow_id,
+                    outcome: LegacyWorkflowMigrationOutcome::AlreadyMigrated,
+                    source_preserved: true,
+                    catalog_revision: skill_catalog.revision.max(workflow_catalog.revision),
+                }));
+        }
+        tracing::warn!(
+            workflow_id,
+            source = ?migrated.source,
+            "legacy migration target request identity is inconsistent"
+        );
+        return Ok(crate::error::json_error(
+            StatusCode::CONFLICT,
+            "Workflow migration conflicts with an existing target Skill",
+        ));
+    }
     if let Err(error) = validate_clone_bundle(&prepared.files) {
         tracing::error!(
             ?error,

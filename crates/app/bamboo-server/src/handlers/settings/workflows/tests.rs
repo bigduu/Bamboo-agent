@@ -781,6 +781,56 @@ async fn project_legacy_workflow_migration_is_exact_non_destructive_and_idempote
         "idempotent retry must not rewrite the editable target"
     );
 
+    let changed_request = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/daily-report/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "legacy-migration-session",
+                "description": "Use a different migration description"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        changed_request.status(),
+        actix_web::http::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "a changed migration request must not rewrite the editable target"
+    );
+
+    let selected_generation = legacy_dir.join("daily-report.selected.md");
+    let raced_retry = super::handlers::migrate_workflow_with_source_hook(
+        state.clone(),
+        "daily-report".to_string(),
+        super::MigrateWorkflowRequest {
+            session_id: "legacy-migration-session".to_string(),
+            description: None,
+        },
+        |selected_path| {
+            std::fs::rename(selected_path, &selected_generation)
+                .expect("retain retry source generation");
+            std::fs::write(
+                selected_path,
+                "# Replaced during retry\n\nDifferent bytes.\n",
+            )
+            .expect("replace retry source generation");
+        },
+    )
+    .await
+    .expect("raced retry response");
+    assert_eq!(raced_retry.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "a raced idempotent retry must not mutate the target"
+    );
+    std::fs::remove_file(&source).expect("remove raced replacement");
+    std::fs::rename(&selected_generation, &source).expect("restore selected source");
+
     let mismatched_source = edited.replace(
         "original_source: .bamboo/workflows/daily-report.md",
         "original_source: .bamboo/workflows/another-report.md",
