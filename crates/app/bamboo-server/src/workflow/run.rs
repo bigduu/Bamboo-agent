@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,8 +8,10 @@ use bamboo_agent_core::tools::{
     Tool, ToolClass, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome, ToolResult,
 };
 use bamboo_domain::{
-    StartWorkflowRun, WorkflowBudgets, WorkflowDefinitionBundle, WorkflowProgress,
-    WorkflowRunDefinition, WorkflowRunSnapshot,
+    StartWorkflowRun, WorkflowBudgetUsage, WorkflowBudgets, WorkflowDefinitionBundle,
+    WorkflowFailure, WorkflowFailureCode, WorkflowPlan, WorkflowProgress, WorkflowRunDefinition,
+    WorkflowRunEvent, WorkflowRunEventKind, WorkflowRunSnapshot, WorkflowRunStatus,
+    WorkflowStepKind, WorkflowStepSnapshot, WorkflowStepStatus, WorkflowSuspensionContext,
 };
 use bamboo_engine::{
     AgentStepPort, AgentStepResult, FileWorkflowRunRepository, NamedAgentSpec, PermissionDecision,
@@ -18,7 +20,7 @@ use bamboo_engine::{
     WorkflowSessionPermissionPort,
 };
 use bamboo_skills::SkillManager;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const MAX_CONCURRENCY: usize = 8;
@@ -615,12 +617,295 @@ fn enforce_pinned_bundle_limits(
     Ok(())
 }
 
-/// The durable snapshot keeps the complete pinned bundle for deterministic
-/// restart, but clients need only the root definition, bundle identity/hash,
-/// step tree and events. Avoid echoing every nested definition over HTTP/tools.
-pub(crate) fn public_workflow_snapshot(mut snapshot: WorkflowRunSnapshot) -> WorkflowRunSnapshot {
-    snapshot.definition_bundle.definitions.clear();
-    snapshot
+/// Stable metadata-only projection of a durable workflow run.
+///
+/// The internal snapshot deliberately persists the complete definition bundle,
+/// validated arguments, input hashes, tool outputs, and diagnostic strings for
+/// deterministic recovery. None of those values are public API data. HTTP and
+/// model-facing tools must serialize this projection instead of the durable
+/// snapshot itself.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct PublicWorkflowRunSnapshot {
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_step_id: Option<String>,
+    pub session_id: String,
+    pub workflow_id: String,
+    pub workflow_revision: u64,
+    pub definition_bundle_hash: String,
+    pub status: WorkflowRunStatus,
+    pub planned_steps: BTreeMap<String, PublicWorkflowPlannedStep>,
+    pub plan: PublicWorkflowPlan,
+    pub steps: BTreeMap<String, PublicWorkflowStepSnapshot>,
+    pub budget: WorkflowBudgets,
+    pub usage: WorkflowBudgetUsage,
+    pub child_agent_count: u32,
+    pub last_sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<PublicWorkflowFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspension: Option<PublicWorkflowSuspension>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct PublicWorkflowStepSnapshot {
+    pub id: String,
+    pub status: WorkflowStepStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<PublicWorkflowFailure>,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PublicWorkflowPlannedStep {
+    pub id: String,
+    pub kind: PublicWorkflowPlannedStepKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicWorkflowPlannedStepKind {
+    Tool,
+    Agent,
+    Workflow,
+}
+
+/// Safe plan topology. Data bindings, map item names, delays, tool arguments,
+/// prompts, schemas, and capabilities remain internal.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum PublicWorkflowPlan {
+    Step {
+        step: String,
+    },
+    Sequence {
+        nodes: Vec<PublicWorkflowPlan>,
+    },
+    Parallel {
+        nodes: Vec<PublicWorkflowPlan>,
+    },
+    Map {
+        body: Box<PublicWorkflowPlan>,
+    },
+    Retry {
+        node: Box<PublicWorkflowPlan>,
+        max_attempts: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct PublicWorkflowFailure {
+    pub code: WorkflowFailureCode,
+    pub message: &'static str,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum PublicWorkflowSuspension {
+    ToolApproval { step_id: String },
+    ToolRunning { step_id: String, killed: bool },
+    Recovery,
+}
+
+/// Durable reconnect events use the same metadata-only boundary as snapshots.
+/// Raw step/run outputs, suspension reasons, and backend diagnostics are never
+/// serialized to HTTP, SSE consumers, or model-facing tools.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub(crate) struct PublicWorkflowRunEvent {
+    pub run_id: String,
+    pub sequence: u64,
+    pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(flatten)]
+    pub kind: PublicWorkflowRunEventKind,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum PublicWorkflowRunEventKind {
+    RunQueued,
+    RunStarted,
+    Phase { name: &'static str },
+    StepQueued,
+    StepStarted,
+    StepSuspended,
+    StepCompleted,
+    StepFailed { failure: PublicWorkflowFailure },
+    StepCancelled,
+    StepSkipped,
+    RunSuspended,
+    RunSucceeded,
+    RunFailed { failure: PublicWorkflowFailure },
+    RunCancelled,
+}
+
+fn public_workflow_plan(plan: &WorkflowPlan) -> PublicWorkflowPlan {
+    match plan {
+        WorkflowPlan::Step { step } => PublicWorkflowPlan::Step { step: step.clone() },
+        WorkflowPlan::Sequence { nodes } => PublicWorkflowPlan::Sequence {
+            nodes: nodes.iter().map(public_workflow_plan).collect(),
+        },
+        WorkflowPlan::Parallel { nodes } => PublicWorkflowPlan::Parallel {
+            nodes: nodes.iter().map(public_workflow_plan).collect(),
+        },
+        WorkflowPlan::Map { body, .. } => PublicWorkflowPlan::Map {
+            body: Box::new(public_workflow_plan(body)),
+        },
+        WorkflowPlan::Retry {
+            node, max_attempts, ..
+        } => PublicWorkflowPlan::Retry {
+            node: Box::new(public_workflow_plan(node)),
+            max_attempts: *max_attempts,
+        },
+    }
+}
+
+fn public_planned_steps(
+    definition: &WorkflowRunDefinition,
+) -> BTreeMap<String, PublicWorkflowPlannedStep> {
+    definition
+        .steps
+        .iter()
+        .map(|step| {
+            let kind = match &step.kind {
+                WorkflowStepKind::Tool { .. } => PublicWorkflowPlannedStepKind::Tool,
+                WorkflowStepKind::Agent { .. } => PublicWorkflowPlannedStepKind::Agent,
+                WorkflowStepKind::Workflow { .. } => PublicWorkflowPlannedStepKind::Workflow,
+            };
+            (
+                step.id.clone(),
+                PublicWorkflowPlannedStep {
+                    id: step.id.clone(),
+                    kind,
+                },
+            )
+        })
+        .collect()
+}
+
+fn public_workflow_failure(failure: WorkflowFailure) -> PublicWorkflowFailure {
+    let message = match failure.code {
+        WorkflowFailureCode::InvalidDefinition => "Workflow definition is invalid",
+        WorkflowFailureCode::InvalidInput => "Workflow input is invalid",
+        WorkflowFailureCode::InvalidOutput => "Workflow output is invalid",
+        WorkflowFailureCode::UnknownReference => "Workflow reference is unavailable",
+        WorkflowFailureCode::PermissionDenied => "Workflow permission was denied",
+        WorkflowFailureCode::UntrustedWorkspace => "Workflow workspace is not trusted",
+        WorkflowFailureCode::BudgetExceeded => "Workflow execution budget was exceeded",
+        WorkflowFailureCode::RetryExhausted => "Workflow retry budget was exhausted",
+        WorkflowFailureCode::ExecutionFailed => "Workflow execution failed",
+        WorkflowFailureCode::Cancelled => "Workflow execution was cancelled",
+        WorkflowFailureCode::RecoverySuspended => "Workflow recovery requires attention",
+        WorkflowFailureCode::Suspended => "Workflow execution is suspended",
+        WorkflowFailureCode::DependencySkipped => "Workflow dependency was skipped",
+        WorkflowFailureCode::Storage => "Workflow storage is unavailable",
+    };
+    PublicWorkflowFailure {
+        code: failure.code,
+        message,
+        retryable: failure.retryable,
+    }
+}
+
+fn public_workflow_step(step: WorkflowStepSnapshot) -> PublicWorkflowStepSnapshot {
+    PublicWorkflowStepSnapshot {
+        id: step.id,
+        status: step.status,
+        failure: step.failure.map(public_workflow_failure),
+        attempts: step.attempts,
+    }
+}
+
+fn public_workflow_suspension(suspension: WorkflowSuspensionContext) -> PublicWorkflowSuspension {
+    match suspension {
+        WorkflowSuspensionContext::ToolApproval { step_id, .. } => {
+            PublicWorkflowSuspension::ToolApproval { step_id }
+        }
+        WorkflowSuspensionContext::ToolRunning {
+            step_id, killed, ..
+        } => PublicWorkflowSuspension::ToolRunning { step_id, killed },
+        WorkflowSuspensionContext::Recovery { .. } => PublicWorkflowSuspension::Recovery,
+    }
+}
+
+fn public_workflow_phase(name: &str) -> &'static str {
+    match name {
+        "retry_reserved" => "retry_reserved",
+        "step_reserved" => "step_reserved",
+        "agent_reserved" => "agent_reserved",
+        "agent_usage_recorded" => "agent_usage_recorded",
+        "suspension_context_persisted" => "suspension_context_persisted",
+        _ => "workflow_progressed",
+    }
+}
+
+pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicWorkflowRunSnapshot {
+    let planned_steps = public_planned_steps(&snapshot.definition);
+    let plan = public_workflow_plan(&snapshot.definition.plan);
+    let child_agent_count = snapshot.usage.agents;
+    PublicWorkflowRunSnapshot {
+        run_id: snapshot.run_id,
+        parent_run_id: snapshot.parent_run_id,
+        parent_step_id: snapshot.parent_step_id,
+        session_id: snapshot.session_id,
+        workflow_id: snapshot.definition.id,
+        workflow_revision: snapshot.definition.revision,
+        definition_bundle_hash: snapshot.definition_bundle_hash,
+        status: snapshot.status,
+        planned_steps,
+        plan,
+        steps: snapshot
+            .steps
+            .into_iter()
+            .map(|(id, step)| (id, public_workflow_step(step)))
+            .collect(),
+        budget: snapshot.definition.budgets,
+        usage: snapshot.usage,
+        child_agent_count,
+        last_sequence: snapshot.last_sequence,
+        failure: snapshot.failure.map(public_workflow_failure),
+        suspension: snapshot.suspension.map(public_workflow_suspension),
+        created_at: snapshot.created_at,
+        updated_at: snapshot.updated_at,
+    }
+}
+
+pub(crate) fn public_workflow_event(event: WorkflowRunEvent) -> PublicWorkflowRunEvent {
+    let kind = match event.kind {
+        WorkflowRunEventKind::RunQueued => PublicWorkflowRunEventKind::RunQueued,
+        WorkflowRunEventKind::RunStarted => PublicWorkflowRunEventKind::RunStarted,
+        WorkflowRunEventKind::Phase { name } => PublicWorkflowRunEventKind::Phase {
+            name: public_workflow_phase(&name),
+        },
+        WorkflowRunEventKind::StepQueued => PublicWorkflowRunEventKind::StepQueued,
+        WorkflowRunEventKind::StepStarted => PublicWorkflowRunEventKind::StepStarted,
+        WorkflowRunEventKind::StepSuspended { .. } => PublicWorkflowRunEventKind::StepSuspended,
+        WorkflowRunEventKind::StepCompleted { .. } => PublicWorkflowRunEventKind::StepCompleted,
+        WorkflowRunEventKind::StepFailed { failure } => PublicWorkflowRunEventKind::StepFailed {
+            failure: public_workflow_failure(failure),
+        },
+        WorkflowRunEventKind::StepCancelled => PublicWorkflowRunEventKind::StepCancelled,
+        WorkflowRunEventKind::StepSkipped { .. } => PublicWorkflowRunEventKind::StepSkipped,
+        WorkflowRunEventKind::RunSuspended { .. } => PublicWorkflowRunEventKind::RunSuspended,
+        WorkflowRunEventKind::RunSucceeded { .. } => PublicWorkflowRunEventKind::RunSucceeded,
+        WorkflowRunEventKind::RunFailed { failure } => PublicWorkflowRunEventKind::RunFailed {
+            failure: public_workflow_failure(failure),
+        },
+        WorkflowRunEventKind::RunCancelled => PublicWorkflowRunEventKind::RunCancelled,
+    };
+    PublicWorkflowRunEvent {
+        run_id: event.run_id,
+        sequence: event.sequence,
+        at: event.at,
+        step_id: event.step_id,
+        kind,
+    }
 }
 
 /// The catalog adapter above always calls `start_pinned`. Generic engine starts
@@ -859,7 +1144,13 @@ impl Tool for WorkflowRunTool {
                     .progress_for_session(session_id, &run_id, since)
                     .await
                     .map_err(workflow_tool_error)?;
-                serde_json::to_value(progress.events)
+                serde_json::to_value(
+                    progress
+                        .events
+                        .into_iter()
+                        .map(public_workflow_event)
+                        .collect::<Vec<_>>(),
+                )
             }
             WorkflowToolInput::Cancel { run_id } => serde_json::to_value(public_workflow_snapshot(
                 self.access
@@ -887,9 +1178,23 @@ impl Tool for WorkflowRunTool {
 
 fn workflow_tool_error(error: WorkflowRunError) -> ToolError {
     match error {
-        WorkflowRunError::InvalidInput(message) => ToolError::InvalidArguments(message),
-        WorkflowRunError::Compile(error) => ToolError::InvalidArguments(error.to_string()),
-        other => ToolError::Execution(other.to_string()),
+        WorkflowRunError::InvalidInput(_) => {
+            ToolError::InvalidArguments("workflow input is invalid".to_string())
+        }
+        WorkflowRunError::Compile(_) => {
+            ToolError::InvalidArguments("workflow definition is invalid".to_string())
+        }
+        WorkflowRunError::Preflight(_) => {
+            ToolError::InvalidArguments("workflow preflight failed".to_string())
+        }
+        WorkflowRunError::Storage(details) => {
+            tracing::error!(%details, "workflow tool storage unavailable");
+            ToolError::Execution("workflow storage unavailable".to_string())
+        }
+        WorkflowRunError::NotFound => ToolError::Execution("workflow run not found".to_string()),
+        WorkflowRunError::Terminal => {
+            ToolError::Execution("workflow run is already terminal".to_string())
+        }
     }
 }
 
@@ -903,7 +1208,7 @@ mod tests {
     use bamboo_agent_core::Session;
     use bamboo_llm::protocol::{gemini::GeminiTool, ToProvider};
     use std::collections::HashMap;
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
 
     #[derive(Default)]
     struct WorkflowTestStorage {
@@ -952,7 +1257,28 @@ mod tests {
         }
     }
 
-    async fn workflow_test_access() -> (
+    struct BlockingWorkflowReadTool {
+        entered: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for BlockingWorkflowReadTool {
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            self.entered.add_permits(1);
+            std::future::pending().await
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            WorkflowReadTool.list_tools()
+        }
+    }
+
+    async fn workflow_test_access_with_tools(
+        tools: Arc<dyn ToolExecutor>,
+    ) -> (
         WorkflowRunAccess,
         bamboo_engine::SessionRepository,
         tempfile::TempDir,
@@ -980,15 +1306,268 @@ mod tests {
         let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
         let cache = Arc::new(dashmap::DashMap::new());
         let repo = bamboo_engine::SessionRepository::new(cache, storage, persistence);
-        let access = WorkflowRunAccess::new(
-            directory.path(),
-            Arc::new(WorkflowReadTool),
-            skills,
-            repo.clone(),
-        )
-        .await
-        .expect("workflow access");
+        let access = WorkflowRunAccess::new(directory.path(), tools, skills, repo.clone())
+            .await
+            .expect("workflow access");
         (access, repo, directory)
+    }
+
+    async fn workflow_test_access() -> (
+        WorkflowRunAccess,
+        bamboo_engine::SessionRepository,
+        tempfile::TempDir,
+    ) {
+        workflow_test_access_with_tools(Arc::new(WorkflowReadTool)).await
+    }
+
+    fn private_workflow_snapshot(status: WorkflowRunStatus) -> WorkflowRunSnapshot {
+        let definition = WorkflowRunDefinition {
+            workflow_schema: 1,
+            id: "review-flow".to_string(),
+            revision: 42,
+            input_schema: json!({"private_schema": "PRIVATE-SCHEMA-SENTINEL"}),
+            output_schema: Some(json!({"private_output": "PRIVATE-SCHEMA-SENTINEL"})),
+            steps: vec![bamboo_domain::WorkflowStepDefinition {
+                id: "inspect".to_string(),
+                kind: WorkflowStepKind::Tool {
+                    tool: "PRIVATE-TOOL-SENTINEL".to_string(),
+                    args: json!({"credential": "PRIVATE-ARG-SENTINEL"}),
+                    capabilities: vec!["PRIVATE-CAPABILITY-SENTINEL".to_string()],
+                },
+                failure: bamboo_domain::FailurePolicy::FailFast,
+                output_schema: Some(json!({"private": "PRIVATE-STEP-SCHEMA-SENTINEL"})),
+            }],
+            plan: WorkflowPlan::Retry {
+                node: Box::new(WorkflowPlan::Map {
+                    source: bamboo_domain::ValueRef::Literal {
+                        value: json!("PRIVATE-BINDING-SENTINEL"),
+                    },
+                    item: "PRIVATE-ITEM-SENTINEL".to_string(),
+                    body: Box::new(WorkflowPlan::Step {
+                        step: "inspect".to_string(),
+                    }),
+                }),
+                max_attempts: 3,
+                delay_ms: 987_654,
+            },
+            budgets: WorkflowBudgets {
+                max_concurrency: 2,
+                max_agents: 4,
+                max_steps: 8,
+                max_retries: 3,
+                max_nesting_depth: 2,
+                wall_time_ms: 10_000,
+                max_tokens: Some(1_000),
+                max_cost_micros: Some(2_000),
+            },
+        };
+        let definition_bundle = WorkflowDefinitionBundle {
+            publication_revision: 7,
+            root_id: definition.id.clone(),
+            root_revision: definition.revision,
+            root_invocation_policy: json!({"private": "PRIVATE-POLICY-SENTINEL"}),
+            definitions: BTreeMap::from([(
+                WorkflowDefinitionBundle::key(&definition.id, definition.revision),
+                definition.clone(),
+            )]),
+        };
+        let now = chrono::Utc::now();
+        WorkflowRunSnapshot {
+            run_id: "public-run".to_string(),
+            parent_run_id: Some("public-parent-run".to_string()),
+            parent_step_id: Some("public-parent-step".to_string()),
+            session_id: "public-session".to_string(),
+            definition,
+            definition_bundle,
+            definition_bundle_hash: "public-bundle-hash".to_string(),
+            validated_args: json!({"password": "PRIVATE-VALIDATED-ARG-SENTINEL"}),
+            status,
+            steps: BTreeMap::from([(
+                "inspect".to_string(),
+                WorkflowStepSnapshot {
+                    id: "inspect".to_string(),
+                    status: WorkflowStepStatus::Failed,
+                    input_hash: "PRIVATE-INPUT-HASH-SENTINEL".to_string(),
+                    output: Some(json!({"raw_tool_output": "PRIVATE-OUTPUT-SENTINEL"})),
+                    failure: Some(WorkflowFailure {
+                        code: WorkflowFailureCode::Storage,
+                        message: "/private/workspace/PRIVATE-DIAGNOSTIC-SENTINEL".to_string(),
+                        retryable: true,
+                    }),
+                    attempts: 2,
+                },
+            )]),
+            usage: WorkflowBudgetUsage {
+                steps: 1,
+                retries: 1,
+                agents: 3,
+                tokens: 40,
+                cost_micros: 50,
+            },
+            last_sequence: 9,
+            output: Some(json!({"raw_run_output": "PRIVATE-RUN-OUTPUT-SENTINEL"})),
+            failure: Some(WorkflowFailure {
+                code: WorkflowFailureCode::ExecutionFailed,
+                message: "credential PRIVATE-RUN-FAILURE-SENTINEL".to_string(),
+                retryable: false,
+            }),
+            suspension: Some(WorkflowSuspensionContext::ToolApproval {
+                step_id: "inspect".to_string(),
+                tool: "PRIVATE-SUSPENSION-TOOL-SENTINEL".to_string(),
+                tool_call_id: "PRIVATE-TOOL-CALL-SENTINEL".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_workflow_snapshot_is_stable_metadata_only_for_every_status() {
+        let statuses = [
+            (WorkflowRunStatus::Queued, "queued"),
+            (WorkflowRunStatus::Running, "running"),
+            (WorkflowRunStatus::Suspended, "suspended"),
+            (WorkflowRunStatus::Succeeded, "succeeded"),
+            (WorkflowRunStatus::Failed, "failed"),
+            (WorkflowRunStatus::Cancelled, "cancelled"),
+        ];
+
+        for (status, wire_status) in statuses {
+            let public =
+                serde_json::to_value(public_workflow_snapshot(private_workflow_snapshot(status)))
+                    .expect("public snapshot serializes");
+            let text = public.to_string();
+            assert_eq!(public["status"], wire_status);
+            assert_eq!(public["workflow_id"], "review-flow");
+            assert_eq!(public["workflow_revision"], 42);
+            assert_eq!(public["definition_bundle_hash"], "public-bundle-hash");
+            assert_eq!(public["planned_steps"]["inspect"]["kind"], "tool");
+            assert_eq!(public["plan"]["type"], "retry");
+            assert_eq!(public["steps"]["inspect"]["attempts"], 2);
+            assert_eq!(public["budget"]["max_steps"], 8);
+            assert_eq!(public["usage"]["agents"], 3);
+            assert_eq!(public["child_agent_count"], 3);
+            assert_eq!(public["last_sequence"], 9);
+            assert_eq!(public["failure"]["message"], "Workflow execution failed");
+            assert_eq!(public["suspension"]["type"], "tool_approval");
+            for internal_field in [
+                "definition",
+                "definition_bundle",
+                "validated_args",
+                "output",
+            ] {
+                assert!(
+                    public.get(internal_field).is_none(),
+                    "public snapshot exposed internal field {internal_field}: {text}"
+                );
+            }
+
+            for private in [
+                "PRIVATE-",
+                "validated_args",
+                "input_hash",
+                "output_schema",
+                "root_invocation_policy",
+                "delay_ms",
+                "tool_call_id",
+                "raw_tool_output",
+                "raw_run_output",
+            ] {
+                assert!(
+                    !text.contains(private),
+                    "public snapshot leaked {private}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_workflow_events_preserve_sequence_and_drop_private_payloads() {
+        let private = "PRIVATE-EVENT-SENTINEL";
+        let failure = WorkflowFailure {
+            code: WorkflowFailureCode::ExecutionFailed,
+            message: format!("/private/workspace/{private}"),
+            retryable: true,
+        };
+        let kinds = vec![
+            WorkflowRunEventKind::RunQueued,
+            WorkflowRunEventKind::RunStarted,
+            WorkflowRunEventKind::Phase {
+                name: private.to_string(),
+            },
+            WorkflowRunEventKind::StepQueued,
+            WorkflowRunEventKind::StepStarted,
+            WorkflowRunEventKind::StepSuspended {
+                reason: private.to_string(),
+            },
+            WorkflowRunEventKind::StepCompleted {
+                output: json!({"raw": private}),
+            },
+            WorkflowRunEventKind::StepFailed {
+                failure: failure.clone(),
+            },
+            WorkflowRunEventKind::StepCancelled,
+            WorkflowRunEventKind::StepSkipped {
+                reason: private.to_string(),
+            },
+            WorkflowRunEventKind::RunSuspended {
+                reason: private.to_string(),
+            },
+            WorkflowRunEventKind::RunSucceeded {
+                output: json!({"raw": private}),
+            },
+            WorkflowRunEventKind::RunFailed { failure },
+            WorkflowRunEventKind::RunCancelled,
+        ];
+        let at = chrono::Utc::now();
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                public_workflow_event(WorkflowRunEvent {
+                    run_id: "public-run".to_string(),
+                    sequence: index as u64 + 1,
+                    at,
+                    step_id: Some("inspect".to_string()),
+                    kind,
+                })
+            })
+            .collect::<Vec<_>>();
+        let public = serde_json::to_value(&events).expect("public events serialize");
+        let text = public.to_string();
+
+        assert!(!text.contains(private), "public events leaked: {text}");
+        assert_eq!(public[2]["name"], "workflow_progressed");
+        assert_eq!(public[6]["type"], "step_completed");
+        assert!(public[6].get("output").is_none());
+        assert_eq!(public[7]["failure"]["message"], "Workflow execution failed");
+        assert_eq!(public[11]["type"], "run_succeeded");
+        assert!(public[11].get("output").is_none());
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=14).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn workflow_tool_errors_never_expose_backend_diagnostics() {
+        let sentinel = "/private/workspace/credentials-PRIVATE-SENTINEL";
+        let cases = [
+            WorkflowRunError::Storage(sentinel.to_string()),
+            WorkflowRunError::InvalidInput(sentinel.to_string()),
+            WorkflowRunError::Preflight(sentinel.to_string()),
+        ];
+        for error in cases {
+            assert!(!workflow_tool_error(error).to_string().contains(sentinel));
+        }
+        assert!(!workflow_tool_error(WorkflowRunError::Compile(
+            bamboo_domain::WorkflowCompileError::InvalidSchema(sentinel.to_string())
+        ))
+        .to_string()
+        .contains(sentinel));
     }
 
     fn canonical_workflow_run_schema() -> Value {
@@ -1249,6 +1828,126 @@ mod tests {
                 .progress_for_session("other-session", &started.run_id, 0)
                 .await,
             Err(WorkflowRunError::NotFound)
+        ));
+
+        // Recreate the adapter over the same durable journal, then combine the
+        // snapshot with only the tail after sequence 4. This is the reconnect
+        // contract used by Lotus after a process or transport restart.
+        let run_id = started.run_id.clone();
+        let skills = access.skills.clone();
+        drop(access);
+        let reopened = WorkflowRunAccess::new(
+            directory.path(),
+            Arc::new(WorkflowReadTool),
+            skills,
+            repo.clone(),
+        )
+        .await
+        .expect("reopen workflow adapter");
+        let reconnected = reopened
+            .progress_for_session("workflow-session", &run_id, 4)
+            .await
+            .expect("durable reconnect");
+        assert_eq!(reconnected.snapshot.status, WorkflowRunStatus::Succeeded);
+        assert_eq!(
+            reconnected
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7]
+        );
+        assert_eq!(
+            public_workflow_snapshot(reconnected.snapshot).last_sequence,
+            7
+        );
+        assert!(matches!(
+            public_workflow_event(reconnected.events.last().cloned().expect("tail event")).kind,
+            PublicWorkflowRunEventKind::RunSucceeded
+        ));
+        assert_eq!(
+            reopened
+                .list_for_session("workflow-session")
+                .await
+                .expect("reconnected list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_is_idempotent_and_reconnects_to_one_terminal_event() {
+        let entered = Arc::new(Semaphore::new(0));
+        let (access, repo, directory) =
+            workflow_test_access_with_tools(Arc::new(BlockingWorkflowReadTool {
+                entered: entered.clone(),
+            }))
+            .await;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut session = Session::new("cancel-session", "model");
+        session.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut session).await.expect("save session");
+
+        let started = access
+            .start("cancel-session", "review-flow", 42, json!({}), None)
+            .await
+            .expect("start blocking run");
+        let _entered = tokio::time::timeout(std::time::Duration::from_secs(2), entered.acquire())
+            .await
+            .expect("blocking step entered")
+            .expect("semaphore open");
+
+        let first = access
+            .cancel_for_session("cancel-session", &started.run_id)
+            .await
+            .expect("first cancel");
+        let second = access
+            .cancel_for_session("cancel-session", &started.run_id)
+            .await
+            .expect("idempotent cancel");
+        assert_eq!(first.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(second.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(first.last_sequence, second.last_sequence);
+
+        let progress = access
+            .progress_for_session("cancel-session", &started.run_id, 0)
+            .await
+            .expect("cancelled journal");
+        assert_eq!(progress.snapshot.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(progress.snapshot.last_sequence, first.last_sequence);
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::RunCancelled))
+                .count(),
+            1
+        );
+        assert!(!progress
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, WorkflowRunEventKind::RunSucceeded { .. })));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=progress.snapshot.last_sequence).collect::<Vec<_>>()
+        );
+        let tail = access
+            .progress_for_session(
+                "cancel-session",
+                &started.run_id,
+                progress.snapshot.last_sequence,
+            )
+            .await
+            .expect("terminal reconnect tail");
+        assert!(tail.events.is_empty());
+        assert!(matches!(
+            public_workflow_snapshot(second).status,
+            WorkflowRunStatus::Cancelled
         ));
     }
 

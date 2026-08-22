@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app_state::AppState;
-use crate::workflow::public_workflow_snapshot;
+use crate::workflow::{public_workflow_event, public_workflow_snapshot};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +86,13 @@ pub async fn events(
         .progress_for_session(&session_id, &run_id, query.since)
         .await
     {
-        Ok(progress) => HttpResponse::Ok().json(progress.events),
+        Ok(progress) => HttpResponse::Ok().json(
+            progress
+                .events
+                .into_iter()
+                .map(public_workflow_event)
+                .collect::<Vec<_>>(),
+        ),
         Err(error) => workflow_error(error),
     }
 }
@@ -119,15 +125,15 @@ pub async fn restart(
 }
 
 fn workflow_error(error: WorkflowRunError) -> HttpResponse {
-    let message = error.to_string();
     match error {
         WorkflowRunError::NotFound => HttpResponse::NotFound().json(serde_json::json!({
-            "error": crate::error::error_value(message)
+            "error": crate::error::error_value("workflow run not found")
         })),
         WorkflowRunError::Terminal => HttpResponse::Conflict().json(serde_json::json!({
-            "error": crate::error::error_value(message)
+            "error": crate::error::error_value("workflow run is already terminal")
         })),
         WorkflowRunError::Storage(details) => {
+            tracing::error!(%details, "workflow HTTP storage unavailable");
             let recovery_run_id = recovery_run_id_from_storage_details(&details);
             HttpResponse::InternalServerError().json(match recovery_run_id {
                 Some(run_id) => serde_json::json!({
@@ -141,10 +147,15 @@ fn workflow_error(error: WorkflowRunError) -> HttpResponse {
                 }),
             })
         }
-        WorkflowRunError::Compile(_)
-        | WorkflowRunError::InvalidInput(_)
-        | WorkflowRunError::Preflight(_) => HttpResponse::BadRequest()
-            .json(serde_json::json!({ "error": crate::error::error_value(message) })),
+        WorkflowRunError::Compile(_) => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value("workflow definition is invalid")
+        })),
+        WorkflowRunError::InvalidInput(_) => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value("workflow input is invalid")
+        })),
+        WorkflowRunError::Preflight(_) => HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value("workflow preflight failed")
+        })),
     }
 }
 
@@ -153,13 +164,7 @@ fn recovery_run_id_from_storage_details(details: &str) -> Option<&str> {
         .split("orphan run ")
         .nth(1)
         .and_then(|tail| tail.split_whitespace().next())
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 64
-                && value
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        })
+        .filter(|value| uuid::Uuid::parse_str(value).is_ok())
 }
 
 #[cfg(test)]
@@ -214,27 +219,48 @@ mod tests {
             .unwrap_or_default()
             .contains("failure"));
         assert_eq!(recovery_run_id_from_storage_details("disk /secret"), None);
+        assert_eq!(
+            recovery_run_id_from_storage_details(
+                "storage failed; orphan run CREDENTIALSENTINEL could not be cancelled"
+            ),
+            None
+        );
     }
 
     #[actix_web::test]
-    async fn workflow_errors_preserve_status_and_use_canonical_envelope() {
+    async fn workflow_errors_preserve_status_and_redact_private_diagnostics() {
+        let sentinel = "/private/workspace/credentials-PRIVATE-SENTINEL";
         let cases = [
             (
                 WorkflowRunError::NotFound,
                 actix_web::http::StatusCode::NOT_FOUND,
+                "workflow run not found",
             ),
             (
                 WorkflowRunError::Terminal,
                 actix_web::http::StatusCode::CONFLICT,
+                "workflow run is already terminal",
             ),
             (
-                WorkflowRunError::InvalidInput("bad args".to_string()),
+                WorkflowRunError::InvalidInput(sentinel.to_string()),
                 actix_web::http::StatusCode::BAD_REQUEST,
+                "workflow input is invalid",
+            ),
+            (
+                WorkflowRunError::Preflight(sentinel.to_string()),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "workflow preflight failed",
+            ),
+            (
+                WorkflowRunError::Compile(bamboo_domain::WorkflowCompileError::InvalidSchema(
+                    sentinel.to_string(),
+                )),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "workflow definition is invalid",
             ),
         ];
 
-        for (error, expected_status) in cases {
-            let expected_message = error.to_string();
+        for (error, expected_status, expected_message) in cases {
             let response = workflow_error(error);
             assert_eq!(response.status(), expected_status);
             let body = actix_web::body::to_bytes(response.into_body())
@@ -243,6 +269,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
             assert_eq!(value["error"]["message"], expected_message);
             assert_eq!(value["error"]["type"], "api_error");
+            assert!(!value.to_string().contains(sentinel));
         }
     }
 }
