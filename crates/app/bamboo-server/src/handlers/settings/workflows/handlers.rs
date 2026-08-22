@@ -1,14 +1,26 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use actix_web::{http::StatusCode, web, HttpResponse};
+use bamboo_skills::catalog::workflow_catalog_content_digest;
 use bamboo_skills::legacy::LegacyWorkflowMigrationOutcome;
-use bamboo_skills::{LegacyWorkflowMigrationStatus, WorkflowCatalogEntry, WorkflowCatalogSnapshot};
+use bamboo_skills::store::builtin::{builtin_clone_files, load_builtin_skill_bundles};
+use bamboo_skills::{
+    LegacyWorkflowMigrationStatus, SkillStore, WorkflowCatalogEntry, WorkflowCatalogSnapshot,
+    WorkflowSource, WorkflowStatus,
+};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::{app_state::AppState, error::AppError};
 
+use super::clone_publication::{
+    publish_builtin_clone, validate_clone_bundle, ClonePublicationError,
+};
 use super::types::{
-    MigrateWorkflowRequest, MigrateWorkflowResponse, SaveWorkflowRequest, WorkflowCatalogQuery,
-    WorkflowGetResponse, WorkflowListItem,
+    CloneWorkflowRequest, CloneWorkflowResponse, CloneWorkflowTarget, MigrateWorkflowRequest,
+    MigrateWorkflowResponse, SaveWorkflowRequest, WorkflowCatalogQuery, WorkflowGetResponse,
+    WorkflowListItem,
 };
 use super::validation::is_safe_workflow_name;
 
@@ -155,6 +167,447 @@ pub async fn list_workflow_catalog(
     Ok(HttpResponse::Ok()
         .insert_header(("Cache-Control", "no-store"))
         .json(snapshot))
+}
+
+struct CloneTargetScope {
+    trusted_root: PathBuf,
+    store: Arc<SkillStore>,
+    published_source: WorkflowSource,
+    session_guard: Option<bamboo_storage::session_merge::SessionLockGuard>,
+}
+
+fn fixed_clone_error(status: StatusCode, message: &'static str) -> HttpResponse {
+    crate::error::json_error(status, message)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn session_project_scope_error(
+    error: crate::project_context::ProjectWorkspaceValidationError,
+) -> HttpResponse {
+    match error {
+        crate::project_context::ProjectWorkspaceValidationError::Invalid { .. }
+        | crate::project_context::ProjectWorkspaceValidationError::Conflict { .. } => {
+            fixed_clone_error(
+                StatusCode::CONFLICT,
+                "Session Project/workspace assignment is invalid",
+            )
+        }
+        crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+            tracing::error!(%error, "failed to validate Workflow clone Project scope");
+            fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workflow clone scope is unavailable",
+            )
+        }
+    }
+}
+
+async fn clone_target_scope(
+    app_state: &AppState,
+    target: CloneWorkflowTarget,
+    session_id: Option<&str>,
+) -> Result<CloneTargetScope, HttpResponse> {
+    match target {
+        CloneWorkflowTarget::User => {
+            if session_id.is_some_and(|value| !value.trim().is_empty()) {
+                return Err(fixed_clone_error(
+                    StatusCode::BAD_REQUEST,
+                    "session_id is only valid for a Project Workflow clone",
+                ));
+            }
+            let store = app_state
+                .skill_manager
+                .store_for_workspace(None)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to resolve user Workflow clone store");
+                    fixed_clone_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Workflow clone scope is unavailable",
+                    )
+                })?;
+            Ok(CloneTargetScope {
+                trusted_root: app_state.app_data_dir.clone(),
+                store,
+                published_source: WorkflowSource::User,
+                session_guard: None,
+            })
+        }
+        CloneWorkflowTarget::Project => {
+            let session_id = session_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    fixed_clone_error(
+                        StatusCode::BAD_REQUEST,
+                        "session_id is required for a Project Workflow clone",
+                    )
+                })?;
+            let session_guard = app_state.persistence.acquire_lock(session_id).await;
+            let session = app_state
+                .persistence
+                .storage()
+                .load_session(session_id)
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to load Workflow clone Session");
+                    fixed_clone_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Workflow clone scope is unavailable",
+                    )
+                })?
+                .ok_or_else(|| fixed_clone_error(StatusCode::NOT_FOUND, "Session not found"))?;
+            let project_id = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&session) {
+                bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                    project_id
+                }
+                bamboo_engine::project_context::SessionProjectIdentity::Unassigned => {
+                    return Err(fixed_clone_error(
+                        StatusCode::BAD_REQUEST,
+                        "Project Workflow clone requires an assigned Project",
+                    ));
+                }
+                bamboo_engine::project_context::SessionProjectIdentity::Invalid { .. } => {
+                    return Err(fixed_clone_error(
+                        StatusCode::CONFLICT,
+                        "Session Project/workspace assignment is invalid",
+                    ));
+                }
+            };
+            let persisted_workspace = (session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str)
+                != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str()))
+            .then(|| session.workspace_path_meta())
+            .flatten();
+            let project = app_state.project_store.get(&project_id).map_err(|error| {
+                tracing::warn!(%error, "assigned Project is unavailable for Workflow clone");
+                fixed_clone_error(StatusCode::CONFLICT, "Assigned Project is unavailable")
+            })?;
+            // Project-home publication does not require a source checkout. If
+            // the Project or Session does declare one, validate it before it
+            // can influence the scoped source-catalog winner.
+            let workspace = if persisted_workspace.is_some() || project.project_path.is_some() {
+                crate::project_context::validate_workspace_assignment_with_resolver(
+                    &app_state.project_store,
+                    Some(&project_id),
+                    persisted_workspace.as_deref(),
+                    &app_state.workspace_resolver,
+                )
+                .map_err(session_project_scope_error)?
+            } else {
+                None
+            };
+            let project_home = app_state.project_store.paths().project_home(&project_id);
+            let store = app_state
+                .skill_manager
+                .store_for_project_workspace(&project_id, &project_home, workspace.as_deref())
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "failed to resolve Project Workflow clone store");
+                    fixed_clone_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Workflow clone scope is unavailable",
+                    )
+                })?;
+            Ok(CloneTargetScope {
+                trusted_root: project_home,
+                store,
+                published_source: WorkflowSource::Project,
+                session_guard: Some(session_guard),
+            })
+        }
+    }
+}
+
+async fn combined_catalog_snapshot(store: &SkillStore) -> WorkflowCatalogSnapshot {
+    let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+    let mut entries = skill_catalog.entries;
+    entries.extend(workflow_catalog.entries);
+    WorkflowCatalogSnapshot {
+        revision: skill_catalog.revision.max(workflow_catalog.revision),
+        entries,
+    }
+}
+
+fn unique_winner<'a>(
+    catalog: &'a WorkflowCatalogSnapshot,
+    workflow_id: &str,
+) -> Result<Option<&'a WorkflowCatalogEntry>, ()> {
+    let mut matches = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.id == workflow_id && entry.winner);
+    let first = matches.next();
+    if matches.next().is_some() {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+/// Publish one exact builtin Workflow into the canonical Project or user layer.
+///
+/// This endpoint is intentionally fresh-publication-only. Recovery, marker
+/// retirement and delete/reclone are owned by #874.
+pub async fn clone_workflow(
+    app_state: web::Data<AppState>,
+    workflow_id: web::Path<String>,
+    payload: web::Json<CloneWorkflowRequest>,
+) -> Result<HttpResponse, AppError> {
+    let workflow_id = workflow_id.into_inner();
+    if !is_safe_workflow_name(&workflow_id)
+        || payload.revision == 0
+        || !valid_sha256(&payload.content_digest)
+    {
+        return Ok(fixed_clone_error(
+            StatusCode::BAD_REQUEST,
+            "Workflow clone selection is invalid",
+        ));
+    }
+    if payload.source != WorkflowSource::Builtin {
+        return Ok(fixed_clone_error(
+            StatusCode::BAD_REQUEST,
+            "Only builtin Workflows can be cloned",
+        ));
+    }
+
+    let mut scope = match clone_target_scope(
+        app_state.get_ref(),
+        payload.target,
+        payload.session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(scope) => scope,
+        Err(response) => return Ok(response),
+    };
+    if let Err(error) = scope.store.reload().await {
+        tracing::error!(%error, "failed to reload Workflow clone source catalog");
+        return Ok(fixed_clone_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Workflow catalog is unavailable",
+        ));
+    }
+    let source_catalog = combined_catalog_snapshot(&scope.store).await;
+    let source_entry = match unique_winner(&source_catalog, &workflow_id) {
+        Ok(Some(entry)) => entry.clone(),
+        Ok(None) => {
+            return Ok(fixed_clone_error(
+                StatusCode::NOT_FOUND,
+                "Workflow is not available",
+            ));
+        }
+        Err(()) => {
+            return Ok(fixed_clone_error(
+                StatusCode::CONFLICT,
+                "Workflow catalog identity is ambiguous",
+            ));
+        }
+    };
+    if source_entry.source != WorkflowSource::Builtin
+        || source_entry.status != WorkflowStatus::Valid
+        || source_entry.revision != payload.revision
+        || source_entry.content_digest != payload.content_digest
+    {
+        return Ok(fixed_clone_error(
+            StatusCode::CONFLICT,
+            "Workflow clone selection is stale or shadowed",
+        ));
+    }
+
+    let bundles = match load_builtin_skill_bundles() {
+        Ok(bundles) => bundles,
+        Err(error) => {
+            tracing::error!(%error, "failed to load embedded Workflow bundles");
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Builtin Workflow materialization is unavailable",
+            ));
+        }
+    };
+    let Some(bundle) = bundles
+        .into_iter()
+        .find(|bundle| bundle.skill.id == workflow_id)
+    else {
+        return Ok(fixed_clone_error(
+            StatusCode::CONFLICT,
+            "Workflow clone source is not an embedded bundle",
+        ));
+    };
+    let source_digest = workflow_catalog_content_digest(
+        &source_entry,
+        Some(&bundle.skill),
+        bundle
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    );
+    if source_digest != source_entry.content_digest {
+        tracing::error!(
+            workflow_id,
+            "builtin Workflow catalog identity diverged from embedded bytes"
+        );
+        return Ok(fixed_clone_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Builtin Workflow identity is unavailable",
+        ));
+    }
+    let files = match builtin_clone_files(&bundle) {
+        Ok(files) => files,
+        Err(error) => {
+            tracing::error!(%error, "failed to render builtin Workflow clone bundle");
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Builtin Workflow materialization is unavailable",
+            ));
+        }
+    };
+    if let Err(error) = validate_clone_bundle(&files) {
+        tracing::error!(
+            ?error,
+            "builtin Workflow clone bundle failed publication validation"
+        );
+        return Ok(fixed_clone_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Builtin Workflow materialization is unavailable",
+        ));
+    }
+
+    let trusted_root = scope.trusted_root.clone();
+    let publish_id = workflow_id.clone();
+    let publish_digest = source_entry.content_digest.clone();
+    let source_revision = source_entry.revision;
+    let session_guard = scope.session_guard.take();
+    let publication = tokio::task::spawn_blocking(move || {
+        let result = publish_builtin_clone(
+            &trusted_root,
+            &publish_id,
+            source_revision,
+            &publish_digest,
+            &files,
+        );
+        (result, session_guard)
+    })
+    .await;
+    let (publication, _session_guard) = match publication {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "Workflow clone publication task failed");
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workflow clone publication failed",
+            ));
+        }
+    };
+    let receipt = match publication {
+        Ok(receipt) => receipt,
+        Err(ClonePublicationError::Conflict(message)) => {
+            tracing::warn!(
+                workflow_id,
+                reason = message,
+                "Workflow clone publication conflict"
+            );
+            return Ok(fixed_clone_error(
+                StatusCode::CONFLICT,
+                "Workflow clone conflicts with existing target state",
+            ));
+        }
+        Err(ClonePublicationError::Io(error)) => {
+            tracing::error!(%error, workflow_id, "Workflow clone publication I/O failure");
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workflow clone publication failed",
+            ));
+        }
+        Err(ClonePublicationError::Internal(message)) => {
+            tracing::error!(
+                workflow_id,
+                reason = message,
+                "Workflow clone publication invariant failed"
+            );
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workflow clone publication failed",
+            ));
+        }
+    };
+    tracing::debug!(
+        workflow_id,
+        target_device = receipt.target_identity.device,
+        target_inode = receipt.target_identity.inode,
+        "published exact builtin Workflow clone"
+    );
+
+    if let Err(error) = scope.store.reload().await {
+        tracing::error!(%error, workflow_id, "failed to reload published Workflow clone");
+        return Ok(fixed_clone_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Published Workflow catalog verification failed",
+        ));
+    }
+    let published_catalog = combined_catalog_snapshot(&scope.store).await;
+    let published_entry = match unique_winner(&published_catalog, &workflow_id) {
+        Ok(Some(entry))
+            if entry.source == scope.published_source && entry.status == WorkflowStatus::Valid =>
+        {
+            entry
+        }
+        _ => {
+            tracing::error!(
+                workflow_id,
+                "published Workflow clone is not the exact catalog winner"
+            );
+            return Ok(fixed_clone_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Published Workflow catalog verification failed",
+            ));
+        }
+    };
+    let mut expected_entry = source_entry.clone();
+    expected_entry.source = scope.published_source;
+    expected_entry.content_digest.clear();
+    expected_entry.last_error = None;
+    expected_entry.shadowed_candidates.clear();
+    let expected_digest = workflow_catalog_content_digest(
+        &expected_entry,
+        Some(&bundle.skill),
+        bundle
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    );
+    if published_entry.content_digest != expected_digest {
+        tracing::error!(
+            workflow_id,
+            "published Workflow clone digest does not match embedded bytes"
+        );
+        return Ok(fixed_clone_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Published Workflow catalog verification failed",
+        ));
+    }
+
+    Ok(HttpResponse::Created()
+        .insert_header(("Cache-Control", "no-store"))
+        .json(CloneWorkflowResponse {
+            workflow_id,
+            target: payload.target,
+            source_preserved: true,
+            source_revision: source_entry.revision,
+            source_content_digest: source_entry.content_digest,
+            published_source: published_entry.source,
+            published_revision: published_entry.revision,
+            published_content_digest: published_entry.content_digest.clone(),
+            catalog_revision: published_catalog.revision,
+        }))
 }
 
 /// Clone one read-only global/workspace/plugin legacy workflow into the trusted

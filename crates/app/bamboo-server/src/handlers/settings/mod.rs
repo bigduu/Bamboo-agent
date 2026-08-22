@@ -57,8 +57,9 @@ pub use redaction::{redact_config_for_api, redact_providers_for_api};
 pub use setup::{get_setup_status, mark_setup_complete, mark_setup_incomplete};
 pub(crate) use workflows::is_safe_workflow_name;
 pub use workflows::{
-    delete_workflow, get_workflow, list_workflow_catalog, list_workflows, migrate_workflow,
-    save_workflow, MigrateWorkflowRequest, SaveWorkflowRequest, WorkflowCatalogQuery,
+    clone_workflow, delete_workflow, get_workflow, list_workflow_catalog, list_workflows,
+    migrate_workflow, save_workflow, CloneWorkflowRequest, CloneWorkflowTarget,
+    MigrateWorkflowRequest, SaveWorkflowRequest, WorkflowCatalogQuery,
 };
 
 // NOTE: the production `/bamboo/*` route map lives in `routes::bamboo_v1_routes`

@@ -61,9 +61,10 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::catalog::{
-    entry_from_skill, legacy_migration_status, load_bundle_metadata, LegacyWorkflowMigrationStatus,
-    ShadowedWorkflowCandidate, WorkflowCatalogEntry, WorkflowCatalogEvent,
-    WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind, WorkflowStatus,
+    entry_from_skill, legacy_migration_status, load_bundle_metadata,
+    workflow_catalog_content_digest, LegacyWorkflowMigrationStatus, ShadowedWorkflowCandidate,
+    WorkflowCatalogEntry, WorkflowCatalogEvent, WorkflowCatalogEventKind, WorkflowCatalogSnapshot,
+    WorkflowKind, WorkflowStatus,
 };
 use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_skill_bundles};
 use crate::store::parser::render_skill_markdown;
@@ -411,6 +412,7 @@ fn invalid_placeholder(
         kind: WorkflowKind::Instruction,
         source: source.into(),
         revision,
+        content_digest: String::new(),
         version: "1".to_string(),
         invocation_policy: serde_json::json!({"explicit": false, "automatic": false}),
         argument_schema: serde_json::json!({"type": "object"}),
@@ -420,6 +422,29 @@ fn invalid_placeholder(
         last_error: Some(error.to_string()),
         winner: true,
         shadowed_candidates: Vec::new(),
+    }
+}
+
+fn assign_catalog_content_digests(
+    entries: &mut [WorkflowCatalogEntry],
+    definitions: &HashMap<SkillId, SkillDefinition>,
+    resources: &HashMap<SkillId, SkillResourceSnapshot>,
+) {
+    for entry in entries {
+        // An invalid last-known-good entry is cloned from its previous exact
+        // publication. Preserve that identity until a valid replacement wins.
+        if entry.status == WorkflowStatus::Invalid && !entry.content_digest.is_empty() {
+            continue;
+        }
+        entry.content_digest = workflow_catalog_content_digest(
+            entry,
+            definitions.get(&entry.id),
+            resources
+                .get(&entry.id)
+                .into_iter()
+                .flat_map(|resources| resources.iter())
+                .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+        );
     }
 }
 
@@ -1358,6 +1383,12 @@ impl SkillStore {
             self.snapshot_limits,
         )
         .await?;
+        assign_catalog_content_digests(&mut skill_entries, &resolved_skills, &resolved_resources);
+        assign_catalog_content_digests(
+            &mut workflow_entries,
+            &resolved_workflows,
+            &resolved_workflow_resources,
+        );
         let skill_definition_changed: HashSet<String> = resolved_skills
             .iter()
             .filter(|(id, skill)| {

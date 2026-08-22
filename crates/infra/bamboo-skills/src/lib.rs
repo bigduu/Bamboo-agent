@@ -3,6 +3,7 @@
 pub mod access_control;
 pub mod activation;
 pub mod catalog;
+pub mod clone_publication;
 pub mod context;
 pub mod legacy;
 pub mod resource_helpers;
@@ -1078,6 +1079,7 @@ mod tests {
                     kind: WorkflowKind::Instruction,
                     source: WorkflowSource::User,
                     revision: 1,
+                    content_digest: String::new(),
                     version: "1".to_string(),
                     invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
                     argument_schema: serde_json::json!({"type": "object"}),
@@ -1114,6 +1116,7 @@ mod tests {
                 kind: WorkflowKind::Instruction,
                 source: WorkflowSource::User,
                 revision: 1,
+                content_digest: String::new(),
                 version: "1".to_string(),
                 invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
                 argument_schema: serde_json::json!({"type": "object"}),

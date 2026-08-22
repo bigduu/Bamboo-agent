@@ -107,6 +107,7 @@ anyhow = "1"
 parking_lot = "0.12"
 dashmap = "6"
 fs2 = "0.4"
+cap-std = "4.0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
 reqwest-middleware = { version = "0.5", features = ["json", "form"] }
 reqwest-retry = "0.9"
@@ -182,6 +183,20 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 # tests that must opt in to the scoped env-cache fixture.
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 bamboo-storage = { path = "../../infra/bamboo-storage", features = ["test-utils"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext = "4.0.3"
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
 
 [[test]]
 name = "env_cache_isolation"
