@@ -32,44 +32,6 @@ fn legacy_workflow_io_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn legacy_source_is_same_file(selected: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
-    if selected.file_type().is_symlink()
-        || current.file_type().is_symlink()
-        || !selected.is_file()
-        || !current.is_file()
-    {
-        return false;
-    }
-    legacy_source_identity_matches(selected, current)
-}
-
-#[cfg(unix)]
-fn legacy_source_identity_matches(
-    selected: &std::fs::Metadata,
-    current: &std::fs::Metadata,
-) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    selected.dev() == current.dev() && selected.ino() == current.ino()
-}
-
-#[cfg(windows)]
-fn legacy_source_identity_matches(
-    selected: &std::fs::Metadata,
-    current: &std::fs::Metadata,
-) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    selected.volume_serial_number() == current.volume_serial_number()
-        && selected.file_index() == current.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn legacy_source_identity_matches(
-    selected: &std::fs::Metadata,
-    current: &std::fs::Metadata,
-) -> bool {
-    selected.len() == current.len() && selected.modified().ok() == current.modified().ok()
-}
-
 async fn workspace_publication_root(
     workspace: &std::path::Path,
 ) -> Result<std::path::PathBuf, AppError> {
@@ -818,6 +780,9 @@ where
     let canonical_source = tokio::fs::canonicalize(&catalog_source)
         .await
         .map_err(|_| AppError::BadRequest("Legacy workflow source is unavailable".to_string()))?;
+    let selected_identity = bamboo_skills::legacy::legacy_markdown_source_identity(&catalog_source)
+        .await
+        .map_err(|_| AppError::BadRequest("Legacy workflow source is unavailable".to_string()))?;
     let canonical_app_data = tokio::fs::canonicalize(&app_state.app_data_dir).await?;
     let canonical_workspace = match workspace.as_ref() {
         Some(workspace) => Some(tokio::fs::canonicalize(workspace).await?),
@@ -940,9 +905,11 @@ where
     }
 
     after_source_selection(&catalog_source);
-    let source_content =
-        match bamboo_skills::legacy::read_legacy_markdown_workflow(&catalog_source).await {
-            Ok(content) => content,
+    let (source_content, read_identity) =
+        match bamboo_skills::legacy::read_legacy_markdown_workflow_with_identity(&catalog_source)
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(_) => {
                 return Ok(crate::error::json_error(
                     StatusCode::CONFLICT,
@@ -950,15 +917,16 @@ where
                 ));
             }
         };
-    let current_metadata = match tokio::fs::symlink_metadata(&catalog_source).await {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return Ok(crate::error::json_error(
-                StatusCode::CONFLICT,
-                "Legacy workflow source changed; refresh the catalog before migrating",
-            ));
-        }
-    };
+    let named_identity =
+        match bamboo_skills::legacy::legacy_markdown_source_identity(&catalog_source).await {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Ok(crate::error::json_error(
+                    StatusCode::CONFLICT,
+                    "Legacy workflow source changed; refresh the catalog before migrating",
+                ));
+            }
+        };
     let live_digest = match bamboo_skills::legacy::legacy_markdown_catalog_content_digest(
         &accepted,
         &catalog_source,
@@ -973,7 +941,8 @@ where
             ));
         }
     };
-    if !legacy_source_is_same_file(&selected_metadata, &current_metadata)
+    if selected_identity != read_identity
+        || read_identity != named_identity
         || live_digest != accepted.content_digest
     {
         return Ok(crate::error::json_error(

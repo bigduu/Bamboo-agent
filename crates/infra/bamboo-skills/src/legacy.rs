@@ -111,16 +111,20 @@ fn public_legacy_error(error: &SkillError) -> String {
     }
 }
 
-async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>> {
-    let metadata_bytes = tokio::fs::metadata(path).await?.len() as usize;
+async fn read_bounded_file_with_identity(
+    path: &Path,
+    max_bytes: usize,
+) -> SkillResult<(Vec<u8>, Option<crate::clone_publication::CloneNodeIdentity>)> {
+    let mut file = open_skill_file_no_follow(path).await?;
+    let metadata_bytes = file.metadata().await?.len() as usize;
     if metadata_bytes > max_bytes {
         return Err(SkillError::Storage(format!(
             "legacy workflow exceeds per-file limit ({metadata_bytes} > {max_bytes} bytes)"
         )));
     }
-    let file = open_skill_file_no_follow(path).await?;
     let mut bytes = Vec::with_capacity(metadata_bytes.min(max_bytes));
-    file.take(max_bytes.saturating_add(1) as u64)
+    (&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
         .await?;
     if bytes.len() > max_bytes {
@@ -129,7 +133,13 @@ async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>
             bytes.len()
         )));
     }
-    Ok(bytes)
+    let file = file.into_std().await;
+    let identity = crate::clone_publication::std_file_identity(&file);
+    Ok((bytes, identity))
+}
+
+async fn read_bounded_file(path: &Path, max_bytes: usize) -> SkillResult<Vec<u8>> {
+    Ok(read_bounded_file_with_identity(path, max_bytes).await?.0)
 }
 
 /// Read one legacy Workflow source without following symlinks and with the
@@ -138,6 +148,33 @@ pub async fn read_legacy_markdown_workflow(path: &Path) -> SkillResult<String> {
     let bytes = read_bounded_file(path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
     String::from_utf8(bytes)
         .map_err(|_| SkillError::Validation("legacy workflow is not valid UTF-8".to_string()))
+}
+
+/// Read one legacy Workflow through a no-follow handle and return the stable
+/// file identity bound to the bytes. Windows uses the handle volume/file ID;
+/// Unix uses device/inode identity.
+pub async fn read_legacy_markdown_workflow_with_identity(
+    path: &Path,
+) -> SkillResult<(String, crate::clone_publication::CloneNodeIdentity)> {
+    let (bytes, identity) =
+        read_bounded_file_with_identity(path, MAX_LEGACY_WORKFLOW_FILE_BYTES).await?;
+    let identity = identity.ok_or_else(|| {
+        SkillError::Storage("legacy workflow file identity is unavailable".to_string())
+    })?;
+    let content = String::from_utf8(bytes)
+        .map_err(|_| SkillError::Validation("legacy workflow is not valid UTF-8".to_string()))?;
+    Ok((content, identity))
+}
+
+/// Open a no-follow handle solely to bind a catalog selection to one durable
+/// source generation before its bytes are consumed.
+pub async fn legacy_markdown_source_identity(
+    path: &Path,
+) -> SkillResult<crate::clone_publication::CloneNodeIdentity> {
+    let file = open_skill_file_no_follow(path).await?.into_std().await;
+    crate::clone_publication::std_file_identity(&file).ok_or_else(|| {
+        SkillError::Storage("legacy workflow file identity is unavailable".to_string())
+    })
 }
 
 fn validate_legacy_description(description: &str) -> SkillResult<()> {
