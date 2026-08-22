@@ -4,7 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
+use crate::catalog::{
+    entry_from_skill, parse_bundle_metadata_bytes, workflow_catalog_content_digest, BundleMetadata,
+    WorkflowCatalogEntry,
+};
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
+use crate::store::storage::SkillDirectorySource;
 use crate::types::{SkillError, SkillResult};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
@@ -62,6 +67,38 @@ pub fn builtin_clone_bundle_digest(files: &BTreeMap<String, BuiltinSkillFile>) -
         digest.update(&file.bytes);
     }
     hex::encode(digest.finalize())
+}
+
+/// Rebuild the metadata-only identity of one embedded builtin without relying
+/// on the current catalog winner. Clone recovery uses this when a deleted user
+/// generation is still retained as last-known-good and shadows the builtin.
+pub fn builtin_workflow_catalog_entry(
+    bundle: &BuiltinSkillBundle,
+    revision: u64,
+) -> SkillResult<WorkflowCatalogEntry> {
+    let metadata = if let Some(bytes) = bundle.files.get("workflow.yaml") {
+        parse_bundle_metadata_bytes("workflow.yaml", bytes, true)
+    } else if let Some(bytes) = bundle.files.get("agents/bamboo.yaml") {
+        parse_bundle_metadata_bytes("agents/bamboo.yaml", bytes, false)
+    } else {
+        Ok(BundleMetadata::default())
+    }
+    .map_err(SkillError::Validation)?;
+    let mut entry = entry_from_skill(
+        &bundle.skill,
+        SkillDirectorySource::Builtin,
+        revision,
+        metadata,
+    );
+    entry.content_digest = workflow_catalog_content_digest(
+        &entry,
+        Some(&bundle.skill),
+        bundle
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    );
+    Ok(entry)
 }
 
 /// Archive the pre-catalog global materialization only when every file proves

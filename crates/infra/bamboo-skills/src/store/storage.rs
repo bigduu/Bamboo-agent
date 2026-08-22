@@ -8,7 +8,8 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
 use crate::clone_publication::{
-    clone_marker_name, std_file_identity, ClonePublicationMarker, MAX_CLONE_MARKER_BYTES,
+    clone_marker_name, parse_clone_marker_journal, std_file_identity, ClonePublicationPhase,
+    MAX_CLONE_MARKER_BYTES,
 };
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillDefinition, SkillError, SkillResult};
@@ -164,10 +165,21 @@ fn clone_marker_allows_publication_sync(skill_file: &Path) -> bool {
     {
         return false;
     }
-    let marker = match serde_json::from_slice::<ClonePublicationMarker>(&bytes) {
-        Ok(marker) => marker,
-        Err(_) => return false,
+    let Some(journal) = parse_clone_marker_journal(&bytes, workflow_id) else {
+        return false;
     };
+    if !journal.partial.is_empty() {
+        return false;
+    }
+    let Some(marker) = journal.current() else {
+        return false;
+    };
+    if matches!(
+        marker.phase,
+        ClonePublicationPhase::Aborted | ClonePublicationPhase::Retired
+    ) {
+        return true;
+    }
     let Some(expected_target) = marker.complete_target_identity(workflow_id) else {
         return false;
     };
@@ -633,7 +645,9 @@ pub async fn write_skill_file(skills_dir: &Path, skill: &SkillDefinition) -> Ski
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clone_publication::{ClonePublicationPhase, CLONE_MARKER_SCHEMA};
+    use crate::clone_publication::{
+        ClonePublicationMarker, ClonePublicationPhase, CLONE_MARKER_SCHEMA,
+    };
 
     fn valid_skill(name: &str) -> String {
         format!("---\nname: {name}\ndescription: test skill\n---\n\nFollow this skill.")
@@ -653,8 +667,15 @@ mod tests {
             bundle_digest: "b".repeat(64),
             staging_name: "txn-12345678-1234-1234-1234-123456789abc".to_string(),
             phase,
-            stage_identity: target_identity,
-            target_identity,
+            stage_identity: (phase != ClonePublicationPhase::Prepared)
+                .then_some(target_identity)
+                .flatten(),
+            target_identity: matches!(
+                phase,
+                ClonePublicationPhase::Complete | ClonePublicationPhase::Retired
+            )
+            .then_some(target_identity)
+            .flatten(),
         };
         std::fs::write(
             root.join(clone_marker_name(workflow_id)),
@@ -716,6 +737,33 @@ mod tests {
             .expect("mismatched discovery is typed");
         assert!(mismatched.loaded.is_empty());
         assert_eq!(mismatched.failed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_and_retired_markers_release_an_ordinary_target() {
+        for phase in [
+            ClonePublicationPhase::Aborted,
+            ClonePublicationPhase::Retired,
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let skill = root.path().join("review");
+            fs::create_dir_all(&skill).await.expect("skill dir");
+            fs::write(skill.join("SKILL.md"), valid_skill("review"))
+                .await
+                .expect("skill");
+            let target = open_directory_no_follow(&skill).expect("target handle");
+            let identity = std_file_identity(&target).expect("target identity");
+            clone_marker(root.path(), "review", phase, Some(identity));
+            let report = load_skills_from_discovery_dirs_detailed(&[SkillDiscoveryDir {
+                dir: root.path().to_path_buf(),
+                source: SkillDirectorySource::Global,
+                mode: None,
+            }])
+            .await
+            .expect("terminal marker discovery");
+            assert_eq!(report.loaded.len(), 1);
+            assert!(report.failed.is_empty());
+        }
     }
 
     #[tokio::test]

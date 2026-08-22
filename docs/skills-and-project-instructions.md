@@ -21,6 +21,17 @@ same adapter in place; installation never copies them into the user's global
 workflow directory. A legacy file without a description receives a placeholder
 description and is explicit/manual-only, never automatically invoked.
 
+Builtin workflows are cloned through
+`POST /api/v1/bamboo/workflow-catalog/<id>/clone`. Bamboo writes the bundle in
+the private same-filesystem `.workflow-clone-txn` directory, journals bounded
+`prepared -> stage_bound -> staged -> complete` transitions, and publishes it
+with an atomic no-replace rename. An exact retry resumes every fully journaled
+phase; ambiguous partial state or an identity mismatch fails closed without
+mutating it. A concurrent target wins unchanged after Bamboo durably records `aborted`.
+If a completed clone directory is later deleted, Bamboo records `retired`
+before starting a bounded replacement epoch; a different directory generation
+at the public name is never retired, adopted, or deleted.
+
 Migration is an explicit clone through
 `POST /api/v1/bamboo/workflow-catalog/<id>/migrate`, using a trusted session id
 to select the current workspace. It creates

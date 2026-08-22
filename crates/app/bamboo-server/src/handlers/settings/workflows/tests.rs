@@ -316,6 +316,46 @@ async fn user_builtin_clone_is_exact_private_and_fresh_only() {
         std::fs::read(target.join("SKILL.md")).expect("unchanged clone"),
         before
     );
+
+    std::fs::remove_dir_all(&target).expect("delete editable clone generation");
+    store.reload().await.expect("reload deleted generation");
+    let stale_revision = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision + 1,
+        "content_digest": source.content_digest.clone(),
+        "target": "user"
+    });
+    let stale = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(stale_revision)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+    assert!(!target.exists());
+
+    let recloned = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    let recloned_status = recloned.status();
+    let recloned_body = actix_web::test::read_body(recloned).await;
+    assert_eq!(
+        recloned_status,
+        actix_web::http::StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&recloned_body)
+    );
+    assert_eq!(
+        std::fs::read(target.join("SKILL.md")).expect("recloned definition"),
+        before
+    );
 }
 
 #[actix_web::test]
