@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::store::storage::SkillDirectorySource;
 use crate::types::SkillDefinition;
@@ -22,6 +23,18 @@ pub enum WorkflowSource {
     Workspace,
     User,
     Plugin,
+}
+
+impl WorkflowSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Project => "project",
+            Self::Workspace => "workspace",
+            Self::User => "user",
+            Self::Plugin => "plugin",
+        }
+    }
 }
 
 impl From<SkillDirectorySource> for WorkflowSource {
@@ -77,6 +90,10 @@ pub struct WorkflowCatalogEntry {
     pub kind: WorkflowKind,
     pub source: WorkflowSource,
     pub revision: u64,
+    /// Restart-stable SHA-256 identity of the exact definition, public
+    /// metadata and immutable resource bytes represented by this winner.
+    #[serde(default)]
+    pub content_digest: String,
     pub version: String,
     pub invocation_policy: serde_json::Value,
     pub argument_schema: serde_json::Value,
@@ -115,6 +132,54 @@ impl WorkflowCatalogSnapshot {
     }
 }
 
+/// Restart-stable content identity for one exact catalog winner. Publication
+/// counters and diagnostics are excluded; execution metadata, the parsed
+/// definition and every immutable resource byte are included.
+pub fn workflow_catalog_content_digest<'a, I>(
+    entry: &WorkflowCatalogEntry,
+    definition: Option<&SkillDefinition>,
+    resources: I,
+) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"bamboo.workflow-catalog-content.v1\0");
+    let public_identity = serde_json::json!({
+        "id": entry.id,
+        "name": entry.name,
+        "description": entry.description,
+        "kind": entry.kind,
+        "source": entry.source,
+        "version": entry.version,
+        "invocation_policy": entry.invocation_policy,
+        "argument_schema": entry.argument_schema,
+        "legacy": entry.legacy,
+        "migration_status": entry.migration_status,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&public_identity) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    if let Some(definition) = definition {
+        if let Ok(bytes) = serde_json::to_vec(definition) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+    } else {
+        hasher.update(b"unavailable-definition");
+    }
+    let mut resources = resources.into_iter().collect::<Vec<_>>();
+    resources.sort_by(|left, right| left.0.cmp(right.0));
+    for (path, bytes) in resources {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    hex::encode(hasher.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowCatalogEventKind {
@@ -128,8 +193,9 @@ pub struct WorkflowCatalogEvent {
     pub workflow_id: String,
     pub revision: u64,
     pub kind: WorkflowCatalogEventKind,
-    /// Whether this transition belongs to the public Workflow identity rather
-    /// than to an instruction-only Skill sharing the internal catalog.
+    /// Compatibility discriminator for consumers predating the unified
+    /// instruction and orchestration Workflow catalog. Newly published catalog
+    /// events always set this; legacy decoded events default to `false`.
     #[serde(default)]
     pub public_workflow: bool,
     /// `global`, `project:<id>`, or an opaque `workspace:<hash>`; never an
@@ -217,20 +283,29 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
     } else {
         "agents/bamboo.yaml"
     };
-    let raw = tokio::fs::read_to_string(&path)
+    let raw = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("{display_name}: {error}"))?;
+    parse_bundle_metadata_bytes(display_name, &raw, path.ends_with("workflow.yaml"))
+}
+
+pub(crate) fn parse_bundle_metadata_bytes(
+    display_name: &str,
+    raw: &[u8],
+    is_workflow_definition: bool,
+) -> Result<BundleMetadata, String> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|_| format!("{display_name}: metadata is not valid UTF-8"))?;
     let metadata: BambooWorkflowMetadata =
-        serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
-    let is_workflow_definition = path.ends_with("workflow.yaml");
+        serde_yaml::from_str(raw).map_err(|error| public_yaml_error(display_name, error))?;
     if is_workflow_definition {
         if metadata.workflow_schema.is_some() {
-            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_str(&raw)
+            let definition: bamboo_domain::WorkflowRunDefinition = serde_yaml::from_str(raw)
                 .map_err(|error| public_yaml_error(display_name, error))?;
             bamboo_domain::CompiledWorkflow::compile(definition.clone())
                 .map_err(|error| public_validation_error(display_name, error))?;
         } else {
-            let definition: bamboo_domain::WorkflowDefinition = serde_yaml::from_str(&raw)
+            let definition: bamboo_domain::WorkflowDefinition = serde_yaml::from_str(raw)
                 .map_err(|error| public_yaml_error(display_name, error))?;
             definition
                 .validate()
@@ -252,7 +327,7 @@ pub(crate) async fn load_bundle_metadata(root: &Path) -> Result<BundleMetadata, 
     }
     if is_workflow_definition && metadata.workflow_schema.is_some() {
         let definition: bamboo_domain::WorkflowRunDefinition =
-            serde_yaml::from_str(&raw).map_err(|error| public_yaml_error(display_name, error))?;
+            serde_yaml::from_str(raw).map_err(|error| public_yaml_error(display_name, error))?;
         result.version = definition.workflow_schema.to_string();
         result.argument_schema = definition.input_schema.clone();
         result.definition_revision = Some(definition.revision);
@@ -317,6 +392,7 @@ pub(crate) fn entry_from_skill(
         kind: metadata.kind,
         source: source.into(),
         revision: metadata.definition_revision.unwrap_or(revision),
+        content_digest: String::new(),
         version: metadata.version,
         invocation_policy: metadata.invocation_policy,
         argument_schema: metadata.argument_schema,
@@ -336,17 +412,62 @@ mod tests {
     #[test]
     fn catalog_serialization_never_contains_instructions_or_resources() {
         let skill = SkillDefinition::new("review", "review", "Reviews code", "SECRET BODY");
-        let entry = entry_from_skill(
+        let mut entry = entry_from_skill(
             &skill,
             SkillDirectorySource::Project,
             4,
             BundleMetadata::default(),
         );
+        entry.content_digest = workflow_catalog_content_digest(
+            &entry,
+            Some(&skill),
+            [("references/example.md", b"PRIVATE RESOURCE".as_slice())],
+        );
         let json = serde_json::to_string(&entry).expect("serialize catalog entry");
         assert!(!json.contains("SECRET BODY"));
+        assert!(!json.contains("PRIVATE RESOURCE"));
         assert!(!json.contains("prompt"));
         assert!(!json.contains("SKILL.md"));
         assert!(!json.contains("references"));
+        assert!(json.contains(&entry.content_digest));
+    }
+
+    #[test]
+    fn content_digest_is_order_independent_and_changes_with_exact_identity() {
+        let skill = SkillDefinition::new("review", "review", "Reviews code", "PRIVATE BODY");
+        let entry = entry_from_skill(
+            &skill,
+            SkillDirectorySource::Builtin,
+            9,
+            BundleMetadata::default(),
+        );
+        let first = workflow_catalog_content_digest(
+            &entry,
+            Some(&skill),
+            [("z.txt", b"z".as_slice()), ("a.txt", b"a".as_slice())],
+        );
+        let reordered = workflow_catalog_content_digest(
+            &entry,
+            Some(&skill),
+            [("a.txt", b"a".as_slice()), ("z.txt", b"z".as_slice())],
+        );
+        assert_eq!(first, reordered);
+        assert_eq!(first.len(), 64);
+
+        let changed_bytes = workflow_catalog_content_digest(
+            &entry,
+            Some(&skill),
+            [("a.txt", b"changed".as_slice()), ("z.txt", b"z".as_slice())],
+        );
+        assert_ne!(first, changed_bytes);
+        let mut project_entry = entry.clone();
+        project_entry.source = WorkflowSource::Project;
+        let changed_source = workflow_catalog_content_digest(
+            &project_entry,
+            Some(&skill),
+            [("a.txt", b"a".as_slice()), ("z.txt", b"z".as_slice())],
+        );
+        assert_ne!(first, changed_source);
     }
 
     #[test]

@@ -10,41 +10,7 @@
 use bamboo_agent_core::{Message, Role};
 use bamboo_domain::Session;
 
-/// Returns true if the message was synthesized by the runtime to resume a
-/// suspended root session (child completion, retry, conclusion-with-options,
-/// gold auto-continue).
-///
-/// Such messages have one or both of the following stable markers:
-/// - `metadata.hidden_from_ui == true`
-/// - `metadata.runtime_kind` set to a known resume kind
-pub fn is_system_resume_message(message: &Message) -> bool {
-    if !matches!(message.role, Role::User) {
-        return false;
-    }
-    let Some(metadata) = message.metadata.as_ref() else {
-        return false;
-    };
-
-    if metadata
-        .get("hidden_from_ui")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    matches!(
-        metadata
-            .get("runtime_kind")
-            .and_then(|value| value.as_str()),
-        Some("child_completion_resume")
-            | Some("retry_resume")
-            | Some("conclusion_with_options_resume")
-            | Some("clarification_resume")
-            | Some("gold_continue_resume")
-            | Some("gold_goal_resume")
-    )
-}
+pub use bamboo_domain::is_system_resume_message;
 
 /// Returns true when the message represents a billable end-user turn.
 ///

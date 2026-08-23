@@ -1,9 +1,9 @@
 use actix_web::{web, HttpResponse, Responder};
 
-use crate::app_state::{AppState, ConfigUpdateEffects};
+use crate::app_state::AppState;
 
 use super::super::api_types::ServerRequest;
-use super::super::persist_config_error;
+use super::super::mutation_error_response;
 
 /// Adds a new MCP server
 ///
@@ -24,40 +24,27 @@ pub async fn add_server(
         },
     };
     let server_id = config.id.clone();
+    let response_server_id = server_id.clone();
 
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                let existing = root
-                    .mcp
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.id == server_id);
-                if let Some(slot) = existing {
-                    *slot = config.clone();
-                } else {
-                    root.mcp.servers.push(config.clone());
-                }
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+    let force_restart = std::collections::BTreeSet::from([server_id.clone()]);
+    if let Err(error) = state
+        .update_legacy_mcp_config(force_restart, move |mcp| {
+            let existing = mcp.servers.iter_mut().find(|server| server.id == server_id);
+            if let Some(slot) = existing {
+                *slot = config.clone();
+            } else {
+                mcp.servers.push(config.clone());
+            }
+            Ok(())
+        })
         .await
     {
-        return persist_config_error(format!("Failed to save config: {e}"));
-    }
-
-    if config.enabled {
-        if let Err(e) = state.mcp_manager.start_server(config).await {
-            return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!("Failed to start server: {}", e))
-            }));
-        }
+        return mutation_error_response(error);
     }
 
     HttpResponse::Created().json(serde_json::json!({
         "message": "Server saved",
-        "server_id": server_id
+        "server_id": response_server_id
     }))
 }
 
@@ -85,41 +72,26 @@ pub async fn update_server(
         },
     };
 
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                let existing = root
-                    .mcp
-                    .servers
-                    .iter_mut()
-                    .find(|server| server.id == server_id);
-                if let Some(slot) = existing {
-                    *slot = config.clone();
-                } else {
-                    root.mcp.servers.push(config.clone());
-                }
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+    let response_server_id = server_id.clone();
+    let force_restart = std::collections::BTreeSet::from([server_id.clone()]);
+    if let Err(error) = state
+        .update_legacy_mcp_config(force_restart, move |mcp| {
+            let existing = mcp.servers.iter_mut().find(|server| server.id == server_id);
+            if let Some(slot) = existing {
+                *slot = config.clone();
+            } else {
+                mcp.servers.push(config.clone());
+            }
+            Ok(())
+        })
         .await
     {
-        return persist_config_error(format!("Failed to save config: {e}"));
-    }
-
-    // Apply runtime: stop existing server if running, then (re)start if enabled.
-    let _ = state.mcp_manager.stop_server(&server_id).await;
-    if config.enabled {
-        if let Err(e) = state.mcp_manager.start_server(config).await {
-            return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!("Failed to update server: {}", e))
-            }));
-        }
+        return mutation_error_response(error);
     }
 
     HttpResponse::Ok().json(serde_json::json!({
         "message": "Server updated",
-        "server_id": server_id
+        "server_id": response_server_id
     }))
 }
 
@@ -130,22 +102,19 @@ pub async fn update_server(
 pub async fn delete_server(state: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let server_id = path.into_inner();
 
-    if let Err(e) = state
-        .update_config(
-            |root| {
-                root.mcp.servers.retain(|server| server.id != server_id);
-                Ok(())
-            },
-            ConfigUpdateEffects::default(),
-        )
+    let response_server_id = server_id.clone();
+    if let Err(error) = state
+        .update_legacy_mcp_config(std::collections::BTreeSet::new(), move |mcp| {
+            mcp.servers.retain(|server| server.id != server_id);
+            Ok(())
+        })
         .await
     {
-        return persist_config_error(format!("Failed to save config: {e}"));
+        return mutation_error_response(error);
     }
 
-    let _ = state.mcp_manager.stop_server(&server_id).await;
     HttpResponse::Ok().json(serde_json::json!({
         "message": "Server removed",
-        "server_id": server_id
+        "server_id": response_server_id
     }))
 }

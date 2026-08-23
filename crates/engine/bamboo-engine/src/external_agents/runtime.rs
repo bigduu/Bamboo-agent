@@ -275,7 +275,7 @@ pub fn build_external_child_runner_with_codex_tokens(
                 fabric_dir,
                 executor,
                 extract_provider_credentials(config),
-                config.provider.clone(),
+                config.effective_default_provider().to_string(),
                 config
                     .subagents()
                     .max_concurrent
@@ -393,7 +393,7 @@ fn build_local_actor_runner(
         fabric_dir,
         executor,
         extract_provider_credentials(config),
-        config.provider.clone(),
+        config.effective_default_provider().to_string(),
         sub.max_concurrent
             .unwrap_or(super::actor_adapter::DEFAULT_MAX_CONCURRENT_ACTORS),
     )
@@ -633,6 +633,52 @@ pub fn extract_provider_credentials(
 ) -> Vec<bamboo_subagent::provision::ScopedCredential> {
     let mut out = Vec::new();
 
+    fn push_instance(
+        out: &mut Vec<bamboo_subagent::provision::ScopedCredential>,
+        id: &str,
+        instance: &bamboo_config::ProviderInstanceConfig,
+    ) {
+        if !instance.enabled {
+            return;
+        }
+        let api_key = instance.api_key.trim().to_string();
+        if api_key.is_empty() {
+            return;
+        }
+        out.push(bamboo_subagent::provision::ScopedCredential {
+            provider: id.to_string(),
+            api_key,
+            base_url: instance.base_url.clone(),
+            provider_type: Some(instance.provider_type.clone()),
+            credential_ref: instance
+                .credential_ref
+                .as_ref()
+                .map(|reference| reference.as_str().to_string()),
+        });
+    }
+
+    if !config.provider_instances.is_empty() {
+        // Native instances are authoritative. Export enabled explicit
+        // instances only; stale legacy slots must not leak into child workers.
+        for (id, instance) in &config.provider_instances {
+            push_instance(&mut out, id, instance);
+        }
+
+        // Narrow #780 compatibility seam: a hybrid default may still name a
+        // real legacy alias not yet materialized. Mirror the registry's exact
+        // rule and add only that default, never every legacy credential.
+        let default_id = config.effective_default_provider();
+        if !config.provider_instances.contains_key(default_id) {
+            if let Some((_, instance)) = bamboo_config::synthesize_legacy_instances(config)
+                .into_iter()
+                .find(|(id, _)| id == default_id)
+            {
+                push_instance(&mut out, default_id, &instance);
+            }
+        }
+        return out;
+    }
+
     // Legacy single-instance slots: providers.anthropic / openai / gemini /
     // bodhi. `copilot` is intentionally omitted — it authenticates via device
     // flow and has no `api_key` field to extract.
@@ -690,27 +736,6 @@ pub fn extract_provider_credentials(
                 .map(|reference| reference.as_str().to_string()),
         );
     }
-
-    // Multi-instance providers: provider_instances keyed by instance id; the
-    // child routes by instance id, the worker constructs by provider_type.
-    // Read the typed struct directly — `api_key` is hydrated in memory but
-    // deliberately `skip_serializing`, so a serde projection would miss it.
-    out.extend(config.provider_instances.iter().filter_map(|(id, inst)| {
-        let api_key = inst.api_key.trim().to_string();
-        if api_key.is_empty() {
-            return None;
-        }
-        Some(bamboo_subagent::provision::ScopedCredential {
-            provider: id.clone(),
-            api_key,
-            base_url: inst.base_url.clone(),
-            provider_type: Some(inst.provider_type.clone()),
-            credential_ref: inst
-                .credential_ref
-                .as_ref()
-                .map(|reference| reference.as_str().to_string()),
-        })
-    }));
 
     out
 }
@@ -903,10 +928,10 @@ mod extract_provider_credentials_tests {
         assert!(extract_provider_credentials(&config).is_empty());
     }
 
-    /// Legacy + `provider_instances` coexisting: both must surface, with no
-    /// duplication/clobbering between the two sources.
+    /// Explicit instances are authoritative: unrelated stale legacy slots do
+    /// not cross the actor provisioning boundary.
     #[test]
-    fn legacy_and_instances_both_present_no_duplicates() {
+    fn instance_mode_omits_unrelated_legacy_credentials() {
         let mut config = Config::default();
         config.providers_mut().anthropic = Some(AnthropicConfig {
             api_key: "sk-ant-legacy".to_string(),
@@ -920,20 +945,79 @@ mod extract_provider_credentials_tests {
         config
             .provider_instances
             .insert("openai-work".to_string(), openai_work);
+        config.default_provider_instance = Some("openai-work".to_string());
+
+        let creds = extract_provider_credentials(&config);
+
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].provider, "openai-work");
+        assert_eq!(creds[0].api_key, "sk-oai-work");
+        assert_eq!(creds[0].provider_type.as_deref(), Some("openai"));
+        assert_eq!(
+            creds[0].credential_ref.as_deref(),
+            Some("provider.openai-work.api_key")
+        );
+    }
+
+    #[test]
+    fn hybrid_legacy_default_is_the_only_legacy_credential_exported() {
+        let mut config = Config::default();
+        config.providers_mut().anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-default".to_string(),
+            ..Default::default()
+        });
+        config.providers_mut().openai = Some(OpenAIConfig {
+            api_key: "sk-oai-stale".to_string(),
+            ..Default::default()
+        });
+        config
+            .provider_instances
+            .insert("work".to_string(), instance("openai", "sk-oai-work"));
+        config.default_provider_instance = Some("anthropic".to_string());
 
         let mut creds = extract_provider_credentials(&config);
         creds.sort_by(|a, b| a.provider.cmp(&b.provider));
 
         assert_eq!(creds.len(), 2);
         assert_eq!(creds[0].provider, "anthropic");
-        assert_eq!(creds[0].api_key, "sk-ant-legacy");
-        assert_eq!(creds[1].provider, "openai-work");
+        assert_eq!(creds[0].api_key, "sk-ant-default");
+        assert_eq!(creds[1].provider, "work");
         assert_eq!(creds[1].api_key, "sk-oai-work");
-        assert_eq!(creds[1].provider_type.as_deref(), Some("openai"));
-        assert_eq!(
-            creds[1].credential_ref.as_deref(),
-            Some("provider.openai-work.api_key")
-        );
+        assert!(creds
+            .iter()
+            .all(|credential| credential.api_key != "sk-oai-stale"));
+    }
+
+    #[test]
+    fn hybrid_legacy_provider_fallback_without_explicit_default_remains_exportable() {
+        let mut config = Config::default();
+        config.provider = "anthropic".to_string();
+        config.providers_mut().anthropic = Some(AnthropicConfig {
+            api_key: "sk-ant-effective-default".to_string(),
+            ..Default::default()
+        });
+        config
+            .provider_instances
+            .insert("work".to_string(), instance("openai", "sk-oai-work"));
+
+        let mut creds = extract_provider_credentials(&config);
+        creds.sort_by(|a, b| a.provider.cmp(&b.provider));
+
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0].provider, "anthropic");
+        assert_eq!(creds[1].provider, "work");
+    }
+
+    #[test]
+    fn disabled_instance_credential_is_not_exported() {
+        let mut config = Config::default();
+        let mut disabled = instance("openai", "sk-disabled");
+        disabled.enabled = false;
+        config
+            .provider_instances
+            .insert("disabled".to_string(), disabled);
+
+        assert!(extract_provider_credentials(&config).is_empty());
     }
 }
 

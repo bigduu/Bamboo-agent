@@ -46,6 +46,10 @@ impl LlmManager for DefaultLlmManager {
         )
         .await?;
 
+        if let Some(error) = result.terminal_validation_error {
+            return Err(error);
+        }
+
         let (content, reasoning_content, tool_calls) = {
             let stream = &result.stream_output;
             (
@@ -62,7 +66,7 @@ impl LlmManager for DefaultLlmManager {
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,
             response_id: None,
-            round_usage: result.round_usage,
+            round_usage: result.attempt_usage,
         })
     }
 

@@ -46,6 +46,8 @@ pub mod error;
 
 pub mod commands;
 
+#[doc(hidden)]
+pub mod process_owner;
 pub mod project_worktree;
 /// The `bamboo subagent-worker` actor worker (provision via stdin, serve over WS).
 pub mod subagent_worker;
@@ -293,9 +295,9 @@ impl BambooBuilder {
     ///
     /// When enabled, [`build`](Self::build) installs file + stdout logging rooted
     /// at the builder's `data_dir` (daily-rotating files under `{data_dir}/logs`,
-    /// date-based retention, `RUST_LOG`-overridable level). Pass `debug = true`
-    /// (typically `cfg!(debug_assertions)`) to default to the `debug` level;
-    /// otherwise `info`.
+    /// startup count- and byte-bounded historical retention, `RUST_LOG`-overridable
+    /// filters). Pass `debug = true` (typically `cfg!(debug_assertions)`) to
+    /// default stdout to `debug`; files remain `info` unless explicitly raised.
     ///
     /// This is **opt-in**: by default a `BambooBuilder` never installs a global
     /// subscriber, so embedding applications keep full control of their own

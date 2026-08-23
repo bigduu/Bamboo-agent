@@ -1,7 +1,7 @@
 //! Live WebSocket integration harness for `GET /v2/stream` (issue #187, Epic #181).
 //!
 //! These tests stand up a REAL bound `bamboo-server` on an ephemeral loopback
-//! port and drive a REAL `awc` WebSocket client through the actual ws_v2 driver /
+//! port and drive a REAL `tokio-tungstenite` WebSocket client through the actual ws_v2 driver /
 //! forwarder concurrency — the path that `test::init_service` (which never binds a
 //! socket) and the in-module unit tests cannot exercise end to end. The
 //! concurrency-heavy driver, the per-channel queue fair-merge, the #186
@@ -20,7 +20,6 @@ use std::sync::Once;
 use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
-use awc::ws;
 use bamboo_agent_core::AgentEvent;
 use bamboo_config::{AccessControlConfig, DeviceCredential};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
@@ -29,7 +28,16 @@ use bamboo_server::{AgentRunner, AgentStatus, AppState};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{header, HeaderValue, Response},
+        Message,
+    },
+    MaybeTlsStream, WebSocketStream,
+};
 
 /// The shortened unauthorized auth deadline for the whole test binary. Long
 /// enough that an authorized/local connection always authenticates inside it, but
@@ -122,33 +130,46 @@ impl TestServer {
     }
 }
 
-/// One live WS connection: the framed read/write half of an `awc` upgrade.
-type WsConn = actix_codec::Framed<awc::BoxedSocket, ws::Codec>;
+/// One live WS connection backed by the same Tungstenite transport family used
+/// by Bamboo's broker/client code.
+type WsConn = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+async fn connect_request(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    expectation: &str,
+) -> (WsConn, Response<Option<Vec<u8>>>) {
+    let (connection, response) = connect_async(request).await.expect(expectation);
+    (connection, response)
+}
 
 /// Open a WS connection as a LOCAL client (no Host override → `127.0.0.1` host,
 /// so `is_local_request` is true and the connection is pre-authorized).
 async fn connect_local(server: &TestServer) -> WsConn {
-    let (_resp, framed) = awc::Client::new()
-        .ws(&server.base_ws_url)
-        .connect()
-        .await
-        .expect("local ws upgrade");
-    framed
+    let request = server
+        .base_ws_url
+        .as_str()
+        .into_client_request()
+        .expect("local ws request");
+    connect_request(request, "local ws upgrade").await.0
 }
 
-/// Open a WS connection as a NON-LOCAL client by overriding the `Host` header to
-/// a public name. `awc` only injects a `Host` when one is absent, so this makes
-/// `is_local_request` return false (mirrors the `access_control` unit test
+/// Open a WS connection as a NON-LOCAL client by overriding the generated
+/// loopback `Host` header with a public name. This makes `is_local_request`
+/// return false (mirrors the `access_control` unit test
 /// `remote_host_is_not_local_even_when_peer_is_loopback`). With an active device
 /// configured, such a connection is NOT pre-authorized and must `hello`.
 async fn connect_remote(server: &TestServer) -> WsConn {
-    let (_resp, framed) = awc::Client::new()
-        .ws(&server.base_ws_url)
-        .set_header(awc::http::header::HOST, "bamboo.example.com")
-        .connect()
+    let mut request = server
+        .base_ws_url
+        .as_str()
+        .into_client_request()
+        .expect("remote ws request");
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static("bamboo.example.com"));
+    connect_request(request, "remote ws upgrade (open per #189)")
         .await
-        .expect("remote ws upgrade (open per #189)");
-    framed
+        .0
 }
 
 /// Open a LOCAL WS connection negotiating the `bamboo.v2.msgpack` subprotocol
@@ -156,15 +177,19 @@ async fn connect_remote(server: &TestServer) -> WsConn {
 /// on the upgrade response (per RFC 6455 the server echoes the single selected
 /// subprotocol), so the test can assert the handshake negotiated msgpack.
 async fn connect_local_msgpack(server: &TestServer) -> (WsConn, Option<String>) {
-    let (resp, framed) = awc::Client::new()
-        .ws(&server.base_ws_url)
-        .protocols(["bamboo.v2.msgpack"])
-        .connect()
-        .await
-        .expect("local msgpack ws upgrade");
+    let mut request = server
+        .base_ws_url
+        .as_str()
+        .into_client_request()
+        .expect("local msgpack ws request");
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("bamboo.v2.msgpack"),
+    );
+    let (framed, resp) = connect_request(request, "local msgpack ws upgrade").await;
     let echoed = resp
         .headers()
-        .get(awc::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     (framed, echoed)
@@ -175,7 +200,7 @@ async fn connect_local_msgpack(server: &TestServer) -> (WsConn, Option<String>) 
 /// bytes carry the SAME logical schema the server's `decode_client_frame` expects.
 async fn send_msgpack(conn: &mut WsConn, value: Value) {
     let bytes = rmp_serde::to_vec_named(&value).expect("encode client frame as msgpack");
-    conn.send(ws::Message::Binary(bytes.into()))
+    conn.send(Message::Binary(bytes.into()))
         .await
         .expect("send msgpack client frame");
 }
@@ -191,7 +216,7 @@ async fn next_msgpack_envelope(conn: &mut WsConn) -> Option<Value> {
             .await
             .expect("frame did not arrive before timeout")?;
         match frame.expect("ws protocol error") {
-            ws::Frame::Binary(bytes) => {
+            Message::Binary(bytes) => {
                 let value: Value = rmp_serde::from_slice(&bytes).expect("envelope is msgpack");
                 // Skip interleaved `sys` keepalives (#533), like a tolerant client.
                 if value["ch"] == "sys" {
@@ -199,12 +224,12 @@ async fn next_msgpack_envelope(conn: &mut WsConn) -> Option<Value> {
                 }
                 return Some(value);
             }
-            ws::Frame::Text(bytes) => panic!(
+            Message::Text(bytes) => panic!(
                 "msgpack mode must yield BINARY frames, got text: {}",
-                String::from_utf8_lossy(&bytes)
+                bytes.as_str()
             ),
-            ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
-            ws::Frame::Close(_) => return None,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => return None,
             other => panic!("unexpected ws frame: {other:?}"),
         }
     }
@@ -212,7 +237,7 @@ async fn next_msgpack_envelope(conn: &mut WsConn) -> Option<Value> {
 
 /// Send a JSON client frame.
 async fn send_json(conn: &mut WsConn, value: Value) {
-    conn.send(ws::Message::Text(value.to_string().into()))
+    conn.send(Message::Text(value.to_string().into()))
         .await
         .expect("send client frame");
 }
@@ -227,16 +252,16 @@ async fn next_envelope(conn: &mut WsConn) -> Option<Value> {
             .await
             .expect("frame did not arrive before timeout")?;
         match frame.expect("ws protocol error") {
-            ws::Frame::Text(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes).expect("envelope is JSON");
+            Message::Text(bytes) => {
+                let value: Value = serde_json::from_str(bytes.as_str()).expect("envelope is JSON");
                 // Skip interleaved `sys` keepalives (#533), like a tolerant client.
                 if value["ch"] == "sys" {
                     continue;
                 }
                 return Some(value);
             }
-            ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
-            ws::Frame::Close(_) => return None,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => return None,
             other => panic!("unexpected ws frame: {other:?}"),
         }
     }
@@ -254,8 +279,8 @@ async fn next_sys_keepalive(conn: &mut WsConn) -> Value {
             .expect("sys keepalive did not arrive before timeout")
             .expect("connection closed while waiting for sys keepalive");
         let value: Value = match frame.expect("ws protocol error") {
-            ws::Frame::Text(bytes) => serde_json::from_slice(&bytes).expect("envelope is JSON"),
-            ws::Frame::Binary(bytes) => rmp_serde::from_slice(&bytes).expect("envelope is msgpack"),
+            Message::Text(bytes) => serde_json::from_str(bytes.as_str()).expect("envelope is JSON"),
+            Message::Binary(bytes) => rmp_serde::from_slice(&bytes).expect("envelope is msgpack"),
             _ => continue,
         };
         if value["ch"] == "sys" {
@@ -276,19 +301,18 @@ async fn next_app_pong(conn: &mut WsConn, msgpack: bool) -> Value {
             .expect("connection closed while waiting for application pong")
             .expect("ws protocol error");
         let value: Value = match frame {
-            ws::Frame::Text(bytes) if !msgpack => {
-                serde_json::from_slice(&bytes).expect("pong is JSON")
+            Message::Text(bytes) if !msgpack => {
+                serde_json::from_str(bytes.as_str()).expect("pong is JSON")
             }
-            ws::Frame::Binary(bytes) if msgpack => {
+            Message::Binary(bytes) if msgpack => {
                 rmp_serde::from_slice(&bytes).expect("pong is msgpack")
             }
-            ws::Frame::Text(bytes) => panic!(
-                "msgpack pong must be BINARY, got text: {}",
-                String::from_utf8_lossy(&bytes)
-            ),
-            ws::Frame::Binary(_) => panic!("JSON pong must be TEXT"),
-            ws::Frame::Ping(_) | ws::Frame::Pong(_) => continue,
-            ws::Frame::Close(_) => panic!("connection closed before application pong"),
+            Message::Text(bytes) => {
+                panic!("msgpack pong must be BINARY, got text: {}", bytes.as_str())
+            }
+            Message::Binary(_) => panic!("JSON pong must be TEXT"),
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Close(_) => panic!("connection closed before application pong"),
             other => panic!("unexpected ws frame: {other:?}"),
         };
         if value["ch"] == "sys" {
@@ -309,12 +333,12 @@ async fn expect_closed(conn: &mut WsConn) {
             .expect("connection did not close before timeout");
         match next {
             None => return,
-            Some(Ok(ws::Frame::Close(_))) => return,
-            Some(Ok(ws::Frame::Ping(_))) | Some(Ok(ws::Frame::Pong(_))) => continue,
-            Some(Ok(ws::Frame::Text(bytes))) => {
+            Some(Ok(Message::Close(_))) => return,
+            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+            Some(Ok(Message::Text(bytes))) => {
                 panic!(
                     "expected the connection to be closed, got a text frame: {}",
-                    String::from_utf8_lossy(&bytes)
+                    bytes.as_str()
                 )
             }
             Some(Ok(other)) => panic!("expected close, got {other:?}"),
@@ -925,16 +949,15 @@ async fn msgpack_subprotocol_subscribe_event_roundtrip() {
 async fn no_subprotocol_stays_json_with_no_echo() {
     let server = TestServer::start(|_| {}).await;
 
-    let (resp, mut conn) = awc::Client::new()
-        .ws(&server.base_ws_url)
-        .connect()
-        .await
-        .expect("local ws upgrade");
+    let request = server
+        .base_ws_url
+        .as_str()
+        .into_client_request()
+        .expect("local ws request");
+    let (mut conn, resp) = connect_request(request, "local ws upgrade").await;
     // No subprotocol offered → none echoed (legacy handshake unchanged).
     assert!(
-        resp.headers()
-            .get(awc::http::header::SEC_WEBSOCKET_PROTOCOL)
-            .is_none(),
+        resp.headers().get(header::SEC_WEBSOCKET_PROTOCOL).is_none(),
         "a client offering no subprotocol must get no echo"
     );
 

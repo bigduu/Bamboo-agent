@@ -17,7 +17,7 @@ pub use agent::types::{
     ImageUrlRef, Message, MessageContent, MessagePart, MessagePhase, PendingQuestion,
     PendingQuestionSource, PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
 };
-pub use agent::AgentError;
+pub use agent::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
 pub use bamboo_domain::TokenBudgetUsage;
 pub use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
@@ -25,12 +25,12 @@ pub use bamboo_domain::{
 pub use storage::Storage;
 pub use tools::{
     classify_tool, execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,
-    normalize_tool_name, parse_tool_args, parse_tool_args_best_effort, plan_mode_allows_tool,
-    try_parse_agentic_result, AgenticContext, AgenticTool, AgenticToolResult, BashCompletionInfo,
-    BashCompletionSink, FunctionCall, FunctionSchema, RegistryError, SharedTool,
-    SmartCodeReviewTool, Tool, ToolCall, ToolCallAccumulator, ToolError, ToolExecutionContext,
-    ToolExecutor, ToolGoal, ToolHandlingOutcome, ToolMutability, ToolRegistry, ToolResult,
-    ToolResultImage, ToolSchema,
+    handle_tool_result_with_agentic_support_and_persistence, normalize_tool_name, parse_tool_args,
+    parse_tool_args_best_effort, plan_mode_allows_tool, try_parse_agentic_result, AgenticContext,
+    AgenticTool, AgenticToolResult, BashCompletionInfo, BashCompletionSink, FunctionCall,
+    FunctionSchema, RegistryError, SharedTool, SmartCodeReviewTool, Tool, ToolCall,
+    ToolCallAccumulator, ToolError, ToolExecutionContext, ToolExecutor, ToolGoal,
+    ToolHandlingOutcome, ToolMutability, ToolRegistry, ToolResult, ToolResultImage, ToolSchema,
 };
 pub use tools::{
     AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,

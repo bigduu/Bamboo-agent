@@ -36,9 +36,15 @@
 //! ```
 
 use crate::tools::ToolResult;
-use bamboo_domain::{AgentHookPoint, HookResult, TaskItemStatus, TaskList};
+use bamboo_domain::{
+    AgentHookPoint, HookResult, PendingQuestionSource, TaskItem, TaskItemStatus, TaskList,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+fn default_title_generated() -> bool {
+    true
+}
 
 /// Represents events emitted during agent execution.
 ///
@@ -208,12 +214,18 @@ pub enum AgentEvent {
         /// Whether the user can provide a free-text response
         #[serde(default = "default_allow_custom")]
         allow_custom: bool,
+        /// Origin of the pending question, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<PendingQuestionSource>,
     },
 
     /// Emitted when task list is created or updated.
     TaskListUpdated {
         /// Current task list state.
         task_list: TaskList,
+        /// Monotonic persisted task-list generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
     },
 
     /// Emitted when a task item makes progress (delta update).
@@ -228,6 +240,9 @@ pub enum AgentEvent {
         tool_calls_count: usize,
         /// Item version (for optimistic concurrency)
         version: u64,
+        /// Rich item projection for blocker/evidence/transition rendering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<TaskItem>,
     },
 
     /// Emitted when all task items are completed.
@@ -240,6 +255,9 @@ pub enum AgentEvent {
         total_rounds: u32,
         /// Total tool calls made
         total_tool_calls: usize,
+        /// Monotonic persisted task-list generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
     },
 
     /// Emitted when task evaluation starts.
@@ -462,6 +480,9 @@ pub enum AgentEvent {
         file_path: String,
         /// Summary of the plan content (truncated)
         content_summary: String,
+        /// Status after persisting the plan file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<bamboo_domain::PlanModeStatus>,
     },
 
     /// Runner progress update emitted at the start of each agent turn.
@@ -492,6 +513,8 @@ pub enum AgentEvent {
         session_id: String,
         title: String,
         title_version: u64,
+        #[serde(default = "default_title_generated")]
+        title_generated: bool,
         source: TitleSource,
         updated_at: chrono::DateTime<chrono::Utc>,
     },
@@ -769,11 +792,11 @@ impl AgentEvent {
     /// client-side session without a per-session connection. For sub-agent
     /// events the *parent* session id is returned (that is the session a client
     /// observes in its list). Pure streaming/diagnostic variants (`Token`,
-    /// `Complete`, …) return `None`; those are ephemeral and never ride the
-    /// account feed anyway.
+    /// `Complete`, …) return `None`; those are routed by their owning
+    /// per-session forwarder instead.
     pub fn session_id(&self) -> Option<&str> {
         match self {
-            AgentEvent::TaskListUpdated { task_list } => Some(task_list.session_id.as_str()),
+            AgentEvent::TaskListUpdated { task_list, .. } => Some(task_list.session_id.as_str()),
             AgentEvent::TaskListItemProgress { session_id, .. }
             | AgentEvent::TaskListCompleted { session_id, .. }
             | AgentEvent::TaskEvaluationStarted { session_id, .. }
@@ -817,6 +840,34 @@ impl AgentEvent {
             } => Some(parent_session_id.as_str()),
             _ => None,
         }
+    }
+
+    /// Whether this event carries live session state that a late per-session
+    /// subscriber must replay before consuming the broadcast stream.
+    ///
+    /// This classification is shared by both server-owned and generic engine
+    /// forwarders. Keeping it in core prevents one execution entry point from
+    /// broadcasting a clarification (or other critical state) without first
+    /// populating the runner replay cache.
+    pub fn is_replayable_session_state(&self) -> bool {
+        matches!(
+            self,
+            AgentEvent::TaskListUpdated { .. }
+                | AgentEvent::TaskListCompleted { .. }
+                | AgentEvent::SubAgentStarted { .. }
+                | AgentEvent::SubAgentCompleted { .. }
+                | AgentEvent::ChildApprovalRequested { .. }
+                | AgentEvent::ChildApprovalChanged { .. }
+                | AgentEvent::BashCompleted { .. }
+                | AgentEvent::SessionTitleUpdated { .. }
+                | AgentEvent::SessionPinnedUpdated { .. }
+                | AgentEvent::PlanModeEntered { .. }
+                | AgentEvent::PlanModeExited { .. }
+                | AgentEvent::BudgetExceeded { .. }
+                | AgentEvent::NeedClarification { .. }
+                | AgentEvent::WorkflowActivated { .. }
+                | AgentEvent::WorkflowDeactivated { .. }
+        )
     }
 
     /// Whether this event belongs on the durable account change feed.
@@ -992,11 +1043,13 @@ mod tests {
     fn task_list_updated_serializes_with_task_names() {
         let event = AgentEvent::TaskListUpdated {
             task_list: sample_task_list(),
+            version: Some(7),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
         assert_eq!(value["type"], "task_list_updated");
         assert!(value.get("task_list").is_some());
+        assert_eq!(value["version"], 7);
         assert!(value.get("todo_list").is_none());
     }
 
@@ -1184,6 +1237,7 @@ mod tests {
             tool_call_id: Some("tool-1".to_string()),
             tool_name: Some("conclusion_with_options".to_string()),
             allow_custom: false,
+            source: Some(PendingQuestionSource::PauseTool),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
@@ -1193,6 +1247,7 @@ mod tests {
         assert_eq!(value["tool_call_id"], "tool-1");
         assert_eq!(value["tool_name"], "conclusion_with_options");
         assert_eq!(value["allow_custom"], false);
+        assert_eq!(value["source"], "pause_tool");
     }
 
     #[test]
@@ -1212,12 +1267,14 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 allow_custom,
+                source,
             } => {
                 assert_eq!(question, "Continue?");
                 assert_eq!(options, Some(vec!["Yes".to_string(), "No".to_string()]));
                 assert_eq!(tool_call_id, None);
                 assert_eq!(tool_name, None);
                 assert!(allow_custom); // default_allow_custom returns true
+                assert_eq!(source, None);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1239,12 +1296,14 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 allow_custom,
+                source,
             } => {
                 assert_eq!(question, "Pick one");
                 assert_eq!(options, None);
                 assert_eq!(tool_call_id, None);
                 assert_eq!(tool_name, None);
                 assert!(!allow_custom);
+                assert_eq!(source, None);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1299,6 +1358,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             file_path: "/tmp/plans/sess-1.md".to_string(),
             content_summary: "Implementation plan for feature X".to_string(),
+            status: Some(bamboo_domain::PlanModeStatus::AwaitingApproval),
         };
 
         let value = serde_json::to_value(event).expect("event should serialize");
@@ -1395,6 +1455,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             title: "My title".to_string(),
             title_version: 3,
+            title_generated: true,
             source: TitleSource::Auto,
             updated_at: Utc::now(),
         };
@@ -1404,7 +1465,31 @@ mod tests {
             "json: {json}"
         );
         assert!(json.contains("\"source\":\"auto\""), "json: {json}");
-        let _decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::SessionTitleUpdated {
+                title_generated: true,
+                ..
+            }
+        ));
+
+        let legacy = serde_json::json!({
+            "type": "session_title_updated",
+            "session_id": "sess-legacy",
+            "title": "Existing title",
+            "title_version": 2,
+            "source": "manual",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        let decoded: AgentEvent = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentEvent::SessionTitleUpdated {
+                title_generated: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1462,5 +1547,22 @@ mod tests {
             let encoded = serde_json::to_string(&event).expect("serialize");
             let _: AgentEvent = serde_json::from_str(&encoded).expect("deserialize");
         }
+    }
+
+    #[test]
+    fn clarification_is_shared_replayable_state_but_tokens_are_not() {
+        let clarification = AgentEvent::NeedClarification {
+            question: "Choose".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some(PendingQuestionSource::PauseTool),
+        };
+        assert!(clarification.is_replayable_session_state());
+        assert!(!AgentEvent::Token {
+            content: "ephemeral".to_string(),
+        }
+        .is_replayable_session_state());
     }
 }

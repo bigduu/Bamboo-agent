@@ -6,10 +6,9 @@ use bamboo_config::OpenAIConfig;
 use bamboo_llm::Config;
 
 use super::common::{
-    config_file_path, connect_backup_file_path, connect_file_path, model_limits_file_path,
-    read_model_limits_file, redacted_config_json, write_model_limits_file,
+    config_file_path, model_limits_file_path, read_model_limits_file, redacted_config_json,
+    write_model_limits_file,
 };
-use super::reset::remove_config_file_if_exists;
 
 fn access_control_fixture() -> bamboo_config::AccessControlConfig {
     bamboo_config::AccessControlConfig {
@@ -100,24 +99,6 @@ fn model_limits_file_path_appends_model_limits_json_filename() {
     assert_eq!(
         model_limits_file_path(dir.path()),
         dir.path().join("model_limits.json")
-    );
-}
-
-#[test]
-fn connect_file_path_appends_connect_json_filename() {
-    let dir = tempdir().expect("temp dir should be created");
-    assert_eq!(
-        connect_file_path(dir.path()),
-        dir.path().join("connect.json")
-    );
-}
-
-#[test]
-fn connect_backup_file_path_appends_connect_json_bak_filename() {
-    let dir = tempdir().expect("temp dir should be created");
-    assert_eq!(
-        connect_backup_file_path(dir.path()),
-        dir.path().join("connect.json.bak")
     );
 }
 
@@ -394,31 +375,6 @@ async fn generic_config_patch_rejects_access_control_without_partial_mutation() 
 }
 
 #[actix_web::test]
-async fn remove_config_file_if_exists_deletes_existing_file() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("config.json");
-    tokio::fs::write(&path, "{}")
-        .await
-        .expect("test file should be written");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("existing config file should be deleted");
-    assert!(!path.exists());
-}
-
-#[actix_web::test]
-async fn remove_config_file_if_exists_is_noop_when_missing() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("config.json");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("missing config file should not fail");
-    assert!(!path.exists());
-}
-
-#[actix_web::test]
 async fn redacted_config_json_injects_model_limits_from_file() {
     let dir = tempdir().expect("temp dir should be created");
     write_model_limits_file(
@@ -439,20 +395,6 @@ async fn redacted_config_json_injects_model_limits_from_file() {
         .await
         .expect("redacted config should serialize");
     assert_eq!(value["model_limits"][0]["model_pattern"], "gpt-5");
-}
-
-#[actix_web::test]
-async fn remove_config_file_if_exists_deletes_model_limits_file() {
-    let dir = tempdir().expect("temp dir should be created");
-    let path = dir.path().join("model_limits.json");
-    tokio::fs::write(&path, "[]")
-        .await
-        .expect("model limits file should be written");
-
-    remove_config_file_if_exists(&path)
-        .await
-        .expect("existing model limits file should be deleted");
-    assert!(!path.exists());
 }
 
 // --- Full persistence (all user-provided overrides are stored) ------------
@@ -621,6 +563,139 @@ async fn set_then_get_bamboo_config_round_trips_all_overrides() {
     assert_eq!(limits.len(), 2);
     assert_eq!(limits[0]["model_pattern"], "gpt-4o");
     assert_eq!(limits[0]["max_context_tokens"], 128000);
+}
+
+#[actix_web::test]
+async fn omitted_model_limits_preserves_modular_section_data_and_revision() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    assert!(
+        state.config_facade.is_some(),
+        "AppState must use the modular section layout for this regression"
+    );
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    let seed = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({
+                "model_limits": [{
+                    "model_pattern": "preserved-model",
+                    "max_context_tokens": 128000,
+                    "max_output_tokens": 16000,
+                    "safety_margin": 1000
+                }]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        seed.status().is_success(),
+        "seeding model limits should succeed"
+    );
+
+    let path = model_limits_file_path(&data_dir);
+    let before: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .expect("model-limits section should exist"),
+    )
+    .expect("model-limits section should be valid JSON");
+    assert_eq!(before["data"][0]["model_pattern"], "preserved-model");
+    let before_revision = before["revision"]
+        .as_u64()
+        .expect("model-limits section should have a revision");
+
+    let unrelated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/bamboo/config")
+            .set_json(serde_json::json!({"headless_auth": true}))
+            .to_request(),
+    )
+    .await;
+    assert!(
+        unrelated.status().is_success(),
+        "unrelated config patch should succeed"
+    );
+
+    let after: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&path)
+            .await
+            .expect("model-limits section should remain present"),
+    )
+    .expect("model-limits section should remain valid JSON");
+    assert_eq!(
+        after["data"], before["data"],
+        "omitting model_limits must preserve its data"
+    );
+    assert_eq!(
+        after["revision"].as_u64(),
+        Some(before_revision),
+        "omitting model_limits must not create a new section revision"
+    );
+}
+
+#[actix_web::test]
+async fn explicit_empty_model_limits_clears_modular_section() {
+    use crate::app_state::AppState;
+    use actix_web::{test, web, App};
+
+    let temp_dir = tempdir().expect("temp dir should be created");
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+    let data_dir = state.app_data_dir.clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .route("/bamboo/config", web::post().to(super::set_bamboo_config)),
+    )
+    .await;
+
+    for model_limits in [
+        serde_json::json!([{
+            "model_pattern": "cleared-model",
+            "max_context_tokens": 64000,
+            "max_output_tokens": 8000
+        }]),
+        serde_json::json!([]),
+    ] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/bamboo/config")
+                .set_json(serde_json::json!({"model_limits": model_limits}))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+    }
+
+    let section: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(model_limits_file_path(&data_dir))
+            .await
+            .expect("empty modular section should remain present"),
+    )
+    .expect("model-limits section should remain valid JSON");
+    assert_eq!(section["data"], serde_json::json!([]));
+    assert_eq!(
+        section["revision"].as_u64(),
+        Some(2),
+        "seed and explicit clear must each commit exactly one revision"
+    );
 }
 
 fn transaction_file_snapshot(data_dir: &std::path::Path) -> BTreeMap<String, Option<Vec<u8>>> {

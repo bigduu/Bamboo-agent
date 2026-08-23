@@ -14,8 +14,9 @@
 //! - `/v1/bamboo/config` is a *permissive* config management endpoint used by setup/UX flows.
 //!   It should allow persisting partial config even when the currently-selected provider is
 //!   not fully configured yet.
-//! - Strict provider validation belongs in provider-specific endpoints like
-//!   `/v1/bamboo/settings/provider` (and explicit reload/apply actions).
+//! - Strict provider validation belongs in the revisioned
+//!   `/v1/bamboo/config/provider-settings` and provider-instance APIs (plus
+//!   explicit reload/apply actions).
 
 use serde_json::{Map, Value};
 

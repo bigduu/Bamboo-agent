@@ -114,6 +114,18 @@ pub struct SpawnContext {
     pub account_feed_inbox: Option<super::event_forwarder::AccountFeedInbox>,
 }
 
+impl SpawnContext {
+    pub(crate) fn replayable_event_publisher(
+        &self,
+    ) -> super::session_events::ReplayableSessionEventPublisher {
+        super::session_events::ReplayableSessionEventPublisher::new(
+            self.agent_runners.clone(),
+            self.session_event_senders.clone(),
+            self.account_feed_inbox.clone(),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct SpawnScheduler {
     tx: mpsc::Sender<SpawnJob>,
@@ -148,13 +160,9 @@ impl SpawnScheduler {
                         error = %join_error,
                         "spawn job panicked; publishing terminal error completion"
                     );
-                    let parent_tx = super::session_events::get_or_create_event_sender(
-                        &worker_ctx.session_event_senders,
-                        &job_for_panic.parent_session_id,
-                    )
-                    .await;
+                    let publisher = worker_ctx.replayable_event_publisher();
                     publish_child_completion_parts(
-                        &parent_tx,
+                        &publisher,
                         worker_ctx.completion_handler.clone(),
                         job_for_panic.parent_session_id.clone(),
                         job_for_panic.child_session_id.clone(),
@@ -179,12 +187,46 @@ impl SpawnScheduler {
     }
 
     pub async fn enqueue(&self, job: SpawnJob) -> Result<(), String> {
+        self.enqueue_announced(job, None).await
+    }
+
+    /// Reserve queue capacity, publish the observable child Start, and only
+    /// then release the job to the worker. This preserves S→C ordering even
+    /// when child loading/execution fails immediately.
+    pub async fn enqueue_announced(
+        &self,
+        job: SpawnJob,
+        title: Option<String>,
+    ) -> Result<(), String> {
         let ctx = self.ctx.clone();
         let preparation_job = job.clone();
         reserve_prepare_and_send(&self.tx, job, async move {
             Self::prepare_child_launch(&ctx, &preparation_job).await;
+            ctx.replayable_event_publisher()
+                .publish(
+                    &preparation_job.parent_session_id,
+                    AgentEvent::SubAgentStarted {
+                        parent_session_id: preparation_job.parent_session_id.clone(),
+                        child_session_id: preparation_job.child_session_id.clone(),
+                        title,
+                    },
+                )
+                .await;
         })
         .await
+    }
+
+    /// Publish replayable parent-session state through the scheduler's shared
+    /// runner/cache/account/broadcast boundary.
+    pub async fn publish_parent_replayable_event(
+        &self,
+        parent_session_id: &str,
+        event: AgentEvent,
+    ) {
+        self.ctx
+            .replayable_event_publisher()
+            .publish(parent_session_id, event)
+            .await;
     }
 
     /// Launch through the canonical child core using a runner slot already
@@ -198,16 +240,16 @@ impl SpawnScheduler {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             Self::prepare_child_launch(&ctx, &job).await;
-            let parent_tx = super::session_events::get_or_create_event_sender(
-                &ctx.session_event_senders,
-                &job.parent_session_id,
-            )
-            .await;
-            let _ = parent_tx.send(AgentEvent::SubAgentStarted {
-                parent_session_id: job.parent_session_id.clone(),
-                child_session_id: job.child_session_id.clone(),
-                title: None,
-            });
+            ctx.replayable_event_publisher()
+                .publish(
+                    &job.parent_session_id,
+                    AgentEvent::SubAgentStarted {
+                        parent_session_id: job.parent_session_id.clone(),
+                        child_session_id: job.child_session_id.clone(),
+                        title: None,
+                    },
+                )
+                .await;
             if let Err(error) =
                 crate::sdk::spawn::run_child_spawn_reserved(ctx, job.clone(), reservation).await
             {
@@ -305,16 +347,21 @@ pub(crate) fn watchdog_policy_for_session(session: &Session) -> ChildWatchdogPol
 }
 
 async fn publish_child_completion(
-    parent_tx: &broadcast::Sender<AgentEvent>,
+    publisher: &super::session_events::ReplayableSessionEventPublisher,
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     completion: ChildCompletion,
 ) {
-    let _ = parent_tx.send(AgentEvent::SubAgentCompleted {
-        parent_session_id: completion.parent_session_id.clone(),
-        child_session_id: completion.child_session_id.clone(),
-        status: completion.status.clone(),
-        error: completion.error.clone(),
-    });
+    publisher
+        .publish(
+            &completion.parent_session_id,
+            AgentEvent::SubAgentCompleted {
+                parent_session_id: completion.parent_session_id.clone(),
+                child_session_id: completion.child_session_id.clone(),
+                status: completion.status.clone(),
+                error: completion.error.clone(),
+            },
+        )
+        .await;
 
     if let Some(handler) = completion_handler {
         // Contain a panicking handler: this call frequently runs on the caller's
@@ -341,7 +388,7 @@ async fn publish_child_completion(
 }
 
 pub(crate) async fn publish_child_completion_parts(
-    parent_tx: &broadcast::Sender<AgentEvent>,
+    publisher: &super::session_events::ReplayableSessionEventPublisher,
     completion_handler: Option<Arc<dyn ChildCompletionHandler>>,
     parent_session_id: String,
     child_session_id: String,
@@ -349,7 +396,7 @@ pub(crate) async fn publish_child_completion_parts(
     error: Option<String>,
 ) {
     publish_child_completion(
-        parent_tx,
+        publisher,
         completion_handler,
         ChildCompletion {
             parent_session_id,

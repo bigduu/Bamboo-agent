@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
 
-use super::read_tracker;
+use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 
 const BLOCKED_DEVICE_PATHS: &[&str] = &[
     "/dev/zero",
@@ -20,8 +20,6 @@ const BLOCKED_DEVICE_PATHS: &[&str] = &[
     "/dev/fd/1",
     "/dev/fd/2",
 ];
-
-const MAX_READ_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, Deserialize)]
 struct ReadArgs {
@@ -232,23 +230,35 @@ impl Tool for ReadTool {
             }));
         }
 
-        if metadata.len() > MAX_READ_SIZE {
+        if metadata.len() > MAX_TRACKED_FILE_SIZE {
             return Err(ToolError::Execution(format!(
                 "File is {} bytes, which exceeds the maximum readable size of {} bytes ({} MB). \
                  Use Grep to search within this file instead.",
                 metadata.len(),
-                MAX_READ_SIZE,
-                MAX_READ_SIZE / 1024 / 1024
+                MAX_TRACKED_FILE_SIZE,
+                MAX_TRACKED_FILE_SIZE / 1024 / 1024
             )));
         }
 
-        let bytes = tokio::fs::read(path)
+        let stable = read_tracker::stable_read(parsed.file_path.trim())
             .await
-            .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?;
+            .map_err(|e| ToolError::Execution(format!("Failed to read stable file: {}", e)))?;
+
+        if stable.bytes().len() as u64 > MAX_TRACKED_FILE_SIZE {
+            return Err(ToolError::Execution(format!(
+                "File is {} bytes, which exceeds the maximum readable size of {} bytes ({} MB). \
+                 Use Grep to search within this file instead.",
+                stable.bytes().len(),
+                MAX_TRACKED_FILE_SIZE,
+                MAX_TRACKED_FILE_SIZE / 1024 / 1024
+            )));
+        }
 
         if let Some(session_id) = ctx.session_id() {
-            read_tracker::mark_read(session_id, parsed.file_path.trim()).await;
+            read_tracker::mark_stable_read(session_id, parsed.file_path.trim(), &stable).await;
         }
+
+        let bytes = stable.bytes();
 
         if bytes.contains(&0) {
             return Ok(ToolOutcome::Completed(ToolResult {
@@ -259,7 +269,7 @@ impl Tool for ReadTool {
             }));
         }
 
-        let content = String::from_utf8_lossy(&bytes).to_string();
+        let content = String::from_utf8_lossy(bytes).to_string();
         let rendered =
             render_file_with_line_numbers(&content, parsed.offset.unwrap_or(0), parsed.limit);
 

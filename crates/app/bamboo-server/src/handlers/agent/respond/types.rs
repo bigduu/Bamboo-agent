@@ -11,6 +11,10 @@ use serde::Deserialize;
 pub struct RespondRequest {
     /// The user's response - either one of the options or custom input
     pub response: String,
+    /// Optional optimistic identity guard for the pending tool call. Older
+    /// clients may omit it; clients that display a typed question should send it.
+    #[serde(default)]
+    pub expected_tool_call_id: Option<String>,
     /// Optional model to auto-resume execution after recording response.
     pub model: Option<String>,
     /// Optional provider name for model resolution.
@@ -34,7 +38,15 @@ mod tests {
         let json = r#"{"response":"yes"}"#;
         let req: RespondRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.response, "yes");
+        assert_eq!(req.expected_tool_call_id, None);
         assert_eq!(req.model, None);
+    }
+
+    #[test]
+    fn test_respond_request_with_expected_tool_call_id() {
+        let json = r#"{"response":"yes","expected_tool_call_id":"call-42"}"#;
+        let req: RespondRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.expected_tool_call_id.as_deref(), Some("call-42"));
     }
 
     #[test]
@@ -64,6 +76,7 @@ mod tests {
     fn test_respond_request_debug() {
         let req = RespondRequest {
             response: "test response".to_string(),
+            expected_tool_call_id: None,
             model: None,
             provider: None,
             model_ref: None,

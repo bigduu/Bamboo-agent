@@ -21,8 +21,9 @@ pub use bamboo_config::settings::PermissionMode;
 use crate::policy::{
     conservative_matchers, DurablePermissionRule, EffectivePermissionPolicy, PermissionDecision,
     PermissionDecisionReceipt, PermissionDecisionSource, PermissionDenyReason,
-    PermissionEvaluation, PermissionOutcome, PermissionReasonCode, PermissionRequest,
-    PermissionRuleEffect, PermissionRuleRef, PermissionRuleScope, PermissionRuleSource,
+    PermissionEvaluation, PermissionMatcher, PermissionMatcherKind, PermissionOutcome,
+    PermissionReasonCode, PermissionRequest, PermissionRuleEffect, PermissionRuleRef,
+    PermissionRuleScope, PermissionRuleSource,
 };
 use crate::rule_parser::ParsedRule;
 
@@ -244,6 +245,33 @@ impl SessionGrant {
         normalized_pattern
             .as_deref()
             .is_some_and(|pattern| match_glob_pattern(pattern, &normalized_resource))
+    }
+}
+
+/// Session-scoped grant that preserves the server-issued typed matcher.
+#[derive(Debug, Clone)]
+struct TypedSessionGrant {
+    granted_at: Instant,
+    expires_at: Instant,
+    matcher: PermissionMatcher,
+}
+
+impl TypedSessionGrant {
+    fn new(matcher: PermissionMatcher, duration: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            granted_at: now,
+            expires_at: now + duration,
+            matcher,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        Instant::now() > self.expires_at
+    }
+
+    fn matches(&self, permission_type: PermissionType, resource: &str) -> bool {
+        !self.is_expired() && self.matcher.matches(permission_type, resource)
     }
 }
 
@@ -699,6 +727,9 @@ fn match_pattern_internal(pattern: &str, resource: &str) -> bool {
     resource == pattern
 }
 
+type TypedSessionGrantMatchers = HashMap<(PermissionMatcherKind, String), TypedSessionGrant>;
+type TypedScopedSessionGrants = DashMap<String, DashMap<PermissionType, TypedSessionGrantMatchers>>;
+
 /// Global permission configuration
 ///
 /// This struct manages both persistent whitelist rules and session-level grants.
@@ -720,7 +751,12 @@ pub struct PermissionConfig {
     /// map; the unscoped map above remains only for API compatibility.
     scoped_session_grants: DashMap<String, DashMap<PermissionType, HashMap<String, SessionGrant>>>,
     scoped_session_denies: DashMap<String, DashMap<PermissionType, HashMap<String, SessionGrant>>>,
+    typed_scoped_session_grants: TypedScopedSessionGrants,
+    typed_scoped_session_denies: TypedScopedSessionGrants,
+    /// Compatibility grants created by legacy boolean response paths.
     one_shot_grants: DashMap<(String, String), Vec<(PermissionType, String)>>,
+    /// Typed one-shot grants are additionally bound to the server generation.
+    typed_one_shot_grants: DashMap<(String, String, String), Vec<(PermissionType, String)>>,
     /// Default session grant duration (default: 30 minutes)
     session_grant_duration: Duration,
     /// Whether permission checks are enabled
@@ -745,10 +781,11 @@ pub struct PermissionConfig {
     /// Revision of the durable permission section that produced this live
     /// policy. Included in every outcome/request and updated only after commit.
     policy_revision: AtomicU64,
-    /// Pending typed requests and immutable decision receipts. Keys include the
-    /// session id so model/tool-call ids cannot collide across sessions.
+    /// Pending typed requests and immutable decision receipts. Receipt keys
+    /// include the server generation because provider tool-call ids may be
+    /// reused within one session.
     pending_requests: DashMap<(String, String), PermissionRequest>,
-    decision_receipts: DashMap<(String, String), PermissionDecisionReceipt>,
+    decision_receipts: DashMap<(String, String, String), PermissionDecisionReceipt>,
     /// Stable workspace identity registered by the execution boundary. This is
     /// non-durable runtime context, keyed by session to prevent workspace rules
     /// from leaking across sessions when tool arguments omit `cwd`.
@@ -769,7 +806,10 @@ impl PermissionConfig {
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
             scoped_session_denies: DashMap::new(),
+            typed_scoped_session_grants: DashMap::new(),
+            typed_scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
+            typed_one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(30 * 60), // 30 minutes
             enabled: AtomicBool::new(true),
             mode: RwLock::new(PermissionMode::Default),
@@ -790,7 +830,10 @@ impl PermissionConfig {
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
             scoped_session_denies: DashMap::new(),
+            typed_scoped_session_grants: DashMap::new(),
+            typed_scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
+            typed_one_shot_grants: DashMap::new(),
             session_grant_duration: session_duration,
             enabled: AtomicBool::new(enabled),
             mode: RwLock::new(PermissionMode::Default),
@@ -847,8 +890,29 @@ impl PermissionConfig {
         session_id: impl Into<String>,
         workspace_path: impl Into<String>,
     ) {
-        self.session_workspaces
-            .insert(session_id.into(), workspace_path.into());
+        self.set_session_workspace(session_id, Some(workspace_path.into()));
+    }
+
+    /// Replace the authoritative workspace identity for one session.
+    /// `None` (or a blank value) explicitly removes stale runtime state when a
+    /// session is unbound; callers must invoke this at every execution boundary.
+    pub fn set_session_workspace(
+        &self,
+        session_id: impl Into<String>,
+        workspace_path: Option<String>,
+    ) {
+        let session_id = session_id.into();
+        match workspace_path
+            .map(|workspace| workspace.trim().to_string())
+            .filter(|workspace| !workspace.is_empty())
+        {
+            Some(workspace) => {
+                self.session_workspaces.insert(session_id, workspace);
+            }
+            None => {
+                self.session_workspaces.remove(&session_id);
+            }
+        }
     }
 
     pub fn session_workspace(&self, session_id: &str) -> Option<String> {
@@ -862,11 +926,52 @@ impl PermissionConfig {
     }
 
     pub fn register_pending_request(&self, request: PermissionRequest) {
+        self.register_pending_request_inner(request, || {});
+    }
+
+    fn register_pending_request_inner<F>(&self, request: PermissionRequest, before_insert: F)
+    where
+        F: FnOnce(),
+    {
         let key = (request.session_id.clone(), request.request_id.clone());
-        if self.decision_receipts.contains_key(&key) {
+        let request_generation = request.request_generation.clone();
+        let receipt_key = (
+            request.session_id.clone(),
+            request.request_id.clone(),
+            request_generation.clone(),
+        );
+        if request_generation.trim().is_empty() {
             return;
         }
-        self.pending_requests.insert(key, request);
+        if self.decision_receipts.contains_key(&receipt_key) {
+            self.pending_requests.remove_if(&key, |_, pending| {
+                pending.request_generation == request_generation
+            });
+            return;
+        }
+        // A request id may be reused by a provider in a later round. Any
+        // unconsumed one-shot grant belongs to the previous parked operation
+        // and must not survive registration of an unresolved generation. Keep
+        // the current generation: a concurrent decision writes its grant
+        // immediately before its receipt, and reconnect hydration must never
+        // revoke that already-authorized operation in the intervening window.
+        self.one_shot_grants.remove(&key);
+        self.typed_one_shot_grants
+            .retain(|(session_id, request_id, generation), _| {
+                session_id != &request.session_id
+                    || request_id != &request.request_id
+                    || generation == &request_generation
+            });
+        before_insert();
+        self.pending_requests.insert(key.clone(), request);
+        // Close the opposite interleaving: a decision receipt may have landed
+        // after the first check but before this insert. Remove only this exact
+        // generation so a newer provider-reused request id remains intact.
+        if self.decision_receipts.contains_key(&receipt_key) {
+            self.pending_requests.remove_if(&key, |_, pending| {
+                pending.request_generation == request_generation
+            });
+        }
     }
 
     pub fn pending_request(&self, session_id: &str, request_id: &str) -> Option<PermissionRequest> {
@@ -879,9 +984,14 @@ impl PermissionConfig {
         &self,
         session_id: &str,
         request_id: &str,
+        request_generation: &str,
     ) -> Option<PermissionDecisionReceipt> {
         self.decision_receipts
-            .get(&(session_id.to_string(), request_id.to_string()))
+            .get(&(
+                session_id.to_string(),
+                request_id.to_string(),
+                request_generation.to_string(),
+            ))
             .map(|entry| entry.value().clone())
     }
 
@@ -893,22 +1003,46 @@ impl PermissionConfig {
         session_id: &str,
         decision: PermissionDecision,
     ) -> Result<bool, String> {
-        let key = (session_id.to_string(), decision.request_id.clone());
+        self.record_decision_receipt(PermissionDecisionReceipt {
+            session_id: session_id.to_string(),
+            decision,
+            decided_at: chrono::Utc::now(),
+        })
+    }
+
+    /// Restore an exact durable receipt after process restart. The timestamp is
+    /// preserved while idempotency remains keyed by session, request, and the
+    /// server-issued operation generation.
+    pub fn record_decision_receipt(
+        &self,
+        receipt: PermissionDecisionReceipt,
+    ) -> Result<bool, String> {
+        let key = (
+            receipt.session_id.clone(),
+            receipt.decision.request_id.clone(),
+            receipt.decision.request_generation.clone(),
+        );
+        if receipt.decision.request_generation.trim().is_empty() {
+            return Err("permission decision generation must not be blank".to_string());
+        }
         match self.decision_receipts.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(existing) => {
-                if existing.get().decision == decision {
+                if existing.get().decision == receipt.decision {
                     Ok(true)
                 } else {
                     Err("request already resolved with a different decision".to_string())
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(PermissionDecisionReceipt {
-                    session_id: session_id.to_string(),
-                    decision,
-                    decided_at: chrono::Utc::now(),
+                let pending_key = (
+                    receipt.session_id.clone(),
+                    receipt.decision.request_id.clone(),
+                );
+                let receipt_generation = receipt.decision.request_generation.clone();
+                entry.insert(receipt);
+                self.pending_requests.remove_if(&pending_key, |_, request| {
+                    request.request_generation == receipt_generation
                 });
-                self.pending_requests.remove(&key);
                 Ok(false)
             }
         }
@@ -1142,20 +1276,53 @@ impl PermissionConfig {
         grants.insert(pattern, grant);
     }
 
+    /// Remember a session allow with the exact typed matcher selected by the
+    /// user. Unlike legacy session grants, matcher values are never interpreted
+    /// as globs.
+    pub fn grant_typed_scoped_session_permission(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        matcher: PermissionMatcher,
+    ) -> Result<(), String> {
+        matcher.validate(perm_type)?;
+        let key = (matcher.kind, matcher.value.clone());
+        let grant = TypedSessionGrant::new(matcher, self.session_grant_duration);
+        let session = self
+            .typed_scoped_session_grants
+            .entry(session_id.to_string())
+            .or_default();
+        let mut grants = session.entry(perm_type).or_default();
+        grants.retain(|_, grant| !grant.is_expired());
+        grants.insert(key, grant);
+        Ok(())
+    }
+
     pub fn is_scoped_session_granted(
         &self,
         session_id: &str,
         perm_type: PermissionType,
         resource: &str,
     ) -> bool {
-        self.scoped_session_grants
+        let typed = self
+            .typed_scoped_session_grants
             .get(session_id)
             .and_then(|session| session.get(&perm_type).map(|grants| grants.clone()))
             .is_some_and(|grants| {
                 grants
                     .values()
-                    .any(|grant| !grant.is_expired() && grant.matches(perm_type, resource))
-            })
+                    .any(|grant| grant.matches(perm_type, resource))
+            });
+        typed
+            || self
+                .scoped_session_grants
+                .get(session_id)
+                .and_then(|session| session.get(&perm_type).map(|grants| grants.clone()))
+                .is_some_and(|grants| {
+                    grants
+                        .values()
+                        .any(|grant| !grant.is_expired() && grant.matches(perm_type, resource))
+                })
     }
 
     pub fn deny_scoped_session_permission(
@@ -1175,20 +1342,52 @@ impl PermissionConfig {
         denies.insert(pattern, grant);
     }
 
+    /// Remember a session deny with the exact typed matcher selected by the
+    /// user. Matcher kind is retained for enforcement and observability.
+    pub fn deny_typed_scoped_session_permission(
+        &self,
+        session_id: &str,
+        perm_type: PermissionType,
+        matcher: PermissionMatcher,
+    ) -> Result<(), String> {
+        matcher.validate(perm_type)?;
+        let key = (matcher.kind, matcher.value.clone());
+        let deny = TypedSessionGrant::new(matcher, self.session_grant_duration);
+        let session = self
+            .typed_scoped_session_denies
+            .entry(session_id.to_string())
+            .or_default();
+        let mut denies = session.entry(perm_type).or_default();
+        denies.retain(|_, deny| !deny.is_expired());
+        denies.insert(key, deny);
+        Ok(())
+    }
+
     pub fn is_scoped_session_denied(
         &self,
         session_id: &str,
         perm_type: PermissionType,
         resource: &str,
     ) -> bool {
-        self.scoped_session_denies
+        let typed = self
+            .typed_scoped_session_denies
             .get(session_id)
             .and_then(|session| session.get(&perm_type).map(|denies| denies.clone()))
             .is_some_and(|denies| {
                 denies
                     .values()
-                    .any(|deny| !deny.is_expired() && deny.matches(perm_type, resource))
-            })
+                    .any(|deny| deny.matches(perm_type, resource))
+            });
+        typed
+            || self
+                .scoped_session_denies
+                .get(session_id)
+                .and_then(|session| session.get(&perm_type).map(|denies| denies.clone()))
+                .is_some_and(|denies| {
+                    denies
+                        .values()
+                        .any(|deny| !deny.is_expired() && deny.matches(perm_type, resource))
+                })
     }
 
     /// Consume a one-shot grant bound to one session. Legacy `Approve` maps to
@@ -1230,6 +1429,34 @@ impl PermissionConfig {
         }
     }
 
+    pub fn grant_once_for_generation(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        request_generation: &str,
+        perm_type: PermissionType,
+        resource: String,
+    ) -> Result<(), String> {
+        if request_generation.trim().is_empty() {
+            return Err("permission grant generation must not be blank".to_string());
+        }
+        let mut grants = self
+            .typed_one_shot_grants
+            .entry((
+                session_id.to_string(),
+                request_id.to_string(),
+                request_generation.to_string(),
+            ))
+            .or_default();
+        if !grants
+            .iter()
+            .any(|grant| grant.0 == perm_type && grant.1 == resource)
+        {
+            grants.push((perm_type, resource));
+        }
+        Ok(())
+    }
+
     pub fn consume_once(
         &self,
         session_id: &str,
@@ -1257,12 +1484,50 @@ impl PermissionConfig {
         true
     }
 
+    pub fn consume_once_for_generation(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        request_generation: &str,
+        perm_type: PermissionType,
+        resource: &str,
+    ) -> bool {
+        if request_generation.trim().is_empty() {
+            return false;
+        }
+        let key = (
+            session_id.to_string(),
+            request_id.to_string(),
+            request_generation.to_string(),
+        );
+        let Some(mut grants) = self.typed_one_shot_grants.get_mut(&key) else {
+            return false;
+        };
+        let Some(index) = grants
+            .iter()
+            .position(|grant| grant.0 == perm_type && grant.1 == resource)
+        else {
+            return false;
+        };
+        grants.swap_remove(index);
+        let empty = grants.is_empty();
+        drop(grants);
+        if empty {
+            self.typed_one_shot_grants
+                .remove_if(&key, |_, grants| grants.is_empty());
+        }
+        true
+    }
+
     /// Clear all session grants
     pub fn clear_session_grants(&self) {
         self.session_grants.clear();
         self.scoped_session_grants.clear();
         self.scoped_session_denies.clear();
+        self.typed_scoped_session_grants.clear();
+        self.typed_scoped_session_denies.clear();
         self.one_shot_grants.clear();
+        self.typed_one_shot_grants.clear();
     }
 
     /// Return a deterministic read-only snapshot of active runtime grants.
@@ -1330,8 +1595,60 @@ impl PermissionConfig {
             }
         }
 
+        for session_entry in self.typed_scoped_session_grants.iter() {
+            for permission_entry in session_entry.value().iter() {
+                for grant in permission_entry.value().values() {
+                    if grant.expires_at < now_instant {
+                        continue;
+                    }
+                    result.push(temporary_typed_session_grant(
+                        TemporaryPermissionGrantEffect::Allow,
+                        session_entry.key().clone(),
+                        *permission_entry.key(),
+                        grant,
+                        now_instant,
+                        now_utc,
+                    ));
+                }
+            }
+        }
+
+        for session_entry in self.typed_scoped_session_denies.iter() {
+            for permission_entry in session_entry.value().iter() {
+                for grant in permission_entry.value().values() {
+                    if grant.expires_at < now_instant {
+                        continue;
+                    }
+                    result.push(temporary_typed_session_grant(
+                        TemporaryPermissionGrantEffect::Deny,
+                        session_entry.key().clone(),
+                        *permission_entry.key(),
+                        grant,
+                        now_instant,
+                        now_utc,
+                    ));
+                }
+            }
+        }
+
         for receipt_entry in self.one_shot_grants.iter() {
             let (session_id, request_id) = receipt_entry.key();
+            for (permission_type, matcher) in receipt_entry.value() {
+                result.push(TemporaryPermissionGrant {
+                    scope: TemporaryPermissionGrantScope::OneShot,
+                    effect: TemporaryPermissionGrantEffect::Allow,
+                    session_id: Some(session_id.clone()),
+                    request_id: Some(request_id.clone()),
+                    permission_type: *permission_type,
+                    matcher: matcher.clone(),
+                    granted_at: None,
+                    expires_at: None,
+                });
+            }
+        }
+
+        for receipt_entry in self.typed_one_shot_grants.iter() {
+            let (session_id, request_id, _) = receipt_entry.key();
             for (permission_type, matcher) in receipt_entry.value() {
                 result.push(TemporaryPermissionGrant {
                     scope: TemporaryPermissionGrantScope::OneShot,
@@ -1366,6 +1683,18 @@ impl PermissionConfig {
     pub fn cleanup_expired_grants(&self) {
         for mut entry in self.session_grants.iter_mut() {
             entry.value_mut().retain(|_, g| !g.is_expired());
+        }
+        for session in self.typed_scoped_session_grants.iter() {
+            for mut permission in session.value().iter_mut() {
+                permission
+                    .value_mut()
+                    .retain(|_, grant| !grant.is_expired());
+            }
+        }
+        for session in self.typed_scoped_session_denies.iter() {
+            for mut permission in session.value().iter_mut() {
+                permission.value_mut().retain(|_, deny| !deny.is_expired());
+            }
         }
     }
 
@@ -1465,14 +1794,26 @@ impl PermissionConfig {
             );
         }
 
-        if input.consume_once
-            && self.consume_once(
+        let replay_generation = input.consume_once.then(|| {
+            crate::current_permission_replay_generation(&input.session_id, &input.request_id)
+        });
+        let consumed_once = match replay_generation.flatten() {
+            Some(generation) => self.consume_once_for_generation(
+                &input.session_id,
+                &input.request_id,
+                &generation,
+                input.permission_type,
+                &input.resource,
+            ),
+            None if input.consume_once => self.consume_once(
                 &input.session_id,
                 &input.request_id,
                 input.permission_type,
                 &input.resource,
-            )
-        {
+            ),
+            None => false,
+        };
+        if consumed_once {
             return PermissionOutcome::Allow {
                 source: PermissionDecisionSource::OneShot,
                 effective_policy,
@@ -1647,6 +1988,7 @@ impl PermissionConfig {
             .collect();
         PermissionRequest {
             request_id: input.request_id.clone(),
+            request_generation: PermissionRequest::fresh_generation(),
             session_id: input.session_id.clone(),
             workspace_path: input.workspace_path.clone(),
             tool_name: input.tool_name.clone(),
@@ -1726,7 +2068,10 @@ impl PermissionConfig {
             session_grants: DashMap::new(),
             scoped_session_grants: DashMap::new(),
             scoped_session_denies: DashMap::new(),
+            typed_scoped_session_grants: DashMap::new(),
+            typed_scoped_session_denies: DashMap::new(),
             one_shot_grants: DashMap::new(),
+            typed_one_shot_grants: DashMap::new(),
             session_grant_duration: Duration::from_secs(config.session_grant_duration_secs),
             enabled: AtomicBool::new(config.enabled),
             mode: RwLock::new(mode),
@@ -1819,6 +2164,27 @@ fn temporary_session_grant(
         request_id: None,
         permission_type,
         matcher: grant.resource_pattern.clone(),
+        granted_at: instant_to_utc(grant.granted_at, now_instant, now_utc),
+        expires_at: instant_to_utc(grant.expires_at, now_instant, now_utc),
+    }
+}
+
+fn temporary_typed_session_grant(
+    effect: TemporaryPermissionGrantEffect,
+    session_id: String,
+    permission_type: PermissionType,
+    grant: &TypedSessionGrant,
+    now_instant: Instant,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> TemporaryPermissionGrant {
+    TemporaryPermissionGrant {
+        scope: TemporaryPermissionGrantScope::Session,
+        effect,
+        session_id: Some(session_id),
+        request_id: None,
+        permission_type,
+        matcher: serde_json::to_string(&grant.matcher)
+            .unwrap_or_else(|_| grant.matcher.value.clone()),
         granted_at: instant_to_utc(grant.granted_at, now_instant, now_utc),
         expires_at: instant_to_utc(grant.expires_at, now_instant, now_utc),
     }
@@ -3030,6 +3396,152 @@ mod integration_tests {
     }
 
     #[test]
+    fn typed_session_exact_resource_never_becomes_a_glob() {
+        let config = PermissionConfig::new();
+        config
+            .grant_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "exact_resource".to_string(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: "rm *.log".to_string(),
+                },
+            )
+            .expect("valid exact matcher");
+
+        assert!(config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "rm *.log"
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "rm audit.log"
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "session-b",
+            PermissionType::ExecuteCommand,
+            "rm *.log"
+        ));
+    }
+
+    #[test]
+    fn typed_session_matcher_kinds_retain_their_server_semantics() {
+        let config = PermissionConfig::new();
+        config
+            .grant_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::WriteFile,
+                PermissionMatcher {
+                    id: "workspace_subtree".to_string(),
+                    kind: PermissionMatcherKind::PathSubtree,
+                    value: "/tmp/workspace".to_string(),
+                },
+            )
+            .expect("valid subtree matcher");
+        config
+            .grant_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "command_prefix".to_string(),
+                    kind: PermissionMatcherKind::CommandPrefix,
+                    value: "cargo test".to_string(),
+                },
+            )
+            .expect("valid command prefix");
+        config
+            .deny_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "deny_prefix".to_string(),
+                    kind: PermissionMatcherKind::CommandPrefix,
+                    value: "git push".to_string(),
+                },
+            )
+            .expect("valid command prefix deny");
+
+        assert!(config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::WriteFile,
+            "/tmp/workspace/src/lib.rs"
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::WriteFile,
+            "/tmp/workspace-sibling/src/lib.rs"
+        ));
+        assert!(config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "cargo test -p bamboo-permission"
+        ));
+        assert!(!config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "cargo nextest run"
+        ));
+        assert!(config.is_scoped_session_denied(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git push origin dev"
+        ));
+        assert!(!config.is_scoped_session_denied(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git push origin dev && rm -rf /"
+        ));
+        assert!(!config.is_scoped_session_denied(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git status"
+        ));
+    }
+
+    #[test]
+    fn typed_session_matchers_expire_and_cleanup() {
+        let config = PermissionConfig::with_settings(true, Duration::ZERO);
+        config
+            .grant_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "exact_resource".to_string(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: "cargo test".to_string(),
+                },
+            )
+            .expect("valid exact matcher");
+        config
+            .deny_typed_scoped_session_permission(
+                "session-a",
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "command_prefix".to_string(),
+                    kind: PermissionMatcherKind::CommandPrefix,
+                    value: "git push".to_string(),
+                },
+            )
+            .expect("valid command prefix");
+
+        assert!(!config.is_scoped_session_granted(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "cargo test"
+        ));
+        assert!(!config.is_scoped_session_denied(
+            "session-a",
+            PermissionType::ExecuteCommand,
+            "git push origin dev"
+        ));
+        config.cleanup_expired_grants();
+        assert!(config.temporary_grants().is_empty());
+    }
+
+    #[test]
     fn file_matchers_canonicalize_static_prefixes_without_widening() {
         let temp = tempfile::tempdir().expect("tempdir");
         let alias_path = temp.path().join("future.txt");
@@ -3301,6 +3813,7 @@ mod integration_tests {
         let config = PermissionConfig::new();
         let allow = PermissionDecision {
             request_id: "req".to_string(),
+            request_generation: "generation-1".to_string(),
             decision: crate::policy::PermissionDecisionKind::AllowOnce,
             matcher_id: None,
             expected_policy_revision: None,
@@ -3310,11 +3823,225 @@ mod integration_tests {
         assert_eq!(config.record_decision("a", allow), Ok(true));
         let deny = PermissionDecision {
             request_id: "req".to_string(),
+            request_generation: "generation-1".to_string(),
             decision: crate::policy::PermissionDecisionKind::DenyOnce,
             matcher_id: None,
             expected_policy_revision: None,
             confirm_global: false,
         };
         assert!(config.record_decision("a", deny).is_err());
+
+        let receipt = config
+            .decision_receipt("a", "req", "generation-1")
+            .expect("original receipt");
+        let restored = PermissionConfig::new();
+        assert_eq!(restored.record_decision_receipt(receipt.clone()), Ok(false));
+        assert_eq!(
+            restored.decision_receipt("a", "req", "generation-1"),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn reused_request_id_keeps_generations_independent() {
+        let config = PermissionConfig::new();
+        let old_decision = PermissionDecision {
+            request_id: "req".to_string(),
+            request_generation: "generation-1".to_string(),
+            decision: crate::policy::PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        assert_eq!(config.record_decision("a", old_decision.clone()), Ok(false));
+        config.grant_once(
+            "a",
+            "req",
+            PermissionType::ExecuteCommand,
+            "old-resource".to_string(),
+        );
+
+        let mut new_request = match config.evaluate(evaluation("a", "req", "new-resource", false)) {
+            PermissionOutcome::Ask(request) => request,
+            other => panic!("expected a new permission request, got {other:?}"),
+        };
+        new_request.request_generation = "generation-2".to_string();
+        config.register_pending_request(new_request.clone());
+
+        assert_eq!(
+            config
+                .pending_request("a", "req")
+                .map(|request| request.request_generation),
+            Some("generation-2".to_string())
+        );
+        assert!(config
+            .decision_receipt("a", "req", "generation-2")
+            .is_none());
+        assert!(!config.consume_once("a", "req", PermissionType::ExecuteCommand, "old-resource"));
+        assert_eq!(config.record_decision("a", old_decision), Ok(true));
+        assert_eq!(
+            config
+                .pending_request("a", "req")
+                .map(|request| request.request_generation),
+            Some("generation-2".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_registration_preserves_current_generation_grant_and_prunes_old_generation() {
+        let config = PermissionConfig::new();
+        for generation in ["generation-old", "generation-current"] {
+            config
+                .grant_once_for_generation(
+                    "session-a",
+                    "request-a",
+                    generation,
+                    PermissionType::ExecuteCommand,
+                    "cargo test".to_string(),
+                )
+                .unwrap();
+        }
+        let mut request =
+            match config.evaluate(evaluation("session-a", "request-a", "cargo test", false)) {
+                PermissionOutcome::Ask(request) => request,
+                other => panic!("expected a permission request, got {other:?}"),
+            };
+        request.request_generation = "generation-current".to_string();
+
+        // Model the grant -> reconnect registration -> receipt interleaving.
+        config.register_pending_request(request);
+
+        assert!(!config.typed_one_shot_grants.contains_key(&(
+            "session-a".to_string(),
+            "request-a".to_string(),
+            "generation-old".to_string(),
+        )));
+        assert!(config.typed_one_shot_grants.contains_key(&(
+            "session-a".to_string(),
+            "request-a".to_string(),
+            "generation-current".to_string(),
+        )));
+
+        assert_eq!(
+            config.record_decision(
+                "session-a",
+                PermissionDecision {
+                    request_id: "request-a".to_string(),
+                    request_generation: "generation-current".to_string(),
+                    decision: crate::policy::PermissionDecisionKind::AllowOnce,
+                    matcher_id: None,
+                    expected_policy_revision: None,
+                    confirm_global: false,
+                },
+            ),
+            Ok(false)
+        );
+        assert!(config.pending_request("session-a", "request-a").is_none());
+        assert!(config.consume_once_for_generation(
+            "session-a",
+            "request-a",
+            "generation-current",
+            PermissionType::ExecuteCommand,
+            "cargo test",
+        ));
+    }
+
+    #[test]
+    fn pending_registration_removes_exact_generation_when_receipt_lands_before_insert() {
+        let config = PermissionConfig::new();
+        let mut request =
+            match config.evaluate(evaluation("session-a", "request-a", "cargo test", false)) {
+                PermissionOutcome::Ask(request) => request,
+                other => panic!("expected a permission request, got {other:?}"),
+            };
+        request.request_generation = "generation-current".to_string();
+        let decision = PermissionDecision {
+            request_id: "request-a".to_string(),
+            request_generation: "generation-current".to_string(),
+            decision: crate::policy::PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+
+        config.register_pending_request_inner(request, || {
+            assert_eq!(config.record_decision("session-a", decision), Ok(false));
+        });
+
+        assert!(config.pending_request("session-a", "request-a").is_none());
+        assert!(config
+            .decision_receipt("session-a", "request-a", "generation-current")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn typed_one_shot_grant_requires_exact_replay_generation() {
+        let config = PermissionConfig::new();
+        config
+            .grant_once_for_generation(
+                "session-a",
+                "reused-request",
+                "generation-old",
+                PermissionType::ExecuteCommand,
+                "cargo test".to_string(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "session-a",
+                "reused-request",
+                "cargo test",
+                false,
+            )),
+            PermissionOutcome::Ask(_)
+        ));
+        crate::with_permission_replay_generation(
+            "session-a",
+            "reused-request",
+            Some("generation-new"),
+            async {
+                assert!(matches!(
+                    config.evaluate(evaluation(
+                        "session-a",
+                        "reused-request",
+                        "cargo test",
+                        false,
+                    )),
+                    PermissionOutcome::Ask(_)
+                ));
+            },
+        )
+        .await;
+        crate::with_permission_replay_generation(
+            "session-a",
+            "reused-request",
+            Some("generation-old"),
+            async {
+                assert!(matches!(
+                    config.evaluate(evaluation(
+                        "session-a",
+                        "reused-request",
+                        "cargo test",
+                        false,
+                    )),
+                    PermissionOutcome::Allow {
+                        source: PermissionDecisionSource::OneShot,
+                        ..
+                    }
+                ));
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            config.evaluate(evaluation(
+                "session-a",
+                "reused-request",
+                "cargo test",
+                false,
+            )),
+            PermissionOutcome::Ask(_)
+        ));
     }
 }

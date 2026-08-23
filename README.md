@@ -188,9 +188,13 @@ Arguments supported by `bamboo serve` (all override the config file):
 | `bamboo mcp list` | List the MCP servers configured in `config.json` (offline; no server needed). |
 | `bamboo mcp status\|connect\|disconnect\|refresh\|tools\|add\|remove` | Manage MCP servers on a running instance over `/api/v1/mcp`: live connection state + tool counts (`status [--json]`), enable/connect + disable/disconnect a server, re-list tools (`refresh [<id>]`), inspect tools (`tools [<id>] [--json]`), add from a raw JSON payload (`add --json <file\|->`), and delete (`remove <id>`, confirms unless `--yes`; a removed server can be re-added with `add`). |
 
+TUI bindings are context-aware and configurable with `--keymap`; see
+[TUI keybindings](docs/tui-keybindings.md) for the JSON schema, safety rules,
+and terminal fallbacks.
+
 The admin commands (`health` / `status` / `sessions` / `stop` / `history` / `respond` / `session` / `schedules`) are thin HTTP clients over a running `bamboo serve`; point them at a non-default server with `--server-url` / `--port` / `--data-dir`. The read commands (`skills list` / `mcp list`) work offline against `--data-dir` (default `~/.bamboo`); the other `mcp` verbs are server-backed and take the same connection flags. (`bamboo subagent-worker` also exists but is an internal worker process spawned by the server — not for interactive use.)
 
-A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present). `bamboo serve` defaults to `info` in every build profile; use `--log-level debug`, `-v`, or `RUST_LOG` to opt into more verbose server logs.
+A global `--log-level <error|warn|info|debug|trace>` sets the default log level for any command when `RUST_LOG` is unset (`RUST_LOG` still wins when present). `bamboo serve` defaults to `info` in every build profile. Embedded debug builds keep `debug` on stdout while date-rotated files default to `info`; at startup, strictly matching historical files are retained by both count and a 128 MiB total byte budget. Daily rotation continues during long-running processes, and startup limits are enforced again on the next process start. Use `--log-level debug`, `-v`, or `RUST_LOG` to opt into more detail; target-specific directives such as `RUST_LOG=h2=debug` override the dependency-noise defaults while leaving each sink's root default unchanged.
 
 **Defaults** (verified against code):
 
@@ -207,15 +211,20 @@ Once the server is running, driving the **full agent loop** — the LLM plans, c
 # 1. Create a turn. This PERSISTS the message and returns immediately — it does
 #    NOT run the loop yet. Response includes the session id and events URL:
 #    { "session_id": "...", "stream_url": "/api/v1/events/<id>", "status": "streaming" }
+CHAT_KEY=$(uuidgen)
 SID=$(curl -s http://127.0.0.1:9562/api/v1/chat \
   -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $CHAT_KEY" \
   -d '{"message":"List the files here and tell me what this project does.","model":"claude-sonnet-4-6"}' \
   | jq -r .session_id)
 
 # 2. Start the agent loop for that session. The body may be empty ({}) — every
 #    field (model/provider/skill_mode/reasoning_effort/…) is an optional override.
+EXECUTE_KEY=$(uuidgen)
 curl -s -X POST "http://127.0.0.1:9562/api/v1/execute/$SID" \
-  -H 'Content-Type: application/json' -d '{}'
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $EXECUTE_KEY" \
+  -d '{}'
 
 # 3. Watch the loop in real time (SSE): assistant text, tool calls, tool results,
 #    token usage, and completion arrive as they happen.
@@ -223,6 +232,15 @@ curl -N "http://127.0.0.1:9562/api/v1/events/$SID"
 ```
 
 On `POST /api/v1/chat`, `message` and `model` are the only required fields; useful optionals are `session_id` (continue a conversation), `system_prompt`, `selected_skill_ids`, `workspace_path`, `provider`, `images`. Note that `chat` only **persists** the turn — you must then `POST /api/v1/execute/{session_id}` to actually run the loop. Besides the per-session `GET /api/v1/events/{session_id}` feed, there is an account-wide, resumable change feed `GET /api/v1/stream` (SSE, resumable via `?since=<seq>` or the `Last-Event-ID` header) that streams events across **all** sessions — handy for multi-session sync.
+
+`POST /api/v1/chat` and `POST /api/v1/execute/{session_id}` accept an optional
+`Idempotency-Key` header. Bamboo keeps up to 1,024 completed responses in memory
+for 10 minutes: an equivalent retry replays the first response without
+duplicating the message or run, while the same key with a different payload
+returns `409`. Keys are scoped independently to chat and execute, and a server
+restart clears these short-lived receipts. `POST /api/v1/sessions` has a
+separate durable recovery contract documented in
+[`docs/session-create-idempotency.md`](docs/session-create-idempotency.md).
 
 ### Use it as a Rust SDK (in-process)
 

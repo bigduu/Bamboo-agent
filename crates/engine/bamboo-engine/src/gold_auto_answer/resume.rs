@@ -6,14 +6,14 @@ use crate::session_app::resolution::resolve_resume_config_snapshot;
 use crate::session_app::respond::PlanModeTransition;
 use crate::session_app::types::ResumeConfigSnapshot;
 
-pub(crate) async fn build_resume_config_snapshot(
+pub(crate) fn build_resume_config_snapshot(
     state: &dyn AgentSessionContext,
+    config_snapshot: &bamboo_llm::Config,
     session: &Session,
     gold_config_override: Option<GoldConfig>,
 ) -> ResumeConfigSnapshot {
-    let config_snapshot = state.config().read().await.clone();
     resolve_resume_config_snapshot(
-        &config_snapshot,
+        config_snapshot,
         state.provider_registry(),
         session,
         gold_config_override,

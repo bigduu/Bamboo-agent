@@ -100,6 +100,10 @@ pub enum SdkError {
     #[error("no pending question waiting for response")]
     NoPendingQuestion,
 
+    /// The pending tool call changed after a typed client displayed it.
+    #[error("pending question changed (expected tool call {expected}, actual {actual})")]
+    PendingQuestionChanged { expected: String, actual: String },
+
     /// The response passed to [`Agent::answer`](super::Agent::answer) did not
     /// match one of the pending question's fixed options (and it does not
     /// allow a custom response).
@@ -141,6 +145,9 @@ impl From<RespondError> for SdkError {
             RespondError::LoadFailed(inner) => inner.into(),
             RespondError::SaveFailed(inner) => inner.into(),
             RespondError::NoPendingQuestion => SdkError::NoPendingQuestion,
+            RespondError::PendingQuestionMismatch { expected, actual } => {
+                SdkError::PendingQuestionChanged { expected, actual }
+            }
             RespondError::InvalidResponse(message) => SdkError::InvalidResponse(message),
         }
     }

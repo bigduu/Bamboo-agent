@@ -194,6 +194,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.to_string()),
             tool_name: None,
             allow_custom: true,
+            source: None,
         }
     }
 

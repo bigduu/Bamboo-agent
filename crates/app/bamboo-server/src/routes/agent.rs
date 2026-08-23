@@ -112,6 +112,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
+        .route(
+            "/session-create-operations/{key}",
+            web::get().to(agent::sessions::get_session_create_operation),
+        )
         // First-class Project registry. Register the literal migration route
         // before `/{id}` so it cannot be captured as a Project id.
         .route(
@@ -163,6 +167,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}",
             web::get().to(agent::sessions::get_session),
+        )
+        .route(
+            "/sessions/{session_id}/copy",
+            web::post().to(agent::sessions::copy_session),
         )
         .route(
             "/sessions/{session_id}/system-prompt",
@@ -382,6 +390,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/metrics/memory/timeline",
             web::get().to(agent::metrics::memory_timeline),
+        )
+        .route(
+            "/metrics/persistence",
+            web::get().to(agent::metrics::persistence),
         )
         // Forward metrics routes (API proxy metrics)
         .route(

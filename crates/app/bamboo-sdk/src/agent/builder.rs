@@ -257,18 +257,21 @@ impl AgentBuilder {
         self
     }
 
-    /// Select the provider by name (`anthropic`, `openai`, `gemini`, `copilot`,
-    /// `bodhi`) for [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir),
-    /// overriding `config.json`'s `provider`. A following [`api_key`](Self::api_key)
-    /// applies to *this* provider. The name is lower-cased (config matching is
-    /// case-sensitive).
+    /// Select the provider by instance id or built-in type (`anthropic`,
+    /// `openai`, `gemini`, `copilot`, `bodhi`) for
+    /// [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir). An exact
+    /// instance id wins; a type deterministically selects the first enabled
+    /// instance of that type, falling back to the legacy slot only when none
+    /// exists. A following [`api_key`](Self::api_key) applies to this effective
+    /// target. Instance ids are matched exactly; built-in type names are
+    /// normalized to lowercase.
     ///
     /// Note: this drives provider creation inside `with_defaults_for_data_dir`
     /// and can fail there (e.g. missing key). A [`provider`](Self::provider)
     /// injected before defaults skips that creation entirely; one injected
     /// afterwards replaces the already-created provider at build time.
     pub fn provider_name(mut self, provider: impl Into<String>) -> Self {
-        self.provider_name = Some(provider.into().trim().to_ascii_lowercase());
+        self.provider_name = Some(provider.into().trim().to_string());
         self
     }
 
@@ -563,7 +566,7 @@ impl AgentBuilder {
         // Select the provider first, so `api_key` and provider creation both act
         // on the chosen provider rather than config.json's default.
         if let Some(provider) = self.provider_name.clone() {
-            config.provider = provider;
+            select_provider_override(&mut config, &provider);
         }
         if let Some(api_key) = self.api_key.clone() {
             apply_api_key(&mut config, &api_key)?;
@@ -835,7 +838,7 @@ impl Default for AgentBuilder {
     }
 }
 
-/// Apply `api_key` to the active provider's in-memory config slot.
+/// Apply `api_key` to the effective provider's in-memory config slot.
 ///
 /// If the provider stanza already exists, its key is overwritten. If it is
 /// absent (the common default-config / no-`config.json` case), a minimal stanza
@@ -845,12 +848,26 @@ impl Default for AgentBuilder {
 /// `gemini`) are fabricated; other providers (e.g. `copilot`, which authenticates
 /// via cached OAuth rather than a plain key) return a typed error.
 fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
+    let provider_key = config.effective_default_provider().to_string();
+    if let Some(instance) = config.provider_instances.get_mut(&provider_key) {
+        let provider = instance.provider_type.clone();
+        if !matches!(provider.as_str(), "openai" | "anthropic" | "gemini") {
+            return Err(SdkError::UnsupportedApiKeyProvider { provider });
+        }
+        instance.api_key = api_key.to_string();
+        instance.api_key_encrypted = None;
+        instance
+            .extra
+            .remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
+        return Ok(());
+    }
+
     // A minimal `{"api_key": …}` stanza; every other provider-config field
     // deserializes to its serde default, so the target type is inferred from
     // the assignment below (no `serde` trait import needed).
     let stanza = || serde_json::json!({ "api_key": api_key });
 
-    let provider = config.provider.clone();
+    let provider = provider_key;
     let providers = config.providers_mut();
     match provider.as_str() {
         "openai" => match providers.openai.as_mut() {
@@ -899,6 +916,34 @@ fn apply_api_key(config: &mut Config, api_key: &str) -> Result<(), SdkError> {
     }
 }
 
+/// Apply an SDK provider override without bypassing provider-instance
+/// authority. Exact ids win (including disabled ids, which the factory then
+/// rejects); a built-in type selects the lexicographically first enabled
+/// instance of that type. Only when no instance matches do we deliberately
+/// fall back to the legacy single-provider slot.
+fn select_provider_override(config: &mut Config, requested: &str) {
+    if config.provider_instances.contains_key(requested) {
+        config.default_provider_instance = Some(requested.to_string());
+        return;
+    }
+
+    let requested_type = requested.to_ascii_lowercase();
+    let mut matching = config
+        .provider_instances
+        .iter()
+        .filter(|(_, instance)| instance.enabled && instance.provider_type == requested_type)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    matching.sort();
+    if let Some(instance_id) = matching.into_iter().next() {
+        config.default_provider_instance = Some(instance_id);
+        return;
+    }
+
+    config.default_provider_instance = None;
+    config.provider = requested_type;
+}
+
 fn permission_checker_for_mode(mode: PermissionMode) -> Option<Arc<dyn PermissionChecker>> {
     let config = Arc::new(PermissionConfig::new());
     config.set_mode(mode);
@@ -908,7 +953,9 @@ fn permission_checker_for_mode(mode: PermissionMode) -> Option<Arc<dyn Permissio
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_api_key, permission_checker_for_mode, AgentBuilder};
+    use super::{
+        apply_api_key, permission_checker_for_mode, select_provider_override, AgentBuilder,
+    };
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
         FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionContext, ToolExecutor,
@@ -1011,6 +1058,92 @@ mod tests {
         assert!(
             config.providers().anthropic.is_none(),
             "the default provider must not receive the key"
+        );
+    }
+
+    #[test]
+    fn provider_override_prefers_exact_instance_then_deterministic_type_match() {
+        let mut config = Config::default();
+        for (id, provider_type, enabled) in [
+            ("Work-Exact", "openai", false),
+            ("z-enabled", "openai", true),
+            ("a-enabled", "openai", true),
+            ("anthropic-work", "anthropic", true),
+        ] {
+            config.provider_instances.insert(
+                id.to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type": provider_type,
+                    "enabled": enabled
+                }))
+                .unwrap(),
+            );
+        }
+
+        select_provider_override(&mut config, "Work-Exact");
+        assert_eq!(
+            config.default_provider_instance.as_deref(),
+            Some("Work-Exact"),
+            "exact id wins even when disabled so factory validation stays fail-closed"
+        );
+
+        select_provider_override(&mut config, "OPENAI");
+        assert_eq!(
+            config.default_provider_instance.as_deref(),
+            Some("a-enabled")
+        );
+    }
+
+    #[test]
+    fn api_key_updates_effective_instance_and_clears_environment_marker() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key_from_env": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+
+        apply_api_key(&mut config, "sk-sdk-override").unwrap();
+        let instance = &config.provider_instances["work"];
+        assert_eq!(instance.api_key, "sk-sdk-override");
+        assert!(instance.api_key_encrypted.is_none());
+        assert!(!bamboo_config::provider_instance_api_key_from_env(instance));
+        assert!(
+            config.providers().openai.is_none(),
+            "instance override must not fabricate a legacy slot"
+        );
+    }
+
+    #[test]
+    fn provider_override_falls_back_to_legacy_slot_only_without_matching_instance() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "anthropic-work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("anthropic-work".to_string());
+        config.providers_mut().gemini = None;
+
+        select_provider_override(&mut config, "GEMINI");
+        assert!(config.default_provider_instance.is_none());
+        assert_eq!(config.provider, "gemini");
+        apply_api_key(&mut config, "gemini-sdk-key").unwrap();
+        assert_eq!(
+            config
+                .providers()
+                .gemini
+                .as_ref()
+                .map(|provider| provider.api_key.as_str()),
+            Some("gemini-sdk-key")
         );
     }
 

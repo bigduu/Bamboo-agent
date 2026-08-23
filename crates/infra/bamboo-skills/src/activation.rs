@@ -62,8 +62,10 @@ pub enum WorkflowActivationStatus {
     Deactivated,
 }
 
-/// Durable, public-safe active workflow metadata. The immutable payload is
-/// stored separately under [`ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY`].
+/// Durable runtime activation metadata. This includes caller arguments and
+/// dynamic provider context and must not be serialized directly at a public
+/// API boundary. The immutable bundle payload is stored separately under
+/// [`ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActiveWorkflow {
     pub id: String,
@@ -171,6 +173,192 @@ pub struct DynamicContextBlock {
 }
 
 pub type DynamicContextCache = BTreeMap<String, DynamicContextBlock>;
+
+/// Persist one exact, already-pinned instruction candidate before a chat turn
+/// is acknowledged. This closes the chat-to-execute restart window: the
+/// server can restore the immutable revision even if the live catalog changes
+/// or the process restarts after `POST /chat` and before `POST /execute`.
+///
+/// Every serialized value is prepared before the metadata map is mutated, so
+/// an error leaves the caller's prior runtime candidate untouched.
+pub fn persist_explicit_workflow_candidate(
+    metadata: &mut HashMap<String, String>,
+    selection: &WorkflowSelection,
+    activation: &crate::SkillActivationSelection,
+    snapshot: &SkillActivationSnapshot,
+) -> Result<(), WorkflowActivationDiagnostic> {
+    let diagnostic = |code, message: &str, recoverable| WorkflowActivationDiagnostic {
+        code,
+        message: message.to_string(),
+        recoverable,
+    };
+    let entry = match activation.catalog_entries.as_slice() {
+        [entry] if entry.id == selection.id => entry,
+        _ => {
+            return Err(diagnostic(
+                WorkflowActivationErrorCode::RevisionMissing,
+                "selected workflow is unavailable or disabled",
+                true,
+            ));
+        }
+    };
+    if entry.status != crate::WorkflowStatus::Valid {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::RevisionMissing,
+            "selected workflow is invalid",
+            true,
+        ));
+    }
+    if entry.source != selection.source {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::SourceMismatch,
+            "selected workflow source changed; refresh the catalog",
+            true,
+        ));
+    }
+    if entry.revision != selection.revision {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::RevisionMismatch,
+            "selected workflow revision changed; refresh the catalog",
+            true,
+        ));
+    }
+    if entry.kind != WorkflowKind::Instruction {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::InvalidSelection,
+            "orchestration workflows must be started through the Workflow Run API",
+            false,
+        ));
+    }
+    if entry.invocation_policy["explicit"].as_bool() != Some(true) {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::ManualOnly,
+            "selected workflow does not allow explicit activation",
+            false,
+        ));
+    }
+    if let Err(error) = bamboo_domain::validate_schema(&entry.argument_schema, &selection.args) {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::InvalidSelection,
+            &format!("workflow arguments do not match the catalog schema: {error}"),
+            true,
+        ));
+    }
+    let Some(snapshot_entry) = snapshot.skills.get(&selection.id) else {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::SnapshotUnavailable,
+            "pinned workflow snapshot is missing the selected definition",
+            true,
+        ));
+    };
+    if snapshot.skills.len() != 1
+        || snapshot_entry.revision != selection.revision
+        || snapshot_entry.catalog_entry != *entry
+    {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::RevisionMismatch,
+            "pinned workflow snapshot does not match the selected catalog identity",
+            true,
+        ));
+    }
+
+    use crate::runtime_metadata::{
+        SKILL_RUNTIME_ACTIVATION_ERROR_KEY, SKILL_RUNTIME_ACTIVATION_GENERATION_KEY,
+        SKILL_RUNTIME_PINNED_SNAPSHOT_KEY, SKILL_RUNTIME_SELECTED_CATALOG_KEY,
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY,
+        SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY, SKILL_RUNTIME_SELECTION_COUNT_KEY,
+        SKILL_RUNTIME_SELECTION_SOURCE_KEY, SKILL_RUNTIME_SELECTION_TRACE_KEY,
+    };
+    let snapshot_json = serde_json::to_string(snapshot).map_err(|_| {
+        diagnostic(
+            WorkflowActivationErrorCode::SnapshotUnavailable,
+            "pinned workflow snapshot could not be serialized",
+            true,
+        )
+    })?;
+    if snapshot_json.len() > MAX_DURABLE_WORKFLOW_ACTIVATION_BYTES {
+        return Err(diagnostic(
+            WorkflowActivationErrorCode::SnapshotTooLarge,
+            "selected workflow snapshot exceeds the durable session limit",
+            true,
+        ));
+    }
+    let catalog_json = serde_json::to_string(&activation.catalog_entries).map_err(|_| {
+        diagnostic(
+            WorkflowActivationErrorCode::SnapshotUnavailable,
+            "selected workflow catalog identity could not be serialized",
+            true,
+        )
+    })?;
+    let selected_ids = vec![selection.id.clone()];
+    let selected_ids_json = serde_json::to_string(&selected_ids).map_err(|_| {
+        diagnostic(
+            WorkflowActivationErrorCode::SnapshotUnavailable,
+            "selected workflow id could not be serialized",
+            true,
+        )
+    })?;
+    let revisions_json =
+        serde_json::to_string(&activation.descriptor.skill_revisions).map_err(|_| {
+            diagnostic(
+                WorkflowActivationErrorCode::SnapshotUnavailable,
+                "selected workflow revision map could not be serialized",
+                true,
+            )
+        })?;
+    let diagnostic_json = serde_json::to_string(&activation.catalog_diagnostic).map_err(|_| {
+        diagnostic(
+            WorkflowActivationErrorCode::SnapshotUnavailable,
+            "selected workflow catalog diagnostic could not be serialized",
+            true,
+        )
+    })?;
+    let trace_json = serde_json::json!({
+        "source": "explicit",
+        "selected_skill_ids": selected_ids,
+        "selected_skill_mode": activation.descriptor.selected_skill_mode,
+        "request_hint_present": false
+    })
+    .to_string();
+
+    metadata.insert(
+        SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    metadata.insert(SKILL_RUNTIME_SELECTED_CATALOG_KEY.to_string(), catalog_json);
+    metadata.insert(
+        WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY.to_string(),
+        diagnostic_json,
+    );
+    metadata.insert(SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(), snapshot_json);
+    metadata.insert(
+        SKILL_RUNTIME_SELECTION_COUNT_KEY.to_string(),
+        "1".to_string(),
+    );
+    metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        selected_ids_json,
+    );
+    metadata.insert(
+        SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.to_string(),
+        activation.descriptor.catalog_revision.to_string(),
+    );
+    metadata.insert(
+        SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.to_string(),
+        revisions_json,
+    );
+    metadata.insert(SKILL_RUNTIME_SELECTION_TRACE_KEY.to_string(), trace_json);
+    if let Some(mode) = activation.descriptor.selected_skill_mode.as_ref() {
+        metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY.to_string(),
+            mode.clone(),
+        );
+    } else {
+        metadata.remove(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY);
+    }
+    metadata.remove(SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
+    Ok(())
+}
 
 /// Record activation only after `load_skill` has returned the pinned payload.
 /// This is shared by explicit preload and model-driven automatic activation.
@@ -358,7 +546,8 @@ mod tests {
         SKILL_RUNTIME_SELECTION_SOURCE_KEY,
     };
     use crate::{
-        SkillActivationSnapshotEntry, SkillDefinition, WorkflowCatalogEntry, WorkflowStatus,
+        SkillActivationDescriptor, SkillActivationSelection, SkillActivationSnapshotEntry,
+        SkillDefinition, WorkflowCatalogEntry, WorkflowStatus,
     };
 
     fn entry(id: &str, revision: u64) -> WorkflowCatalogEntry {
@@ -369,6 +558,7 @@ mod tests {
             kind: WorkflowKind::Instruction,
             source: WorkflowSource::Project,
             revision,
+            content_digest: "test-digest".to_string(),
             version: "1".to_string(),
             invocation_policy: serde_json::json!({"explicit": true, "automatic": true}),
             argument_schema: serde_json::json!({"type": "object"}),
@@ -526,5 +716,69 @@ mod tests {
         )
         .expect("valid unchanged candidate snapshot");
         assert_eq!(unchanged.skills["oversized"].revision, 11);
+    }
+
+    #[test]
+    fn explicit_candidate_rejects_invalid_arguments_without_metadata_mutation() {
+        let mut selected = entry("review", 13);
+        selected.argument_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"depth": {"type": "integer"}},
+            "required": ["depth"],
+            "additionalProperties": false
+        });
+        let descriptor = SkillActivationDescriptor {
+            catalog_revision: 71,
+            skill_revisions: BTreeMap::from([("review".to_string(), 13)]),
+            selected_skill_mode: Some("explicit".to_string()),
+        };
+        let activation = SkillActivationSelection {
+            skills: vec![snapshot_entry(selected.clone(), BTreeMap::new()).definition],
+            catalog_entries: vec![selected.clone()],
+            catalog_diagnostic: WorkflowCatalogDiagnostic {
+                total_candidates: 1,
+                advertised_candidates: 1,
+                initial_chars: 128,
+                final_chars: 128,
+                char_budget: 1024,
+                token_budget: 256,
+                compressed_descriptions: false,
+                shortlisted: false,
+                omitted_ids: Vec::new(),
+            },
+            descriptor,
+        };
+        let snapshot = SkillActivationSnapshot {
+            catalog_revision: 71,
+            selected_skill_mode: Some("explicit".to_string()),
+            skills: BTreeMap::from([(
+                "review".to_string(),
+                snapshot_entry(selected, BTreeMap::new()),
+            )]),
+        };
+        let selection = WorkflowSelection {
+            id: "review".to_string(),
+            source: WorkflowSource::Project,
+            revision: 13,
+            args: serde_json::json!({"depth": "deep"}),
+        };
+        let mut metadata = HashMap::from([
+            ("preserve".to_string(), "exact".to_string()),
+            (
+                SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+                "prior".to_string(),
+            ),
+        ]);
+        let before = metadata.clone();
+
+        let diagnostic =
+            persist_explicit_workflow_candidate(&mut metadata, &selection, &activation, &snapshot)
+                .expect_err("invalid arguments fail before metadata publication");
+
+        assert_eq!(
+            diagnostic.code,
+            WorkflowActivationErrorCode::InvalidSelection
+        );
+        assert_eq!(metadata, before);
     }
 }

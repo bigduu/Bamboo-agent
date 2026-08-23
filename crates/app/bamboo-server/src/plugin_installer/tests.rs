@@ -62,6 +62,29 @@ fn mcp_manifest_json(id: &str, version: &str, mcp_ids: &[&str]) -> String {
     .to_string()
 }
 
+fn restartable_mcp_manifest_json(id: &str, version: &str, python: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "name": "Restartable MCP Plugin",
+        "version": version,
+        "provides": {
+            "mcp_servers": [{
+                "id": "restartable-mcp",
+                "transport": {
+                    "type": "stdio",
+                    "command": python,
+                    "args": [
+                        "${plugin_dir}/mcp-fixture.py",
+                        "${plugin_dir}/starts.log",
+                        "${plugin_dir}/generation.txt"
+                    ]
+                }
+            }]
+        }
+    })
+    .to_string()
+}
+
 /// `command: "${platform_bin}"` resolves to `<plugin_dir>/bin/<platform>/<id>`,
 /// which none of these tests ever create on disk — `ServiceManager::start_service`
 /// therefore fails fast (`ENOENT`) exactly like `NONEXISTENT_COMMAND` does for
@@ -430,6 +453,124 @@ async fn upgrade_deregisters_mcp_server_dropped_by_the_new_version() {
         listed[0].registered.mcp_server_ids,
         vec!["alpha".to_string()]
     );
+}
+
+#[tokio::test]
+async fn upgrade_restarts_owned_mcp_when_effective_config_is_unchanged() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let python = ["python3", "python"]
+        .into_iter()
+        .find(|command| {
+            std::process::Command::new(command)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("a Python interpreter is required for the MCP restart fixture");
+    let plugin_dir = root.path().join("plugins").join("restartable-mcp-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    tokio::fs::write(
+        plugin_dir.join("mcp-fixture.py"),
+        r#"import json
+import sys
+
+generation = open(sys.argv[2], encoding="utf-8").read().strip()
+with open(sys.argv[1], "a", encoding="utf-8") as marker:
+    marker.write(generation + "\n")
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "server/discover":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }), flush=True)
+        continue
+    if request.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "plugin-restart-fixture", "version": generation},
+        }
+    elif request.get("method") == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(plugin_dir.join("generation.txt"), "v1")
+        .await
+        .unwrap();
+
+    let v1_json = restartable_mcp_manifest_json("restartable-mcp-plugin", "1.0.0", python);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v1_json)
+        .await
+        .unwrap();
+    let v1_manifest = PluginManifest::parse_str(&v1_json).unwrap();
+    installer
+        .install(
+            &v1_manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install v1 and start its MCP runtime");
+    assert_eq!(
+        tokio::fs::read_to_string(plugin_dir.join("starts.log"))
+            .await
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["v1"]
+    );
+
+    tokio::fs::write(plugin_dir.join("generation.txt"), "v2")
+        .await
+        .unwrap();
+    let v2_json = restartable_mcp_manifest_json("restartable-mcp-plugin", "2.0.0", python);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v2_json)
+        .await
+        .unwrap();
+    let v2_manifest = PluginManifest::parse_str(&v2_json).unwrap();
+    installer
+        .install(
+            &v2_manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+        )
+        .await
+        .expect("upgrade must replace the same-config MCP runtime");
+
+    assert_eq!(
+        tokio::fs::read_to_string(plugin_dir.join("starts.log"))
+            .await
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["v1", "v2"],
+        "the upgraded bundle must be loaded by a fresh MCP process"
+    );
+    assert!(state
+        .mcp_manager
+        .get_server_info("restartable-mcp")
+        .is_some());
+    state.mcp_manager.shutdown_all().await;
 }
 
 // ---------------------------------------------------------------------

@@ -1,8 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
+use crate::catalog::{
+    entry_from_skill, parse_bundle_metadata_bytes, workflow_catalog_content_digest, BundleMetadata,
+    WorkflowCatalogEntry,
+};
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
+use crate::store::storage::SkillDirectorySource;
 use crate::types::{SkillError, SkillResult};
 
 include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
@@ -10,6 +17,88 @@ include!(concat!(env!("OUT_DIR"), "/builtin_skills_embedded.rs"));
 pub struct BuiltinSkillBundle {
     pub skill: crate::types::SkillDefinition,
     pub files: HashMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltinSkillFile {
+    pub bytes: Vec<u8>,
+    pub executable: bool,
+}
+
+/// Exact, sorted file tree used by fresh clone publication. `SKILL.md` is
+/// rendered from the parsed embedded definition so the copied bytes match the
+/// canonical builtin materialization rather than a caller-provided body.
+pub fn builtin_clone_files(
+    bundle: &BuiltinSkillBundle,
+) -> SkillResult<BTreeMap<String, BuiltinSkillFile>> {
+    let mut files = bundle
+        .files
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.clone(),
+                BuiltinSkillFile {
+                    bytes: bytes.clone(),
+                    executable: path.starts_with("scripts/"),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    files.insert(
+        "SKILL.md".to_string(),
+        BuiltinSkillFile {
+            bytes: render_skill_markdown(&bundle.skill)?.into_bytes(),
+            executable: false,
+        },
+    );
+    Ok(files)
+}
+
+/// Stable identity for the exact bytes and Unix executable class copied by the
+/// publication protocol. Framing keeps path/content boundaries unambiguous.
+pub fn builtin_clone_bundle_digest(files: &BTreeMap<String, BuiltinSkillFile>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo.workflow-clone-bundle.v1\0");
+    for (path, file) in files {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path.as_bytes());
+        digest.update([u8::from(file.executable)]);
+        digest.update((file.bytes.len() as u64).to_be_bytes());
+        digest.update(&file.bytes);
+    }
+    hex::encode(digest.finalize())
+}
+
+/// Rebuild the metadata-only identity of one embedded builtin without relying
+/// on the current catalog winner. Clone recovery uses this when a deleted user
+/// generation is still retained as last-known-good and shadows the builtin.
+pub fn builtin_workflow_catalog_entry(
+    bundle: &BuiltinSkillBundle,
+    revision: u64,
+) -> SkillResult<WorkflowCatalogEntry> {
+    let metadata = if let Some(bytes) = bundle.files.get("workflow.yaml") {
+        parse_bundle_metadata_bytes("workflow.yaml", bytes, true)
+    } else if let Some(bytes) = bundle.files.get("agents/bamboo.yaml") {
+        parse_bundle_metadata_bytes("agents/bamboo.yaml", bytes, false)
+    } else {
+        Ok(BundleMetadata::default())
+    }
+    .map_err(SkillError::Validation)?;
+    let mut entry = entry_from_skill(
+        &bundle.skill,
+        SkillDirectorySource::Builtin,
+        revision,
+        metadata,
+    );
+    entry.content_digest = workflow_catalog_content_digest(
+        &entry,
+        Some(&bundle.skill),
+        bundle
+            .files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    );
+    Ok(entry)
 }
 
 /// Archive the pre-catalog global materialization only when every file proves

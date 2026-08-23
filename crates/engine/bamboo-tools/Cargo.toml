@@ -28,6 +28,7 @@ thiserror = "2"
 anyhow = "1"
 regex = "1"
 dashmap = "6"
+sha2 = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 walkdir = "2"
 globset = "0.4"
@@ -41,6 +42,7 @@ colored = "2"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }

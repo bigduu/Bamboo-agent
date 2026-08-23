@@ -15,7 +15,7 @@ use actix_web::web;
 use bamboo_agent_core::storage::Storage as _;
 use bamboo_agent_core::{Message, Role, Session, SessionKind};
 use bamboo_server::app_state::AppState;
-use bamboo_server::handlers::agent::execute::{handler as execute_handler, ExecuteRequest};
+use bamboo_server::handlers::agent::execute::{handle_execute, ExecuteRequest};
 use bamboo_server::handlers::agent::respond::{submit_response, RespondRequest};
 use bamboo_tools::permission::PermissionMode;
 
@@ -334,6 +334,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             }
             let mut session = Session::new(uuid::Uuid::new_v4().to_string(), String::new());
             session.title = title;
+            session.title_generated = true;
             if let Some(project_id) = requested_project.as_ref() {
                 session.set_project_id_meta(project_id.to_string());
             }
@@ -482,9 +483,9 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // inventing behavior the API doesn't back. `--timeout` IS added, but as a
     // client-side wall-clock cutoff (reuses the Ctrl-C cancellation path
     // below) rather than a request field, for the same reason.
-    let response = execute_handler(
+    let response = handle_execute(
         data.clone(),
-        web::Path::from(session_id.clone()),
+        session_id.clone(),
         web::Json(ExecuteRequest {
             model: model_selection.model.clone(),
             provider: model_selection.provider.clone(),
@@ -633,6 +634,7 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             web::Path::from(session_id.clone()),
             web::Json(RespondRequest {
                 response,
+                expected_tool_call_id: Some(pending.tool_call_id.clone()),
                 model: model_selection.model.clone(),
                 provider: model_selection.provider.clone(),
                 model_ref: model_selection.model_ref.clone(),

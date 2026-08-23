@@ -1,12 +1,5 @@
 mod catalog;
-mod endpoints;
-mod models;
-mod types;
-
-#[cfg(test)]
-mod tests;
+mod reload;
 
 pub use catalog::{fetch_catalog_models, get_provider_catalog};
-pub use endpoints::{get_provider_config, reload_provider_config, update_provider_config};
-pub use models::fetch_provider_models;
-pub use types::UpdateProviderRequest;
+pub use reload::reload_provider_config;

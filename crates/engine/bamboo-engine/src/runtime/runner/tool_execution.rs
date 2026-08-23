@@ -54,7 +54,6 @@ mod output_compressor;
 mod per_call;
 mod policy;
 mod task;
-pub(in crate::runtime::runner) use task::persist_shared_task_list;
 pub(crate) mod tool_error_collector;
 
 use loop_state::RoundExecutionState;
@@ -1700,6 +1699,63 @@ mod tests {
         assert!(session.messages.last().is_some_and(|message| message
             .content
             .contains("cannot request expanded permissions")));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::NeedClarification { .. })));
+    }
+
+    #[tokio::test]
+    async fn proactive_request_permissions_without_a_checker_completes_without_legacy_pause() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use tokio::sync::mpsc;
+
+        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let mut session = Session::new("typed-no-legacy-pause", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("typed-no-legacy-pause");
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+        let tool_call = tool_call_with_args(
+            "request_permissions",
+            json!({
+                "reason": "Need to write a protected file",
+                "permissions": [{
+                    "type": "write_file",
+                    "resource": "/protected/config.toml"
+                }]
+            }),
+        );
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "typed-no-legacy-pause",
+            "typed-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            tools.list_tools().as_slice(),
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+        assert!(!session.has_pending_question());
+        assert!(session
+            .messages
+            .last()
+            .is_some_and(|message| message.content.contains("permissions_authorized")));
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events
             .iter()

@@ -1,7 +1,27 @@
 use bamboo_agent_core::Session;
 use bamboo_config::MemoryConfig;
 
-use super::{AgentLoopConfig, PromptMemoryFlags};
+use super::{
+    normalize_auxiliary_evaluation_max_concurrency, AgentLoopConfig, PromptMemoryFlags,
+    DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY, MAX_AUXILIARY_EVALUATION_MAX_CONCURRENCY,
+};
+
+#[test]
+fn auxiliary_evaluation_concurrency_defaults_and_clamps_oversized_config() {
+    assert_eq!(
+        normalize_auxiliary_evaluation_max_concurrency(None),
+        DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY
+    );
+    assert_eq!(
+        normalize_auxiliary_evaluation_max_concurrency(Some(0)),
+        DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY
+    );
+    assert_eq!(normalize_auxiliary_evaluation_max_concurrency(Some(7)), 7);
+    assert_eq!(
+        normalize_auxiliary_evaluation_max_concurrency(Some(u64::MAX)),
+        MAX_AUXILIARY_EVALUATION_MAX_CONCURRENCY
+    );
+}
 
 #[test]
 fn agent_loop_config_model_name_defaults_to_none() {

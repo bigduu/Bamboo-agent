@@ -72,7 +72,7 @@ Follow the latest real user request and recent tool results over this block when
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextBlockType {
     /// System base identity / persona (the `base` system block).

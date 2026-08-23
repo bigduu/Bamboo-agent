@@ -43,6 +43,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::migrate_workflow),
         )
         .route(
+            "/bamboo/workflow-catalog/{workflow_id}/clone",
+            web::post().to(settings::clone_workflow),
+        )
+        .route(
             "/sessions/{session_id}/workflow-runs",
             web::post().to(workflow_runs::start),
         )
@@ -256,18 +260,6 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
         .route(
             "/bamboo/permission/diagnose",
             web::post().to(settings::diagnose_permission),
-        )
-        .route(
-            "/bamboo/settings/provider",
-            web::get().to(settings::get_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider",
-            web::post().to(settings::update_provider_config),
-        )
-        .route(
-            "/bamboo/settings/provider/models",
-            web::post().to(settings::fetch_provider_models),
         )
         .route(
             "/bamboo/settings/reload",

@@ -406,21 +406,10 @@ async fn run_schedule_job(
     );
     let session_id = session.id.clone();
     if let Some(config) = ctx.permission_config.as_ref() {
-        if let Some(workspace) = session.workspace.as_ref() {
-            config.register_session_workspace(session_id.clone(), workspace.clone());
-        }
+        config.set_session_workspace(session_id.clone(), session.workspace.clone());
         record_bamboo_runtime_permission_metadata(&mut session, config.as_ref())
             .map_err(|error| error.to_string())?;
     }
-
-    // #73: a scheduled run has no interactive human approver — mark the root so
-    // its sub-agents (which inherit the flag) decide gated actions with the
-    // off-loop model-reviewer locally instead of escalating to an absent human,
-    // which would 300s-deny.
-    session
-        .agent_runtime_state
-        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .no_human_approver = true;
 
     let mut prompt_hook_block = None;
     if let Some(user_index) = session
@@ -449,7 +438,7 @@ async fn run_schedule_job(
 
     // Persist session and index entry.
     ctx.persistence
-        .merge_save_runtime(&mut session)
+        .save_runtime_authoritative_flags(&mut session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
     if let Err(error) = ctx
@@ -551,6 +540,7 @@ async fn run_schedule_job(
 
     let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
         session_id.clone(),
+        execution_reservation.run_id().to_string(),
         session_tx.clone(),
         ctx.agent_runners.clone(),
         ctx.account_feed_inbox.clone(),

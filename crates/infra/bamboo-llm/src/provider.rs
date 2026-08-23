@@ -6,9 +6,9 @@
 use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
-use bamboo_domain::Message;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
+use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
 use std::pin::Pin;
 use thiserror::Error;
@@ -100,8 +100,8 @@ pub struct ResponsesRequestOptions {
     /// (e.g. "low", "medium", "high").
     pub text_verbosity: Option<String>,
     /// Stable affinity key for OpenAI prompt caching. Callers should provide a
-    /// privacy-preserving value; Bamboo never derives one from raw session
-    /// identity in this generic request DTO.
+    /// privacy-preserving value. The agent loop supplies a domain-separated hash,
+    /// never its raw session identity, through this generic request DTO.
     pub prompt_cache_key: Option<String>,
     /// OpenAI request-wide cache policy (currently `mode` and optional `ttl`).
     /// Kept as JSON so newly added official policy keys survive proxying.
@@ -114,6 +114,11 @@ pub struct ResponsesRequestOptions {
     /// `input_file` markers survive byte-for-byte. Agent/runtime calls leave it
     /// unset.
     pub raw_input_with_cache_breakpoints: Option<serde_json::Value>,
+    /// Internal model-context prefix epoch used only for safe wire-shape
+    /// diagnostics. It is never serialized into the upstream request.
+    pub prefix_epoch: Option<u64>,
+    /// Internal, secret-free reset reason paired with `prefix_epoch`.
+    pub prefix_reset_reason: Option<ModelContextResetReason>,
     /// Retain raw Responses protocol events alongside provider-neutral chunks.
     ///
     /// This is an internal compatibility-endpoint control, not an upstream

@@ -1,6 +1,7 @@
 //! Bamboo domain types — kernel types, session, schedule, workflow, storage models.
 
 // From bamboo-shared-types
+pub mod bounded_dedup;
 pub mod poison;
 pub mod reasoning;
 pub mod token_usage;
@@ -44,7 +45,7 @@ pub use reasoning::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 pub use schedule::*;
 pub use session::*;
 pub use storage::*;
-pub use token_usage::TokenUsage;
+pub use token_usage::{TokenUsage, MAX_DURABLE_TOKEN_COUNT};
 pub use tool_names::*;
 pub use tool_types::*;
 pub use workflow::*;

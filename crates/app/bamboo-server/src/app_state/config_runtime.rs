@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -14,6 +14,64 @@ use bamboo_mcp::{McpConfig, McpServerManager, TransportConfig};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+
+#[cfg(test)]
+struct InitialMcpApplyTestHook {
+    before: Box<dyn FnOnce() + Send + 'static>,
+    after: Box<dyn FnOnce() + Send + 'static>,
+}
+
+#[cfg(test)]
+fn initial_mcp_apply_test_hooks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, InitialMcpApplyTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, InitialMcpApplyTestHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_initial_mcp_apply_test_hook(
+    data_dir: &Path,
+    before: impl FnOnce() + Send + 'static,
+    after: impl FnOnce() + Send + 'static,
+) {
+    initial_mcp_apply_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            data_dir.to_path_buf(),
+            InitialMcpApplyTestHook {
+                before: Box::new(before),
+                after: Box::new(after),
+            },
+        );
+}
+
+#[cfg(test)]
+struct InitialMcpApplyTestCompletion(Option<Box<dyn FnOnce() + Send + 'static>>);
+
+#[cfg(test)]
+impl Drop for InitialMcpApplyTestCompletion {
+    fn drop(&mut self) {
+        if let Some(after) = self.0.take() {
+            after();
+        }
+    }
+}
+
+#[cfg(test)]
+fn begin_initial_mcp_apply_test_hook(data_dir: &Path) -> InitialMcpApplyTestCompletion {
+    let hook = initial_mcp_apply_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    let Some(hook) = hook else {
+        return InitialMcpApplyTestCompletion(None);
+    };
+    (hook.before)();
+    InitialMcpApplyTestCompletion(Some(hook.after))
+}
 
 #[cfg(test)]
 struct ClusterAfterCommitBeforeAdoptionTestHook {
@@ -172,6 +230,37 @@ fn run_generic_before_provider_publish_test_hook(data_dir: &Path) {
     }
 }
 
+#[cfg(test)]
+type ResetAfterDeleteTestHook = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(test)]
+type ResetAfterDeleteTestHooks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, ResetAfterDeleteTestHook>>;
+
+#[cfg(test)]
+fn reset_after_delete_test_hooks() -> &'static ResetAfterDeleteTestHooks {
+    static HOOKS: std::sync::OnceLock<ResetAfterDeleteTestHooks> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_reset_after_delete_test_hook(data_dir: &Path, hook: impl FnOnce() + Send + 'static) {
+    reset_after_delete_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(data_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_reset_after_delete_test_hook(data_dir: &Path) {
+    let hook = reset_after_delete_test_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(data_dir);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct FacadeRuntimeMaterialization {
     config: Config,
     failures: BTreeSet<SectionId>,
@@ -261,8 +350,8 @@ pub(super) fn load_facade_effective_config(
 }
 
 fn load_committed_effective_config(data_dir: &Path) -> Result<Config, ConfigStoreError> {
-    if bamboo_config::section_layout_is_active(data_dir)? {
-        let facade = bamboo_config::ConfigFacade::open(data_dir)?;
+    if bamboo_config::modular_authority_boundary_present(data_dir)? {
+        let facade = bamboo_config::ConfigFacade::open_or_migrate(data_dir)?;
         let config = load_facade_effective_config(&facade, data_dir);
         Ok(config)
     } else {
@@ -292,7 +381,24 @@ pub struct ConfigWatcherRuntime {
 
 struct ConfigPathChanges {
     paths: Vec<PathBuf>,
-    initial_mcp: bool,
+    initial_mcp_revision: Option<u64>,
+    startup_legacy_root: Option<bamboo_config::LegacyRootReconciliationOutcome>,
+    startup_recoveries: BTreeMap<SectionId, u64>,
+    legacy_root_retry_attempt: u8,
+}
+
+/// Owned handles needed to publish provider and MCP effects for one committed
+/// configuration generation. Keeping them together makes it explicit that a
+/// detached transaction carries one immutable publication context end to end.
+struct ConfigRuntimeEffectContext {
+    app_data_dir: PathBuf,
+    config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+    provider_registry: Arc<bamboo_llm::ProviderRegistry>,
+    provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
+    mcp_manager: Arc<McpServerManager>,
+    account_sink: Arc<bamboo_engine::events::AccountEventSink>,
+    config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
+    mcp_config_live_health: Arc<std::sync::RwLock<ConfigLiveHealth>>,
 }
 
 impl ConfigWatcherRuntime {
@@ -352,6 +458,9 @@ impl ConfigWatcherRuntime {
         // thread after aborting the async consumer, so a bounded blocking_send
         // could deadlock shutdown if its queue were full.
         let self_write_marker = watcher.self_write_marker();
+        let startup_legacy_root = config_facade
+            .as_ref()
+            .and_then(|facade| facade.take_startup_legacy_root_reconciliation());
         let (changes_tx, mut changes_rx) =
             tokio::sync::mpsc::unbounded_channel::<ConfigPathChanges>();
         let initial_changes = changes_tx.clone();
@@ -363,7 +472,10 @@ impl ConfigWatcherRuntime {
                         if changes_tx
                             .send(ConfigPathChanges {
                                 paths,
-                                initial_mcp: false,
+                                initial_mcp_revision: None,
+                                startup_legacy_root: None,
+                                startup_recoveries: BTreeMap::new(),
+                                legacy_root_retry_attempt: 0,
                             })
                             .is_err()
                         {
@@ -381,18 +493,73 @@ impl ConfigWatcherRuntime {
         // events; parse-only initial health must never be mistaken for a
         // published runtime snapshot.
         let initial_mcp_path = data_dir.join("mcp.json");
-        if initial_mcp_path.exists() {
+        let mut initial_paths = Vec::new();
+        let initial_mcp_revision = if initial_mcp_path.exists() {
+            initial_paths.push(initial_mcp_path);
+            Some(
+                config_facade
+                    .as_ref()
+                    .map(|facade| facade.registry().mcp.snapshot().revision)
+                    .unwrap_or_else(|| {
+                        mcp_health
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .revision
+                    }),
+            )
+        } else {
+            None
+        };
+        let rejected = bamboo_config::legacy_root_rejected_sections(&data_dir);
+        let startup_recoveries = match (config_facade.as_ref(), rejected.as_ref()) {
+            (Some(facade), Ok(rejected)) => {
+                durable_invalid_recoveries(&account_sink, facade, rejected)
+            }
+            _ => BTreeMap::new(),
+        };
+        if let (Some(facade), Ok(rejected)) = (config_facade.as_ref(), rejected.as_ref()) {
+            if let Ok(health) = facade.registry().health() {
+                initial_paths.extend(
+                    health
+                        .into_iter()
+                        .filter(|health| {
+                            health.status != SectionStatus::Healthy
+                                && !rejected.contains(&health.section)
+                        })
+                        .map(|health| data_dir.join(health.section.descriptor().file_name)),
+                );
+            }
+        }
+        initial_paths.extend(
+            startup_recoveries
+                .keys()
+                .map(|id| data_dir.join(id.descriptor().file_name)),
+        );
+        // Every modular watcher start performs one catch-up pass. This is the
+        // recovery seam for crashes after a canonical outbox/rejection update
+        // but before its runtime or account-feed publication. The pass is
+        // content-deduped and does not make config.json authoritative again.
+        let legacy_root_needs_reconciliation = config_facade.is_some();
+        if legacy_root_needs_reconciliation {
+            initial_paths.push(data_dir.join("config.json"));
+        }
+        if !initial_paths.is_empty() {
             let _ = initial_changes.send(ConfigPathChanges {
-                paths: vec![initial_mcp_path],
-                initial_mcp: true,
+                paths: initial_paths,
+                initial_mcp_revision,
+                startup_legacy_root,
+                startup_recoveries,
+                legacy_root_retry_attempt: 0,
             });
         }
 
         let apply_provider_health = provider_health.clone();
         let apply_mcp_health = mcp_health.clone();
+        let catchup_changes = initial_changes.clone();
         let apply_task = tokio::spawn(async move {
-            while let Some(changes) = changes_rx.recv().await {
-                let watched_sections = config_facade
+            let mut reported_root_runtime_failures = BTreeSet::<(SectionId, u64)>::new();
+            while let Some(mut changes) = changes_rx.recv().await {
+                let mut watched_sections = config_facade
                     .as_ref()
                     .map(|_| {
                         changes
@@ -406,113 +573,408 @@ impl ConfigWatcherRuntime {
                             .collect::<BTreeSet<_>>()
                     })
                     .unwrap_or_default();
-                let provider_watched = changes.paths.iter().any(|path| {
+                let direct_watched_sections = watched_sections.clone();
+                let legacy_root_watched = config_facade.is_some()
+                    && changes.paths.iter().any(|path| {
+                        matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some(
+                                "config.json"
+                                    | "config.json.bak"
+                                    | "config.json.bak.1"
+                                    | "config.json.bak.2"
+                            )
+                        )
+                    });
+                let mut provider_watched = changes.paths.iter().any(|path| {
                     path.file_name().and_then(|name| name.to_str()) == Some("providers.json")
                 });
-                let mcp_watched = changes.paths.iter().any(|path| {
+                let mut mcp_watched = changes.paths.iter().any(|path| {
                     path.file_name().and_then(|name| name.to_str()) == Some("mcp.json")
                 });
-                let ordinary_watched = watched_sections
-                    .iter()
-                    .copied()
-                    .filter(|id| !matches!(id, SectionId::Providers | SectionId::Mcp))
-                    .collect::<Vec<_>>();
-                if !provider_watched && !mcp_watched && ordinary_watched.is_empty() {
+                if !provider_watched
+                    && !mcp_watched
+                    && watched_sections.is_empty()
+                    && !legacy_root_watched
+                {
                     continue;
                 }
+
+                #[cfg(test)]
+                let _initial_mcp_apply_completion = changes
+                    .initial_mcp_revision
+                    .map(|_| begin_initial_mcp_apply_test_hook(&data_dir));
 
                 // Serialize candidate construction and publication with config
                 // writers. Otherwise a slow provider build could later publish
                 // a clone taken before an unrelated API update and clobber it.
                 let _io = config_io_lock.lock().await;
+                let mut synthetic_root_events = BTreeMap::<SectionId, ConfigSectionEvent>::new();
+                let mut pending_root_publications =
+                    BTreeMap::<SectionId, ConfigSectionEvent>::new();
+                let startup_root_batch = changes.startup_legacy_root.is_some();
+                let mut requeue_legacy_root = false;
+                let mut retry_legacy_root_publication = false;
+                let mut canonical_root_rejections = BTreeSet::new();
+                if legacy_root_watched {
+                    let reconciliation = match changes.startup_legacy_root.take() {
+                        Some(outcome) => Ok(Some(outcome)),
+                        None => {
+                            let reconcile_facade = config_facade
+                                .as_ref()
+                                .expect("legacy root watching requires a facade")
+                                .clone();
+                            tokio::task::spawn_blocking(move || {
+                                reconcile_facade.reconcile_reappeared_legacy_root()
+                            })
+                            .await
+                            .map_err(|_| {
+                                ConfigStoreError::Validation(
+                                    "legacy root reconciliation task failed".to_string(),
+                                )
+                            })
+                            .and_then(|result| result)
+                        }
+                    };
+                    match reconciliation {
+                        Ok(Some(outcome)) if !outcome.duplicate => {
+                            requeue_legacy_root = outcome.partial || startup_root_batch;
+                            for event in &outcome.committed {
+                                let section = match event {
+                                    ConfigSectionEvent::Changed { section, .. }
+                                    | ConfigSectionEvent::Invalid { section, .. }
+                                    | ConfigSectionEvent::Recovered { section, .. } => section,
+                                };
+                                if let Some(id) = SectionId::from_name(section) {
+                                    watched_sections.insert(id);
+                                    synthetic_root_events.insert(id, event.clone());
+                                    if matches!(
+                                        event,
+                                        ConfigSectionEvent::Changed { .. }
+                                            | ConfigSectionEvent::Recovered { .. }
+                                    ) {
+                                        pending_root_publications.insert(id, event.clone());
+                                    }
+                                }
+                            }
+                            if let Some(facade) = config_facade.as_ref() {
+                                for id in &outcome.recovered {
+                                    queue_legacy_root_recovery(
+                                        facade,
+                                        *id,
+                                        None,
+                                        &mut watched_sections,
+                                        &mut synthetic_root_events,
+                                    );
+                                }
+                                for rejection in outcome.rejected {
+                                    canonical_root_rejections.insert(rejection.section);
+                                    if rejection.reason
+                                        == bamboo_config::LegacyRootRejectionReason::RevisionConflict
+                                    {
+                                        watched_sections.insert(rejection.section);
+                                    }
+                                    if let Some(event) = legacy_root_rejection_event(
+                                        facade,
+                                        rejection.section,
+                                        rejection.reason.diagnostic(),
+                                        startup_root_batch,
+                                    ) {
+                                        publish_registry_event(&account_sink, &event).await;
+                                    }
+                                }
+                            }
+                            if outcome.partial {
+                                tracing::warn!(
+                                    "legacy config root changed during reconciliation; awaiting the newer generation"
+                                );
+                            }
+                        }
+                        Ok(Some(outcome)) => {
+                            requeue_legacy_root = outcome.partial || startup_root_batch;
+                            // Another facade/process may have committed this
+                            // exact root while this process registry still
+                            // lags. Keep its outbox pending and synthesize only
+                            // when the process already owns the exact healthy
+                            // revision; otherwise the normal reload path must
+                            // install it before the durable event is acked.
+                            if let Some(facade) = config_facade.as_ref() {
+                                for id in &outcome.recovered {
+                                    queue_legacy_root_recovery(
+                                        facade,
+                                        *id,
+                                        None,
+                                        &mut watched_sections,
+                                        &mut synthetic_root_events,
+                                    );
+                                }
+                                for event in &outcome.committed {
+                                    let (section, revision) = match event {
+                                        ConfigSectionEvent::Changed { section, revision }
+                                        | ConfigSectionEvent::Recovered { section, revision } => {
+                                            (section, *revision)
+                                        }
+                                        ConfigSectionEvent::Invalid { .. } => continue,
+                                    };
+                                    let Some(id) = SectionId::from_name(section) else {
+                                        continue;
+                                    };
+                                    watched_sections.insert(id);
+                                    pending_root_publications.insert(id, event.clone());
+                                    if facade.registry().envelope_value(id).is_ok_and(|envelope| {
+                                        envelope.revision == revision
+                                            && envelope.status == SectionStatus::Healthy
+                                    }) {
+                                        synthetic_root_events.insert(id, event.clone());
+                                    }
+                                }
+                                for rejection in outcome.rejected {
+                                    canonical_root_rejections.insert(rejection.section);
+                                    if rejection.reason
+                                        == bamboo_config::LegacyRootRejectionReason::RevisionConflict
+                                    {
+                                        watched_sections.insert(rejection.section);
+                                    }
+                                    if let Some(event) = legacy_root_rejection_event(
+                                        facade,
+                                        rejection.section,
+                                        rejection.reason.diagnostic(),
+                                        startup_root_batch,
+                                    ) {
+                                        publish_registry_event(&account_sink, &event).await;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if bamboo_config::modular_authority_boundary_present(&data_dir)
+                                .unwrap_or(false)
+                            {
+                                if let Some(facade) = config_facade.as_ref() {
+                                    if let Some(event) = facade.registry().mark_runtime_degraded(
+                                        SectionId::Core,
+                                        "completed modular configuration reconciliation is unavailable",
+                                    ) {
+                                        publish_registry_event(&account_sink, &event).await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(facade) = config_facade.as_ref() {
+                                if let Some(event) = facade.registry().mark_runtime_degraded(
+                                    SectionId::Core,
+                                    "legacy config root reconciliation is unavailable",
+                                ) {
+                                    publish_registry_event(&account_sink, &event).await;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(facade) = config_facade.as_ref() {
+                        for (id, event) in pending_root_publications.clone() {
+                            let revision = config_section_event_revision(&event);
+                            if !pending_root_publication_matches_fresh_durable(
+                                &data_dir, facade, id, revision,
+                            ) {
+                                // A typed writer advanced after root
+                                // reconciliation released the migration lock.
+                                // Never materialize or journal the superseded
+                                // root revision. Catch the typed generation up
+                                // now, then requeue the root so its durable
+                                // outbox is rejected as a revision conflict.
+                                pending_root_publications.remove(&id);
+                                synthetic_root_events.remove(&id);
+                                watched_sections.insert(id);
+                                requeue_legacy_root = true;
+                            }
+                        }
+                    }
+                    provider_watched |= watched_sections.contains(&SectionId::Providers);
+                    mcp_watched |= watched_sections.contains(&SectionId::Mcp);
+                }
                 if let Some(facade) = config_facade.as_ref() {
-                    reload_and_apply_ordinary_sections(
+                    for (id, revision) in std::mem::take(&mut changes.startup_recoveries) {
+                        if !canonical_root_rejections.contains(&id) {
+                            queue_legacy_root_recovery(
+                                facade,
+                                id,
+                                Some(revision),
+                                &mut watched_sections,
+                                &mut synthetic_root_events,
+                            );
+                        }
+                    }
+                    provider_watched |= watched_sections.contains(&SectionId::Providers);
+                    mcp_watched |= watched_sections.contains(&SectionId::Mcp);
+                }
+                // If notify coalesced the compatibility root and a later
+                // direct typed generation, process the root's exact adopted
+                // snapshot first, then queue one bounded catch-up pass. The
+                // next pass has no synthetic root event and therefore cannot
+                // recursively requeue itself.
+                let catchup_paths = synthetic_root_events
+                    .keys()
+                    .filter(|id| startup_root_batch || direct_watched_sections.contains(id))
+                    .map(|id| data_dir.join(id.descriptor().file_name))
+                    .collect::<Vec<_>>();
+                let ordinary_watched = watched_sections
+                    .iter()
+                    .copied()
+                    .filter(|id| !matches!(id, SectionId::Providers | SectionId::Mcp))
+                    .collect::<Vec<_>>();
+                if let Some(facade) = config_facade.as_ref() {
+                    retry_legacy_root_publication |= reload_and_apply_ordinary_sections(
                         &data_dir,
                         &config,
                         facade,
                         &account_sink,
                         ordinary_watched,
+                        OrdinarySectionReloadState {
+                            synthetic_events: &mut synthetic_root_events,
+                            pending_root_publications: &mut pending_root_publications,
+                            reported_root_runtime_failures: &mut reported_root_runtime_failures,
+                        },
                     )
                     .await;
                 }
                 if provider_watched {
                     if let Some(facade) = config_facade.as_ref() {
                         wait_for_section_file_settle(&data_dir, SectionId::Providers).await;
-                        if let Some(event) =
-                            facade.registry().reload_if_changed(SectionId::Providers)
+                        if let Some(observed) = synthetic_root_events
+                            .remove(&SectionId::Providers)
+                            .or_else(|| facade.registry().reload_if_changed(SectionId::Providers))
                         {
-                            if matches!(event, ConfigSectionEvent::Invalid { .. }) {
-                                publish_section_failure(
-                                &apply_provider_health,
+                            if let Some(event) = pending_root_publication_event(
+                                &data_dir,
+                                facade,
                                 &account_sink,
-                                "providers",
-                                facade.registry().providers.snapshot().status,
-                                "provider section is invalid; retaining last-known-good runtime"
-                                    .to_string(),
-                            );
-                            } else {
-                                self_write_marker.mark_self_write(provider_store.path());
-                                let materialized =
-                                    materialize_facade_effective_config(facade, &data_dir);
-                                if materialized.failures.contains(&SectionId::Providers) {
-                                    facade.registry().mark_runtime_degraded(
-                                    SectionId::Providers,
-                                    "provider credential hydration failed; retaining last-known-good runtime",
-                                );
+                                &pending_root_publications,
+                                SectionId::Providers,
+                                observed,
+                            ) {
+                                if matches!(event, ConfigSectionEvent::Invalid { .. }) {
                                     publish_section_failure(
-                                    &apply_provider_health,
-                                    &account_sink,
-                                    "providers",
-                                    SectionStatus::Degraded,
-                                    "provider credential hydration failed; retaining last-known-good runtime"
-                                        .to_string(),
-                                );
+                                        &apply_provider_health,
+                                        &account_sink,
+                                        "providers",
+                                        facade.registry().providers.snapshot().status,
+                                        "provider section is invalid; retaining last-known-good runtime"
+                                            .to_string(),
+                                    )
+                                    .await;
                                 } else {
-                                    let mut candidate = config.read().await.clone();
-                                    apply_runtime_section(
-                                        SectionId::Providers,
-                                        &materialized.config,
-                                        &mut candidate,
-                                    );
-                                    match prepare_provider_candidate(candidate, &data_dir).await {
-                                        Ok((candidate, registry, next_provider)) => {
-                                            let mut live_config = config.write().await;
-                                            let mut live_provider = provider.write().await;
-                                            let recovered =
-                                                section_is_unhealthy(&apply_provider_health);
-                                            candidate.publish_env_vars();
-                                            *live_config = candidate;
-                                            provider_registry.replace_with(registry);
-                                            *live_provider = next_provider;
-                                            drop(live_provider);
-                                            drop(live_config);
-                                            let revision =
-                                                facade.registry().providers.snapshot().revision;
-                                            publish_section_success(
-                                                &apply_provider_health,
-                                                &account_sink,
-                                                "providers",
-                                                data_dir.join("providers.json"),
-                                                recovered,
-                                                Some(revision),
-                                            );
-                                        }
-                                        Err(_) => {
-                                            facade.registry().mark_runtime_degraded(
+                                    self_write_marker.mark_self_write(provider_store.path());
+                                    let materialized =
+                                        materialize_facade_effective_config(facade, &data_dir);
+                                    if materialized.failures.contains(&SectionId::Providers) {
+                                        retry_legacy_root_publication |=
+                                        publish_staged_facade_section_failure(
+                                            &data_dir,
+                                            facade,
                                             SectionId::Providers,
-                                            "provider runtime initialization failed; retaining last-known-good runtime",
+                                            "provider credential hydration failed; retaining last-known-good runtime",
+                                            StagedFacadeSectionFailureContext {
+                                                health: &apply_provider_health,
+                                                account_sink: &account_sink,
+                                                section: "providers",
+                                                pending_root_publications: &pending_root_publications,
+                                            },
+                                        )
+                                        .await;
+                                    } else {
+                                        let mut candidate = config.read().await.clone();
+                                        apply_runtime_section(
+                                            SectionId::Providers,
+                                            &materialized.config,
+                                            &mut candidate,
                                         );
-                                            publish_section_failure(
-                                            &apply_provider_health,
-                                            &account_sink,
-                                            "providers",
-                                            SectionStatus::Degraded,
-                                            "provider runtime initialization failed; retaining last-known-good runtime"
-                                                .to_string(),
-                                        );
+                                        match prepare_provider_candidate(candidate, &data_dir).await
+                                        {
+                                            Ok((candidate, registry, next_provider)) => {
+                                                let mut live_config = config.write().await;
+                                                let mut live_provider = provider.write().await;
+                                                let recovered =
+                                                    section_is_unhealthy(&apply_provider_health);
+                                                candidate.publish_env_vars();
+                                                *live_config = candidate;
+                                                provider_registry.replace_with(registry);
+                                                *live_provider = next_provider;
+                                                drop(live_provider);
+                                                drop(live_config);
+                                                let revision =
+                                                    facade.registry().providers.snapshot().revision;
+                                                if pending_root_publications
+                                                    .get(&SectionId::Providers)
+                                                    .is_some_and(|event| {
+                                                        config_section_event_revision(event)
+                                                            == revision
+                                                    })
+                                                {
+                                                    set_live_health_revision(
+                                                        &apply_provider_health,
+                                                        revision,
+                                                        Some((
+                                                            data_dir.join("providers.json"),
+                                                            SectionSourceKind::File,
+                                                        )),
+                                                    );
+                                                    retry_legacy_root_publication |=
+                                                        publish_registry_event_with_root_ack(
+                                                            &data_dir,
+                                                            &account_sink,
+                                                            &mut pending_root_publications,
+                                                            SectionId::Providers,
+                                                            &event,
+                                                        )
+                                                        .await;
+                                                } else if matches!(
+                                                    event,
+                                                    ConfigSectionEvent::Recovered { .. }
+                                                ) {
+                                                    set_live_health_revision(
+                                                        &apply_provider_health,
+                                                        revision,
+                                                        Some((
+                                                            data_dir.join("providers.json"),
+                                                            SectionSourceKind::File,
+                                                        )),
+                                                    );
+                                                    publish_registry_event(&account_sink, &event)
+                                                        .await;
+                                                } else {
+                                                    publish_section_success(
+                                                        &apply_provider_health,
+                                                        &account_sink,
+                                                        "providers",
+                                                        data_dir.join("providers.json"),
+                                                        recovered,
+                                                        Some(revision),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                retry_legacy_root_publication |=
+                                                publish_staged_facade_section_failure(
+                                                    &data_dir,
+                                                    facade,
+                                                    SectionId::Providers,
+                                                    "provider runtime initialization failed; retaining last-known-good runtime",
+                                                    StagedFacadeSectionFailureContext {
+                                                        health: &apply_provider_health,
+                                                        account_sink: &account_sink,
+                                                        section: "providers",
+                                                        pending_root_publications: &pending_root_publications,
+                                                    },
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                 }
+                            } else {
+                                retry_legacy_root_publication = true;
                             }
                         }
                     } else {
@@ -550,15 +1012,19 @@ impl ConfigWatcherRuntime {
                                     data_dir.join("providers.json"),
                                     recovered,
                                     Some(candidate.revision),
-                                );
+                                )
+                                .await;
                             }
-                            Err(error) => publish_section_failure(
-                                &apply_provider_health,
-                                &account_sink,
-                                "providers",
-                                candidate_error_status(&error.kind),
-                                error.message,
-                            ),
+                            Err(error) => {
+                                publish_section_failure(
+                                    &apply_provider_health,
+                                    &account_sink,
+                                    "providers",
+                                    candidate_error_status(&error.kind),
+                                    error.message,
+                                )
+                                .await
+                            }
                         }
                     }
                 }
@@ -566,104 +1032,174 @@ impl ConfigWatcherRuntime {
                 if mcp_watched {
                     if let Some(facade) = config_facade.as_ref() {
                         wait_for_section_file_settle(&data_dir, SectionId::Mcp).await;
-                        let event =
-                            facade
-                                .registry()
-                                .reload_if_changed(SectionId::Mcp)
-                                .or_else(|| {
-                                    changes.initial_mcp.then(|| ConfigSectionEvent::Changed {
-                                        section: "mcp".to_string(),
-                                        revision: facade.registry().mcp.snapshot().revision,
-                                    })
-                                });
-                        let Some(event) = event else {
-                            continue;
-                        };
-                        if matches!(event, ConfigSectionEvent::Invalid { .. }) {
-                            publish_section_failure(
-                                &apply_mcp_health,
+                        let startup_root_mcp = synthetic_root_events.contains_key(&SectionId::Mcp);
+                        let synthetic = synthetic_root_events.remove(&SectionId::Mcp);
+                        let reloaded = synthetic
+                            .is_none()
+                            .then(|| facade.registry().reload_if_changed(SectionId::Mcp))
+                            .flatten();
+                        let forced_initial_mcp = synthetic.is_none()
+                            && reloaded.is_none()
+                            && changes.initial_mcp_revision.is_some_and(|revision| {
+                                facade.registry().mcp.snapshot().revision == revision
+                            });
+                        let event = synthetic.or(reloaded).or_else(|| {
+                            forced_initial_mcp.then(|| ConfigSectionEvent::Changed {
+                                section: "mcp".to_string(),
+                                revision: facade.registry().mcp.snapshot().revision,
+                            })
+                        });
+                        if let Some(observed) = event {
+                            if let Some(event) = pending_root_publication_event(
+                                &data_dir,
+                                facade,
                                 &account_sink,
-                                "mcp",
-                                facade.registry().mcp.snapshot().status,
-                                "MCP section is invalid; retaining last-known-good runtime"
-                                    .to_string(),
-                            );
-                        } else {
-                            self_write_marker.mark_self_write(mcp_store.path());
-                            let materialized =
-                                materialize_facade_effective_config(facade, &data_dir);
-                            if materialized.failures.contains(&SectionId::Mcp) {
-                                facade.registry().mark_runtime_degraded(
-                                    SectionId::Mcp,
-                                    "MCP credential hydration failed; retaining last-known-good runtime",
-                                );
-                                publish_section_failure(
-                                    &apply_mcp_health,
-                                    &account_sink,
-                                    "mcp",
-                                    SectionStatus::Degraded,
-                                    "MCP credential hydration failed; retaining last-known-good runtime"
-                                        .to_string(),
-                                );
-                                continue;
-                            }
-                            let next_mcp = materialized.config.mcp.clone();
-                            let publish_config = config.clone();
-                            match mcp_manager
-                                .reconcile_from_config_transactional_after(
-                                    &materialized.config.mcp,
-                                    || async move {
-                                        publish_config.write().await.mcp = next_mcp;
-                                        Ok(())
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    let recovered = section_is_unhealthy(&apply_mcp_health);
-                                    let snapshot = facade.registry().mcp.snapshot();
-                                    let revision = snapshot.revision;
-                                    if changes.initial_mcp
-                                        && snapshot.status == SectionStatus::Healthy
-                                    {
-                                        // Startup reconciliation makes the
-                                        // already-materialized section live in
-                                        // the MCP manager; it is not a config
-                                        // mutation and must not consume an
-                                        // account-feed sequence number.
-                                        set_live_health_revision(
-                                            &apply_mcp_health,
-                                            revision,
-                                            Some((
-                                                data_dir.join("mcp.json"),
-                                                SectionSourceKind::File,
-                                            )),
-                                        );
-                                    } else {
-                                        publish_section_success(
-                                            &apply_mcp_health,
-                                            &account_sink,
-                                            "mcp",
-                                            data_dir.join("mcp.json"),
-                                            recovered,
-                                            Some(revision),
-                                        );
-                                    }
-                                }
-                                Err(_) => {
-                                    facade.registry().mark_runtime_degraded(
-                                        SectionId::Mcp,
-                                        "MCP runtime initialization failed; retaining last-known-good runtime",
-                                    );
+                                &pending_root_publications,
+                                SectionId::Mcp,
+                                observed,
+                            ) {
+                                if matches!(event, ConfigSectionEvent::Invalid { .. }) {
                                     publish_section_failure(
                                         &apply_mcp_health,
                                         &account_sink,
                                         "mcp",
-                                        SectionStatus::Degraded,
-                                        "MCP runtime initialization failed; retaining last-known-good runtime"
+                                        facade.registry().mcp.snapshot().status,
+                                        "MCP section is invalid; retaining last-known-good runtime"
                                             .to_string(),
                                     )
+                                    .await;
+                                } else {
+                                    self_write_marker.mark_self_write(mcp_store.path());
+                                    let materialized =
+                                        materialize_facade_effective_config(facade, &data_dir);
+                                    if materialized.failures.contains(&SectionId::Mcp) {
+                                        retry_legacy_root_publication |=
+                                        publish_staged_facade_section_failure(
+                                            &data_dir,
+                                            facade,
+                                            SectionId::Mcp,
+                                            "MCP credential hydration failed; retaining last-known-good runtime",
+                                            StagedFacadeSectionFailureContext {
+                                                health: &apply_mcp_health,
+                                                account_sink: &account_sink,
+                                                section: "mcp",
+                                                pending_root_publications: &pending_root_publications,
+                                            },
+                                        )
+                                        .await;
+                                    } else {
+                                        let next_mcp = materialized.config.mcp.clone();
+                                        let publish_config = config.clone();
+                                        match mcp_manager
+                                            .reconcile_from_config_transactional_after(
+                                                &materialized.config.mcp,
+                                                || async move {
+                                                    publish_config.write().await.mcp = next_mcp;
+                                                    Ok(())
+                                                },
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                let recovered =
+                                                    section_is_unhealthy(&apply_mcp_health);
+                                                let snapshot = facade.registry().mcp.snapshot();
+                                                let revision = snapshot.revision;
+                                                if forced_initial_mcp
+                                                    && !startup_root_mcp
+                                                    && !pending_root_publications
+                                                        .contains_key(&SectionId::Mcp)
+                                                    && snapshot.status == SectionStatus::Healthy
+                                                {
+                                                    // Startup reconciliation makes the
+                                                    // already-materialized section live in
+                                                    // the MCP manager; it is not a config
+                                                    // mutation and must not consume an
+                                                    // account-feed sequence number.
+                                                    set_live_health_revision(
+                                                        &apply_mcp_health,
+                                                        revision,
+                                                        Some((
+                                                            data_dir.join("mcp.json"),
+                                                            SectionSourceKind::File,
+                                                        )),
+                                                    );
+                                                } else {
+                                                    if pending_root_publications
+                                                        .get(&SectionId::Mcp)
+                                                        .is_some_and(|event| {
+                                                            config_section_event_revision(event)
+                                                                == revision
+                                                        })
+                                                    {
+                                                        set_live_health_revision(
+                                                            &apply_mcp_health,
+                                                            revision,
+                                                            Some((
+                                                                data_dir.join("mcp.json"),
+                                                                SectionSourceKind::File,
+                                                            )),
+                                                        );
+                                                        retry_legacy_root_publication |=
+                                                            publish_registry_event_with_root_ack(
+                                                                &data_dir,
+                                                                &account_sink,
+                                                                &mut pending_root_publications,
+                                                                SectionId::Mcp,
+                                                                &event,
+                                                            )
+                                                            .await;
+                                                    } else if matches!(
+                                                        event,
+                                                        ConfigSectionEvent::Recovered { .. }
+                                                    ) {
+                                                        set_live_health_revision(
+                                                            &apply_mcp_health,
+                                                            revision,
+                                                            Some((
+                                                                data_dir.join("mcp.json"),
+                                                                SectionSourceKind::File,
+                                                            )),
+                                                        );
+                                                        publish_registry_event(
+                                                            &account_sink,
+                                                            &event,
+                                                        )
+                                                        .await;
+                                                    } else {
+                                                        publish_section_success(
+                                                            &apply_mcp_health,
+                                                            &account_sink,
+                                                            "mcp",
+                                                            data_dir.join("mcp.json"),
+                                                            recovered,
+                                                            Some(revision),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                retry_legacy_root_publication |=
+                                                publish_staged_facade_section_failure(
+                                                    &data_dir,
+                                                    facade,
+                                                    SectionId::Mcp,
+                                                    "MCP runtime initialization failed; retaining last-known-good runtime",
+                                                    StagedFacadeSectionFailureContext {
+                                                        health: &apply_mcp_health,
+                                                        account_sink: &account_sink,
+                                                        section: "mcp",
+                                                        pending_root_publications: &pending_root_publications,
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
                                 }
+                            } else {
+                                retry_legacy_root_publication = true;
                             }
                         }
                     } else {
@@ -672,11 +1208,13 @@ impl ConfigWatcherRuntime {
                             .read()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .revision;
+                        let force_initial_mcp =
+                            changes.initial_mcp_revision == Some(current_revision);
                         let result = load_and_validate_mcp_candidate(
                             &mcp_store,
                             current_revision,
                             current_config,
-                            changes.initial_mcp,
+                            force_initial_mcp,
                         )
                         .await;
                         match result {
@@ -711,7 +1249,8 @@ impl ConfigWatcherRuntime {
                                                 &account_sink,
                                                 candidate.source_path,
                                                 candidate.revision,
-                                            );
+                                            )
+                                            .await;
                                         } else {
                                             publish_section_success(
                                                 &apply_mcp_health,
@@ -720,7 +1259,8 @@ impl ConfigWatcherRuntime {
                                                 data_dir.join("mcp.json"),
                                                 recovered,
                                                 Some(candidate.revision),
-                                            );
+                                            )
+                                            .await;
                                         }
                                     }
                                     Err(_) => publish_section_failure(
@@ -730,18 +1270,56 @@ impl ConfigWatcherRuntime {
                                         SectionStatus::Degraded,
                                         "MCP runtime initialization failed; retaining last-known-good runtime"
                                             .to_string(),
-                                    ),
+                                    )
+                                    .await,
                                 }
                             }
-                            Err(error) => publish_section_failure(
-                                &apply_mcp_health,
-                                &account_sink,
-                                "mcp",
-                                candidate_error_status(&error.kind),
-                                error.message,
-                            ),
+                            Err(error) => {
+                                publish_section_failure(
+                                    &apply_mcp_health,
+                                    &account_sink,
+                                    "mcp",
+                                    candidate_error_status(&error.kind),
+                                    error.message,
+                                )
+                                .await
+                            }
                         }
                     }
+                }
+                if !catchup_paths.is_empty() {
+                    let _ = catchup_changes.send(ConfigPathChanges {
+                        paths: catchup_paths,
+                        initial_mcp_revision: None,
+                        startup_legacy_root: None,
+                        startup_recoveries: BTreeMap::new(),
+                        legacy_root_retry_attempt: 0,
+                    });
+                }
+                if requeue_legacy_root && pending_root_publications.is_empty() {
+                    let _ = catchup_changes.send(ConfigPathChanges {
+                        paths: vec![data_dir.join("config.json")],
+                        initial_mcp_revision: None,
+                        startup_legacy_root: None,
+                        startup_recoveries: BTreeMap::new(),
+                        legacy_root_retry_attempt: 0,
+                    });
+                }
+                if retry_legacy_root_publication {
+                    let retry_changes = catchup_changes.clone();
+                    let retry_path = data_dir.join("config.json");
+                    let retry_attempt = changes.legacy_root_retry_attempt.saturating_add(1);
+                    let delay = Duration::from_millis(50_u64 << retry_attempt.min(5));
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = retry_changes.send(ConfigPathChanges {
+                            paths: vec![retry_path],
+                            initial_mcp_revision: None,
+                            startup_legacy_root: None,
+                            startup_recoveries: BTreeMap::new(),
+                            legacy_root_retry_attempt: retry_attempt,
+                        });
+                    });
                 }
             }
         });
@@ -756,6 +1334,95 @@ impl ConfigWatcherRuntime {
             mcp_health,
         )
     }
+}
+
+fn durable_invalid_recoveries(
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    facade: &bamboo_config::ConfigFacade,
+    rejected: &BTreeSet<SectionId>,
+) -> BTreeMap<SectionId, u64> {
+    let Ok(durable_facade) = bamboo_config::ConfigFacade::open(facade.data_dir()) else {
+        return BTreeMap::new();
+    };
+    let mut latest = BTreeMap::<SectionId, (bool, u64)>::new();
+    if let Ok(events) = bamboo_engine::events::journal::read_since(account_sink.events_dir(), 0) {
+        for change in events {
+            let state = match change.event {
+                AgentEvent::ConfigInvalid { section, revision } => Some((section, true, revision)),
+                AgentEvent::ConfigChanged { section, revision }
+                | AgentEvent::ConfigRecovered { section, revision } => {
+                    Some((section, false, revision))
+                }
+                _ => None,
+            };
+            if let Some((section, invalid, revision)) = state {
+                if let Some(id) = SectionId::from_name(&section) {
+                    latest.insert(id, (invalid, revision));
+                }
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .filter_map(|(id, (invalid, invalid_revision))| {
+            if !invalid || rejected.contains(&id) {
+                return None;
+            }
+            let envelope = durable_facade.registry().envelope_value(id).ok()?;
+            (envelope.revision >= invalid_revision
+                && envelope.status == SectionStatus::Healthy
+                && envelope.source_kind == SectionSourceKind::File)
+                .then_some((id, envelope.revision))
+        })
+        .collect()
+}
+
+fn queue_legacy_root_recovery(
+    facade: &bamboo_config::ConfigFacade,
+    id: SectionId,
+    minimum_revision: Option<u64>,
+    watched_sections: &mut BTreeSet<SectionId>,
+    synthetic_events: &mut BTreeMap<SectionId, ConfigSectionEvent>,
+) {
+    watched_sections.insert(id);
+    // A same-facade watcher restart may retain process-local Degraded health;
+    // reload the healthy typed authority before its runtime is installed.
+    let _ = facade.registry().reload(id);
+    let Ok(envelope) = facade.registry().envelope_value(id) else {
+        return;
+    };
+    if envelope.status != SectionStatus::Healthy
+        || envelope.source_kind != SectionSourceKind::File
+        || minimum_revision.is_some_and(|minimum| envelope.revision < minimum)
+    {
+        return;
+    }
+    synthetic_events
+        .entry(id)
+        .or_insert_with(|| ConfigSectionEvent::Recovered {
+            section: id.descriptor().name.to_string(),
+            revision: envelope.revision,
+        });
+}
+
+fn pending_root_publication_matches_fresh_durable(
+    data_dir: &Path,
+    process_facade: &bamboo_config::ConfigFacade,
+    id: SectionId,
+    revision: u64,
+) -> bool {
+    let Ok(process) = process_facade.registry().envelope_value(id) else {
+        return false;
+    };
+    if process.revision != revision {
+        return false;
+    }
+    let event = ConfigSectionEvent::Changed {
+        section: id.descriptor().name.to_string(),
+        revision,
+    };
+    bamboo_config::legacy_root_publication_matches_snapshot(data_dir, &event, &process.data)
+        .unwrap_or(false)
 }
 
 async fn wait_for_section_file_settle(data_dir: &Path, id: SectionId) {
@@ -773,27 +1440,54 @@ async fn wait_for_section_file_settle(data_dir: &Path, id: SectionId) {
 ///
 /// The caller owns `config_io_lock`; keeping this sequence shared by the live
 /// watcher and focused regressions makes the event/runtime ordering explicit.
+struct OrdinarySectionReloadState<'a> {
+    synthetic_events: &'a mut BTreeMap<SectionId, ConfigSectionEvent>,
+    pending_root_publications: &'a mut BTreeMap<SectionId, ConfigSectionEvent>,
+    reported_root_runtime_failures: &'a mut BTreeSet<(SectionId, u64)>,
+}
+
 async fn reload_and_apply_ordinary_sections(
     data_dir: &Path,
     config: &Arc<RwLock<Config>>,
     facade: &bamboo_config::ConfigFacade,
     account_sink: &bamboo_engine::events::AccountEventSink,
     sections: impl IntoIterator<Item = SectionId>,
-) {
+    state: OrdinarySectionReloadState<'_>,
+) -> bool {
+    let OrdinarySectionReloadState {
+        synthetic_events,
+        pending_root_publications,
+        reported_root_runtime_failures,
+    } = state;
+    let mut retry_legacy_root_publication = false;
     let mut publishable = Vec::new();
     for id in sections {
         wait_for_section_file_settle(data_dir, id).await;
-        let Some(event) = facade.registry().reload_if_changed(id) else {
+        let Some(event) = synthetic_events
+            .remove(&id)
+            .or_else(|| facade.registry().reload_if_changed(id))
+        else {
+            continue;
+        };
+        let Some(event) = pending_root_publication_event(
+            data_dir,
+            facade,
+            account_sink,
+            pending_root_publications,
+            id,
+            event,
+        ) else {
+            retry_legacy_root_publication = true;
             continue;
         };
         if matches!(event, ConfigSectionEvent::Invalid { .. }) {
-            publish_registry_event(account_sink, &event);
+            publish_registry_event(account_sink, &event).await;
         } else {
             publishable.push((id, event));
         }
     }
     if publishable.is_empty() {
-        return;
+        return retry_legacy_root_publication;
     }
 
     let materialized = materialize_facade_effective_config(facade, data_dir);
@@ -801,19 +1495,34 @@ async fn reload_and_apply_ordinary_sections(
     let mut applied = Vec::new();
     for (id, event) in publishable {
         if materialized.failures.contains(&id) {
-            if let Some(invalid) = facade.registry().mark_runtime_degraded(
+            let revision = facade
+                .registry()
+                .envelope_value(id)
+                .map(|envelope| envelope.revision)
+                .unwrap_or_default();
+            let invalid = facade.registry().mark_runtime_degraded(
                 id,
                 "configuration runtime hydration failed; retaining last-known-good runtime",
-            ) {
-                publish_registry_event(account_sink, &invalid);
+            );
+            if let Some(invalid) = invalid {
+                if pending_root_publications
+                    .get(&id)
+                    .is_some_and(|event| config_section_event_revision(event) == revision)
+                {
+                    let _ =
+                        confirm_legacy_root_runtime_failure(data_dir, account_sink, &invalid).await;
+                } else if reported_root_runtime_failures.insert((id, revision)) {
+                    publish_registry_event(account_sink, &invalid).await;
+                }
             }
+            retry_legacy_root_publication |= pending_root_publications.contains_key(&id);
             continue;
         }
         apply_runtime_section(id, &materialized.config, &mut current);
         applied.push((id, event));
     }
     if applied.is_empty() {
-        return;
+        return retry_legacy_root_publication;
     }
 
     let publishes_env = applied.iter().any(|(id, _)| *id == SectionId::Env);
@@ -826,16 +1535,171 @@ async fn reload_and_apply_ordinary_sections(
     if enforcement_newly_off {
         warn_plugin_trust_enforcement_off();
     }
-    for (_, event) in applied {
-        publish_registry_event(account_sink, &event);
+    for (id, event) in applied {
+        retry_legacy_root_publication |= publish_registry_event_with_root_ack(
+            data_dir,
+            account_sink,
+            pending_root_publications,
+            id,
+            &event,
+        )
+        .await;
+        reported_root_runtime_failures.retain(|(failed_id, _)| *failed_id != id);
+    }
+    retry_legacy_root_publication
+}
+
+fn pending_root_publication_event(
+    data_dir: &Path,
+    facade: &bamboo_config::ConfigFacade,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    pending: &BTreeMap<SectionId, ConfigSectionEvent>,
+    id: SectionId,
+    observed: ConfigSectionEvent,
+) -> Option<ConfigSectionEvent> {
+    let Some(pending_event) = pending.get(&id) else {
+        return Some(observed);
+    };
+    let revision = config_section_event_revision(pending_event);
+    let Ok(envelope) = facade.registry().envelope_value(id) else {
+        return None;
+    };
+    if envelope.revision != revision || envelope.status != SectionStatus::Healthy {
+        return None;
+    }
+    let pending = ConfigSectionEvent::Changed {
+        section: id.descriptor().name.to_string(),
+        revision,
+    };
+    if account_sink.latest_config_transition_is_invalid(id.descriptor().name, revision) {
+        let invalid = ConfigSectionEvent::Invalid {
+            section: id.descriptor().name.to_string(),
+            revision,
+        };
+        match bamboo_config::mark_legacy_root_publication_runtime_degraded(data_dir, &invalid) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    section = id.descriptor().name,
+                    revision,
+                    "failed to repair canonical root runtime-degraded proof from the durable journal"
+                );
+                return None;
+            }
+        }
+    }
+    bamboo_config::legacy_root_publication_success_event(data_dir, &pending, &envelope.data)
+        .ok()
+        .flatten()
+}
+
+async fn publish_registry_event_with_root_ack(
+    data_dir: &Path,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    pending: &mut BTreeMap<SectionId, ConfigSectionEvent>,
+    id: SectionId,
+    event: &ConfigSectionEvent,
+) -> bool {
+    if matches!(event, ConfigSectionEvent::Invalid { .. }) {
+        publish_registry_event(account_sink, event).await;
+        return false;
+    }
+    if pending.get(&id).is_none_or(|pending_event| {
+        config_section_event_revision(pending_event) != config_section_event_revision(event)
+    }) {
+        publish_registry_event(account_sink, event).await;
+        return false;
+    }
+    let durable = account_sink
+        .record_confirmed(None, &registry_agent_event(event))
+        .await;
+    if durable
+        && bamboo_config::acknowledge_legacy_root_publication(data_dir, event).unwrap_or(false)
+    {
+        pending.remove(&id);
+        false
+    } else {
+        true
     }
 }
 
-pub(super) fn publish_registry_event(
+pub(super) async fn publish_registry_event(
     account_sink: &bamboo_engine::events::AccountEventSink,
     event: &ConfigSectionEvent,
 ) {
-    let event = match event {
+    let event = registry_agent_event(event);
+    if !account_sink.record_confirmed(None, &event).await {
+        tracing::warn!("configuration event could not be confirmed in the account journal");
+    }
+}
+
+async fn confirm_legacy_root_runtime_failure(
+    data_dir: &Path,
+    account_sink: &bamboo_engine::events::AccountEventSink,
+    event: &ConfigSectionEvent,
+) -> bool {
+    if !account_sink
+        .record_confirmed(None, &registry_agent_event(event))
+        .await
+    {
+        return false;
+    }
+    match bamboo_config::mark_legacy_root_publication_runtime_degraded(data_dir, event) {
+        Ok(marked) => marked,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to mark canonical root publication runtime-degraded"
+            );
+            false
+        }
+    }
+}
+
+fn legacy_root_rejection_event(
+    facade: &bamboo_config::ConfigFacade,
+    id: SectionId,
+    diagnostic: &str,
+    force_publication: bool,
+) -> Option<ConfigSectionEvent> {
+    let already_reported = facade.registry().envelope_value(id).is_ok_and(|envelope| {
+        envelope.status == SectionStatus::Degraded
+            && envelope.last_error.as_deref() == Some(diagnostic)
+    });
+    if already_reported && !force_publication {
+        return None;
+    }
+    facade
+        .registry()
+        .mark_runtime_degraded(id, diagnostic)
+        .or_else(|| {
+            // Defensive fallback for section implementations that cannot
+            // expose process-local degraded health.
+            force_publication
+                .then(|| {
+                    facade.registry().envelope_value(id).ok().map(|envelope| {
+                        ConfigSectionEvent::Invalid {
+                            section: id.descriptor().name.to_string(),
+                            revision: envelope.revision,
+                        }
+                    })
+                })
+                .flatten()
+        })
+}
+
+fn config_section_event_revision(event: &ConfigSectionEvent) -> u64 {
+    match event {
+        ConfigSectionEvent::Changed { revision, .. }
+        | ConfigSectionEvent::Invalid { revision, .. }
+        | ConfigSectionEvent::Recovered { revision, .. } => *revision,
+    }
+}
+
+fn registry_agent_event(event: &ConfigSectionEvent) -> AgentEvent {
+    match event {
         ConfigSectionEvent::Changed { section, revision } => AgentEvent::ConfigChanged {
             section: section.clone(),
             revision: *revision,
@@ -848,16 +1712,22 @@ pub(super) fn publish_registry_event(
             section: section.clone(),
             revision: *revision,
         },
-    };
-    account_sink.record(None, &event);
+    }
 }
 
-fn publish_exact_facade_events(
+async fn publish_exact_facade_events(
     account_sink: &bamboo_engine::events::AccountEventSink,
     events: &[ConfigSectionEvent],
 ) -> Result<(), AppError> {
     for event in events {
-        publish_registry_event(account_sink, event);
+        let durable = account_sink
+            .record_confirmed(None, &registry_agent_event(event))
+            .await;
+        if !durable {
+            return Err(AppError::InternalError(anyhow::anyhow!(
+                "committed configuration event could not be confirmed in the account journal"
+            )));
+        }
         if matches!(event, ConfigSectionEvent::Invalid { .. }) {
             return Err(AppError::InternalError(anyhow::anyhow!(
                 "committed configuration section became invalid before publication"
@@ -1008,7 +1878,13 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.plugin_trust = source.plugin_trust.clone();
         }
         SectionId::Memory => *target.memory_mut() = source.memory().clone(),
-        SectionId::Subagents => *target.subagents_mut() = source.subagents().clone(),
+        SectionId::Subagents => {
+            let runtime_broker = target.subagents().broker.clone();
+            *target.subagents_mut() = source.subagents().clone();
+            if target.subagents().broker.is_none() {
+                target.subagents_mut().broker = runtime_broker;
+            }
+        }
         SectionId::Notifications => target.notifications = source.notifications.clone(),
         SectionId::Connect => target.connect = source.connect.clone(),
         SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
@@ -1037,6 +1913,15 @@ fn restore_authoritative_cluster_fabric(
     }
 }
 
+/// Preserve the process-only broker injected at boot when a config projection
+/// cannot carry it. An incoming runtime broker is authoritative, so external
+/// broker changes still replace the previous endpoint.
+fn preserve_runtime_broker(new_config: &mut Config, previous: &Config) {
+    if new_config.subagents().broker.is_none() {
+        new_config.subagents_mut().broker = previous.subagents().broker.clone();
+    }
+}
+
 fn section_is_unhealthy(health: &std::sync::RwLock<ConfigLiveHealth>) -> bool {
     health
         .read()
@@ -1045,7 +1930,7 @@ fn section_is_unhealthy(health: &std::sync::RwLock<ConfigLiveHealth>) -> bool {
         != SectionStatus::Healthy
 }
 
-fn publish_section_success(
+async fn publish_section_success(
     health: &std::sync::RwLock<ConfigLiveHealth>,
     account_sink: &bamboo_engine::events::AccountEventSink,
     section: &str,
@@ -1078,27 +1963,107 @@ fn publish_section_success(
             revision,
         }
     };
-    account_sink.record(None, &event);
+    if !account_sink.record_confirmed(None, &event).await {
+        tracing::warn!(
+            section,
+            revision,
+            "configuration success event was not durable"
+        );
+    }
 }
 
-fn publish_section_failure(
+async fn publish_section_failure(
     health: &std::sync::RwLock<ConfigLiveHealth>,
     account_sink: &bamboo_engine::events::AccountEventSink,
     section: &str,
     status: SectionStatus,
     message: String,
 ) {
+    let duplicate = {
+        let health = health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        health.status == status && health.last_error.as_deref() == Some(message.as_str())
+    };
     let revision = update_live_health(health, status, Some(message), false, None);
-    account_sink.record(
-        None,
-        &AgentEvent::ConfigInvalid {
-            section: section.to_string(),
+    if duplicate {
+        return;
+    }
+    let event = AgentEvent::ConfigInvalid {
+        section: section.to_string(),
+        revision,
+    };
+    if !account_sink.record_confirmed(None, &event).await {
+        tracing::warn!(
+            section,
             revision,
-        },
-    );
+            "configuration failure event was not durable"
+        );
+    }
 }
 
-fn publish_mcp_backup_lkg(
+struct StagedFacadeSectionFailureContext<'a> {
+    health: &'a std::sync::RwLock<ConfigLiveHealth>,
+    account_sink: &'a bamboo_engine::events::AccountEventSink,
+    section: &'a str,
+    pending_root_publications: &'a BTreeMap<SectionId, ConfigSectionEvent>,
+}
+
+async fn publish_staged_facade_section_failure(
+    data_dir: &Path,
+    facade: &bamboo_config::ConfigFacade,
+    id: SectionId,
+    message: &str,
+    context: StagedFacadeSectionFailureContext<'_>,
+) -> bool {
+    let StagedFacadeSectionFailureContext {
+        health,
+        account_sink,
+        section,
+        pending_root_publications,
+    } = context;
+    let event = facade
+        .registry()
+        .mark_runtime_degraded(id, message)
+        .expect("every facade section exposes runtime health");
+    let exact_pending = matches!(
+        &event,
+        ConfigSectionEvent::Invalid { revision, .. }
+            if pending_root_publications
+                .get(&id)
+                .is_some_and(|event| config_section_event_revision(event) == *revision)
+    );
+    if exact_pending {
+        // Keep ConfigLiveHealth's revision as the last installed runtime, but
+        // publish the exact typed candidate revision that failed its runtime
+        // hook. AccountSink's transition state dedupes delayed retries.
+        update_live_health(
+            health,
+            SectionStatus::Degraded,
+            Some(message.to_string()),
+            false,
+            None,
+        );
+        if !confirm_legacy_root_runtime_failure(data_dir, account_sink, &event).await {
+            tracing::warn!(
+                section,
+                "root runtime failure was not confirmed against its canonical publication"
+            );
+        }
+    } else {
+        publish_section_failure(
+            health,
+            account_sink,
+            section,
+            SectionStatus::Degraded,
+            message.to_string(),
+        )
+        .await;
+    }
+    exact_pending
+}
+
+async fn publish_mcp_backup_lkg(
     health: &std::sync::RwLock<ConfigLiveHealth>,
     account_sink: &bamboo_engine::events::AccountEventSink,
     source_path: PathBuf,
@@ -1116,13 +2081,13 @@ fn publish_mcp_backup_lkg(
         health.last_error =
             Some("primary MCP section invalid; running last-known-good backup runtime".to_string());
     }
-    account_sink.record(
-        None,
-        &AgentEvent::ConfigInvalid {
-            section: "mcp".to_string(),
-            revision,
-        },
-    );
+    let event = AgentEvent::ConfigInvalid {
+        section: "mcp".to_string(),
+        revision,
+    };
+    if !account_sink.record_confirmed(None, &event).await {
+        tracing::warn!(revision, "MCP backup health event was not durable");
+    }
 }
 
 fn initial_provider_health(store: &AtomicJsonStore<ProviderConfigs>) -> ConfigLiveHealth {
@@ -1630,6 +2595,21 @@ fn set_live_health_revision(
     revision
 }
 
+fn set_live_health_from_snapshot<T>(
+    health: &std::sync::RwLock<ConfigLiveHealth>,
+    snapshot: &bamboo_config::SectionSnapshot<T>,
+) {
+    let mut health = health
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    health.revision = snapshot.revision;
+    health.loaded_at = snapshot.loaded_at;
+    health.source_path = snapshot.source_path.clone();
+    health.source_kind = snapshot.source_kind;
+    health.status = snapshot.status;
+    health.last_error = snapshot.last_error.clone();
+}
+
 #[derive(Debug)]
 pub(crate) enum ConfigSectionMutationError {
     Store(ConfigStoreError),
@@ -1661,12 +2641,20 @@ impl AppState {
             .config_facade
             .as_ref()
             .expect("test ordinary reload requires the modular facade");
+        let mut synthetic_events = BTreeMap::new();
+        let mut pending_root_publications = BTreeMap::new();
+        let mut reported_root_runtime_failures = BTreeSet::new();
         reload_and_apply_ordinary_sections(
             &self.app_data_dir,
             &self.config,
             facade,
             &self.account_sink,
             std::iter::once(id),
+            OrdinarySectionReloadState {
+                synthetic_events: &mut synthetic_events,
+                pending_root_publications: &mut pending_root_publications,
+                reported_root_runtime_failures: &mut reported_root_runtime_failures,
+            },
         )
         .await;
     }
@@ -1803,7 +2791,7 @@ impl AppState {
                 "configuration runtime hydration failed; retaining last-known-good runtime"
                     .to_string();
             if let Some(invalid) = facade.registry().mark_runtime_degraded(id, message.clone()) {
-                publish_registry_event(&self.account_sink, &invalid);
+                publish_registry_event(&self.account_sink, &invalid).await;
             }
             return Err(ConfigSectionMutationError::Runtime(message));
         }
@@ -1820,7 +2808,7 @@ impl AppState {
         if enforcement_newly_off {
             warn_plugin_trust_enforcement_off();
         }
-        publish_registry_event(&self.account_sink, &event);
+        publish_registry_event(&self.account_sink, &event).await;
         Ok(committed)
     }
 
@@ -1851,7 +2839,8 @@ impl AppState {
                         "providers",
                         SectionStatus::Degraded,
                         message.clone(),
-                    );
+                    )
+                    .await;
                     return Err(ConfigSectionMutationError::Runtime(message));
                 }
             };
@@ -1900,7 +2889,8 @@ impl AppState {
             source_path,
             section_is_unhealthy(&self.config_live_health),
             Some(revision),
-        );
+        )
+        .await;
         Ok(revision)
     }
 
@@ -1956,7 +2946,8 @@ impl AppState {
                             "providers",
                             SectionStatus::Degraded,
                             message.clone(),
-                        );
+                        )
+                        .await;
                         return Err(ConfigSectionMutationError::Runtime(message));
                     }
                 };
@@ -1997,6 +2988,7 @@ impl AppState {
             provider_registry.replace_with(registry);
             *live_provider = candidate_provider;
             publish_exact_facade_events(&account_sink, &installed.events)
+                .await
                 .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             let provider_snapshot = facade.registry().providers.snapshot();
             set_live_health_revision(
@@ -2087,6 +3079,7 @@ impl AppState {
                 )),
             );
             publish_exact_facade_events(&account_sink, &installed.events)
+                .await
                 .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
 
             let runtime_failure = match bamboo_llm::ProviderRegistry::from_config(
@@ -2119,7 +3112,8 @@ impl AppState {
                     "providers",
                     SectionStatus::Degraded,
                     message,
-                );
+                )
+                .await;
             }
             Ok(provider_snapshot.revision)
         });
@@ -2212,7 +3206,8 @@ impl AppState {
                 "mcp",
                 SectionStatus::Degraded,
                 message.clone(),
-            );
+            )
+            .await;
             return Err(ConfigSectionMutationError::Runtime(message));
         }
         let revision = revision.expect("successful MCP reconcile commits a revision");
@@ -2223,7 +3218,8 @@ impl AppState {
             self.app_data_dir.join("mcp.json"),
             section_is_unhealthy(&self.mcp_config_live_health),
             Some(revision),
-        );
+        )
+        .await;
         Ok(revision)
     }
 
@@ -2331,11 +3327,13 @@ impl AppState {
                     "mcp",
                     SectionStatus::Degraded,
                     message.clone(),
-                );
+                )
+                .await;
                 return Err(ConfigSectionMutationError::Runtime(message));
             }
 
             publish_exact_facade_events(&account_sink, &commit_events)
+                .await
                 .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             let snapshot = facade.registry().mcp.snapshot();
             set_live_health_revision(
@@ -2348,6 +3346,190 @@ impl AppState {
         transaction.await.map_err(|error| {
             ConfigSectionMutationError::Runtime(format!(
                 "MCP settings transaction task failed: {error}"
+            ))
+        })?
+    }
+
+    /// Apply one legacy MCP mutation through the typed MCP section's exact
+    /// credential/runtime transaction.
+    ///
+    /// Lock order is always `config_io_lock` -> MCP `reconcile_lock` -> live
+    /// `config` write. Provider locks are never acquired on this path. Runtime
+    /// connection, initialization, and tool discovery finish before the
+    /// durable MCP/credential boundary. The detached owner then publishes the
+    /// exact live section, runtime set, tool index, health, and events before a
+    /// later config generation may acquire `config_io_lock`.
+    pub(crate) async fn update_legacy_mcp_config<F>(
+        &self,
+        force_restart: BTreeSet<String>,
+        update: F,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut McpConfig) -> Result<(), AppError>,
+    {
+        // Apply the caller's mutation against the exact lock-time live
+        // generation. Cancellation while either guard is pending is pre-commit.
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let (mut candidate_config, expected_revision, credential_intents) = {
+            ensure_provider_mcp_migration_ready(&self.app_data_dir)
+                .map_err(map_exact_credential_store_error)?;
+            let facade = self.config_facade.as_ref().ok_or_else(|| {
+                AppError::BadRequest(
+                    "legacy MCP mutations require the modular configuration facade".to_string(),
+                )
+            })?;
+            let current = self.config.read().await.clone();
+            reject_if_recovery_pending(&current)?;
+            let mut candidate = current.mcp.clone();
+            update(&mut candidate)?;
+            let credential_intents =
+                normalize_legacy_mcp_credentials(&current.mcp, &mut candidate)?;
+            validate_mcp_config(&candidate).map_err(AppError::BadRequest)?;
+            let expected_revision = facade.registry().mcp.snapshot().revision;
+            let mut candidate_config = current;
+            candidate_config.mcp = candidate;
+            (candidate_config, expected_revision, credential_intents)
+        };
+
+        let config = self.config.clone();
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let facade = config_facade.expect("validated modular configuration facade");
+            let runtime_candidate = candidate_config.mcp.clone();
+            let force_replacements = force_restart.into_iter().collect();
+            let durable_document =
+                credential_ref_mcp_document(&runtime_candidate).map_err(map_mcp_section_error)?;
+            bamboo_config::validate_mcp_section(&durable_document).map_err(AppError::BadRequest)?;
+            let current_document = facade.registry().mcp.snapshot();
+            let metadata_changed = serde_json::to_value(&current_document.data.0)
+                .map_err(AppError::SerializationError)?
+                != serde_json::to_value(&durable_document).map_err(AppError::SerializationError)?;
+            let credential_transaction = !credential_intents.is_empty();
+            let mut transaction_error = None;
+            let mut commit_events = Vec::new();
+            let mut published_config = None;
+            let commit_dir = app_data_dir.clone();
+            let commit_facade = facade.clone();
+            let result = mcp_manager
+                .reconcile_from_config_transactional_after_forcing(
+                    &runtime_candidate,
+                    &force_replacements,
+                    || async {
+                        // Acquiring the live guard before the durable call
+                        // closes the only cancellation window between disk and
+                        // process state.
+                        let mut live_config = config.write().await;
+                        if credential_transaction {
+                            let commit = tokio::task::spawn_blocking(move || {
+                                let commit = bamboo_config::persist_mcp_credential_transaction_at_revision_with_adoption(
+                                    &commit_dir,
+                                    &mut candidate_config,
+                                    &credential_intents,
+                                    expected_revision,
+                                    commit_facade.as_ref(),
+                                )?;
+                                Ok::<_, ConfigStoreError>((candidate_config, commit))
+                            })
+                            .await;
+                            match commit {
+                                Ok(Ok((mut committed, commit))) => {
+                                    #[cfg(test)]
+                                    run_credential_after_commit_before_live_test_hook(
+                                        &app_data_dir,
+                                        SectionId::Mcp,
+                                    );
+                                    match install_credential_section_commit(commit, &mut committed) {
+                                        Ok(installed) => {
+                                            *live_config = committed.clone();
+                                            commit_events = installed.events;
+                                            published_config = Some(committed);
+                                        }
+                                        Err(error) => {
+                                            transaction_error =
+                                                Some(map_exact_credential_store_error(error));
+                                            return Err(bamboo_mcp::McpError::InvalidConfig(
+                                                "MCP process adoption failed".to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(Err(error)) => {
+                                    transaction_error =
+                                        Some(map_exact_credential_store_error(error));
+                                    return Err(bamboo_mcp::McpError::InvalidConfig(
+                                        "MCP durable transaction failed".to_string(),
+                                    ));
+                                }
+                                Err(error) => {
+                                    transaction_error = Some(AppError::InternalError(
+                                        anyhow::anyhow!(
+                                            "MCP credential transaction task failed: {error}"
+                                        ),
+                                    ));
+                                    return Err(bamboo_mcp::McpError::InvalidConfig(
+                                        "MCP durable transaction failed".to_string(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            if metadata_changed {
+                                match facade
+                                    .registry()
+                                    .mcp
+                                    .commit(expected_revision, McpSection(durable_document))
+                                {
+                                    Ok(event) => commit_events.push(event),
+                                    Err(error) => {
+                                        transaction_error =
+                                            Some(map_exact_credential_store_error(error));
+                                        return Err(bamboo_mcp::McpError::InvalidConfig(
+                                            "MCP durable commit failed".to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            candidate_config.mcp = runtime_candidate.clone();
+                            *live_config = candidate_config.clone();
+                            published_config = Some(candidate_config);
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if let Some(error) = transaction_error {
+                return Err(error);
+            }
+            if result.is_err() {
+                tracing::warn!("legacy MCP runtime staging failed before durable commit");
+                let message =
+                    "MCP runtime initialization failed before commit; retaining last-known-good generation"
+                        .to_string();
+                return Err(AppError::InternalError(anyhow::anyhow!(message)));
+            }
+
+            // Runtime/tool-index publication is complete when transactional
+            // reconcile returns. Event/health publication therefore cannot
+            // prevent an already-committed generation from becoming runtime.
+            publish_exact_facade_events(&account_sink, &commit_events).await?;
+            let snapshot = facade.registry().mcp.snapshot();
+            set_live_health_revision(
+                &mcp_config_live_health,
+                snapshot.revision,
+                Some((snapshot.source_path.clone(), SectionSourceKind::File)),
+            );
+            Ok::<_, AppError>(
+                published_config.expect("successful MCP transaction publishes config"),
+            )
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "legacy MCP config transaction task failed: {error}"
             ))
         })?
     }
@@ -2422,10 +3604,12 @@ impl AppState {
                 "mcp",
                 SectionStatus::Degraded,
                 message.clone(),
-            );
+            )
+            .await;
             return Err(ConfigSectionMutationError::Runtime(message));
         }
         publish_exact_facade_events(&self.account_sink, &commit_events)
+            .await
             .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
         let revision = facade.registry().mcp.snapshot().revision;
         publish_section_success(
@@ -2435,7 +3619,8 @@ impl AppState {
             self.app_data_dir.join("mcp.json"),
             section_is_unhealthy(&self.mcp_config_live_health),
             Some(revision),
-        );
+        )
+        .await;
         Ok(revision)
     }
 
@@ -2578,6 +3763,7 @@ impl AppState {
             *config.write().await = candidate.clone();
             if id != SectionId::ClusterFabric {
                 publish_exact_facade_events(&account_sink, &section_events)
+                    .await
                     .map_err(|error| ConfigSectionMutationError::Runtime(error.to_string()))?;
             }
             let commit = if id == SectionId::ClusterFabric {
@@ -2616,7 +3802,7 @@ impl AppState {
                     )));
                 }
                 if let Some(event) = event.as_ref() {
-                    publish_registry_event(&account_sink, event);
+                    publish_registry_event(&account_sink, event).await;
                 }
                 if let Err(error) = committed_recovery {
                     return Err(ConfigSectionMutationError::Runtime(format!(
@@ -3060,6 +4246,247 @@ fn reference_headers(
     Ok(())
 }
 
+/// Convert the legacy MCP request shape (which carries credential plaintext
+/// inline) into the same server-owned references and explicit credential
+/// intents used by the typed MCP settings transaction.
+///
+/// The caller must hold `config_io_lock`. References supplied by a legacy
+/// client are never authoritative: an existing binding is retained by field
+/// identity, while a new binding receives its canonical server-owned ref.
+fn mcp_credential_refs(
+    config: &McpConfig,
+) -> Result<BTreeSet<bamboo_config::CredentialRef>, ConfigSectionMutationError> {
+    let mut references = BTreeSet::new();
+    for server in &config.servers {
+        match &server.transport {
+            TransportConfig::Stdio(stdio) => {
+                for raw in stdio.env_credential_refs.values() {
+                    references.insert(bamboo_config::CredentialRef::parse(raw.clone()).map_err(
+                        |_| {
+                            ConfigSectionMutationError::Invalid(
+                                "MCP credential reference is invalid".to_string(),
+                            )
+                        },
+                    )?);
+                }
+            }
+            TransportConfig::Sse(http) => collect_mcp_header_refs(&http.headers, &mut references)?,
+            TransportConfig::StreamableHttp(http) => {
+                collect_mcp_header_refs(&http.headers, &mut references)?
+            }
+        }
+    }
+    Ok(references)
+}
+
+fn collect_mcp_header_refs(
+    headers: &[bamboo_mcp::HeaderConfig],
+    output: &mut BTreeSet<bamboo_config::CredentialRef>,
+) -> Result<(), ConfigSectionMutationError> {
+    for raw in headers
+        .iter()
+        .filter_map(|header| header.credential_ref.as_ref())
+    {
+        output.insert(
+            bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                ConfigSectionMutationError::Invalid(
+                    "MCP credential reference is invalid".to_string(),
+                )
+            })?,
+        );
+    }
+    Ok(())
+}
+
+fn normalize_legacy_mcp_credentials(
+    current: &McpConfig,
+    candidate: &mut McpConfig,
+) -> Result<BTreeSet<bamboo_config::CredentialRef>, AppError> {
+    let current_refs = mcp_credential_refs(current).map_err(map_mcp_section_error)?;
+    let mut intents = BTreeSet::new();
+
+    for candidate_server in &mut candidate.servers {
+        let current_server = current
+            .servers
+            .iter()
+            .find(|server| server.id == candidate_server.id);
+        match &mut candidate_server.transport {
+            TransportConfig::Stdio(candidate_stdio) => {
+                if !candidate_stdio.env_encrypted.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "MCP ciphertext is server-managed and cannot be supplied".to_string(),
+                    ));
+                }
+                let current_stdio = current_server.and_then(|server| match &server.transport {
+                    TransportConfig::Stdio(stdio) => Some(stdio),
+                    _ => None,
+                });
+                for (name, incoming_reference) in &candidate_stdio.env_credential_refs {
+                    let current_reference = current_stdio
+                        .and_then(|stdio| stdio.env_credential_refs.get(name))
+                        .map(String::as_str);
+                    if current_reference != Some(incoming_reference.as_str()) {
+                        return Err(AppError::BadRequest(
+                            "MCP credential references are server-managed and cannot be supplied"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let incoming = std::mem::take(&mut candidate_stdio.env);
+                candidate_stdio.env_credential_refs.clear();
+                for (name, value) in incoming {
+                    let current_reference = current_stdio
+                        .and_then(|stdio| stdio.env_credential_refs.get(&name))
+                        .map(|raw| {
+                            bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                                AppError::BadRequest(
+                                    "MCP credential reference is invalid".to_string(),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let current_value = current_stdio.and_then(|stdio| stdio.env.get(&name));
+                    let (value, reference, touched) =
+                        if bamboo_config::patch::is_masked_api_key(&value) {
+                            let reference = current_reference.ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "masked MCP credential has no existing value".to_string(),
+                                )
+                            })?;
+                            let value = current_value.cloned().ok_or_else(|| {
+                                AppError::BadRequest(
+                                    "referenced MCP credential is unavailable".to_string(),
+                                )
+                            })?;
+                            (value, reference, false)
+                        } else if value.is_empty() {
+                            if let Some(reference) = current_reference {
+                                intents.insert(reference);
+                            }
+                            continue;
+                        } else {
+                            let reference = current_reference.map_or_else(
+                                || {
+                                    bamboo_config::credential_ref(
+                                        "mcp",
+                                        &candidate_server.id,
+                                        &format!("env_{name}"),
+                                    )
+                                    .map_err(map_exact_credential_store_error)
+                                },
+                                Ok,
+                            )?;
+                            let touched = current_value != Some(&value);
+                            (value, reference, touched)
+                        };
+                    if touched {
+                        intents.insert(reference.clone());
+                    }
+                    candidate_stdio.env.insert(name.clone(), value);
+                    candidate_stdio
+                        .env_credential_refs
+                        .insert(name, reference.as_str().to_string());
+                }
+            }
+            TransportConfig::Sse(candidate_http) => normalize_legacy_mcp_headers(
+                &candidate_server.id,
+                current_server.and_then(|server| match &server.transport {
+                    TransportConfig::Sse(http) => Some(http.headers.as_slice()),
+                    _ => None,
+                }),
+                &mut candidate_http.headers,
+                &mut intents,
+            )?,
+            TransportConfig::StreamableHttp(candidate_http) => normalize_legacy_mcp_headers(
+                &candidate_server.id,
+                current_server.and_then(|server| match &server.transport {
+                    TransportConfig::StreamableHttp(http) => Some(http.headers.as_slice()),
+                    _ => None,
+                }),
+                &mut candidate_http.headers,
+                &mut intents,
+            )?,
+        }
+    }
+
+    let candidate_refs = mcp_credential_refs(candidate).map_err(map_mcp_section_error)?;
+    intents.extend(current_refs.symmetric_difference(&candidate_refs).cloned());
+    Ok(intents)
+}
+
+fn normalize_legacy_mcp_headers(
+    server_id: &str,
+    current: Option<&[bamboo_mcp::HeaderConfig]>,
+    candidate: &mut [bamboo_mcp::HeaderConfig],
+    intents: &mut BTreeSet<bamboo_config::CredentialRef>,
+) -> Result<(), AppError> {
+    for header in candidate {
+        if header.value_encrypted.is_some() {
+            return Err(AppError::BadRequest(
+                "MCP ciphertext is server-managed and cannot be supplied".to_string(),
+            ));
+        }
+        let current_header =
+            current.and_then(|headers| headers.iter().find(|current| current.name == header.name));
+        if header.credential_ref.as_deref().is_some_and(|incoming| {
+            current_header.and_then(|current| current.credential_ref.as_deref()) != Some(incoming)
+        }) {
+            return Err(AppError::BadRequest(
+                "MCP credential references are server-managed and cannot be supplied".to_string(),
+            ));
+        }
+        let current_reference = current_header
+            .and_then(|current| current.credential_ref.as_ref())
+            .map(|raw| {
+                bamboo_config::CredentialRef::parse(raw.clone()).map_err(|_| {
+                    AppError::BadRequest("MCP credential reference is invalid".to_string())
+                })
+            })
+            .transpose()?;
+        let current_value = current_header.map(|current| &current.value);
+        if bamboo_config::patch::is_masked_api_key(&header.value) {
+            let reference = current_reference.ok_or_else(|| {
+                AppError::BadRequest("masked MCP credential has no existing value".to_string())
+            })?;
+            header.value = current_value.cloned().ok_or_else(|| {
+                AppError::BadRequest("referenced MCP credential is unavailable".to_string())
+            })?;
+            header.credential_ref = Some(reference.as_str().to_string());
+        } else if header.value.is_empty() {
+            if let Some(reference) = current_reference {
+                intents.insert(reference);
+            }
+            header.credential_ref = None;
+        } else {
+            let reference = current_reference.map_or_else(
+                || {
+                    bamboo_config::credential_ref(
+                        "mcp",
+                        server_id,
+                        &format!("header_{}", header.name),
+                    )
+                    .map_err(map_exact_credential_store_error)
+                },
+                Ok,
+            )?;
+            if current_value != Some(&header.value) {
+                intents.insert(reference.clone());
+            }
+            header.credential_ref = Some(reference.as_str().to_string());
+        }
+        header.value_encrypted = None;
+    }
+    Ok(())
+}
+
+fn map_mcp_section_error(error: ConfigSectionMutationError) -> AppError {
+    match error {
+        ConfigSectionMutationError::Store(error) => map_exact_credential_store_error(error),
+        ConfigSectionMutationError::Invalid(message)
+        | ConfigSectionMutationError::Runtime(message) => AppError::BadRequest(message),
+    }
+}
+
 impl AppState {
     /// Reload the provider based on current configuration
     ///
@@ -3093,6 +4520,11 @@ impl AppState {
     /// }
     /// ```
     pub async fn reload_provider(&self) -> Result<(), bamboo_llm::LLMError> {
+        // Every direct provider reload participates in the same generation
+        // order as config writers. A caller may await construction, but no
+        // later durable/live config generation can commit and then be
+        // overwritten by this publication.
+        let _io = self.config_io_lock.lock().await;
         let config = self.config.read().await.clone();
         let candidate_registry =
             bamboo_llm::ProviderRegistry::from_config(&config, self.app_data_dir.clone()).await?;
@@ -3119,6 +4551,8 @@ impl AppState {
             bamboo_llm::LLMError::Auth(message)
         })?;
 
+        #[cfg(test)]
+        run_generic_before_provider_publish_test_hook(&self.app_data_dir);
         let mut provider = self.provider.write().await;
         self.provider_registry.replace_with(candidate_registry);
         *provider = new_provider;
@@ -3166,16 +4600,192 @@ impl AppState {
         // disk-reading Config authority.
         let _io = self.config_io_lock.lock().await;
         let mut config = self.config.write().await;
-        let new_config = self
+        let mut new_config = self
             .config_facade
             .as_ref()
             .map(|facade| load_facade_effective_config(facade, &self.app_data_dir))
             .unwrap_or_else(|| {
                 Config::from_data_dir_without_publish(Some(self.app_data_dir.clone()))
             });
+        preserve_runtime_broker(&mut new_config, &config);
         new_config.publish_env_vars();
         *config = new_config.clone();
         new_config
+    }
+
+    /// Reload one exact root snapshot and publish its config, provider and MCP
+    /// runtimes under a single generation boundary.
+    ///
+    /// The detached owner retains `config_io_lock` through all publication, so
+    /// request cancellation cannot strand a newly installed live config ahead
+    /// of provider/MCP convergence and a later writer cannot be overwritten by
+    /// effects captured from this reload.
+    pub async fn reload_config_and_runtime(&self) -> Result<Config, AppError> {
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let config_facade = self.config_facade.clone();
+        let config = self.config.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let account_sink = self.account_sink.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let mut new_config = config_facade
+                .as_ref()
+                .map(|facade| load_facade_effective_config(facade, &app_data_dir))
+                .unwrap_or_else(|| {
+                    Config::from_data_dir_without_publish(Some(app_data_dir.clone()))
+                });
+            {
+                let previous = config.read().await;
+                preserve_runtime_broker(&mut new_config, &previous);
+            }
+            if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
+                tracing::warn!("reloaded provider config is invalid");
+                let message =
+                    "provider configuration is invalid; retaining last-known-good generation"
+                        .to_string();
+                if let Some(facade) = config_facade.as_ref() {
+                    if let Some(event) = facade
+                        .registry()
+                        .mark_runtime_degraded(SectionId::Providers, message.clone())
+                    {
+                        publish_registry_event(&account_sink, &event).await;
+                    }
+                }
+                publish_section_failure(
+                    &config_live_health,
+                    &account_sink,
+                    "providers",
+                    SectionStatus::Invalid,
+                    message,
+                )
+                .await;
+                return Err(AppError::BadRequest(format!(
+                    "Invalid configuration: {error}"
+                )));
+            }
+            new_config.publish_env_vars();
+            *config.write().await = new_config.clone();
+            Self::apply_config_effects_owned(
+                new_config.clone(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
+                },
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
+            Ok::<_, AppError>(new_config)
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "config/runtime reload transaction task failed: {error}"
+            ))
+        })?
+    }
+
+    /// Delete the legacy primary config, model-limits, and connect authorities,
+    /// then install the resulting default config/provider/MCP generation while
+    /// one detached owner retains `config_io_lock`.
+    ///
+    /// `config.json.bak` remains as the intentionally recoverable low-sensitivity
+    /// configuration snapshot. `connect.json.bak` is removed because it can
+    /// contain an immediately usable encrypted remote-control credential.
+    ///
+    /// Once dispatched, request cancellation cannot stop the reset between
+    /// file deletion and runtime convergence. Runtime failures are committed
+    /// as degraded last-known-good state because the destructive reset itself
+    /// has already crossed its durable boundary.
+    pub async fn reset_legacy_config_and_runtime(&self) -> Result<Config, AppError> {
+        if self.config_facade.is_some() {
+            return Err(AppError::BadRequest(
+                "full config reset spans multiple revisioned sections and is disabled without a recoverable manifest; reset sections individually through the typed section API"
+                    .to_string(),
+            ));
+        }
+
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let config = self.config.clone();
+        let provider_registry = self.provider_registry.clone();
+        let provider = self.provider.clone();
+        let mcp_manager = self.mcp_manager.clone();
+        let account_sink = self.account_sink.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let mut deletion_error = None;
+            for path in [
+                app_data_dir.join("config.json"),
+                app_data_dir.join("model_limits.json"),
+                app_data_dir.join("connect.json"),
+                app_data_dir.join("connect.json.bak"),
+            ] {
+                let result = match tokio::fs::try_exists(&path).await {
+                    Ok(true) => tokio::fs::remove_file(&path).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        file = %path.display(),
+                        "failed to delete one legacy config artifact during reset"
+                    );
+                    deletion_error.get_or_insert(error);
+                }
+            }
+            #[cfg(test)]
+            run_reset_after_delete_test_hook(&app_data_dir);
+
+            let mut new_config = Config::from_data_dir_without_publish(Some(app_data_dir.clone()));
+            {
+                let previous = config.read().await;
+                preserve_runtime_broker(&mut new_config, &previous);
+            }
+            new_config.publish_env_vars();
+            *config.write().await = new_config.clone();
+            Self::apply_config_effects_owned(
+                new_config.clone(),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade: None,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
+            match deletion_error {
+                Some(error) => Err(AppError::StorageError(error)),
+                None => Ok(new_config),
+            }
+        });
+        transaction.await.map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "legacy config reset transaction task failed: {error}"
+            ))
+        })?
     }
 
     async fn persist_config_snapshot(
@@ -3236,6 +4846,19 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
+        self.update_config_with_forced_mcp_replacements(update, effects, HashSet::new())
+            .await
+    }
+
+    pub(crate) async fn update_config_with_forced_mcp_replacements<F>(
+        &self,
+        update: F,
+        effects: ConfigUpdateEffects,
+        forced_mcp_replacements: HashSet<String>,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
         // Cancellation while waiting for either guard is pre-commit and leaves
         // every authority untouched. After candidate construction there is no
         // await before the owned guard and candidate enter the detached task.
@@ -3276,6 +4899,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         // The detached task owns every step after dispatch. Dropping the
         // request's JoinHandle cannot strand a completed durable/facade commit
         // ahead of live publication, its exact events, or requested effects.
@@ -3310,21 +4935,28 @@ impl AppState {
                 };
                 {
                     let mut cfg = config.write().await;
+                    preserve_runtime_broker(&mut snapshot, &cfg);
                     snapshot.publish_env_vars();
                     *cfg = snapshot.clone();
                 }
                 // Keep synchronous event enqueue inside the same serialization
                 // boundary as durable commit and live installation. Otherwise a
                 // later local writer can enqueue r2 before this task enqueues r1.
-                publish_exact_facade_events(&account_sink, &events)?;
-                Self::apply_config_effects_owned(
+                publish_exact_facade_events(&account_sink, &events).await?;
+                Self::apply_config_effects_owned_after_forcing(
                     snapshot.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
+                    forced_mcp_replacements,
                 )
                 .await?;
                 snapshot
@@ -3411,6 +5043,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let transaction = tokio::spawn(async move {
             let snapshot = {
                 let _io = io;
@@ -3462,7 +5096,7 @@ impl AppState {
                         "configuration watch failed: {error}"
                     )),
                 })?;
-                let (snapshot, events) = match commit {
+                let (mut snapshot, events) = match commit {
                     Some(commit) => {
                         let mut published = live_base;
                         let installed = install_credential_section_commit(commit, &mut published)
@@ -3477,21 +5111,27 @@ impl AppState {
                 };
                 {
                     let mut cfg = config.write().await;
+                    preserve_runtime_broker(&mut snapshot, &cfg);
                     snapshot.publish_env_vars();
                     *cfg = snapshot.clone();
                 }
-                publish_exact_facade_events(&account_sink, &events)?;
+                publish_exact_facade_events(&account_sink, &events).await?;
                 if enforcement_newly_off {
                     warn_plugin_trust_enforcement_off();
                 }
                 Self::apply_config_effects_owned(
                     snapshot.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
                 )
                 .await?;
                 snapshot
@@ -3639,7 +5279,7 @@ impl AppState {
             };
             published.publish_env_vars();
             *config.write().await = published.clone();
-            publish_exact_facade_events(&account_sink, &installed.events)?;
+            publish_exact_facade_events(&account_sink, &installed.events).await?;
             let section = installed.section;
             Ok::<_, AppError>((published, revision, installed.metadata, section))
         });
@@ -3777,7 +5417,7 @@ impl AppState {
                 ),
             };
             *config.write().await = published.clone();
-            publish_exact_facade_events(&account_sink, &installed.events)?;
+            publish_exact_facade_events(&account_sink, &installed.events).await?;
             let section = installed.section;
             Ok::<_, AppError>((published, revision, installed.metadata, section))
         });
@@ -3911,7 +5551,7 @@ impl AppState {
                 ),
             };
             *config.write().await = published.clone();
-            publish_exact_facade_events(&account_sink, &installed.events)?;
+            publish_exact_facade_events(&account_sink, &installed.events).await?;
             let section = installed.section;
             Ok::<_, AppError>((published, revision, installed.metadata, section))
         });
@@ -4045,7 +5685,7 @@ impl AppState {
                 ),
             };
             *config.write().await = published.clone();
-            publish_exact_facade_events(&account_sink, &installed.events)?;
+            publish_exact_facade_events(&account_sink, &installed.events).await?;
             let section = installed.section;
             Ok::<_, AppError>((published, revision, installed.metadata, section))
         });
@@ -4300,7 +5940,7 @@ impl AppState {
                 )));
             }
             if let Some(event) = event.as_ref() {
-                publish_registry_event(&account_sink, event);
+                publish_registry_event(&account_sink, event).await;
             }
             if let Err(error) = committed_recovery {
                 return Err(AppError::InternalError(anyhow::anyhow!(
@@ -4380,6 +6020,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let config_facade = self.config_facade.clone();
         let account_sink = self.account_sink.clone();
 
@@ -4501,36 +6143,24 @@ impl AppState {
             *config.write().await = published.clone();
 
             if let Some(installed) = installed.as_ref() {
-                publish_exact_facade_events(&account_sink, &installed.events)?;
+                publish_exact_facade_events(&account_sink, &installed.events).await?;
             }
 
-            if effects.reload_provider {
-                match bamboo_llm::ProviderRegistry::from_config(&published, app_data_dir.clone())
-                    .await
-                {
-                    Ok(candidate_registry) => {
-                        if let Some(candidate_provider) = candidate_registry.get_default() {
-                            let mut live_provider = provider.write().await;
-                            provider_registry.replace_with(candidate_registry);
-                            *live_provider = candidate_provider;
-                        } else {
-                            tracing::warn!(
-                                "proxy auth committed but provider reload had no default provider"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "proxy auth committed but provider reload failed"
-                        );
-                    }
-                }
-            }
-
-            if effects.reconcile_mcp {
-                mcp_manager.reconcile_from_config(&published.mcp).await;
-            }
+            Self::apply_config_effects_owned(
+                published.clone(),
+                effects,
+                ConfigRuntimeEffectContext {
+                    app_data_dir,
+                    config_facade,
+                    provider_registry,
+                    provider,
+                    mcp_manager,
+                    account_sink,
+                    config_live_health,
+                    mcp_config_live_health,
+                },
+            )
+            .await?;
 
             let (status, health) = if let Some(installed) = installed {
                 (
@@ -4601,6 +6231,8 @@ impl AppState {
         let provider_registry = self.provider_registry.clone();
         let provider = self.provider.clone();
         let mcp_manager = self.mcp_manager.clone();
+        let config_live_health = self.config_live_health.clone();
+        let mcp_config_live_health = self.mcp_config_live_health.clone();
         let transaction = tokio::spawn(async move {
             // Same #126 serialization as update_config: mutate + persist under
             // the config-IO lock so a reload can't interleave. Provider/MCP
@@ -4630,22 +6262,31 @@ impl AppState {
                     None => Vec::new(),
                 };
                 let enforcement_newly_off = !was_off && published.plugin_trust.enforcement_is_off();
-                published.publish_env_vars();
-                *config.write().await = published.clone();
+                {
+                    let mut current = config.write().await;
+                    preserve_runtime_broker(&mut published, &current);
+                    published.publish_env_vars();
+                    *current = published.clone();
+                }
                 // Same live signal as `update_config` — a full-config replace
                 // that transitions plugin_trust.enforcement into `Off` warns.
                 if enforcement_newly_off {
                     warn_plugin_trust_enforcement_off();
                 }
-                publish_exact_facade_events(&account_sink, &events)?;
+                publish_exact_facade_events(&account_sink, &events).await?;
                 Self::apply_config_effects_owned(
                     published.clone(),
                     effects,
-                    app_data_dir,
-                    config,
-                    provider_registry,
-                    provider,
-                    mcp_manager,
+                    ConfigRuntimeEffectContext {
+                        app_data_dir,
+                        config_facade,
+                        provider_registry,
+                        provider,
+                        mcp_manager,
+                        account_sink,
+                        config_live_health,
+                        mcp_config_live_health,
+                    },
                 )
                 .await?;
                 published
@@ -4662,59 +6303,196 @@ impl AppState {
     async fn apply_config_effects_owned(
         new_config: Config,
         effects: ConfigUpdateEffects,
-        app_data_dir: PathBuf,
-        config: Arc<RwLock<Config>>,
-        provider_registry: Arc<bamboo_llm::ProviderRegistry>,
-        provider: Arc<RwLock<Arc<dyn LLMProvider>>>,
-        mcp_manager: Arc<McpServerManager>,
+        context: ConfigRuntimeEffectContext,
     ) -> Result<(), AppError> {
-        if effects.reload_provider {
-            // The caller retains config_io_lock through provider construction
-            // and publication, so this current live snapshot cannot be
-            // superseded while an awaited runtime build is in flight.
-            let live_config = config.read().await.clone();
-            let candidate_registry =
-                bamboo_llm::ProviderRegistry::from_config(&live_config, app_data_dir.clone())
-                    .await
-                    .map_err(|e| {
-                        AppError::InternalError(anyhow::anyhow!(
-                            "Failed to reload provider after updating config: {e}"
-                        ))
-                    })?;
-            let default_provider_name = candidate_registry.default_provider_name();
-            let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
-                let message = if live_config.has_provider_instances() {
-                    format!(
-                        "Default provider instance '{}' is not available or failed to initialize",
-                        default_provider_name
-                    )
-                } else {
-                    format!(
-                        "Provider '{}' is not available or failed to initialize",
-                        live_config.provider
-                    )
-                };
-                AppError::InternalError(anyhow::anyhow!(
-                    "Failed to reload provider after updating config: {}",
+        Self::apply_config_effects_owned_after_forcing(new_config, effects, context, HashSet::new())
+            .await
+    }
+
+    async fn apply_config_effects_owned_after_forcing(
+        new_config: Config,
+        effects: ConfigUpdateEffects,
+        context: ConfigRuntimeEffectContext,
+        forced_mcp_replacements: HashSet<String>,
+    ) -> Result<(), AppError> {
+        let ConfigRuntimeEffectContext {
+            app_data_dir,
+            config_facade,
+            provider_registry,
+            provider,
+            mcp_manager,
+            account_sink,
+            config_live_health,
+            mcp_config_live_health,
+        } = context;
+        // The caller owns config_io_lock for this whole method. Build every
+        // runtime from `new_config` itself: consulting the mutable live view
+        // here would let one durable generation publish another generation's
+        // provider or MCP state.
+        let mut provider_failure = None;
+        if !matches!(
+            effects.reload_provider,
+            bamboo_config::patch::ReloadMode::None
+        ) {
+            let candidate = async {
+                let candidate_registry =
+                    bamboo_llm::ProviderRegistry::from_config(&new_config, app_data_dir.clone())
+                        .await?;
+                let default_provider_name = candidate_registry.default_provider_name();
+                let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
+                    let message = if new_config.has_provider_instances() {
+                        format!(
+                            "Default provider instance '{}' is not available or failed to initialize",
+                            default_provider_name
+                        )
+                    } else {
+                        format!(
+                            "Provider '{}' is not available or failed to initialize",
+                            new_config.provider
+                        )
+                    };
                     bamboo_llm::LLMError::Auth(message)
+                })?;
+                Ok::<_, bamboo_llm::LLMError>((
+                    candidate_registry,
+                    candidate_provider,
+                    default_provider_name,
                 ))
-            })?;
-            #[cfg(test)]
-            run_generic_before_provider_publish_test_hook(&app_data_dir);
-            let mut live_provider = provider.write().await;
-            provider_registry.replace_with(candidate_registry);
-            *live_provider = candidate_provider;
-            tracing::info!(
-                default_provider = %default_provider_name,
-                "Provider reloaded successfully"
-            );
+            }
+            .await;
+
+            match candidate {
+                Ok((candidate_registry, candidate_provider, default_provider_name)) => {
+                    #[cfg(test)]
+                    run_generic_before_provider_publish_test_hook(&app_data_dir);
+                    {
+                        // Never hold the provider guard while acquiring the MCP
+                        // reconcile guard below.
+                        let mut live_provider = provider.write().await;
+                        provider_registry.replace_with(candidate_registry);
+                        *live_provider = candidate_provider;
+                    }
+                    if let Some(facade) = config_facade.as_ref() {
+                        let snapshot = facade.registry().providers.snapshot();
+                        set_live_health_revision(
+                            &config_live_health,
+                            snapshot.revision,
+                            Some((snapshot.source_path.clone(), snapshot.source_kind)),
+                        );
+                    } else {
+                        update_live_health(
+                            &config_live_health,
+                            SectionStatus::Healthy,
+                            None,
+                            true,
+                            Some((app_data_dir.join("config.json"), SectionSourceKind::File)),
+                        );
+                    }
+                    tracing::info!(
+                        default_provider = %default_provider_name,
+                        "Provider reloaded successfully"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!("committed provider generation could not start");
+                    let message =
+                        "provider runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                    if let Some(facade) = config_facade.as_ref() {
+                        if let Some(event) = facade
+                            .registry()
+                            .mark_runtime_degraded(SectionId::Providers, message.clone())
+                        {
+                            let snapshot = facade.registry().providers.snapshot();
+                            set_live_health_from_snapshot(&config_live_health, &snapshot);
+                            publish_registry_event(&account_sink, &event).await;
+                        }
+                    } else {
+                        publish_section_failure(
+                            &config_live_health,
+                            &account_sink,
+                            "providers",
+                            SectionStatus::Degraded,
+                            message.clone(),
+                        )
+                        .await;
+                    }
+                    if matches!(
+                        effects.reload_provider,
+                        bamboo_config::patch::ReloadMode::Strict
+                    ) {
+                        provider_failure = Some(AppError::InternalError(anyhow::anyhow!(message)));
+                    }
+                }
+            }
         }
 
-        if effects.reconcile_mcp {
-            mcp_manager.reconcile_from_config(&new_config.mcp).await;
+        let mut mcp_failure = None;
+        if !matches!(
+            effects.reconcile_mcp,
+            bamboo_config::patch::ReloadMode::None
+        ) {
+            match mcp_manager
+                .reconcile_from_config_transactional_after_forcing(
+                    &new_config.mcp,
+                    &forced_mcp_replacements,
+                    || async { Ok(()) },
+                )
+                .await
+            {
+                Ok(()) => {
+                    if let Some(facade) = config_facade.as_ref() {
+                        let snapshot = facade.registry().mcp.snapshot();
+                        set_live_health_revision(
+                            &mcp_config_live_health,
+                            snapshot.revision,
+                            Some((snapshot.source_path.clone(), snapshot.source_kind)),
+                        );
+                    } else {
+                        update_live_health(
+                            &mcp_config_live_health,
+                            SectionStatus::Healthy,
+                            None,
+                            true,
+                            Some((app_data_dir.join("config.json"), SectionSourceKind::File)),
+                        );
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("committed MCP generation could not start");
+                    let message =
+                        "MCP runtime initialization failed; retaining last-known-good runtime"
+                            .to_string();
+                    if let Some(facade) = config_facade.as_ref() {
+                        if let Some(event) = facade
+                            .registry()
+                            .mark_runtime_degraded(SectionId::Mcp, message.clone())
+                        {
+                            let snapshot = facade.registry().mcp.snapshot();
+                            set_live_health_from_snapshot(&mcp_config_live_health, &snapshot);
+                            publish_registry_event(&account_sink, &event).await;
+                        }
+                    } else {
+                        publish_section_failure(
+                            &mcp_config_live_health,
+                            &account_sink,
+                            "mcp",
+                            SectionStatus::Degraded,
+                            message.clone(),
+                        )
+                        .await;
+                    }
+                    if matches!(
+                        effects.reconcile_mcp,
+                        bamboo_config::patch::ReloadMode::Strict
+                    ) {
+                        mcp_failure = Some(AppError::InternalError(anyhow::anyhow!(message)));
+                    }
+                }
+            }
         }
 
-        Ok(())
+        provider_failure.or(mcp_failure).map_or(Ok(()), Err)
     }
 
     /// Resolve a pending config-corruption recovery (#153; see
@@ -4837,6 +6615,22 @@ mod live_reload_tests {
         }
     }
 
+    fn restart_config_watcher(state: &mut AppState) {
+        let (runtime, provider_health, mcp_health) = ConfigWatcherRuntime::start(
+            state.app_data_dir.clone(),
+            state.config.clone(),
+            state.config_facade.clone(),
+            state.config_io_lock.clone(),
+            state.provider_registry.clone(),
+            state.provider.clone(),
+            state.mcp_manager.clone(),
+            state.account_sink.clone(),
+        );
+        state.config_watcher = runtime;
+        state.config_live_health = provider_health;
+        state.mcp_config_live_health = mcp_health;
+    }
+
     async fn insert_registry_worker(state: &AppState, key: String, worker_id: &str) {
         #[cfg(unix)]
         let child = tokio::process::Command::new("/bin/sleep")
@@ -4882,6 +6676,136 @@ mod live_reload_tests {
         }
     }
 
+    fn working_stdio_mcp_config(dir: &Path, id: &str, secret: Option<&str>) -> McpConfig {
+        let script = dir.join(format!("{id}-mcp-fixture.py"));
+        std::fs::write(
+            &script,
+            r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if request.get("method") == "server/discover":
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }), flush=True)
+        continue
+    if request.get("method") == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "config-generation-fixture", "version": "1.0.0"},
+        }
+    elif request.get("method") == "tools/list":
+        result = {"tools": []}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|command| {
+                std::process::Command::new(command)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            })
+            .expect("a Python interpreter is required for the MCP ordering fixture");
+        let mut env = std::collections::HashMap::new();
+        if let Some(secret) = secret {
+            env.insert("TOKEN".to_string(), secret.to_string());
+        }
+        McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: id.to_string(),
+                name: None,
+                enabled: true,
+                transport: TransportConfig::Stdio(StdioConfig {
+                    command: python.to_string(),
+                    args: vec![script.to_string_lossy().into_owned()],
+                    cwd: None,
+                    env,
+                    env_encrypted: std::collections::HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
+                    startup_timeout_ms: 2_000,
+                }),
+                request_timeout_ms: 2_000,
+                healthcheck_interval_ms: 10_000,
+                reconnect: ReconnectConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn config_update_preserves_runtime_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let expected = state
+            .config
+            .read()
+            .await
+            .subagents()
+            .broker
+            .clone()
+            .expect("AppState embeds a runtime broker");
+
+        let updated = state
+            .update_config(
+                |config| {
+                    config.subagents_mut().max_concurrent = Some(3);
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.subagents().broker.as_ref(), Some(&expected));
+        assert_eq!(
+            state.config.read().await.subagents().broker.as_ref(),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn preserve_runtime_broker_keeps_explicit_broker() {
+        let previous_broker = bamboo_config::BrokerClientConfig {
+            endpoint: "ws://127.0.0.1:41001".to_string(),
+            token: "previous".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: false,
+        };
+        let explicit_broker = bamboo_config::BrokerClientConfig {
+            endpoint: "wss://broker.example.test".to_string(),
+            token: "explicit".to_string(),
+            token_encrypted: None,
+            credential_ref: None,
+            configured: true,
+        };
+        let mut previous = Config::default();
+        previous.subagents_mut().broker = Some(previous_broker);
+        let mut incoming = Config::default();
+        incoming.subagents_mut().broker = Some(explicit_broker.clone());
+
+        preserve_runtime_broker(&mut incoming, &previous);
+
+        assert_eq!(incoming.subagents().broker.as_ref(), Some(&explicit_broker));
+    }
+
     fn mcp_document_bytes(revision: u64, config: &McpConfig) -> Vec<u8> {
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
@@ -4889,6 +6813,74 @@ mod live_reload_tests {
             "data": config,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn legacy_mcp_rejects_client_owned_stdio_and_header_credential_refs() {
+        let mut stdio_current = disabled_mcp_config("stdio-server");
+        let stdio_reference =
+            bamboo_config::credential_ref("mcp", "stdio-server", "env_TOKEN").unwrap();
+        let TransportConfig::Stdio(stdio) = &mut stdio_current.servers[0].transport else {
+            unreachable!()
+        };
+        stdio
+            .env
+            .insert("TOKEN".to_string(), "existing-secret".to_string());
+        stdio
+            .env_credential_refs
+            .insert("TOKEN".to_string(), stdio_reference.as_str().to_string());
+        let mut stdio_candidate = stdio_current.clone();
+        let TransportConfig::Stdio(stdio) = &mut stdio_candidate.servers[0].transport else {
+            unreachable!()
+        };
+        stdio
+            .env_credential_refs
+            .insert("TOKEN".to_string(), "mcp.foreign.env_token".to_string());
+        let error = normalize_legacy_mcp_credentials(&stdio_current, &mut stdio_candidate)
+            .expect_err("an arbitrary stdio credential ref must be rejected");
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "MCP credential references are server-managed and cannot be supplied"
+        ));
+
+        let header_reference =
+            bamboo_config::credential_ref("mcp", "http-server", "header_Authorization").unwrap();
+        let http_current = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "http-server".to_string(),
+                name: None,
+                enabled: false,
+                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                    url: "https://example.test/sse".to_string(),
+                    headers: vec![bamboo_mcp::HeaderConfig {
+                        name: "Authorization".to_string(),
+                        value: "existing-secret".to_string(),
+                        value_encrypted: None,
+                        credential_ref: Some(header_reference.as_str().to_string()),
+                    }],
+                    connect_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let mut http_candidate = http_current.clone();
+        let TransportConfig::Sse(http) = &mut http_candidate.servers[0].transport else {
+            unreachable!()
+        };
+        http.headers[0].credential_ref = Some("mcp.foreign.header_authorization".to_string());
+        let error = normalize_legacy_mcp_credentials(&http_current, &mut http_candidate)
+            .expect_err("an arbitrary header credential ref must be rejected");
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message)
+                if message == "MCP credential references are server-managed and cannot be supplied"
+        ));
     }
 
     #[test]
@@ -5098,6 +7090,19 @@ mod live_reload_tests {
         feed: &mut tokio::sync::broadcast::Receiver<Arc<bamboo_engine::events::ChangeEvent>>,
     ) -> AgentEvent {
         next_config_event(feed, "mcp").await
+    }
+
+    async fn wait_for_root_outbox_to_clear(data_dir: &Path) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if !bamboo_config::has_pending_legacy_root_publications(data_dir).unwrap() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("legacy root outbox did not clear");
     }
 
     #[tokio::test]
@@ -6434,8 +8439,8 @@ for line in sys.stdin:
                             Ok(())
                         },
                         ConfigUpdateEffects {
-                            reload_provider: true,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await
@@ -6488,8 +8493,8 @@ for line in sys.stdin:
                             Ok(())
                         },
                         ConfigUpdateEffects {
-                            reload_provider: false,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::None,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await
@@ -6507,6 +8512,755 @@ for line in sys.stdin:
             "the later durable config generation must remain the final runtime generation"
         );
         state.mcp_manager.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_provider_reload_cannot_publish_after_later_config_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.provider = "openai".to_string();
+        initial.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            api_key: "first-generation-key".to_string(),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            ..Default::default()
+        });
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial,
+            Arc::new(WorkingProvider),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let quiesced = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("startup config work must quiesce");
+        drop(quiesced);
+        let (reload_ready_tx, reload_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_provider_publish_test_hook(dir.path(), move || {
+            let _ = reload_ready_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let reload = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reload_provider().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reload_ready_rx)
+            .await
+            .expect("direct reload reaches provider publication hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+
+        let mut later_instance: bamboo_config::ProviderInstanceConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "enabled": true
+            }))
+            .unwrap();
+        later_instance.api_key = "later-generation-key".to_string();
+        let (later_started_tx, later_started_rx) = tokio::sync::oneshot::channel();
+        let later = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = later_started_tx.send(());
+                state
+                    .update_config_with_provider_credentials(
+                        move |config| {
+                            config
+                                .provider_instances
+                                .insert("later-winner".to_string(), later_instance);
+                            config.default_provider_instance = Some("later-winner".to_string());
+                            Ok(())
+                        },
+                        BTreeSet::new(),
+                        BTreeSet::from(["later-winner".to_string()]),
+                        ConfigUpdateEffects {
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                        },
+                    )
+                    .await
+            })
+        };
+        later_started_rx.await.unwrap();
+        assert!(!later.is_finished());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reload.await.unwrap().unwrap();
+            later.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized provider generations finish");
+        assert_eq!(
+            state
+                .config
+                .read()
+                .await
+                .default_provider_instance
+                .as_deref(),
+            Some("later-winner")
+        );
+        assert_eq!(
+            state.provider_registry.default_provider_name(),
+            "later-winner"
+        );
+        let registry_default = state.provider_registry.get_default().unwrap();
+        let live_provider = state.provider.read().await.clone();
+        assert!(
+            Arc::ptr_eq(&registry_default, &live_provider),
+            "registry default and reloadable provider handle must publish one generation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn combined_reload_cannot_publish_captured_mcp_after_later_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.provider = "openai".to_string();
+        initial.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            api_key: "combined-reload-key".to_string(),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            ..Default::default()
+        });
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial,
+            Arc::new(WorkingProvider),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        state
+            .update_config_with_provider_credentials(
+                |_| Ok(()),
+                BTreeSet::from(["openai".to_string()]),
+                BTreeSet::new(),
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        let first_mcp = working_stdio_mcp_config(dir.path(), "captured-first", None);
+        state
+            .update_config(
+                move |config| {
+                    config.mcp = first_mcp;
+                    Ok(())
+                },
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let (reload_ready_tx, reload_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_provider_publish_test_hook(dir.path(), move || {
+            let _ = reload_ready_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let reload = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reload_config_and_runtime().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reload_ready_rx)
+            .await
+            .expect("combined reload reaches provider publication hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+
+        let later_mcp = working_stdio_mcp_config(dir.path(), "later-winner", None);
+        let (later_started_tx, later_started_rx) = tokio::sync::oneshot::channel();
+        let later = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = later_started_tx.send(());
+                state
+                    .update_config(
+                        move |config| {
+                            config.mcp = later_mcp;
+                            Ok(())
+                        },
+                        ConfigUpdateEffects {
+                            reload_provider: bamboo_config::patch::ReloadMode::None,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
+                        },
+                    )
+                    .await
+            })
+        };
+        later_started_rx.await.unwrap();
+        assert!(!later.is_finished());
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            reload.await.unwrap().unwrap();
+            later.await.unwrap().unwrap();
+        })
+        .await
+        .expect("serialized config/runtime generations finish");
+        assert_eq!(state.config.read().await.mcp.servers[0].id, "later-winner");
+        assert_eq!(
+            state.mcp_manager.list_servers(),
+            vec!["later-winner".to_string()]
+        );
+        state.mcp_manager.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_mcp_credentials_round_trip_without_plaintext_in_durable_or_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let secret = "legacy-mcp-roundtrip-secret";
+        let mut candidate = disabled_mcp_config("credential-server");
+        let TransportConfig::Stdio(stdio) = &mut candidate.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.env.insert("TOKEN".to_string(), secret.to_string());
+
+        state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = candidate;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let live = state.config.read().await.clone();
+        let TransportConfig::Stdio(stdio) = &live.mcp.servers[0].transport else {
+            unreachable!()
+        };
+        assert_eq!(stdio.env["TOKEN"], secret);
+        let reference =
+            bamboo_config::CredentialRef::parse(stdio.env_credential_refs["TOKEN"].clone())
+                .unwrap();
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            secret
+        );
+        for path in [
+            dir.path().join("mcp.json"),
+            dir.path().join("credentials.json"),
+        ] {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+        }
+        let events = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap();
+        assert!(!format!("{events:?}").contains(secret));
+
+        state
+            .update_legacy_mcp_config(BTreeSet::new(), |mcp| {
+                let TransportConfig::Stdio(stdio) = &mut mcp.servers[0].transport else {
+                    unreachable!()
+                };
+                stdio
+                    .env
+                    .insert("TOKEN".to_string(), "****...****".to_string());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let live = state.config.read().await.clone();
+        let TransportConfig::Stdio(stdio) = &live.mcp.servers[0].transport else {
+            unreachable!()
+        };
+        assert_eq!(stdio.env["TOKEN"], secret);
+        assert_eq!(stdio.env_credential_refs["TOKEN"], reference.as_str());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_mcp_cancelled_start_finishes_before_later_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let secret = "legacy-mcp-cancel-secret";
+        let candidate = working_stdio_mcp_config(dir.path(), "cancelled-start", Some(secret));
+        let reference =
+            bamboo_config::credential_ref("mcp", "cancelled-start", "env_TOKEN").unwrap();
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_credential_after_commit_before_live_test_hook(dir.path(), SectionId::Mcp, move || {
+            let _ = commit_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                        *mcp = candidate;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), commit_rx)
+            .await
+            .expect("legacy MCP write reaches durable-before-live hook")
+            .unwrap();
+        assert!(state.config_io_lock.try_lock().is_err());
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(dir.path().join("mcp.json")).unwrap())
+                .contains(secret)
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let delete = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = delete_started_tx.send(());
+                state
+                    .update_legacy_mcp_config(BTreeSet::new(), |mcp| {
+                        mcp.servers.clear();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        delete_started_rx.await.unwrap();
+        assert!(!delete.is_finished());
+        release_tx.send(()).unwrap();
+        delete.await.unwrap().unwrap();
+
+        assert!(state.config.read().await.mcp.servers.is_empty());
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+        assert!(state
+            .credential_store
+            .resolve(&reference)
+            .unwrap()
+            .is_none());
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(dir.path().join("mcp.json")).unwrap())
+                .contains(secret)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_rejects_secret_bearing_url_before_runtime_or_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let before = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        let secret = "must-never-connect-or-log";
+        let candidate = McpConfig {
+            version: 1,
+            servers: vec![McpServerConfig {
+                id: "unsafe-url".to_string(),
+                name: None,
+                enabled: true,
+                transport: TransportConfig::Sse(bamboo_mcp::SseConfig {
+                    url: format!("https://example.test/sse?token={secret}"),
+                    headers: vec![],
+                    connect_timeout_ms: 100,
+                }),
+                request_timeout_ms: 100,
+                healthcheck_interval_ms: 100,
+                reconnect: ReconnectConfig::default(),
+                allowed_tools: vec![],
+                denied_tools: vec![],
+            }],
+        };
+        let error = state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = candidate;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(std::fs::read(dir.path().join("mcp.json")).unwrap(), before);
+        assert!(state.config.read().await.mcp.servers.is_empty());
+        assert!(state.mcp_manager.list_servers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_start_failure_keeps_every_authority_on_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let disk_before = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        let config_before = state.config.read().await.clone();
+        let facade_before = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        let health_before = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut failing = disabled_mcp_config("never-committed");
+        failing.servers[0].enabled = true;
+        let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.command = "definitely-not-a-real-mcp-command-before-commit-736".to_string();
+
+        let error = state
+            .update_legacy_mcp_config(BTreeSet::new(), move |mcp| {
+                *mcp = failing;
+                Ok(())
+            })
+            .await
+            .expect_err("runtime staging must fail before the MCP durable boundary");
+        assert!(matches!(error, AppError::InternalError(_)));
+        assert_eq!(
+            error.to_string(),
+            "Internal server error: MCP runtime initialization failed before commit; retaining last-known-good generation"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("mcp.json")).unwrap(),
+            disk_before
+        );
+        assert_eq!(
+            serde_json::to_value(state.config.read().await.clone()).unwrap(),
+            serde_json::to_value(config_before).unwrap()
+        );
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(state.mcp_manager.tool_index().all_aliases().is_empty());
+
+        let facade_after = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        assert_eq!(facade_after.revision, facade_before.revision);
+        assert_eq!(facade_after.loaded_at, facade_before.loaded_at);
+        assert_eq!(facade_after.status, facade_before.status);
+        let health_after = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(health_after.revision, health_before.revision);
+        assert_eq!(health_after.loaded_at, health_before.loaded_at);
+        assert_eq!(health_after.status, health_before.status);
+        assert_eq!(health_after.last_error, health_before.last_error);
+        assert!(bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|event| !matches!(
+            event.event,
+            AgentEvent::ConfigChanged { ref section, .. }
+                | AgentEvent::ConfigInvalid { ref section, .. }
+                | AgentEvent::ConfigRecovered { ref section, .. }
+                if section == "mcp"
+        )));
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_reload_retains_live_provider_generation_and_marks_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_301;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state = AppState::new_with_provider(
+            dir.path().to_path_buf(),
+            initial.clone(),
+            injected.clone(),
+        )
+        .await
+        .unwrap();
+        stop_config_watcher(&mut state);
+        let expected_provider = state.config.read().await.provider.clone();
+
+        let mut invalid = initial;
+        invalid.provider = "unknown-invalid-provider".to_string();
+        invalid.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let error = state.reload_config_and_runtime().await.unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(_)));
+        assert_eq!(state.config.read().await.server.port, 24_301);
+        assert_eq!(state.config.read().await.provider, expected_provider);
+        let live_provider = state.provider.read().await.clone();
+        assert!(Arc::ptr_eq(&live_provider, &injected));
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(health.status, SectionStatus::Invalid);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("provider configuration is invalid; retaining last-known-good generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_provider_start_failure_publishes_one_exact_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let previous_provider = state.provider.read().await.clone();
+        let previous_default = state.provider_registry.default_provider_name();
+
+        let published = state
+            .update_config(
+                |config| {
+                    config.provider = "unknown-runtime-provider".to_string();
+                    config.default_provider_instance = None;
+                    config.provider_instances.clear();
+                    Ok(())
+                },
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                },
+            )
+            .await
+            .expect("the durable provider generation commits with degraded runtime health");
+        assert_eq!(published.provider, "unknown-runtime-provider");
+        assert_eq!(
+            state.config.read().await.provider,
+            "unknown-runtime-provider"
+        );
+        assert_eq!(
+            state.provider_registry.default_provider_name(),
+            previous_default
+        );
+        assert!(Arc::ptr_eq(
+            &state.provider.read().await.clone(),
+            &previous_provider
+        ));
+
+        let facade_snapshot = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .providers
+            .snapshot();
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(facade_snapshot.revision, 1);
+        assert_eq!(facade_snapshot.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, facade_snapshot.revision);
+        assert_eq!(health.loaded_at, facade_snapshot.loaded_at);
+        assert_eq!(health.source_path, facade_snapshot.source_path);
+        assert_eq!(health.source_kind, facade_snapshot.source_kind);
+        assert_eq!(health.status, facade_snapshot.status);
+        assert_eq!(health.last_error, facade_snapshot.last_error);
+
+        let invalid_revisions = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::ConfigInvalid { section, revision } if section == "providers" => {
+                Some(revision)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(invalid_revisions, vec![facade_snapshot.revision]);
+    }
+
+    #[tokio::test]
+    async fn committed_mcp_start_failure_publishes_one_exact_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let baseline_seq = state.account_sink.latest_seq();
+        let mut failing = disabled_mcp_config("committed-but-unstartable");
+        failing.servers[0].enabled = true;
+        let TransportConfig::Stdio(stdio) = &mut failing.servers[0].transport else {
+            unreachable!()
+        };
+        stdio.command = "definitely-not-a-real-mcp-command-736".to_string();
+
+        let published = state
+            .update_config(
+                move |config| {
+                    config.mcp = failing;
+                    Ok(())
+                },
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::None,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::BestEffort,
+                },
+            )
+            .await
+            .expect("the durable MCP generation commits with degraded runtime health");
+        assert_eq!(published.mcp.servers[0].id, "committed-but-unstartable");
+        assert_eq!(
+            state.config.read().await.mcp.servers[0].id,
+            "committed-but-unstartable"
+        );
+        assert!(state.mcp_manager.list_servers().is_empty());
+
+        let facade_snapshot = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        let health = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(facade_snapshot.revision, 1);
+        assert_eq!(facade_snapshot.status, SectionStatus::Degraded);
+        assert_eq!(health.revision, facade_snapshot.revision);
+        assert_eq!(health.loaded_at, facade_snapshot.loaded_at);
+        assert_eq!(health.source_path, facade_snapshot.source_path);
+        assert_eq!(health.source_kind, facade_snapshot.source_kind);
+        assert_eq!(health.status, facade_snapshot.status);
+        assert_eq!(health.last_error, facade_snapshot.last_error);
+
+        let invalid_revisions = bamboo_engine::events::journal::read_since(
+            state.account_sink.events_dir(),
+            baseline_seq,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            AgentEvent::ConfigInvalid { section, revision } if section == "mcp" => Some(revision),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(invalid_revisions, vec![facade_snapshot.revision]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_legacy_reset_finishes_deletion_and_runtime_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_302;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("config.json.bak"), b"recovery-marker").unwrap();
+        std::fs::write(dir.path().join("model_limits.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("connect.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("connect.json.bak"), b"credential-backup").unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state =
+            AppState::new_with_provider(dir.path().to_path_buf(), initial, injected.clone())
+                .await
+                .unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let (deleted_tx, deleted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_reset_after_delete_test_hook(dir.path(), move || {
+            let _ = deleted_tx.send(());
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            tokio::spawn(async move { state.reset_legacy_config_and_runtime().await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), deleted_rx)
+            .await
+            .expect("reset reaches durable delete boundary")
+            .unwrap();
+        for path in [
+            dir.path().join("config.json"),
+            dir.path().join("model_limits.json"),
+            dir.path().join("connect.json"),
+            dir.path().join("connect.json.bak"),
+        ] {
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("config.json.bak")).unwrap(),
+            b"recovery-marker"
+        );
+        assert_eq!(state.config.read().await.server.port, 24_302);
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached reset must finish live/runtime publication");
+        drop(completed);
+        assert_eq!(state.config.read().await.server.port, 9562);
+        assert!(state.mcp_manager.list_servers().is_empty());
+        let health = state
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            health.status,
+            SectionStatus::Degraded,
+            "the committed default config has no usable Anthropic credential, so reset must report truthful runtime degradation"
+        );
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("provider runtime initialization failed; retaining last-known-good runtime")
+        );
+        assert!(Arc::ptr_eq(&state.provider.read().await.clone(), &injected));
+    }
+
+    #[tokio::test]
+    async fn legacy_reset_converges_runtime_after_partial_delete_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = Config::default();
+        initial.server.port = 24_303;
+        initial.save_to_dir(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join("model_limits.json"), b"{}").unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(WorkingProvider);
+        let mut state =
+            AppState::new_with_provider(dir.path().to_path_buf(), initial, injected.clone())
+                .await
+                .unwrap();
+        stop_config_watcher(&mut state);
+
+        // A directory at a file path makes `remove_file` fail deterministically.
+        // The reset must still delete later sensitive artifacts and publish the
+        // generation represented by whatever remains on disk.
+        std::fs::create_dir(dir.path().join("connect.json")).unwrap();
+        std::fs::write(dir.path().join("connect.json.bak"), b"credential-backup").unwrap();
+
+        let error = state.reset_legacy_config_and_runtime().await.unwrap_err();
+        assert!(matches!(error, AppError::StorageError(_)));
+        assert!(!dir.path().join("config.json").exists());
+        assert!(!dir.path().join("model_limits.json").exists());
+        assert!(dir.path().join("connect.json").is_dir());
+        assert!(!dir.path().join("connect.json.bak").exists());
+        assert_eq!(state.config.read().await.server.port, 9562);
+        assert!(state.mcp_manager.list_servers().is_empty());
+        assert!(Arc::ptr_eq(&state.provider.read().await.clone(), &injected));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7951,8 +10705,8 @@ for line in sys.stdin:
                         }),
                         0,
                         ConfigUpdateEffects {
-                            reload_provider: true,
-                            reconcile_mcp: true,
+                            reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                            reconcile_mcp: bamboo_config::patch::ReloadMode::Strict,
                         },
                     )
                     .await
@@ -8280,11 +11034,25 @@ for line in sys.stdin:
             1
         );
         let runtime = state.config.read().await;
-        let TransportConfig::Stdio(stdio) = &runtime.mcp.servers[0].transport else {
+        let TransportConfig::Stdio(stdio) = &runtime
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == "switch-stdio")
+            .expect("stdio server")
+            .transport
+        else {
             panic!("stdio transport")
         };
         assert_eq!(stdio.env["TOKEN"], "env-b");
-        let TransportConfig::Sse(sse) = &runtime.mcp.servers[1].transport else {
+        let TransportConfig::Sse(sse) = &runtime
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == "switch-header")
+            .expect("SSE server")
+            .transport
+        else {
             panic!("sse transport")
         };
         assert_eq!(sse.headers[0].value, "header-b");
@@ -8302,10 +11070,135 @@ for line in sys.stdin:
             disk_before
         );
         let runtime = state.config.read().await;
-        let TransportConfig::Stdio(stdio) = &runtime.mcp.servers[0].transport else {
+        let TransportConfig::Stdio(stdio) = &runtime
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.id == "switch-stdio")
+            .expect("stdio server")
+            .transport
+        else {
             panic!("stdio transport")
         };
         assert_eq!(stdio.env["TOKEN"], "env-b");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_initial_mcp_batch_does_not_reapply_after_typed_revision_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        let make_server = |id: &str, transport: TransportConfig| McpServerConfig {
+            id: id.to_string(),
+            name: None,
+            enabled: false,
+            transport,
+            request_timeout_ms: 100,
+            healthcheck_interval_ms: 100,
+            reconnect: ReconnectConfig::default(),
+            allowed_tools: vec![],
+            denied_tools: vec![],
+        };
+        let initial = McpConfig {
+            version: 1,
+            servers: vec![make_server(
+                "initial",
+                TransportConfig::Stdio(StdioConfig {
+                    command: "unused-initial-command".to_string(),
+                    args: vec![],
+                    cwd: None,
+                    env: std::collections::HashMap::new(),
+                    env_encrypted: std::collections::HashMap::new(),
+                    env_credential_refs: std::collections::HashMap::new(),
+                    startup_timeout_ms: 100,
+                }),
+            )],
+        };
+        assert_eq!(state.put_mcp_section(0, initial).await.unwrap(), 1);
+        stop_config_watcher(&mut state);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        set_initial_mcp_apply_test_hook(
+            dir.path(),
+            move || {
+                reached_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+            move || {
+                done_tx.send(()).unwrap();
+            },
+        );
+        restart_config_watcher(&mut state);
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        // The typed r2 commit wins while the queued startup batch still owns
+        // an r1 generation token. The intentionally non-lexical Vec order is
+        // only an internal canary: a redundant JSON-map reload would reorder
+        // it even though server order is not a public persistence contract.
+        let latest = McpConfig {
+            version: 1,
+            servers: vec![
+                make_server(
+                    "z-stdio",
+                    TransportConfig::Stdio(StdioConfig {
+                        command: "unused-latest-command".to_string(),
+                        args: vec![],
+                        cwd: None,
+                        env: std::collections::HashMap::new(),
+                        env_encrypted: std::collections::HashMap::new(),
+                        env_credential_refs: std::collections::HashMap::new(),
+                        startup_timeout_ms: 100,
+                    }),
+                ),
+                make_server(
+                    "a-sse",
+                    TransportConfig::Sse(bamboo_mcp::SseConfig {
+                        url: "https://example.test/sse".to_string(),
+                        headers: vec![],
+                        connect_timeout_ms: 100,
+                    }),
+                ),
+            ],
+        };
+        let baseline = state.account_sink.latest_seq();
+        assert_eq!(state.put_mcp_section(1, latest).await.unwrap(), 2);
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || done_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let runtime = state.config.read().await;
+        assert_eq!(
+            runtime
+                .mcp
+                .servers
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-stdio", "a-sse"],
+            "the superseded startup generation must not reapply"
+        );
+        drop(runtime);
+        let mcp_events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), baseline)
+                .unwrap()
+                .into_iter()
+                .filter(|change| {
+                    matches!(
+                        &change.event,
+                        AgentEvent::ConfigChanged { section, revision }
+                            | AgentEvent::ConfigRecovered { section, revision }
+                            if section == "mcp" && *revision == 2
+                    )
+                })
+                .count();
+        assert_eq!(
+            mcp_events, 1,
+            "the startup batch must not emit a pseudo event"
+        );
     }
 
     #[tokio::test]
@@ -8721,5 +11614,813 @@ for line in sys.stdin:
             next_mcp_config_event(&mut feed).await,
             AgentEvent::ConfigInvalid { revision: 1, .. }
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopped_root_commit_is_installed_before_one_confirmed_event_on_same_facade_restart() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x52; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25201}}"#,
+        )
+        .unwrap();
+        let committed = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.committed.len(), 1);
+        assert_ne!(state.config.read().await.server.port, 25_201);
+
+        let mut feed = state.account_sink.subscribe();
+        let config = state.config.clone();
+        let read_guard = config.read().await;
+        restart_config_watcher(&mut state);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(350),
+                next_config_event(&mut feed, "core")
+            )
+            .await
+            .is_err(),
+            "the account event must wait for the runtime write"
+        );
+        drop(read_guard);
+
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        assert_eq!(state.config.read().await.server.port, 25_201);
+        wait_for_root_outbox_to_clear(dir.path()).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, revision }
+                        if section == "core" && *revision == 1
+                ))
+                .count(),
+            1
+        );
+
+        stop_config_watcher(&mut state);
+        restart_config_watcher(&mut state);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(500),
+            next_config_event(&mut feed, "core")
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_root_resolver_unavailable_keeps_lkg_silent_and_requests_retry() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x59; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let old_port = state.config.read().await.server.port;
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25901}}"#,
+        )
+        .unwrap();
+        let committed = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        let event = committed.committed[0].clone();
+        let mut synthetic_events = BTreeMap::from([(SectionId::Core, event.clone())]);
+        let mut pending_root_publications = BTreeMap::from([(SectionId::Core, event)]);
+        let mut reported_root_runtime_failures = BTreeSet::new();
+        let mut feed = state.account_sink.subscribe();
+        std::fs::remove_file(dir.path().join("config-section-layout-completion.json")).unwrap();
+
+        let retry = reload_and_apply_ordinary_sections(
+            dir.path(),
+            &state.config,
+            state.config_facade.as_ref().unwrap(),
+            &state.account_sink,
+            std::iter::once(SectionId::Core),
+            OrdinarySectionReloadState {
+                synthetic_events: &mut synthetic_events,
+                pending_root_publications: &mut pending_root_publications,
+                reported_root_runtime_failures: &mut reported_root_runtime_failures,
+            },
+        )
+        .await;
+
+        assert!(retry);
+        assert_eq!(state.config.read().await.server.port, old_port);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), feed.recv())
+                .await
+                .is_err()
+        );
+        assert!(pending_root_publications.contains_key(&SectionId::Core));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_root_then_new_root_survives_coalesced_mcp_noop_and_requeues() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x53; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        let mut feed = state.account_sink.subscribe();
+        let io = state.config_io_lock.clone().lock_owned().await;
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25301}}"#,
+        )
+        .unwrap();
+        let first = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.committed.len(), 1);
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25302}}"#,
+        )
+        .unwrap();
+        let mcp_bytes = std::fs::read(dir.path().join("mcp.json")).unwrap();
+        std::fs::write(dir.path().join("mcp.json"), mcp_bytes).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(io);
+
+        let first_event = next_config_event(&mut feed, "core").await;
+        let second_event = next_config_event(&mut feed, "core").await;
+        assert!(matches!(
+            first_event,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        assert!(matches!(
+            second_event,
+            AgentEvent::ConfigChanged { revision: 2, .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.config.read().await.server.port == 25_302 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        wait_for_root_outbox_to_clear(dir.path()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_handoff_always_catches_root_generation_written_before_watcher_registration() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x56; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25601}}"#,
+        )
+        .unwrap();
+        let startup_facade =
+            Arc::new(bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap());
+        assert!(bamboo_config::has_pending_legacy_root_publications(dir.path()).unwrap());
+        state.config_facade = Some(startup_facade);
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25602}}"#,
+        )
+        .unwrap();
+        let mut feed = state.account_sink.subscribe();
+
+        restart_config_watcher(&mut state);
+
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged { revision: 2, .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.config.read().await.server.port == 25_602 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        wait_for_root_outbox_to_clear(dir.path()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_facade_restart_replays_one_rejection_and_one_lost_recovery() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x54; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"vendor_api_key":"never-persist-this"}}"#,
+        )
+        .unwrap();
+        let rejected = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.rejected.len(), 1);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .status,
+            SectionStatus::Healthy
+        );
+        let mut feed = state.account_sink.subscribe();
+        restart_config_watcher(&mut state);
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigInvalid { revision: 0, .. }
+        ));
+        stop_config_watcher(&mut state);
+
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let recovered = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.recovered, vec![SectionId::Core]);
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .status,
+            SectionStatus::Degraded
+        );
+        restart_config_watcher(&mut state);
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigRecovered { revision: 0, .. }
+        ));
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .core
+                .snapshot()
+                .status,
+            SectionStatus::Healthy
+        );
+
+        stop_config_watcher(&mut state);
+        restart_config_watcher(&mut state);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(500),
+            next_config_event(&mut feed, "core")
+        )
+        .await
+        .is_err());
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigInvalid { section, .. } if section == "core"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigRecovered { section, .. } if section == "core"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn degraded_root_mcp_is_carried_while_new_root_core_commits_then_recovers() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x57; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        let failing = working_stdio_mcp_config(dir.path(), "root-carry", None);
+        let script = match &failing.servers[0].transport {
+            TransportConfig::Stdio(stdio) => PathBuf::from(&stdio.args[0]),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(&script).unwrap();
+        let mut feed = state.account_sink.subscribe();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": failing})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            br#"{"server":{"port":25701}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.config.read().await.server.port == 25_701 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(bamboo_config::has_pending_legacy_root_publications(dir.path()).unwrap());
+
+        let repaired = working_stdio_mcp_config(dir.path(), "root-carry", None);
+        assert_eq!(repaired.servers[0].id, "root-carry");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+        wait_for_root_outbox_to_clear(dir.path()).await;
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigInvalid { section, revision }
+                        if section == "mcp" && *revision == 1
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigRecovered { section, revision }
+                        if section == "mcp" && *revision == 1
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejected_new_mcp_keeps_old_degraded_publication_dormant_until_clean_root() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x5b; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        let failing = working_stdio_mcp_config(dir.path(), "root-dormant", None);
+        let script = match &failing.servers[0].transport {
+            TransportConfig::Stdio(stdio) => PathBuf::from(&stdio.args[0]),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(&script).unwrap();
+        let mut feed = state.account_sink.subscribe();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": failing})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
+
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "server": {"port": 25801},
+                "mcpServers": {
+                    "rejected-next": {
+                        "command": "unused-rejected-command",
+                        "disabled": true,
+                        "access_token_value": "must-not-cross"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next_config_event(&mut feed, "core").await,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        assert_eq!(state.config.read().await.server.port, 25_801);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let dormant_events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert!(!dormant_events.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::ConfigRecovered { section, revision }
+                if section == "mcp" && *revision == 1
+        )));
+        assert!(bamboo_config::has_pending_legacy_root_publications(dir.path()).unwrap());
+
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !bamboo_config::legacy_root_rejected_sections(dir.path())
+                    .unwrap()
+                    .contains(&SectionId::Mcp)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let repaired = working_stdio_mcp_config(dir.path(), "root-dormant", None);
+        assert_eq!(repaired.servers[0].id, "root-dormant");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+        wait_for_root_outbox_to_clear(dir.path()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn changed_before_ack_then_runtime_failure_recovers_with_exact_kind() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x58; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        stop_config_watcher(&mut state);
+        let failing = working_stdio_mcp_config(dir.path(), "root-crash-window", None);
+        let script = match &failing.servers[0].transport {
+            TransportConfig::Stdio(stdio) => PathBuf::from(&stdio.args[0]),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(&script).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": failing})).unwrap(),
+        )
+        .unwrap();
+        let committed = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "mcp".to_string(),
+                revision: 1,
+            }]
+        );
+        assert!(
+            state
+                .account_sink
+                .record_confirmed(None, &registry_agent_event(&committed.committed[0]))
+                .await
+        );
+        assert!(bamboo_config::has_pending_legacy_root_publications(dir.path()).unwrap());
+
+        let events_dir = state.account_sink.events_dir().to_path_buf();
+        state.account_sink = bamboo_engine::events::AccountEventSink::new(events_dir).unwrap();
+        tokio::task::yield_now().await;
+        let mut feed = state.account_sink.subscribe();
+        restart_config_watcher(&mut state);
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
+        let repaired = working_stdio_mcp_config(dir.path(), "root-crash-window", None);
+        assert_eq!(repaired.servers[0].id, "root-crash-window");
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+        wait_for_root_outbox_to_clear(dir.path()).await;
+
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        let transitions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ConfigChanged { section, revision } if section == "mcp" => {
+                    Some(("changed", *revision))
+                }
+                AgentEvent::ConfigInvalid { section, revision } if section == "mcp" => {
+                    Some(("invalid", *revision))
+                }
+                AgentEvent::ConfigRecovered { section, revision } if section == "mcp" => {
+                    Some(("recovered", *revision))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transitions,
+            vec![("changed", 1), ("invalid", 1), ("recovered", 1)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invalid_journaled_before_canonical_mark_restarts_as_recovered_only() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x5b; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        stop_config_watcher(&mut state);
+        let candidate = disabled_mcp_config("root-invalid-mark-crash");
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": candidate})).unwrap(),
+        )
+        .unwrap();
+        let committed = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "mcp".to_string(),
+                revision: 1,
+            }]
+        );
+        let invalid = ConfigSectionEvent::Invalid {
+            section: "mcp".to_string(),
+            revision: 1,
+        };
+        assert!(
+            state
+                .account_sink
+                .record_confirmed(None, &registry_agent_event(&invalid))
+                .await
+        );
+        let envelope = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .envelope_value(SectionId::Mcp)
+            .unwrap();
+        assert!(matches!(
+            bamboo_config::legacy_root_publication_success_event(
+                dir.path(),
+                &committed.committed[0],
+                &envelope.data,
+            )
+            .unwrap(),
+            Some(ConfigSectionEvent::Changed { revision: 1, .. })
+        ));
+
+        let events_dir = state.account_sink.events_dir().to_path_buf();
+        state.account_sink = bamboo_engine::events::AccountEventSink::new(events_dir).unwrap();
+        assert!(state
+            .account_sink
+            .latest_config_transition_is_invalid("mcp", 1));
+        let mut feed = state.account_sink.subscribe();
+        restart_config_watcher(&mut state);
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigRecovered { revision: 1, .. }
+        ));
+        wait_for_root_outbox_to_clear(dir.path()).await;
+
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        let transitions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ConfigChanged { section, revision } if section == "mcp" => {
+                    Some(("changed", *revision))
+                }
+                AgentEvent::ConfigInvalid { section, revision } if section == "mcp" => {
+                    Some(("invalid", *revision))
+                }
+                AgentEvent::ConfigRecovered { section, revision } if section == "mcp" => {
+                    Some(("recovered", *revision))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(transitions, vec![("invalid", 1), ("recovered", 1)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_lagging_mcp_facade_installs_and_acknowledges_root_publication() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x5a; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        stop_config_watcher(&mut state);
+        let external = bamboo_config::ConfigFacade::open(dir.path()).unwrap();
+        let candidate = disabled_mcp_config("startup-lag-root");
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": candidate})).unwrap(),
+        )
+        .unwrap();
+        let committed = external
+            .reconcile_reappeared_legacy_root()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.committed,
+            vec![ConfigSectionEvent::Changed {
+                section: "mcp".to_string(),
+                revision: 1,
+            }]
+        );
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .mcp
+                .snapshot()
+                .revision,
+            0
+        );
+
+        let mut feed = state.account_sink.subscribe();
+        restart_config_watcher(&mut state);
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigChanged { revision: 1, .. }
+        ));
+        wait_for_root_outbox_to_clear(dir.path()).await;
+        assert!(state
+            .config
+            .read()
+            .await
+            .mcp
+            .servers
+            .iter()
+            .any(|server| server.id == "startup-lag-root"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn persistent_root_mcp_runtime_failure_retries_without_invalid_event_storm() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x55; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        wait_for_mcp_health(&state, SectionStatus::Healthy, 0).await;
+        let failing = working_stdio_mcp_config(dir.path(), "root-retry", None);
+        let script = match &failing.servers[0].transport {
+            TransportConfig::Stdio(stdio) => PathBuf::from(&stdio.args[0]),
+            _ => unreachable!(),
+        };
+        std::fs::remove_file(&script).unwrap();
+        let mut feed = state.account_sink.subscribe();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": failing})).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            next_mcp_config_event(&mut feed).await,
+            AgentEvent::ConfigInvalid { revision: 1, .. }
+        ));
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let failed_events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            failed_events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigInvalid { section, .. } if section == "mcp"
+                ))
+                .count(),
+            1
+        );
+        assert!(bamboo_config::has_pending_legacy_root_publications(dir.path()).unwrap());
+
+        let mut repaired = working_stdio_mcp_config(dir.path(), "root-retry-fixed", None);
+        repaired.servers[0].id = "root-retry".to_string();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"mcp": repaired})).unwrap(),
+        )
+        .unwrap();
+        let repaired_root_event = next_mcp_config_event(&mut feed).await;
+        let repaired_health = state
+            .mcp_config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let repaired_snapshot = state
+            .config_facade
+            .as_ref()
+            .unwrap()
+            .registry()
+            .mcp
+            .snapshot();
+        assert!(
+            matches!(
+                repaired_root_event,
+                AgentEvent::ConfigChanged { revision: 2, .. }
+            ),
+            "unexpected repaired root event: {repaired_root_event:?}; health: {repaired_health:?}; typed: {:?}",
+            repaired_snapshot.data
+        );
+        wait_for_root_outbox_to_clear(dir.path()).await;
+        assert!(state.config.read().await.mcp.servers.iter().any(|server| {
+            server.id == "root-retry"
+                && matches!(
+                    &server.transport,
+                    TransportConfig::Stdio(stdio)
+                        if stdio.args.iter().any(|arg| arg.contains("root-retry-fixed"))
+                )
+        }));
+        let events =
+            bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigInvalid { section, .. } if section == "mcp"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, revision }
+                        if section == "mcp" && *revision == 2
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ConfigChanged { section, revision }
+                        if section == "mcp" && *revision == 1
+                ))
+                .count(),
+            0
+        );
     }
 }

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use bamboo_agent_core::tools::{ToolCall, ToolExecutionContext};
+use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_engine::execution::{
     create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
@@ -31,15 +31,18 @@ use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
 };
 use bamboo_engine::session_app::approval_replay::{
-    refresh_approval_replay_posture, ApprovalReplayDecision,
+    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
+    repark_permission_replay, restore_permission_replay_authorization, ApprovalReplayDecision,
+    PermissionReplayTarget,
 };
+use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
-    submit_pending_response, PERMISSION_REEXECUTE_METADATA_KEY,
+    acquire_pending_response_guard, inspect_pending_response_guarded,
+    submit_pending_response_checked_guarded, validate_pending_response,
+    PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
-use bamboo_engine::session_app::resume::{
-    resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
-};
+use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use bamboo_engine::session_app::types::RespondInput;
 use bamboo_engine::{ModelRoster, RoleModel};
 
@@ -66,6 +69,10 @@ pub struct ParkedAsk {
     /// forged/stale data is ignored.
     pub nonce: String,
     pub session_id: String,
+    /// Exact durable identity used as the response CAS guard. Legacy live
+    /// events are reconciled against session persistence before a `ParkedAsk`
+    /// can be constructed, so a new Connect client never submits an
+    /// unguarded clarification answer.
     pub tool_call_id: String,
     pub tool_name: String,
     pub question: String,
@@ -74,16 +81,16 @@ pub struct ParkedAsk {
 }
 
 impl ParkedAsk {
-    pub fn new(nonce: String, session_id: String, ask: &PendingAsk) -> Self {
-        Self {
+    pub fn new(nonce: String, session_id: String, ask: &PendingAsk) -> Option<Self> {
+        Some(Self {
             nonce,
             session_id,
-            tool_call_id: ask.tool_call_id.clone(),
+            tool_call_id: ask.tool_call_id.clone()?,
             tool_name: ask.tool_name.clone(),
             question: ask.question.clone(),
             options: ask.options.clone(),
             allow_custom: ask.allow_custom,
-        }
+        })
     }
 }
 
@@ -155,6 +162,32 @@ pub async fn render_ask(
         OutboundMessage::text(text)
     };
     platform.reply(reply_ctx, outbound).await.map(|_| ())
+}
+
+/// Render a legacy/external clarification that cannot be matched to a durable
+/// pending tool call. It remains fully inspectable, but deliberately has no
+/// buttons or reply instructions and is never registered as answerable chat
+/// state.
+pub async fn render_read_only_ask(
+    platform: &Arc<dyn Platform>,
+    reply_ctx: &ReplyCtx,
+    ask: &PendingAsk,
+    reason: &str,
+) -> PlatformResult<()> {
+    let mut text = ask.question.clone();
+    if !ask.options.is_empty() {
+        text.push_str("\n\n");
+        for (index, option) in ask.options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", index + 1, option));
+        }
+    }
+    text.push_str("\n(Response unavailable: ");
+    text.push_str(reason);
+    text.push(')');
+    platform
+        .reply(reply_ctx, OutboundMessage::text(text))
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +324,8 @@ pub enum ResponderError {
     NotFound,
     #[error("no pending question waiting for a response")]
     NoPendingQuestion,
+    #[error("the pending question changed; this action has expired")]
+    PendingQuestionChanged,
     #[error("invalid response: {0}")]
     InvalidResponse(String),
     #[error("{0}")]
@@ -308,6 +343,7 @@ pub trait Responder: Send + Sync {
     async fn respond_and_resume(
         &self,
         session_id: &str,
+        expected_tool_call_id: Option<&str>,
         answer: String,
     ) -> Result<RespondAndResumeOutcome, ResponderError>;
 }
@@ -317,6 +353,7 @@ fn map_respond_error(error: bamboo_engine::session_app::errors::RespondError) ->
     match error {
         RespondError::NotFound(_) => ResponderError::NotFound,
         RespondError::NoPendingQuestion => ResponderError::NoPendingQuestion,
+        RespondError::PendingQuestionMismatch { .. } => ResponderError::PendingQuestionChanged,
         RespondError::InvalidResponse(message) => ResponderError::InvalidResponse(message),
         other => ResponderError::Other(other.to_string()),
     }
@@ -346,8 +383,45 @@ impl Responder for EngineResponder {
     async fn respond_and_resume(
         &self,
         session_id: &str,
+        expected_tool_call_id: Option<&str>,
         answer: String,
     ) -> Result<RespondAndResumeOutcome, ResponderError> {
+        let response_guard = acquire_pending_response_guard(session_id).await;
+        let current =
+            inspect_pending_response_guarded(&self.ctx.session_repo, session_id, &response_guard)
+                .await
+                .map_err(map_respond_error)?
+                .ok_or(ResponderError::NotFound)?;
+        let pending = current
+            .pending_question
+            .as_ref()
+            .ok_or(ResponderError::NoPendingQuestion)?;
+        if expected_tool_call_id.is_some_and(|expected| expected != pending.tool_call_id) {
+            return Err(ResponderError::PendingQuestionChanged);
+        }
+        validate_pending_response(pending, &answer).map_err(ResponderError::InvalidResponse)?;
+
+        let port = ConnectResumePort {
+            ctx: self.ctx.clone(),
+        };
+        let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+            &port,
+            session_id,
+            std::time::Duration::from_secs(15),
+        )
+        .await
+        .map_err(|_| {
+            ResponderError::Other(
+                "the suspending run is still finalizing; answer not consumed".to_string(),
+            )
+        })?;
+        // Subscribe and resolve async configuration before the response CAS.
+        // This intentionally gives one response a stable config snapshot;
+        // concurrent config changes apply to later requests/runs. After the
+        // answer commits, the reserved successor is transferred to a detached
+        // owner synchronously, so callback cancellation cannot strand it.
+        let receiver = handoff.subscribe();
+        let config_snapshot = self.ctx.config.read().await.clone();
         let input = RespondInput {
             session_id: session_id.to_string(),
             user_response: answer,
@@ -357,10 +431,21 @@ impl Responder for EngineResponder {
             reasoning_effort: None,
         };
 
-        let (session, _submitted_answer, plan_mode_transition, permission_grants) =
-            submit_pending_response(&self.ctx.session_repo, input)
-                .await
-                .map_err(map_respond_error)?;
+        let submission = submit_pending_response_checked_guarded(
+            &self.ctx.session_repo,
+            input,
+            expected_tool_call_id.map(str::to_string),
+            &response_guard,
+        )
+        .await;
+        let (session, _submitted_answer, plan_mode_transition, permission_grants) = match submission
+        {
+            Ok(submission) => submission,
+            Err(error) => {
+                handoff.abandon().await;
+                return Err(map_respond_error(error));
+            }
+        };
 
         // Mirrors `handlers::agent::respond::handlers::submit`: record any
         // permission grant so the resumed re-execution of the gated tool
@@ -376,18 +461,10 @@ impl Responder for EngineResponder {
             }
         }
 
-        // Subscribe BEFORE triggering resume so the `ExecutionStarted` event
-        // (and everything after) is never missed — same ordering
-        // `bridge::ConnectBridge::run_prompt` uses for a fresh prompt.
-        let session_tx =
-            get_or_create_event_sender(&self.ctx.session_event_senders, session_id).await;
-        let receiver = session_tx.subscribe();
-
         if let Some(event) = plan_mode_transition_event(session_id, plan_mode_transition.as_ref()) {
-            let _ = session_tx.send(event);
+            handoff.publish_event(event);
         }
 
-        let config_snapshot = self.ctx.config.read().await.clone();
         let resume_config = resolve_resume_config_snapshot(
             &config_snapshot,
             &self.ctx.provider_registry,
@@ -395,10 +472,15 @@ impl Responder for EngineResponder {
             None,
         );
 
-        let port = ConnectResumePort {
-            ctx: self.ctx.clone(),
-        };
-        let outcome = resume_session_execution(&port, session_id, resume_config).await;
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
+            &port,
+            session_id,
+            session,
+            resume_config,
+            handoff,
+        )
+        .await;
+        drop(response_guard);
 
         match outcome {
             bamboo_engine::session_app::types::ResumeOutcome::Started { .. } => {
@@ -496,10 +578,23 @@ impl ResumeExecutionPort for ConnectResumePort {
         get_or_create_event_sender(&self.ctx.session_event_senders, session_id).await
     }
 
+    fn dispatch_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = ConnectResumePort {
+            ctx: self.ctx.clone(),
+        };
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
         let ResumeSpawnRequest {
             session_id,
-            session,
+            mut session,
             mut execution_reservation,
             event_sender,
             config,
@@ -533,6 +628,7 @@ impl ResumeExecutionPort for ConnectResumePort {
 
         let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             event_sender,
             self.ctx.agent_runners.clone(),
             self.ctx.account_feed_inbox.clone(),
@@ -549,8 +645,20 @@ impl ResumeExecutionPort for ConnectResumePort {
             .metadata
             .get(PERMISSION_REEXECUTE_METADATA_KEY)
             .cloned();
+        let reexecute_request_generation = session
+            .metadata
+            .get(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY)
+            .cloned();
 
         let Some(reexecute_tool_call_id) = reexecute_tool_call_id else {
+            if reexecute_request_generation.is_some() {
+                tracing::error!(
+                    %session_id,
+                    "connect found orphaned permission replay generation marker; refusing to resume"
+                );
+                return;
+            }
+            consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
                 agent: self.ctx.agent.clone(),
                 session_id,
@@ -592,7 +700,22 @@ impl ResumeExecutionPort for ConnectResumePort {
         tokio::spawn(async move {
             let mut session = session;
 
-            if let Some(tool_call) = find_pending_tool_call(&session, &reexecute_tool_call_id) {
+            if let Some(replay_target) = find_pending_tool_call(
+                &session,
+                &reexecute_tool_call_id,
+                reexecute_request_generation.as_deref(),
+            ) {
+                if reexecute_request_generation.is_none()
+                    && replay_target.request_generation().is_some()
+                {
+                    tracing::error!(
+                        %session_id,
+                        tool_call_id = %reexecute_tool_call_id,
+                        "connect typed permission replay is missing its generation marker; refusing to resume"
+                    );
+                    return;
+                }
+                let tool_call = replay_target.tool_call().clone();
                 let tool_name = tool_call.function.name.clone();
                 let configured_mode = ctx
                     .permission_checker
@@ -619,6 +742,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                     }
                 };
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
+                session
+                    .metadata
+                    .remove(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
 
                 let (content, success) = match decision {
                     ApprovalReplayDecision::BlockedByPlan(_) => (
@@ -628,6 +754,29 @@ impl ResumeExecutionPort for ConnectResumePort {
                         false,
                     ),
                     ApprovalReplayDecision::Execute(flags) => {
+                        let Some(permission_config) =
+                            ctx.permission_checker.permission_config()
+                        else {
+                            tracing::error!(
+                                %session_id,
+                                tool_call_id = %reexecute_tool_call_id,
+                                "connect typed approval replay has no permission configuration; refusing to resume"
+                            );
+                            return;
+                        };
+                        if let Err(error) = restore_permission_replay_authorization(
+                            permission_config.as_ref(),
+                            &session,
+                            &replay_target,
+                        ) {
+                            tracing::error!(
+                                %session_id,
+                                tool_call_id = %reexecute_tool_call_id,
+                                %error,
+                                "connect typed approval replay authorization recovery failed closed"
+                            );
+                            return;
+                        }
                         let executor = ctx.tools.clone();
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
@@ -640,8 +789,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                         let _ = mpsc_tx
                             .send(emitter.begin().clone().into_agent_event())
                             .await;
-                        let exec_result = executor
-                            .execute_with_context(
+                        let exec_result = bamboo_tools::permission::with_permission_replay_generation(
+                            session.id.as_str(),
+                            reexecute_tool_call_id.as_str(),
+                            reexecute_request_generation.as_deref(),
+                            executor.execute_with_context(
                                 &tool_call,
                                 ToolExecutionContext {
                                     session_id: Some(session.id.as_str()),
@@ -655,11 +807,62 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
-                            )
-                            .await;
+                            ),
+                        )
+                        .await;
 
                         match exec_result {
                             Ok(tool_result) => {
+                                match repark_permission_replay(
+                                    &mut session,
+                                    &replay_target,
+                                    &tool_result,
+                                ) {
+                                    Ok(Some(reparked)) => {
+                                        let _ = mpsc_tx
+                                            .send(
+                                                emitter
+                                                    .finish(Some(
+                                                        "Awaiting additional permission approval"
+                                                            .to_string(),
+                                                    ))
+                                                    .clone()
+                                                    .into_agent_event(),
+                                            )
+                                            .await;
+                                        let _ = mpsc_tx
+                                            .send(AgentEvent::ToolComplete {
+                                                tool_call_id: tool_call.id.clone(),
+                                                result: tool_result,
+                                            })
+                                            .await;
+                                        let _ = mpsc_tx
+                                            .send(AgentEvent::NeedClarification {
+                                                question: reparked.question,
+                                                options: (!reparked.options.is_empty())
+                                                    .then_some(reparked.options),
+                                                tool_call_id: Some(tool_call.id.clone()),
+                                                tool_name: Some(tool_name.clone()),
+                                                allow_custom: reparked.allow_custom,
+                                                source: Some(
+                                                    bamboo_agent_core::PendingQuestionSource::PauseTool,
+                                                ),
+                                            })
+                                            .await;
+                                        ctx.session_repo.save_and_cache(&mut session).await;
+                                        return;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        tracing::error!(
+                                            %session_id,
+                                            tool_call_id = %reexecute_tool_call_id,
+                                            %error,
+                                            "connect additional permission replay could not be re-parked; refusing to resume"
+                                        );
+                                        return;
+                                    }
+                                }
                                 let _ = mpsc_tx
                                     .send(
                                         emitter
@@ -699,17 +902,26 @@ impl ResumeExecutionPort for ConnectResumePort {
                     reexecute_tool_call_id,
                     success
                 );
-                apply_tool_result(&mut session, &reexecute_tool_call_id, content, success);
+                if !apply_tool_result(&mut session, &replay_target, content, success) {
+                    tracing::error!(
+                        %session_id,
+                        tool_call_id = %reexecute_tool_call_id,
+                        "connect approved tool replay result target changed unexpectedly; refusing to resume"
+                    );
+                    return;
+                }
                 ctx.session_repo.save_and_cache(&mut session).await;
             } else {
-                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-                tracing::warn!(
-                    "[{}] connect: permission re-exec marker set but tool call '{}' not found in history",
-                    session_id,
-                    reexecute_tool_call_id
+                tracing::error!(
+                    %session_id,
+                    tool_call_id = %reexecute_tool_call_id,
+                    request_generation = ?reexecute_request_generation,
+                    "connect permission replay target missing or generation-mismatched; markers retained and resume refused"
                 );
+                return;
             }
 
+            consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
                 agent: ctx.agent.clone(),
                 session_id,
@@ -748,32 +960,61 @@ impl ResumeExecutionPort for ConnectResumePort {
     }
 }
 
-/// Find the original tool call (with its arguments) by id in the session
-/// history. Mirrors `app_state::resume_adapter::find_pending_tool_call`.
-fn find_pending_tool_call(session: &Session, tool_call_id: &str) -> Option<ToolCall> {
-    session.messages.iter().find_map(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.iter().find(|call| call.id == tool_call_id).cloned())
-    })
+/// Find the concrete approved invocation, newest-first and generation-bound.
+fn find_pending_tool_call(
+    session: &Session,
+    tool_call_id: &str,
+    request_generation: Option<&str>,
+) -> Option<PermissionReplayTarget> {
+    find_permission_replay_target(session, tool_call_id, request_generation)
 }
 
-/// Overwrite the tool-result message for `tool_call_id` with the real tool
-/// output. Mirrors `app_state::resume_adapter::apply_tool_result`.
-fn apply_tool_result(session: &mut Session, tool_call_id: &str, content: String, success: bool) {
-    for message in &mut session.messages {
-        if message.tool_call_id.as_deref() == Some(tool_call_id) {
-            message.content = content;
-            message.tool_success = Some(success);
-            return;
-        }
-    }
+/// Overwrite only the exact generation-bound tool-result message.
+fn apply_tool_result(
+    session: &mut Session,
+    target: &PermissionReplayTarget,
+    content: String,
+    success: bool,
+) -> bool {
+    apply_permission_replay_result(session, target, content, success)
 }
 
 #[cfg(test)]
 mod tests {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+    use bamboo_agent_core::Message;
+
     use super::*;
+
+    fn append_permission_round(
+        session: &mut Session,
+        call_id: &str,
+        generation: &str,
+        arguments: &str,
+        result_id: &str,
+    ) {
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: call_id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Write".to_string(),
+                    arguments: arguments.to_string(),
+                },
+            }]),
+        ));
+        let mut result = Message::tool_result(
+            call_id,
+            serde_json::json!({
+                "status": "awaiting_permission_approval",
+                "permission_request": { "request_generation": generation }
+            })
+            .to_string(),
+        );
+        result.id = result_id.to_string();
+        session.add_message(result);
+    }
 
     fn ask(options: Vec<&str>, allow_custom: bool) -> ParkedAsk {
         ParkedAsk {
@@ -785,6 +1026,40 @@ mod tests {
             options: options.into_iter().map(str::to_string).collect(),
             allow_custom,
         }
+    }
+
+    #[test]
+    fn connect_replay_targets_current_generation_when_provider_reuses_id() {
+        let mut session = Session::new("session", "model");
+        append_permission_round(
+            &mut session,
+            "reused",
+            "generation-old",
+            r#"{"content":"old"}"#,
+            "result-old",
+        );
+        append_permission_round(
+            &mut session,
+            "reused",
+            "generation-current",
+            r#"{"content":"current"}"#,
+            "result-current",
+        );
+
+        let target = find_pending_tool_call(&session, "reused", Some("generation-current"))
+            .expect("current generation target");
+        assert_eq!(
+            target.tool_call().function.arguments,
+            r#"{"content":"current"}"#
+        );
+        assert!(apply_tool_result(
+            &mut session,
+            &target,
+            "executed current".to_string(),
+            true,
+        ));
+        assert!(session.messages[1].content.contains("generation-old"));
+        assert_eq!(session.messages[3].content, "executed current");
     }
 
     #[test]

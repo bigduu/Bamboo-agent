@@ -10,7 +10,7 @@
 //!    session so that commit order == publish order.
 //! 3. `storage.load_session(session_id)` — pick up the latest authoritative
 //!    copy from disk (not a runner-held session that may have stale metadata).
-//! 4. Re-check preconditions inside the lock (e.g. `is_untitled` for
+//! 4. Re-check preconditions inside the lock (e.g. `title_generated` for
 //!    `apply_generated_title` when not forced; equality short-circuit for
 //!    setters that would be a no-op).
 //! 5. Mutate the field, bump `title_version` (for title) and always bump
@@ -25,7 +25,8 @@
 //! ## Authority rules
 //!
 //! - `set_title` / `apply_generated_title`: the only authoritative writers
-//!   for `title` and `title_version`. The runtime engine, scheduler, and
+//!   for `title`, `title_version`, and `title_generated`. The runtime engine,
+//!   scheduler, and
 //!   tool execution paths are non-authoritative and must stay on
 //!   `merge_save_session` / `merge_save_runtime` without touching `title`
 //!   directly.
@@ -40,7 +41,6 @@ use chrono::Utc;
 use crate::app_context::AgentSessionContext;
 use crate::events::publish_replayable_session_event;
 use crate::model_config_helper::GOLD_CONFIG_METADATA_KEY;
-use crate::title_gen::is_untitled;
 
 /// Errors returned by [`SessionMetadataService`].
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +82,9 @@ pub struct SessionMetadataService;
 impl SessionMetadataService {
     /// Manual rename via PATCH. Always authoritative; always bumps
     /// `title_version` and `metadata_version`. Returns `Ok(None)` when the
-    /// trimmed input equals the existing title (no event emitted).
+    /// trimmed input equals the existing finalized title (no event emitted).
+    /// Renaming a pending session to the same visible text still finalizes the
+    /// lifecycle so an in-flight automatic request cannot overwrite it.
     pub async fn set_title(
         state: &dyn AgentSessionContext,
         session_id: &str,
@@ -99,11 +101,12 @@ impl SessionMetadataService {
 
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
-        if session.title == trimmed {
+        if session.title == trimmed && session.title_generated {
             return Ok(None);
         }
 
         session.title = trimmed.to_string();
+        session.title_generated = true;
         session.title_version = session.title_version.saturating_add(1);
         session.metadata_version = session.metadata_version.saturating_add(1);
         session.updated_at = Utc::now();
@@ -120,6 +123,7 @@ impl SessionMetadataService {
             session_id: session.id.clone(),
             title: session.title.clone(),
             title_version: session.title_version,
+            title_generated: session.title_generated,
             source: TitleSource::Manual,
             updated_at: session.updated_at,
         };
@@ -129,8 +133,9 @@ impl SessionMetadataService {
     }
 
     /// Auto/fallback rename produced by the title generator. Aborts (returns
-    /// `Ok(None)`) if the on-disk session is no longer untitled and `force`
-    /// is false — this guards against races where the user renames mid-LLM.
+    /// `Ok(None)`) if the on-disk title lifecycle is already finalized and
+    /// `force` is false — this guards against races where the user renames
+    /// mid-LLM without inferring state from the visible title text.
     /// On success bumps `title_version` and `metadata_version`, emits with
     /// the supplied [`TitleSource`].
     pub async fn apply_generated_title(
@@ -149,14 +154,15 @@ impl SessionMetadataService {
         let _guard = state.persistence().acquire_lock(session_id).await;
 
         let mut session = load_latest(state, session_id).await?;
-        if !force && !is_untitled(&session.title) {
+        if !force && session.title_generated {
             return Ok(None);
         }
-        if session.title == trimmed {
+        if session.title == trimmed && session.title_generated {
             return Ok(None);
         }
 
         session.title = trimmed.to_string();
+        session.title_generated = true;
         session.title_version = session.title_version.saturating_add(1);
         session.metadata_version = session.metadata_version.saturating_add(1);
         session.updated_at = Utc::now();
@@ -173,6 +179,7 @@ impl SessionMetadataService {
             session_id: session.id.clone(),
             title: session.title.clone(),
             title_version: session.title_version,
+            title_generated: session.title_generated,
             source,
             updated_at: session.updated_at,
         };

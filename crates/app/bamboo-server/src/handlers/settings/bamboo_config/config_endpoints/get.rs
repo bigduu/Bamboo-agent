@@ -7,7 +7,7 @@ use super::common::{config_file_path, redacted_config_json};
 pub async fn get_bamboo_config(app_state: web::Data<AppState>) -> Result<HttpResponse, AppError> {
     let path = config_file_path(&app_state.app_data_dir);
     if !path.exists()
-        && !bamboo_config::section_layout_is_active(&app_state.app_data_dir)
+        && !bamboo_config::modular_authority_boundary_present(&app_state.app_data_dir)
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error.to_string())))?
     {
         return Ok(HttpResponse::Ok().json(serde_json::json!({})));

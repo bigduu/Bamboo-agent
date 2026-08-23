@@ -63,8 +63,8 @@ default. The full field list of `Config`:
 | `provider` | `String` | Default provider name. Default `"anthropic"`. |
 | `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...); only consulted when `features.provider_model_ref` is on. |
 | `providers` | `ProviderConfigs` | Legacy single-instance-per-type provider configs. See [Providers](#providers). |
-| `provider_instances` | `HashMap<String, ProviderInstanceConfig>` | Multi-instance provider configs, keyed by an id you choose (e.g. two Anthropic keys under different labels). Takes precedence over `providers` when non-empty. |
-| `default_provider_instance` | `Option<String>` | Which `provider_instances` entry is the default; overrides legacy `provider` when set. |
+| `provider_instances` | `HashMap<String, ProviderInstanceConfig>` | Authoritative provider configs, keyed by a stable routing id (e.g. two Anthropic keys under different labels). Runtime construction, model resolution, model discovery and child-agent credential scoping read these entries directly. |
+| `default_provider_instance` | `Option<String>` | Which enabled `provider_instances` entry is the default. A missing id is accepted only as a temporary hybrid reference to a real legacy provider stanza. |
 | `server` | `ServerConfig` | HTTP bind/port/TLS. See [Server](#server). |
 | `keyword_masking` | `KeywordMaskingConfig` | Outbound-body secret scrubbing. See [Keyword masking](#keyword-masking). |
 | `anthropic_model_mapping` / `gemini_model_mapping` | `{ mappings: HashMap<String,String> }` | Alias an OpenAI-shaped model id (e.g. `"gemini-pro"`) to the real upstream model id for that provider's compat endpoint. |
@@ -100,8 +100,10 @@ not part of Bamboo Issue #597.
 
 ## Providers
 
-Two shapes coexist; a fresh `bamboo init` writes the legacy single-instance
-`providers` shape, which is simplest for one key per provider:
+`provider_instances` is the durable and runtime authority. The legacy
+single-instance `provider` / `providers` shape remains accepted as a
+serde/migration compatibility input, most importantly so older installations
+can be materialized into provider instances safely on cold start:
 
 ```json
 {
@@ -127,8 +129,29 @@ openai/anthropic/gemini the Bodhi proxy should present as). `CopilotConfig`
 has no `api_key` at all — it authenticates via a cached OAuth token
 (`headless_auth` for headless/CI login).
 
-For more than one instance of a provider type (e.g. two separate Anthropic
-keys/workspaces), use `provider_instances` instead:
+For GPT-5.6+ OpenAI Responses requests from the agent loop, Bamboo derives a
+stable, session-scoped `prompt_cache_key` as a domain-separated SHA-256 hash.
+The raw session identifier is never serialized into the provider request, and
+non-agent requests do not receive a generated key. The key is only a cache
+affinity hint that can improve routing to a matching prefix; it does not
+guarantee a cache hit. `request_overrides` body patches run afterward, so an
+operator may replace the generated key or remove `prompt_cache_key` entirely.
+
+The server idempotently materializes a usable selected legacy provider into
+`provider_instances` when it opens the modular configuration. Built-in provider
+type names become stable instance ids (`openai`, `anthropic`, and so on), the
+selected id becomes `default_provider_instance`, and provider-specific fields
+such as Anthropic `max_tokens` / `thinking_replay_always`, Copilot
+`headless_auth`, and Bodhi `target_provider` are retained. Existing credential
+references are reused; plaintext is never copied into `providers.json`.
+Migration commits use the provider-section revision and the configuration
+facade's recoverable transaction protocol. Reopening an already migrated
+configuration is a byte/revision no-op. If the provider or credential authority
+is degraded, a legacy reconciliation is pending, or the exact base revision has
+changed, migration does not overwrite that state; startup retains the readable
+last-known-good/hybrid view and retries on a later safe open.
+
+For one or more provider accounts, the canonical shape is:
 
 ```json
 {
@@ -142,8 +165,32 @@ keys/workspaces), use `provider_instances` instead:
 
 `provider_instances` entries have the same field set as the legacy stanzas
 plus `provider_type` (which of the five kinds this is) and `enabled` (default
-`true`). When `provider_instances` is non-empty it takes precedence over
-`providers`/`provider` as the routing source.
+`true`). An explicit instance id always wins over a same-named legacy alias,
+including when that instance is disabled or invalid; Bamboo never silently
+resurrects the stale alias. A temporary hybrid may keep a legacy default id
+only when a real stanza with that id still exists. Other instance-native paths
+do not re-project instances into global legacy slots.
+
+`BAMBOO_PROVIDER` may select an exact instance id. A built-in type value selects
+the lexicographically first enabled instance of that type, making multi-account
+startup deterministic. `BAMBOO_OPENAI_API_KEY`,
+`BAMBOO_ANTHROPIC_API_KEY`, and `BAMBOO_GEMINI_API_KEY` hydrate only instances
+marked for the standard environment override; they do not recreate legacy
+slots. Legacy-materialized instances keep that binding so the historical
+precedence remains stable: a present environment key wins, while a migrated
+credential reference remains the fallback after the variable is removed. The
+persisted marker records only the binding, never the secret. An environment-only
+instance with no stored fallback reports `configured: false` and
+`source: "environment"` whenever the variable is absent.
+
+Use the revisioned `GET/PUT /v1/bamboo/config/provider-settings` contract or the
+provider-instance CRUD endpoints for settings, and
+`POST /v1/bamboo/provider-catalog/fetch-models` for live model discovery. The
+legacy `GET/POST /v1/bamboo/settings/provider` and
+`POST /v1/bamboo/settings/provider/models` routes are no longer registered;
+older clients receive `404` and must migrate to the canonical contracts. This
+HTTP retirement does not remove the on-disk compatibility input described
+above.
 
 ## Server
 
@@ -191,7 +238,7 @@ main response stream and auxiliary silent model calls:
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `transport_idle_timeout_secs` | `120` | Maximum gap between valid provider transport frames. Parsed SSE ping/lifecycle frames count even when they contain no token. |
+| `transport_idle_timeout_secs` | `120` | Maximum time for the provider call to establish its response stream, and the maximum subsequent gap between successfully received, non-empty response-body chunks. SSE ping/lifecycle events, comment heartbeats, and partial event fragments count even when they contain no token. |
 | `first_semantic_timeout_secs` | `600` | Maximum time from request dispatch to the first text, reasoning, or tool-call delta. Transport keepalives do not extend it. |
 | `semantic_idle_timeout_secs` | `600` | Maximum semantic-progress gap after output starts. Transport keepalives do not extend it. |
 
@@ -200,8 +247,35 @@ are rejected by config loading; invalid values constructed by an embedding are
 replaced with the safe defaults. Timeout errors report the expired phase,
 deadline, provider/model identifiers, and last transport/semantic activity,
 but never include prompts or raw provider payloads. A stream timeout is not
-automatically retried, because replay after partial output or tool-call deltas
-could duplicate externally visible state.
+retried after text, reasoning, or tool-call output has started, because replay
+could duplicate externally visible state. A timeout before any semantic output
+on the primary response stream is marked retry-safe and may use the agent
+loop's existing bounded turn retry policy. Auxiliary model calls are bounded by
+the same watchdogs but never replay the containing agent turn.
+
+### OpenAI-compatible proxy heartbeats
+
+An OpenAI-compatible proxy should establish the response stream within
+`transport_idle_timeout_secs`, then either forward upstream response bytes or
+emit an SSE heartbeat more frequently than that deadline. Bamboo treats any
+successfully received, non-empty body chunk as transport activity before
+parsing SSE, including the standard comment form `: keep-alive\n\n`. These
+internal activity markers do not become model output and do not extend either
+semantic deadline.
+
+For example, CLIProxyAPI supports periodic streaming heartbeats with:
+
+```yaml
+streaming:
+  keepalive-seconds: 15
+```
+
+CLIProxyAPI documents `0` (disabled) as the default. Operators using that or
+another compatible proxy should choose a heartbeat interval safely below the
+transport timeout. If a proxy cannot emit heartbeats during long upstream
+reasoning gaps, configure `transport_idle_timeout_secs` at least as high as the
+intended semantic wait instead; disabling the bounded transport watchdog is
+not recommended.
 
 ## Memory / auto-dream / gardener
 
@@ -579,6 +653,7 @@ for Docker/CI/secret-manager deploys):
 | `BAMBOO_CORS_ALLOW_ORIGINS` | CORS allowlist. |
 | `BAMBOO_ENABLE_DEV_ENDPOINTS` | Gate dev-only HTTP endpoints. |
 | `BAMBOO_WS_AUTH_DEADLINE_MS` | WS v2 auth handshake timeout. |
+| `BAMBOO_WEB_SEARCH_ENDPOINTS` | Ordered, comma-separated absolute HTTP(S) endpoints used by `WebSearch`. Each endpoint receives a `POST` form with the `q` field; the first recognized HTML/Lite response wins. Defaults to DuckDuckGo's HTML endpoint followed by its Lite endpoint. |
 
 **Workspace / paths:**
 

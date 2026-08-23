@@ -5,7 +5,7 @@ impl AppState {
     ///
     /// Uses [`bamboo_storage::LockedSessionStore::merge_save_runtime`]
     /// so any concurrent UI edits to the authoritative metadata group (`title`,
-    /// `title_version`, `pinned`, `metadata_version`) are preserved when our
+    /// `title_version`, `title_generated`, `pinned`, `metadata_version`) are preserved when our
     /// runtime-side `metadata_version` does not strictly exceed disk's.
     ///
     /// # Arguments

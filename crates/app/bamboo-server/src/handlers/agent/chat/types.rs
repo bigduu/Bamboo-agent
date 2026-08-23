@@ -1,4 +1,4 @@
-use bamboo_domain::ProviderModelRef;
+use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef};
 use serde::{Deserialize, Serialize};
 
 /// Request payload for creating a new chat message.
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
 ///   When absent or empty, the server falls back to its resolved default model
 ///   (issue #480) — the same resolution `GET /api/v1/execute/defaults` reports.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatRequest {
     pub message: String,
     pub session_id: Option<String>,
@@ -48,9 +48,14 @@ pub struct ChatRequest {
     pub provider: Option<String>,
     #[serde(default)]
     pub model_ref: Option<ProviderModelRef>,
+    /// Optional per-session execution-profile override for a newly-created
+    /// chat. Existing sessions retain their stored value unless changed via
+    /// the CAS-guarded session PATCH endpoint.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ChatImage {
     pub base64: String,
     #[serde(default)]
@@ -173,10 +178,12 @@ mod tests {
             model: Some("gpt-4".to_string()),
             provider: None,
             model_ref: None,
+            reasoning_effort: Some(ReasoningEffort::High),
         };
         let debug_str = format!("{:?}", req);
         assert!(debug_str.contains("ChatRequest"));
         assert!(debug_str.contains("Test"));
+        assert!(debug_str.contains("High"));
     }
 
     #[test]

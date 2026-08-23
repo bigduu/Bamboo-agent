@@ -2,6 +2,7 @@ use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use serde::Deserialize;
 
 use super::stream::{live_stream_response, terminal_response};
+use super::subscription::subscribe_with_runner_snapshot;
 use super::terminal::terminal_event_if_ready;
 use crate::app_state::{AgentStatus, AppState};
 
@@ -63,19 +64,12 @@ pub async fn handler(
         }));
     }
 
-    let sender = state.get_session_event_sender(&session_id).await;
-    let receiver = sender.subscribe();
+    let (sender, receiver, runner_snapshot) =
+        subscribe_with_runner_snapshot(state.get_ref(), &session_id).await;
 
     // Ensure a backend notification relay is running for this session so that
     // approval/clarification/context/subagent events surface as notifications.
     state.ensure_notification_relay(&session_id, sender.clone());
-
-    // Snapshot runner info (if present). After restarts we may not have runners in-memory,
-    // so don't rely solely on this for "already completed" detection.
-    let runner_snapshot = {
-        let runners = state.agent_runners.read().await;
-        runners.get(&session_id).cloned()
-    };
 
     // Replay last budget event if available (for late subscribers).
     let budget_event_to_replay = runner_snapshot

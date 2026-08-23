@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -6,12 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::prompt_context::{
-    strip_existing_core_directives, strip_existing_external_memory, strip_existing_goal,
-    strip_existing_plan_mode_instructions, strip_existing_plan_runtime_context,
-    strip_existing_task_list,
+    append_core_agent_directives, strip_existing_core_directives, strip_existing_external_memory,
+    strip_existing_goal, strip_existing_plan_mode_instructions,
+    strip_existing_plan_runtime_context, strip_existing_task_list,
 };
 use crate::runtime::runner::session_setup::prompt_envelope::{
-    assemble_prompt_envelope, build_active_workflow_context_block, build_agent_hook_context_block,
+    build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_plan_mode_context_block, build_plan_runtime_context_block,
     build_project_resources_context_block, build_task_list_context_block,
@@ -25,14 +26,16 @@ use bamboo_agent_core::{
     AgentError, AgentEvent, ContextBlock, ContextBlockPriority, ContextBlockStability,
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
-use bamboo_compression::PreparedContext;
+use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::MAX_MODEL_CONTEXT_RENDERED_BYTES;
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
     SegmentRole,
 };
 use bamboo_tools::exposure::activated_discoverable_tools;
+use sha2::{Digest, Sha256};
 
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
@@ -52,6 +55,8 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
+const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
+const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
 
 fn interruption_kind(error: &AgentError) -> &'static str {
     match error {
@@ -151,6 +156,26 @@ fn engine_responses_policy() -> ResponsesRequestOptions {
         include: Some(vec!["reasoning.encrypted_content".to_string()]),
         ..Default::default()
     }
+}
+
+/// Derive the privacy-preserving OpenAI Responses cache-affinity hint for an
+/// agent-loop session. This is a routing hint only, not a cache-hit guarantee.
+/// Length-prefixing the purpose and session beneath a versioned protocol domain
+/// prevents concatenation ambiguity and cross-purpose reuse.
+fn agent_loop_prompt_cache_key(
+    session_id: Option<&str>,
+    request_purpose: Option<&str>,
+) -> Option<String> {
+    let purpose = request_purpose.filter(|purpose| *purpose == AGENT_LOOP_REQUEST_PURPOSE)?;
+    let session_id = session_id.filter(|session_id| !session_id.trim().is_empty())?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(PROMPT_CACHE_KEY_DOMAIN);
+    for component in [purpose.as_bytes(), session_id.as_bytes()] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Whether the stateful Responses continuation (`previous_response_id`) may be
@@ -334,74 +359,140 @@ fn derive_system_remainder_message(
 
 struct PreparedRequestEnvelope {
     /// The single canonical request and SOLE source of truth: system field +
-    /// ordered, addressable message runs (system_remainder and the volatile tail are
-    /// their OWN runs) + the cache plan (`ir.cache`). `continuation` is filled in at
-    /// dispatch time. Every provider renders its wire from this via `chat_stream_ir`;
-    /// every wire view (chat / Responses-input / continuation-delta) is derived by
-    /// the IR's lowering methods, so there are no parallel pre-baked message vecs.
+    /// immutable stable prefix + one chronological model transcript + the cache
+    /// plan (`ir.cache`). `continuation` is filled in at dispatch time. Every
+    /// provider renders its wire from this via `chat_stream_ir`; every wire view
+    /// (chat / Responses-input / continuation-delta) is derived by the IR's
+    /// lowering methods, so there are no parallel pre-baked message vecs.
     ir: PromptIR,
     /// Per-section breakdown of the cacheable stable prefix, kept for prompt-cache
     /// drift diagnostics (not sent to the provider; not part of the wire IR).
     stable_prefix_sections: Vec<StablePrefixSection>,
+    ledger_changed: bool,
+    prefix_epoch: u64,
+    prefix_reset_reason: Option<bamboo_domain::ModelContextResetReason>,
 }
 
-fn build_request_envelope(
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProjectedRequestUsage {
+    pub input_tokens: u32,
+    pub ledger_rendered_bytes: usize,
+}
+
+fn measure_request_usage(
+    session: &Session,
+    envelope: &PreparedRequestEnvelope,
+) -> ProjectedRequestUsage {
+    let input_tokens = TiktokenTokenCounter::default().count_messages(&envelope.ir.flatten());
+    let ledger_rendered_bytes = session
+        .model_context_state
+        .as_ref()
+        .map(|state| {
+            state.events.iter().fold(0usize, |total, event| {
+                total.saturating_add(event.rendered_text.len())
+            })
+        })
+        .unwrap_or(0);
+    ProjectedRequestUsage {
+        input_tokens,
+        ledger_rendered_bytes,
+    }
+}
+
+fn required_tool_for_session(session: &Session) -> Option<&'static str> {
+    crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
+        .then_some("load_skill")
+}
+
+fn effective_tool_schemas<'a>(
+    session: &Session,
+    tool_schemas: &'a [ToolSchema],
+) -> Cow<'a, [ToolSchema]> {
+    let Some(required_tool) = required_tool_for_session(session) else {
+        return Cow::Borrowed(tool_schemas);
+    };
+    Cow::Owned(
+        tool_schemas
+            .iter()
+            .filter(|schema| schema.function.name == required_tool)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Project the exact PromptIR message input after ledger reconciliation without
+/// mutating the live session. Context preparation uses this shadow pass to
+/// reserve space for snapshots that are created only after ordinary message
+/// fitting (notably when a retention reset seeds a fresh prefix epoch).
+pub(super) fn project_request_usage(
     session: &Session,
     prepared_context: &PreparedContext,
     config: &AgentLoopConfig,
     tool_schemas: &[ToolSchema],
+    model: &str,
+) -> ProjectedRequestUsage {
+    let mut shadow = session.clone();
+    let effective_tool_schemas = effective_tool_schemas(&shadow, tool_schemas);
+    let envelope = build_request_envelope_reconciled(
+        &mut shadow,
+        prepared_context,
+        config,
+        effective_tool_schemas.as_ref(),
+        model,
+    );
+    measure_request_usage(&shadow, &envelope)
+}
+
+fn build_request_envelope_reconciled(
+    session: &mut Session,
+    prepared_context: &PreparedContext,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+    model: &str,
 ) -> PreparedRequestEnvelope {
     let activated = activated_discoverable_tools(session);
     let (stable_frame, stable_prefix_sections) =
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
 
-    // Per-round volatile context (recalled memory, task list, plan state) is
-    // placed AFTER the conversation history so it never sits inside the cached
-    // prefix and invalidates it each round. The conversation summary stays at the
-    // front: it represents older history and changes only on re-summarization, so
-    // it is cache-friendly there and gets its own (mostly stable) breakpoint.
-    let mut front_blocks = Vec::new();
-    let mut volatile_blocks = Vec::new();
+    // Host-owned context (recalled memory, task list, plan state, summary) is
+    // reconciled into durable typed events. Initial snapshots lead the real
+    // transcript; later changes append after the prior request boundary.
+    let mut context_blocks = Vec::new();
     if let Some(block) = build_active_workflow_context_block(session) {
-        front_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_external_memory_context_block(session) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_project_resources_context_block(session) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_task_list_context_block(session) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     // Session goal rides the volatile tail (built directly from the active goal),
     // NOT injected into the system message — so a goal change never invalidates
     // the cached system prefix (goal-leak fix).
     if let Some(block) = build_goal_context_block(config.active_goal()) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_agent_hook_context_block(session) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     // Plan runtime + plan mode blocks are built DIRECTLY from session state (the
     // active PlanModeState + persisted plan artifacts), not reparsed from markers
     // injected into the system message — so the system prefix stays cache-stable
     // across plan transitions.
     if let Some(block) = build_plan_runtime_context_block(session, config.app_data_dir.as_deref()) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_plan_mode_context_block(session) {
-        volatile_blocks.push(block);
+        context_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
-        front_blocks.push(block);
+        context_blocks.push(block);
     }
-
-    let volatile_context_messages: Vec<Message> = volatile_blocks
-        .iter()
-        .map(|block| block.render_runtime_context_message())
-        .collect();
 
     let mut system_remainder_messages = Vec::new();
     let mut conversation_messages = Vec::new();
@@ -417,30 +508,14 @@ fn build_request_envelope(
         }
     }
 
-    // Last message of the cached region (the SystemRemainder+Conversation runs,
-    // before the volatile context appended below). A rolling breakpoint here lets
-    // the growing conversation cache incrementally turn over turn.
-    let conversation_breakpoint_id = conversation_messages
-        .last()
-        .or_else(|| system_remainder_messages.last())
-        .map(|message| message.id.clone());
-
-    let envelope = assemble_prompt_envelope(stable_frame, front_blocks);
-    // The only front block is the conversation summary (if present); its rendered
-    // message id becomes the summary breakpoint.
-    let summary_breakpoint_id = envelope
-        .dynamic_context_messages
-        .last()
-        .map(|message| message.id.clone());
-
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
     //
     // The tool/server guide (tool schemas + each connected MCP server's
     // `initialize` instructions — e.g. nova's targeting workflow) is relocated OUT
     // of the system prompt and INTO a fixed prefix MESSAGE: the system keeps only
-    // the static identity/workspace/env/skill, and the large, session-stable guide
-    // rides as a typed context block at a known position with its own cache
+    // invariant identity/directives, and the large, session-stable guide rides as
+    // a typed context block at a known position with its own cache
     // breakpoint — so every provider family gets the same static-system structure.
     // The IR's lowering methods derive the chat / Responses-input / continuation
     // views from these runs; the engine no longer pre-bakes any of them.
@@ -454,7 +529,7 @@ fn build_request_envelope(
     let tool_guide = section("tool_guide");
     let relocate_tool_guide = !tool_guide.trim().is_empty();
     // Keep ONLY cross-session-invariant content in the system field: the static
-    // identity (`base`) plus the globally-stable env snapshot. Session-variable
+    // identity (`base`) plus framework core directives. Session-variable
     // context — workspace path, project instruction overlay (CLAUDE.md/AGENTS.md),
     // loaded skills — is relocated into context-block MESSAGES placed AFTER the
     // large, invariant tool guide (see `session_context_messages` below). This
@@ -463,8 +538,8 @@ fn build_request_envelope(
     // lets an automatic prefix cache (OpenAI/GLM-style, which has no explicit
     // breakpoints) actually hit on the big block instead of re-reading it.
     // Assemble the cross-session-invariant system field as DISCRETE structured
-    // blocks (identity `base`, framework `core_directives`, globally-stable
-    // `env`) instead of one glued string. `system_blocks` is the structured form
+    // blocks (identity `base`, framework `core_directives`) instead of one glued
+    // string. `system_blocks` is the structured form
     // (observability/analysis + a block-native provider can render one wire block
     // per entry); `lane_system` is their byte join for the legacy string wire
     // path. Session-variable context (workspace/instruction/skill) is still
@@ -475,11 +550,15 @@ fn build_request_envelope(
             "core_directives",
             bamboo_domain::ContextBlockType::CoreDirectives,
         ),
-        ("env", bamboo_domain::ContextBlockType::EnvSnapshot),
     ]
     .into_iter()
     .filter_map(|(name, kind)| {
         let text = section(name);
+        let text = if name == "core_directives" {
+            append_core_agent_directives("", &text)
+        } else {
+            text
+        };
         (!text.trim().is_empty()).then(|| {
             bamboo_domain::PromptBlock::new(name, kind, text)
                 .with_stability(bamboo_domain::ContextBlockStability::Stable)
@@ -490,17 +569,11 @@ fn build_request_envelope(
     if let Some(last) = system_blocks.last_mut() {
         last.cache_anchor = true;
     }
-    let lane_system = if relocate_tool_guide {
-        system_blocks
-            .iter()
-            .map(|b| b.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    } else {
-        // Zero-tools fallback: keep the legacy merged system string and no blocks.
-        system_blocks.clear();
-        envelope.stable_instructions.clone()
-    };
+    let lane_system = system_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let tool_guide_message = relocate_tool_guide.then(|| {
         ContextBlock::new(
             ContextBlockType::ToolGuide,
@@ -512,6 +585,13 @@ fn build_request_envelope(
         .render_runtime_context_message()
     });
     let tool_guide_breakpoint_id = tool_guide_message.as_ref().map(|m| m.id.clone());
+    // Preserve the zero-tool carrier shape: with no relocated guide, the
+    // invariant base + core directives remain a byte-authoritative string and
+    // block-native providers see no structured system blocks. Mutable
+    // workspace/env/skill material still lives in the ledger below.
+    if !relocate_tool_guide {
+        system_blocks.clear();
+    }
 
     // Session-variable context (workspace path, project instruction overlay,
     // loaded skills), relocated to ride AFTER the invariant tool guide so it never
@@ -519,78 +599,75 @@ fn build_request_envelope(
     // present; keeping them as separate blocks lets an unchanged block stay inside
     // the shared prefix even when a sibling changes. The instruction overlay keeps
     // Critical priority so its authority survives the move out of the system field.
-    let session_context_messages: Vec<Message> = if relocate_tool_guide {
-        [
-            (
-                ContextBlockType::Workspace,
-                ContextBlockPriority::High,
-                "Workspace",
-                section("workspace"),
-            ),
-            (
-                ContextBlockType::InstructionOverlay,
-                ContextBlockPriority::Critical,
-                "Project Instructions",
-                section("instruction"),
-            ),
-            (
-                ContextBlockType::SkillContext,
-                ContextBlockPriority::High,
-                "Loaded Skills",
-                section("skill"),
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, _, _, content)| !content.trim().is_empty())
-        .map(|(block_type, priority, title, content)| {
-            ContextBlock::new(
-                block_type,
-                priority,
-                ContextBlockStability::SessionStable,
-                title,
-                content,
-            )
-            .render_runtime_context_message()
-        })
-        .collect()
-    } else {
-        Vec::new()
-    };
+    [
+        (
+            ContextBlockType::Workspace,
+            ContextBlockPriority::High,
+            "Project & Workspace",
+            [section("project"), section("workspace")]
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        ),
+        (
+            ContextBlockType::InstructionOverlay,
+            ContextBlockPriority::Critical,
+            "Project Instructions",
+            section("instruction"),
+        ),
+        (
+            ContextBlockType::SkillContext,
+            ContextBlockPriority::High,
+            "Loaded Skills",
+            section("skill"),
+        ),
+        (
+            ContextBlockType::EnvSnapshot,
+            ContextBlockPriority::High,
+            "Environment Snapshot",
+            section("env"),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, _, _, content)| !content.trim().is_empty())
+    .map(|(block_type, priority, title, content)| {
+        ContextBlock::new(
+            block_type,
+            priority,
+            ContextBlockStability::SessionStable,
+            title,
+            content,
+        )
+    })
+    .for_each(|block| context_blocks.push(block));
 
     // The Responses-API view (instructions = stable system, guide leading the input
     // array) is no longer pre-baked here: the IR carries the system field + the
     // ordered runs, and the OpenAI/Copilot adapter derives `instructions` /
     // `input_messages` from it via `PromptIR::responses_request_options`.
-    let mut stable_prefix_messages = envelope.stable_prefix_messages.clone();
+    let mut stable_prefix_messages = stable_frame.stable_prefix_messages.clone();
     if let Some(message) = tool_guide_message {
         stable_prefix_messages.push(message);
     }
-    stable_prefix_messages.extend(session_context_messages);
 
-    // tools + system + (summary) + (conversation tail) — at most the
-    // 4-breakpoint Anthropic budget. Providers without explicit breakpoints
-    // (OpenAI/Gemini/Copilot) still benefit from the stable-prefix ordering.
+    // Keep Responses item annotations append-only too: a rolling breakpoint on
+    // the conversation tail would remove the marker from an item in the prior
+    // request. The stable tool-guide boundary is the only generated message
+    // breakpoint on the ledger path.
     let mut breakpoint_message_ids = Vec::new();
     // The relocated tool guide is large and session-stable, so it earns a
-    // dedicated breakpoint; when present it takes priority over the summary
-    // breakpoint to stay within Anthropic's marker budget (the summary still
-    // caches as part of the prefix up to the conversation tail, just without its
-    // own boundary). For the legacy/continuation paths this id simply isn't found
-    // in the message array, so the breakpoint is harmlessly ignored there.
+    // dedicated breakpoint. For legacy/continuation paths this id simply isn't
+    // found in the message array, so the breakpoint is harmlessly ignored there.
     if let Some(id) = tool_guide_breakpoint_id {
-        breakpoint_message_ids.push(id);
-    } else if let Some(id) = summary_breakpoint_id {
-        breakpoint_message_ids.push(id);
-    }
-    if let Some(id) = conversation_breakpoint_id {
         breakpoint_message_ids.push(id);
     }
     let cache_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
         breakpoint_message_ids,
-        // Use the 1-hour extended cache TTL for the whole stable prefix
-        // (tools + system + tool guide + summary + conversation history). The
+        // Use the 1-hour extended cache TTL for the growing append-only prefix
+        // (tools + system + tool guide + model transcript). The
         // default 5-minute TTL expires across any pause longer than 5 min
         // (waiting on the user, slow tools, long model think time), forcing a
         // full re-read of the large append-only history — including big tool
@@ -601,25 +678,37 @@ fn build_request_envelope(
         ttl: CacheTtl::Extended,
     };
 
-    // The single canonical request: the system field plus the ordered, addressable
-    // message runs (system_remainder and the volatile tail are their OWN runs, so
-    // an adapter can derive the chat / Responses-input / continuation-delta views
-    // itself). `continuation` is set at dispatch time.
+    let mut real_transcript = system_remainder_messages;
+    real_transcript.extend(conversation_messages);
+    let cache_scope = serde_json::json!({
+        "model": model,
+        "system": &lane_system,
+        "stable_prefix": stable_prefix_messages
+            .iter()
+            .map(|message| (&message.role, message.content.as_str()))
+            .collect::<Vec<_>>(),
+        "tools": tool_schemas,
+    });
+    let cache_scope_sha256 = hex::encode(Sha256::digest(
+        serde_json::to_vec(&cache_scope).expect("cache scope is serializable"),
+    ));
+    let ledger = super::context_ledger::reconcile_model_context(
+        session,
+        context_blocks,
+        &real_transcript,
+        cache_scope_sha256,
+        prepared_context.truncation_occurred,
+    );
+
+    // The single canonical request: stable prefix followed by one chronological
+    // model transcript. Legacy lanes remain supported by PromptIR for external
+    // callers, but the normal engine path no longer rebuilds them per round.
     let ir = PromptIR {
         system_text: lane_system,
         system_blocks,
         segments: vec![
             Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
-            Segment::new(
-                SegmentRole::DynamicContext,
-                envelope.dynamic_context_messages.clone(),
-            ),
-            Segment::new(
-                SegmentRole::SystemRemainder,
-                system_remainder_messages.clone(),
-            ),
-            Segment::new(SegmentRole::Conversation, conversation_messages.clone()),
-            Segment::new(SegmentRole::VolatileTail, volatile_context_messages.clone()),
+            Segment::new(SegmentRole::ModelTranscript, ledger.transcript),
         ],
         cache: cache_plan,
         continuation: None,
@@ -628,7 +717,22 @@ fn build_request_envelope(
     PreparedRequestEnvelope {
         ir,
         stable_prefix_sections,
+        ledger_changed: ledger.changed,
+        prefix_epoch: ledger.prefix_epoch,
+        prefix_reset_reason: ledger.reset_reason,
     }
+}
+
+#[cfg(test)]
+fn build_request_envelope(
+    session: &Session,
+    prepared_context: &PreparedContext,
+    config: &AgentLoopConfig,
+    tool_schemas: &[ToolSchema],
+) -> PreparedRequestEnvelope {
+    let mut shadow = session.clone();
+    let model = config.model_name.as_deref().unwrap_or(&session.model);
+    build_request_envelope_reconciled(&mut shadow, prepared_context, config, tool_schemas, model)
 }
 
 /// Session metadata key holding the latest [`RequestRenderObservability`] JSON.
@@ -647,6 +751,7 @@ pub(crate) struct RequestRenderObservability {
     pub system_block_count: usize,
     pub system_chars: usize,
     pub stable_prefix_messages: usize,
+    pub model_transcript_messages: usize,
     pub dynamic_context_messages: usize,
     pub conversation_messages: usize,
     pub volatile_context_messages: usize,
@@ -657,17 +762,20 @@ pub(crate) struct RequestRenderObservability {
     pub cache_tools: bool,
     pub cache_breakpoints: usize,
     pub cache_ttl: &'static str,
+    pub prefix_epoch: u64,
+    pub prefix_reset_reason: Option<&'static str>,
 }
 
 impl RequestRenderObservability {
     fn log(&self, session_id: &str) {
         tracing::info!(
-            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} cache(system={}, tools={}, breakpoints={}, ttl={})",
+            "[{}] LLM request render: wire={} system_blocks={} system_chars={} stable_prefix_msgs={} model_transcript_msgs={} dynamic_ctx_msgs={} conversation_msgs={} volatile_ctx_msgs={} request_msgs={} tools={} cache(system={}, tools={}, breakpoints={}, ttl={}) prefix_epoch={} prefix_reset_reason={}",
             session_id,
             self.wire,
             self.system_block_count,
             self.system_chars,
             self.stable_prefix_messages,
+            self.model_transcript_messages,
             self.dynamic_context_messages,
             self.conversation_messages,
             self.volatile_context_messages,
@@ -677,6 +785,8 @@ impl RequestRenderObservability {
             self.cache_tools,
             self.cache_breakpoints,
             self.cache_ttl,
+            self.prefix_epoch,
+            self.prefix_reset_reason.unwrap_or("none"),
         );
     }
 }
@@ -718,7 +828,11 @@ fn plan_llm_request(
     // The engine sets request POLICY only. The Responses prompt wire view
     // (instructions / input_messages / previous_response_id) is derived by the
     // OpenAI/Copilot adapter from the IR via `responses_request_options`.
-    let responses_options = engine_responses_policy();
+    let mut responses_options = engine_responses_policy();
+    responses_options.prompt_cache_key =
+        agent_loop_prompt_cache_key(Some(session_id), Some(AGENT_LOOP_REQUEST_PURPOSE));
+    responses_options.prefix_epoch = Some(envelope.prefix_epoch);
+    responses_options.prefix_reset_reason = envelope.prefix_reset_reason;
 
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
@@ -726,7 +840,7 @@ fn plan_llm_request(
         parallel_tool_calls: Some(required_tool.is_none()),
         required_tool: required_tool.map(str::to_string),
         responses: Some(responses_options),
-        request_purpose: Some("agent_loop".to_string()),
+        request_purpose: Some(AGENT_LOOP_REQUEST_PURPOSE.to_string()),
         cache: Some(envelope.ir.cache.clone()),
     };
 
@@ -736,11 +850,12 @@ fn plan_llm_request(
         wire: if is_continuation {
             "responses_continuation"
         } else {
-            "lanes"
+            "model_transcript"
         },
         system_block_count: envelope.ir.system_blocks.len(),
         system_chars: envelope.ir.system_field().len(),
         stable_prefix_messages: envelope.ir.run(SegmentRole::StablePrefix).len(),
+        model_transcript_messages: envelope.ir.run(SegmentRole::ModelTranscript).len(),
         dynamic_context_messages: envelope.ir.run(SegmentRole::DynamicContext).len(),
         conversation_messages: envelope.ir.run(SegmentRole::Conversation).len(),
         volatile_context_messages: envelope.ir.run(SegmentRole::VolatileTail).len(),
@@ -754,6 +869,10 @@ fn plan_llm_request(
         cache_tools: envelope.ir.cache.cache_tools,
         cache_breakpoints: envelope.ir.cache.breakpoint_message_ids.len(),
         cache_ttl: cache_ttl_label(envelope.ir.cache.ttl),
+        prefix_epoch: envelope.prefix_epoch,
+        prefix_reset_reason: envelope
+            .prefix_reset_reason
+            .map(bamboo_domain::ModelContextResetReason::as_str),
     };
 
     LlmRequestPlan {
@@ -790,20 +909,9 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
-    let required_tool =
-        crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
-            .then_some("load_skill");
-    let restricted_tool_schemas;
-    let tool_schemas = if let Some(required_tool) = required_tool {
-        restricted_tool_schemas = tool_schemas
-            .iter()
-            .filter(|schema| schema.function.name == required_tool)
-            .cloned()
-            .collect::<Vec<_>>();
-        restricted_tool_schemas.as_slice()
-    } else {
-        tool_schemas
-    };
+    let required_tool = required_tool_for_session(session);
+    let effective_tool_schemas = effective_tool_schemas(session, tool_schemas);
+    let tool_schemas = effective_tool_schemas.as_ref();
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
@@ -817,8 +925,43 @@ pub(super) async fn execute_llm_stream(
         None
     };
 
+    let previous_model_context_state = session.model_context_state.clone();
     let mut prepared_envelope =
-        build_request_envelope(session, prepared_context, config, tool_schemas);
+        build_request_envelope_reconciled(session, prepared_context, config, tool_schemas, model);
+    // `prepare_round_context` reserves the already-durable ledger history. The
+    // reconciliation above can append a new host-state snapshot, so verify the
+    // exact final IR again before checkpoint/provider dispatch. Failing closed
+    // preserves the context-window contract without committing an unsendable
+    // ledger candidate.
+    let final_usage = measure_request_usage(session, &prepared_envelope);
+    let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+    if final_usage.input_tokens > request_input_limit
+        || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+    {
+        session.model_context_state = previous_model_context_state;
+        return Err(AgentError::Budget(format!(
+            "final PromptIR message input exceeds ledger-safe limits: input_tokens={}, input_limit={request_input_limit}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+            final_usage.input_tokens, final_usage.ledger_rendered_bytes,
+        )));
+    }
+    // Reconciliation changes the next outbound model transcript. It must become
+    // durable before any provider request is attempted, otherwise a crash/retry
+    // could allocate a different event sequence. Fail closed on checkpoint
+    // failure instead of sending an unrepeatable request.
+    if prepared_envelope.ledger_changed {
+        if let Some(persistence) = config.persistence.as_ref() {
+            if let Err(error) = persistence.checkpoint_runtime_session(session).await {
+                // Reconciliation is an in-memory transaction until its durable
+                // checkpoint succeeds. Restore the prior state so an in-process
+                // retry cannot mistake the failed candidate for a committed
+                // ledger and bypass persistence on its next attempt.
+                session.model_context_state = previous_model_context_state;
+                return Err(AgentError::LLM(format!(
+                    "model-context ledger checkpoint failed before provider dispatch: {error}"
+                )));
+            }
+        }
+    }
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -828,13 +971,13 @@ pub(super) async fn execute_llm_stream(
         &prepared_envelope.stable_prefix_sections,
     );
     // Set the stateful Responses continuation on the IR (boundary = the last
-    // assistant turn in the conversation run) BEFORE planning, so the provider — or
+    // assistant turn in the model transcript) BEFORE planning, so the provider — or
     // the default lowering — derives the delta itself from addressable runs and the
     // plan's wire label reflects it.
     if let Some(response_id) = previous_response_id.as_deref() {
         let last_committed_assistant_id = prepared_envelope
             .ir
-            .run(SegmentRole::Conversation)
+            .run(SegmentRole::ModelTranscript)
             .iter()
             .rev()
             .find(|message| matches!(message.role, Role::Assistant))
@@ -846,10 +989,8 @@ pub(super) async fn execute_llm_stream(
     }
 
     // Single home for turning the canonical envelope into a concrete provider
-    // request (request POLICY + observability). The cache plan keeps per-round
-    // volatile content in trailing context-block messages, so everything up to the
-    // conversation-tail breakpoint is byte-stable across rounds and caches
-    // incrementally.
+    // request (request POLICY + observability). The ledger keeps every previously
+    // emitted item byte-stable while appending real turns and context events.
     let planned = plan_llm_request(
         &prepared_envelope,
         session_id,
@@ -869,26 +1010,41 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
+    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+        config.stream_timeout,
+        provider_name,
+        Some(model),
+    )
+    .allow_turn_retry_before_semantic_output()
+    .begin_request();
+
     // ONE canonical dispatch: every provider renders the IR. The default lowering
     // (chat / continuation-delta) and the provider overrides (Anthropic block-native
     // system, OpenAI/Copilot Responses view) all derive their wire from this IR.
-    let stream = llm
-        .chat_stream_ir(
+    // The provider future itself is covered by the same transport-idle policy as
+    // the returned stream. This bounds proxies that accept the request but never
+    // return response headers, a phase the per-frame watchdog cannot observe.
+    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+        llm.chat_stream_ir(
             &prepared_envelope.ir,
             tool_schemas,
             Some(max_output_tokens),
             model,
             Some(&planned.request_options),
-        )
-        .await
-        .map_err(|error| {
-            let message = format_provider_error(error);
-            if is_llm_overflow_error(&message) {
-                AgentError::LLMOverflow(message)
-            } else {
-                AgentError::LLM(message)
-            }
-        })?;
+        ),
+        cancel_token,
+        session_id,
+        &timeout_context,
+    )
+    .await?
+    .map_err(|error| {
+        let message = format_provider_error(error);
+        if is_llm_overflow_error(&message) {
+            AgentError::LLMOverflow(message)
+        } else {
+            AgentError::LLM(message)
+        }
+    })?;
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.
@@ -918,11 +1074,6 @@ pub(super) async fn execute_llm_stream(
         );
     }
 
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
-        config.stream_timeout,
-        provider_name,
-        Some(model),
-    );
     // A single structured explicit workflow has a fail-closed first step: the
     // model must call load_skill before any answer tokens become user-visible.
     // Keep that first stream silent; the pipeline verifies and executes the
@@ -954,7 +1105,7 @@ pub(super) async fn execute_llm_stream(
         Err(failure) => {
             let appended = append_interrupted_assistant_output(
                 session,
-                failure.partial_output,
+                *failure.partial_output,
                 &failure.error,
             );
             if appended {

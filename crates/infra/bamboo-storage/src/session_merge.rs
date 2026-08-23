@@ -1,8 +1,9 @@
 //! Merge-aware session save helper.
 //!
 //! Provides [`merge_save_session`], which preserves any concurrent UI edits to
-//! the authoritative metadata group (`title`, `title_version`, `pinned`,
-//! `metadata_version`) before writing the runtime-modified session to storage.
+//! the authoritative metadata group (`title`, `title_version`,
+//! `title_generated`, `pinned`, `metadata_version`) before writing the
+//! runtime-modified session to storage.
 //! Re-reads the latest persisted copy and only takes in-memory values when the
 //! caller's `metadata_version` strictly exceeds disk's.
 //!
@@ -10,8 +11,9 @@
 //!
 //! All authoritative metadata fields are grouped under `metadata_version`:
 //! when `disk.metadata_version >= session.metadata_version`, the on-disk
-//! `title`, `title_version`, `pinned`, and `metadata_version` overwrite the
-//! in-memory values before writing. Authoritative writers bump
+//! `title`, `title_version`, `title_generated`, `pinned`, and
+//! `metadata_version` overwrite the in-memory values before writing.
+//! Authoritative writers bump
 //! `metadata_version` (and `title_version` for title edits) before calling so
 //! their values survive the merge; non-authoritative writers don't bump and so
 //! are overwritten by any later disk changes.
@@ -35,11 +37,176 @@ use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::Storage;
-use bamboo_domain::{PermissionAuditSeed, PermissionAuditSnapshot, RuntimeSessionPersistence};
+use bamboo_domain::{
+    latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
+    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+};
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
+    CONSUMED_CLARIFICATION_IDS_KEY,
+    CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    "runtime.suspend_reason",
+    "clarification_resume_pending",
+    "conclusion_with_options_resume_pending",
+    "execute.startup_handoff_at",
+    "permission.reexecute_tool_call_id",
+    "permission.reexecute_request_generation",
+    "retry_resume_pending",
+    "retry_resume_reason",
+    "provider_name",
+];
+const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
+const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
+
+/// A pending response is an authoritative compare-and-consume transaction.
+/// When a stale runner still carries the consumed ask, its terminal save must
+/// adopt the durable response control plane instead of resurrecting the ask or
+/// erasing the resume handoff. The bounded consumed-id ledger distinguishes a
+/// genuinely new pending question from an old snapshot after `pending_question`
+/// itself has been cleared. New sessions bind that ledger to the concrete
+/// tool-result message and permission generation; the id-only key is a
+/// compatibility fallback only when no occurrence ledger exists.
+fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session) -> bool {
+    let Some(incoming_tool_call_id) = session
+        .pending_question
+        .as_ref()
+        .map(|pending| pending.tool_call_id.clone())
+    else {
+        return false;
+    };
+    let occurrence_ledger = durable
+        .metadata
+        .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        .map(|value| serde_json::from_str::<Vec<ResponseOccurrence>>(value));
+    let was_consumed = match occurrence_ledger {
+        Some(Ok(consumed)) => latest_response_occurrence(session, &incoming_tool_call_id)
+            .is_some_and(|incoming| consumed.iter().any(|entry| entry == &incoming)),
+        // A present but malformed v1 ledger is never widened to the legacy
+        // id-only matcher: doing so could consume a later reused provider id.
+        Some(Err(_)) => false,
+        None => {
+            let legacy_consumed = durable
+                .metadata
+                .get(CONSUMED_CLARIFICATION_IDS_KEY)
+                .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .unwrap_or_default()
+                .iter()
+                .any(|tool_call_id| tool_call_id == &incoming_tool_call_id);
+            // Upgrade compatibility must still bind the old id-only ledger to
+            // its concrete durable tool-result. Otherwise a provider-reused id
+            // in the next round would be mistaken for the consumed occurrence.
+            legacy_consumed
+                && latest_response_occurrence(durable, &incoming_tool_call_id).is_some_and(
+                    |durable_occurrence| {
+                        latest_response_occurrence(session, &incoming_tool_call_id)
+                            .is_some_and(|incoming| incoming == durable_occurrence)
+                    },
+                )
+        }
+    };
+    if !was_consumed {
+        return false;
+    }
+
+    // Durable ordering/content wins (including the selected-response rewrite),
+    // while any truly new runner-only suffix remains append-only.
+    bamboo_domain::append_missing_runtime_messages(session, durable);
+    session
+        .pending_question
+        .clone_from(&durable.pending_question);
+    for key in RESPONSE_CONTROL_METADATA_KEYS {
+        if let Some(value) = durable.metadata.get(*key) {
+            session.metadata.insert((*key).to_string(), value.clone());
+        } else {
+            session.metadata.remove(*key);
+        }
+    }
+    session.model.clone_from(&durable.model);
+    session.model_ref.clone_from(&durable.model_ref);
+    session.reasoning_effort = durable.reasoning_effort;
+    session
+        .agent_runtime_state
+        .clone_from(&durable.agent_runtime_state);
+    if let Some(runtime_metadata) = session.runtime_metadata.as_mut() {
+        runtime_metadata.provider_name = durable
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_name.clone());
+    } else if durable
+        .runtime_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.provider_name.is_some())
+    {
+        session.runtime_metadata = durable.runtime_metadata.as_ref().map(|metadata| {
+            let mut response_metadata = bamboo_domain::SessionRuntimeMetadata::default();
+            response_metadata
+                .provider_name
+                .clone_from(&metadata.provider_name);
+            response_metadata
+        });
+    }
+    true
+}
+
+fn is_task_control_plane_save_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        && error
+            .to_string()
+            .starts_with(TASK_CONTROL_PLANE_CONFLICT_PREFIX)
+}
+
+fn adopt_durable_task_control_plane(session: &mut Session, durable: &Session) {
+    session.task_list = durable.task_list.clone();
+    session
+        .metadata
+        .remove(bamboo_domain::session::runtime_metadata::keys::TASK_LIST_VERSION);
+    if let Some(runtime_metadata) = session.runtime_metadata.as_mut() {
+        runtime_metadata.task_list_version = None;
+    }
+    if session
+        .runtime_metadata
+        .as_ref()
+        .is_some_and(bamboo_domain::session::SessionRuntimeMetadata::is_empty)
+    {
+        session.runtime_metadata = None;
+    }
+    if let Some(version) = durable.task_list_version_meta() {
+        session.set_task_list_version_meta(version);
+    }
+}
+
+fn task_list_snapshot_matches(
+    session: &Session,
+    expected_task_list: &bamboo_domain::TaskList,
+) -> std::io::Result<bool> {
+    Ok(serde_json::to_value(&session.task_list)
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        == serde_json::to_value(Some(expected_task_list))
+            .map_err(|error| std::io::Error::other(error.to_string()))?)
+}
+
+fn unconditional_task_patch_would_regress(
+    durable: &Session,
+    incoming_task_list: &bamboo_domain::TaskList,
+    incoming_version: &str,
+) -> std::io::Result<bool> {
+    let same_list = task_list_snapshot_matches(durable, incoming_task_list)?;
+    let Some(durable_version) = durable.task_list_version_meta() else {
+        return Ok(false);
+    };
+    match (
+        incoming_version.parse::<u64>(),
+        durable_version.parse::<u64>(),
+    ) {
+        (Ok(incoming), Ok(durable)) => {
+            Ok(incoming < durable || (incoming == durable && !same_list))
+        }
+        _ => Ok(incoming_version != durable_version || !same_list),
+    }
+}
 
 // ── LockedSessionStore ────────────────────────────────────────────────
 
@@ -51,6 +218,10 @@ const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
     locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+    /// Serializes recoverable child/root Task transactions. Per-session locks
+    /// still provide the data isolation; this gate ensures a retained recovery
+    /// journal is resolved before another pair attempts to commit.
+    task_pair_transaction_lock: Arc<Mutex<()>>,
 }
 
 /// Self-cleaning guard returned by [`LockedSessionStore::acquire_lock`].
@@ -98,6 +269,7 @@ impl LockedSessionStore {
         Self {
             storage,
             locks: Arc::new(DashMap::new()),
+            task_pair_transaction_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -135,6 +307,78 @@ impl LockedSessionStore {
         }
     }
 
+    /// Save a full snapshot while preserving Task generations advanced by an
+    /// independent store instance. V2 rejects such a stale write before any
+    /// mutation; reloading and adopting only Task-owned fields makes the retry,
+    /// caller snapshot, and subsequent cache publication agree exactly.
+    async fn save_session_rebasing_task_conflicts(
+        &self,
+        session: &mut Session,
+    ) -> std::io::Result<()> {
+        for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
+            match self.storage.save_session(session).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_task_control_plane_save_conflict(&error)
+                        && attempt < MAX_TASK_CONTROL_PLANE_REBASE_RETRIES =>
+                {
+                    let Some(durable) =
+                        self.storage.load_runtime_control_plane(&session.id).await?
+                    else {
+                        return Err(error);
+                    };
+                    adopt_durable_task_control_plane(session, &durable);
+                }
+                Err(error) => {
+                    if is_task_control_plane_save_conflict(&error) {
+                        if let Some(durable) =
+                            self.storage.load_runtime_control_plane(&session.id).await?
+                        {
+                            adopt_durable_task_control_plane(session, &durable);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded Task conflict retry loop always returns")
+    }
+
+    /// Sidecar-only counterpart of
+    /// [`Self::save_session_rebasing_task_conflicts`].
+    async fn save_runtime_state_rebasing_task_conflicts(
+        &self,
+        session: &mut Session,
+    ) -> std::io::Result<()> {
+        for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
+            match self.storage.save_runtime_state(session).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_task_control_plane_save_conflict(&error)
+                        && attempt < MAX_TASK_CONTROL_PLANE_REBASE_RETRIES =>
+                {
+                    let Some(durable) =
+                        self.storage.load_runtime_control_plane(&session.id).await?
+                    else {
+                        return Err(error);
+                    };
+                    adopt_durable_task_control_plane(session, &durable);
+                }
+                Err(error) => {
+                    if is_task_control_plane_save_conflict(&error) {
+                        if let Some(durable) =
+                            self.storage.load_runtime_control_plane(&session.id).await?
+                        {
+                            adopt_durable_task_control_plane(session, &durable);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded Task conflict retry loop always returns")
+    }
+
     /// Runtime-only save: persist the control-plane (`agent_runtime_state`,
     /// metadata, …) without rewriting the message history.
     ///
@@ -149,7 +393,9 @@ impl LockedSessionStore {
     /// do so.
     ///
     /// Callers MUST NOT use this when they have appended messages: the in-memory
-    /// `messages` are ignored by the sidecar and would not be persisted.
+    /// `messages` are ignored by the sidecar and would not be persisted. They
+    /// also MUST NOT use it to author `model_context_state`; the durable ledger
+    /// loaded under the lock always wins this narrow save.
     pub async fn save_runtime_only(&self, session: &mut Session) -> std::io::Result<()> {
         self.save_runtime_only_and_publish(session, |_| {}).await
     }
@@ -172,13 +418,20 @@ impl LockedSessionStore {
         F: FnOnce(&Session) + Send,
     {
         let _guard = self.acquire_lock(&session.id).await;
-        if let Ok(Some(latest)) = self.storage.load_runtime_control_plane(&session.id).await {
+        if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
             adopt_fresher_disk_permission_posture(session, &latest);
+            // Runtime-only callers own narrow control-plane fields (Task list,
+            // parent wait state, …), never the model-context ledger. The sidecar
+            // load and save share this lock, so disk is unconditionally
+            // authoritative for the ledger and the published snapshot.
+            adopt_durable_model_context_state(session, &latest);
         }
-        let result = self.storage.save_runtime_state(session).await;
+        let result = self
+            .save_runtime_state_rebasing_task_conflicts(session)
+            .await;
         publish(session);
         result
     }
@@ -203,10 +456,160 @@ impl LockedSessionStore {
         let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
             return Ok(false);
         };
-        latest.set_task_list(task_list.clone());
+        if unconditional_task_patch_would_regress(&latest, task_list, version)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("Task control-plane changed while patching session {session_id}"),
+            ));
+        }
+        let original = latest.clone();
+        latest.task_list = Some(task_list.clone());
         latest.set_task_list_version_meta(version.to_string());
-        self.storage.save_runtime_state(&latest).await?;
+        if !self
+            .storage
+            .save_task_control_plane_if_matches(&original, &latest)
+            .await?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("Task control-plane changed while patching session {session_id}"),
+            ));
+        }
         publish(&latest);
+        Ok(true)
+    }
+
+    /// Compare-and-patch variant used by asynchronous evaluators. The durable
+    /// generation check, narrow Task mutation, save, and cache publication all
+    /// occur under the same per-session lock.
+    pub async fn update_task_list_control_plane_if_version_and_publish<F>(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut latest) = self.storage.load_runtime_control_plane(session_id).await? else {
+            return Ok(false);
+        };
+        if latest.task_list_version_meta().as_deref() != Some(expected_version)
+            || !task_list_snapshot_matches(&latest, expected_task_list)?
+        {
+            return Ok(false);
+        }
+        let original = latest.clone();
+        latest.task_list = Some(task_list.clone());
+        latest.set_task_list_version_meta(version.to_string());
+        if !self
+            .storage
+            .save_task_control_plane_if_matches(&original, &latest)
+            .await?
+        {
+            return Ok(false);
+        }
+        publish(&latest);
+        Ok(true)
+    }
+
+    /// Recoverably validate and narrowly patch both the executing session and
+    /// its shared root. Locks are acquired in lexical id order to prevent two
+    /// child evaluators from deadlocking while sharing a root. The underlying
+    /// storage transaction must either commit both Task generations or retain
+    /// an undo journal and fail closed until both originals are restored.
+    pub async fn update_task_list_control_planes_if_version_and_publish<F>(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+        publish: F,
+    ) -> std::io::Result<bool>
+    where
+        F: FnOnce(&Session, &Session) + Send,
+    {
+        if session_id == shared_session_id {
+            return self
+                .update_task_list_control_plane_if_version_and_publish(
+                    session_id,
+                    expected_version,
+                    expected_task_list,
+                    task_list,
+                    version,
+                    |session| publish(session, session),
+                )
+                .await;
+        }
+
+        let (first_id, second_id) = if session_id < shared_session_id {
+            (session_id, shared_session_id)
+        } else {
+            (shared_session_id, session_id)
+        };
+        let _transaction_guard = self.task_pair_transaction_lock.lock().await;
+        let _first_guard = self.acquire_lock(first_id).await;
+        let _second_guard = self.acquire_lock(second_id).await;
+
+        // A prior rollback may have failed after one sidecar was published.
+        // Recover under the same lexical pair locks before observing either
+        // generation; an unresolved journal fails this access closed.
+        self.storage
+            .recover_task_control_plane_transaction(first_id, second_id)
+            .await?;
+
+        let Some(mut local) = self.storage.load_runtime_control_plane(session_id).await? else {
+            return Ok(false);
+        };
+        let Some(mut shared) = self
+            .storage
+            .load_runtime_control_plane(shared_session_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if local.task_list_version_meta().as_deref() != Some(expected_version)
+            || shared.task_list_version_meta().as_deref() != Some(expected_version)
+            || !task_list_snapshot_matches(&local, expected_task_list)?
+            || !task_list_snapshot_matches(&shared, expected_task_list)?
+        {
+            return Ok(false);
+        }
+
+        let local_original = local.clone();
+        let shared_original = shared.clone();
+        // The paired persistence port owns only Task list/generation. Keep the
+        // surrounding session snapshot byte-stable so its minimal undo journal
+        // never needs transcript or unrelated metadata.
+        local.task_list = Some(task_list.clone());
+        local.set_task_list_version_meta(version.to_string());
+        shared.task_list = Some(task_list.clone());
+        shared.set_task_list_version_meta(version.to_string());
+        let (first_original, first_updated, second_original, second_updated) =
+            if session_id < shared_session_id {
+                (&local_original, &local, &shared_original, &shared)
+            } else {
+                (&shared_original, &shared, &local_original, &local)
+            };
+        let committed = self
+            .storage
+            .save_task_control_planes_atomically(
+                first_original,
+                first_updated,
+                second_original,
+                second_updated,
+            )
+            .await?;
+        if !committed {
+            return Ok(false);
+        }
+        publish(&local, &shared);
         Ok(true)
     }
 
@@ -221,13 +624,18 @@ impl LockedSessionStore {
     /// between the caller's load and this save, so merge is unnecessary.
     pub async fn commit_metadata(&self, session: &Session) -> std::io::Result<()> {
         let _guard = self.acquire_lock(&session.id).await;
-        self.storage.save_session(session).await
+        let mut committed = session.clone();
+        if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
+            adopt_durable_model_context_state(&mut committed, &latest);
+        }
+        self.save_session_rebasing_task_conflicts(&mut committed)
+            .await
     }
 
     /// Runtime / non-authoritative save with per-session lock.
     ///
     /// Inside the lock: reload disk, merge the authoritative metadata group
-    /// (`title`, `title_version`, `pinned`, `metadata_version`) from disk into
+    /// (`title`, `title_version`, `title_generated`, `pinned`, `metadata_version`) from disk into
     /// the in-memory copy if disk's `metadata_version >= session.metadata_version`,
     /// then save.
     ///
@@ -294,23 +702,26 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&session.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_model_context_checkpoint_is_current(session, latest)?;
             let incoming_count = session.messages.len();
             let durable_count = latest.messages.len();
             let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
             bamboo_domain::merge_session_inbox_admission(session, latest);
+            let adopted_response = adopt_durable_consumed_clarification(session, latest);
             tracing::debug!(
-                "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, saved={}",
+                "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, adopted_response={}, saved={}",
                 session.id,
                 durable_count,
                 incoming_count,
                 appended,
+                adopted_response,
                 session.messages.len(),
             );
             apply_authoritative_metadata(session, latest);
             adopt_fresher_disk_permission_posture(session, latest);
         }
 
-        let result = self.storage.save_session(session).await;
+        let result = self.save_session_rebasing_task_conflicts(session).await;
         publish(session, result.is_ok());
         result
     }
@@ -348,7 +759,7 @@ impl LockedSessionStore {
         // session carrying the full conversation history that doubled the
         // deserialization cost of every runtime save, which is the hot path
         // during sub-agent spawn.
-        let latest = self.storage.load_session(&session.id).await.ok().flatten();
+        let latest = self.storage.load_session(&session.id).await?;
 
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
         // (it only merges authoritative metadata, not messages). If the incoming
@@ -377,6 +788,7 @@ impl LockedSessionStore {
         }
 
         if let Some(latest) = latest.as_ref() {
+            adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
             if restored > 0 {
@@ -394,8 +806,9 @@ impl LockedSessionStore {
             if adopt_bypass {
                 adopt_fresher_disk_permission_posture(session, latest);
             }
+            adopt_fresher_durable_model_context_state(session, latest);
         }
-        let result = self.storage.save_session(session).await;
+        let result = self.save_session_rebasing_task_conflicts(session).await;
         publish(session, result.is_ok());
         result
     }
@@ -430,6 +843,7 @@ impl LockedSessionStore {
             apply_authoritative_metadata(session, &latest);
             bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
             bamboo_domain::merge_session_inbox_admission(session, &latest);
+            adopt_fresher_durable_model_context_state(session, &latest);
 
             let durable_audit = PermissionAuditSnapshot::from_metadata(&latest.metadata);
             let durable_floor = durable_audit
@@ -455,7 +869,7 @@ impl LockedSessionStore {
             .set_permission_mode(incoming_audit.resolution.requested);
         incoming_audit.write_to(&mut session.metadata);
 
-        let result = self.storage.save_session(session).await;
+        let result = self.save_session_rebasing_task_conflicts(session).await;
         publish(session, result.is_ok());
         result
     }
@@ -504,7 +918,8 @@ impl LockedSessionStore {
         if mode_changed {
             latest.metadata_version = latest.metadata_version.saturating_add(1);
         }
-        self.storage.save_session(&latest).await?;
+        self.save_session_rebasing_task_conflicts(&mut latest)
+            .await?;
         publish(&latest);
         Ok(Some(latest))
     }
@@ -551,7 +966,8 @@ impl LockedSessionStore {
         bamboo_domain::record_permission_audit(&mut latest.metadata, seed, None).map_err(
             |error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
         )?;
-        self.storage.save_session(&latest).await?;
+        self.save_session_rebasing_task_conflicts(&mut latest)
+            .await?;
         publish(&latest);
         Ok(Some(latest))
     }
@@ -596,9 +1012,119 @@ impl LockedSessionStore {
             return Ok(None);
         };
         mutate(&mut session);
-        self.storage.save_session(&session).await?;
+        self.save_session_rebasing_task_conflicts(&mut session)
+            .await?;
         publish(&session);
         Ok(Some(session))
+    }
+
+    /// Load the authoritative response transaction candidate while the caller
+    /// holds this store's per-session lock. The merge rules intentionally
+    /// match [`Self::mutate_runtime_session_and_publish`], including adoption
+    /// of a clarification that durable storage already consumed.
+    async fn load_response_candidate<C>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+    ) -> std::io::Result<Option<Session>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+    {
+        let cached_candidate = load_cached();
+        let durable = self.storage.load_session(session_id).await?;
+        let Some(mut session) = (match (cached_candidate, durable.as_ref()) {
+            (Some(cached), Some(durable)) => {
+                let prefer_durable = durable.updated_at > cached.updated_at
+                    || (durable.updated_at == cached.updated_at
+                        && cached.pending_question.is_none()
+                        && durable.pending_question.is_some());
+                Some(if prefer_durable {
+                    durable.clone()
+                } else {
+                    cached
+                })
+            }
+            (Some(cached), None) => Some(cached),
+            (None, durable) => durable.cloned(),
+        }) else {
+            return Ok(None);
+        };
+        if let Some(latest) = durable.as_ref() {
+            // A response transaction starts from an append-safe transcript.
+            // In particular, a cache snapshot that is timestamp-newer but
+            // still carries an already-consumed ask must not resurrect that
+            // ask or discard ordinary messages committed with the answer.
+            adopt_durable_consumed_clarification(&mut session, latest);
+            bamboo_domain::append_missing_runtime_messages(&mut session, latest);
+            apply_authoritative_metadata(&mut session, latest);
+            let restored =
+                bamboo_domain::restore_missing_admitted_inbox_messages(&mut session, latest);
+            if restored > 0 {
+                tracing::warn!(
+                    session_id,
+                    restored,
+                    "restored durable SessionInbox transcript messages into response transaction"
+                );
+            }
+            bamboo_domain::merge_session_inbox_admission(&mut session, latest);
+            adopt_fresher_disk_permission_posture(&mut session, latest);
+            adopt_fresher_durable_model_context_state(&mut session, latest);
+        }
+        Ok(Some(session))
+    }
+
+    /// Inspect the same authoritative snapshot a response mutation would use,
+    /// without persisting or publishing it. Callers use this immediately before
+    /// reserving a successor so an already-consumed response cannot allocate a
+    /// replacement runner.
+    pub async fn inspect_runtime_session_for_response<C>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+    ) -> std::io::Result<Option<Session>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        self.load_response_candidate(session_id, load_cached).await
+    }
+
+    /// Atomically load, validate/mutate, persist, and publish one runtime
+    /// session under its canonical per-session lock.
+    ///
+    /// The nested result keeps validation errors distinct from storage errors:
+    /// `Ok(Err(error))` means `mutate` rejected the latest snapshot and no save
+    /// occurred. This is suitable for compare-and-consume operations such as a
+    /// typed pending-question response, where separate load/save calls would
+    /// allow another writer to replace the question between validation and
+    /// persistence.
+    pub async fn mutate_runtime_session_and_publish<C, M, P, E>(
+        &self,
+        session_id: &str,
+        load_cached: C,
+        mutate: M,
+        publish: P,
+    ) -> std::io::Result<Result<Option<Session>, E>>
+    where
+        C: FnOnce() -> Option<Session> + Send,
+        M: FnOnce(&mut Session) -> Result<(), E> + Send,
+        P: FnOnce(&Session) + Send,
+        E: Send,
+    {
+        let _guard = self.acquire_lock(session_id).await;
+        let Some(mut session) = self
+            .load_response_candidate(session_id, load_cached)
+            .await?
+        else {
+            return Ok(Ok(None));
+        };
+        if let Err(error) = mutate(&mut session) {
+            return Ok(Err(error));
+        }
+        self.save_session_rebasing_task_conflicts(&mut session)
+            .await?;
+        publish(&session);
+        Ok(Ok(Some(session)))
     }
 
     /// Clear the legacy compatibility queue using durable CAS and publish the
@@ -620,7 +1146,8 @@ impl LockedSessionStore {
             return Ok(false);
         }
         latest.clear_pending_injected_messages();
-        self.storage.save_runtime_state(&latest).await?;
+        self.save_runtime_state_rebasing_task_conflicts(&mut latest)
+            .await?;
         publish(&latest);
         Ok(true)
     }
@@ -676,6 +1203,46 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             .await
     }
 
+    async fn update_task_list_control_plane_if_version(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.update_task_list_control_plane_if_version_and_publish(
+            session_id,
+            expected_version,
+            expected_task_list,
+            task_list,
+            version,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn update_task_list_control_planes_if_version(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.update_task_list_control_planes_if_version_and_publish(
+            session_id,
+            shared_session_id,
+            expected_version,
+            expected_task_list,
+            task_list,
+            version,
+            |_, _| {},
+        )
+        .await
+    }
+
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         LockedSessionStore::checkpoint_runtime_session(self, session).await
     }
@@ -705,13 +1272,76 @@ impl RuntimeSessionPersistence for LockedSessionStore {
 async fn merge_authoritative_metadata_into_stale(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
-) {
-    if let Ok(Some(latest)) = storage.load_session(&session.id).await {
+) -> std::io::Result<()> {
+    if let Some(latest) = storage.load_session(&session.id).await? {
+        adopt_durable_consumed_clarification(session, &latest);
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
         bamboo_domain::merge_session_inbox_admission(session, &latest);
         adopt_fresher_disk_permission_posture(session, &latest);
+        adopt_fresher_durable_model_context_state(session, &latest);
     }
+    Ok(())
+}
+
+/// Runtime-only writes never own the ledger, so the snapshot loaded under the
+/// session lock is authoritative even if the caller happens to carry a larger
+/// revision. This keeps both the sidecar and synchronous cache publication from
+/// regressing after a concurrent engine checkpoint.
+fn adopt_durable_model_context_state(session: &mut Session, latest: &Session) {
+    session
+        .model_context_state
+        .clone_from(&latest.model_context_state);
+}
+
+/// Merge policy for ordinary full runtime saves. Legitimate ledger writers
+/// (compression/rollback/reconciliation) advance `state_revision`; stale or
+/// conflicting non-ledger writers adopt the already-committed state. Equal
+/// revisions with different bytes are concurrent children of the same base, so
+/// durable state wins instead of allowing last-writer-wins corruption.
+fn adopt_fresher_durable_model_context_state(session: &mut Session, latest: &Session) {
+    let adopt = match (
+        session.model_context_state.as_ref(),
+        latest.model_context_state.as_ref(),
+    ) {
+        (None, Some(_)) => true,
+        (Some(incoming), Some(durable)) => {
+            durable.state_revision > incoming.state_revision
+                || (durable.state_revision == incoming.state_revision && durable != incoming)
+        }
+        _ => false,
+    };
+    if adopt {
+        adopt_durable_model_context_state(session, latest);
+    }
+}
+
+/// A provider-bound ledger checkpoint must never silently substitute a newer or
+/// conflicting disk ledger after the request body was prepared. Reject it so
+/// the engine can roll back the in-memory candidate and retry from a fresh
+/// session; only a strictly newer incoming revision may replace disk.
+fn ensure_model_context_checkpoint_is_current(
+    session: &Session,
+    latest: &Session,
+) -> std::io::Result<()> {
+    let stale_or_conflicting = match (
+        session.model_context_state.as_ref(),
+        latest.model_context_state.as_ref(),
+    ) {
+        (None, Some(_)) => true,
+        (Some(incoming), Some(durable)) => {
+            durable.state_revision > incoming.state_revision
+                || (durable.state_revision == incoming.state_revision && durable != incoming)
+        }
+        _ => false,
+    };
+    if stale_or_conflicting {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "stale or conflicting model-context ledger checkpoint",
+        ));
+    }
+    Ok(())
 }
 
 /// Adopt the on-disk typed permission posture into the session about to be
@@ -777,6 +1407,7 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     if latest.metadata_version >= session.metadata_version {
         session.title = latest.title.clone();
         session.title_version = latest.title_version;
+        session.title_generated = latest.title_generated;
         session.pinned = latest.pinned;
         for key in AUTHORITATIVE_METADATA_KEYS {
             if let Some(value) = latest.metadata.get(*key) {
@@ -795,7 +1426,7 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
 /// authoritative metadata group.
 ///
 /// Behaviour: if the on-disk session has `metadata_version >=
-/// session.metadata_version`, the on-disk `title`, `title_version`, `pinned`
+/// session.metadata_version`, the on-disk `title`, `title_version`, `title_generated`, `pinned`
 /// and `metadata_version` overwrite the in-memory values before writing.
 ///
 /// This is the stateless variant (no per-session lock). Prefer
@@ -805,7 +1436,7 @@ pub async fn merge_save_session(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
 ) -> std::io::Result<()> {
-    merge_authoritative_metadata_into_stale(storage, session).await;
+    merge_authoritative_metadata_into_stale(storage, session).await?;
     storage.save_session(session).await
 }
 
@@ -814,17 +1445,102 @@ pub async fn merge_save_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::SessionStoreV2;
+    use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct CountingControlPlaneStorage {
         inner: Arc<SessionStoreV2>,
         control_plane_loads: AtomicUsize,
+        full_saves: AtomicUsize,
+        runtime_state_saves: AtomicUsize,
+    }
+
+    struct PairCommitBarrierStorage {
+        inner: Arc<SessionStoreV2>,
+        before_commit: Arc<tokio::sync::Barrier>,
+    }
+
+    struct SingleCommitBarrierStorage {
+        inner: Arc<SessionStoreV2>,
+        before_commit: Arc<tokio::sync::Barrier>,
+    }
+
+    struct SingleCommitPauseStorage {
+        inner: Arc<SessionStoreV2>,
+        commit_reached: Arc<tokio::sync::Barrier>,
+        release_commit: Arc<tokio::sync::Barrier>,
     }
 
     #[async_trait::async_trait]
-    impl Storage for CountingControlPlaneStorage {
+    impl Storage for SingleCommitPauseStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(session_id).await
+        }
+
+        async fn save_task_control_plane_if_matches(
+            &self,
+            original: &Session,
+            updated: &Session,
+        ) -> std::io::Result<bool> {
+            self.commit_reached.wait().await;
+            self.release_commit.wait().await;
+            self.inner
+                .save_task_control_plane_if_matches(original, updated)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for SingleCommitBarrierStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(session_id).await
+        }
+
+        async fn save_task_control_plane_if_matches(
+            &self,
+            original: &Session,
+            updated: &Session,
+        ) -> std::io::Result<bool> {
+            self.before_commit.wait().await;
+            self.inner
+                .save_task_control_plane_if_matches(original, updated)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for PairCommitBarrierStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
             self.inner.save_session(session).await
         }
@@ -845,8 +1561,115 @@ mod tests {
             &self,
             session_id: &str,
         ) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(session_id).await
+        }
+
+        async fn recover_task_control_plane_transaction(
+            &self,
+            first_session_id: &str,
+            second_session_id: &str,
+        ) -> std::io::Result<()> {
+            self.inner
+                .recover_task_control_plane_transaction(first_session_id, second_session_id)
+                .await
+        }
+
+        async fn save_task_control_planes_atomically(
+            &self,
+            first_original: &Session,
+            first_updated: &Session,
+            second_original: &Session,
+            second_updated: &Session,
+        ) -> std::io::Result<bool> {
+            // Both independent LockedSessionStores have already recovered,
+            // loaded, and validated v1 when they meet here. Their per-instance
+            // lexical locks cannot serialize each other; the V2 commit-point
+            // revalidation must select exactly one winner.
+            self.before_commit.wait().await;
+            self.inner
+                .save_task_control_planes_atomically(
+                    first_original,
+                    first_updated,
+                    second_original,
+                    second_updated,
+                )
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CountingControlPlaneStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.full_saves.fetch_add(1, Ordering::SeqCst);
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
+        }
+
+        async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.runtime_state_saves.fetch_add(1, Ordering::SeqCst);
+            self.inner.save_runtime_state(session).await
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
             self.control_plane_loads.fetch_add(1, Ordering::SeqCst);
             self.inner.load_runtime_control_plane(session_id).await
+        }
+
+        async fn recover_task_control_plane_transaction(
+            &self,
+            first_session_id: &str,
+            second_session_id: &str,
+        ) -> std::io::Result<()> {
+            self.inner
+                .recover_task_control_plane_transaction(first_session_id, second_session_id)
+                .await
+        }
+
+        async fn save_task_control_plane_if_matches(
+            &self,
+            original: &Session,
+            updated: &Session,
+        ) -> std::io::Result<bool> {
+            let committed = self
+                .inner
+                .save_task_control_plane_if_matches(original, updated)
+                .await?;
+            if committed {
+                self.runtime_state_saves.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(committed)
+        }
+
+        async fn save_task_control_planes_atomically(
+            &self,
+            first_original: &Session,
+            first_updated: &Session,
+            second_original: &Session,
+            second_updated: &Session,
+        ) -> std::io::Result<bool> {
+            let committed = self
+                .inner
+                .save_task_control_planes_atomically(
+                    first_original,
+                    first_updated,
+                    second_original,
+                    second_updated,
+                )
+                .await?;
+            if committed {
+                self.runtime_state_saves.fetch_add(2, Ordering::SeqCst);
+            }
+            Ok(committed)
         }
     }
 
@@ -860,6 +1683,33 @@ mod tests {
 
     fn fresh(id: &str) -> Session {
         Session::new(id.to_string(), "test-model".to_string())
+    }
+
+    fn typed_permission_result(
+        tool_call_id: &str,
+        message_id: &str,
+        generation: &str,
+        content: &str,
+    ) -> bamboo_domain::session::types::Message {
+        let mut message =
+            bamboo_domain::session::types::Message::tool_result(tool_call_id, content);
+        message.id = message_id.to_string();
+        message.metadata = Some(serde_json::json!({
+            "permission_request": {
+                "request_generation": generation,
+            }
+        }));
+        message
+    }
+
+    fn ledger_state(state_revision: u64, marker: &str) -> bamboo_domain::ModelContextState {
+        bamboo_domain::ModelContextState {
+            state_revision,
+            prefix_epoch: state_revision,
+            cache_scope_sha256: Some("scope".to_string()),
+            transcript_item_sha256: vec![marker.to_string()],
+            ..bamboo_domain::ModelContextState::default()
+        }
     }
 
     fn set_permission_audit(
@@ -880,6 +1730,200 @@ mod tests {
             Some(transitioned_at),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_persists_a_cache_only_pending_session() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut cached = fresh("cache-only-response");
+        cached.set_pending_question(
+            "tool-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let saved = store
+            .mutate_runtime_session_and_publish(
+                &cached.id.clone(),
+                move || Some(cached),
+                |session| {
+                    assert!(session.pending_question.is_some());
+                    session.clear_pending_question();
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("cache-only session should be created durably");
+
+        assert!(saved.pending_question.is_none());
+        assert!(storage
+            .load_session("cache-only-response")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_question
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_preserves_durable_authorities_for_newer_cache() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "cached-response-authorities";
+        let mut durable = fresh(session_id);
+        durable.title = "Durable title".to_string();
+        durable.title_version = 4;
+        durable.title_generated = true;
+        durable.metadata_version = 9;
+        set_permission_audit(
+            &mut durable,
+            bamboo_domain::SessionPermissionMode::Auto,
+            7,
+            "bamboo_runtime:durable-auto",
+            "2026-08-10T09:00:00Z",
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut cached = fresh(session_id);
+        cached.title = "Stale cached title".to_string();
+        cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+        cached.set_pending_question(
+            "tool-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        store
+            .mutate_runtime_session_and_publish(
+                session_id,
+                move || Some(cached),
+                |session| {
+                    session.clear_pending_question();
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("session should exist");
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(saved.title, "Durable title");
+        assert_eq!(saved.title_version, 4);
+        assert_eq!(saved.metadata_version, 9);
+        assert_eq!(
+            saved
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Auto
+        );
+        let audit = bamboo_domain::PermissionAuditSnapshot::from_metadata(&saved.metadata).unwrap();
+        assert_eq!(audit.policy_revision, 7);
+        assert_eq!(audit.executor_mapping, "bamboo_runtime:durable-auto");
+    }
+
+    #[tokio::test]
+    async fn checked_runtime_mutation_cannot_resurrect_consumed_ask_from_newer_cache() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "cached-consumed-response";
+        let mut stale_cached = fresh(session_id);
+        stale_cached.add_message(Message::tool_result("call-1", "waiting"));
+        stale_cached.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let mut durable = stale_cached.clone();
+        durable.clear_pending_question();
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        durable.messages[0].content = "Selected response: A".to_string();
+        durable.add_message(Message::user("durable concurrent message"));
+        storage.save_session(&durable).await.unwrap();
+
+        // A cache write after the durable response can have a newer wall-clock
+        // timestamp while still containing the old runner snapshot.
+        stale_cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+        let saved = store
+            .mutate_runtime_session_and_publish(
+                session_id,
+                move || Some(stale_cached),
+                |session| {
+                    assert!(session.pending_question.is_none());
+                    Ok::<_, ()>(())
+                },
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(saved.pending_question.is_none());
+        assert_eq!(saved.messages.len(), 2);
+        assert_eq!(saved.messages[0].content, "Selected response: A");
+        assert_eq!(saved.messages[1].content, "durable concurrent message");
+    }
+
+    #[tokio::test]
+    async fn response_inspection_adopts_durable_consumption_without_writing() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "inspect-consumed-response";
+        let mut stale_cached = fresh(session_id);
+        // Legacy id-only adoption is still bound to the concrete response
+        // occurrence. Real pending questions always have a paired tool-result;
+        // keep that identity in this compatibility fixture so it cannot model
+        // an unsafe id-only consume.
+        stale_cached.add_message(bamboo_domain::session::types::Message::tool_result(
+            "call-1", "waiting",
+        ));
+        stale_cached.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+
+        let mut durable = stale_cached.clone();
+        durable.clear_pending_question();
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+        stale_cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
+
+        let inspected = store
+            .inspect_runtime_session_for_response(session_id, move || Some(stale_cached))
+            .await
+            .unwrap()
+            .expect("session should be inspectable");
+        assert!(inspected.pending_question.is_none());
+
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.updated_at, durable.updated_at);
+        assert!(unchanged.pending_question.is_none());
     }
 
     #[tokio::test]
@@ -1377,6 +2421,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_final_save_cannot_resurrect_a_consumed_clarification() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-clarification-final-save";
+
+        let mut suspended = fresh(session_id);
+        suspended.add_message(Message::tool_result(
+            "call-1",
+            r#"{"status":"awaiting_clarification"}"#,
+        ));
+        suspended.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+        suspended.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_clarification".to_string(),
+        );
+        storage.save_session(&suspended).await.unwrap();
+        let mut stale_runner = suspended.clone();
+
+        let mut answered = suspended;
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        answered.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        answered.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.metadata.insert(
+            "conclusion_with_options_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.metadata.insert(
+            "execute.startup_handoff_at".to_string(),
+            "2026-08-10T09:00:00.000Z".to_string(),
+        );
+        let answer = answered
+            .messages
+            .iter_mut()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .unwrap();
+        answer.content = "Selected response: A".to_string();
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut stale_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(
+            saved
+                .metadata
+                .get("clarification_resume_pending")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            saved
+                .metadata
+                .get("execute.startup_handoff_at")
+                .map(String::as_str),
+            Some("2026-08-10T09:00:00.000Z")
+        );
+        let answers = saved
+            .messages
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("call-1"))
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].content, "Selected response: A");
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoint_cannot_resurrect_a_consumed_clarification() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-clarification-checkpoint";
+        let mut stale_runner = fresh(session_id);
+        stale_runner.add_message(Message::tool_result("call-1", "waiting"));
+        stale_runner.set_pending_question(
+            "call-1".to_string(),
+            "ConclusionWithOptions".to_string(),
+            "Choose".to_string(),
+            vec!["A".to_string()],
+            false,
+        );
+        stale_runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_clarification".to_string(),
+        );
+
+        let mut answered = stale_runner.clone();
+        answered.clear_pending_question();
+        answered.metadata.remove("runtime.suspend_reason");
+        answered.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["call-1"]"#.to_string(),
+        );
+        answered.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        answered.messages[0].content = "Selected response: A".to_string();
+        storage.save_session(&answered).await.unwrap();
+
+        store
+            .checkpoint_runtime_session(&mut stale_runner)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
+        assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.messages[0].content, "Selected response: A");
+    }
+
+    #[tokio::test]
+    async fn runtime_final_save_does_not_consume_a_new_reused_permission_occurrence() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "reused-permission-final-save";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Approve",
+        ));
+        durable.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "reused-call".to_string(),
+                tool_result_message_id: "old-result".to_string(),
+                permission_generation: Some("generation-old".to_string()),
+            }])
+            .unwrap(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+        new_runner.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "awaiting_permission_approval".to_string(),
+        );
+
+        store.merge_save_runtime(&mut new_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            saved.messages.last().unwrap().content,
+            "waiting for the new decision"
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_consumed_id_does_not_consume_a_new_reused_occurrence_after_upgrade() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "legacy-reused-permission-final-save";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Approve",
+        ));
+        durable.metadata.insert(
+            CONSUMED_CLARIFICATION_IDS_KEY.to_string(),
+            r#"["reused-call"]"#.to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        store.merge_save_runtime(&mut new_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoint_does_not_consume_a_new_reused_permission_occurrence() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "reused-permission-checkpoint";
+
+        let mut durable = fresh(session_id);
+        durable.add_message(typed_permission_result(
+            "reused-call",
+            "old-result",
+            "generation-old",
+            "Selected response: Deny",
+        ));
+        durable.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "reused-call".to_string(),
+                tool_result_message_id: "old-result".to_string(),
+                permission_generation: Some("generation-old".to_string()),
+            }])
+            .unwrap(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let mut new_runner = durable;
+        new_runner.add_message(typed_permission_result(
+            "reused-call",
+            "new-result",
+            "generation-new",
+            "waiting for the new decision",
+        ));
+        new_runner.set_pending_question(
+            "reused-call".to_string(),
+            "Permission".to_string(),
+            "Approve new operation?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        store
+            .checkpoint_runtime_session(&mut new_runner)
+            .await
+            .unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("reused-call")
+        );
+        assert_eq!(
+            saved.messages.last().map(|message| message.id.as_str()),
+            Some("new-result")
+        );
+        assert_eq!(
+            latest_response_occurrence(&saved, "reused-call")
+                .and_then(|occurrence| occurrence.permission_generation),
+            Some("generation-new".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_permission_adoption_keeps_reexecute_id_and_generation_paired() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "consumed-permission-control-pair";
+
+        let mut stale_runner = fresh(session_id);
+        stale_runner.add_message(typed_permission_result(
+            "call-1",
+            "result-1",
+            "generation-1",
+            "waiting",
+        ));
+        stale_runner.set_pending_question(
+            "call-1".to_string(),
+            "Permission".to_string(),
+            "Approve?".to_string(),
+            vec!["Approve".to_string(), "Deny".to_string()],
+            false,
+        );
+
+        let mut answered = stale_runner.clone();
+        answered.clear_pending_question();
+        answered.messages[0].content = "Selected response: Approve".to_string();
+        answered.metadata.insert(
+            CONSUMED_RESPONSE_OCCURRENCES_KEY.to_string(),
+            serde_json::to_string(&vec![ResponseOccurrence {
+                tool_call_id: "call-1".to_string(),
+                tool_result_message_id: "result-1".to_string(),
+                permission_generation: Some("generation-1".to_string()),
+            }])
+            .unwrap(),
+        );
+        answered.metadata.insert(
+            "permission.reexecute_tool_call_id".to_string(),
+            "call-1".to_string(),
+        );
+        answered.metadata.insert(
+            "permission.reexecute_request_generation".to_string(),
+            "generation-1".to_string(),
+        );
+        storage.save_session(&answered).await.unwrap();
+
+        store.merge_save_runtime(&mut stale_runner).await.unwrap();
+
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.pending_question.is_none());
+        assert_eq!(
+            saved
+                .metadata
+                .get("permission.reexecute_tool_call_id")
+                .map(String::as_str),
+            Some("call-1")
+        );
+        assert_eq!(
+            saved
+                .metadata
+                .get("permission.reexecute_request_generation")
+                .map(String::as_str),
+            Some("generation-1")
+        );
+    }
+
+    #[tokio::test]
     async fn checkpoint_runtime_session_preserves_disk_suffix_and_appends_live_messages() {
         use bamboo_domain::session::types::Message;
 
@@ -1419,6 +2841,169 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn runtime_only_save_preserves_checkpointed_ledger_and_publishes_merged_state() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "runtime-only-ledger-race";
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale_control = storage.load_session(session_id).await.unwrap().unwrap();
+
+        let mut runner = baseline;
+        runner.model_context_state = Some(ledger_state(1, "runner-l1"));
+        store.checkpoint_runtime_session(&mut runner).await.unwrap();
+
+        stale_control.metadata.insert(
+            "runtime.suspend_reason".to_string(),
+            "waiting_for_children".to_string(),
+        );
+        let published = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published_clone = published.clone();
+        store
+            .save_runtime_only_and_publish(&mut stale_control, move |saved| {
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state.clone();
+        assert_eq!(stale_control.model_context_state, expected);
+        assert_eq!(
+            published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .model_context_state,
+            expected
+        );
+        let sidecar = storage
+            .load_runtime_control_plane(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sidecar.model_context_state, expected);
+        assert_eq!(
+            sidecar
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
+        );
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, expected);
+    }
+
+    #[tokio::test]
+    async fn full_runtime_save_preserves_newer_ledger_but_commits_control_mutation() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "full-save-ledger-race";
+        let baseline = fresh(session_id);
+        storage.save_session(&baseline).await.unwrap();
+        let mut stale = storage.load_session(session_id).await.unwrap().unwrap();
+
+        let mut runner = baseline;
+        runner.model_context_state = Some(ledger_state(1, "runner-l1"));
+        store.checkpoint_runtime_session(&mut runner).await.unwrap();
+
+        stale
+            .metadata
+            .insert("activated_tools".to_string(), "[\"search\"]".to_string());
+        let published = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let published_clone = published.clone();
+        store
+            .merge_save_runtime_and_publish(&mut stale, move |saved, committed| {
+                assert!(committed);
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state.clone();
+        assert_eq!(stale.model_context_state, expected);
+        assert_eq!(
+            published
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .model_context_state,
+            expected
+        );
+        let sidecar = storage
+            .load_runtime_control_plane(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sidecar.model_context_state, expected);
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, expected);
+        assert_eq!(
+            reloaded.metadata.get("activated_tools").map(String::as_str),
+            Some("[\"search\"]")
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_explicit_epoch_reset_wins_an_ordinary_full_runtime_save() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "full-save-ledger-reset";
+        let mut durable = fresh(session_id);
+        durable.model_context_state = Some(ledger_state(1, "runner-l1"));
+        storage.save_session(&durable).await.unwrap();
+
+        let mut compression = storage.load_session(session_id).await.unwrap().unwrap();
+        compression.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        let reset = compression.model_context_state.clone();
+        assert_eq!(reset.as_ref().unwrap().state_revision, 2);
+        store.merge_save_runtime(&mut compression).await.unwrap();
+
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, reset);
+        assert_eq!(
+            reloaded
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::Compression)
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_equal_revision_divergence_without_overwriting_disk() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "ledger-checkpoint-cas";
+        let mut baseline = fresh(session_id);
+        baseline.model_context_state = Some(ledger_state(1, "runner-l1"));
+        storage.save_session(&baseline).await.unwrap();
+
+        let mut first = baseline.clone();
+        first.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        let mut conflicting = baseline;
+        conflicting.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Rollback);
+        assert_eq!(
+            first.model_context_state.as_ref().unwrap().state_revision,
+            conflicting
+                .model_context_state
+                .as_ref()
+                .unwrap()
+                .state_revision
+        );
+
+        store.checkpoint_runtime_session(&mut first).await.unwrap();
+        let error = store
+            .checkpoint_runtime_session(&mut conflicting)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let reloaded = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.model_context_state, first.model_context_state);
     }
 
     #[tokio::test]
@@ -1855,12 +3440,14 @@ mod tests {
         let mut on_disk = fresh(session_id);
         on_disk.title = "User Set This".to_string();
         on_disk.title_version = 0;
+        on_disk.title_generated = true;
         on_disk.metadata_version = 0;
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
         runtime_copy.title = "Stale Default".to_string();
         runtime_copy.title_version = 0;
+        runtime_copy.title_generated = false;
         runtime_copy.metadata_version = 0;
         runtime_copy.messages = vec![];
 
@@ -1871,7 +3458,9 @@ mod tests {
         let after = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(after.title, "User Set This");
         assert_eq!(after.title_version, 0);
+        assert!(after.title_generated);
         assert_eq!(runtime_copy.title, "User Set This");
+        assert!(runtime_copy.title_generated);
     }
 
     #[tokio::test]
@@ -2060,6 +3649,8 @@ mod tests {
         let counted = Arc::new(CountingControlPlaneStorage {
             inner: inner.clone(),
             control_plane_loads: AtomicUsize::new(0),
+            full_saves: AtomicUsize::new(0),
+            runtime_state_saves: AtomicUsize::new(0),
         });
         let storage: Arc<dyn Storage> = counted.clone();
         let store = Arc::new(LockedSessionStore::new(storage));
@@ -2139,6 +3730,762 @@ mod tests {
             reloaded.task_list.as_ref().map(|list| list.title.as_str()),
             Some("Atomic Task patch")
         );
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_conflict_cannot_overwrite_newer_root_or_child_state() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let root_id = "task-cas-root";
+        let child_id = "task-cas-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut root = fresh(root_id);
+        root.set_task_list(task_list("newer root"));
+        root.set_task_list_version_meta("2");
+        storage.save_session(&root).await.expect("seed root");
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.set_task_list(task_list("current child"));
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.expect("seed child");
+
+        let updated = RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+            &store,
+            child_id,
+            root_id,
+            "1",
+            &task_list("current child"),
+            &task_list("stale evaluator"),
+            "3",
+        )
+        .await
+        .expect("CAS returns clean conflict");
+        assert!(
+            !updated,
+            "mismatched root generation must reject both writes"
+        );
+
+        let durable_root = storage
+            .load_session(root_id)
+            .await
+            .expect("load root")
+            .expect("root exists");
+        let durable_child = storage
+            .load_session(child_id)
+            .await
+            .expect("load child")
+            .expect("child exists");
+        assert_eq!(durable_root.task_list_version_meta().as_deref(), Some("2"));
+        assert_eq!(
+            durable_root
+                .task_list
+                .as_ref()
+                .map(|list| list.title.as_str()),
+            Some("newer root")
+        );
+        assert_eq!(durable_child.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(
+            durable_child
+                .task_list
+                .as_ref()
+                .map(|list| list.title.as_str()),
+            Some("current child")
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_success_uses_only_targeted_saves_and_preserves_both_transcripts() {
+        use bamboo_domain::session::types::Message;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let root_id = "task-cas-success-root";
+        let child_id = "task-cas-success-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut root = fresh(root_id);
+        root.add_message(Message::user("root transcript"));
+        root.metadata
+            .insert("unrelated.root".to_string(), "preserve".to_string());
+        root.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("root-run"));
+        root.set_task_list(task_list("old shared"));
+        root.set_task_list_version_meta("1");
+        inner.save_session(&root).await.expect("seed root");
+
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.add_message(Message::user("child transcript"));
+        child
+            .metadata
+            .insert("unrelated.child".to_string(), "preserve".to_string());
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("child-run"));
+        child.set_task_list(task_list("old shared"));
+        child.set_task_list_version_meta("1");
+        inner.save_session(&child).await.expect("seed child");
+
+        let counted = Arc::new(CountingControlPlaneStorage {
+            inner: inner.clone(),
+            control_plane_loads: AtomicUsize::new(0),
+            full_saves: AtomicUsize::new(0),
+            runtime_state_saves: AtomicUsize::new(0),
+        });
+        let storage: Arc<dyn Storage> = counted.clone();
+        let store = LockedSessionStore::new(storage);
+        assert!(
+            RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+                &store,
+                child_id,
+                root_id,
+                "1",
+                &task_list("old shared"),
+                &task_list("evaluated"),
+                "2",
+            )
+            .await
+            .expect("paired CAS succeeds")
+        );
+        assert_eq!(counted.control_plane_loads.load(Ordering::SeqCst), 2);
+        assert_eq!(counted.runtime_state_saves.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            counted.full_saves.load(Ordering::SeqCst),
+            0,
+            "evaluation CAS must not call full save_session for child or root"
+        );
+
+        let durable_root = inner.load_session(root_id).await.unwrap().unwrap();
+        let durable_child = inner.load_session(child_id).await.unwrap().unwrap();
+        for (session, transcript, metadata_key, run_id) in [
+            (
+                &durable_root,
+                "root transcript",
+                "unrelated.root",
+                "root-run",
+            ),
+            (
+                &durable_child,
+                "child transcript",
+                "unrelated.child",
+                "child-run",
+            ),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("evaluated")
+            );
+            assert_eq!(session.messages.len(), 1);
+            assert_eq!(session.messages[0].content, transcript);
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some("preserve")
+            );
+            assert_eq!(
+                session
+                    .agent_runtime_state
+                    .as_ref()
+                    .map(|state| state.run_id.as_str()),
+                Some(run_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_runtime_and_full_saves_adopt_task_conflicts_before_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let first_storage = Arc::new(
+            SessionStoreV2::new(home.clone())
+                .await
+                .expect("first storage init"),
+        );
+        let second_storage = Arc::new(
+            SessionStoreV2::new(home)
+                .await
+                .expect("second storage init"),
+        );
+        let now = chrono::Utc::now();
+        let task_list = |session_id: &str, title: &str| bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let runtime_id = "ordinary-task-retry-runtime";
+        let full_id = "ordinary-task-retry-full";
+        let mut runtime_initial = fresh(runtime_id);
+        runtime_initial.set_task_list(task_list(runtime_id, "runtime v1"));
+        runtime_initial.set_task_list_version_meta("1");
+        first_storage
+            .save_session(&runtime_initial)
+            .await
+            .expect("seed runtime session");
+        let mut full_initial = fresh(full_id);
+        full_initial.set_task_list(task_list(full_id, "full v1"));
+        full_initial.set_task_list_version_meta("1");
+        first_storage
+            .save_session(&full_initial)
+            .await
+            .expect("seed full session");
+
+        let mut runtime_advanced = runtime_initial.clone();
+        runtime_advanced.set_task_list(task_list(runtime_id, "runtime v2"));
+        runtime_advanced.set_task_list_version_meta("2");
+        second_storage
+            .save_runtime_state(&runtime_advanced)
+            .await
+            .expect("advance runtime Task generation");
+        let mut full_advanced = full_initial.clone();
+        full_advanced.set_task_list(task_list(full_id, "full v2"));
+        full_advanced.set_task_list_version_meta("2");
+        second_storage
+            .save_runtime_state(&full_advanced)
+            .await
+            .expect("advance full Task generation");
+
+        let storage: Arc<dyn Storage> = first_storage.clone();
+        let store = LockedSessionStore::new(storage);
+        let runtime_published = Arc::new(std::sync::Mutex::new(None));
+        let runtime_callback = runtime_published.clone();
+        let mut runtime_stale = runtime_initial;
+        runtime_stale
+            .metadata
+            .insert("runtime.non-task".to_string(), "preserved".to_string());
+        store
+            .save_runtime_only_and_publish(&mut runtime_stale, move |saved| {
+                *runtime_callback.lock().expect("runtime publish lock") = Some(saved.clone());
+            })
+            .await
+            .expect("locked runtime save rebases and retries");
+
+        let full_published = Arc::new(std::sync::Mutex::new(None));
+        let full_callback = full_published.clone();
+        let mut full_stale = full_initial;
+        full_stale
+            .metadata
+            .insert("full.non-task".to_string(), "preserved".to_string());
+        store
+            .merge_save_runtime_and_publish(&mut full_stale, move |saved, committed| {
+                assert!(committed);
+                *full_callback.lock().expect("full publish lock") = Some(saved.clone());
+            })
+            .await
+            .expect("locked full save rebases and retries");
+
+        let durable_runtime = first_storage
+            .load_session(runtime_id)
+            .await
+            .unwrap()
+            .expect("durable runtime session");
+        let durable_full = first_storage
+            .load_session(full_id)
+            .await
+            .unwrap()
+            .expect("durable full session");
+        let published_runtime = runtime_published
+            .lock()
+            .expect("runtime publish lock")
+            .clone()
+            .expect("runtime published snapshot");
+        let published_full = full_published
+            .lock()
+            .expect("full publish lock")
+            .clone()
+            .expect("full published snapshot");
+
+        for (session, expected_title, metadata_key) in [
+            (&runtime_stale, "runtime v2", "runtime.non-task"),
+            (&durable_runtime, "runtime v2", "runtime.non-task"),
+            (&published_runtime, "runtime v2", "runtime.non-task"),
+            (&full_stale, "full v2", "full.non-task"),
+            (&durable_full, "full v2", "full.non-task"),
+            (&published_full, "full v2", "full.non-task"),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some(expected_title)
+            );
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some("preserved")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_task_cas_rejects_same_version_divergent_snapshot_without_callback() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "single-task-exact-snapshot";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let durable_winner = task_list("durable winner");
+        let stale_snapshot = task_list("stale same-version snapshot");
+        let mut session = fresh(session_id);
+        session.set_task_list(durable_winner.clone());
+        session.set_task_list_version_meta("1");
+        storage.save_session(&session).await.expect("seed session");
+
+        let published = Arc::new(AtomicBool::new(false));
+        let callback = published.clone();
+        assert!(!store
+            .update_task_list_control_plane_if_version_and_publish(
+                session_id,
+                "1",
+                &stale_snapshot,
+                &task_list("stale evaluation"),
+                "2",
+                move |_| callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("same-version divergence is a clean stale result"));
+        assert!(!published.load(Ordering::SeqCst));
+        let durable = storage
+            .load_session(session_id)
+            .await
+            .unwrap()
+            .expect("session remains");
+        assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(
+            serde_json::to_value(&durable.task_list).expect("serialize durable Task list"),
+            serde_json::to_value(Some(&durable_winner)).expect("serialize expected Task list")
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_rejects_same_version_divergent_snapshot_without_callback() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let root_id = "paired-task-exact-snapshot-root";
+        let child_id = "paired-task-exact-snapshot-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let durable_winner = task_list("durable winner");
+        let stale_snapshot = task_list("stale same-version snapshot");
+        let mut root = fresh(root_id);
+        root.set_task_list(durable_winner.clone());
+        root.set_task_list_version_meta("1");
+        storage.save_session(&root).await.expect("seed root");
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.set_task_list(durable_winner.clone());
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.expect("seed child");
+
+        let published = Arc::new(AtomicBool::new(false));
+        let callback = published.clone();
+        assert!(!store
+            .update_task_list_control_planes_if_version_and_publish(
+                child_id,
+                root_id,
+                "1",
+                &stale_snapshot,
+                &task_list("stale evaluation"),
+                "2",
+                move |_, _| callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect("same-version divergence is a clean stale result"));
+        assert!(!published.load(Ordering::SeqCst));
+        for id in [child_id, root_id] {
+            let durable = storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .expect("session remains");
+            assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+            assert_eq!(
+                serde_json::to_value(&durable.task_list).expect("serialize durable Task list"),
+                serde_json::to_value(Some(&durable_winner)).expect("serialize expected Task list")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unconditional_root_task_patch_reports_final_cas_conflict_without_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let first_inner = Arc::new(
+            SessionStoreV2::new(home.clone())
+                .await
+                .expect("first storage init"),
+        );
+        let root_id = "single-task-unconditional-loser";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut root = fresh(root_id);
+        root.task_list = Some(task_list("original"));
+        root.set_task_list_version_meta("1");
+        first_inner.save_session(&root).await.expect("seed root");
+        let second_inner = Arc::new(
+            SessionStoreV2::new(home)
+                .await
+                .expect("second storage init"),
+        );
+        let commit_reached = Arc::new(tokio::sync::Barrier::new(2));
+        let release_commit = Arc::new(tokio::sync::Barrier::new(2));
+        let storage: Arc<dyn Storage> = Arc::new(SingleCommitPauseStorage {
+            inner: first_inner.clone(),
+            commit_reached: commit_reached.clone(),
+            release_commit: release_commit.clone(),
+        });
+        let store = LockedSessionStore::new(storage);
+        let published = Arc::new(AtomicBool::new(false));
+        let callback = published.clone();
+        let loser_candidate = task_list("loser");
+
+        let loser = store.update_task_list_control_plane_and_publish(
+            root_id,
+            &loser_candidate,
+            "2",
+            move |_| callback.store(true, Ordering::SeqCst),
+        );
+        let winner = async {
+            commit_reached.wait().await;
+            let original = second_inner
+                .load_runtime_control_plane(root_id)
+                .await
+                .expect("load winner original")
+                .expect("winner original exists");
+            let mut updated = original.clone();
+            updated.task_list = Some(task_list("winner"));
+            updated.set_task_list_version_meta("2");
+            assert!(second_inner
+                .save_task_control_plane_if_matches(&original, &updated)
+                .await
+                .expect("commit winner"));
+            release_commit.wait().await;
+        };
+        let (loser_result, ()) = tokio::join!(loser, winner);
+        let error = loser_result.expect_err("unconditional loser must be an explicit conflict");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!published.load(Ordering::SeqCst));
+        let durable = first_inner
+            .load_session(root_id)
+            .await
+            .unwrap()
+            .expect("durable root");
+        assert_eq!(durable.task_list_version_meta().as_deref(), Some("2"));
+        assert_eq!(
+            durable.task_list.as_ref().map(|list| list.title.as_str()),
+            Some("winner")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_root_task_patches_have_one_final_cas_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let first_inner = Arc::new(
+            SessionStoreV2::new(home.clone())
+                .await
+                .expect("first storage init"),
+        );
+        let root_id = "single-task-cas-race-root";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut root = fresh(root_id);
+        root.set_task_list(task_list("original"));
+        root.set_task_list_version_meta("1");
+        first_inner.save_session(&root).await.expect("seed root");
+        let second_inner = Arc::new(
+            SessionStoreV2::new(home)
+                .await
+                .expect("second storage init"),
+        );
+        let before_commit = Arc::new(tokio::sync::Barrier::new(2));
+        let first_storage: Arc<dyn Storage> = Arc::new(SingleCommitBarrierStorage {
+            inner: first_inner.clone(),
+            before_commit: before_commit.clone(),
+        });
+        let second_storage: Arc<dyn Storage> = Arc::new(SingleCommitBarrierStorage {
+            inner: second_inner.clone(),
+            before_commit,
+        });
+        let first_store = LockedSessionStore::new(first_storage);
+        let second_store = LockedSessionStore::new(second_storage);
+        let first_published = Arc::new(AtomicBool::new(false));
+        let second_published = Arc::new(AtomicBool::new(false));
+        let first_callback = first_published.clone();
+        let second_callback = second_published.clone();
+        let expected = task_list("original");
+        let first_candidate = task_list("candidate one");
+        let second_candidate = task_list("candidate two");
+
+        // Two expected-version patches stage from v1, but the storage final-CAS
+        // admits only one regardless of process-local lock ownership.
+        let first = first_store.update_task_list_control_plane_if_version_and_publish(
+            root_id,
+            "1",
+            &expected,
+            &first_candidate,
+            "2",
+            move |_| first_callback.store(true, Ordering::SeqCst),
+        );
+        let second = second_store.update_task_list_control_plane_if_version_and_publish(
+            root_id,
+            "1",
+            &expected,
+            &second_candidate,
+            "2",
+            move |_| second_callback.store(true, Ordering::SeqCst),
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+        let first_won = first_result.expect("first root result");
+        let second_won = second_result.expect("second root result");
+        assert_ne!(first_won, second_won, "exactly one root candidate wins");
+        assert_eq!(first_published.load(Ordering::SeqCst), first_won);
+        assert_eq!(second_published.load(Ordering::SeqCst), second_won);
+
+        let durable = first_inner
+            .load_session(root_id)
+            .await
+            .unwrap()
+            .expect("root");
+        assert_eq!(durable.task_list_version_meta().as_deref(), Some("2"));
+        assert_eq!(
+            durable.task_list.as_ref().map(|list| list.title.as_str()),
+            Some(if first_won {
+                "candidate one"
+            } else {
+                "candidate two"
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_locked_stores_revalidate_pair_cas_at_storage_commit_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let first_inner = Arc::new(
+            SessionStoreV2::new(home.clone())
+                .await
+                .expect("first storage init"),
+        );
+        let root_id = "task-cas-race-root";
+        let child_id = "task-cas-race-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut root = fresh(root_id);
+        root.set_task_list(task_list("original shared"));
+        root.set_task_list_version_meta("1");
+        first_inner.save_session(&root).await.expect("seed root");
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.set_task_list(task_list("original shared"));
+        child.set_task_list_version_meta("1");
+        first_inner.save_session(&child).await.expect("seed child");
+
+        let second_inner = Arc::new(
+            SessionStoreV2::new(home)
+                .await
+                .expect("second storage init"),
+        );
+        let before_commit = Arc::new(tokio::sync::Barrier::new(2));
+        let first_storage: Arc<dyn Storage> = Arc::new(PairCommitBarrierStorage {
+            inner: first_inner.clone(),
+            before_commit: before_commit.clone(),
+        });
+        let second_storage: Arc<dyn Storage> = Arc::new(PairCommitBarrierStorage {
+            inner: second_inner.clone(),
+            before_commit,
+        });
+        let first_store = LockedSessionStore::new(first_storage);
+        let second_store = LockedSessionStore::new(second_storage);
+        let first_published = Arc::new(AtomicBool::new(false));
+        let second_published = Arc::new(AtomicBool::new(false));
+        let first_published_callback = first_published.clone();
+        let second_published_callback = second_published.clone();
+        let expected = task_list("original shared");
+        let first_candidate = task_list("candidate one");
+        let second_candidate = task_list("candidate two");
+
+        let first = first_store.update_task_list_control_planes_if_version_and_publish(
+            child_id,
+            root_id,
+            "1",
+            &expected,
+            &first_candidate,
+            "2",
+            move |_, _| first_published_callback.store(true, Ordering::SeqCst),
+        );
+        let second = second_store.update_task_list_control_planes_if_version_and_publish(
+            child_id,
+            root_id,
+            "1",
+            &expected,
+            &second_candidate,
+            "2",
+            move |_, _| second_published_callback.store(true, Ordering::SeqCst),
+        );
+        let (first_result, second_result) = tokio::join!(first, second);
+        let first_won = first_result.expect("first CAS result");
+        let second_won = second_result.expect("second CAS result");
+        assert_ne!(first_won, second_won, "exactly one staged v1 CAS may win");
+        assert_eq!(first_published.load(Ordering::SeqCst), first_won);
+        assert_eq!(second_published.load(Ordering::SeqCst), second_won);
+
+        let expected_title = if first_won {
+            "candidate one"
+        } else {
+            "candidate two"
+        };
+        let durable_child = first_inner
+            .load_session(child_id)
+            .await
+            .unwrap()
+            .expect("child");
+        let durable_root = second_inner
+            .load_session(root_id)
+            .await
+            .unwrap()
+            .expect("root");
+        for session in [&durable_child, &durable_root] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some(expected_title)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_task_second_write_failure_rolls_back_and_skips_publish_callback() {
+        use bamboo_domain::session::types::Message;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inner = Arc::new(
+            SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("storage init"),
+        );
+        let root_id = "task-cas-failure-root";
+        let child_id = "task-cas-failure-child";
+        let now = chrono::Utc::now();
+        let task_list = |title: &str| bamboo_domain::TaskList {
+            session_id: root_id.to_string(),
+            title: title.to_string(),
+            items: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut root = fresh(root_id);
+        root.add_message(Message::user("root transcript"));
+        root.metadata
+            .insert("unrelated.root".to_string(), "preserve".to_string());
+        root.set_task_list(task_list("old shared"));
+        root.set_task_list_version_meta("1");
+        inner.save_session(&root).await.expect("seed root");
+
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.add_message(Message::user("child transcript"));
+        child
+            .metadata
+            .insert("unrelated.child".to_string(), "preserve".to_string());
+        child.set_task_list(task_list("old shared"));
+        child.set_task_list_version_meta("1");
+        inner.save_session(&child).await.expect("seed child");
+
+        inner
+            .inject_runtime_task_transaction_fault(RuntimeTaskTransactionFault::SecondUpdatedWrite);
+        let storage: Arc<dyn Storage> = inner.clone();
+        let store = LockedSessionStore::new(storage);
+        let published = Arc::new(AtomicBool::new(false));
+        let published_for_callback = published.clone();
+        let error = store
+            .update_task_list_control_planes_if_version_and_publish(
+                child_id,
+                root_id,
+                "1",
+                &task_list("old shared"),
+                &task_list("must roll back"),
+                "2",
+                move |_, _| published_for_callback.store(true, Ordering::SeqCst),
+            )
+            .await
+            .expect_err("injected second write fails");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert!(
+            !published.load(Ordering::SeqCst),
+            "durable failure must not publish either cache snapshot"
+        );
+
+        let durable_root = inner.load_session(root_id).await.unwrap().unwrap();
+        let durable_child = inner.load_session(child_id).await.unwrap().unwrap();
+        for (session, title, transcript, metadata_key) in [
+            (
+                &durable_root,
+                "old shared",
+                "root transcript",
+                "unrelated.root",
+            ),
+            (
+                &durable_child,
+                "old shared",
+                "child transcript",
+                "unrelated.child",
+            ),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("1"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some(title)
+            );
+            assert_eq!(session.messages[0].content, transcript);
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some("preserve")
+            );
+        }
     }
 
     // ── LockedSessionStore tests ────────────────────────────────────

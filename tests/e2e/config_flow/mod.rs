@@ -3,7 +3,7 @@
 //! These tests exercise multiple endpoints in sequence to catch regressions where:
 //! - config patches clobber other sections (lost updates)
 //! - permissive config endpoint incorrectly enforces provider validation
-//! - strict provider endpoint returns proper HTTP codes and messages
+//! - revisioned provider settings validate credentials and preserve CAS
 //! - config patch sanitization prevents encrypted material injection
 
 use actix_web::{test, App};

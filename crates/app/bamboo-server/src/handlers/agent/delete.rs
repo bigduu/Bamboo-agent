@@ -46,6 +46,7 @@ use crate::app_state::AppState;
 /// ```
 pub async fn handler(state: web::Data<AppState>, path: web::Path<String>) -> Result<HttpResponse> {
     let session_id = path.into_inner();
+    let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
 
     // Best-effort pre-cancellation of the session (and its children if this is a root session).
     let ids_to_cancel: Vec<String> = match state.session_store.get_index_entry(&session_id).await {

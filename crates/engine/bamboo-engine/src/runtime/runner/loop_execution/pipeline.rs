@@ -5,6 +5,7 @@
 //!
 //! "Round" is kept only as a counter for metrics compatibility.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,11 +48,39 @@ use crate::runtime::runner::state_bridge;
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
 
+#[cfg(test)]
+const TEST_POST_LLM_RETRY_FAILURES_KEY: &str = "test.pipeline.post_llm_retry_failures";
+
+#[cfg(test)]
+fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError> {
+    let remaining = session
+        .metadata
+        .get(TEST_POST_LLM_RETRY_FAILURES_KEY)?
+        .parse::<usize>()
+        .ok()?;
+    if remaining == 0 {
+        return None;
+    }
+    if remaining == 1 {
+        session.metadata.remove(TEST_POST_LLM_RETRY_FAILURES_KEY);
+    } else {
+        session.metadata.insert(
+            TEST_POST_LLM_RETRY_FAILURES_KEY.to_string(),
+            (remaining - 1).to_string(),
+        );
+    }
+    Some(AgentError::LLM(
+        "transient test-injected post-LLM handler failure".to_string(),
+    ))
+}
+
 // ---- Error classification (from rounds.rs) ----
 
 fn should_retry_turn_error(error: &AgentError) -> bool {
-    let AgentError::LLM(message) = error else {
-        return false;
+    let message = match error {
+        AgentError::StreamTimeout(timeout) => return timeout.retry_safe(),
+        AgentError::LLM(message) => message,
+        _ => return false,
     };
     let message = message.trim().to_ascii_lowercase();
     if message.is_empty() {
@@ -122,7 +151,7 @@ struct RunBudgetExceeded {
     actual: u64,
 }
 
-/// One round's ACTUAL (provider-reported) usage + activity, accumulated
+/// One round's canonical usage + activity, accumulated
 /// across the round's retry attempts for the per-run budget guardrails
 /// (issue #221).
 ///
@@ -147,13 +176,15 @@ impl RoundActivity {
     /// totals. Called once per successful `execute_llm_round` return, the
     /// moment `stream_output` becomes available — before it is consumed by
     /// `handle_no_tool_calls`/`handle_tool_calls_path`.
-    fn absorb_attempt(&mut self, stream_output: &StreamHandlingOutput) {
-        self.prompt_tokens = self
-            .prompt_tokens
-            .saturating_add(stream_output.prompt_tokens_for_runtime_budget());
-        self.completion_tokens = self
-            .completion_tokens
-            .saturating_add(stream_output.completion_tokens_for_runtime_budget());
+    fn absorb_attempt(
+        &mut self,
+        stream_output: &StreamHandlingOutput,
+        attempt_usage: MetricsTokenUsage,
+    ) {
+        let mut accumulated = self.token_usage();
+        accumulated.add_assign_durable(attempt_usage);
+        self.prompt_tokens = accumulated.prompt_tokens;
+        self.completion_tokens = accumulated.completion_tokens;
         self.tool_call_count = self
             .tool_call_count
             .saturating_add(stream_output.tool_calls.len() as u32);
@@ -164,6 +195,41 @@ impl RoundActivity {
                 .filter(|call| is_subagent_create_call(call))
                 .count() as u32,
         );
+    }
+
+    /// The exact token value persisted for this round. Runtime budget totals
+    /// consume these same two components via `commit_to_runtime`, making the
+    /// canonical policy impossible to fork between the two consumers.
+    fn token_usage(&self) -> MetricsTokenUsage {
+        MetricsTokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.prompt_tokens.saturating_add(self.completion_tokens),
+        }
+        .clamped_for_durable_metrics()
+    }
+
+    /// Commit a round exactly once, including terminal rounds. A billed stream
+    /// followed by validation or post-LLM failure must still affect the runtime
+    /// budget just as it affects durable metrics.
+    fn commit_to_runtime(&self, runtime_state: &mut AgentRuntimeState) {
+        let mut accumulated = MetricsTokenUsage {
+            prompt_tokens: runtime_state.round.total_prompt_tokens,
+            completion_tokens: runtime_state.round.total_completion_tokens,
+            total_tokens: 0,
+        }
+        .clamped_for_durable_metrics();
+        accumulated.add_assign_durable(self.token_usage());
+        runtime_state.round.total_prompt_tokens = accumulated.prompt_tokens;
+        runtime_state.round.total_completion_tokens = accumulated.completion_tokens;
+        runtime_state.round.total_tool_calls = runtime_state
+            .round
+            .total_tool_calls
+            .saturating_add(self.tool_call_count);
+        runtime_state.round.total_subagents_spawned = runtime_state
+            .round
+            .total_subagents_spawned
+            .saturating_add(self.subagent_spawn_count);
     }
 }
 
@@ -179,7 +245,8 @@ fn check_run_budget_exceeded(
 ) -> Option<RunBudgetExceeded> {
     let total_tokens = round
         .total_prompt_tokens
-        .saturating_add(round.total_completion_tokens);
+        .saturating_add(round.total_completion_tokens)
+        .min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT);
     if let Some(limit) = budget.max_total_tokens {
         if total_tokens >= limit {
             return Some(RunBudgetExceeded {
@@ -662,6 +729,7 @@ fn record_turn_failure(
     round_id: &str,
     session_id: &str,
     message_count: u32,
+    round_usage: MetricsTokenUsage,
     error: &AgentError,
 ) {
     let (round_status, session_status) = map_turn_error_status(error);
@@ -671,8 +739,72 @@ fn record_turn_failure(
         session_id,
         message_count,
         round_status,
+        round_usage,
         Some(error.to_string()),
         session_status,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_task_evaluation_terminal_metrics(
+    metrics_collector: Option<&MetricsCollector>,
+    metrics_round_id: &str,
+    metrics_started: &AtomicBool,
+    metrics_terminal: &AtomicBool,
+    completed_at: chrono::DateTime<Utc>,
+    status: MetricsRoundStatus,
+    usage: MetricsTokenUsage,
+    error: Option<String>,
+) {
+    if !metrics_started.load(Ordering::Acquire)
+        || metrics_terminal
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    if let Some(metrics) = metrics_collector {
+        metrics.round_completed(
+            metrics_round_id.to_string(),
+            completed_at,
+            status,
+            usage,
+            0,
+            0,
+            error,
+        );
+    }
+}
+
+fn task_evaluation_result_usage(
+    result: &crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult,
+) -> MetricsTokenUsage {
+    let prompt_tokens = result.evaluation_result.prompt_tokens;
+    let completion_tokens = result.evaluation_result.completion_tokens;
+    MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    }
+}
+
+fn record_harvested_task_evaluation_metrics(
+    metrics_collector: Option<&MetricsCollector>,
+    result: &crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult,
+) {
+    let (status, error) = match result.error.clone() {
+        Some(error) => (MetricsRoundStatus::Error, Some(error)),
+        None => (MetricsRoundStatus::Success, None),
+    };
+    record_task_evaluation_terminal_metrics(
+        metrics_collector,
+        &result.metrics_round_id,
+        result.metrics_started.as_ref(),
+        result.metrics_terminal.as_ref(),
+        result.finished_at,
+        status,
+        task_evaluation_result_usage(result),
+        error,
     );
 }
 
@@ -703,6 +835,16 @@ async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
                 state.session_id,
                 in_flight.request.round_number
             );
+            record_task_evaluation_terminal_metrics(
+                state.metrics_collector.as_ref(),
+                &in_flight.request.metrics_round_id,
+                in_flight.metrics_started.as_ref(),
+                in_flight.metrics_terminal.as_ref(),
+                Utc::now(),
+                MetricsRoundStatus::Cancelled,
+                MetricsTokenUsage::default(),
+                Some("task evaluation cancelled".to_string()),
+            );
         }
         Err(error) => {
             tracing::warn!(
@@ -710,6 +852,16 @@ async fn poll_completed_task_evaluation(state: &mut LoopRunState) {
                 state.session_id,
                 in_flight.request.round_number,
                 error
+            );
+            record_task_evaluation_terminal_metrics(
+                state.metrics_collector.as_ref(),
+                &in_flight.request.metrics_round_id,
+                in_flight.metrics_started.as_ref(),
+                in_flight.metrics_terminal.as_ref(),
+                Utc::now(),
+                MetricsRoundStatus::Error,
+                MetricsTokenUsage::default(),
+                Some(format!("task evaluation join failed: {error}")),
             );
         }
     }
@@ -725,75 +877,107 @@ async fn apply_completed_task_evaluation(
         return;
     };
 
-    let apply_outcome = crate::runtime::runner::task_lifecycle::apply_task_evaluation_result(
-        &mut state.task_context,
-        session,
+    // Apply into staged clones first. An asynchronous evaluator only publishes
+    // its state after the durable Task generation compare-and-patch succeeds;
+    // a conflict must not leak stale changes into the live session or its next
+    // checkpoint.
+    let mut staged_task_context = state.task_context.clone();
+    let mut staged_session = session.clone();
+    let mut apply_outcome = crate::runtime::runner::task_lifecycle::apply_task_evaluation_result(
+        &mut staged_task_context,
+        &mut staged_session,
         &state.session_id,
         result.clone(),
     );
-
-    let synthetic_round_id = format!(
-        "{}-task-evaluation-round-{}",
-        state.session_id, result.round_number
-    );
-    crate::runtime::runner::metrics_lifecycle::record_round_started(
-        state.metrics_collector.as_ref(),
-        &synthetic_round_id,
-        &state.session_id,
-        result.model_name.as_str(),
-    );
-    crate::runtime::runner::metrics_lifecycle::record_round_completed(
-        state.metrics_collector.as_ref(),
-        &synthetic_round_id,
-        &state.session_id,
-        session.messages.len() as u32,
-        if apply_outcome.stale {
-            MetricsRoundStatus::Cancelled
-        } else {
-            MetricsRoundStatus::Success
-        },
-        apply_outcome.usage,
-        session
-            .token_usage
-            .as_ref()
-            .map(|usage| usage.prompt_cached_tool_outputs)
-            .unwrap_or(0)
-            .min(u32::MAX as usize) as u32,
-        session
-            .token_usage
-            .as_ref()
-            .map(|usage| usage.prompt_cached_tool_tokens_saved)
-            .unwrap_or(0),
-        None,
-    );
-
+    let mut persistence_error = None;
     if !apply_outcome.stale && apply_outcome.applied_updates > 0 {
-        if let Some(ref ctx) = state.task_context {
+        if let Some(ref ctx) = staged_task_context {
             let task_list_title = result
                 .task_list_title
+                .clone()
                 .or_else(|| {
-                    session
+                    staged_session
                         .task_list
                         .as_ref()
                         .map(|task_list| task_list.title.clone())
                 })
                 .unwrap_or_else(|| "Agent Tasks".to_string());
-            session.set_task_list_version_meta(ctx.version.to_string());
             let task_list = ctx.to_task_list_with_title(task_list_title);
-            session.set_task_list(task_list.clone());
-            crate::runtime::runner::tool_execution::persist_shared_task_list(
-                config,
-                session,
-                &result.shared_session_id,
-                &state.session_id,
-                &task_list,
-            )
-            .await;
-            let _ = event_tx
-                .send(AgentEvent::TaskListUpdated { task_list })
-                .await;
+            let new_version = ctx.version.to_string();
+            let expected_version = result.based_on_task_context_version.to_string();
+            let persisted = if let Some(persistence) = config.persistence.as_ref() {
+                match persistence
+                    .update_task_list_control_planes_if_version(
+                        &state.session_id,
+                        &result.shared_session_id,
+                        &expected_version,
+                        &result.based_on_task_list,
+                        &task_list,
+                        &new_version,
+                    )
+                    .await
+                {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        tracing::warn!(
+                            "[{}] Failed to compare-and-patch evaluated Task state on {}: {}",
+                            state.session_id,
+                            result.shared_session_id,
+                            error
+                        );
+                        persistence_error = Some(error.to_string());
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+
+            if persisted {
+                state.task_context = staged_task_context;
+                let event_version = new_version.parse::<u64>().ok();
+                session.set_task_list_version_meta(new_version);
+                session.set_task_list(task_list.clone());
+                let _ = event_tx
+                    .send(AgentEvent::TaskListUpdated {
+                        task_list,
+                        version: event_version,
+                    })
+                    .await;
+            } else {
+                apply_outcome.stale = true;
+                tracing::debug!(
+                    "[{}] Dropping evaluated Task update because durable generation {} no longer matches",
+                    state.session_id,
+                    expected_version
+                );
+            }
         }
     }
+
+    let (metrics_status, completed_at, metrics_error) = if let Some(error) = result.error.clone() {
+        (MetricsRoundStatus::Error, result.finished_at, Some(error))
+    } else if let Some(error) = persistence_error {
+        (MetricsRoundStatus::Error, Utc::now(), Some(error))
+    } else if apply_outcome.stale {
+        (
+            MetricsRoundStatus::Cancelled,
+            Utc::now(),
+            Some("stale task evaluation result".to_string()),
+        )
+    } else {
+        (MetricsRoundStatus::Success, result.finished_at, None)
+    };
+    record_task_evaluation_terminal_metrics(
+        state.metrics_collector.as_ref(),
+        &result.metrics_round_id,
+        result.metrics_started.as_ref(),
+        result.metrics_terminal.as_ref(),
+        completed_at,
+        metrics_status,
+        apply_outcome.usage,
+        metrics_error,
+    );
 }
 
 fn spawn_task_evaluation_request(
@@ -802,11 +986,17 @@ fn spawn_task_evaluation_request(
     request: crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     cancel_token: CancellationToken,
+    configured_limit: usize,
 ) {
     let task_round = request.round_number;
     let session_id = state.session_id.clone();
     let event_tx = event_tx.clone();
     let request_for_spawn = request.clone();
+    let metrics_collector = state.metrics_collector.clone();
+    let metrics_started = Arc::new(AtomicBool::new(false));
+    let metrics_terminal = Arc::new(AtomicBool::new(false));
+    let metrics_started_for_spawn = metrics_started.clone();
+    let metrics_terminal_for_spawn = metrics_terminal.clone();
     // Thread the run's cancel token into the detached eval so a cancelled run
     // drops the in-flight LLM request future at the first await point (`None`)
     // instead of running the evaluation — and its late `TaskListUpdated` event —
@@ -819,11 +1009,16 @@ fn spawn_task_evaluation_request(
                 request_for_spawn,
                 llm,
                 event_tx,
+                configured_limit,
+                metrics_collector,
+                metrics_started_for_spawn,
+                metrics_terminal_for_spawn,
             ) => Some(result),
         }
     });
 
     tracing::debug!(
+        evaluation_id = %request.evaluation_id,
         "[{}] Spawned async task evaluation for round {}",
         session_id,
         task_round
@@ -831,6 +1026,8 @@ fn spawn_task_evaluation_request(
 
     state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
         request,
+        metrics_started,
+        metrics_terminal,
         join_handle,
     });
 }
@@ -846,18 +1043,99 @@ async fn abort_in_flight_evaluations(
     event_tx: &mpsc::Sender<AgentEvent>,
     reason: &'static str,
 ) {
-    let task_was_running = state.task_evaluation.in_flight.is_some();
-    let task_generation = state
-        .task_evaluation
-        .in_flight
-        .as_ref()
-        .map(|in_flight| in_flight.request.based_on_task_context_version);
-    let gold_was_running = state.gold_evaluation.in_flight.is_some();
+    let mut task_was_cancelled = false;
+    let mut task_generation = None;
+    let mut gold_was_cancelled = false;
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
-        in_flight.join_handle.abort();
+        task_generation = Some(in_flight.request.based_on_task_context_version);
+        let was_finished = in_flight.join_handle.is_finished();
+        if !was_finished {
+            in_flight.join_handle.abort();
+        }
+        let metrics_round_id = in_flight.request.metrics_round_id.clone();
+        let metrics_started = in_flight.metrics_started.clone();
+        let metrics_terminal = in_flight.metrics_terminal.clone();
+        // Awaiting a handle that was already finished is an immediate harvest,
+        // not a provider drain. For an active handle this wait only lets Tokio
+        // observe the abort. In either case the actual join outcome wins the
+        // is_finished/abort race: a completed result must never be rewritten as
+        // Cancelled or followed by a duplicate cancellation event.
+        match in_flight.join_handle.await {
+            Ok(Some(result)) => {
+                record_harvested_task_evaluation_metrics(state.metrics_collector.as_ref(), &result);
+            }
+            Ok(None) => {
+                task_was_cancelled = true;
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Cancelled,
+                    MetricsTokenUsage::default(),
+                    Some(reason.to_string()),
+                );
+            }
+            Err(error) if error.is_cancelled() => {
+                task_was_cancelled = true;
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Cancelled,
+                    MetricsTokenUsage::default(),
+                    Some(reason.to_string()),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Async task evaluation join failed during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+                record_task_evaluation_terminal_metrics(
+                    state.metrics_collector.as_ref(),
+                    &metrics_round_id,
+                    metrics_started.as_ref(),
+                    metrics_terminal.as_ref(),
+                    Utc::now(),
+                    MetricsRoundStatus::Error,
+                    MetricsTokenUsage::default(),
+                    Some(format!("task evaluation join failed: {error}")),
+                );
+                // A panic/failure is harvested as Error and must not receive a
+                // fabricated cancellation lifecycle event.
+            }
+        }
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
-        in_flight.join_handle.abort();
+        let was_finished = in_flight.join_handle.is_finished();
+        if !was_finished {
+            in_flight.join_handle.abort();
+        }
+        // As with Task evaluation, the join result is authoritative when abort
+        // races natural completion. A finished Gold evaluator has already
+        // emitted GoldEvaluationCompleted and must not receive a contradictory
+        // cancellation lifecycle event during run cleanup.
+        match in_flight.join_handle.await {
+            Ok(Some(_result)) => {}
+            Ok(None) => gold_was_cancelled = true,
+            Err(error) if error.is_cancelled() => gold_was_cancelled = true,
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Async Gold evaluation join failed during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+                // A panic/failure is terminal in its own right; its actual join
+                // outcome must never be rewritten as cancellation.
+            }
+        }
     }
     // Queued snapshots belong to this run. A later run rebuilds an evaluation
     // request from the current task-list generation instead of replaying stale
@@ -868,7 +1146,7 @@ async fn abort_in_flight_evaluations(
     // A Started event may already be visible to clients. Always close that
     // lifecycle explicitly so a reconnecting/current UI never remains stuck in
     // "evaluating" after the owning run has reached a terminal/suspended state.
-    if task_was_running {
+    if task_was_cancelled {
         let _ = event_tx
             .send(AgentEvent::TaskEvaluationCancelled {
                 session_id: state.session_id.clone(),
@@ -877,7 +1155,7 @@ async fn abort_in_flight_evaluations(
             })
             .await;
     }
-    if gold_was_running {
+    if gold_was_cancelled {
         let _ = event_tx
             .send(AgentEvent::GoldEvaluationCancelled {
                 session_id: state.session_id.clone(),
@@ -944,7 +1222,14 @@ fn spawn_task_evaluation_if_needed(
         return Ok(());
     }
 
-    spawn_task_evaluation_request(state, event_tx, request, llm, cancel_token);
+    spawn_task_evaluation_request(
+        state,
+        event_tx,
+        request,
+        llm,
+        cancel_token,
+        config.auxiliary_evaluation_max_concurrency,
+    );
     Ok(())
 }
 
@@ -1527,6 +1812,35 @@ pub(super) async fn run_pipeline(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
+    let result =
+        run_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+
+    // This outer lifecycle fence deliberately catches every return from the
+    // implementation below, including `?` from prompt refresh and hook paths.
+    // The inner explicit calls remain useful for precise UI reasons and make
+    // this final pass idempotent.
+    let reason = if cancel_token.is_cancelled() {
+        "run_cancelled"
+    } else if result.is_err() {
+        "run_failed"
+    } else if session.metadata.contains_key("runtime.suspend_reason") {
+        "run_suspended"
+    } else {
+        "run_completed"
+    };
+    abort_in_flight_evaluations(state, event_tx, reason).await;
+    result
+}
+
+async fn run_pipeline_inner(
+    session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    llm: Arc<dyn LLMProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    cancel_token: &CancellationToken,
+    config: &AgentLoopConfig,
+    state: &mut LoopRunState,
+) -> super::super::Result<bool> {
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -1563,6 +1877,7 @@ pub(super) async fn run_pipeline(
                     request,
                     eval_provider,
                     cancel_token.clone(),
+                    config.auxiliary_evaluation_max_concurrency,
                 );
             }
         }
@@ -1577,11 +1892,16 @@ pub(super) async fn run_pipeline(
                 .clone()
                 .unwrap_or_else(|| llm.clone()),
             cancel_token.clone(),
+            config.auxiliary_evaluation_max_concurrency,
         );
 
         state.runtime_state.round.current_round = turn_counter;
 
-        let round_id = format!("{}-round-{}", state.session_id, turn_counter + 1);
+        let round_id = crate::runtime::runner::round_prelude::build_round_id(
+            &state.session_id,
+            &state.execution_id,
+            turn_counter as usize,
+        );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
 
         if config
@@ -1726,11 +2046,11 @@ pub(super) async fn run_pipeline(
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
         let mut terminal_error: Option<AgentError> = None;
+        let mut hook_suspension: Option<AgentError> = None;
 
-        // Actual (provider-reported) usage + activity for THIS round for the
-        // per-run budget guardrails (issue #221) — real numbers, not the
-        // heuristic `round_usage` estimate used for metrics. Reset every
-        // round; accumulated across the retry attempts below (see
+        // Canonical usage + activity for THIS round, shared by runtime budget
+        // totals and durable metrics. Reset every round; accumulated across
+        // the retry attempts below (see
         // `RoundActivity` for why it must sum, never overwrite); an attempt
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
@@ -1794,16 +2114,11 @@ pub(super) async fn run_pipeline(
                             {
                                 Ok(recovered) => recovered,
                                 Err(error) => {
-                                    // Early exit before the post-loop drain — abort
-                                    // any in-flight eval so it does not detach and
-                                    // keep spending (issue #347).
-                                    abort_in_flight_evaluations(
-                                        state,
-                                        event_tx,
-                                        "terminal_error",
-                                    )
-                                    .await;
-                                    return Err(error);
+                                    // Route through the shared terminal path so
+                                    // any earlier billed retry attempt is retained
+                                    // in both runtime and durable usage.
+                                    terminal_error = Some(error);
+                                    break;
                                 }
                             };
                         if recovered {
@@ -1898,7 +2213,11 @@ pub(super) async fn run_pipeline(
             let stream_output = llm_output.stream_output;
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
-            round_activity.absorb_attempt(&stream_output);
+            round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
+            if let Some(error) = llm_output.terminal_validation_error {
+                terminal_error = Some(error);
+                break;
+            }
             let activation_attempt =
                 match validate_explicit_activation_first_step(session, &stream_output.tool_calls) {
                     Ok(attempt) => attempt,
@@ -1947,28 +2266,44 @@ pub(super) async fn run_pipeline(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
-                turn_outcome = Some(
-                    handle_no_tool_calls(
-                        stream_output.content,
-                        reasoning,
-                        reasoning_signature,
-                        llm_output.prompt_tokens,
-                        llm_output.completion_tokens,
-                        llm_output.round_usage,
-                        session,
-                        &mut state.runtime_state,
-                        event_tx,
-                        state.metrics_collector.as_ref(),
-                        &round_id,
-                        &state.session_id,
-                        config,
-                        &state.task_context,
-                        &eval_model,
-                        turn_counter + 1,
-                        llm.clone(),
-                    )
-                    .await?,
-                );
+                match handle_no_tool_calls(
+                    stream_output.content,
+                    reasoning,
+                    reasoning_signature,
+                    llm_output.prompt_tokens,
+                    llm_output.completion_tokens,
+                    round_activity.token_usage(),
+                    session,
+                    &mut state.runtime_state,
+                    event_tx,
+                    state.metrics_collector.as_ref(),
+                    &round_id,
+                    &state.session_id,
+                    config,
+                    &state.task_context,
+                    &eval_model,
+                    turn_counter + 1,
+                    llm.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) => turn_outcome = Some(outcome),
+                    Err(error) if error.is_hook_suspended() => {
+                        // Preserve the control-flow contract consumed by the
+                        // outer loop finalizer. The provider round itself
+                        // completed successfully, so retain its usage without
+                        // misclassifying the intentional suspension as Error.
+                        record_no_tool_calls_round_completed(
+                            state.metrics_collector.as_ref(),
+                            &round_id,
+                            &state.session_id,
+                            session,
+                            round_activity.token_usage(),
+                        );
+                        hook_suspension = Some(error);
+                    }
+                    Err(error) => terminal_error = Some(error),
+                }
                 break;
             }
 
@@ -1984,19 +2319,29 @@ pub(super) async fn run_pipeline(
                 tools: &tools,
             };
 
-            match handle_tool_calls_path(
-                &frame,
-                stream_output,
-                llm_output.round_usage,
-                session,
-                &mut state.runtime_state,
-                &state.auxiliary_models,
-                &state.model_name,
-                &mut state.task_context,
-                cancel_token,
-            )
-            .await
-            {
+            #[cfg(test)]
+            let injected_handler_error = take_test_post_llm_retry_failure(session);
+            #[cfg(not(test))]
+            let injected_handler_error: Option<AgentError> = None;
+            let handler_result = match injected_handler_error {
+                Some(error) => Err(error),
+                None => {
+                    handle_tool_calls_path(
+                        &frame,
+                        stream_output,
+                        round_activity.token_usage(),
+                        session,
+                        &mut state.runtime_state,
+                        &state.auxiliary_models,
+                        &state.model_name,
+                        &mut state.task_context,
+                        cancel_token,
+                    )
+                    .await
+                }
+            };
+
+            match handler_result {
                 Ok(outcome) => {
                     if let Some(attempt) = activation_attempt.as_ref() {
                         if !outcome.should_break {
@@ -2045,13 +2390,27 @@ pub(super) async fn run_pipeline(
             }
         }
 
+        // Commit once for every exit from the attempt loop. In particular, a
+        // terminal validation/post-LLM failure must retain the same accumulated
+        // usage that its durable round record receives below.
+        round_activity.commit_to_runtime(&mut state.runtime_state);
+
+        if let Some(error) = hook_suspension {
+            return Err(error);
+        }
+
         // --- Handle terminal error ---
         if let Some(error) = terminal_error {
+            // Terminal activations skip normal finalization, so mirror the
+            // just-committed runtime usage onto the Session before the outer
+            // execute boundary checkpoints it.
+            state_bridge::write_runtime_state(session, &state.runtime_state);
             record_turn_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,
                 &state.session_id,
                 session.messages.len() as u32,
+                round_activity.token_usage(),
                 &error,
             );
             // Early exit before the post-loop drain — abort in-flight evals so a
@@ -2066,11 +2425,13 @@ pub(super) async fn run_pipeline(
                 state.session_id,
                 turn_counter + 1
             ));
+            state_bridge::write_runtime_state(session, &state.runtime_state);
             record_turn_failure(
                 state.metrics_collector.as_ref(),
                 &round_id,
                 &state.session_id,
                 session.messages.len() as u32,
+                round_activity.token_usage(),
                 &error,
             );
             // Early exit before the post-loop drain — abort in-flight evals (#347).
@@ -2240,32 +2601,6 @@ pub(super) async fn run_pipeline(
             }
             _ => {}
         }
-
-        // Accumulate this round's actual usage/activity into the run-level
-        // totals BEFORE persisting the runtime state snapshot below, so the
-        // per-run budget guardrails (issue #221) — checked further down — see
-        // up-to-date numbers, and a resumed/inspected session's runtime state
-        // reflects them immediately.
-        state.runtime_state.round.total_prompt_tokens = state
-            .runtime_state
-            .round
-            .total_prompt_tokens
-            .saturating_add(round_activity.prompt_tokens);
-        state.runtime_state.round.total_completion_tokens = state
-            .runtime_state
-            .round
-            .total_completion_tokens
-            .saturating_add(round_activity.completion_tokens);
-        state.runtime_state.round.total_tool_calls = state
-            .runtime_state
-            .round
-            .total_tool_calls
-            .saturating_add(round_activity.tool_call_count);
-        state.runtime_state.round.total_subagents_spawned = state
-            .runtime_state
-            .round
-            .total_subagents_spawned
-            .saturating_add(round_activity.subagent_spawn_count);
 
         if !config.hook_runner.is_empty() {
             crate::runtime::hooks::merge_session_hook_checkpoints(
@@ -2542,7 +2877,7 @@ fn heuristic_complexity(
 
 #[cfg(test)]
 mod tests {
-    use super::super::startup::OverflowRecoveryState;
+    use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, build_guardian_review_prompt,
         check_run_budget_exceeded, is_overflow_recoverable, is_subagent_create_call,
@@ -2560,13 +2895,16 @@ mod tests {
     };
     use crate::runtime::runner::state_bridge;
     use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::{AgentError, AgentEvent, AgentHook, Message, Session};
+    use bamboo_agent_core::{
+        AgentError, AgentEvent, AgentHook, Message, Session, StreamTimeoutError, StreamTimeoutPhase,
+    };
     use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
         TokenUsage as MetricsTokenUsage,
     };
+    use chrono::Utc;
     use futures::stream;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -3648,6 +3986,7 @@ mod tests {
         };
         LoopRunState {
             session_id: session_id.to_string(),
+            execution_id: "test-execution".to_string(),
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -3962,6 +4301,753 @@ mod tests {
         }
     }
 
+    /// One completed provider stream whose authoritative usage deliberately
+    /// differs from the local tokenizer estimate. `content=None` produces the
+    /// billed empty-response validation failure path.
+    struct CanonicalUsageProvider {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        content: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CanonicalUsageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let mut chunks = vec![
+                Ok(LLMChunk::ProviderUsage {
+                    input_tokens: Some(self.prompt_tokens),
+                    output_tokens: Some(self.completion_tokens),
+                    // Deliberately inconsistent: canonical totals are derived
+                    // from the selected components, not this wire convenience.
+                    total_tokens: Some(9_999),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                }),
+                Ok(LLMChunk::ResponseId("canonical-usage-response".to_string())),
+            ];
+            if let Some(content) = self.content {
+                chunks.push(Ok(LLMChunk::Token(content.to_string())));
+            }
+            chunks.push(Ok(LLMChunk::Done));
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct IntentionalFinalizeSuspendHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for IntentionalFinalizeSuspendHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Suspend {
+                reason: "wait for external approval".to_string(),
+            }
+        }
+    }
+
+    struct AbortFinalizeHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for AbortFinalizeHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeFinalize
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Abort {
+                reason: "injected terminal policy failure".to_string(),
+            }
+        }
+    }
+
+    struct BilledRetryProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BilledRetryProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let usage = match attempt {
+                0 => LLMChunk::ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(3),
+                    total_tokens: Some(13),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                1 => LLMChunk::ProviderUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(5),
+                    total_tokens: Some(25),
+                    reasoning_tokens: None,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                },
+                other => panic!("unexpected provider attempt {other}"),
+            };
+            let mut chunks = vec![Ok(usage)];
+            if attempt == 0 {
+                chunks.push(Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: "retry-tool-attempt-1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "noop".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                ])));
+            } else {
+                chunks.push(Ok(LLMChunk::Token(
+                    "second billed attempt completed".to_string(),
+                )));
+            }
+            chunks.push(Ok(LLMChunk::Done));
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct FailBeforeUsageProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for FailBeforeUsageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api(
+                "authentication error before a stream was created".to_string(),
+            ))
+        }
+    }
+
+    async fn create_pipeline_metrics() -> (
+        tempfile::TempDir,
+        bamboo_metrics::MetricsCollector,
+        Arc<bamboo_metrics::SqliteMetricsStorage>,
+    ) {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let dir = tempfile::tempdir().expect("temp metrics dir");
+        let storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            dir.path().join("metrics.db"),
+        ));
+        storage.init().await.expect("init metrics storage");
+        let collector = bamboo_metrics::MetricsCollector::spawn(storage.clone(), 7);
+        (dir, collector, storage)
+    }
+
+    struct DelayedTaskMetricsProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        windows: std::sync::Mutex<Vec<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for DelayedTaskMetricsProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let started = Utc::now();
+            tokio::time::sleep(if call == 0 {
+                Duration::from_millis(60)
+            } else {
+                Duration::from_millis(150)
+            })
+            .await;
+            let completed = Utc::now();
+            self.windows
+                .lock()
+                .expect("metrics windows lock")
+                .push((started, completed));
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_task_evaluation_rounds_use_distinct_rows_and_dispatch_durations() {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let session_id = "task-evaluation-metrics-repeated-activation";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        let base = chrono::Utc::now();
+        collector.session_started(session_id, "model", base);
+
+        let mut session = Session::new(session_id, "model");
+        session.set_task_list(bamboo_domain::TaskList {
+            session_id: session_id.to_string(),
+            title: "Metrics task".to_string(),
+            items: vec![bamboo_domain::TaskItem {
+                id: "task-1".to_string(),
+                description: "measure evaluator".to_string(),
+                status: bamboo_domain::TaskItemStatus::InProgress,
+                ..bamboo_domain::TaskItem::default()
+            }],
+            created_at: base,
+            updated_at: base,
+        });
+        session.set_task_list_version_meta("1");
+        let task_context = crate::runtime::task_context::TaskLoopContext::from_session(&session);
+        let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+            bamboo_config::StreamTimeoutConfig::default(),
+            Some("provider"),
+            Some("fast-model"),
+        );
+        let provider = Arc::new(DelayedTaskMetricsProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            windows: std::sync::Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+        let mut metric_ids = Vec::new();
+
+        // Two real loop activations reuse the same session id and round number.
+        // Each executes through budget admission, the provider-dispatch metric
+        // callback, result.finished_at, and the normal apply terminal path.
+        for activation in 0..2 {
+            let request =
+                crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+                    &task_context,
+                    &session,
+                    session_id,
+                    1,
+                    Some("fast-model"),
+                    None,
+                    timeout_context.clone(),
+                )
+                .expect("activation request")
+                .expect("task context exists");
+            let request_id = request.evaluation_id.clone();
+            let result = crate::runtime::runner::task_lifecycle::execute_async_task_evaluation(
+                request,
+                llm.clone(),
+                event_tx.clone(),
+                1,
+                Some(collector.clone()),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+            assert!(result.metrics_started.load(Ordering::Acquire));
+            metric_ids.push((request_id, result.metrics_round_id.clone()));
+
+            let mut activation_state = e2e_loop_state(session_id);
+            activation_state.execution_id = format!("activation-{activation}");
+            activation_state.task_context = task_context.clone();
+            activation_state.metrics_collector = Some(collector.clone());
+            activation_state.task_evaluation.completed = Some(result);
+            super::apply_completed_task_evaluation(
+                &mut session,
+                &event_tx,
+                &AgentLoopConfig::default(),
+                &mut activation_state,
+            )
+            .await;
+        }
+        assert_ne!(metric_ids[0].0, metric_ids[1].0);
+        assert_ne!(metric_ids[0].1, metric_ids[1].1);
+
+        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = storage
+                    .session_detail(session_id)
+                    .await
+                    .expect("session metrics query")
+                {
+                    if detail.rounds.len() == 2
+                        && detail
+                            .rounds
+                            .iter()
+                            .all(|round| round.completed_at.is_some())
+                    {
+                        break detail;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("two evaluator metric rows are persisted");
+        let first_row = detail
+            .rounds
+            .iter()
+            .find(|row| row.round_id == metric_ids[0].1)
+            .expect("first activation row");
+        let second_row = detail
+            .rounds
+            .iter()
+            .find(|row| row.round_id == metric_ids[1].1)
+            .expect("second activation row");
+        let windows = provider.windows.lock().expect("metrics windows lock");
+        assert_eq!(windows.len(), 2);
+        for (row, (provider_started, provider_completed)) in
+            [(first_row, windows[0]), (second_row, windows[1])]
+        {
+            assert!(row.started_at <= provider_started);
+            assert!(
+                provider_started - row.started_at < chrono::Duration::milliseconds(50),
+                "metric start must be adjacent to real provider dispatch"
+            );
+            let completed_at = row.completed_at.expect("terminal timestamp");
+            assert!(completed_at >= provider_completed);
+            assert!(
+                completed_at - provider_completed < chrono::Duration::milliseconds(50),
+                "metric completion must use the evaluator's real finish"
+            );
+        }
+        assert!(first_row.duration_ms.is_some_and(|duration| duration >= 60));
+        assert!(second_row
+            .duration_ms
+            .is_some_and(|duration| duration >= 150));
+        assert!(second_row.duration_ms.unwrap() > first_row.duration_ms.unwrap() + 50);
+    }
+
+    async fn wait_for_pipeline_metrics(
+        storage: &bamboo_metrics::SqliteMetricsStorage,
+        session_id: &str,
+        expected_status: MetricsRoundStatus,
+        expected_usage: MetricsTokenUsage,
+    ) -> bamboo_metrics::types::SessionDetail {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        for _ in 0..100 {
+            if let Some(detail) = storage
+                .session_detail(session_id)
+                .await
+                .expect("session detail query")
+            {
+                if detail.rounds.first().is_some_and(|round| {
+                    round.status == expected_status && round.token_usage == expected_usage
+                }) && detail.session.total_token_usage == expected_usage
+                {
+                    return detail;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "session {session_id} did not persist a {expected_status:?} round with usage {expected_usage:?}"
+        );
+    }
+
+    fn canonical_usage_pipeline_config() -> AgentLoopConfig {
+        use crate::runtime::config::PromptMemoryFlags;
+
+        AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..AgentLoopConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_success_clamps_overflow_and_reconciles_runtime_round_and_session() {
+        let session_id = "canonical-success";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user(
+            "provider reports values beyond the durable signed range",
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX,
+            content: Some("provider-backed answer"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect("successful pipeline");
+        drop(tx);
+        drain(&mut rx).await;
+
+        let max = bamboo_domain::MAX_DURABLE_TOKEN_COUNT;
+        let expected = MetricsTokenUsage {
+            prompt_tokens: max,
+            completion_tokens: max,
+            total_tokens: max,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, max);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, max);
+    }
+
+    #[tokio::test]
+    async fn pipeline_billed_retry_attempts_persist_exactly_once_across_all_consumers() {
+        let session_id = "canonical-billed-retry";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("retry after post-LLM handler failure"));
+        session.metadata.insert(
+            super::TEST_POST_LLM_RETRY_FAILURES_KEY.to_string(),
+            "1".to_string(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let provider = Arc::new(BilledRetryProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect("second billed attempt completes the same round");
+        drop(tx);
+        drain(&mut rx).await;
+
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one completed attempt fails in post-LLM handling and exactly one retry is billed"
+        );
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 8,
+            total_tokens: 38,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1, "both attempts belong to one round");
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 30);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn pipeline_terminal_validation_retains_billed_usage_in_runtime_and_metrics() {
+        let session_id = "canonical-terminal";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("returning no answer is terminal"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            content: None,
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect_err("empty assistant response is terminal");
+        assert!(matches!(error, AgentError::EmptyAssistantResponse { .. }));
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            total_tokens: 38,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 31);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 7);
+        let persisted_runtime = session
+            .agent_runtime_state
+            .as_ref()
+            .expect("terminal runtime state mirrored to session");
+        assert_eq!(persisted_runtime.round.total_prompt_tokens, 31);
+        assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn pipeline_post_llm_hook_abort_retains_usage_in_terminal_metrics_and_runtime() {
+        let session_id = "canonical-post-llm-abort";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("abort only after the stream completes"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 23,
+            completion_tokens: 6,
+            content: Some("completed provider response"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+        let mut config = canonical_usage_pipeline_config();
+        let mut hook_runner = crate::runtime::hooks::HookRunner::new();
+        hook_runner.register(Arc::new(AbortFinalizeHook));
+        config.hook_runner = Arc::new(hook_runner);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("finalize hook aborts after the completed stream");
+        assert!(matches!(error, AgentError::Tool(message) if message.contains("hook aborted")));
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 23,
+            completion_tokens: 6,
+            total_tokens: 29,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 23);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn pipeline_hook_suspension_keeps_success_usage_without_error_status() {
+        let session_id = "canonical-hook-suspend";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("pause before finalizing"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(CanonicalUsageProvider {
+            prompt_tokens: 19,
+            completion_tokens: 4,
+            content: Some("ready, pending approval"),
+        });
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+        let mut config = canonical_usage_pipeline_config();
+        let mut hook_runner = crate::runtime::hooks::HookRunner::new();
+        hook_runner.register(Arc::new(IntentionalFinalizeSuspendHook));
+        config.hook_runner = Arc::new(hook_runner);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &tx,
+            llm,
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("hook suspension remains a control-flow signal");
+        assert!(error.is_hook_suspended());
+        drop(tx);
+        drain(&mut rx).await;
+
+        let expected = MetricsTokenUsage {
+            prompt_tokens: 19,
+            completion_tokens: 4,
+            total_tokens: 23,
+        };
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Success,
+            expected,
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, expected);
+        assert_eq!(detail.session.total_token_usage, expected);
+        assert_eq!(
+            detail.session.status,
+            MetricsSessionStatus::Running,
+            "the outer finalizer, not terminal-error metrics, owns suspension status"
+        );
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 19);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn pipeline_failure_before_provider_usage_remains_zero_everywhere() {
+        let session_id = "canonical-pre-stream-error";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        crate::runtime::runner::metrics_lifecycle::record_session_started(
+            Some(&collector),
+            session_id,
+            "model",
+            chrono::Utc::now(),
+            1,
+        );
+
+        let mut session = Session::new(session_id, "model");
+        session.add_message(Message::user("this request fails before streaming"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let mut state = e2e_loop_state(session_id);
+        state.metrics_collector = Some(collector);
+
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(FailBeforeUsageProvider),
+            tools,
+            &tokio_util::sync::CancellationToken::new(),
+            &canonical_usage_pipeline_config(),
+            &mut state,
+        )
+        .await
+        .expect_err("provider authentication error is terminal");
+        drop(tx);
+        drain(&mut rx).await;
+
+        let detail = wait_for_pipeline_metrics(
+            storage.as_ref(),
+            session_id,
+            MetricsRoundStatus::Error,
+            MetricsTokenUsage::default(),
+        )
+        .await;
+        assert_eq!(detail.rounds[0].token_usage, MetricsTokenUsage::default());
+        assert_eq!(
+            detail.session.total_token_usage,
+            MetricsTokenUsage::default()
+        );
+        assert_eq!(state.runtime_state.round.total_prompt_tokens, 0);
+        assert_eq!(state.runtime_state.round.total_completion_tokens, 0);
+    }
+
     #[tokio::test]
     async fn run_budget_token_limit_stops_run_gracefully() {
         use crate::runtime::config::PromptMemoryFlags;
@@ -4265,7 +5351,10 @@ mod tests {
         let mut activity = super::RoundActivity::default();
 
         // Attempt 1: billed 100 in / 50 out, one Bash + one SubAgent create.
-        activity.absorb_attempt(&attempt(100, 50, vec!["Bash", "SubAgent"]));
+        let attempt_1 = attempt(100, 50, vec!["Bash", "SubAgent"]);
+        let attempt_1_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&attempt_1, 999, 999);
+        activity.absorb_attempt(&attempt_1, attempt_1_usage);
         assert_eq!(activity.prompt_tokens, 100);
         assert_eq!(activity.completion_tokens, 50);
         assert_eq!(activity.tool_call_count, 2);
@@ -4273,19 +5362,43 @@ mod tests {
 
         // Post-LLM handling fails retryably; attempt 2 is billed too. Totals
         // must be the SUM of both attempts, not attempt 2's numbers alone.
-        activity.absorb_attempt(&attempt(120, 30, vec!["Bash"]));
+        let attempt_2 = attempt(120, 30, vec!["Bash"]);
+        let attempt_2_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&attempt_2, 999, 999);
+        activity.absorb_attempt(&attempt_2, attempt_2_usage);
         assert_eq!(
             activity.prompt_tokens, 220,
             "attempt 1's billed prompt tokens must not be dropped on retry"
         );
         assert_eq!(activity.completion_tokens, 80);
+        assert_eq!(
+            activity.token_usage(),
+            MetricsTokenUsage {
+                prompt_tokens: 220,
+                completion_tokens: 80,
+                total_tokens: 300,
+            },
+            "durable usage must contain every billed retry attempt exactly once"
+        );
         assert_eq!(activity.tool_call_count, 3);
         assert_eq!(activity.subagent_spawn_count, 1);
 
         // Saturates rather than wrapping on absurd totals.
-        activity.absorb_attempt(&attempt(u64::MAX, u64::MAX, vec![]));
-        assert_eq!(activity.prompt_tokens, u64::MAX);
-        assert_eq!(activity.completion_tokens, u64::MAX);
+        let saturating_attempt = attempt(u64::MAX, u64::MAX, vec![]);
+        let saturating_usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(
+            &saturating_attempt,
+            1,
+            1,
+        );
+        activity.absorb_attempt(&saturating_attempt, saturating_usage);
+        assert_eq!(
+            activity.prompt_tokens,
+            bamboo_domain::MAX_DURABLE_TOKEN_COUNT
+        );
+        assert_eq!(
+            activity.completion_tokens,
+            bamboo_domain::MAX_DURABLE_TOKEN_COUNT
+        );
     }
 
     #[test]
@@ -4318,7 +5431,8 @@ mod tests {
         };
 
         let mut activity = super::RoundActivity::default();
-        activity.absorb_attempt(&output);
+        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 7, 9);
+        activity.absorb_attempt(&output, usage);
 
         assert_eq!(activity.prompt_tokens, 1000);
         assert_eq!(
@@ -4332,10 +5446,50 @@ mod tests {
             .expect("provider usage")
             .output_tokens = Some(0);
         let mut zero_activity = super::RoundActivity::default();
-        zero_activity.absorb_attempt(&output);
+        let zero_usage =
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 7, 9);
+        zero_activity.absorb_attempt(&output, zero_usage);
         assert_eq!(
             zero_activity.completion_tokens, 0,
             "explicit provider zero must beat a nonzero legacy flat value"
+        );
+    }
+
+    #[test]
+    fn canonical_attempt_usage_falls_back_per_component_only_when_unreported() {
+        use crate::runtime::stream::handler::{ProviderUsageSnapshot, StreamHandlingOutput};
+
+        let output = StreamHandlingOutput {
+            response_id: None,
+            content: "answer".to_string(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 6,
+            tool_calls: Vec::new(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: Some(ProviderUsageSnapshot {
+                input_tokens: Some(41),
+                output_tokens: None,
+                total_tokens: Some(999),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }),
+            input_tokens: 0,
+        };
+
+        assert_eq!(
+            crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 3, 5),
+            MetricsTokenUsage {
+                prompt_tokens: 41,
+                completion_tokens: 5,
+                total_tokens: 46,
+            },
+            "reported prompt wins, missing completion estimates, and provider total is not trusted"
         );
     }
 
@@ -4553,6 +5707,42 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct EvaluationCasPersistence {
+        full_saves: std::sync::atomic::AtomicUsize,
+        control_plane_saves: std::sync::atomic::AtomicUsize,
+        paired_task_patches: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for EvaluationCasPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            self.full_saves.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn save_runtime_control_plane(&self, _session: &mut Session) -> std::io::Result<()> {
+            self.control_plane_saves.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn update_task_list_control_planes_if_version(
+            &self,
+            session_id: &str,
+            shared_session_id: &str,
+            expected_version: &str,
+            _expected_task_list: &bamboo_domain::TaskList,
+            _task_list: &bamboo_domain::TaskList,
+            version: &str,
+        ) -> std::io::Result<bool> {
+            assert_eq!(session_id, shared_session_id);
+            assert_eq!(expected_version, "1");
+            assert!(version.parse::<u64>().expect("numeric version") > 1);
+            self.paired_task_patches.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
     #[tokio::test]
     async fn pending_injected_messages_are_merged_once_and_cleared_from_storage() {
         let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
@@ -4679,9 +5869,42 @@ mod tests {
         assert!(!should_retry_turn_error(&AgentError::Budget(
             "budget exceeded".to_string(),
         )));
-        assert!(!should_retry_turn_error(&AgentError::StreamTimeout(
-            "semantic_output_started=true, retry_safe=false".to_string(),
-        )));
+    }
+
+    #[test]
+    fn retries_only_structurally_safe_stream_timeouts() {
+        let retry_safe = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            None,
+            true,
+        ));
+        assert!(should_retry_turn_error(&retry_safe));
+
+        let partial_output = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::TransportIdle,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            Some(Duration::from_secs(120)),
+            true,
+        ));
+        assert!(!should_retry_turn_error(&partial_output));
+
+        let auxiliary_timeout = AgentError::StreamTimeout(StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            Some("provider".to_string()),
+            Some("model".to_string()),
+            Duration::from_secs(120),
+            None,
+            false,
+        ));
+        assert!(!should_retry_turn_error(&auxiliary_timeout));
     }
 
     #[test]
@@ -4850,9 +6073,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_completed_task_evaluation_updates_task_list_and_emits_event() {
-        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
-        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
-            Arc::new(TestPersistence(storage.clone()));
+        let persistence = Arc::new(EvaluationCasPersistence::default());
         let mut session = Session::new("session-task-eval", "model");
         session.set_task_list(bamboo_domain::TaskList {
             session_id: "session-task-eval".to_string(),
@@ -4869,9 +6090,11 @@ mod tests {
         session
             .metadata
             .insert("task_list_version".to_string(), "1".to_string());
+        let based_on_task_list = session.task_list.clone().expect("task list");
 
         let mut state = super::super::startup::LoopRunState {
             session_id: "session-task-eval".to_string(),
+            execution_id: "task-eval-execution".to_string(),
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -4881,11 +6104,12 @@ mod tests {
                 in_flight: None,
                 completed: Some(
                     crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult {
+                        metrics_round_id: "session-task-eval-task-evaluation-test".to_string(),
                         shared_session_id: "session-task-eval".to_string(),
                         round_number: 1,
                         based_on_task_context_version: 1,
+                        based_on_task_list,
                         task_list_title: Some("Eval Tasks".to_string()),
-                        model_name: "fast-model".to_string(),
                         evaluation_result: crate::runtime::task_evaluation::TaskEvaluationResult {
                             needs_evaluation: true,
                             updates: vec![crate::runtime::task_evaluation::TaskItemUpdate {
@@ -4900,6 +6124,14 @@ mod tests {
                             prompt_tokens: 4,
                             completion_tokens: 2,
                         },
+                        finished_at: chrono::Utc::now(),
+                        error: None,
+                        metrics_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            true,
+                        )),
+                        metrics_terminal: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                            false,
+                        )),
                     },
                 ),
                 queued_request: None,
@@ -4909,8 +6141,7 @@ mod tests {
             runtime_state: AgentRuntimeState::new("session-task-eval"),
         };
         let config = crate::runtime::config::AgentLoopConfig {
-            storage: Some(storage.clone()),
-            persistence: Some(persistence),
+            persistence: Some(persistence.clone()),
             ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -4926,7 +6157,7 @@ mod tests {
             .await
             .expect("task update event should be emitted");
         match event {
-            AgentEvent::TaskListUpdated { task_list } => {
+            AgentEvent::TaskListUpdated { task_list, .. } => {
                 assert_eq!(
                     task_list.items[0].status,
                     bamboo_domain::TaskItemStatus::Completed
@@ -4934,17 +6165,60 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        assert_eq!(
+            persistence.paired_task_patches.load(Ordering::SeqCst),
+            1,
+            "evaluation must persist exactly one targeted Task CAS"
+        );
+        assert_eq!(persistence.full_saves.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            persistence.control_plane_saves.load(Ordering::SeqCst),
+            0,
+            "evaluation must not add a child/root whole control-plane save"
+        );
     }
 
     // --- Tests from round_prelude/round_state.rs ---
 
     #[test]
     fn test_build_round_id() {
-        let id = format!("{}-round-{}", "session-123", 1);
-        assert_eq!(id, "session-123-round-1");
+        let id =
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-a", 0);
+        assert_eq!(id, "session-123-run-execution-a-round-1");
 
-        let id = format!("{}-round-{}", "test", 4 + 1);
-        assert_eq!(id, "test-round-5");
+        let id = crate::runtime::runner::round_prelude::build_round_id("test", "execution-b", 4);
+        assert_eq!(id, "test-run-execution-b-round-5");
+
+        assert_ne!(
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-a", 0,),
+            crate::runtime::runner::round_prelude::build_round_id("session-123", "execution-b", 0,),
+            "the per-run round counter may reset, but the execution namespace must not"
+        );
+
+        let task_a = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-a",
+            "task-evaluation",
+            1,
+        );
+        let task_b = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-b",
+            "task-evaluation",
+            1,
+        );
+        let gold_a = crate::runtime::runner::round_prelude::build_auxiliary_round_id(
+            "session-123",
+            "execution-a",
+            "gold-evaluation",
+            1,
+        );
+        assert_eq!(
+            task_a,
+            "session-123-run-execution-a-task-evaluation-round-1"
+        );
+        assert_ne!(task_a, task_b);
+        assert_ne!(task_a, gold_a);
     }
 
     // --- Tests from round_prelude/cancellation.rs ---
@@ -5885,6 +7159,373 @@ mod tests {
     // the run's cancel token into the spawned eval (a `select!` that resolves to
     // `None` on cancel) AND aborts any in-flight handle at every early return.
 
+    struct AbortBeforeRoundHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for AbortBeforeRoundHook {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::BeforeRound
+        }
+
+        async fn run(
+            &self,
+            _point: AgentHookPoint,
+            _payload: &HookPayload,
+            _session: &Session,
+        ) -> HookResult {
+            HookResult::Abort {
+                reason: "injected before-round failure".to_string(),
+            }
+        }
+    }
+
+    struct EvalDropFlag(Arc<AtomicBool>);
+
+    impl Drop for EvalDropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn seed_blocked_task_evaluation(
+        session: &mut Session,
+        state: &mut super::super::startup::LoopRunState,
+    ) -> Arc<AtomicBool> {
+        let now = chrono::Utc::now();
+        session.set_task_list(bamboo_domain::TaskList {
+            session_id: session.id.clone(),
+            title: "Pending evaluator".to_string(),
+            items: vec![bamboo_domain::TaskItem {
+                id: "pending".to_string(),
+                description: "wait".to_string(),
+                status: bamboo_domain::TaskItemStatus::InProgress,
+                ..bamboo_domain::TaskItem::default()
+            }],
+            created_at: now,
+            updated_at: now,
+        });
+        session.set_task_list_version_meta("1");
+        state.task_context = crate::runtime::task_context::TaskLoopContext::from_session(session);
+        let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+            &state.task_context,
+            session,
+            &state.session_id,
+            1,
+            Some("fast-model"),
+            None,
+            crate::runtime::stream::handler::StreamTimeoutContext::new(
+                bamboo_config::StreamTimeoutConfig::default(),
+                Some("provider"),
+                Some("fast-model"),
+            ),
+        )
+        .expect("evaluation request")
+        .expect("task context");
+        state.task_evaluation.queued_request = Some(request.clone());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = EvalDropFlag(dropped.clone());
+        let join_handle = tokio::spawn(async move {
+            let _drop_flag = drop_flag;
+            futures::future::pending::<
+                Option<crate::runtime::runner::task_lifecycle::AsyncTaskEvaluationResult>,
+            >()
+            .await
+        });
+        state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+            request,
+            metrics_started: Arc::new(AtomicBool::new(false)),
+            metrics_terminal: Arc::new(AtomicBool::new(false)),
+            join_handle,
+        });
+        dropped
+    }
+
+    #[tokio::test]
+    async fn before_round_hook_failure_aborts_task_eval_and_clears_latest_snapshot() {
+        let mut session = Session::new("task-eval-before-round-hook", "model");
+        let mut state = e2e_loop_state(&session.id);
+        let dropped = seed_blocked_task_evaluation(&mut session, &mut state);
+        let mut config = stop_hook_config(Arc::new(AbortBeforeRoundHook));
+        config.model_name = Some("model".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(StubProvider),
+            Arc::new(AlwaysOkExecutor),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+
+        assert!(result.is_err(), "BeforeRound abort must fail the run");
+        assert!(state.task_evaluation.in_flight.is_none());
+        assert!(state.task_evaluation.queued_request.is_none());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "evaluator future was aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_tool_finalize_hook_failure_aborts_task_eval_and_clears_latest_snapshot() {
+        let mut session = Session::new("task-eval-no-tool-hook", "model");
+        let mut state = e2e_loop_state(&session.id);
+        let dropped = seed_blocked_task_evaluation(&mut session, &mut state);
+        let mut config = stop_hook_config(Arc::new(AbortFinalizeHook));
+        config.model_name = Some("model".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let result = super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(CanonicalUsageProvider {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                content: Some("final answer"),
+            }),
+            Arc::new(AlwaysOkExecutor),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "BeforeFinalize abort must fail no-tool path"
+        );
+        assert!(state.task_evaluation.in_flight.is_none());
+        assert!(state.task_evaluation.queued_request.is_none());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "evaluator future was aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_while_waiting_for_auxiliary_permit_does_not_start_metric_row() {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let session_id = "task-eval-waiting-budget-cancel";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        collector.session_started(session_id, "model", Utc::now());
+        let provider: Arc<dyn LLMProvider> = Arc::new(StubProvider);
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&provider, "fast-model", 1).await;
+
+        let mut session = Session::new(session_id, "model");
+        let mut state = e2e_loop_state(session_id);
+        seed_blocked_task_evaluation(&mut session, &mut state);
+        let (reset_tx, _reset_rx) = mpsc::channel(4);
+        super::abort_in_flight_evaluations(&mut state, &reset_tx, "test_reset").await;
+        let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+            &state.task_context,
+            &session,
+            session_id,
+            1,
+            Some("fast-model"),
+            None,
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .expect("request builds")
+        .expect("task context exists");
+        state.metrics_collector = Some(collector);
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        super::spawn_task_evaluation_request(
+            &mut state,
+            &event_tx,
+            request,
+            provider,
+            CancellationToken::new(),
+            1,
+        );
+        tokio::task::yield_now().await;
+        let started = state
+            .task_evaluation
+            .in_flight
+            .as_ref()
+            .expect("evaluation waits")
+            .metrics_started
+            .clone();
+        assert!(!started.load(Ordering::Acquire));
+
+        super::abort_in_flight_evaluations(&mut state, &event_tx, "run_cancelled").await;
+        drop(held);
+        assert!(!started.load(Ordering::Acquire));
+        assert!(state.task_evaluation.in_flight.is_none());
+        assert!(state.task_evaluation.queued_request.is_none());
+
+        let detail = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(detail) = storage
+                    .session_detail(session_id)
+                    .await
+                    .expect("session metrics query")
+                {
+                    break detail;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("session start metric persists");
+        assert!(
+            detail.rounds.is_empty(),
+            "permit-wait cancellation must not create a started evaluator row"
+        );
+    }
+
+    struct CompletedTaskEvaluationProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for CompletedTaskEvaluationProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let call = bamboo_agent_core::tools::ToolCall {
+                id: "completed-unharvested-evaluation".to_string(),
+                tool_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "update_task_item".to_string(),
+                    arguments: r#"{"item_id":"pending","status":"completed","notes":"verified"}"#
+                        .to_string(),
+                },
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![call])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_harvests_finished_task_evaluation_without_false_cancellation() {
+        use bamboo_metrics::storage::MetricsStorage;
+
+        let session_id = "task-eval-finished-before-cleanup";
+        let (_dir, collector, storage) = create_pipeline_metrics().await;
+        collector.session_started(session_id, "model", Utc::now());
+
+        let mut session = Session::new(session_id, "model");
+        let mut state = e2e_loop_state(session_id);
+        seed_blocked_task_evaluation(&mut session, &mut state);
+        let (reset_tx, _reset_rx) = mpsc::channel(4);
+        super::abort_in_flight_evaluations(&mut state, &reset_tx, "test_reset").await;
+
+        let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
+            &state.task_context,
+            &session,
+            session_id,
+            1,
+            Some("fast-model"),
+            None,
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .expect("request builds")
+        .expect("task context exists");
+        let metrics_round_id = request.metrics_round_id.clone();
+        state.metrics_collector = Some(collector);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        super::spawn_task_evaluation_request(
+            &mut state,
+            &event_tx,
+            request,
+            Arc::new(CompletedTaskEvaluationProvider),
+            CancellationToken::new(),
+            1,
+        );
+        let metrics_started = state
+            .task_evaluation
+            .in_flight
+            .as_ref()
+            .expect("evaluation spawned")
+            .metrics_started
+            .clone();
+        let metrics_terminal = state
+            .task_evaluation
+            .in_flight
+            .as_ref()
+            .expect("evaluation spawned")
+            .metrics_terminal
+            .clone();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .task_evaluation
+                .in_flight
+                .as_ref()
+                .expect("unharvested handle remains installed")
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("evaluator should finish before cleanup");
+        assert!(metrics_started.load(Ordering::Acquire));
+        assert!(!metrics_terminal.load(Ordering::Acquire));
+
+        super::abort_in_flight_evaluations(&mut state, &event_tx, "run_completed").await;
+        assert!(state.task_evaluation.in_flight.is_none());
+        assert!(metrics_terminal.load(Ordering::Acquire));
+
+        let mut started_events = 0;
+        let mut completed_events = 0;
+        let mut cancelled_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::TaskEvaluationStarted { .. } => started_events += 1,
+                AgentEvent::TaskEvaluationCompleted { .. } => completed_events += 1,
+                AgentEvent::TaskEvaluationCancelled { .. } => cancelled_events += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started_events, 1);
+        assert_eq!(completed_events, 1);
+        assert_eq!(
+            cancelled_events, 0,
+            "a completed evaluator must not receive a duplicate cancellation event"
+        );
+
+        let detail = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(detail) = storage
+                    .session_detail(session_id)
+                    .await
+                    .expect("session metrics query")
+                {
+                    if detail.rounds.len() == 1 && detail.rounds[0].completed_at.is_some() {
+                        break detail;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("harvested evaluator terminal metric persists");
+        let row = &detail.rounds[0];
+        assert_eq!(row.round_id, metrics_round_id);
+        assert_eq!(row.status, MetricsRoundStatus::Success);
+        assert!(row.error.is_none());
+        assert!(row.token_usage.prompt_tokens > 0);
+        assert!(row.token_usage.completion_tokens > 0);
+        assert_eq!(
+            row.token_usage.total_tokens,
+            row.token_usage
+                .prompt_tokens
+                .saturating_add(row.token_usage.completion_tokens)
+        );
+    }
+
     /// What the scripted main agent does on its SECOND round, once the Gold
     /// evaluation spawned after round 1 is genuinely in flight.
     #[derive(Clone, Copy)]
@@ -6022,6 +7663,95 @@ mod tests {
             max_rounds: 5,
             ..AgentLoopConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_harvests_finished_gold_evaluation_without_false_cancellation() {
+        let session_id = "gold-eval-finished-before-cleanup";
+        let mut state = e2e_loop_state(session_id);
+        let checkpoint = bamboo_agent_core::GoldCheckpoint::PostRound;
+        let request = crate::runtime::gold_evaluation::AsyncGoldEvaluationRequest {
+            session_id: session_id.to_string(),
+            round_number: 1,
+            model_name: "fast".to_string(),
+            reasoning_effort: None,
+            checkpoint,
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            session_snapshot: Session::new(session_id, "model"),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig::default(),
+        };
+        let result = crate::runtime::gold_evaluation::AsyncGoldEvaluationResult {
+            round_number: 1,
+            model_name: "fast".to_string(),
+            evaluation_result: crate::runtime::gold_evaluation::GoldEvaluationResult {
+                checkpoint,
+                iteration: 1,
+                decision: bamboo_agent_core::GoldDecision::Continue,
+                confidence: bamboo_agent_core::GoldConfidence::High,
+                reasoning: "complete".to_string(),
+                missing_information: Vec::new(),
+                next_action: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(AgentEvent::GoldEvaluationStarted {
+            session_id: session_id.to_string(),
+            checkpoint,
+            iteration: 1,
+        })
+        .await
+        .expect("started event");
+        tx.send(AgentEvent::GoldEvaluationCompleted {
+            session_id: session_id.to_string(),
+            checkpoint,
+            iteration: 1,
+            decision: bamboo_agent_core::GoldDecision::Continue,
+            confidence: bamboo_agent_core::GoldConfidence::High,
+            reasoning: "complete".to_string(),
+        })
+        .await
+        .expect("completed event");
+        state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            request,
+            join_handle: tokio::spawn(async move { Some(result) }),
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .expect("unharvested Gold handle")
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Gold evaluator should finish before cleanup");
+
+        super::abort_in_flight_evaluations(&mut state, &tx, "run_completed").await;
+        assert!(state.gold_evaluation.in_flight.is_none());
+        let mut started = 0;
+        let mut completed = 0;
+        let mut cancelled = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::GoldEvaluationStarted { .. } => started += 1,
+                AgentEvent::GoldEvaluationCompleted { .. } => completed += 1,
+                AgentEvent::GoldEvaluationCancelled { .. } => cancelled += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(started, 1);
+        assert_eq!(completed, 1);
+        assert_eq!(
+            cancelled, 0,
+            "a completed Gold evaluator must not receive a contradictory cancellation"
+        );
     }
 
     /// A run the user CANCELS with a Gold evaluation in flight must not run that

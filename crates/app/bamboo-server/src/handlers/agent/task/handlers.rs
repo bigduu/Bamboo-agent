@@ -25,20 +25,27 @@ pub async fn get_task_list(
         session.clone()
     };
 
+    let version = shared_session
+        .task_list_version_meta()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let Some(task_list) = shared_session.task_list.as_ref() else {
-        return Ok(HttpResponse::Ok().json(serde_json::json!({
-            "session_id": shared_session.id,
-            "title": null,
-            "items": [],
-            "progress": {
-                "completed": 0,
-                "total": 0,
-                "percentage": 0
-            }
-        })));
+        return Ok(HttpResponse::Ok().json(super::types::TaskListResponse {
+            session_id: shared_session.id.clone(),
+            title: None,
+            items: Vec::new(),
+            progress: super::types::TaskProgress {
+                completed: 0,
+                total: 0,
+                percentage: 0,
+            },
+            version,
+            created_at: None,
+            updated_at: None,
+        }));
     };
 
-    Ok(HttpResponse::Ok().json(to_task_list_response(task_list)))
+    Ok(HttpResponse::Ok().json(to_task_list_response(task_list, version)))
 }
 
 /// Check if a session has a task list.

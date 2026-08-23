@@ -14,6 +14,6 @@ pub use storage::{
 pub use types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, MetricsDateFilter, MetricsSummary, ModelMetrics,
-    RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus,
-    TokenUsage, ToolCallMetrics,
+    ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
+    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
 };

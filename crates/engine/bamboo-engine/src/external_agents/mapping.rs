@@ -142,6 +142,7 @@ impl A2AEventMapper {
                     tool_call_id: None,
                     tool_name: None,
                     allow_custom: true,
+                    source: Some(bamboo_agent_core::PendingQuestionSource::ExternalAgent),
                 });
             }
             TaskState::AuthRequired => {
@@ -152,6 +153,7 @@ impl A2AEventMapper {
                     tool_call_id: None,
                     tool_name: None,
                     allow_custom: true,
+                    source: Some(bamboo_agent_core::PendingQuestionSource::ExternalAgent),
                 });
             }
             TaskState::Completed => {

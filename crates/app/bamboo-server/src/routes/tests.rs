@@ -12,6 +12,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
 
     let requests = vec![
         ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/metrics/persistence"),
         // Unversioned liveness/readiness probes (#251 finding 6).
         ("GET", "/healthz"),
         ("GET", "/readyz"),
@@ -51,6 +52,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
 
     let requests = vec![
         ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/metrics/persistence"),
         // Unversioned liveness/readiness probes (#251 finding 6).
         ("GET", "/healthz"),
         ("GET", "/readyz"),

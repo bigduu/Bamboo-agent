@@ -112,7 +112,7 @@ pub fn restore_missing_admitted_inbox_messages(session: &mut Session, durable: &
 ///
 /// Implementors must:
 /// - Serialize concurrent saves per session ID.
-/// - Merge on-disk authoritative metadata (`title`, `pinned`, `title_version`,
+/// - Merge on-disk authoritative metadata (`title`, `title_generated`, `pinned`, `title_version`,
 ///   `metadata_version`) before writing, so UI edits are never clobbered.
 #[async_trait::async_trait]
 pub trait RuntimeSessionPersistence: Send + Sync {
@@ -166,7 +166,10 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// operation with their sidecar-only path. Custom/legacy implementations
     /// remain source-compatible and safely fall back to the full runtime save.
     ///
-    /// Callers must not rely on this operation to persist message changes.
+    /// Callers must not rely on this operation to persist message or
+    /// `model_context_state` changes. The durable ledger is checkpoint-owned;
+    /// sidecar implementations must preserve its latest committed value while
+    /// applying the caller's narrow control-plane mutation.
     async fn save_runtime_control_plane(&self, session: &mut Session) -> io::Result<()> {
         self.save_runtime_session(session).await
     }
@@ -207,6 +210,70 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         session.set_task_list_version_meta(version.to_string());
         self.save_runtime_control_plane(&mut session).await?;
         Ok(true)
+    }
+
+    /// Atomically update Task-owned control-plane fields only when the durable
+    /// Task generation and exact list still match the expected snapshot.
+    ///
+    /// `false` covers an unsupported atomic compare-and-patch, a missing target,
+    /// or a version conflict. Callers must treat it as a stale write and must
+    /// not publish their staged Task state. The default fails closed because a
+    /// load followed by a separately locked save is not an atomic CAS.
+    async fn update_task_list_control_plane_if_version(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        expected_task_list: &TaskList,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        let _ = (
+            session_id,
+            expected_version,
+            expected_task_list,
+            task_list,
+            version,
+        );
+        Ok(false)
+    }
+
+    /// Recoverably compare-and-patch the executing session and its shared root.
+    /// Implementations must validate both generations before either target is
+    /// written and may return `Ok(true)` only after both Task generations are
+    /// durable with no undo record that could later revert them. An error after
+    /// one physical write must restore both originals before returning or retain
+    /// durable recovery state and fail subsequent paired access closed until
+    /// recovery completes. Root-session callers pass the same id twice and
+    /// receive the single-target CAS semantics above.
+    async fn update_task_list_control_planes_if_version(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        expected_task_list: &TaskList,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        if session_id == shared_session_id {
+            return self
+                .update_task_list_control_plane_if_version(
+                    session_id,
+                    expected_version,
+                    expected_task_list,
+                    task_list,
+                    version,
+                )
+                .await;
+        }
+        let _ = (
+            session_id,
+            shared_session_id,
+            expected_version,
+            expected_task_list,
+            task_list,
+            version,
+        );
+        Ok(false)
     }
 
     /// Append-safe checkpoint used at the shared engine execute boundary.
@@ -301,6 +368,46 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<bool> {
         (**self)
             .update_task_list_control_plane(session_id, task_list, version)
+            .await
+    }
+
+    async fn update_task_list_control_plane_if_version(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        expected_task_list: &TaskList,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        (**self)
+            .update_task_list_control_plane_if_version(
+                session_id,
+                expected_version,
+                expected_task_list,
+                task_list,
+                version,
+            )
+            .await
+    }
+
+    async fn update_task_list_control_planes_if_version(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        expected_task_list: &TaskList,
+        task_list: &TaskList,
+        version: &str,
+    ) -> io::Result<bool> {
+        (**self)
+            .update_task_list_control_planes_if_version(
+                session_id,
+                shared_session_id,
+                expected_version,
+                expected_task_list,
+                task_list,
+                version,
+            )
             .await
     }
 

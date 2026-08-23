@@ -13,7 +13,7 @@
 use super::*;
 
 use bamboo_agent_core::Session;
-use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
+use bamboo_engine::session_app::errors::{RespondError, SessionLoadError, SessionSaveError};
 use bamboo_engine::session_app::repository::SessionAccess;
 
 // `SessionAccess` for `AppState` is a pure forward to the framework-owned
@@ -40,6 +40,22 @@ impl SessionAccess for AppState {
 
     async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError> {
         SessionAccess::save_and_cache(&self.session_repo, session).await
+    }
+
+    async fn inspect_for_response(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {
+        SessionAccess::inspect_for_response(&self.session_repo, id).await
+    }
+
+    async fn mutate_for_response(
+        &self,
+        id: &str,
+        mutate: Box<
+            dyn for<'session> FnOnce(&'session mut Session) -> Result<(), RespondError>
+                + Send
+                + 'static,
+        >,
+    ) -> Result<Option<Session>, RespondError> {
+        SessionAccess::mutate_for_response(&self.session_repo, id, mutate).await
     }
 }
 

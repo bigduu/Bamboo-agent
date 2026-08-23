@@ -3,18 +3,14 @@ use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde_json::json;
 
 use crate::permission::PermissionType;
+use crate::permission::MAX_PROACTIVE_PERMISSION_BATCH;
 
-/// Tool for the LLM to proactively request additional permissions from the user.
+/// Proactively request one or more remembered permissions from the user.
 ///
-/// Instead of failing when a permission is denied, the LLM can call this tool
-/// to explain why it needs certain permissions and ask the user for approval.
-///
-/// The tool returns a payload that signals the agent loop to pause and ask
-/// the user for permission approval (similar to how `conclusion_with_options` pauses for
-/// user input).
-///
-/// Inspired by Codex's `request_permissions` tool which allows the model to
-/// request filesystem and network permissions at runtime.
+/// The executor classifies every requested entry as a typed permission context
+/// before this implementation runs. It can therefore pause/replay the same
+/// tool-call through each batch item, and reaches `invoke` only after every
+/// context was authorized at a semantically durable scope.
 pub struct RequestPermissionsTool;
 
 impl RequestPermissionsTool {
@@ -52,7 +48,7 @@ impl Tool for RequestPermissionsTool {
     }
 
     fn description(&self) -> &str {
-        "Request additional permissions from the user. Use this when you need to perform an operation that requires elevated permissions (e.g., writing to a specific directory, executing a dangerous command, making HTTP requests). The user will be prompted to approve or deny the request."
+        "Request one or more permissions through Bamboo's typed approval flow. Each item is reviewed independently; proactive requests support remembered scopes, while one-shot approval belongs to the actual target operation."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -85,7 +81,8 @@ impl Tool for RequestPermissionsTool {
                         },
                         "required": ["type", "resource"]
                     },
-                    "minItems": 1
+                    "minItems": 1,
+                    "maxItems": MAX_PROACTIVE_PERMISSION_BATCH
                 }
             },
             "required": ["reason", "permissions"]
@@ -117,6 +114,11 @@ impl Tool for RequestPermissionsTool {
                 "'permissions' array must contain at least one item".to_string(),
             ));
         }
+        if permissions.len() > MAX_PROACTIVE_PERMISSION_BATCH {
+            return Err(ToolError::InvalidArguments(format!(
+                "'permissions' array cannot contain more than {MAX_PROACTIVE_PERMISSION_BATCH} items"
+            )));
+        }
 
         // Validate each permission entry
         let mut validated_permissions = Vec::new();
@@ -142,7 +144,6 @@ impl Tool for RequestPermissionsTool {
             let description = perm["description"]
                 .as_str()
                 .unwrap_or_else(|| perm_type.description());
-
             validated_permissions.push(json!({
                 "type": perm_type_str,
                 "resource": resource.trim(),
@@ -151,33 +152,17 @@ impl Tool for RequestPermissionsTool {
             }));
         }
 
-        // Build a human-readable question for the UI
-        let mut question = format!("**Permission Request**\n\n{}\n\n", reason);
-        question.push_str("**Requested permissions:**\n");
-        for perm in &validated_permissions {
-            let risk = perm["risk_level"].as_str().unwrap_or("Unknown");
-            let desc = perm["description"].as_str().unwrap_or("");
-            let resource = perm["resource"].as_str().unwrap_or("");
-            let ptype = perm["type"].as_str().unwrap_or("");
-            question.push_str(&format!(
-                "- **[{}]** {} `{}` — {}\n",
-                risk, ptype, resource, desc
-            ));
-        }
-
-        let result_payload = json!({
-            "status": "awaiting_permission_approval",
-            "question": question,
-            "reason": reason,
-            "permissions": validated_permissions,
-            "options": ["Approve", "Deny"],
-            "allow_custom": false
-        });
-
         Ok(ToolOutcome::Completed(ToolResult {
             success: true,
-            result: result_payload.to_string(),
-            display_preference: Some("request_permissions".to_string()),
+            result: json!({
+                "status": "permissions_authorized",
+                "reason": reason,
+                "permissions": validated_permissions,
+                "message": "Every requested permission passed the typed policy gate. Target operations remain subject to the same policy."
+            })
+            .to_string(),
+            // This is a terminal acknowledgement, not another human pause.
+            display_preference: None,
             images: Vec::new(),
         }))
     }
@@ -193,10 +178,39 @@ mod tests {
         assert_eq!(tool.name(), "request_permissions");
     }
 
+    #[test]
+    fn schema_caps_the_batch_at_the_replay_ledger_limit() {
+        let schema = RequestPermissionsTool::new().parameters_schema();
+        assert_eq!(
+            schema["properties"]["permissions"]["maxItems"],
+            MAX_PROACTIVE_PERMISSION_BATCH
+        );
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_a_batch_larger_than_the_replay_ledger() {
+        let permissions = (0..=MAX_PROACTIVE_PERMISSION_BATCH)
+            .map(|index| {
+                json!({
+                    "type": "write_file",
+                    "resource": format!("/workspace/file-{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = RequestPermissionsTool::new()
+            .invoke(
+                json!({"reason": "Prepare files", "permissions": permissions}),
+                ToolCtx::none("t"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("more than 64 items"));
+    }
+
     #[tokio::test]
     async fn test_valid_single_permission_request() {
         let tool = RequestPermissionsTool::new();
-        let out = tool
+        let outcome = tool
             .invoke(
                 json!({
                     "reason": "Need to write deployment config",
@@ -209,30 +223,21 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::Completed(result) = outcome else {
+            panic!("terminal acknowledgement")
         };
-
         assert!(result.success);
-        assert_eq!(
-            result.display_preference,
-            Some("request_permissions".to_string())
-        );
-
+        assert!(result.display_preference.is_none());
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-        assert_eq!(payload["status"], "awaiting_permission_approval");
-        assert!(payload["question"]
-            .as_str()
-            .unwrap()
-            .contains("deployment config"));
+        assert_eq!(payload["status"], "permissions_authorized");
         assert_eq!(payload["permissions"].as_array().unwrap().len(), 1);
-        assert_eq!(payload["options"], json!(["Approve", "Deny"]));
+        assert!(!result.result.contains("awaiting_permission_approval"));
     }
 
     #[tokio::test]
     async fn test_valid_multiple_permissions() {
         let tool = RequestPermissionsTool::new();
-        let out = tool
+        let outcome = tool
             .invoke(
                 json!({
                     "reason": "Need to deploy the application",
@@ -253,15 +258,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let ToolOutcome::Completed(result) = out else {
-            panic!("expected Completed")
+        let ToolOutcome::Completed(result) = outcome else {
+            panic!("terminal acknowledgement")
         };
-
-        assert!(result.success);
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["status"], "permissions_authorized");
         assert_eq!(payload["permissions"].as_array().unwrap().len(), 2);
-        assert_eq!(payload["permissions"][0]["risk_level"], "High Risk");
-        assert_eq!(payload["permissions"][1]["risk_level"], "Medium Risk");
     }
 
     #[tokio::test]
@@ -388,11 +390,7 @@ mod tests {
                     ToolCtx::none("t"),
                 )
                 .await;
-            assert!(
-                result.is_ok(),
-                "Permission type '{}' should be valid",
-                ptype
-            );
+            assert!(result.is_ok(), "{ptype}");
         }
     }
 
@@ -418,11 +416,7 @@ mod tests {
                     ToolCtx::none("t"),
                 )
                 .await;
-            assert!(
-                result.is_ok(),
-                "PascalCase permission type '{}' should be valid",
-                ptype
-            );
+            assert!(result.is_ok(), "{ptype}");
         }
     }
 

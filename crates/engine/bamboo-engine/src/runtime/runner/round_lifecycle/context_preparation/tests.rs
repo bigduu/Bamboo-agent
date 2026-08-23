@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    emit_context_pressure_notification, maybe_apply_host_context_compression,
+    build_compression_context_blocks, emit_context_pressure_notification,
+    enforce_model_context_ledger_retention, maybe_apply_host_context_compression,
     prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
@@ -10,7 +12,11 @@ use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
 use bamboo_compression::{BudgetStrategy, TiktokenTokenCounter, TokenBudget, TokenCounter};
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, TaskItem, TaskItemStatus, TaskList};
+use bamboo_domain::{
+    AgentHookPoint, ContextBlockType, HookPayload, HookResult, ModelContextEvent,
+    ModelContextEventKind, ModelContextResetReason, ModelContextState, TaskItem, TaskItemStatus,
+    TaskList,
+};
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo};
 use bamboo_llm::{LLMChunk, LLMError};
@@ -62,8 +68,51 @@ fn sample_task_list(session_id: &str, status: TaskItemStatus) -> TaskList {
     }
 }
 
+#[test]
+fn historical_ledger_tokens_start_a_bounded_retention_epoch_below_event_cap() {
+    let mut session = Session::new("ledger-retention-budget", "test-model");
+    let large_snapshot = "historical context ".repeat(2_000);
+    let events = (0..3)
+        .map(|sequence| ModelContextEvent {
+            id: format!("ctx-{sequence}"),
+            epoch: 4,
+            sequence,
+            anchor_message_id: None,
+            block_type: ContextBlockType::TaskSnapshot,
+            revision: sequence + 1,
+            supersedes_revision: (sequence > 0).then_some(sequence),
+            kind: ModelContextEventKind::Snapshot,
+            content_sha256: format!("digest-{sequence}"),
+            rendered_text: large_snapshot.clone(),
+        })
+        .collect();
+    session.model_context_state = Some(ModelContextState {
+        state_revision: 7,
+        prefix_epoch: 4,
+        next_sequence: 3,
+        events,
+        cache_scope_sha256: Some("scope".to_string()),
+        ..ModelContextState::default()
+    });
+    let budget = TokenBudget::with_safety_margin(8_000, 1_000, BudgetStrategy::default(), 0);
+    let counter = TiktokenTokenCounter::default();
+
+    let usage = enforce_model_context_ledger_retention(&mut session, &budget, &counter);
+
+    assert_eq!(usage.tokens, 0);
+    let state = session.model_context_state.as_ref().unwrap();
+    assert_eq!(state.prefix_epoch, 5);
+    assert_eq!(state.state_revision, 8);
+    assert!(state.events.is_empty());
+    assert_eq!(
+        state.last_reset_reason,
+        Some(ModelContextResetReason::RetentionLimit)
+    );
+}
+
 struct RecordingLlmProvider {
     models: Arc<Mutex<Vec<String>>>,
+    response: String,
 }
 
 #[async_trait::async_trait]
@@ -81,16 +130,23 @@ impl LLMProvider for RecordingLlmProvider {
             .push(model.to_string());
 
         Ok(Box::pin(stream::iter(vec![
-            Ok::<LLMChunk, LLMError>(LLMChunk::Token("summary".to_string())),
+            Ok::<LLMChunk, LLMError>(LLMChunk::Token(self.response.clone())),
             Ok::<LLMChunk, LLMError>(LLMChunk::Done),
         ])))
     }
 }
 
 fn recording_llm() -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
+    recording_llm_with_response("summary")
+}
+
+fn recording_llm_with_response(
+    response: impl Into<String>,
+) -> (Arc<dyn LLMProvider>, Arc<Mutex<Vec<String>>>) {
     let models = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LLMProvider> = Arc::new(RecordingLlmProvider {
         models: Arc::clone(&models),
+        response: response.into(),
     });
     (llm, models)
 }
@@ -889,23 +945,340 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
 }
 
 #[tokio::test]
-async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
-    let mut session = Session::new("session-cp-2", "test-model");
-    session.token_budget = Some(TokenBudget::new(
-        600,
-        80,
-        BudgetStrategy::Window { size: 50 },
+async fn projected_relocation_does_not_double_reserve_large_system_env_context() {
+    let large_env = "stable environment inventory and capability detail ".repeat(900);
+    let configured_system = format!(
+        "system\n\n<!-- BAMBOO_ENV_CONTEXT_START -->\n{large_env}\n<!-- BAMBOO_ENV_CONTEXT_END -->"
+    );
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some(configured_system),
+        ..Default::default()
+    };
+    let mut session = Session::new("session-cp-relocated-env", "test-model");
+    let (stable_frame, _) =
+        crate::runtime::runner::session_setup::prompt_setup::build_stable_prompt_frame_with_sections(
+            &session,
+            &config,
+            &[],
+            &Default::default(),
+        );
+    session
+        .messages
+        .push(Message::system(stable_frame.stable_instructions));
+    session
+        .messages
+        .push(Message::user("inspect the environment"));
+
+    let counter = TiktokenTokenCounter::default();
+    let fitted_system_tokens = counter.count_messages(&session.messages[..1]);
+    let max_output_tokens = 256;
+    let request_input_limit = fitted_system_tokens.saturating_add(768);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        request_input_limit.saturating_add(max_output_tokens),
+        max_output_tokens,
+        BudgetStrategy::default(),
+        0,
     ));
-    session.messages.push(Message::system("System prompt"));
+
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-relocated-env",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("relocating an already-fitted env block must not reserve it twice");
+    let projected = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+
+    assert!(projected.input_tokens <= request_input_limit);
+    assert!(
+        session.model_context_state.is_none(),
+        "projection must stay pure"
+    );
+}
+
+#[tokio::test]
+async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
+    let summary_content =
+        "compressed decisions requirements and verification evidence ".repeat(900);
+    let mut session = Session::new("session-cp-relocated-summary", "test-model");
+    session.messages.push(Message::system("system"));
+    session
+        .messages
+        .push(Message::user("continue after compression"));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        summary_content.clone(),
+        40,
+        10_000,
+    ));
+    session.model_context_state = Some(ModelContextState {
+        state_revision: 7,
+        prefix_epoch: 4,
+        last_reset_reason: Some(ModelContextResetReason::Compression),
+        ..ModelContextState::default()
+    });
+
+    let counter = TiktokenTokenCounter::default();
+    let system_tokens = counter.count_messages(&session.messages[..1]);
+    let summary_tokens =
+        counter.count_messages(&[bamboo_compression::compression_summary_message(
+            &summary_content,
+        )]);
+    let max_output_tokens = 256;
+    let request_input_limit = system_tokens
+        .saturating_add(summary_tokens)
+        // Leave room for the ledger event envelope itself. The old total-ledger
+        // feedback still fails this fixture because it adds the full summary a
+        // second time on top of the fitter's summary reservation.
+        .saturating_add(1_600);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        request_input_limit.saturating_add(max_output_tokens),
+        max_output_tokens,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("system".to_string()),
+        ..Default::default()
+    };
+    let pending_reset = session.model_context_state.clone();
+
+    let llm = noop_llm();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-relocated-summary",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("relocating an already-fitted summary must not reserve it twice");
+    let projected = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+
+    assert!(projected.input_tokens <= request_input_limit);
+    assert_eq!(
+        session.model_context_state, pending_reset,
+        "shadow projection must not commit the compression reseed"
+    );
+}
+
+#[tokio::test]
+async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
+    let mut session = Session::new("session-cp-vision-refit", "test-model");
+    session.messages.push(Message::system("system"));
     for index in 0..20 {
-        session
-            .messages
-            .push(Message::user(format!("Old user message {}", index)));
+        session.messages.push(Message::user(format!(
+            "conversation-{index} {}",
+            "bounded transcript payload ".repeat(40)
+        )));
         session.messages.push(Message::assistant(
-            format!("Old assistant response {}", index),
+            format!(
+                "answer-{index} {}",
+                "implementation evidence and verification ".repeat(40)
+            ),
             None,
         ));
     }
+    session.messages.push(Message::user_with_parts(
+        "inspect the latest image",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/latest.png".to_string(),
+                detail: None,
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    ));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Active ledger context".to_string(),
+        items: vec![TaskItem {
+            id: "task-vision-refit".to_string(),
+            description: "current task state must survive the epoch reseed ".repeat(120),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+    session.model_context_state = Some(ModelContextState {
+        state_revision: 5,
+        prefix_epoch: 3,
+        last_reset_reason: Some(ModelContextResetReason::RetentionLimit),
+        ..ModelContextState::default()
+    });
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("system".to_string()),
+        image_fallback: Some(ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-test".to_string()),
+        }),
+        ..Default::default()
+    };
+    let counter = TiktokenTokenCounter::default();
+    let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
+        &session,
+        session.token_budget.as_ref().unwrap(),
+        &counter,
+        0,
+    )
+    .expect("legacy zero-reservation fit");
+    let naive_message_count = naive.messages.len();
+    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
+    let mut expanded_candidate_messages = naive.messages.clone();
+    let expanded_image = expanded_candidate_messages
+        .iter_mut()
+        .find(|message| message.content_parts.is_some())
+        .expect("latest image must survive the initial fit");
+    expanded_image.content = format!(
+        "inspect the latest image\n\n[Vision description of image 1: latest.png]\n{vision_description}\n"
+    );
+    expanded_image.content_parts = None;
+    let request_input_limit = session
+        .token_budget
+        .as_ref()
+        .unwrap()
+        .max_request_input_tokens();
+    assert!(
+        counter.count_messages(&expanded_candidate_messages) > request_input_limit,
+        "fixture must make the transformed candidate itself exceed the input limit"
+    );
+    let naive_projection = super::super::stream_execution::project_request_usage(
+        &session,
+        &naive,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(
+        naive_projection.input_tokens
+            > session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .max_request_input_tokens(),
+        "fixture must require a projected refit"
+    );
+
+    let (llm, models) = recording_llm_with_response(vision_description);
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-cp-vision-refit",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("projected refit should reuse the transformed candidate");
+
+    assert!(prepared.prepared_context.truncation_occurred);
+    assert!(prepared.prepared_context.messages.len() < naive_message_count);
+    assert!(prepared.prepared_context.messages.iter().any(|message| {
+        message.content.contains("[Vision description of image 1:")
+            && message.content.contains("expanded vision detail")
+    }));
+    assert_eq!(
+        *models.lock().expect("vision call list lock"),
+        vec!["vision-test".to_string()],
+        "bounded projection refits must not repeat the paid vision transform"
+    );
+    let projected = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(
+        counter.count_messages(&prepared.prepared_context.messages) <= request_input_limit,
+        "refit must bring the transformed message vector itself back under the limit"
+    );
+    assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
+}
+
+#[tokio::test]
+async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
+    let mut session = Session::new("session-cp-2", "test-model");
+    session.token_budget = Some(TokenBudget::new(
+        4_000,
+        200,
+        BudgetStrategy::Window { size: 50 },
+    ));
+    session.messages.push(Message::system(
+        crate::runtime::runner::prompt_context::append_core_agent_directives(
+            "System prompt",
+            crate::runtime::context::CORE_AGENT_DIRECTIVES,
+        ),
+    ));
+    for index in 0..20 {
+        session.messages.push(Message::user(format!(
+            "Old user message {index} {}",
+            "historical context under hard-limit pressure ".repeat(10)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Old assistant response {index} {}",
+                "decisions implementation and verification evidence ".repeat(10)
+            ),
+            None,
+        ));
+    }
+    let budget = session.token_budget.as_ref().unwrap();
+    let exposure = bamboo_compression::estimate_context_compression_exposure(
+        &session,
+        "test-model",
+        Some(budget),
+    );
+    let trigger_percent = (budget.compression_trigger_context_tokens() as f64
+        / budget.max_context_tokens as f64)
+        * 100.0;
+    assert!(
+        exposure.active_usage_percent >= trigger_percent,
+        "fixture must cross the compression trigger: exposure={exposure:?}"
+    );
+    let candidate = bamboo_compression::build_forced_compression_candidate_plan(
+        &session,
+        "test-model",
+        Some(budget),
+        0.20,
+        CompressionTriggerType::Auto,
+    );
+    assert!(
+        candidate.is_ok(),
+        "fixture must admit a bounded compression plan: {candidate:?}"
+    );
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
@@ -1251,6 +1624,70 @@ fn activate_plan_mode(session: &mut Session) {
     });
 }
 
+fn attach_durable_instruction_workflow(session: &mut Session) {
+    const WORKFLOW_ID: &str = "compression-workflow-872";
+    const WORKFLOW_REVISION: u64 = 7;
+
+    let definition = bamboo_skills::SkillDefinition::new(
+        WORKFLOW_ID,
+        "Compression Workflow",
+        "Private durable workflow used by the compression regression",
+        "WORKFLOW_PRIVATE_INSTRUCTION_872",
+    );
+    let catalog_entry = bamboo_skills::WorkflowCatalogEntry {
+        id: WORKFLOW_ID.to_string(),
+        name: "Compression Workflow".to_string(),
+        description: "Private durable workflow used by the compression regression".to_string(),
+        kind: bamboo_skills::WorkflowKind::Instruction,
+        source: bamboo_skills::WorkflowSource::Builtin,
+        revision: WORKFLOW_REVISION,
+        content_digest: "compression-workflow-digest".to_string(),
+        version: "1.0.0".to_string(),
+        invocation_policy: serde_json::json!({"manual": true}),
+        argument_schema: serde_json::json!({"type": "object"}),
+        status: bamboo_skills::WorkflowStatus::Valid,
+        legacy: false,
+        migration_status: None,
+        last_error: None,
+        winner: true,
+        shadowed_candidates: Vec::new(),
+    };
+    let mut skills = BTreeMap::new();
+    skills.insert(
+        WORKFLOW_ID.to_string(),
+        bamboo_skills::SkillActivationSnapshotEntry {
+            definition,
+            catalog_entry,
+            revision: WORKFLOW_REVISION,
+            resources: BTreeMap::new(),
+        },
+    );
+    let durable = bamboo_skills::DurableWorkflowActivation {
+        active: bamboo_skills::ActiveWorkflow {
+            id: WORKFLOW_ID.to_string(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: WORKFLOW_REVISION,
+            kind: bamboo_skills::WorkflowKind::Instruction,
+            args: serde_json::json!({"private_scope": "WORKFLOW_PRIVATE_ARG_872"}),
+            invoked_by: bamboo_skills::WorkflowInvokedBy::User,
+            activated_at: chrono::Utc::now(),
+            status: bamboo_skills::WorkflowActivationStatus::Active,
+            diagnostic: None,
+            context_fingerprint: Some("workflow-context-fingerprint-872".to_string()),
+            dynamic_context: Vec::new(),
+        },
+        snapshot: bamboo_skills::SkillActivationSnapshot {
+            catalog_revision: 11,
+            selected_skill_mode: None,
+            skills,
+        },
+    };
+    session.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY.to_string(),
+        serde_json::to_string(&durable).expect("serialize durable workflow fixture"),
+    );
+}
+
 #[tokio::test]
 async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-mid-turn-context-blocks", "test-model");
@@ -1371,6 +1808,7 @@ async fn mid_turn_host_context_compression_includes_unified_context_blocks_in_su
 async fn pre_turn_host_context_compression_includes_available_context_blocks_in_summary_prompt() {
     let mut session = Session::new("session-cp-pre-turn-context-blocks", "test-model");
     activate_plan_mode(&mut session);
+    attach_durable_instruction_workflow(&mut session);
     session.token_budget = Some(TokenBudget {
         max_context_tokens: 5000,
         max_output_tokens: 200,
@@ -1424,6 +1862,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
     });
+    assert!(session.messages.iter().all(|message| {
+        !message.content.contains("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            && !message.content.contains("WORKFLOW_PRIVATE_ARG_872")
+    }));
 
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
@@ -1446,6 +1888,10 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     .expect("pre-turn host compression should run");
 
     assert!(applied, "expected pre-turn compression to be applied");
+    assert!(session.messages.iter().all(|message| {
+        !message.content.contains("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            && !message.content.contains("WORKFLOW_PRIVATE_ARG_872")
+    }));
 
     let requests = requests
         .lock()
@@ -1458,21 +1904,47 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
 
     assert!(prompt.contains("## Compression Context Blocks"));
     assert!(prompt.contains("type: task_snapshot"));
+    assert!(prompt.contains("type: workflow_runtime"));
     assert!(prompt.contains("type: plan_mode_state"));
     assert!(prompt.contains("type: plan_runtime_state"));
     assert!(prompt.contains("Current Task List"));
     assert!(prompt.contains("Plan Mode State"));
     assert!(prompt.contains("Durable Plan Execution Context"));
+    assert_eq!(
+        prompt.matches("WORKFLOW_PRIVATE_INSTRUCTION_872").count(),
+        1
+    );
+    assert_eq!(prompt.matches("WORKFLOW_PRIVATE_ARG_872").count(), 1);
+
+    let workflow_blocks = build_compression_context_blocks(&session, None)
+        .into_iter()
+        .filter(|block| block.block_type == ContextBlockType::WorkflowRuntime)
+        .collect::<Vec<_>>();
+    assert_eq!(workflow_blocks.len(), 1);
+    assert_eq!(
+        workflow_blocks[0]
+            .content
+            .matches("WORKFLOW_PRIVATE_INSTRUCTION_872")
+            .count(),
+        1
+    );
+    assert_eq!(
+        workflow_blocks[0]
+            .content
+            .matches("WORKFLOW_PRIVATE_ARG_872")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses_trigger() {
     // Host auto-compression now uses a single rule:
     // usage(context_window) >= compression_trigger_percent.
-    // Here total_tokens/context_window = 1000/1200 = 83.3% with trigger=80, so it should run.
+    // Here total_tokens/context_window = 3500/4000 = 87.5% with trigger=80, so it should run.
     let mut session = Session::new("session-cp-force-context-only", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 4000,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -1490,7 +1962,12 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
         prompt_cache_recent_tool_chains: 2,
         max_tool_output_tokens: 0,
     });
-    session.messages.push(Message::system("System prompt"));
+    session.messages.push(Message::system(
+        crate::runtime::runner::prompt_context::append_core_agent_directives(
+            "System prompt",
+            crate::runtime::context::CORE_AGENT_DIRECTIVES,
+        ),
+    ));
     for index in 0..12 {
         session.messages.push(Message::user(format!(
             "User message {} {}",
@@ -1506,15 +1983,15 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
             None,
         ));
     }
-    // context_window = 1200
-    // total_tokens/context_window = 1000/1200 = 83.3% >= 80%
+    // context_window = 4000
+    // total_tokens/context_window = 3500/4000 = 87.5% >= 80%
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 900,
-        total_tokens: 1000,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        window_tokens: 3400,
+        total_tokens: 3500,
+        max_context_tokens: 4000,
+        budget_limit: 4000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -1544,7 +2021,7 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
 
     assert!(
         !session.compression_events.is_empty(),
-        "host auto compression should run when context-window usage (83.3%) crosses trigger (80%)"
+        "host auto compression should run when context-window usage (87.5%) crosses trigger (80%)"
     );
     assert!(
         session.messages.iter().any(|m| m.compressed),

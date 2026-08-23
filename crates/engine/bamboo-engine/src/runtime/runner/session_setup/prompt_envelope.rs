@@ -7,6 +7,7 @@ use bamboo_agent_core::{
 /// engine reads these three runs straight into the canonical [`PromptIR`]; the
 /// conversation window and the wire-specific projections live on the IR, not here.
 #[derive(Debug, Clone, Default)]
+#[cfg(test)]
 pub struct PromptEnvelope {
     pub stable_instructions: String,
     pub stable_prefix_messages: Vec<Message>,
@@ -31,6 +32,7 @@ impl StablePromptFrame {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
 }
@@ -38,6 +40,7 @@ pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
 /// Assemble a [`PromptEnvelope`] from the stable frame and the per-round dynamic
 /// context blocks. The conversation window is threaded directly into the IR by the
 /// caller, so it is not stored here.
+#[cfg(test)]
 pub(crate) fn assemble_prompt_envelope(
     stable: StablePromptFrame,
     dynamic_blocks: Vec<ContextBlock>,

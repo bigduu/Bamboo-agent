@@ -632,17 +632,17 @@ pub async fn patch_session(
             req.model.as_deref(),
         );
 
-        // A typed permission write is authoritative and CAS-guarded. The
-        // expected revision is the exact value produced by the preceding
-        // operations in this request, never a lock-free reload of whatever a
-        // third party may have committed in the gap.
+        // Every execution-profile/permission write honors an optional
+        // `If-Match`. The expected revision is the exact value produced by any
+        // preceding operations in this request, never a lock-free reload of
+        // whatever a third party may have committed in the gap.
         #[cfg(test)]
         let earlier_authoritative_field = req.project_id.is_some()
             || req.workspace_path.is_some()
             || req.title.is_some()
             || req.pinned.is_some()
             || req.gold_config.is_some();
-        let permission_expected_version = req.permission_mode.and(precondition);
+        let config_expected_version = precondition;
 
         #[cfg(test)]
         if req.permission_mode.is_some() && earlier_authoritative_field {
@@ -670,7 +670,7 @@ pub async fn patch_session(
                 "session_id": session_id
             })));
         };
-        if let Some(expected) = permission_expected_version {
+        if let Some(expected) = config_expected_version {
             if session.metadata_version != expected {
                 return Ok(precondition_failed(&session_id, session.metadata_version));
             }
@@ -736,11 +736,14 @@ pub async fn patch_session(
                     ))
                 })?;
             }
-            session.metadata_version = session.metadata_version.saturating_add(1);
         }
 
         let model_changed = session.model != prev_model || session.model_ref != prev_model_ref;
         let reasoning_changed = session.reasoning_effort != prev_reasoning;
+        let config_changed = model_changed || reasoning_changed || permission_transition.is_some();
+        if config_changed {
+            session.metadata_version = session.metadata_version.saturating_add(1);
+        }
         session.updated_at = chrono::Utc::now();
         state
             .persistence
@@ -932,6 +935,95 @@ mod tests {
         assert_eq!(
             indexed.permission_mode,
             bamboo_domain::SessionPermissionMode::Auto
+        );
+    }
+
+    #[actix_web::test]
+    async fn execution_profile_patch_is_atomic_versioned_and_rejects_stale_writes() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = create_session!(app);
+        let initial_version = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session")
+            .metadata_version;
+        let initial_etag = format!("\"{initial_version}\"");
+
+        let updated = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({
+                    "model": "shared",
+                    "provider": "provider-b",
+                    "reasoning_effort": "xhigh"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated_etag = format!("\"{}\"", initial_version.saturating_add(1));
+        assert_eq!(
+            updated
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(updated_etag.as_str())
+        );
+        let body: Value = test::read_body_json(updated).await;
+        assert_eq!(body["session"]["model"], "shared");
+        assert_eq!(body["session"]["model_ref"]["provider"], "provider-b");
+        assert_eq!(body["session"]["reasoning_effort"], "xhigh");
+
+        let stale = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, initial_etag.as_str()))
+                .set_json(serde_json::json!({
+                    "model": "other",
+                    "provider": "provider-c",
+                    "clear_reasoning_effort": true
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            stale
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(updated_etag.as_str())
+        );
+
+        let persisted = state
+            .storage
+            .load_session(&id)
+            .await
+            .expect("load")
+            .expect("session");
+        assert_eq!(persisted.metadata_version, initial_version + 1);
+        assert_eq!(persisted.model, "shared");
+        assert_eq!(
+            persisted
+                .model_ref
+                .as_ref()
+                .map(|model| model.provider.as_str()),
+            Some("provider-b")
+        );
+        assert_eq!(
+            persisted.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Xhigh)
         );
     }
 

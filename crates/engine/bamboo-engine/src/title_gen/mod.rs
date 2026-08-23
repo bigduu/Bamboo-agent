@@ -1,13 +1,13 @@
 //! Backend auto-title-generation service.
 //!
-//! Runs asynchronously after the execute handler accepts a request, derives a
-//! concise title for the session via the configured fast model (with a heuristic
-//! fallback), persists it via the merge-save helper so concurrent runtime saves
-//! cannot clobber it, and emits [`AgentEvent::SessionTitleUpdated`].
+//! Runs asynchronously as soon as the chat handler durably appends a user
+//! message, derives a concise title for the session via the configured fast
+//! model (with a heuristic fallback), persists it through the authoritative
+//! metadata writer, and emits [`AgentEvent::SessionTitleUpdated`].
 //!
 //! Public entry points:
-//! - [`spawn_title_generation`] - skips work when the session already has a
-//!   non-default title.
+//! - [`spawn_title_generation`] - skips work when the session title lifecycle
+//!   has already been finalized.
 //! - [`spawn_title_generation_force`] - always regenerates (used by the
 //!   `POST /sessions/{id}/regenerate-title` endpoint).
 //!
@@ -37,14 +37,14 @@ const TITLE_GEN_TIMEOUT_SECS: u64 = 30;
 const MAX_TITLE_LEN: usize = 80;
 const MAX_USER_TEXT_FOR_TITLE: usize = 2000;
 
-/// Spawn a background task that generates an auto-title for a new (untitled) session.
-/// Skips if the session already has a non-default title.
+/// Spawn a background task that generates an auto-title for a pending session.
+/// Skips if the title lifecycle is already finalized.
 pub fn spawn_title_generation(state: Arc<dyn AgentSessionContext>, session_id: String) {
     spawn_inner(state, session_id, false);
 }
 
-/// Same as [`spawn_title_generation`] but bypasses the "is untitled" check -
-/// always regenerates. Used by `POST /sessions/{id}/regenerate-title`.
+/// Same as [`spawn_title_generation`] but bypasses the finalized-lifecycle
+/// check. Used by `POST /sessions/{id}/regenerate-title`.
 pub fn spawn_title_generation_force(state: Arc<dyn AgentSessionContext>, session_id: String) {
     spawn_inner(state, session_id, true);
 }
@@ -78,38 +78,6 @@ impl Drop for TitleGenGuard {
     }
 }
 
-/// Returns true when a session title is still a frontend-provided default / placeholder.
-pub fn is_untitled(title: &str) -> bool {
-    let s = title.trim();
-    if s.is_empty() {
-        return true;
-    }
-
-    // Exact known frontend defaults/localized defaults.
-    if matches!(
-        s,
-        "New Session"
-            | "新建会话"
-            | "新建會話"
-            | "Nouvelle session"
-            | "新しいセッション"
-            | "नया सत्र"
-    ) {
-        return true;
-    }
-
-    // Frontend historically created prompt-scoped placeholder titles such as
-    // `New Session - Bodhi`, `New Session with Bodhi`, and the current
-    // localized/sidebar variant `New session with Bodhi`. Treat only these
-    // narrow, obvious default forms as untitled so clear custom titles are preserved.
-    s.strip_prefix("New Session - ")
-        .or_else(|| s.strip_prefix("New Session with "))
-        .or_else(|| s.strip_prefix("New session - "))
-        .or_else(|| s.strip_prefix("New session with "))
-        .map(|suffix| !suffix.trim().is_empty())
-        .unwrap_or(false)
-}
-
 async fn run_title_generation(
     state: &Arc<dyn AgentSessionContext>,
     session_id: &str,
@@ -123,9 +91,9 @@ async fn run_title_generation(
         .map_err(|e| format!("load_session: {e}"))?
         .ok_or_else(|| "session not found".to_string())?;
 
-    // 2. Skip if already titled (unless forced).
-    if !force && !is_untitled(&session.title) {
-        debug!(session_id = %session_id, "title-gen: session already titled, skipping");
+    // 2. Skip if the lifecycle is already finalized (unless forced).
+    if !force && session.title_generated {
+        debug!(session_id = %session_id, "title-gen: title lifecycle already finalized, skipping");
         return Ok(());
     }
 
@@ -162,10 +130,10 @@ async fn run_title_generation(
     }
 
     // 5. Hand off to the authoritative metadata writer. It re-checks
-    //    is_untitled (when force=false) inside a per-session lock so a
-    //    concurrent user PATCH wins, bumps title_version and metadata_version,
-    //    performs a plain save, refreshes the in-memory cache, and emits
-    //    SessionTitleUpdated through the replayable helper.
+    //    title_generated (when force=false) inside a per-session lock so a
+    //    concurrent user PATCH wins, finalizes the lifecycle, bumps
+    //    title_version and metadata_version, refreshes the in-memory cache,
+    //    and emits SessionTitleUpdated through the replayable helper.
     match SessionMetadataService::apply_generated_title(
         state.as_ref(),
         session_id,
@@ -188,7 +156,7 @@ async fn run_title_generation(
         None => {
             debug!(
                 session_id = %session_id,
-                "title-gen: skipped (already titled or unchanged)"
+                "title-gen: skipped (title lifecycle finalized or unchanged)"
             );
         }
     }
@@ -200,27 +168,34 @@ async fn run_title_generation(
 /// Skips hidden runtime resume messages so internal system messages don't
 /// pollute generated titles.
 fn first_user_text(session: &Session) -> Option<String> {
-    let msg = session.messages.iter().find(|m| {
-        matches!(m.role, Role::User) && !crate::session_app::execute::is_system_resume_message(m)
-    })?;
-    let raw = if let Some(parts) = msg.content_parts.as_ref() {
-        let joined: String = parts
-            .iter()
-            .filter_map(|p| match p {
-                bamboo_agent_core::MessagePart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if joined.trim().is_empty() {
-            msg.content.clone()
-        } else {
-            joined
-        }
-    } else {
-        msg.content.clone()
-    };
-    Some(raw.chars().take(MAX_USER_TEXT_FOR_TITLE).collect())
+    session
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, Role::User)
+                && !crate::session_app::execute::is_system_resume_message(message)
+        })
+        .find_map(|message| {
+            let raw = if let Some(parts) = message.content_parts.as_ref() {
+                let joined: String = parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        bamboo_agent_core::MessagePart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if joined.trim().is_empty() {
+                    message.content.clone()
+                } else {
+                    joined
+                }
+            } else {
+                message.content.clone()
+            };
+            let truncated: String = raw.chars().take(MAX_USER_TEXT_FOR_TITLE).collect();
+            (!truncated.trim().is_empty()).then_some(truncated)
+        })
 }
 
 /// Run the LLM call to produce a title. Wrapped in a 30s timeout; any error
@@ -233,13 +208,7 @@ async fn try_llm_title(
 ) -> Result<String, String> {
     // Determine provider name (session-aware, with global config fallback) and resolve fast model.
     let config_snapshot = { state.config().read().await.clone() };
-    let provider_name = if let Some(ref m) = session.model_ref {
-        m.provider.clone()
-    } else if let Some(p) = session.provider_name() {
-        p
-    } else {
-        config_snapshot.provider.clone()
-    };
+    let provider_name = title_provider_name(&config_snapshot, session);
 
     let resolved = crate::model_config_helper::resolve_fast_model(
         &config_snapshot,
@@ -255,20 +224,33 @@ async fn try_llm_title(
         config_snapshot.stream_timeout,
         Some(&provider_name),
         Some(&model_name),
-    );
+    )
+    .begin_request();
 
     let fut = async move {
         let options = bamboo_llm::provider::LLMRequestOptions {
             request_purpose: Some("title_generation".to_string()),
             ..Default::default()
         };
-        let stream = provider
-            .chat_stream_with_options(&messages, &[], Some(64), &model_name, Some(&options))
-            .await
-            .map_err(|e| format!("chat_stream: {e}"))?;
+        let cancel_token = CancellationToken::new();
+        let stream = crate::runtime::stream::handler::await_stream_bootstrap(
+            provider.chat_stream_with_options(
+                &messages,
+                &[],
+                Some(64),
+                &model_name,
+                Some(&options),
+            ),
+            &cancel_token,
+            "title-gen",
+            &timeout_context,
+        )
+        .await
+        .map_err(|e| format!("chat_stream bootstrap: {e}"))?
+        .map_err(|e| format!("chat_stream: {e}"))?;
         let output = crate::runtime::stream::handler::consume_llm_stream_silent_with_context(
             stream,
-            &CancellationToken::new(),
+            &cancel_token,
             "title-gen",
             &timeout_context,
         )
@@ -280,6 +262,16 @@ async fn try_llm_title(
     timeout(Duration::from_secs(TITLE_GEN_TIMEOUT_SECS), fut)
         .await
         .map_err(|_| "title-gen LLM timeout".to_string())?
+}
+
+fn title_provider_name(config: &bamboo_config::Config, session: &Session) -> String {
+    if let Some(ref m) = session.model_ref {
+        m.provider.clone()
+    } else if let Some(p) = session.provider_name() {
+        p
+    } else {
+        config.effective_default_provider().to_string()
+    }
 }
 
 /// Trim, take first line, strip leading/trailing quotes/punctuation,

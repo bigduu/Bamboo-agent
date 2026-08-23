@@ -767,6 +767,13 @@ impl AgentRuntime {
             model_name: model,
             fast_model_name: fast_model.or_else(|| config.get_fast_model()),
             fast_model_provider,
+            auxiliary_evaluation_max_concurrency:
+                crate::runtime::config::normalize_auxiliary_evaluation_max_concurrency(
+                    config
+                        .extra
+                        .get("auxiliary_evaluation_max_concurrency")
+                        .and_then(serde_json::Value::as_u64),
+                ),
             background_model_name: background_model
                 .or_else(|| config.get_memory_background_model()),
             planning_model_name: config
@@ -794,7 +801,9 @@ impl AgentRuntime {
                 .or_else(|| config.get_task_summary_model()),
             background_model_provider,
             summarization_model_provider,
-            provider_name: Some(provider_name.unwrap_or_else(|| config.provider.clone())),
+            provider_name: Some(
+                provider_name.unwrap_or_else(|| config.effective_default_provider().to_string()),
+            ),
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,

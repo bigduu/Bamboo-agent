@@ -13,15 +13,20 @@ use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
 use super::build_sync_info_from_session;
-use super::response::{already_running_response, internal_server_error_response, started_response};
+use super::response::{
+    already_running_response, bad_request_error_response, internal_server_error_response,
+    started_response,
+};
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
     reserve_runner, spawn_agent_execution, spawn_event_forwarder, RunnerReservation,
     SpawnAgentExecution,
 };
 use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{resolve_gold_config, GOLD_CONFIG_METADATA_KEY};
-use bamboo_engine::session_app::provider_model::session_effective_model_ref;
+use bamboo_engine::model_config_helper::{
+    resolve_gold_config, resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
+};
+use bamboo_engine::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
 use bamboo_engine::session_app::types::ExecutionConfigSnapshot;
 use bamboo_engine::ImageFallbackConfig;
 use bamboo_llm::Config;
@@ -69,6 +74,52 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         disabled_skill_ids,
     } = context;
     let mut session = ready.session;
+
+    // Old sessions and compatibility clients may still persist a built-in
+    // provider type (for example `openai`) while the registry is keyed by a
+    // custom instance id. Canonicalize before reserving or saving the run, and
+    // require the exact target to be live. An unresolved explicit/session
+    // target must never fall through to the process-wide default provider.
+    let provider_override = if let Some(mut model_ref) = session_effective_model_ref(&session) {
+        let routing_key = match resolve_provider_routing_key(
+            config_snapshot,
+            &model_ref.provider,
+            &state.provider_registry,
+        ) {
+            Ok(routing_key) => routing_key,
+            Err(error) => {
+                let detail = format!("provider routing failed: {error}");
+                super::fail_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &detail,
+                    &mut *ready.startup_guard,
+                )
+                .await;
+                return bad_request_error_response(detail);
+            }
+        };
+        model_ref.provider = routing_key;
+        persist_model_ref(&mut session, &model_ref);
+        match state.provider_router.route(&model_ref) {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                let detail = format!("provider routing failed: {error}");
+                super::fail_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &detail,
+                    &mut *ready.startup_guard,
+                )
+                .await;
+                return bad_request_error_response(detail);
+            }
+        }
+    } else {
+        None
+    };
 
     // #74: re-derive the "no interactive human approver" posture per
     // user-initiated execute, OVERWRITING the session's persisted flag (see
@@ -129,19 +180,6 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
     );
 
-    // Kick off async auto-title generation for fresh, untitled sessions.
-    if crate::title_gen::is_untitled(&session.title)
-        && session
-            .messages
-            .iter()
-            .any(|m| matches!(m.role, bamboo_agent_core::Role::User))
-    {
-        crate::title_gen::spawn_title_generation(
-            state.clone().into_inner(),
-            session_id.to_string(),
-        );
-    }
-
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
     let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
     let resolved_provider_name = session_effective_model_ref(&session)
@@ -190,6 +228,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     spawn_event_forwarder(
         state.clone(),
         session_id.to_string(),
+        run_id.clone(),
         mpsc_rx,
         session_tx.clone(),
         gold_config.clone(),
@@ -207,7 +246,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         execution_reservation,
         is_child_session: ready.is_child_session,
         provider_name: resolved_provider_name,
-        provider_override: None,
+        provider_override,
         model_roster,
         reasoning_effort: ready.effective_reasoning_effort,
         reasoning_effort_source: ready.reasoning_source.to_string(),

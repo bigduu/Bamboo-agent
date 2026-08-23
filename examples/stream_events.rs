@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // -- Progress tracking --------------------------------------------
-            AgentEvent::TaskListUpdated { task_list } => {
+            AgentEvent::TaskListUpdated { task_list, .. } => {
                 println!("\n[task list updated] {} item(s)", task_list.items.len());
             }
 

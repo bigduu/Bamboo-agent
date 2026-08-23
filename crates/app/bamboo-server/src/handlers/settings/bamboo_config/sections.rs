@@ -154,6 +154,14 @@ pub struct ProviderInstanceSettingsData {
     /// Anthropic-compatible upstream opt-in introduced by #520.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_replay_always: Option<bool>,
+    /// Anthropic maximum output tokens retained from the legacy provider
+    /// contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Copilot device-flow browser behavior retained from the legacy provider
+    /// contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless_auth: Option<bool>,
 }
 
 fn provider_instance_enabled_default() -> bool {
@@ -199,6 +207,13 @@ impl ProviderInstanceSettingsData {
                         .and_then(Value::as_bool)
                 })
                 .flatten(),
+            max_tokens: (instance.provider_type == "anthropic")
+                .then(|| instance.extra.get("max_tokens").and_then(Value::as_u64))
+                .flatten()
+                .and_then(|value| u32::try_from(value).ok()),
+            headless_auth: (instance.provider_type == "copilot")
+                .then(|| instance.extra.get("headless_auth").and_then(Value::as_bool))
+                .flatten(),
         }
     }
 
@@ -218,6 +233,12 @@ impl ProviderInstanceSettingsData {
                 bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY.to_string(),
                 json!(explicit_prompt_cache),
             );
+        }
+        if let Some(max_tokens) = self.max_tokens {
+            extra.insert("max_tokens".to_string(), json!(max_tokens));
+        }
+        if let Some(headless_auth) = self.headless_auth {
+            extra.insert("headless_auth".to_string(), json!(headless_auth));
         }
         ProviderInstanceConfig {
             provider_type: self.provider_type,
@@ -272,7 +293,7 @@ pub async fn get_provider_section(
     let _io = app_state.config_io_lock.lock().await;
     let config = app_state.config.read().await.clone();
     let data = json!({
-        "active_provider": config.provider,
+        "active_provider": config.effective_default_provider(),
         "providers": provider_diagnostics(&config),
         "defaults": config.defaults,
         "features": config.features,
@@ -300,13 +321,17 @@ pub async fn get_provider_settings_section(
     macro_rules! builtin_status {
         ($name:literal, $field:ident, $from_env:expr) => {
             if let Some(provider) = config.providers().$field.as_ref() {
+                let environment_bound = $from_env;
+                let runtime_configured =
+                    !provider.api_key.trim().is_empty() || provider.api_key_encrypted.is_some();
                 builtin_status.insert(
                     $name.to_string(),
                     serde_json::to_value(provider_credential_status(
                         &app_state,
                         provider.credential_ref.as_ref(),
-                        $from_env,
-                        !provider.api_key.trim().is_empty() || provider.api_key_encrypted.is_some(),
+                        environment_bound,
+                        environment_bound && !provider.api_key.trim().is_empty(),
+                        runtime_configured,
                     )?)?,
                 );
             }
@@ -343,12 +368,14 @@ pub async fn get_provider_settings_section(
 
     let mut instance_status = Map::new();
     for (id, instance) in &config.provider_instances {
+        let environment_bound = bamboo_config::provider_instance_api_key_from_env(instance);
         instance_status.insert(
             id.clone(),
             serde_json::to_value(provider_credential_status(
                 &app_state,
                 instance.credential_ref.as_ref(),
-                false,
+                environment_bound,
+                bamboo_config::provider_instance_environment_override_active(instance),
                 !instance.api_key.trim().is_empty() || instance.api_key_encrypted.is_some(),
             )?)?,
         );
@@ -401,7 +428,7 @@ pub async fn put_provider_settings_section(
 
             let ProviderSettingsData {
                 provider,
-                providers,
+                mut providers,
                 defaults,
                 features,
                 provider_instances,
@@ -409,6 +436,25 @@ pub async fn put_provider_settings_section(
                 available_providers: _,
                 credential_status: _,
             } = data;
+
+            for (id, instance) in &provider_instances {
+                let Some(existing) = current.provider_instances.get(id) else {
+                    continue;
+                };
+                if existing.provider_type != instance.provider_type {
+                    return Err(ConfigSectionMutationError::Invalid(format!(
+                        "provider_type for existing provider instance '{id}' cannot be changed from '{}' to '{}'; create a new provider instance instead",
+                        existing.provider_type, instance.provider_type
+                    )));
+                }
+            }
+
+            let instance_native = default_provider_instance_id
+                .as_ref()
+                .is_some_and(|id| provider_instances.contains_key(id));
+            if instance_native {
+                providers.clear_legacy_builtin_aliases();
+            }
 
             for name in ["openai", "anthropic", "gemini", "bodhi"] {
                 if provider_exists(current.providers(), name) && !provider_exists(&providers, name)
@@ -439,6 +485,7 @@ pub async fn put_provider_settings_section(
                 candidate,
                 &credential_changes.provider_instances,
             )?;
+            validate_provider_settings_default(candidate)?;
             bamboo_llm::validate_provider_config(candidate).map_err(|error| {
                 ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
             })?;
@@ -755,12 +802,15 @@ fn sanitized_provider_instance_metadata(
     Ok(value)
 }
 
-fn scrub_unsafe_request_override_literals(value: &mut Value) {
+pub(crate) fn scrub_unsafe_request_override_literals(value: &mut Value) {
     match value {
         Value::Object(object) => {
             if let Some(headers) = object.get_mut("headers").and_then(Value::as_object_mut) {
                 headers.retain(|name, expression| {
-                    !is_sensitive_header_name(name) || is_external_template_reference(expression)
+                    !bamboo_config::request_override_header_is_credential(name)
+                        || bamboo_config::request_override_value_is_nonliteral_runtime_template(
+                            expression,
+                        )
                 });
             }
             if let Some(patches) = object.get_mut("body_patch").and_then(Value::as_array_mut) {
@@ -771,10 +821,10 @@ fn scrub_unsafe_request_override_literals(value: &mut Value) {
                     !patch
                         .get("path")
                         .and_then(Value::as_str)
-                        .is_some_and(is_sensitive_override_path)
-                        || patch
-                            .get("value")
-                            .is_none_or(is_external_template_reference)
+                        .is_some_and(bamboo_config::request_override_body_patch_targets_credential)
+                        || patch.get("value").is_none_or(
+                            bamboo_config::request_override_value_is_nonliteral_runtime_template,
+                        )
                 });
             }
             for value in object.values_mut() {
@@ -793,13 +843,22 @@ fn scrub_unsafe_request_override_literals(value: &mut Value) {
 fn provider_credential_status(
     app_state: &AppState,
     credential_ref: Option<&bamboo_config::CredentialRef>,
-    from_environment: bool,
+    environment_bound: bool,
+    environment_active: bool,
     runtime_configured: bool,
 ) -> Result<ProviderCredentialStatusView, AppError> {
+    if environment_active {
+        return Ok(ProviderCredentialStatusView {
+            credential_ref: credential_ref.map(|reference| reference.as_str().to_string()),
+            configured: true,
+            source: Some("environment".to_string()),
+            updated_at: None,
+        });
+    }
     if let Some(reference) = credential_ref {
         let status = app_state
             .credential_store
-            .status(reference)
+            .status_with_crypto_validation(reference)
             .map_err(|error| map_mutation_error(ConfigSectionMutationError::Store(error)))?;
         let source = status.configured.then_some(match status.source {
             bamboo_config::CredentialSource::User => "user",
@@ -816,8 +875,11 @@ fn provider_credential_status(
     }
     Ok(ProviderCredentialStatusView {
         credential_ref: None,
-        configured: from_environment || runtime_configured,
-        source: if from_environment {
+        // An env marker records a binding, not availability. Without an active
+        // variable or a stored fallback, stale in-memory plaintext cannot make
+        // the instance appear configured.
+        configured: !environment_bound && runtime_configured,
+        source: if environment_bound {
             Some("environment".to_string())
         } else if runtime_configured {
             Some("migrated".to_string())
@@ -839,6 +901,30 @@ fn provider_exists(providers: &ProviderConfigs, name: &str) -> bool {
     }
 }
 
+fn validate_provider_settings_default(
+    candidate: &bamboo_config::Config,
+) -> Result<(), ConfigSectionMutationError> {
+    let Some(default_id) = candidate.default_provider_instance.as_deref() else {
+        if candidate.provider_instances.is_empty()
+            || provider_exists(candidate.providers(), &candidate.provider)
+        {
+            return Ok(());
+        }
+        return Err(ConfigSectionMutationError::Invalid(format!(
+            "provider instances require a default_provider_instance_id when legacy provider '{}' is not configured",
+            candidate.provider
+        )));
+    };
+    if candidate.provider_instances.contains_key(default_id)
+        || provider_exists(candidate.providers(), default_id)
+    {
+        return Ok(());
+    }
+    Err(ConfigSectionMutationError::Invalid(format!(
+        "default provider instance '{default_id}' has no matching provider instance or legacy provider configuration"
+    )))
+}
+
 fn retain_provider_settings_server_owned_fields(
     current: &bamboo_config::Config,
     candidate: &mut bamboo_config::Config,
@@ -846,7 +932,7 @@ fn retain_provider_settings_server_owned_fields(
     // Unknown forward-compatible metadata is intentionally not exposed by the
     // network DTO because its contents cannot be classified as non-secret.
     // Preserve it from the process-owned snapshot just like credential refs.
-    candidate.providers_mut().extra = current.providers().extra.clone();
+    candidate.providers_mut().extra = secret_free_provider_extra(&current.providers().extra);
     macro_rules! retain_env_provider {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (
@@ -857,7 +943,7 @@ fn retain_provider_settings_server_owned_fields(
                 candidate.api_key_encrypted = current.api_key_encrypted.clone();
                 candidate.credential_ref = current.credential_ref.clone();
                 candidate.api_key_from_env = current.api_key_from_env;
-                candidate.extra = current.extra.clone();
+                candidate.extra = secret_free_provider_extra(&current.extra);
             }
         };
     }
@@ -871,13 +957,13 @@ fn retain_provider_settings_server_owned_fields(
         candidate.api_key = current.api_key.clone();
         candidate.api_key_encrypted = current.api_key_encrypted.clone();
         candidate.credential_ref = current.credential_ref.clone();
-        candidate.extra = current.extra.clone();
+        candidate.extra = secret_free_provider_extra(&current.extra);
     }
     if let (Some(current), Some(candidate)) = (
         current.providers().copilot.as_ref(),
         candidate.providers_mut().copilot.as_mut(),
     ) {
-        candidate.extra = current.extra.clone();
+        candidate.extra = secret_free_provider_extra(&current.extra);
     }
     for (id, instance) in &mut candidate.provider_instances {
         if let Some(current) = current.provider_instances.get(id) {
@@ -893,13 +979,34 @@ fn retain_provider_settings_server_owned_fields(
                         key.as_str(),
                         "target_provider"
                             | "thinking_replay_always"
+                            | "max_tokens"
+                            | "headless_auth"
                             | bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY
                     )
+                })
+                .filter(|(key, value)| {
+                    bamboo_config::provider_metadata_is_secret_free(&Value::Object(
+                        std::iter::once(((*key).clone(), (*value).clone())).collect(),
+                    ))
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             instance.extra.extend(editable_extra);
         }
+    }
+}
+
+fn secret_free_provider_extra(extra: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut value = Value::Object(
+        extra
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    bamboo_config::scrub_provider_metadata_credentials(&mut value);
+    match value {
+        Value::Object(extra) => extra.into_iter().collect(),
+        _ => BTreeMap::new(),
     }
 }
 
@@ -989,6 +1096,9 @@ fn apply_provider_instance_credential_changes(
                 ProviderCredentialChange::Replace { value } if !value.trim().is_empty() => {
                     instance.api_key = value.clone();
                     instance.api_key_encrypted = None;
+                    instance
+                        .extra
+                        .remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
                 }
                 ProviderCredentialChange::Replace { .. } => {
                     return Err(ConfigSectionMutationError::Invalid(format!(
@@ -998,6 +1108,9 @@ fn apply_provider_instance_credential_changes(
                 ProviderCredentialChange::Clear => {
                     instance.api_key.clear();
                     instance.api_key_encrypted = None;
+                    instance
+                        .extra
+                        .remove(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY);
                 }
             },
             None if matches!(change, ProviderCredentialChange::Clear) => {}
@@ -1042,6 +1155,16 @@ fn validate_provider_instance_shape(
         if instance.thinking_replay_always.is_some() && instance.provider_type != "anthropic" {
             return Err(format!(
                 "thinking_replay_always is only accepted for anthropic provider instance '{id}'"
+            ));
+        }
+        if instance.max_tokens.is_some() && instance.provider_type != "anthropic" {
+            return Err(format!(
+                "max_tokens is only accepted for anthropic provider instance '{id}'"
+            ));
+        }
+        if instance.headless_auth.is_some() && instance.provider_type != "copilot" {
+            return Err(format!(
+                "headless_auth is only accepted for copilot provider instance '{id}'"
             ));
         }
         if instance.explicit_prompt_cache.is_some() && instance.provider_type != "openai" {
@@ -1110,7 +1233,9 @@ fn reject_sensitive_header_literals(value: &Value) -> Result<(), String> {
         return Ok(());
     };
     for (name, expression) in headers {
-        if is_sensitive_header_name(name) && !is_external_template_reference(expression) {
+        if bamboo_config::request_override_header_is_credential(name)
+            && !bamboo_config::request_override_value_is_nonliteral_runtime_template(expression)
+        {
             return Err(format!(
                 "sensitive request override header '{name}' must use an env_ref or generated value"
             ));
@@ -1127,11 +1252,11 @@ fn reject_sensitive_body_patch_literals(value: &Value) -> Result<(), String> {
         let sensitive_path = patch
             .get("path")
             .and_then(Value::as_str)
-            .is_some_and(is_sensitive_override_path);
+            .is_some_and(bamboo_config::request_override_body_patch_targets_credential);
         if sensitive_path
-            && patch
-                .get("value")
-                .is_some_and(|value| !is_external_template_reference(value))
+            && patch.get("value").is_some_and(|value| {
+                !bamboo_config::request_override_value_is_nonliteral_runtime_template(value)
+            })
         {
             return Err(
                 "sensitive request override body values must use an env_ref or generated value"
@@ -1140,47 +1265,6 @@ fn reject_sensitive_body_patch_literals(value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn is_sensitive_header_name(name: &str) -> bool {
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
-    [
-        "authorization",
-        "api-key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn is_sensitive_override_path(path: &str) -> bool {
-    let normalized = path.to_ascii_lowercase();
-    [
-        "api_key",
-        "api-key",
-        "apikey",
-        "token",
-        "secret",
-        "password",
-        "authorization",
-        "cookie",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn is_external_template_reference(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    matches!(
-        object.get("type").and_then(Value::as_str),
-        Some("env_ref") | Some("generated")
-    ) && object.get("fallback").is_none_or(Value::is_null)
 }
 
 fn deserialize_provider_candidate<'de, D>(deserializer: D) -> Result<ProviderConfigs, D::Error>
@@ -1870,7 +1954,7 @@ mod tests {
         HeaderConfig, McpConfig, McpServerConfig, ReconnectConfig, StdioConfig,
         StreamableHttpConfig, TransportConfig,
     };
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::time::Duration;
 
     fn server(id: &str, transport: TransportConfig) -> McpServerConfig {
@@ -1885,6 +1969,83 @@ mod tests {
             allowed_tools: vec!["read".to_string()],
             denied_tools: vec!["delete".to_string()],
         }
+    }
+
+    #[actix_web::test]
+    async fn provider_instance_credential_intent_clears_environment_marker() {
+        let mut config = bamboo_config::Config::default();
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "api_key_from_env": true
+        }))
+        .unwrap();
+        instance.api_key = "sk-runtime-env".to_string();
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+
+        apply_provider_instance_credential_changes(
+            &mut config,
+            &BTreeMap::from([(
+                "work".to_string(),
+                ProviderCredentialChange::Replace {
+                    value: "sk-user".to_string(),
+                },
+            )]),
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &config.provider_instances["work"]
+        ));
+
+        config
+            .provider_instances
+            .get_mut("work")
+            .unwrap()
+            .extra
+            .insert(
+                bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.to_string(),
+                json!(true),
+            );
+        apply_provider_instance_credential_changes(
+            &mut config,
+            &BTreeMap::from([("work".to_string(), ProviderCredentialChange::Clear)]),
+        )
+        .unwrap();
+        assert!(!bamboo_config::provider_instance_api_key_from_env(
+            &config.provider_instances["work"]
+        ));
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_default_rejects_dangling_builtin_alias() {
+        let mut config = bamboo_config::Config::default();
+        *config.providers_mut() = ProviderConfigs::default();
+        config.default_provider_instance = Some("copilot".to_string());
+        assert!(matches!(
+            validate_provider_settings_default(&config),
+            Err(ConfigSectionMutationError::Invalid(_))
+        ));
+
+        config.providers_mut().copilot = Some(Default::default());
+        validate_provider_settings_default(&config)
+            .expect("an actual legacy stanza keeps the hybrid alias valid");
+
+        config.default_provider_instance = None;
+        config.provider = "anthropic".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            validate_provider_settings_default(&config),
+            Err(ConfigSectionMutationError::Invalid(_))
+        ));
     }
 
     fn editable_provider_settings() -> Value {
@@ -2021,14 +2182,50 @@ mod tests {
                     model: Some("diagnostic-model".to_string()),
                     request_overrides: Some(
                         serde_json::from_value(json!({
-                            "common": {"headers": {"Authorization": "override-header-secret"}}
+                            "common": {
+                                "headers": {
+                                    "Authorization": "override-header-secret",
+                                    "X-Access-Key": "override-access-key-secret",
+                                    "X-Private-Key": "override-private-key-secret",
+                                    "X-Device-Key": "override-device-key-secret",
+                                    "X-Client-Tokens": "override-client-tokens-secret"
+                                },
+                                "body_patch": [
+                                    {
+                                        "path": "/credential",
+                                        "value": "override-credential-secret"
+                                    },
+                                    {
+                                        "path": "/secrets/primary",
+                                        "value": "override-plural-secret"
+                                    },
+                                    {
+                                        "path": "/client_tokens/0",
+                                        "value": "override-client-token-body-secret"
+                                    }
+                                ]
+                            }
                         }))
                         .unwrap(),
                     ),
-                    extra: BTreeMap::from([(
-                        "future_secret".to_string(),
-                        json!("unknown-provider-secret"),
-                    )]),
+                    extra: BTreeMap::from([
+                        (
+                            "future_secret".to_string(),
+                            json!("unknown-provider-secret"),
+                        ),
+                        (
+                            "secrets".to_string(),
+                            json!({"primary": "unknown-provider-plural-secret"}),
+                        ),
+                        (
+                            "api_keys".to_string(),
+                            json!({"primary": "unknown-provider-api-keys-secret"}),
+                        ),
+                        (
+                            "client_tokens".to_string(),
+                            json!(["unknown-provider-client-token-secret"]),
+                        ),
+                    ]),
                     ..OpenAIConfig::default()
                 }),
                 ..ProviderConfigs::default()
@@ -2120,7 +2317,17 @@ mod tests {
             "provider-plaintext-secret",
             "provider-ciphertext-secret",
             "override-header-secret",
+            "override-access-key-secret",
+            "override-private-key-secret",
+            "override-device-key-secret",
+            "override-client-tokens-secret",
+            "override-client-token-body-secret",
+            "override-credential-secret",
+            "override-plural-secret",
             "unknown-provider-secret",
+            "unknown-provider-plural-secret",
+            "unknown-provider-api-keys-secret",
+            "unknown-provider-client-token-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",
@@ -2164,7 +2371,17 @@ mod tests {
             "provider-plaintext-secret",
             "provider-ciphertext-secret",
             "override-header-secret",
+            "override-access-key-secret",
+            "override-private-key-secret",
+            "override-device-key-secret",
+            "override-client-tokens-secret",
+            "override-client-token-body-secret",
+            "override-credential-secret",
+            "override-plural-secret",
             "unknown-provider-secret",
+            "unknown-provider-plural-secret",
+            "unknown-provider-api-keys-secret",
+            "unknown-provider-client-token-secret",
             "provider-url-secret",
             "query-secret",
             "****...****",
@@ -2473,7 +2690,6 @@ mod tests {
 
     #[actix_web::test]
     async fn provider_settings_round_trip_is_full_cas_and_credentials_are_explicit_and_redacted() {
-        let _key = bamboo_config::encryption::set_test_encryption_key([0x70; 32]);
         let dir = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
         let app = test::init_service(
@@ -2616,10 +2832,8 @@ mod tests {
         assert!(!updated_body.contains(hidden_forward_value));
         let updated: Value = serde_json::from_str(&updated_body).unwrap();
         assert_eq!(updated["revision"], 2);
-        assert_eq!(
-            updated["data"]["providers"]["openai"]["model"],
-            "gpt-edited"
-        );
+        assert_eq!(updated["data"]["providers"], json!({}));
+        assert_eq!(updated["data"]["credential_status"]["providers"], json!({}));
         assert_eq!(updated["data"]["defaults"]["fast"]["model"], "gpt-fast");
         assert_eq!(updated["data"]["features"]["provider_model_ref"], true);
         assert_eq!(updated["data"]["default_provider_instance_id"], "work");
@@ -2628,13 +2842,15 @@ mod tests {
             true
         );
 
+        let mut stale_data = updated["data"].clone();
+        stale_data["defaults"]["fast"]["model"] = json!("lost-update");
         let stale = test::call_service(
             &app,
             test::TestRequest::put()
                 .uri("/provider-settings")
                 .set_json(json!({
                     "expected_revision": 1,
-                    "data": editable_provider_settings()
+                    "data": stale_data
                 }))
                 .to_request(),
         )
@@ -2658,6 +2874,7 @@ mod tests {
         let mut cleared = updated["data"].clone();
         cleared["provider_instances"] = json!({});
         cleared["default_provider_instance_id"] = Value::Null;
+        cleared["providers"] = editable_provider_settings()["providers"].clone();
         let cleared = test::call_service(
             &app,
             test::TestRequest::put()
@@ -2666,6 +2883,10 @@ mod tests {
                     "expected_revision": 2,
                     "data": cleared,
                     "credential_changes": {
+                        "providers": {
+                            "openai": {"action": "replace", "value": openai_secret},
+                            "anthropic": {"action": "replace", "value": anthropic_secret}
+                        },
                         "provider_instances": {
                             "work": {"action": "clear"}
                         }
@@ -2684,6 +2905,19 @@ mod tests {
         assert_eq!(cleared["revision"], 3);
         assert!(cleared["data"]["provider_instances"]["work"].is_null());
         assert!(cleared["data"]["provider_instances"]["personal"].is_null());
+        state
+            .config
+            .write()
+            .await
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert(
+                "future_provider_metadata".to_string(),
+                json!(hidden_forward_value),
+            );
 
         let mut metadata_only = cleared["data"].clone();
         metadata_only["providers"]["openai"]["model"] = json!("gpt-metadata-only");
@@ -2774,6 +3008,600 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn instance_native_provider_settings_save_without_legacy_provider_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        {
+            let mut config = state.config.write().await;
+            config.provider = "anthropic".to_string();
+            *config.providers_mut() = serde_json::from_value(json!({
+                "openai": {"model": "stale-openai"},
+                "anthropic": {"model": "stale-anthropic"}
+            }))
+            .unwrap();
+        }
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let work_secret = "instance-native-work-secret";
+        let personal_secret = "instance-native-personal-secret";
+
+        let saved = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "anthropic",
+                        "providers": {},
+                        "defaults": {
+                            "chat": {"provider": "work", "model": "gpt-instance"},
+                            "fast": {"provider": "personal", "model": "claude-instance"}
+                        },
+                        "features": {
+                            "provider_model_ref": true,
+                            "dynamic_model_routing": false
+                        },
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "openai",
+                                "model": "gpt-instance",
+                                "enabled": true
+                            },
+                            "personal": {
+                                "provider_type": "anthropic",
+                                "model": "claude-instance",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "work"
+                    },
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "replace", "value": work_secret},
+                            "personal": {"action": "replace", "value": personal_secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = saved.status();
+        let body = String::from_utf8(test::read_body(saved).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected instance-native provider response {status}: {body}"
+        );
+        assert!(!body.contains(work_secret));
+        assert!(!body.contains(personal_secret));
+        let saved: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["data"]["providers"], json!({}));
+        assert_eq!(
+            saved["data"]["credential_status"]["provider_instances"]["work"]["configured"],
+            true
+        );
+        assert_eq!(
+            saved["data"]["credential_status"]["provider_instances"]["personal"]["configured"],
+            true
+        );
+
+        let no_op = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": saved["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = no_op.status();
+        let no_op_body = String::from_utf8(test::read_body(no_op).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "instance-native no-op save failed {status}: {no_op_body}"
+        );
+        assert!(!no_op_body.contains(work_secret));
+        assert!(!no_op_body.contains(personal_secret));
+        let no_op: Value = serde_json::from_str(&no_op_body).unwrap();
+        assert_eq!(no_op["revision"], 1);
+        assert_eq!(no_op["data"]["providers"], json!({}));
+
+        let round_trip = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": saved["data"].clone()
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = round_trip.status();
+        let round_trip_body =
+            String::from_utf8(test::read_body(round_trip).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "instance-native settings round trip failed {status}: {round_trip_body}"
+        );
+        assert!(!round_trip_body.contains(work_secret));
+        assert!(!round_trip_body.contains(personal_secret));
+        let round_trip: Value = serde_json::from_str(&round_trip_body).unwrap();
+        assert_eq!(round_trip["revision"], 1);
+        assert_eq!(round_trip["data"]["providers"], json!({}));
+
+        let root_document: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert!(root_document.get("provider").is_none());
+        assert!(root_document.get("providers").is_none());
+
+        let provider_document: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        let provider_data = &provider_document["data"];
+        assert!(provider_data.get("provider").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(
+                provider_data.get(key).is_none(),
+                "persisted legacy alias {key}"
+            );
+        }
+        assert_eq!(provider_data["default_provider_instance"], "work");
+        assert_eq!(provider_data["defaults"]["fast"]["provider"], "personal");
+        assert_eq!(provider_data["features"]["provider_model_ref"], true);
+        assert!(provider_data["provider_instances"]["work"].is_object());
+        assert!(provider_data["provider_instances"]["personal"].is_object());
+        let work_ref = CredentialRef::parse(
+            provider_data["provider_instances"]["work"]["credential_ref"]
+                .as_str()
+                .expect("work credential ref is durable")
+                .to_string(),
+        )
+        .unwrap();
+        let personal_ref = CredentialRef::parse(
+            provider_data["provider_instances"]["personal"]["credential_ref"]
+                .as_str()
+                .expect("personal credential ref is durable")
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&work_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            work_secret
+        );
+        assert_eq!(
+            state
+                .credential_store
+                .resolve(&personal_ref)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            personal_secret
+        );
+        let durable = std::fs::read_to_string(dir.path().join("providers.json")).unwrap();
+        assert!(!durable.contains(work_secret));
+        assert!(!durable.contains(personal_secret));
+
+        assert!(state.config.read().await.providers().openai.is_none());
+        assert!(state.config.read().await.providers().anthropic.is_none());
+        assert_eq!(state.config.read().await.provider_instances.len(), 2);
+
+        drop(app);
+        drop(state);
+        let restarted = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let restarted_health = restarted
+            .config_live_health
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            restarted_health.status,
+            SectionStatus::Healthy,
+            "provider restart health: {restarted_health:?}"
+        );
+        let restarted_config = restarted.config.read().await;
+        assert_eq!(
+            restarted_config.default_provider_instance.as_deref(),
+            Some("work")
+        );
+        assert_eq!(restarted_config.provider_instances.len(), 2);
+        assert_eq!(
+            restarted_config.provider_instances["work"].api_key,
+            work_secret
+        );
+        assert_eq!(
+            restarted_config.provider_instances["personal"].api_key,
+            personal_secret
+        );
+        assert!(restarted_config.providers().openai.is_none());
+        assert!(restarted_config.providers().anthropic.is_none());
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_rejects_provider_type_change_for_existing_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let secret = "immutable-provider-type-secret";
+
+        let created = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "openai",
+                        "providers": {},
+                        "defaults": null,
+                        "features": {},
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "openai",
+                                "model": "gpt-instance",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "work"
+                    },
+                    "credential_changes": {
+                        "provider_instances": {
+                            "work": {"action": "replace", "value": secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = created.status();
+        let body = String::from_utf8(test::read_body(created).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "unexpected provider settings response {status}: {body}"
+        );
+        let created: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(created["revision"], 1);
+        let credential_ref = created["data"]["credential_status"]["provider_instances"]["work"]
+            ["credential_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let providers_before = std::fs::read(dir.path().join("providers.json")).unwrap();
+        let credentials_before = std::fs::read(dir.path().join("credentials.json")).unwrap();
+
+        let mut changed = created["data"].clone();
+        changed["provider_instances"]["work"]["provider_type"] = json!("anthropic");
+        let rejected = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 1,
+                    "data": changed
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        let rejected_body = String::from_utf8(test::read_body(rejected).await.to_vec()).unwrap();
+        assert!(rejected_body.contains(
+            "provider_type for existing provider instance 'work' cannot be changed from 'openai' to 'anthropic'"
+        ));
+
+        let current = state.config.read().await;
+        let work = &current.provider_instances["work"];
+        assert_eq!(work.provider_type, "openai");
+        assert_eq!(work.api_key, secret);
+        assert_eq!(
+            work.credential_ref.as_ref().map(|value| value.as_str()),
+            Some(credential_ref.as_str())
+        );
+        drop(current);
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            providers_before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.json")).unwrap(),
+            credentials_before
+        );
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let response: Value = test::read_body_json(response).await;
+        assert_eq!(response["revision"], 1);
+        assert_eq!(
+            response["data"]["provider_instances"]["work"]["provider_type"],
+            "openai"
+        );
+    }
+
+    #[actix_web::test]
+    async fn hybrid_legacy_default_provider_settings_preserves_alias_until_restart_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new().app_data(state.clone()).service(
+                web::resource("/provider-settings")
+                    .route(web::get().to(get_provider_settings_section))
+                    .route(web::put().to(put_provider_settings_section)),
+            ),
+        )
+        .await;
+        let legacy_secret = "hybrid-legacy-openai-secret";
+
+        let saved = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri("/provider-settings")
+                .set_json(json!({
+                    "expected_revision": 0,
+                    "data": {
+                        "provider": "openai",
+                        "providers": {
+                            "openai": {"model": "gpt-legacy"}
+                        },
+                        "defaults": {
+                            "chat": {"provider": "openai", "model": "gpt-legacy"}
+                        },
+                        "features": {},
+                        "provider_instances": {
+                            "work": {
+                                "provider_type": "copilot",
+                                "enabled": true
+                            }
+                        },
+                        "default_provider_instance_id": "openai"
+                    },
+                    "credential_changes": {
+                        "providers": {
+                            "openai": {"action": "replace", "value": legacy_secret}
+                        }
+                    }
+                }))
+                .to_request(),
+        )
+        .await;
+        let status = saved.status();
+        let body = String::from_utf8(test::read_body(saved).await.to_vec()).unwrap();
+        assert!(
+            status.is_success(),
+            "hybrid legacy-default save failed {status}: {body}"
+        );
+        assert!(!body.contains(legacy_secret));
+        let saved: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["data"]["default_provider_instance_id"], "openai");
+        assert_eq!(saved["data"]["providers"]["openai"]["model"], "gpt-legacy");
+        assert!(saved["data"]["provider_instances"]["work"].is_object());
+
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        assert!(root.get("provider").is_none());
+        assert!(root.get("default_provider_instance").is_none());
+        let providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert_eq!(providers["data"]["provider"], "openai");
+        assert_eq!(providers["data"]["openai"]["model"], "gpt-legacy");
+        assert!(!std::fs::read_to_string(dir.path().join("providers.json"))
+            .unwrap()
+            .contains(legacy_secret));
+
+        drop(app);
+        drop(state);
+        let restarted = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let restarted_config = restarted.config.read().await;
+        assert_eq!(
+            restarted_config.default_provider_instance.as_deref(),
+            Some("openai")
+        );
+        assert!(restarted_config.provider_instances.contains_key("work"));
+        assert_eq!(restarted_config.provider_instances.len(), 2);
+        assert_eq!(
+            restarted_config
+                .provider_instances
+                .get("openai")
+                .expect("restart materializes the legacy default")
+                .api_key,
+            legacy_secret
+        );
+        assert_eq!(
+            restarted_config.provider_instances["openai"].provider_type,
+            "openai"
+        );
+        assert!(restarted_config.providers().openai.is_none());
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_environment_status_tracks_runtime_availability() {
+        let _openai = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-openai-environment"),
+        );
+        let _anthropic =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        {
+            let mut config = state.config.write().await;
+            for (id, provider_type, api_key) in [
+                ("available", "openai", "sk-runtime-openai-environment"),
+                ("missing", "gemini", "stale-runtime-value"),
+            ] {
+                let mut instance: ProviderInstanceConfig = serde_json::from_value(json!({
+                    "provider_type": provider_type,
+                    "enabled": true,
+                    "api_key_from_env": true
+                }))
+                .unwrap();
+                instance.api_key = api_key.to_string();
+                config.provider_instances.insert(id.to_string(), instance);
+            }
+        }
+        let app = test::init_service(App::new().app_data(state).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["data"]["credential_status"]["provider_instances"]["available"]["configured"],
+            true
+        );
+        assert_eq!(
+            body["data"]["credential_status"]["provider_instances"]["missing"]["configured"],
+            false
+        );
+        for id in ["available", "missing"] {
+            assert_eq!(
+                body["data"]["credential_status"]["provider_instances"][id]["source"],
+                "environment"
+            );
+            assert!(body["data"]["provider_instances"][id]
+                .get("api_key_from_env")
+                .is_none());
+        }
+    }
+
+    #[actix_web::test]
+    async fn provider_settings_environment_override_precedes_and_falls_back_to_stored_ref() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6a; 32]);
+        let openai = bamboo_config::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-openai-override"),
+        );
+        let _anthropic =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini =
+            bamboo_config::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
+        let dir = tempfile::tempdir().unwrap();
+        let facade = bamboo_config::ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let credential_ref =
+            CredentialRef::parse("provider.work.api_key").expect("valid credential ref");
+        bamboo_config::CredentialStore::open(dir.path())
+            .replace(
+                credential_ref.clone(),
+                "sk-stored-fallback",
+                bamboo_config::CredentialSource::Migrated,
+                0,
+            )
+            .unwrap();
+        let snapshot = facade.registry().providers.snapshot();
+        let mut providers = snapshot.data.as_ref().clone();
+        let instance: ProviderInstanceConfig = serde_json::from_value(json!({
+            "provider_type": "openai",
+            "model": "gpt-env-restart",
+            "enabled": true,
+            "api_key_from_env": true,
+            "credential_ref": credential_ref.as_str()
+        }))
+        .unwrap();
+        providers
+            .provider_instances
+            .insert("work".to_string(), instance);
+        providers.default_provider_instance = Some("work".to_string());
+        facade
+            .registry()
+            .providers
+            .commit(snapshot.revision, providers)
+            .unwrap();
+        drop(facade);
+
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert_eq!(
+            state.config.read().await.provider_instances["work"].api_key,
+            "sk-runtime-openai-override"
+        );
+        let app = test::init_service(App::new().app_data(state.clone()).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        let active = &body["data"]["credential_status"]["provider_instances"]["work"];
+        assert_eq!(active["configured"], true);
+        assert_eq!(active["source"], "environment");
+        assert_eq!(active["credential_ref"], credential_ref.as_str());
+
+        drop(app);
+        drop(state);
+        openai.replace(None);
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        assert_eq!(
+            state.config.read().await.provider_instances["work"].api_key,
+            "sk-stored-fallback"
+        );
+        let app = test::init_service(App::new().app_data(state).route(
+            "/provider-settings",
+            web::get().to(get_provider_settings_section),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/provider-settings")
+                .to_request(),
+        )
+        .await;
+        let body: Value = test::read_body_json(response).await;
+        let fallback = &body["data"]["credential_status"]["provider_instances"]["work"];
+        assert_eq!(fallback["configured"], true);
+        assert_eq!(fallback["source"], "migrated");
+        assert!(fallback["updated_at"].is_string());
+    }
+
+    #[actix_web::test]
     async fn provider_instance_runtime_fields_are_explicit_editable_and_preserve_unknown_metadata()
     {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x71; 32]);
@@ -2807,6 +3635,13 @@ mod tests {
                     "provider_type": "anthropic",
                     "label": "GLM compatible",
                     "thinking_replay_always": true,
+                    "max_tokens": 8192,
+                    "enabled": false
+                },
+                "copilot-cli": {
+                    "provider_type": "copilot",
+                    "label": "Copilot CLI",
+                    "headless_auth": true,
                     "enabled": false
                 },
                 "openai-proxy": {
@@ -2855,6 +3690,14 @@ mod tests {
             true
         );
         assert_eq!(
+            created["data"]["provider_instances"]["glm-compat"]["max_tokens"],
+            8192
+        );
+        assert_eq!(
+            created["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
+            true
+        );
+        assert_eq!(
             created["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"],
             false
         );
@@ -2869,10 +3712,22 @@ mod tests {
             .unwrap()
             .extra
             .insert("future_server_field".to_string(), json!(hidden_value));
+        let recovered_secret = "recovered-provider-extra-secret";
+        state
+            .config
+            .write()
+            .await
+            .provider_instances
+            .get_mut("bodhi-proxy")
+            .unwrap()
+            .extra
+            .insert("client_secret".to_string(), json!(recovered_secret));
 
         let mut updated = created["data"].clone();
         updated["provider_instances"]["bodhi-proxy"]["target_provider"] = json!("anthropic");
         updated["provider_instances"]["glm-compat"]["thinking_replay_always"] = json!(false);
+        updated["provider_instances"]["glm-compat"]["max_tokens"] = json!(4096);
+        updated["provider_instances"]["copilot-cli"]["headless_auth"] = json!(false);
         updated["provider_instances"]["openai-proxy"]["explicit_prompt_cache"] = json!(true);
         let updated = test::call_service(
             &app,
@@ -2885,6 +3740,7 @@ mod tests {
         assert!(updated.status().is_success());
         let updated_body = String::from_utf8(test::read_body(updated).await.to_vec()).unwrap();
         assert!(!updated_body.contains(hidden_value));
+        assert!(!updated_body.contains(recovered_secret));
         let updated: Value = serde_json::from_str(&updated_body).unwrap();
         assert_eq!(updated["revision"], 2);
         assert_eq!(
@@ -2893,6 +3749,14 @@ mod tests {
         );
         assert_eq!(
             updated["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"],
+            false
+        );
+        assert_eq!(
+            updated["data"]["provider_instances"]["glm-compat"]["max_tokens"],
+            4096
+        );
+        assert_eq!(
+            updated["data"]["provider_instances"]["copilot-cli"]["headless_auth"],
             false
         );
         assert_eq!(
@@ -2905,12 +3769,23 @@ mod tests {
                 config.provider_instances["bodhi-proxy"].extra["future_server_field"],
                 hidden_value
             );
+            assert!(!config.provider_instances["bodhi-proxy"]
+                .extra
+                .contains_key("client_secret"));
             assert_eq!(
                 config.provider_instances["bodhi-proxy"].extra["target_provider"],
                 "anthropic"
             );
             assert_eq!(
                 config.provider_instances["glm-compat"].extra["thinking_replay_always"],
+                false
+            );
+            assert_eq!(
+                config.provider_instances["glm-compat"].extra["max_tokens"],
+                4096
+            );
+            assert_eq!(
+                config.provider_instances["copilot-cli"].extra["headless_auth"],
                 false
             );
             assert_eq!(
@@ -2929,6 +3804,14 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("thinking_replay_always");
+        removed["provider_instances"]["glm-compat"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_tokens");
+        removed["provider_instances"]["copilot-cli"]
+            .as_object_mut()
+            .unwrap()
+            .remove("headless_auth");
         removed["provider_instances"]["openai-proxy"]
             .as_object_mut()
             .unwrap()
@@ -2948,6 +3831,8 @@ mod tests {
         assert!(
             removed["data"]["provider_instances"]["glm-compat"]["thinking_replay_always"].is_null()
         );
+        assert!(removed["data"]["provider_instances"]["glm-compat"]["max_tokens"].is_null());
+        assert!(removed["data"]["provider_instances"]["copilot-cli"]["headless_auth"].is_null());
         assert!(
             removed["data"]["provider_instances"]["openai-proxy"]["explicit_prompt_cache"]
                 .is_null()
@@ -2964,6 +3849,12 @@ mod tests {
             assert!(!config.provider_instances["glm-compat"]
                 .extra
                 .contains_key("thinking_replay_always"));
+            assert!(!config.provider_instances["glm-compat"]
+                .extra
+                .contains_key("max_tokens"));
+            assert!(!config.provider_instances["copilot-cli"]
+                .extra
+                .contains_key("headless_auth"));
             assert!(!config.provider_instances["openai-proxy"]
                 .extra
                 .contains_key(bamboo_config::OPENAI_EXPLICIT_PROMPT_CACHE_CONFIG_KEY));
@@ -2975,6 +3866,8 @@ mod tests {
             ("bodhi-proxy", "target_provider", json!("copilot")),
             ("glm-compat", "target_provider", json!("openai")),
             ("glm-compat", "explicit_prompt_cache", json!(false)),
+            ("openai-proxy", "max_tokens", json!(4096)),
+            ("openai-proxy", "headless_auth", json!(true)),
         ] {
             let mut invalid = removed["data"].clone();
             invalid["provider_instances"][id][field] = value;
@@ -3890,6 +4783,29 @@ mod tests {
             Some("external-user")
         );
         drop(live);
+        let caught_up_event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = feed.recv().await.unwrap();
+                if matches!(
+                    &event.event,
+                    bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                        | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                        if section == "core"
+                ) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("caught-up Core event");
+        assert!(matches!(
+            caught_up_event.event,
+            bamboo_agent_core::AgentEvent::ConfigChanged {
+                ref section,
+                revision: 1
+            } if section == "core"
+        ));
         let committed_event = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let event = feed.recv().await.unwrap();
@@ -3913,6 +4829,10 @@ mod tests {
                 revision: 2
             } if section == "core"
         ));
+        assert!(
+            caught_up_event.seq < committed_event.seq,
+            "bridged r1 must precede locally committed r2"
+        );
         let duplicate = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
                 let event = feed.recv().await.unwrap();
@@ -3930,7 +4850,30 @@ mod tests {
         .await;
         assert!(
             duplicate.is_err(),
-            "stale-local success must publish only committed r2"
+            "stale-local success must publish durable catch-up r1 then committed r2 exactly once"
+        );
+        let journaled =
+            bamboo_engine::events::journal::read_since(stale.account_sink.events_dir(), 0).unwrap();
+        let core_revisions = journaled
+            .iter()
+            .filter_map(|change| match &change.event {
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                    if section == "core" =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(core_revisions, vec![1, 2]);
+        assert_eq!(
+            journaled
+                .iter()
+                .map(|change| change.seq)
+                .collect::<HashSet<_>>()
+                .len(),
+            journaled.len(),
+            "shared journal sequence numbers must be globally unique"
         );
     }
 

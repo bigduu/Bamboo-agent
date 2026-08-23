@@ -1,46 +1,129 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::api::types::{
-    ListSessionsEnvelope, McpServer, PendingQuestion, ProviderCatalog, Schedule, Skill,
-    SkillDetail, ToolInfo,
+    CatalogModel, CommandDetail, CommandListResponse, ListSessionTreeEnvelope,
+    ListSessionsEnvelope, McpServer, PendingQuestion, PermissionDecisionResponse,
+    PermissionPolicyResponse, PlanModeState, ProviderCatalog, ReasoningEffort, Schedule,
+    SessionSummary, SessionTreeSummary, Skill, SkillDetail, SubagentSnapshotResponse,
+    TaskListResponse, ToolInfo,
 };
-use crate::app::OpenedSession;
+use crate::api::{
+    PermissionMutationFailure, RespondFailure, SessionMutationFailure, VersionedSession,
+};
+use crate::app::{OpenedSession, QuestionIdentity, SessionPickerIntent};
 
 /// Result of a background API call, delivered back to the event loop so the call
 /// never blocks the UI thread. `Err` carries a display string.
 type Loaded<T> = Result<T, String>;
+
+/// Successful completion of one of the three distinct input protocols. Keeping
+/// this typed prevents display labels such as "Approve" from driving control
+/// flow or selecting an endpoint.
+pub enum AnswerSubmissionOutcome {
+    Clarification { auto_resume_status: String },
+    Permission(PermissionDecisionResponse),
+    ChildApproval,
+}
 
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     /// Terminal resized; the next loop iteration redraws at the new size (the
     /// dimensions themselves aren't needed — ratatui re-measures on draw).
-    Resize,
+    Resize(u16, u16),
 
     // ── Non-blocking API results (posted by spawned tasks) ──
-    SessionsLoaded(Loaded<ListSessionsEnvelope>),
+    SessionsLoaded {
+        observation_epoch: u64,
+        result: Loaded<ListSessionsEnvelope>,
+    },
     McpServersLoaded(Loaded<Vec<McpServer>>),
     McpToolsLoaded(Loaded<Vec<ToolInfo>>),
     SchedulesLoaded(Loaded<Vec<Schedule>>),
     SkillsLoaded(Loaded<Vec<Skill>>),
     ConfigLoaded(Loaded<serde_json::Value>),
+    PermissionPolicyLoaded {
+        epoch: u64,
+        result: Loaded<PermissionPolicyResponse>,
+    },
+    PermissionRuleSaved {
+        epoch: u64,
+        result: Result<PermissionPolicyResponse, PermissionMutationFailure>,
+    },
+    PermissionRuleDeleted {
+        rule_id: String,
+        result: Result<PermissionPolicyResponse, PermissionMutationFailure>,
+    },
+    PermissionDiagnosed {
+        epoch: u64,
+        result: Loaded<serde_json::Value>,
+    },
+    PermissionModeLoaded {
+        epoch: u64,
+        session_id: String,
+        result: Loaded<VersionedSession>,
+    },
+    PermissionModePatched {
+        epoch: u64,
+        session_id: String,
+        result: Result<VersionedSession, SessionMutationFailure>,
+    },
+    ChildApprovalSnapshotLoaded {
+        epoch: u64,
+        session_id: String,
+        result: Loaded<SubagentSnapshotResponse>,
+    },
     /// A background mutation finished; the outcome is `Ok(success message)` or
     /// `Err(failure message)` so the receiver can classify it (info vs error)
     /// without sniffing the display text. `reload_tab` reloads the current tab.
     ActionDone {
         outcome: Loaded<String>,
         reload_tab: bool,
+        /// The contextual Session picker generation that originated this
+        /// action, if any. Generic background actions must never reload and
+        /// erase a newer picker/editor merely because they finish late.
+        session_picker_epoch: Option<u64>,
     },
-    /// A chat turn was created + started; carries the new session id.
-    ChatStarted(Loaded<String>),
+    /// A session DELETE finished. Unlike generic actions, this retains the
+    /// deleted id so Chat state can detach atomically when the operator
+    /// deleted the session currently shown beneath either session UI.
+    SessionDeleted {
+        session_id: String,
+        result: Loaded<()>,
+        session_picker_epoch: Option<u64>,
+    },
+    /// A schedule DELETE finished. Retaining the id prevents repeated confirm
+    /// keystrokes from issuing concurrent DELETE requests for the same row.
+    ScheduleDeleted {
+        schedule_id: String,
+        result: Loaded<()>,
+    },
+    /// A chat turn was created + started. The optimistic assistant turn id
+    /// binds this late HTTP result to the draft that originated it.
+    ChatStarted {
+        context_id: u64,
+        turn_id: String,
+        result: Loaded<String>,
+    },
     /// The `execute` POST that kicks off a run failed (server down, 4xx/5xx).
     /// Since no SSE terminal event will ever arrive for a run that never
     /// started, this is how `chat.streaming` gets unstuck.
-    ExecuteFailed(String),
+    ExecuteFailed {
+        session_id: String,
+        turn_id: String,
+        message: String,
+    },
     /// The background `stop` POST finished; `Err` still finalizes streaming
     /// locally (see `stop_streaming`) so the operator regains control even if
-    /// the server is unreachable.
-    StopFinished(Loaded<()>),
+    /// the server is unreachable. Session + stream generation bind the late
+    /// HTTP result to the run that originated it, so it cannot stop a newer
+    /// turn that started after a terminal SSE won the race.
+    StopFinished {
+        session_id: String,
+        turn_id: String,
+        stream_epoch: u64,
+        result: Loaded<()>,
+    },
     /// A skill's detail view finished loading (`Enter` on the Skills tab).
     SkillDetailLoaded(Loaded<SkillDetail>),
     /// A session resume (Sessions-tab `Enter` or `--session-id` at startup)
@@ -49,11 +132,53 @@ pub enum AppEvent {
     /// report which session failed to open.
     SessionOpened {
         session_id: String,
+        epoch: u64,
         result: Result<OpenedSession, String>,
     },
+    /// Authoritative task and plan snapshot for the active session. A single
+    /// epoch binds both reads so late responses cannot cross a session switch.
+    TaskPlanSnapshotLoaded {
+        epoch: u64,
+        session_id: String,
+        /// Plan event revision observed when the request started. A late HTTP
+        /// response cannot overwrite a newer live plan event.
+        plan_revision: u64,
+        result: Loaded<(TaskListResponse, Option<PlanModeState>)>,
+    },
+    /// One bounded, periodic status pass for cached sessions whose full SSE
+    /// subscription was evicted. Context id + stream epoch prevent an older
+    /// poll from overwriting a newly resumed/re-subscribed view.
+    BackgroundSessionStatusesLoaded {
+        epoch: u64,
+        observation_epoch: u64,
+        results: Vec<(u64, String, u64, Loaded<SessionSummary>)>,
+    },
     /// `Ctrl+Q` with no cached dismissed question found one on the server (or
-    /// confirmed there isn't one).
-    PendingQuestionChecked(Loaded<PendingQuestion>),
+    /// confirmed there isn't one). Session + epoch bind the async result to
+    /// the context that requested it so a late fetch cannot replace a newer
+    /// session/tool-call question.
+    PendingQuestionChecked {
+        session_id: String,
+        epoch: u64,
+        result: Loaded<PendingQuestion>,
+    },
+    /// Authoritative pending-question state fetched after an SSE handshake.
+    /// The epoch prevents a late fetch from replacing a question or answer
+    /// that changed while the request was in flight.
+    PendingQuestionReconciled {
+        session_id: String,
+        epoch: u64,
+        reconcile_epoch: u64,
+        result: Loaded<PendingQuestion>,
+    },
+    /// Server-state reconciliation after a rejected answer whose 400/409
+    /// status indicates the question may have changed or been consumed.
+    PendingQuestionRefreshed {
+        session_id: String,
+        epoch: u64,
+        identity: QuestionIdentity,
+        result: Loaded<PendingQuestion>,
+    },
     /// The answer POST for the pending question finished (`submit_answer`
     /// spawns it off the event loop — awaiting it inline froze the whole UI
     /// for the round-trip). `epoch` is the submission epoch captured when the
@@ -64,12 +189,82 @@ pub enum AppEvent {
     /// `result` carries the server's `auto_resume_status` on success.
     AnswerSubmitted {
         epoch: u64,
+        identity: QuestionIdentity,
         answer: String,
-        result: Loaded<String>,
+        result: Result<AnswerSubmissionOutcome, RespondFailure>,
     },
-    /// `Ctrl+O`'s provider-catalog fetch finished. Dropped by the handler if
-    /// `model_picker` was already closed (Esc) before this arrived.
-    CatalogLoaded(Loaded<ProviderCatalog>),
+    /// Session-aware command catalog loaded for an open palette. Both the
+    /// palette epoch and Session id must still match before it can replace the
+    /// visible server entries.
+    CommandCatalogLoaded {
+        epoch: u64,
+        session_id: Option<String>,
+        result: Loaded<CommandListResponse>,
+    },
+    /// Prompt/workflow preview resolution completed. Selection never sends a
+    /// chat turn; the matching handler only fills the composer draft.
+    CommandResolved {
+        epoch: u64,
+        session_id: Option<String>,
+        command_key: String,
+        result: Loaded<CommandDetail>,
+    },
+    /// `Ctrl+O`'s provider-catalog fetch finished. `epoch` makes close/reopen
+    /// safe when an older HTTP response arrives after the new overlay opened.
+    CatalogLoaded {
+        epoch: u64,
+        session_id: Option<String>,
+        result: Loaded<ProviderCatalog>,
+        /// Matching session snapshot + ETag when an existing session opened
+        /// the picker. `None` is the intentional new-session path.
+        session: Option<Loaded<VersionedSession>>,
+    },
+    /// Recoverable model PATCH result. The picker stays open until success so
+    /// query/selection and the chat draft survive validation/network errors.
+    ModelPatched {
+        epoch: u64,
+        session_id: String,
+        model: CatalogModel,
+        reasoning_effort: Option<ReasoningEffort>,
+        result: Result<VersionedSession, SessionMutationFailure>,
+    },
+    /// One lazily-loaded page for the contextual session picker. Pages are
+    /// requested serially and capped in memory; stale epochs are discarded.
+    SessionPickerPageLoaded {
+        epoch: u64,
+        offset: usize,
+        observation_epoch: u64,
+        result: Loaded<ListSessionsEnvelope>,
+    },
+    /// Relationship-rich detail for the session that opened the Sub-agents
+    /// inspector. It establishes the durable root before pages are reduced.
+    SubagentTreeRootLoaded {
+        epoch: u64,
+        active_session_id: String,
+        result: Loaded<SessionTreeSummary>,
+    },
+    /// One serialized page of the account session index. The tree scans the
+    /// bounded paginated source, then retains only the active root graph.
+    SubagentTreePageLoaded {
+        epoch: u64,
+        offset: usize,
+        result: Loaded<ListSessionTreeEnvelope>,
+    },
+    /// Fresh session summary + ETag loaded before a rename/pin mutation.
+    SessionPickerVersionLoaded {
+        epoch: u64,
+        session_id: String,
+        intent: SessionPickerIntent,
+        result: Loaded<VersionedSession>,
+    },
+    /// Optimistic rename/pin PATCH completed. A 412 remains typed so the UI
+    /// can preserve the draft and offer an explicit refetch/retry action.
+    SessionPickerPatched {
+        epoch: u64,
+        session_id: String,
+        intent: SessionPickerIntent,
+        result: Result<VersionedSession, SessionMutationFailure>,
+    },
     /// The auto-serve health-poll waiter finished: `Ok(pid)` once
     /// `client.health()` succeeded (carries the spawned server's pid, for the
     /// confirmation notice); `Err(message)` if it never became healthy within

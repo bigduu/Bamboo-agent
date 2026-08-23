@@ -15,6 +15,10 @@ const TOOL_MESSAGE_HEAD_BYTES: usize = 160 * 1024;
 const TOOL_MESSAGE_TAIL_BYTES: usize = 64 * 1024;
 const TOOL_MESSAGE_TRUNCATION_MARKER: &str = "[... tool output truncated ...]";
 
+fn default_title_generated() -> bool {
+    true
+}
+
 /// Message role in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -311,6 +315,42 @@ impl Message {
     }
 }
 
+/// Returns true if the message was synthesized by the runtime to resume a
+/// suspended session (child completion, retry, clarification, or gold
+/// auto-continue).
+///
+/// Runtime resume messages have one or both of the following stable markers:
+/// - `metadata.hidden_from_ui == true`
+/// - `metadata.runtime_kind` set to a known resume kind
+pub fn is_system_resume_message(message: &Message) -> bool {
+    if !matches!(message.role, Role::User) {
+        return false;
+    }
+    let Some(metadata) = message.metadata.as_ref() else {
+        return false;
+    };
+
+    if metadata
+        .get("hidden_from_ui")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    matches!(
+        metadata
+            .get("runtime_kind")
+            .and_then(|value| value.as_str()),
+        Some("child_completion_resume")
+            | Some("retry_resume")
+            | Some("conclusion_with_options_resume")
+            | Some("clarification_resume")
+            | Some("gold_continue_resume")
+            | Some("gold_goal_resume")
+    )
+}
+
 /// A pending question waiting for user response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -599,6 +639,12 @@ pub struct Session {
     pub pinned: bool,
     #[serde(default)]
     pub title_version: u64,
+    /// Whether the initial title lifecycle has been finalized. New root
+    /// sessions start pending (`false`); generated, fallback, and explicit
+    /// manual titles finalize it (`true`). Legacy sessions default to `true`
+    /// so an upgrade never overwrites an existing user-authored title.
+    #[serde(default = "default_title_generated")]
+    pub title_generated: bool,
     /// Authoritative UI metadata revision. Bumped by every authoritative
     /// metadata write (title / pinned / future replayable metadata fields).
     /// Runtime / non-authoritative paths must not bump this; they read it
@@ -651,6 +697,11 @@ pub struct Session {
     pub prompt_snapshot: Option<PromptSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compression_events: Vec<CompressionEvent>,
+    /// Durable, provider-neutral host-context timeline. Synthetic ledger events
+    /// are projected only into model requests and never exposed through
+    /// `messages` or the existing session API/UI transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_state: Option<crate::session::model_context::ModelContextState>,
     /// Custom instructions for conversation summarization at the session level.
     /// Overrides config-level `compression_instructions` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,6 +776,7 @@ impl Session {
             title: "New Session".to_string(),
             pinned: false,
             title_version: 0,
+            title_generated: false,
             metadata_version: 0,
             kind: SessionKind::Root,
             parent_session_id: None,
@@ -745,6 +797,7 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            model_context_state: None,
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -808,6 +861,7 @@ impl Session {
             title: title.into(),
             pinned: false,
             title_version: 0,
+            title_generated: true,
             metadata_version: 0,
             kind: SessionKind::Child,
             parent_session_id: Some(parent_session_id),
@@ -828,6 +882,7 @@ impl Session {
             conversation_summary: None,
             prompt_snapshot: None,
             compression_events: Vec::new(),
+            model_context_state: None,
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -876,6 +931,38 @@ impl Session {
         for message in &mut self.messages {
             message.compressed = false;
             message.compressed_by_event_id = None;
+        }
+        self.reset_model_context_epoch(
+            crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+    }
+
+    /// Mark a deliberate model-history rewrite. The next engine reconciliation
+    /// coalesces current host state into this new epoch before dispatch.
+    pub fn reset_model_context_epoch(
+        &mut self,
+        reason: crate::session::model_context::ModelContextResetReason,
+    ) {
+        let state = self
+            .model_context_state
+            .get_or_insert_with(Default::default);
+        // Several repair steps can participate in one deliberate history
+        // rewrite before another model request is dispatched. Coalesce those
+        // steps into the already-pending boundary instead of advancing through
+        // multiple unobservable epochs. The latest reason is the most precise
+        // description of the final rewrite that will be seeded next.
+        let reset_is_pending = state.cache_scope_sha256.is_none()
+            && state.baselines.is_empty()
+            && state.events.is_empty()
+            && state.transcript_item_sha256.is_empty()
+            && state.last_reset_reason.is_some();
+        if reset_is_pending {
+            if state.last_reset_reason != Some(reason) {
+                state.last_reset_reason = Some(reason);
+                state.advance_state_revision();
+            }
+        } else {
+            state.reset_epoch(reason);
         }
     }
 
@@ -1572,6 +1659,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_without_model_context_state_deserializes_unchanged() {
+        let original = Session::new("legacy-context-ledger", "test-model");
+        let mut json = serde_json::to_value(&original).unwrap();
+        json.as_object_mut().unwrap().remove("model_context_state");
+
+        let restored: Session = serde_json::from_value(json).unwrap();
+        assert!(restored.model_context_state.is_none());
+        assert!(restored.messages.is_empty());
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.model, original.model);
+    }
+
+    #[test]
+    fn new_root_session_starts_with_pending_title_generation() {
+        let session = Session::new("root-1", "m");
+        assert!(!session.title_generated);
+
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["title_generated"], serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn legacy_session_without_title_lifecycle_fails_safe_as_generated() {
+        let session = Session::new("legacy", "m");
+        let mut json = serde_json::to_value(&session).unwrap();
+        json.as_object_mut().unwrap().remove("title_generated");
+
+        let restored: Session = serde_json::from_value(json).unwrap();
+        assert!(restored.title_generated);
+    }
+
+    #[test]
     fn new_child_is_depth_one_under_root() {
         let root = Session::new("root-1", "m");
         let child = Session::new_child_of("child-1", &root, "m", "c");
@@ -1579,6 +1698,7 @@ mod tests {
         assert_eq!(child.parent_session_id.as_deref(), Some("root-1"));
         assert_eq!(child.root_session_id, "root-1");
         assert_eq!(child.spawn_depth, 1);
+        assert!(child.title_generated);
     }
 
     #[test]

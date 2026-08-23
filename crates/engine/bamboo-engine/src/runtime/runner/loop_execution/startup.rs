@@ -8,6 +8,8 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
 use bamboo_metrics::MetricsCollector;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use super::super::logging::DebugLogger;
 use crate::runtime::runner::state_bridge;
@@ -39,6 +41,11 @@ impl OverflowRecoveryState {
 
 pub(super) struct InFlightTaskEvaluation {
     pub(super) request: AsyncTaskEvaluationRequest,
+    /// Set only at the provider-dispatch boundary, after the low-priority
+    /// budget has admitted this request.
+    pub(super) metrics_started: Arc<AtomicBool>,
+    /// Exactly-once guard shared with the completed result.
+    pub(super) metrics_terminal: Arc<AtomicBool>,
     // `Option<..>` output: the spawned future `select!`s on the run's
     // `CancellationToken`, so a cancelled run yields `None` (the eval work was
     // dropped at an await point, stopping the wasted LLM spend) instead of a
@@ -69,6 +76,10 @@ pub(super) struct GoldEvaluationState {
 
 pub(super) struct LoopRunState {
     pub(super) session_id: String,
+    /// Collision-resistant namespace for metrics emitted by this logical
+    /// pipeline execution. Round counters restart on resume/re-execution, so
+    /// they are only unique within this private run scope.
+    pub(super) execution_id: String,
     pub(super) model_name: String,
     pub(super) metrics_collector: Option<MetricsCollector>,
     pub(super) debug_logger: DebugLogger,
@@ -194,6 +205,7 @@ pub(super) async fn initialize_loop_state(
 
     Ok(LoopRunState {
         session_id,
+        execution_id: crate::runtime::runner::round_prelude::new_execution_id(),
         model_name,
         metrics_collector,
         debug_logger,
@@ -212,10 +224,13 @@ mod tests {
     use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
-        FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema,
+        FunctionSchema, ToolCall, ToolExecutionSessionFlags, ToolExecutor, ToolResult, ToolSchema,
     };
     use bamboo_agent_core::Session;
-    use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+    use bamboo_domain::{
+        record_permission_audit, resolve_permission_mode, AgentRuntimeState, AgentStatusState,
+        PermissionAuditSeed, PermissionAuditSnapshot, PermissionMode, SessionPermissionMode,
+    };
     use bamboo_skills::runtime_metadata::{
         LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_ACTIVATION_GENERATION_KEY,
         SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY, SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
@@ -329,6 +344,59 @@ mod tests {
 
         assert_eq!(first.summarization_model_name.as_deref(), Some("sum-1"));
         assert_eq!(second.summarization_model_name.as_deref(), Some("sum-2"));
+    }
+
+    #[tokio::test]
+    async fn startup_carries_scheduled_auto_no_human_and_audit_into_fresh_loop_state() {
+        let mut session = Session::new("scheduled-startup", "model");
+        let runtime = session.agent_runtime_state.get_or_insert_default();
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        runtime.no_human_approver = true;
+        record_permission_audit(
+            &mut session.metadata,
+            &PermissionAuditSeed::bamboo_runtime(
+                17,
+                resolve_permission_mode(SessionPermissionMode::Auto, PermissionMode::Default),
+            ),
+            Some("2026-08-04T00:00:00Z"),
+        )
+        .unwrap();
+        let audit_before = PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap();
+        let tools = SuccessfulLoadSkill::default();
+        let config = AgentLoopConfig::default();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+
+        let loop_state =
+            initialize_loop_state(&mut session, "scheduled task", &config, &tools, &event_tx)
+                .await
+                .expect("scheduled startup");
+
+        for runtime in [
+            &loop_state.runtime_state,
+            session
+                .agent_runtime_state
+                .as_ref()
+                .expect("startup writes runtime state"),
+        ] {
+            assert_eq!(runtime.permission_mode, SessionPermissionMode::Auto);
+            assert!(
+                runtime.bypass_permissions,
+                "legacy Auto compatibility mirror"
+            );
+            assert!(runtime.no_human_approver);
+        }
+        assert_eq!(
+            ToolExecutionSessionFlags::from_session(&session),
+            ToolExecutionSessionFlags {
+                bypass_permissions: false,
+                auto_approve_permissions: true,
+                plan_read_only: false,
+            }
+        );
+        assert_eq!(
+            PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap(),
+            audit_before
+        );
     }
 
     #[tokio::test]

@@ -188,18 +188,14 @@ impl SessionRepository {
     /// The cache is refreshed cache-aside but with a no-regression guarantee:
     /// `load_merged` never overwrites a newer cached session with an older
     /// storage copy, so it is safe to call from hot read paths.
-    pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
+    pub async fn load_merged_checked(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         let _guard = self.persistence.acquire_lock(session_id).await;
         let memory_session = read_cached_session(&self.cache, session_id);
-        let storage_session = self
-            .storage
-            .load_session(session_id)
-            .await
-            .unwrap_or_default();
+        let storage_session = self.storage.load_session(session_id).await?;
         #[cfg(test)]
         self.run_post_durable_hook("load_merged", session_id);
 
-        match (memory_session, storage_session) {
+        Ok(match (memory_session, storage_session) {
             (Some(memory), Some(storage)) => {
                 let prefer_storage = should_prefer_storage(&memory, &storage);
                 let diverged = prefer_storage || memory.messages.len() != storage.messages.len();
@@ -253,6 +249,23 @@ impl SessionRepository {
                 Some(storage)
             }
             (None, None) => None,
+        })
+    }
+
+    /// Compatibility wrapper for read paths where the historical contract
+    /// treated a storage failure like absence. Mutating/recovery paths should
+    /// use [`Self::load_merged_checked`] so they can preserve retry state.
+    pub async fn load_merged(&self, session_id: &str) -> Option<Session> {
+        match self.load_merged_checked(session_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    "[{}] Failed to load merged session from storage: {}",
+                    session_id,
+                    error
+                );
+                read_cached_session(&self.cache, session_id)
+            }
         }
     }
 
@@ -273,6 +286,42 @@ impl SessionRepository {
         if let Err(error) = result {
             tracing::warn!("[{}] Failed to save session: {}", session.id, error);
         }
+    }
+
+    async fn refresh_cached_task_control_plane(&self, session_id: &str) {
+        match self.storage.load_runtime_control_plane(session_id).await {
+            Ok(Some(durable)) => {
+                if let Some(cached) = self.cache.get(session_id) {
+                    adopt_task_control_plane(&mut cached.write(), &durable);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                "[{}] Failed to refresh Task control-plane after write conflict: {}",
+                session_id,
+                error
+            ),
+        }
+    }
+}
+
+fn adopt_task_control_plane(target: &mut Session, durable: &Session) {
+    target.task_list = durable.task_list.clone();
+    target
+        .metadata
+        .remove(bamboo_domain::session::runtime_metadata::keys::TASK_LIST_VERSION);
+    if let Some(runtime_metadata) = target.runtime_metadata.as_mut() {
+        runtime_metadata.task_list_version = None;
+    }
+    if target
+        .runtime_metadata
+        .as_ref()
+        .is_some_and(bamboo_domain::session::SessionRuntimeMetadata::is_empty)
+    {
+        target.runtime_metadata = None;
+    }
+    if let Some(version) = durable.task_list_version_meta() {
+        target.set_task_list_version_meta(version);
     }
 }
 
@@ -404,7 +453,8 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         task_list: &bamboo_domain::TaskList,
         version: &str,
     ) -> std::io::Result<bool> {
-        self.persistence
+        let result = self
+            .persistence
             .update_task_list_control_plane_and_publish(session_id, task_list, version, |_| {
                 #[cfg(test)]
                 self.run_post_durable_hook("task", version);
@@ -420,6 +470,73 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                     cached.set_task_list_version_meta(version.to_string());
                 }
             })
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            // The storage final-CAS rejected this unconditional patch because
+            // an independent writer won. Refresh the winner into the cache but
+            // preserve the conflict result so Taskwrite never mistakes it for
+            // the Ok(false) legacy-persistence fallback signal.
+            self.refresh_cached_task_control_plane(session_id).await;
+        }
+        result
+    }
+
+    async fn update_task_list_control_plane_if_version(
+        &self,
+        session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.persistence
+            .update_task_list_control_plane_if_version_and_publish(
+                session_id,
+                expected_version,
+                expected_task_list,
+                task_list,
+                version,
+                |_| {
+                    if let Some(cached) = self.cache.get(session_id) {
+                        let mut cached = cached.write();
+                        cached.set_task_list(task_list.clone());
+                        cached.set_task_list_version_meta(version.to_string());
+                    }
+                },
+            )
+            .await
+    }
+
+    async fn update_task_list_control_planes_if_version(
+        &self,
+        session_id: &str,
+        shared_session_id: &str,
+        expected_version: &str,
+        expected_task_list: &bamboo_domain::TaskList,
+        task_list: &bamboo_domain::TaskList,
+        version: &str,
+    ) -> std::io::Result<bool> {
+        self.persistence
+            .update_task_list_control_planes_if_version_and_publish(
+                session_id,
+                shared_session_id,
+                expected_version,
+                expected_task_list,
+                task_list,
+                version,
+                |_, _| {
+                    for id in [session_id, shared_session_id] {
+                        if let Some(cached) = self.cache.get(id) {
+                            let mut cached = cached.write();
+                            cached.set_task_list(task_list.clone());
+                            cached.set_task_list_version_meta(version.to_string());
+                        }
+                    }
+                },
+            )
             .await
     }
 
@@ -486,12 +603,14 @@ mod tests {
     use bamboo_agent_core::storage::Storage;
     use chrono::Utc;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     #[derive(Default)]
     struct MapStorage {
         sessions: Mutex<HashMap<String, Session>>,
+        fail_pair_commit: AtomicBool,
     }
 
     struct FailingSaveStorage {
@@ -512,6 +631,62 @@ mod tests {
         }
         async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
             Ok(self.sessions.lock().unwrap().remove(session_id).is_some())
+        }
+
+        async fn save_task_control_plane_if_matches(
+            &self,
+            original: &Session,
+            updated: &Session,
+        ) -> std::io::Result<bool> {
+            let mut sessions = self.sessions.lock().unwrap();
+            let matches_original = sessions.get(&original.id).is_some_and(|current| {
+                current.task_list_version_meta() == original.task_list_version_meta()
+                    && serde_json::to_value(&current.task_list).ok()
+                        == serde_json::to_value(&original.task_list).ok()
+            });
+            if !matches_original {
+                return Ok(false);
+            }
+            let Some(current) = sessions.get(&original.id).cloned() else {
+                return Ok(false);
+            };
+            let mut committed = current;
+            committed.task_list = updated.task_list.clone();
+            if let Some(version) = updated.task_list_version_meta() {
+                committed.set_task_list_version_meta(version);
+            }
+            sessions.insert(committed.id.clone(), committed);
+            Ok(true)
+        }
+
+        async fn save_task_control_planes_atomically(
+            &self,
+            first_original: &Session,
+            first_updated: &Session,
+            second_original: &Session,
+            second_updated: &Session,
+        ) -> std::io::Result<bool> {
+            if self.fail_pair_commit.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other(
+                    "injected paired Task transaction failure",
+                ));
+            }
+            let mut sessions = self.sessions.lock().unwrap();
+            let matches_original = |current: Option<&Session>, original: &Session| {
+                current.is_some_and(|current| {
+                    current.task_list_version_meta() == original.task_list_version_meta()
+                        && serde_json::to_value(&current.task_list).ok()
+                            == serde_json::to_value(&original.task_list).ok()
+                })
+            };
+            if !matches_original(sessions.get(&first_original.id), first_original)
+                || !matches_original(sessions.get(&second_original.id), second_original)
+            {
+                return Ok(false);
+            }
+            sessions.insert(first_updated.id.clone(), first_updated.clone());
+            sessions.insert(second_updated.id.clone(), second_updated.clone());
+            Ok(true)
         }
     }
 
@@ -551,6 +726,140 @@ mod tests {
             items: Vec::new(),
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_task_cas_narrowly_updates_child_and_root_cache() {
+        let storage: Arc<dyn Storage> = Arc::new(MapStorage::default());
+        let repo = test_repo(storage.clone());
+        let root_id = "paired-cache-root";
+        let child_id = "paired-cache-child";
+        let expected_task_list = task_list(root_id, "old shared");
+
+        let mut root = Session::new(root_id, "model");
+        root.add_message(bamboo_agent_core::Message::user("root transcript"));
+        root.metadata
+            .insert("unrelated.root".to_string(), "keep".to_string());
+        root.set_task_list(expected_task_list.clone());
+        root.set_task_list_version_meta("1");
+        storage.save_session(&root).await.unwrap();
+        cache_put(&repo, &root);
+
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.add_message(bamboo_agent_core::Message::user("child transcript"));
+        child
+            .metadata
+            .insert("unrelated.child".to_string(), "keep".to_string());
+        child.set_task_list(expected_task_list.clone());
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.unwrap();
+        cache_put(&repo, &child);
+
+        assert!(
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+                &repo,
+                child_id,
+                root_id,
+                "1",
+                &expected_task_list,
+                &task_list(root_id, "evaluated"),
+                "2",
+            )
+            .await
+            .expect("paired cache CAS succeeds")
+        );
+
+        let cached_root = read_cached_session(repo.cache(), root_id).expect("cached root");
+        let cached_child = read_cached_session(repo.cache(), child_id).expect("cached child");
+        for (session, transcript, metadata_key) in [
+            (&cached_root, "root transcript", "unrelated.root"),
+            (&cached_child, "child transcript", "unrelated.child"),
+        ] {
+            assert_eq!(session.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(
+                session.task_list.as_ref().map(|list| list.title.as_str()),
+                Some("evaluated")
+            );
+            assert_eq!(session.messages.len(), 1);
+            assert_eq!(session.messages[0].content, transcript);
+            assert_eq!(
+                session.metadata.get(metadata_key).map(String::as_str),
+                Some("keep")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_paired_task_transaction_does_not_publish_child_or_root_cache() {
+        let concrete = Arc::new(MapStorage::default());
+        let storage: Arc<dyn Storage> = concrete.clone();
+        let repo = test_repo(storage.clone());
+        let root_id = "paired-cache-failure-root";
+        let child_id = "paired-cache-failure-child";
+        let expected_task_list = task_list(root_id, "old shared");
+
+        let mut root = Session::new(root_id, "model");
+        root.add_message(bamboo_agent_core::Message::user("root transcript"));
+        root.metadata
+            .insert("unrelated.root".to_string(), "keep".to_string());
+        root.set_task_list(expected_task_list.clone());
+        root.set_task_list_version_meta("1");
+        storage.save_session(&root).await.unwrap();
+        cache_put(&repo, &root);
+
+        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        child.add_message(bamboo_agent_core::Message::user("child transcript"));
+        child
+            .metadata
+            .insert("unrelated.child".to_string(), "keep".to_string());
+        child.set_task_list(expected_task_list.clone());
+        child.set_task_list_version_meta("1");
+        storage.save_session(&child).await.unwrap();
+        cache_put(&repo, &child);
+
+        concrete.fail_pair_commit.store(true, Ordering::SeqCst);
+        let error =
+            bamboo_domain::RuntimeSessionPersistence::update_task_list_control_planes_if_version(
+                &repo,
+                child_id,
+                root_id,
+                "1",
+                &expected_task_list,
+                &task_list(root_id, "must not publish"),
+                "2",
+            )
+            .await
+            .expect_err("paired durable transaction fails");
+        assert!(error.to_string().contains("injected paired"));
+
+        for (id, expected_title, transcript, metadata_key) in [
+            (root_id, "old shared", "root transcript", "unrelated.root"),
+            (
+                child_id,
+                "old shared",
+                "child transcript",
+                "unrelated.child",
+            ),
+        ] {
+            let cached = read_cached_session(repo.cache(), id).expect("cached session remains");
+            assert_eq!(cached.task_list_version_meta().as_deref(), Some("1"));
+            assert_eq!(
+                cached.task_list.as_ref().map(|list| list.title.as_str()),
+                Some(expected_title)
+            );
+            assert_eq!(cached.messages[0].content, transcript);
+            assert_eq!(
+                cached.metadata.get(metadata_key).map(String::as_str),
+                Some("keep")
+            );
+
+            let durable = storage.load_session(id).await.unwrap().unwrap();
+            assert_eq!(durable.task_list_version_meta().as_deref(), Some("1"));
+            assert_eq!(
+                durable.task_list.as_ref().map(|list| list.title.as_str()),
+                Some(expected_title)
+            );
         }
     }
 
@@ -1227,6 +1536,58 @@ mod tests {
                 1,
                 "{tier} must preserve the transcript"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_control_plane_save_keeps_checkpointed_ledger_in_durable_and_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("SessionStoreV2"),
+        );
+        let repo = test_repo(storage.clone());
+        let id = "control-plane-ledger-cache";
+        let mut initial = Session::new(id, "model");
+        initial.add_message(bamboo_agent_core::Message::user("durable transcript"));
+        storage.save_session(&initial).await.unwrap();
+        cache_put(&repo, &initial);
+        let mut stale = initial.clone();
+
+        let mut runner = initial;
+        runner.model_context_state = Some(bamboo_domain::ModelContextState {
+            state_revision: 1,
+            prefix_epoch: 1,
+            cache_scope_sha256: Some("scope".to_string()),
+            transcript_item_sha256: vec!["runner-l1".to_string()],
+            ..bamboo_domain::ModelContextState::default()
+        });
+        bamboo_domain::RuntimeSessionPersistence::checkpoint_runtime_session(&repo, &mut runner)
+            .await
+            .unwrap();
+
+        stale
+            .metadata
+            .insert("runtime.suspend_reason".to_string(), "waiting".to_string());
+        bamboo_domain::RuntimeSessionPersistence::save_runtime_control_plane(&repo, &mut stale)
+            .await
+            .unwrap();
+
+        let expected = runner.model_context_state;
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached session");
+        for (tier, session) in [("durable", durable), ("cache", cached)] {
+            assert_eq!(session.model_context_state, expected, "tier={tier}");
+            assert_eq!(
+                session
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .map(String::as_str),
+                Some("waiting"),
+                "tier={tier}"
+            );
+            assert_eq!(session.messages.len(), 1, "tier={tier}");
         }
     }
 

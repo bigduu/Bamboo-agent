@@ -1,8 +1,14 @@
 //! Shared SSE -> [`LLMStream`] adapter.
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::task::Poll;
+
 use eventsource_stream::Eventsource;
 use futures::stream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use reqwest::Response;
 use serde_json::Value;
 
@@ -58,7 +64,10 @@ where
 /// Like [`llm_stream_from_sse`], but the handler may emit **zero or more**
 /// chunks per SSE event; they are flattened into the stream in order. A valid
 /// event producing zero chunks becomes one [`LLMChunk::TransportActivity`]
-/// marker rather than disappearing from the transport watchdog.
+/// marker rather than disappearing from the transport watchdog. Successfully
+/// received, non-empty HTTP body chunks are observed before EventSource
+/// dispatch, so SSE comments and incomplete event fragments also retain
+/// transport liveness while remaining invisible to provider handlers.
 ///
 /// This is required for providers where a single SSE event must surface
 /// multiple logical chunks. The motivating case is Gemini: a final
@@ -72,20 +81,61 @@ pub fn llm_stream_from_sse_multi<H>(response: Response, mut handler: H) -> LLMSt
 where
     H: FnMut(&str, &str) -> Result<Vec<LLMChunk>> + Send + 'static,
 {
-    let stream = response
-        .bytes_stream()
-        .eventsource()
-        .map(move |event| {
-            let event = event.map_err(|e| LLMError::Stream(e.to_string()))?;
-            handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)
-        })
-        .flat_map(|result| {
-            stream::iter(match result {
-                Ok(chunks) if chunks.is_empty() => vec![Ok(LLMChunk::TransportActivity)],
-                Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
-                Err(err) => vec![Err(err)],
+    // `eventsource-stream` intentionally discards SSE comments and buffers
+    // incomplete event fragments. Observe the raw body first so those bytes
+    // can still refresh the independent transport watchdog (#787). A boolean
+    // coalesces any number of synchronously consumed fragments into at most
+    // one marker and cannot build an unbounded side queue.
+    let raw_body_activity = Arc::new(AtomicBool::new(false));
+    let observed_activity = Arc::clone(&raw_body_activity);
+    let observed_body = response.bytes_stream().map(move |result| {
+        if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
+            observed_activity.store(true, Ordering::Relaxed);
+        }
+        result
+    });
+
+    let mut parsed = Box::pin(
+        observed_body
+            .eventsource()
+            .map(move |event| {
+                let event = event.map_err(|e| LLMError::Stream(e.to_string()))?;
+                handler(event.event.as_str(), event.data.as_str()).map_err(to_stream_error)
             })
-        });
+            .flat_map(|result| {
+                stream::iter(match result {
+                    Ok(chunks) if chunks.is_empty() => vec![Ok(LLMChunk::TransportActivity)],
+                    Ok(chunks) => chunks.into_iter().map(Ok).collect::<Vec<_>>(),
+                    Err(err) => vec![Err(err)],
+                })
+            }),
+    );
+
+    // Poll the parser first. When it immediately produces an item, that item
+    // already counts as transport activity in the engine, so suppress the
+    // redundant raw marker. If comments/fragments made the parser return
+    // Pending (or EOF), surface exactly one internal marker first. The next
+    // poll then preserves the parser's original Pending/EOF/error contract.
+    let stream = stream::poll_fn(move |cx| match parsed.as_mut().poll_next(cx) {
+        Poll::Ready(Some(item)) => {
+            raw_body_activity.store(false, Ordering::Relaxed);
+            Poll::Ready(Some(item))
+        }
+        Poll::Ready(None) => {
+            if raw_body_activity.swap(false, Ordering::Relaxed) {
+                Poll::Ready(Some(Ok(LLMChunk::TransportActivity)))
+            } else {
+                Poll::Ready(None)
+            }
+        }
+        Poll::Pending => {
+            if raw_body_activity.swap(false, Ordering::Relaxed) {
+                Poll::Ready(Some(Ok(LLMChunk::TransportActivity)))
+            } else {
+                Poll::Pending
+            }
+        }
+    });
 
     Box::pin(stream)
 }
@@ -137,9 +187,30 @@ mod tests {
     use crate::providers::anthropic::{parse_anthropic_sse_event, AnthropicStreamState};
     use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict_multi;
     use crate::providers::common::openai_responses::ResponsesSseParser;
+    use bytes::Bytes;
     use futures::StreamExt;
     use serde_json::json;
-    // use http; // TODO: add http crate if needed
+
+    /// Build a body whose chunks are separated by an actual `Poll::Pending`.
+    /// This models network delivery and ensures the adapter has an opportunity
+    /// to surface liveness before an incomplete SSE event becomes dispatchable.
+    fn chunked_sse_response(chunks: Vec<Bytes>) -> Response {
+        let body_stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+            tokio::task::yield_now().await;
+            chunks
+                .next()
+                .map(|chunk| (Ok::<_, std::io::Error>(chunk), chunks))
+        });
+        let body = reqwest::Body::wrap_stream(body_stream);
+
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .expect("http response"),
+        )
+    }
 
     #[test]
     fn sse_error_is_present_distinguishes_real_errors_from_benign_markers() {
@@ -242,6 +313,105 @@ mod tests {
             .expect("keepalive should yield a liveness marker")
             .expect("keepalive should not fail the stream");
         assert!(matches!(chunk, LLMChunk::TransportActivity));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sse_comment_only_body_is_preserved_as_transport_activity() {
+        let response = chunked_sse_response(vec![Bytes::from_static(b": keep-alive\n\n")]);
+        let mut stream = llm_stream_from_sse(response, |_event, _data| {
+            panic!("SSE comments must not be dispatched to the provider handler")
+        });
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::TransportActivity))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_sse_fragments_refresh_transport_without_corrupting_utf8() {
+        let response = chunked_sse_response(vec![
+            Bytes::from_static(b"event: token\ndata: \xe4"),
+            Bytes::from_static(b"\xbd\xa0\xe5"),
+            Bytes::from_static(b"\xa5\xbd\n\n"),
+        ]);
+        let mut stream = llm_stream_from_sse(response, |event, data| {
+            Ok(Some(LLMChunk::Token(format!("{event}:{data}"))))
+        });
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::TransportActivity))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::TransportActivity))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::Token(text))) if text == "token:你好"
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_comment_then_completed_emits_one_done_without_trailing_activity() {
+        let response = chunked_sse_response(vec![
+            Bytes::from_static(b": keep-alive\n\n"),
+            Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\"}}\n\n",
+            ),
+        ]);
+        let mut parser = ResponsesSseParser::new();
+        let mut stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| parser.handle_event_multi(event, data),
+            "OpenAI Responses",
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("valid Responses stream"));
+        }
+
+        assert!(matches!(chunks.first(), Some(LLMChunk::TransportActivity)));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ResponseId(id) if id == "resp_done")));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::Done))
+                .count(),
+            1
+        );
+        assert!(matches!(chunks.last(), Some(LLMChunk::Done)));
+    }
+
+    #[tokio::test]
+    async fn responses_comment_then_eof_emits_activity_and_one_terminal_error() {
+        let response = chunked_sse_response(vec![Bytes::from_static(b": keep-alive\n\n")]);
+        let mut parser = ResponsesSseParser::new();
+        let mut stream = llm_stream_from_sse_multi_requiring_done(
+            response,
+            move |event, data| parser.handle_event_multi(event, data),
+            "OpenAI Responses",
+        );
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LLMChunk::TransportActivity))
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect("premature EOF error")
+            .expect_err("comment-only EOF cannot complete a Responses stream");
+        assert!(error
+            .to_string()
+            .contains("ended before a protocol terminal event"));
         assert!(stream.next().await.is_none());
     }
 

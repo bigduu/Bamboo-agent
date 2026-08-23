@@ -6,7 +6,7 @@ mod unified_handlers;
 
 pub use core_handlers::{
     by_model, daily, forward_by_endpoint, forward_requests, forward_summary, memory_summary,
-    memory_timeline, session_detail, sessions, summary, usage_breakdown,
+    memory_timeline, persistence, session_detail, sessions, summary, usage_breakdown,
 };
 pub use types::{
     CombinedSummary, ForwardMetricsQuery, McpServerUsageItem, McpToolUsageItem, MemoryMetricsQuery,

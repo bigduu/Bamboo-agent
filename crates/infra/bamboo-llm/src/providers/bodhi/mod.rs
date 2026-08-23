@@ -157,6 +157,10 @@ impl LLMProvider for BodhiProvider {
                 .await
             }
             "gemini" => {
+                crate::providers::common::validate_max_thinking_budget(
+                    reasoning_effort,
+                    max_output_tokens,
+                )?;
                 self.proxy_gemini(
                     messages,
                     tools,
@@ -259,11 +263,18 @@ impl BodhiProvider {
         use crate::providers::anthropic::{
             apply_required_tool_auto_fallback, apply_required_tool_choice, build_anthropic_request,
             looks_like_thinking_forced_tool_choice_error, parse_anthropic_sse_event,
-            reasoning_effort_for_required_tool, AnthropicStreamState,
+            reasoning_effort_for_budget_validation, reasoning_effort_for_required_tool,
+            AnthropicStreamState,
         };
 
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let reasoning_effort = reasoning_effort_for_required_tool(reasoning_effort, required_tool);
+        let budget_reasoning_effort =
+            reasoning_effort_for_budget_validation(reasoning_effort, messages, false);
+        crate::providers::common::validate_max_thinking_budget(
+            budget_reasoning_effort,
+            Some(max_tokens),
+        )?;
 
         let mut body = build_anthropic_request(
             messages,
@@ -351,7 +362,8 @@ impl BodhiProvider {
         use crate::protocol::gemini::GeminiRequest;
         use crate::protocol::ToProvider;
         use crate::providers::gemini::{
-            apply_required_tool_choice, parse_gemini_sse_event, GeminiStreamState,
+            apply_generation_config, apply_required_tool_choice, parse_gemini_sse_event,
+            GeminiStreamState,
         };
 
         let messages_vec: Vec<Message> = messages.to_vec();
@@ -362,25 +374,7 @@ impl BodhiProvider {
             request.tools = Some(tools_vec.to_provider()?);
         }
 
-        if max_output_tokens.is_some()
-            || reasoning_effort
-                .and_then(Self::thinking_budget_for_effort)
-                .is_some()
-        {
-            let mut generation_config = serde_json::Map::new();
-            if let Some(max_tokens) = max_output_tokens {
-                generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
-            }
-            if let Some(thinking_budget) =
-                reasoning_effort.and_then(Self::thinking_budget_for_effort)
-            {
-                generation_config.insert(
-                    "thinkingConfig".to_string(),
-                    json!({ "thinkingBudget": thinking_budget }),
-                );
-            }
-            request.generation_config = Some(serde_json::Value::Object(generation_config));
-        }
+        apply_generation_config(&mut request, max_output_tokens, reasoning_effort);
 
         // Serialize then run the last-moment scan over the body Value before send.
         let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
@@ -424,13 +418,12 @@ impl BodhiProvider {
         Ok(stream)
     }
 
-    fn thinking_budget_for_effort(effort: ReasoningEffort) -> Option<u32> {
-        match effort {
-            ReasoningEffort::Low => None,
-            ReasoningEffort::Medium => Some(1024),
-            ReasoningEffort::High => Some(4096),
-            ReasoningEffort::Xhigh | ReasoningEffort::Max => Some(8192),
-        }
+    #[cfg(test)]
+    fn thinking_budget_for_effort(
+        effort: ReasoningEffort,
+        max_output_tokens: Option<u32>,
+    ) -> Option<u32> {
+        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
     }
 }
 
@@ -443,6 +436,38 @@ mod tests {
     use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[test]
+    fn max_reasoning_uses_a_distinct_larger_gemini_thinking_budget() {
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, None),
+            Some(8_192)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, None),
+            Some(16_384)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(16_384)),
+            Some(8_192)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(16_384)),
+            Some(12_288)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(8_320)),
+            Some(4_160)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(8_320)),
+            Some(6_240)
+        );
+        assert_eq!(
+            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(1_024)),
+            None
+        );
+    }
 
     struct ThinkingToolChoiceResponder;
 
@@ -470,6 +495,25 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    fn unsigned_tool_loop_messages() -> Vec<Message> {
+        vec![
+            Message::user("run a tool"),
+            Message::assistant_with_reasoning(
+                "",
+                Some(vec![bamboo_domain::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_domain::FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"test"}"#.to_string(),
+                    },
+                }]),
+                Some("Foreign unsigned reasoning.".to_string()),
+            ),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ]
     }
 
     #[tokio::test]
@@ -563,5 +607,114 @@ mod tests {
         assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
         assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(fallback["tools"][0]["name"], "load_skill");
+    }
+
+    #[tokio::test]
+    async fn anthropic_required_tool_disables_max_before_small_budget_validation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic")
+            .with_reasoning_effort(Some(ReasoningEffort::Max));
+        let tools = vec![load_skill_tool()];
+        let options = LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                Some(2_048),
+                "claude-sonnet-4-5",
+                Some(&options),
+            )
+            .await
+            .expect("required tool should disable thinking before Max budget validation");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 2_048);
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "load_skill");
+    }
+
+    #[tokio::test]
+    async fn anthropic_max_without_required_tool_rejects_impossible_small_budget() {
+        let server = MockServer::start().await;
+        let provider = BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic")
+            .with_reasoning_effort(Some(ReasoningEffort::Max));
+
+        let result = provider
+            .chat_stream(
+                &[Message::user("hello")],
+                &[],
+                Some(2_048),
+                "claude-sonnet-4-5",
+            )
+            .await;
+
+        match result {
+            Err(LLMError::Api(message)) => {
+                assert!(message.contains("requires max_output_tokens of at least 2049"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("impossible Max budget should fail before the request"),
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn anthropic_unsigned_tool_turn_disables_max_before_small_budget_validation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic")
+            .with_reasoning_effort(Some(ReasoningEffort::Max));
+
+        let _stream = provider
+            .chat_stream(
+                &unsigned_tool_loop_messages(),
+                &[],
+                Some(2_048),
+                "claude-sonnet-4-5",
+            )
+            .await
+            .expect("unsigned tool turn should disable thinking before Max validation");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 2_048);
     }
 }

@@ -23,18 +23,11 @@ pub async fn update_keyword_masking_config(
             ConfigUpdateEffects {
                 // Best-effort: keyword masking is a UX feature and should remain configurable
                 // even when the provider is not yet configured.
-                reload_provider: false,
-                reconcile_mcp: false,
+                reload_provider: bamboo_config::patch::ReloadMode::BestEffort,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
         )
         .await?;
-
-    if let Err(error) = app_state.reload_provider().await {
-        tracing::warn!(
-            "Keyword masking updated but provider reload failed: {}",
-            error
-        );
-    }
 
     Ok(HttpResponse::Ok().json(KeywordMaskingResponse::new(config.entries)))
 }

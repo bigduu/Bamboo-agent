@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Largest token counter that can be represented losslessly by the signed
+/// 64-bit integer columns used by durable metrics stores.
+///
+/// Keeping this boundary beside the shared value object lets runtime budgets
+/// and persistence apply one policy instead of allowing `u64 as i64` wraparound
+/// or storage-specific divergence.
+pub const MAX_DURABLE_TOKEN_COUNT: u64 = i64::MAX as u64;
+
 /// Token consumption statistics for a single LLM call or aggregated period.
 ///
 /// This is a stable, cross-layer value object. Every crate that needs to
@@ -30,6 +38,38 @@ impl TokenUsage {
     /// Recompute `total_tokens` from the two component fields.
     pub fn recompute_total(&mut self) {
         self.total_tokens = self.prompt_tokens.saturating_add(self.completion_tokens);
+    }
+
+    /// Normalize all counters to the lossless signed-64 durable range.
+    ///
+    /// Components saturate independently and the total is recomputed from the
+    /// saturated components, then saturated to the same boundary. This makes
+    /// the policy deterministic even if an upstream supplied an inconsistent
+    /// total and keeps round, session, and runtime views reconcilable.
+    pub fn clamped_for_durable_metrics(mut self) -> Self {
+        self.prompt_tokens = self.prompt_tokens.min(MAX_DURABLE_TOKEN_COUNT);
+        self.completion_tokens = self.completion_tokens.min(MAX_DURABLE_TOKEN_COUNT);
+        self.total_tokens = self
+            .prompt_tokens
+            .saturating_add(self.completion_tokens)
+            .min(MAX_DURABLE_TOKEN_COUNT);
+        self
+    }
+
+    /// Accumulate usage with the same saturation policy used by durable stores.
+    pub fn add_assign_durable(&mut self, other: TokenUsage) {
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(other.prompt_tokens)
+            .min(MAX_DURABLE_TOKEN_COUNT);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens)
+            .min(MAX_DURABLE_TOKEN_COUNT);
+        self.total_tokens = self
+            .prompt_tokens
+            .saturating_add(self.completion_tokens)
+            .min(MAX_DURABLE_TOKEN_COUNT);
     }
 }
 
@@ -72,5 +112,37 @@ mod tests {
         };
         usage.recompute_total();
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn durable_metrics_policy_clamps_components_and_recomputes_total() {
+        let usage = TokenUsage {
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX,
+            total_tokens: 1,
+        }
+        .clamped_for_durable_metrics();
+
+        assert_eq!(usage.prompt_tokens, MAX_DURABLE_TOKEN_COUNT);
+        assert_eq!(usage.completion_tokens, MAX_DURABLE_TOKEN_COUNT);
+        assert_eq!(usage.total_tokens, MAX_DURABLE_TOKEN_COUNT);
+    }
+
+    #[test]
+    fn durable_accumulation_saturates_without_wraparound() {
+        let mut usage = TokenUsage {
+            prompt_tokens: MAX_DURABLE_TOKEN_COUNT - 2,
+            completion_tokens: MAX_DURABLE_TOKEN_COUNT - 3,
+            total_tokens: MAX_DURABLE_TOKEN_COUNT,
+        };
+        usage.add_assign_durable(TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+        });
+
+        assert_eq!(usage.prompt_tokens, MAX_DURABLE_TOKEN_COUNT);
+        assert_eq!(usage.completion_tokens, MAX_DURABLE_TOKEN_COUNT);
+        assert_eq!(usage.total_tokens, MAX_DURABLE_TOKEN_COUNT);
     }
 }

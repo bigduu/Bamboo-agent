@@ -64,6 +64,10 @@ jobs:
       - name: Run integration tests
         run: cargo test --tests
 
+      - name: Run real SSH/SFTP transport test
+        timeout-minutes: 10
+        run: scripts/run-russh-live.sh
+
       - name: Build examples
         # Compile-only (no network/config needed): guards `examples/*.rs` —
         # and the README SDK snippet each one's doc comment mirrors — against
@@ -121,7 +125,12 @@ jobs:
       - name: Verify OpenSSL
         run: openssl version
 
+      - name: Run TLS fixture tests (macOS unwind guard)
+        if: runner.os == 'macOS'
+        run: scripts/run-macos-server-lib-tests.sh
+
       - name: Run TLS fixture tests
+        if: runner.os != 'macOS'
         run: cargo test --locked -p bamboo-server --lib server::tls::tests -- --nocapture
 
   e2e-test:
@@ -264,7 +273,10 @@ jobs:
         # discovery path — a bare root-level `audit.toml` is NOT picked up),
         # where each entry carries a justification and a re-check trigger
         # instead of being a silent, undocumented flag (bamboo-agent#254).
-        run: cargo audit
+        # Deny every other warning as well as vulnerabilities so a newly
+        # introduced unsound, unmaintained, or yanked dependency cannot leave
+        # this required security job green without an explicit review.
+        run: cargo audit --deny warnings
 
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)

@@ -1,10 +1,50 @@
-use super::super::{ForwardMetricsQuery, MetricsSessionsQuery};
+use chrono::NaiveDate;
+
+use super::super::{
+    ForwardMetricsQuery, MetricsDailyQuery, MetricsSessionsQuery, MetricsSummaryQuery,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TimelineGranularity {
+pub(in crate::handlers::agent::metrics) enum TimelineGranularity {
     Daily,
     Weekly,
     Monthly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handlers::agent::metrics) struct ChatTimelineFilter {
+    pub days: u32,
+    pub end_date: Option<NaiveDate>,
+    pub model: Option<String>,
+}
+
+pub(in crate::handlers::agent::metrics) fn normalize_model_filter(
+    model: Option<&str>,
+) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+pub(in crate::handlers::agent::metrics) fn build_summary_filter(
+    query: &MetricsSummaryQuery,
+) -> bamboo_metrics::ModelMetricsDateFilter {
+    bamboo_metrics::ModelMetricsDateFilter {
+        start_date: query.start_date,
+        end_date: query.end_date,
+        model: normalize_model_filter(query.model.as_deref()),
+    }
+}
+
+pub(in crate::handlers::agent::metrics) fn build_chat_timeline_filter(
+    query: &MetricsDailyQuery,
+) -> ChatTimelineFilter {
+    ChatTimelineFilter {
+        days: normalize_days(query.days),
+        end_date: query.end_date,
+        model: normalize_model_filter(query.model.as_deref()),
+    }
 }
 
 pub(super) fn build_sessions_filter(
@@ -13,7 +53,7 @@ pub(super) fn build_sessions_filter(
     bamboo_metrics::SessionMetricsFilter {
         start_date: query.start_date,
         end_date: query.end_date,
-        model: query.model.clone(),
+        model: normalize_model_filter(query.model.as_deref()),
         limit: normalize_limit(query.limit),
     }
 }
@@ -25,7 +65,7 @@ pub(super) fn build_forward_filter(
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: query.endpoint.clone(),
-        model: query.model.clone(),
+        model: normalize_model_filter(query.model.as_deref()),
         limit: normalize_limit(query.limit),
     }
 }
@@ -37,12 +77,12 @@ pub(super) fn build_forward_grouped_filter(
         start_date: query.start_date,
         end_date: query.end_date,
         endpoint: None,
-        model: query.model.clone(),
+        model: normalize_model_filter(query.model.as_deref()),
         limit: normalize_limit(query.limit),
     }
 }
 
-pub(super) fn normalize_days(days: Option<u32>) -> u32 {
+pub(in crate::handlers::agent::metrics) fn normalize_days(days: Option<u32>) -> u32 {
     days.unwrap_or(30).clamp(1, 365)
 }
 
@@ -60,7 +100,9 @@ pub(super) fn normalize_limit(limit: Option<u32>) -> Option<u32> {
     )
 }
 
-pub(super) fn resolve_timeline_granularity(value: Option<&str>) -> TimelineGranularity {
+pub(in crate::handlers::agent::metrics) fn resolve_timeline_granularity(
+    value: Option<&str>,
+) -> TimelineGranularity {
     match value.unwrap_or("daily") {
         "weekly" => TimelineGranularity::Weekly,
         "monthly" => TimelineGranularity::Monthly,

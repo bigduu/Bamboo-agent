@@ -4,6 +4,7 @@
 //! Eliminates the proxy pattern by using unified AppState
 
 mod entrypoints;
+mod h1;
 mod listeners;
 mod tls;
 mod web_service;

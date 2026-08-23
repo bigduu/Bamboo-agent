@@ -954,7 +954,7 @@ impl Tool for LoadSkillTool {
                     ))
                 })?;
         }
-        let (skill, skill_root, revision, resources, payload_descriptor) = store
+        let (skill, _skill_root, revision, _resources, payload_descriptor) = store
             .get_pinned_skill_with_root_and_descriptor(session_id, skill_id)
             .await
             .map_err(|err| {
@@ -980,19 +980,6 @@ impl Tool for LoadSkillTool {
                     .to_string(),
             ));
         }
-        let restored_snapshot = store.activation_was_restored(session_id).await;
-        let canonical_skill_root = if restored_snapshot
-            || catalog_entry.migration_status
-                == Some(bamboo_skills::LegacyWorkflowMigrationStatus::Available)
-        {
-            None
-        } else {
-            Some(
-                tokio::fs::canonicalize(&skill_root)
-                    .await
-                    .unwrap_or(skill_root),
-            )
-        };
         let mut session = self
             .access
             .session_for_context(Some(session_id))
@@ -1061,25 +1048,6 @@ impl Tool for LoadSkillTool {
             block.status == bamboo_skills::WorkflowActivationStatus::Degraded
                 && block.stop_on_failure
         });
-        let payload = json!({
-            "skill_id": skill.id.clone(),
-            "revision": revision,
-            "name": skill.name.clone(),
-            "description": skill.description.clone(),
-            "license": skill.license.clone(),
-            "compatibility": skill.compatibility.clone(),
-            "allowed_tools": skill.tool_refs.clone(),
-            "instructions": skill.prompt.clone(),
-            "skill_base_dir": canonical_skill_root
-                .as_ref()
-                .map(|root| bamboo_config::paths::path_to_display_string(root)),
-            "snapshot_provenance": if restored_snapshot { "durable_session_lkg" } else { "live_catalog_pin" },
-            "resource_files": resources,
-            "dynamic_context": dynamic_context.clone(),
-            // Non-stopping provider degradation is carried inside the typed
-            // runtime blocks while the workflow itself remains active.
-            "activation_status": if activation_stopped { "degraded" } else { "active" },
-        });
         if activation_stopped {
             session.metadata.insert(
                 bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY.to_string(),
@@ -1101,17 +1069,35 @@ impl Tool for LoadSkillTool {
             .await?;
             return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
-                result: payload.to_string(),
+                // Public transports and durable Tool messages receive only
+                // this typed receipt. Instructions, resources, paths,
+                // arguments and dynamic provider output remain in the
+                // session's runtime-only activation authority.
+                result: json!({
+                    "skill_id": skill.id,
+                    "revision": revision,
+                    "source": catalog_entry.source,
+                    "kind": catalog_entry.kind,
+                    "activation_status": "degraded",
+                })
+                .to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
             }));
         }
+        let receipt = json!({
+            "skill_id": skill.id.clone(),
+            "revision": revision,
+            "source": catalog_entry.source,
+            "kind": catalog_entry.kind,
+            "activation_status": "active",
+        });
         let canonical_context = json!({
             "id": skill.id,
             "revision": revision,
             "selection": session.metadata.get(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY),
             "instructions": skill.prompt,
-            "dynamic_context": payload.get("dynamic_context"),
+            "dynamic_context": dynamic_context,
         });
         let fingerprint = hex::encode(Sha256::digest(canonical_context.to_string().as_bytes()));
         let mut loaded_ids = session
@@ -1152,7 +1138,7 @@ impl Tool for LoadSkillTool {
             .await?;
             return Ok(ToolOutcome::Completed(ToolResult {
                 success: true,
-                result: payload.to_string(),
+                result: receipt.to_string(),
                 display_preference: Some("Collapsible".to_string()),
                 images: Vec::new(),
             }));
@@ -1189,8 +1175,9 @@ impl Tool for LoadSkillTool {
                     result: json!({
                         "skill_id": skill_id,
                         "revision": revision,
+                        "source": catalog_entry.source,
+                        "kind": catalog_entry.kind,
                         "activation_status": "degraded",
-                        "diagnostic": diagnostic,
                     })
                     .to_string(),
                     display_preference: Some("Collapsible".to_string()),
@@ -1236,7 +1223,7 @@ impl Tool for LoadSkillTool {
 
         Ok(ToolOutcome::Completed(ToolResult {
             success: true,
-            result: payload.to_string(),
+            result: receipt.to_string(),
             display_preference: Some("Collapsible".to_string()),
             images: Vec::new(),
         }))

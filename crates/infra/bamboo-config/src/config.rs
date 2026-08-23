@@ -61,7 +61,7 @@ use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::keyword_masking::KeywordMaskingConfig;
@@ -1999,6 +1999,27 @@ impl From<ConfigRoot> for ConfigValues {
     }
 }
 
+/// Serialize the root-only durable document.
+///
+/// Public `Config` serialization intentionally retains the historical
+/// compatibility shape, including the legacy `provider` selector. Durable
+/// instance-native writes are narrower: the explicit instance default is the
+/// routing authority, so legacy routing fields must not be written back.
+fn durable_root_value(values: ConfigValues) -> serde_json::Result<Value> {
+    let instance_native = values
+        .default_provider_instance
+        .as_ref()
+        .is_some_and(|id| values.provider_instances.contains_key(id));
+    let mut value = serde_json::to_value(ConfigRoot::from(values))?;
+    if instance_native {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("provider");
+            object.remove("providers");
+        }
+    }
+    Ok(value)
+}
+
 define_counted_struct! {
     /// Runtime configuration facade. Phase-1 sidecar domains are typed modules;
     /// the remaining values keep field-access compatibility through `Deref`.
@@ -2144,6 +2165,19 @@ pub struct ProviderConfigs {
     /// Preserve unknown provider keys (forward compatibility).
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl ProviderConfigs {
+    /// Remove only the known legacy selector and built-in aliases while
+    /// preserving unknown forward-compatible provider entries in `extra`.
+    pub fn clear_legacy_builtin_aliases(&mut self) {
+        self.openai = None;
+        self.anthropic = None;
+        self.gemini = None;
+        self.copilot = None;
+        self.bodhi = None;
+        self.extra.remove("provider");
+    }
 }
 
 /// Feature flags for incremental rollout of new subsystems.
@@ -2557,11 +2591,15 @@ pub struct ToolsConfig {
     /// Tool names that are disabled globally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+
+    /// Preserve tool configuration owned by newer Bamboo versions or plugins.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl ToolsConfig {
     fn is_empty(&self) -> bool {
-        self.disabled.is_empty()
+        self.disabled.is_empty() && self.extra.is_empty()
     }
 }
 
@@ -2571,11 +2609,15 @@ pub struct SkillsConfig {
     /// Skill IDs that are disabled globally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
+
+    /// Preserve skill configuration owned by newer Bamboo versions or plugins.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl SkillsConfig {
     fn is_empty(&self) -> bool {
-        self.disabled.is_empty()
+        self.disabled.is_empty() && self.extra.is_empty()
     }
 }
 
@@ -3219,6 +3261,19 @@ impl Config {
         &mut self.providers.0
     }
 
+    /// Canonicalize only the durable provider view when instance routing is
+    /// authoritative. Unknown provider entries remain available for forward
+    /// compatibility.
+    pub(crate) fn clear_legacy_provider_aliases_for_instance_mode(&mut self) {
+        if self
+            .default_provider_instance
+            .as_ref()
+            .is_some_and(|id| self.provider_instances.contains_key(id))
+        {
+            self.providers.0.clear_legacy_builtin_aliases();
+        }
+    }
+
     /// Build the legacy full-config JSON view used by in-memory patching APIs.
     ///
     /// Public serde and patch/dot-path callers retain the historical full
@@ -3263,6 +3318,75 @@ impl Config {
         Self::from_data_dir(None)
     }
 
+    fn from_completed_facade(data_dir: &Path, publish: bool, apply_env: bool) -> Self {
+        let mut config = match crate::ConfigFacade::open_or_migrate(data_dir) {
+            Ok(facade) => facade.effective_config(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "completed modular configuration is unavailable; refusing legacy-root fallback"
+                );
+                Self::create_default()
+            }
+        };
+
+        if let Err(error) = config.hydrate_proxy_auth_from_store(data_dir) {
+            tracing::warn!(error = %error, "proxy auth credential hydration unavailable");
+            config.proxy_auth = None;
+        }
+        if let Err(error) = config.hydrate_provider_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "provider credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_mcp_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "MCP credential hydration unavailable");
+        }
+        if let Err(error) = config.hydrate_env_var_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "env credential hydration unavailable");
+            for entry in &mut config.env_vars {
+                if entry.secret {
+                    entry.value.clear();
+                }
+            }
+        }
+        if let Err(error) = config.hydrate_cluster_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "cluster credential hydration unavailable");
+            config.clear_cluster_runtime_credentials();
+        }
+        if let Err(error) = config.hydrate_notification_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "notification credential hydration unavailable");
+            config.notifications.ntfy.token = None;
+            config.notifications.bark.device_key = None;
+        }
+        if let Err(error) = config.hydrate_connect_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "connect credential hydration unavailable");
+            for platform in &mut config.connect.platforms {
+                platform.token = None;
+                platform.app_secret = None;
+            }
+        }
+        if let Err(error) = config.hydrate_access_control_credentials_from_store(data_dir) {
+            tracing::warn!(error = %error, "access-control credential hydration unavailable");
+            config.clear_access_control_runtime_verifiers();
+        }
+        if let Some(broker) = config.subagents_mut().broker.as_mut() {
+            if let Err(error) = broker.hydrate_credential_from_store(data_dir) {
+                tracing::warn!(error = %error, "external broker credential hydration unavailable");
+                broker.token.clear();
+            }
+        }
+        config.normalize_tool_settings();
+        config.normalize_skill_settings();
+        config.normalize_plugin_trust_settings();
+        config.extra.remove("data_dir");
+        if apply_env {
+            config.apply_env_overrides();
+        }
+        if publish {
+            config.publish_env_vars();
+        }
+        config
+    }
+
     /// Load configuration from a specific data directory.
     ///
     /// Use [`Config::from_data_dir`] (publishes env vars to the global cache, for
@@ -3276,6 +3400,25 @@ impl Config {
         let data_dir = data_dir
             .or_else(|| std::env::var("BAMBOO_DATA_DIR").ok().map(PathBuf::from))
             .unwrap_or_else(default_data_dir);
+
+        match crate::modular_authority_boundary_present(&data_dir) {
+            Ok(true) => return Self::from_completed_facade(&data_dir, publish, apply_env),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration marker is unavailable; refusing legacy-root fallback"
+                );
+                let mut config = Self::create_default();
+                if apply_env {
+                    config.apply_env_overrides();
+                }
+                if publish {
+                    config.publish_env_vars();
+                }
+                return config;
+            }
+        }
 
         // Finish any shared manifest-committed credential extraction before
         // reading even one member of the transaction, then plan only the
@@ -3295,6 +3438,29 @@ impl Config {
                 error
             })
             .is_ok();
+
+        // A recovery performed by either legacy credential planner may have
+        // completed the modular split. Reclassify immediately before touching
+        // config.json so a pending split cannot race this compatibility load
+        // back into legacy authority.
+        match crate::modular_authority_boundary_present(&data_dir) {
+            Ok(true) => return Self::from_completed_facade(&data_dir, publish, apply_env),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "modular configuration boundary is unavailable; refusing legacy-root fallback"
+                );
+                let mut config = Self::create_default();
+                if apply_env {
+                    config.apply_env_overrides();
+                }
+                if publish {
+                    config.publish_env_vars();
+                }
+                return config;
+            }
+        }
 
         let config_path = data_dir.join("config.json");
 
@@ -3511,9 +3677,34 @@ impl Config {
             self.server.bind = bind;
         }
 
-        // Note: BAMBOO_DATA_DIR already handled by the caller.
-        if let Ok(provider) = std::env::var("BAMBOO_PROVIDER") {
-            self.provider = provider;
+        // Note: BAMBOO_DATA_DIR already handled by the caller. In instance
+        // mode the override may name either an exact instance id or a provider
+        // type. Type matches are ordered by instance id so the result is
+        // deterministic even for a multi-account configuration.
+        if let Ok(provider) = crate::runtime_env_var("BAMBOO_PROVIDER") {
+            let provider = provider.trim().to_string();
+            if !provider.is_empty() {
+                self.provider = provider.clone();
+                if !self.provider_instances.is_empty() {
+                    let selected = self
+                        .provider_instances
+                        .contains_key(&provider)
+                        .then_some(provider.clone())
+                        .or_else(|| {
+                            let mut matching = self
+                                .provider_instances
+                                .iter()
+                                .filter(|(_, instance)| {
+                                    instance.enabled && instance.provider_type == provider
+                                })
+                                .map(|(id, _)| id.clone())
+                                .collect::<Vec<_>>();
+                            matching.sort();
+                            matching.into_iter().next()
+                        });
+                    self.default_provider_instance = selected;
+                }
+            }
         }
 
         if let Ok(headless) = std::env::var("BAMBOO_HEADLESS") {
@@ -3548,38 +3739,60 @@ impl Config {
         // config.json. The `api_key_from_env` flag keeps `refresh_provider_api_keys_encrypted`
         // from re-encrypting these keys into `api_key_encrypted` on a later save,
         // so an env key is never persisted to disk. (#253)
-        if let Ok(key) = std::env::var("BAMBOO_OPENAI_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_OPENAI_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
-                let openai = self
-                    .providers
-                    .openai
-                    .get_or_insert_with(OpenAIConfig::default);
-                openai.api_key = key.to_string();
-                openai.api_key_from_env = true;
+                if self.provider_instances.is_empty() {
+                    let openai = self
+                        .providers
+                        .openai
+                        .get_or_insert_with(OpenAIConfig::default);
+                    openai.api_key = key.to_string();
+                    openai.api_key_from_env = true;
+                } else {
+                    self.apply_provider_instance_env_key("openai", key);
+                }
             }
         }
-        if let Ok(key) = std::env::var("BAMBOO_ANTHROPIC_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_ANTHROPIC_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
-                let anthropic = self
-                    .providers
-                    .anthropic
-                    .get_or_insert_with(AnthropicConfig::default);
-                anthropic.api_key = key.to_string();
-                anthropic.api_key_from_env = true;
+                if self.provider_instances.is_empty() {
+                    let anthropic = self
+                        .providers
+                        .anthropic
+                        .get_or_insert_with(AnthropicConfig::default);
+                    anthropic.api_key = key.to_string();
+                    anthropic.api_key_from_env = true;
+                } else {
+                    self.apply_provider_instance_env_key("anthropic", key);
+                }
             }
         }
-        if let Ok(key) = std::env::var("BAMBOO_GEMINI_API_KEY") {
+        if let Ok(key) = crate::runtime_env_var("BAMBOO_GEMINI_API_KEY") {
             let key = key.trim();
             if !key.is_empty() {
-                let gemini = self
-                    .providers
-                    .gemini
-                    .get_or_insert_with(GeminiConfig::default);
-                gemini.api_key = key.to_string();
-                gemini.api_key_from_env = true;
+                if self.provider_instances.is_empty() {
+                    let gemini = self
+                        .providers
+                        .gemini
+                        .get_or_insert_with(GeminiConfig::default);
+                    gemini.api_key = key.to_string();
+                    gemini.api_key_from_env = true;
+                } else {
+                    self.apply_provider_instance_env_key("gemini", key);
+                }
             }
+        }
+    }
+
+    fn apply_provider_instance_env_key(&mut self, provider_type: &str, key: &str) {
+        for instance in self.provider_instances.values_mut().filter(|instance| {
+            instance.provider_type == provider_type
+                && crate::provider_instance_api_key_from_env(instance)
+        }) {
+            instance.api_key = key.to_string();
+            instance.api_key_encrypted = None;
         }
     }
 
@@ -3851,7 +4064,14 @@ impl Config {
                 return Some(model_ref.model.clone());
             }
         }
-        match self.provider.as_str() {
+        let provider = self.effective_default_provider();
+        if let Some(instance) = self.provider_instances.get(provider) {
+            return instance
+                .model
+                .clone()
+                .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()));
+        }
+        match provider {
             "openai" => self.providers.openai.as_ref().and_then(|c| c.model.clone()),
             "anthropic" => self
                 .providers
@@ -3883,28 +4103,33 @@ impl Config {
                 return Some(model_ref.model.clone());
             }
         }
-        let fast = match self.provider.as_str() {
-            "openai" => self
-                .providers
-                .openai
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "anthropic" => self
-                .providers
-                .anthropic
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "gemini" => self
-                .providers
-                .gemini
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "copilot" => self
-                .providers
-                .copilot
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            _ => None,
+        let provider = self.effective_default_provider();
+        let fast = if let Some(instance) = self.provider_instances.get(provider) {
+            instance.fast_model.clone()
+        } else {
+            match provider {
+                "openai" => self
+                    .providers
+                    .openai
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "anthropic" => self
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "gemini" => self
+                    .providers
+                    .gemini
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "copilot" => self
+                    .providers
+                    .copilot
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                _ => None,
+            }
         };
         fast.or_else(|| self.get_model())
     }
@@ -3969,28 +4194,34 @@ impl Config {
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        configured.or_else(|| match self.provider.as_str() {
-            "openai" => self
-                .providers
-                .openai
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "anthropic" => self
-                .providers
-                .anthropic
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "gemini" => self
-                .providers
-                .gemini
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            "copilot" => self
-                .providers
-                .copilot
-                .as_ref()
-                .and_then(|c| c.fast_model.clone()),
-            _ => None,
+        configured.or_else(|| {
+            let provider = self.effective_default_provider();
+            if let Some(instance) = self.provider_instances.get(provider) {
+                return instance.fast_model.clone();
+            }
+            match provider {
+                "openai" => self
+                    .providers
+                    .openai
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "anthropic" => self
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "gemini" => self
+                    .providers
+                    .gemini
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                "copilot" => self
+                    .providers
+                    .copilot
+                    .as_ref()
+                    .and_then(|c| c.fast_model.clone()),
+                _ => None,
+            }
         })
     }
 
@@ -4034,35 +4265,40 @@ impl Config {
     /// Used for image understanding tasks.
     /// Falls back to `get_model()` when no vision_model is configured.
     pub fn get_vision_model(&self) -> Option<String> {
-        let vision = match self.provider.as_str() {
-            "openai" => self
-                .providers
-                .openai
-                .as_ref()
-                .and_then(|c| c.vision_model.clone()),
-            "anthropic" => self
-                .providers
-                .anthropic
-                .as_ref()
-                .and_then(|c| c.vision_model.clone()),
-            "gemini" => self
-                .providers
-                .gemini
-                .as_ref()
-                .and_then(|c| c.vision_model.clone()),
-            "copilot" => self
-                .providers
-                .copilot
-                .as_ref()
-                .and_then(|c| c.vision_model.clone()),
-            _ => None,
+        let provider = self.effective_default_provider();
+        let vision = if let Some(instance) = self.provider_instances.get(provider) {
+            instance.vision_model.clone()
+        } else {
+            match provider {
+                "openai" => self
+                    .providers
+                    .openai
+                    .as_ref()
+                    .and_then(|c| c.vision_model.clone()),
+                "anthropic" => self
+                    .providers
+                    .anthropic
+                    .as_ref()
+                    .and_then(|c| c.vision_model.clone()),
+                "gemini" => self
+                    .providers
+                    .gemini
+                    .as_ref()
+                    .and_then(|c| c.vision_model.clone()),
+                "copilot" => self
+                    .providers
+                    .copilot
+                    .as_ref()
+                    .and_then(|c| c.vision_model.clone()),
+                _ => None,
+            }
         };
         vision.or_else(|| self.get_model())
     }
 
     /// Get the default reasoning effort for the currently active provider.
     pub fn get_reasoning_effort(&self) -> Option<ReasoningEffort> {
-        self.reasoning_effort_for_key(&self.provider)
+        self.reasoning_effort_for_key(self.effective_default_provider())
     }
 
     /// Resolve the configured default reasoning effort for a provider routing key.
@@ -4308,6 +4544,7 @@ impl Config {
     /// refreshed into their encrypted at-rest representation.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         let mut config = self.clone();
+        config.clear_legacy_provider_aliases_for_instance_mode();
         config.refresh_provider_api_keys_encrypted()?;
         config.providers.save_sync(data_dir)
     }
@@ -4327,6 +4564,7 @@ impl Config {
         }
 
         let mut to_save = self.clone();
+        to_save.clear_legacy_provider_aliases_for_instance_mode();
         to_save.extra.remove("data_dir");
         to_save.extra.remove("model");
         to_save.refresh_encrypted_secrets()?;
@@ -4339,7 +4577,7 @@ impl Config {
         to_save.normalize_tool_settings();
         to_save.normalize_skill_settings();
 
-        let mut root = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+        let mut root = durable_root_value(to_save.values.clone())
             .context("Failed to serialize root config DTO to JSON")?;
         if let Some(object) = root.as_object_mut() {
             object.remove("connect");
@@ -4529,6 +4767,16 @@ impl Config {
             );
         }
 
+        if crate::modular_authority_boundary_present(&data_dir)
+            .context("Failed to inspect modular configuration authority boundary")?
+        {
+            crate::ConfigFacade::open_or_migrate(&data_dir)
+                .context("Failed to recover modular configuration before persistence")?;
+            crate::persist_facade_effective_config(&data_dir, self)
+                .context("Failed to persist modular configuration sections")?;
+            return Ok(());
+        }
+
         if crate::section_layout_is_active(&data_dir)
             .context("Failed to inspect modular configuration layout")?
         {
@@ -4545,6 +4793,7 @@ impl Config {
         }
 
         let mut to_save = self.clone();
+        to_save.clear_legacy_provider_aliases_for_instance_mode();
         // Never persist `data_dir` into config.json (data dir is runtime-derived).
         to_save.extra.remove("data_dir");
         // Root-level `model` is deprecated; do not persist it.
@@ -4570,7 +4819,7 @@ impl Config {
         // in-memory struct) — only the serialized DOCUMENT that becomes
         // config.json's bytes has the key stripped, and that's done on the
         // `serde_json::Value` here, not via `#[serde(skip)]` on the field.
-        let mut config_value = serde_json::to_value(ConfigRoot::from(to_save.values.clone()))
+        let mut config_value = durable_root_value(to_save.values.clone())
             .context("Failed to serialize root config DTO to JSON")?;
         if let Some(obj) = config_value.as_object_mut() {
             obj.remove("connect");
@@ -5099,6 +5348,76 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn tools_config_preserves_unknown_keys_across_roundtrip() {
+        let input = serde_json::json!({
+            "disabled": ["bash"],
+            "plugin_runtime": {
+                "timeout_ms": 5_000,
+                "sandbox": true
+            },
+            "future_flag": "enabled"
+        });
+
+        let config: ToolsConfig = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(config.disabled, vec!["bash"]);
+        assert_eq!(config.extra["plugin_runtime"]["timeout_ms"], 5_000);
+        assert_eq!(config.extra["future_flag"], "enabled");
+        assert_eq!(serde_json::to_value(config).unwrap(), input);
+    }
+
+    #[test]
+    fn tools_config_keeps_section_when_only_unknown_keys_present() {
+        let input = serde_json::json!({
+            "tool_extension": {
+                "mode": "strict",
+                "options": ["one", "two"]
+            }
+        });
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools": input.clone()
+        }))
+        .unwrap();
+
+        assert!(config.tools.disabled.is_empty());
+        assert_eq!(config.tools.extra["tool_extension"]["mode"], "strict");
+        assert_eq!(serde_json::to_value(&config).unwrap()["tools"], input);
+
+        let temp_home = TempHome::new();
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(temp_home.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["tools"], input);
+    }
+
+    #[test]
+    fn skills_config_preserves_unknown_keys_across_roundtrip() {
+        let input = serde_json::json!({
+            "external_catalog": {
+                "path": "/opt/bamboo/skills",
+                "refresh": false
+            },
+            "schema_version": 2
+        });
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "skills": input.clone()
+        }))
+        .unwrap();
+        assert!(config.skills.disabled.is_empty());
+        assert_eq!(config.skills.extra["external_catalog"]["refresh"], false);
+        assert_eq!(config.skills.extra["schema_version"], 2);
+        assert_eq!(serde_json::to_value(&config).unwrap()["skills"], input);
+
+        let temp_home = TempHome::new();
+        config.save_to_dir(temp_home.path.clone()).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(temp_home.path.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["skills"], input);
+    }
+
+    #[test]
     fn lifecycle_hooks_round_trip_as_a_distinct_top_level_section() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "hooks": {
@@ -5260,6 +5579,146 @@ mod tests {
                 semantic_idle_timeout_secs: 300,
             }
         );
+    }
+
+    #[test]
+    fn compatibility_serialization_keeps_legacy_provider_in_instance_mode() {
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "enabled": true
+        }))
+        .unwrap();
+        let mut config = Config::default();
+        config.values.provider = "gemini".to_string();
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+        config.default_provider_instance = Some("work".to_string());
+        config.providers_mut().openai = Some(OpenAIConfig::default());
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["provider"], "gemini");
+        assert!(json["providers"]["openai"].is_object());
+        assert_eq!(json["default_provider_instance"], "work");
+
+        let round_trip: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip.provider, "gemini");
+        assert_eq!(
+            round_trip.default_provider_instance.as_deref(),
+            Some("work")
+        );
+        assert!(round_trip.provider_instances.contains_key("work"));
+        assert!(round_trip.providers().openai.is_some());
+    }
+
+    #[test]
+    fn instance_native_durable_writes_remove_only_legacy_builtin_aliases() {
+        let _key = crate::encryption::set_test_encryption_key([0x73; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.values.provider = "anthropic".to_string();
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "model": "gpt-instance",
+                "enabled": true,
+                "future_instance_metadata": "preserved"
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work".to_string());
+        config.features.provider_model_ref = true;
+        config.providers_mut().openai = Some(OpenAIConfig::default());
+        config.providers_mut().anthropic = Some(AnthropicConfig::default());
+        config
+            .providers_mut()
+            .extra
+            .insert("provider".to_string(), serde_json::json!("anthropic"));
+        config.providers_mut().extra.insert(
+            "future_provider".to_string(),
+            serde_json::json!({"kept": true}),
+        );
+
+        let (root_bytes, provider_bytes) =
+            config.prepare_provider_transaction_documents(&[]).unwrap();
+        let root: Value = serde_json::from_slice(&root_bytes).unwrap();
+        let providers: Value = serde_json::from_slice(&provider_bytes).unwrap();
+        assert!(root.get("provider").is_none());
+        assert!(root.get("providers").is_none());
+        assert_eq!(root["default_provider_instance"], "work");
+        assert_eq!(
+            root["provider_instances"]["work"]["future_instance_metadata"],
+            "preserved"
+        );
+        assert!(providers.get("provider").is_none());
+        for key in ["openai", "anthropic", "gemini", "copilot", "bodhi"] {
+            assert!(providers.get(key).is_none(), "persisted legacy alias {key}");
+        }
+        assert_eq!(providers["future_provider"]["kept"], true);
+
+        config.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let saved_root: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        let saved_providers: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(saved_root.get("provider").is_none());
+        assert!(saved_root.get("providers").is_none());
+        assert_eq!(saved_root["default_provider_instance"], "work");
+        assert!(saved_providers.get("openai").is_none());
+        assert!(saved_providers.get("anthropic").is_none());
+        assert!(saved_providers.get("provider").is_none());
+        assert_eq!(saved_providers["future_provider"]["kept"], true);
+
+        config.providers_mut().gemini = Some(GeminiConfig::default());
+        config.save_providers_to_dir(dir.path()).unwrap();
+        let provider_only: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert!(provider_only.get("gemini").is_none());
+        assert!(provider_only.get("provider").is_none());
+        assert_eq!(provider_only["future_provider"]["kept"], true);
+    }
+
+    #[test]
+    fn hybrid_legacy_default_preserves_its_builtin_alias_on_durable_writes() {
+        let mut config = Config::default();
+        config.values.provider = "openai".to_string();
+        config.providers_mut().openai = Some(OpenAIConfig {
+            model: Some("gpt-legacy".to_string()),
+            ..OpenAIConfig::default()
+        });
+        config.provider_instances.insert(
+            "work".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "copilot",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".to_string());
+
+        let (root_bytes, provider_bytes) =
+            config.prepare_provider_transaction_documents(&[]).unwrap();
+        let root: Value = serde_json::from_slice(&root_bytes).unwrap();
+        let providers: Value = serde_json::from_slice(&provider_bytes).unwrap();
+        assert_eq!(root["provider"], "openai");
+        assert_eq!(root["default_provider_instance"], "openai");
+        assert!(root["provider_instances"]["work"].is_object());
+        assert_eq!(providers["openai"]["model"], "gpt-legacy");
+    }
+
+    #[test]
+    fn persistence_keeps_legacy_provider_without_instance_default() {
+        let values = ConfigValues {
+            provider: "gemini".to_string(),
+            ..ConfigValues::default()
+        };
+
+        let json = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(json["provider"], "gemini");
     }
 
     #[test]
@@ -7636,6 +8095,136 @@ mod tests {
     }
 
     #[test]
+    fn effective_instance_models_and_reasoning_override_stale_legacy_provider() {
+        let mut config = Config::default();
+        config.features.provider_model_ref = false;
+        config.provider = "openai".to_string();
+        config.providers.openai = Some(OpenAIConfig {
+            api_key: "sk-stale".to_string(),
+            model: Some("legacy-main".to_string()),
+            fast_model: Some("legacy-fast".to_string()),
+            vision_model: Some("legacy-vision".to_string()),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..OpenAIConfig::default()
+        });
+        let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "openai",
+            "model": "instance-main",
+            "fast_model": "instance-fast",
+            "vision_model": "instance-vision",
+            "reasoning_effort": "high",
+            "enabled": true
+        }))
+        .unwrap();
+        instance.api_key = "sk-instance".to_string();
+        config
+            .provider_instances
+            .insert("work".to_string(), instance);
+        config.default_provider_instance = Some("work".to_string());
+
+        assert_eq!(config.get_model().as_deref(), Some("instance-main"));
+        assert_eq!(config.get_fast_model().as_deref(), Some("instance-fast"));
+        assert_eq!(
+            config.get_memory_background_model().as_deref(),
+            Some("instance-fast")
+        );
+        assert_eq!(
+            config.get_task_summary_model().as_deref(),
+            Some("instance-fast")
+        );
+        assert_eq!(
+            config.get_vision_model().as_deref(),
+            Some("instance-vision")
+        );
+        assert_eq!(config.get_reasoning_effort(), Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn runtime_env_overrides_select_and_hydrate_only_marked_instances() {
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("openai"));
+        let _openai_key = crate::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-runtime-env-instance"),
+        );
+        let _anthropic_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
+
+        let mut config = Config::default();
+        *config.providers_mut() = ProviderConfigs::default();
+        for (id, from_environment) in [("z-unmarked", false), ("a-marked", true)] {
+            let mut extra = serde_json::Map::new();
+            if from_environment {
+                extra.insert("api_key_from_env".to_string(), serde_json::json!(true));
+            }
+            extra.insert("provider_type".to_string(), serde_json::json!("openai"));
+            extra.insert("enabled".to_string(), serde_json::json!(true));
+            config.provider_instances.insert(
+                id.to_string(),
+                serde_json::from_value(serde_json::Value::Object(extra)).unwrap(),
+            );
+        }
+
+        config.apply_runtime_env_overrides();
+
+        assert_eq!(
+            config.default_provider_instance.as_deref(),
+            Some("a-marked"),
+            "type override selects the lexicographically first enabled instance"
+        );
+        assert_eq!(
+            config.provider_instances["a-marked"].api_key,
+            "sk-runtime-env-instance"
+        );
+        assert!(config.provider_instances["z-unmarked"].api_key.is_empty());
+        assert!(
+            config.providers().openai.is_none(),
+            "instance-mode env hydration must not recreate a legacy alias"
+        );
+
+        config.refresh_encrypted_secrets().unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("sk-runtime-env-instance"));
+        assert!(
+            config.provider_instances["a-marked"]
+                .api_key_encrypted
+                .is_none(),
+            "runtime env plaintext must not be encrypted into ordinary config"
+        );
+    }
+
+    #[test]
+    fn runtime_provider_override_prefers_exact_instance_id() {
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("personal"));
+        let _openai_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_OPENAI_API_KEY", None);
+        let _anthropic_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_ANTHROPIC_API_KEY", None);
+        let _gemini_key =
+            crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
+        let mut config = Config::default();
+        for id in ["work", "personal"] {
+            config.provider_instances.insert(
+                id.to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type": "openai",
+                    "enabled": true
+                }))
+                .unwrap(),
+            );
+        }
+
+        config.apply_runtime_env_overrides();
+        assert_eq!(
+            config.default_provider_instance.as_deref(),
+            Some("personal")
+        );
+    }
+
+    #[test]
     fn get_memory_background_model_does_not_fall_back_to_main_model() {
         let mut config = Config::default();
         config.features.provider_model_ref = false;
@@ -7800,8 +8389,15 @@ mod tests {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         let _home = EnvVarGuard::set("HOME", temp_home.path.to_string_lossy().as_ref());
-        let _anthropic = EnvVarGuard::set("BAMBOO_ANTHROPIC_API_KEY", "sk-ant-from-env");
-        let _openai = EnvVarGuard::set("BAMBOO_OPENAI_API_KEY", "sk-oai-from-env");
+        let _anthropic = crate::test_support::override_runtime_env_var(
+            "BAMBOO_ANTHROPIC_API_KEY",
+            Some("sk-ant-from-env"),
+        );
+        let _openai = crate::test_support::override_runtime_env_var(
+            "BAMBOO_OPENAI_API_KEY",
+            Some("sk-oai-from-env"),
+        );
+        let _gemini = crate::test_support::override_runtime_env_var("BAMBOO_GEMINI_API_KEY", None);
 
         // No config.json on disk → the providers are created from the env keys
         // alone (#253: deploy without a plaintext api_key in a mounted file).
@@ -7999,7 +8595,8 @@ mod tests {
 
         let _port = EnvVarGuard::set("BAMBOO_PORT", "9999");
         let _bind = EnvVarGuard::set("BAMBOO_BIND", "192.168.1.1");
-        let _provider = EnvVarGuard::set("BAMBOO_PROVIDER", "openai");
+        let _provider =
+            crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", Some("openai"));
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
         assert_eq!(config.server.port, 9999);

@@ -7,6 +7,44 @@ use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
 use bamboo_engine::model_config_helper::parse_session_gold_config;
 
+/// Minimal public workflow lifecycle identity. Durable activation metadata also
+/// contains the immutable arguments, context fingerprint and dynamic provider
+/// output used by the runtime; none of those payloads belong in a session
+/// summary response.
+#[derive(Debug, Serialize)]
+pub struct SessionActiveWorkflow {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub source: bamboo_skills::WorkflowSource,
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub kind: bamboo_skills::WorkflowKind,
+    pub invoked_by: bamboo_skills::WorkflowInvokedBy,
+    pub activated_at: chrono::DateTime<chrono::Utc>,
+    pub status: bamboo_skills::WorkflowActivationStatus,
+}
+
+impl SessionActiveWorkflow {
+    pub fn from_active(
+        active: bamboo_skills::ActiveWorkflow,
+        catalog_entry: Option<&bamboo_skills::WorkflowCatalogEntry>,
+    ) -> Self {
+        Self {
+            id: active.id,
+            name: catalog_entry.map(|entry| entry.name.clone()),
+            source: active.source,
+            revision: active.revision,
+            version: catalog_entry.map(|entry| entry.version.clone()),
+            kind: active.kind,
+            invoked_by: active.invoked_by,
+            activated_at: active.activated_at,
+            status: active.status,
+        }
+    }
+}
+
 /// Deserialize an explicitly-present nullable Project id while preserving the
 /// distinction between an absent field (`None`, no-op) and JSON `null`
 /// (`Some(None)`, explicit unassign).
@@ -27,6 +65,7 @@ pub struct SessionSummary {
     pub kind: bamboo_agent_core::SessionKind,
     pub title: String,
     pub title_version: u64,
+    pub title_generated: bool,
     pub pinned: bool,
     pub parent_session_id: Option<String>,
     pub root_session_id: String,
@@ -79,6 +118,12 @@ pub struct SessionSummary {
     /// Lets the frontend render plan-mode UI without loading full session history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_mode: Option<bamboo_domain::PlanModeState>,
+    /// Public-safe durable workflow identity restored from the authoritative
+    /// session metadata. List rows intentionally leave this empty; the detail
+    /// endpoint hydrates it from `session.json` so browser refreshes do not
+    /// depend on an already-consumed account-feed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workflow: Option<SessionActiveWorkflow>,
     /// Number of child sessions currently running under this session.
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
@@ -130,6 +175,7 @@ impl SessionSummary {
             kind: entry.kind,
             title: entry.title,
             title_version: entry.title_version,
+            title_generated: entry.title_generated,
             pinned: entry.pinned,
             parent_session_id: entry.parent_session_id,
             root_session_id: entry.root_session_id,
@@ -155,6 +201,7 @@ impl SessionSummary {
             resident_name: entry.resident_name,
             has_pending_question: entry.has_pending_question,
             plan_mode: entry.plan_mode,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions
@@ -231,13 +278,17 @@ pub struct RunningSessionsResponse {
     pub sessions: Vec<RunningSessionEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
     /// Stable first-class Project membership for the new root session.
     #[serde(default)]
     pub project_id: Option<bamboo_domain::ProjectId>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Explicit title lifecycle. UI placeholder titles send `false`; omitted
+    /// legacy requests with a non-empty title fail safe as finalized.
+    #[serde(default)]
+    pub title_generated: Option<bool>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
@@ -261,6 +312,37 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateSessionResponse {
     pub session: SessionSummary,
+}
+
+/// Response for `POST /api/v1/sessions/{session_id}/copy`.
+#[derive(Debug, Serialize)]
+pub struct CopySessionResponse {
+    pub session: SessionSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCreateOperationStatus {
+    Pending,
+    Succeeded,
+    Failed,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCreateOperationError {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionCreateOperationResponse {
+    pub status: SessionCreateOperationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionCreateOperationError>,
 }
 
 #[derive(Debug, Serialize)]
@@ -377,6 +459,7 @@ mod tests {
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
 
         assert!(req.title.is_none());
+        assert!(req.title_generated.is_none());
         assert!(req.system_prompt.is_none());
         assert!(req.model.is_none());
         assert!(req.reasoning_effort.is_none());
@@ -384,10 +467,11 @@ mod tests {
 
     #[test]
     fn test_create_session_request_full() {
-        let json = r#"{"title":"Test Session","system_prompt":"You are helpful","model":"gpt-4","reasoning_effort":"high"}"#;
+        let json = r#"{"title":"Test Session","title_generated":false,"system_prompt":"You are helpful","model":"gpt-4","reasoning_effort":"high"}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
 
         assert_eq!(req.title, Some("Test Session".to_string()));
+        assert_eq!(req.title_generated, Some(false));
         assert_eq!(req.system_prompt, Some("You are helpful".to_string()));
         assert_eq!(req.model, Some("gpt-4".to_string()));
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
@@ -398,6 +482,7 @@ mod tests {
         let req = CreateSessionRequest {
             project_id: None,
             title: Some("Test".to_string()),
+            title_generated: None,
             system_prompt: None,
             model: None,
             provider: None,
@@ -522,6 +607,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: false,
             parent_session_id: None,
             root_session_id: "root-id".to_string(),
@@ -547,6 +633,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -556,6 +643,7 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"session\""));
         assert!(json.contains("\"test-id\""));
+        assert!(json.contains("\"title_generated\":true"));
         assert!(json.contains("\"workspace_path\":\"/workspaces/zenith\""));
     }
 
@@ -570,6 +658,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Child,
             title: "My Session".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: true,
             parent_session_id: Some("parent-id".to_string()),
             root_session_id: "root-id".to_string(),
@@ -595,6 +684,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };
@@ -706,6 +796,7 @@ mod tests {
             kind: bamboo_agent_core::SessionKind::Root,
             title: "Test".to_string(),
             title_version: 0,
+            title_generated: true,
             pinned: false,
             parent_session_id: None,
             root_session_id: "root".to_string(),
@@ -731,6 +822,7 @@ mod tests {
             resident_name: None,
             has_pending_question: false,
             plan_mode: None,
+            active_workflow: None,
             running_child_count: 0,
             gold_config: None,
         };

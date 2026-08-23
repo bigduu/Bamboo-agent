@@ -477,6 +477,13 @@ impl Config {
                 instance.api_key_encrypted = None;
                 continue;
             }
+            if crate::provider_instance_api_key_from_env(instance) {
+                // Runtime environment keys are never converted into durable
+                // ciphertext. The metadata marker is enough to re-inject the
+                // standard provider env var after the next restart.
+                instance.api_key_encrypted = None;
+                continue;
+            }
             let api_key = instance.api_key.trim();
             // Empty plaintext → preserve existing ciphertext (see
             // refresh_provider_api_keys_encrypted). #268.
@@ -495,6 +502,10 @@ impl Config {
     pub fn ensure_provider_instance_credentials_isolated(&mut self) -> Result<()> {
         for (id, instance) in &mut self.provider_instances {
             if instance.credential_ref.is_some() {
+                instance.api_key_encrypted = None;
+                continue;
+            }
+            if crate::provider_instance_api_key_from_env(instance) {
                 instance.api_key_encrypted = None;
                 continue;
             }
@@ -1077,7 +1088,7 @@ impl Config {
         data_dir: &std::path::Path,
     ) -> crate::ConfigStoreResult<()> {
         let store = crate::CredentialStore::open(data_dir);
-        let allow_legacy_runtime_value = !crate::section_layout_is_active(data_dir)?;
+        let allow_legacy_runtime_value = !crate::modular_authority_boundary_present(data_dir)?;
         self.hydrate_connect_credentials_from_resolver(&store, allow_legacy_runtime_value)
     }
 

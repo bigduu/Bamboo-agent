@@ -7,23 +7,22 @@
 //!
 //! ## Ownership model
 //!
-//! Writes are owned by a single writer task (see [`super::account_sink`]); this
-//! type's `&mut self` append methods are never shared. Reads ([`read_since`],
-//! [`oldest_seq`]) are stateless free functions that open files read-only, so a
-//! `/stream` replay never contends with the writer.
+//! Each sink owns one writer task and never shares an [`EventJournal`] value.
+//! Rolling processes serialize reopen/sequence/append through the fixed file
+//! claim in [`super::account_sink`]. Reads ([`read_since`], [`oldest_seq`]) are
+//! stateless free functions that open files read-only.
 //!
 //! ## Rotation & recovery
 //!
 //! A new file is opened lazily on the first append, named by that event's seq.
 //! When the current file passes [`ROTATE_THRESHOLD_BYTES`] it is closed and the
-//! next append opens a fresh file — so files never need to be reopened for
-//! append, which sidesteps torn-line-on-append entirely. On boot,
-//! [`EventJournal::open`] recovers the max seq by reading the last *complete*
-//! line of the newest file (a partial trailing line from a crash mid-write is
-//! tolerated).
+//! next append opens a fresh file. A cross-process claimed append reopens the
+//! newest underfilled file and truncates any partial crash tail first. On boot,
+//! [`EventJournal::open`] recovers the max seq from the last complete event near
+//! the tail rather than scanning an entire file.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::change_feed::ChangeEvent;
@@ -69,27 +68,79 @@ fn list_journal_files(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 
 /// The greatest `seq` present across all journal files, or 0 if empty.
 ///
-/// Reads only the last file and scans it for the last complete line, tolerating
-/// a torn trailing line from a crash mid-write.
+/// Reads only tail windows of the last file to find the last complete valid
+/// line, tolerating a torn trailing line from a crash mid-write.
 fn recover_max_seq(dir: &Path) -> io::Result<u64> {
     let files = list_journal_files(dir)?;
     let Some((_, path)) = files.last() else {
         return Ok(0);
     };
-    let contents = std::fs::read_to_string(path)?;
-    let mut max_seq = 0u64;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // A torn final line will fail to parse; skip it (only complete lines
-        // were ever fully flushed).
-        if let Ok(ce) = serde_json::from_str::<ChangeEvent>(line) {
-            max_seq = max_seq.max(ce.seq);
+    recover_last_complete_event_seq(path)
+}
+
+fn last_complete_line_end(path: &Path) -> io::Result<u64> {
+    const TAIL_CHUNK: usize = 8 * 1024;
+
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(len);
+    }
+
+    let mut cursor = len;
+    let mut buffer = vec![0u8; TAIL_CHUNK];
+    while cursor > 0 {
+        let read_len = usize::try_from(cursor.min(TAIL_CHUNK as u64)).unwrap_or(TAIL_CHUNK);
+        cursor -= read_len as u64;
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut buffer[..read_len])?;
+        if let Some(position) = buffer[..read_len].iter().rposition(|byte| *byte == b'\n') {
+            return Ok(cursor + position as u64 + 1);
         }
     }
-    Ok(max_seq)
+    Ok(0)
+}
+
+fn recover_last_complete_event_seq(path: &Path) -> io::Result<u64> {
+    const INITIAL_TAIL_WINDOW: u64 = 8 * 1024;
+
+    let complete_end = last_complete_line_end(path)?;
+    if complete_end == 0 {
+        return Ok(0);
+    }
+    let mut file = File::open(path)?;
+    let mut window = INITIAL_TAIL_WINDOW.min(complete_end);
+    loop {
+        let start = complete_end - window;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0u8; window as usize];
+        file.read_exact(&mut bytes)?;
+        let lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate().rev() {
+            // A non-zero window start may bisect a JSON line.
+            if start > 0 && index == 0 {
+                continue;
+            }
+            let line = *line;
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_slice::<ChangeEvent>(line) {
+                return Ok(event.seq);
+            }
+        }
+        if start == 0 {
+            return Ok(0);
+        }
+        window = window.saturating_mul(2).min(complete_end);
+    }
 }
 
 /// Append-only writer for the change-feed journal.
@@ -126,13 +177,64 @@ impl EventJournal {
         ))
     }
 
+    /// Open under the account-wide journal claim and resume the newest file
+    /// when it is below the rotation threshold. A partial crash tail is
+    /// truncated to the last complete newline before append, so reopening does
+    /// not concatenate a valid event onto an invalid JSON fragment.
+    pub(crate) fn open_for_locked_append(dir: PathBuf) -> io::Result<(Self, u64)> {
+        std::fs::create_dir_all(&dir)?;
+        let files = list_journal_files(&dir)?;
+        let mut current = None;
+        let mut bytes_written = 0;
+        if let Some((_, path)) = files.last() {
+            let file_len = std::fs::metadata(path)?.len();
+            let complete_len = last_complete_line_end(path)?;
+            if complete_len != file_len {
+                let file = OpenOptions::new().write(true).open(path)?;
+                file.set_len(complete_len)?;
+                file.sync_data()?;
+            }
+            if complete_len == 0 {
+                std::fs::remove_file(path)?;
+                sync_directory(&dir)?;
+                return Self::open_for_locked_append(dir);
+            }
+            if complete_len < ROTATE_THRESHOLD_BYTES {
+                current = Some(BufWriter::new(OpenOptions::new().append(true).open(path)?));
+                bytes_written = complete_len;
+            }
+        }
+        let max_seq = recover_max_seq(&dir)?;
+        Ok((
+            Self {
+                dir,
+                current,
+                bytes_written,
+                rotate_threshold: ROTATE_THRESHOLD_BYTES,
+            },
+            max_seq,
+        ))
+    }
+
     /// Append one change event as a JSON line, rotating first if needed.
     ///
     /// The line is flushed immediately: change events are low-volume, and
     /// flushing keeps concurrent `/stream` replays able to read the latest
     /// line without waiting on a timer.
     pub fn append(&mut self, ce: &ChangeEvent) -> io::Result<()> {
-        if self.current.is_none() {
+        self.append_inner(ce, false)
+    }
+
+    /// Append, flush, and sync the journal file before returning. Confirmed
+    /// cross-process publications use this while holding the global journal
+    /// claim so acknowledgement means the dedupe truth is durable.
+    pub(crate) fn append_synced(&mut self, ce: &ChangeEvent) -> io::Result<()> {
+        self.append_inner(ce, true)
+    }
+
+    fn append_inner(&mut self, ce: &ChangeEvent, sync: bool) -> io::Result<()> {
+        let created_file = self.current.is_none();
+        if created_file {
             let path = self.dir.join(file_name_for(ce.seq));
             let file = OpenOptions::new().create(true).append(true).open(&path)?;
             self.current = Some(BufWriter::new(file));
@@ -148,6 +250,12 @@ impl EventJournal {
             .expect("current writer set above when None");
         writer.write_all(line.as_bytes())?;
         writer.flush()?;
+        if sync {
+            writer.get_ref().sync_data()?;
+            if created_file {
+                sync_directory(&self.dir)?;
+            }
+        }
         self.bytes_written += line.len() as u64;
 
         if self.bytes_written >= self.rotate_threshold {
@@ -155,6 +263,18 @@ impl EventJournal {
             // by that event's seq.
             self.current = None;
         }
+        Ok(())
+    }
+}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
         Ok(())
     }
 }
@@ -174,13 +294,13 @@ pub fn read_since(dir: &Path, since: u64) -> io::Result<Vec<ChangeEvent>> {
                 continue;
             }
         }
-        let contents = std::fs::read_to_string(path)?;
-        for line in contents.lines() {
-            let line = line.trim();
+        let contents = std::fs::read(path)?;
+        for line in contents.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
                 continue;
             }
-            if let Ok(ce) = serde_json::from_str::<ChangeEvent>(line) {
+            if let Ok(ce) = serde_json::from_slice::<ChangeEvent>(line) {
                 if ce.seq > since {
                     out.push(ce);
                 }

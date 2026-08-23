@@ -17,6 +17,10 @@ pub struct CreateSessionInput {
     /// Stable Project membership for this root session.
     pub project_id: Option<bamboo_domain::ProjectId>,
     pub title: Option<String>,
+    /// Explicit title lifecycle supplied by the client. When omitted, an
+    /// explicit non-empty title is treated as finalized for backwards
+    /// compatibility, while a default server title remains pending.
+    pub title_generated: Option<bool>,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
     pub model_ref: Option<ProviderModelRef>,
@@ -69,9 +73,13 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
         session.set_project_id_meta(project_id.to_string());
     }
 
-    if let Some(title) = trimmed_non_empty(input.title.as_deref()) {
-        session.title = title;
+    let explicit_title = trimmed_non_empty(input.title.as_deref());
+    if let Some(title) = explicit_title.as_ref() {
+        session.title = title.clone();
     }
+    session.title_generated = input
+        .title_generated
+        .unwrap_or_else(|| explicit_title.is_some());
     let explicit_prompt = trimmed_non_empty(input.system_prompt.as_deref());
     let has_explicit_prompt = explicit_prompt.is_some();
     let base_prompt = explicit_prompt.unwrap_or_else(|| {
@@ -174,6 +182,7 @@ mod tests {
             id: "session-1".to_string(),
             project_id: None,
             title: Some("  Sprint Session  ".to_string()),
+            title_generated: None,
             system_prompt: Some("  You are helpful  ".to_string()),
             model: Some("gpt-5".to_string()),
             model_ref: None,
@@ -184,6 +193,7 @@ mod tests {
         let session = build_new_session(&input, &default_config());
 
         assert_eq!(session.title, "Sprint Session");
+        assert!(session.title_generated);
         assert_eq!(
             session
                 .metadata
@@ -199,11 +209,32 @@ mod tests {
     }
 
     #[test]
+    fn build_new_session_keeps_explicit_placeholder_title_pending() {
+        let input = CreateSessionInput {
+            id: "session-placeholder".to_string(),
+            project_id: None,
+            title: Some("Any UI Placeholder".to_string()),
+            title_generated: Some(false),
+            system_prompt: None,
+            model: Some("gpt-5".to_string()),
+            model_ref: None,
+            reasoning_effort: None,
+            gold_config_json: None,
+            workspace_path: None,
+        };
+
+        let session = build_new_session(&input, &default_config());
+        assert_eq!(session.title, "Any UI Placeholder");
+        assert!(!session.title_generated);
+    }
+
+    #[test]
     fn build_new_session_uses_global_default_when_no_explicit_prompt() {
         let input = CreateSessionInput {
             id: "session-2".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
             model_ref: None,
@@ -213,6 +244,7 @@ mod tests {
         };
         let session = build_new_session(&input, &default_config());
 
+        assert!(!session.title_generated);
         assert_eq!(
             session
                 .metadata
@@ -233,6 +265,7 @@ mod tests {
             id: "session-3".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
             model_ref: None,
@@ -257,6 +290,7 @@ mod tests {
             id: "session-4".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: Some("Custom prompt".to_string()),
             model: Some("gpt-5".to_string()),
             model_ref: None,
@@ -278,6 +312,7 @@ mod tests {
             id: "session-5".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: None,
             model: Some("ignored-compat-model".to_string()),
             model_ref: Some(ProviderModelRef::new("anthropic", "claude-3-7-sonnet")),
@@ -306,6 +341,7 @@ mod tests {
             id: "session-6".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
             model_ref: None,
@@ -327,6 +363,7 @@ mod tests {
             id: "session-7".to_string(),
             project_id: None,
             title: None,
+            title_generated: None,
             system_prompt: None,
             model: Some("gpt-5".to_string()),
             model_ref: None,

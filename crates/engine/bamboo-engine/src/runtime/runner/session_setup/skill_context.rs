@@ -196,7 +196,7 @@ pub(super) async fn load_skill_context(
     session: &Session,
     session_id: &str,
     request_hint: &str,
-    must_resume_pinned_activation: bool,
+    _must_resume_pinned_activation: bool,
 ) -> Result<SkillContextLoadResult, String> {
     if let Some(skill_manager) = config.skill_manager.as_ref() {
         let resource_scope = SkillResourceScope::resolve(config, session).await?;
@@ -225,9 +225,13 @@ pub(super) async fn load_skill_context(
             .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
             .and_then(|raw| serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw).ok())
             .is_some_and(|active| active.status == bamboo_skills::WorkflowActivationStatus::Active);
+        // A chat-boundary explicit pin is durable authority even before the
+        // first execute starts. Restore it after a process restart regardless
+        // of whether the prior runtime state was suspended; otherwise a
+        // catalog edit in the POST /chat -> POST /execute window could silently
+        // substitute a newer revision.
         if retained_activation.is_none()
-            && (has_active_workflow
-                || (must_resume_pinned_activation && persisted_selection_requires_snapshot))
+            && (has_active_workflow || persisted_selection_requires_snapshot)
         {
             let restored = async {
                 let snapshot = if has_active_workflow {

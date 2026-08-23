@@ -2,7 +2,120 @@
 //!
 //! This module defines the error types used throughout the agent system.
 
+use std::fmt;
+use std::time::Duration;
+
 use thiserror::Error;
+
+/// Watchdog phase that expired while establishing or consuming an LLM stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamTimeoutPhase {
+    /// The provider call did not establish a response stream before the
+    /// transport-idle deadline.
+    Bootstrap,
+    /// No valid provider transport frame arrived before the transport-idle
+    /// deadline.
+    TransportIdle,
+    /// The stream was transport-live but produced no semantic output before
+    /// the first-semantic deadline.
+    FirstSemantic,
+    /// Semantic output had started, then stopped before the semantic-idle
+    /// deadline.
+    SemanticIdle,
+}
+
+impl fmt::Display for StreamTimeoutPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Bootstrap => "bootstrap",
+            Self::TransportIdle => "transport_idle",
+            Self::FirstSemantic => "first_semantic",
+            Self::SemanticIdle => "semantic_idle",
+        })
+    }
+}
+
+/// Structured, secret-free diagnostics for one LLM stream watchdog expiry.
+///
+/// Retry safety is derived from structured request provenance and observed
+/// semantic output instead of parsed from the formatted diagnostic string. A
+/// primary response timeout before any text, reasoning, or tool-call delta can
+/// be replayed by the turn-level retry policy; auxiliary calls and timeouts
+/// after semantic output starts are terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamTimeoutError {
+    phase: StreamTimeoutPhase,
+    deadline: Duration,
+    provider: Option<String>,
+    model: Option<String>,
+    last_transport: Duration,
+    last_semantic: Option<Duration>,
+    turn_retry_eligible: bool,
+}
+
+impl StreamTimeoutError {
+    /// Build a timeout diagnostic from already-sanitized provider/model
+    /// identifiers, monotonic elapsed durations, and whether the caller is the
+    /// primary turn response eligible for replay.
+    pub fn new(
+        phase: StreamTimeoutPhase,
+        deadline: Duration,
+        provider: Option<String>,
+        model: Option<String>,
+        last_transport: Duration,
+        last_semantic: Option<Duration>,
+        turn_retry_eligible: bool,
+    ) -> Self {
+        Self {
+            phase,
+            deadline,
+            provider,
+            model,
+            last_transport,
+            last_semantic,
+            turn_retry_eligible,
+        }
+    }
+
+    /// Watchdog phase that expired.
+    pub fn phase(&self) -> StreamTimeoutPhase {
+        self.phase
+    }
+
+    /// Whether replaying the turn cannot duplicate already-visible semantic
+    /// output or a partially emitted tool call.
+    pub fn retry_safe(&self) -> bool {
+        self.turn_retry_eligible && self.last_semantic.is_none()
+    }
+
+    /// Whether any text, reasoning, or tool-call delta was observed before the
+    /// timeout.
+    pub fn semantic_output_started(&self) -> bool {
+        self.last_semantic.is_some()
+    }
+}
+
+impl fmt::Display for StreamTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let last_semantic = self
+            .last_semantic
+            .map(|duration| format!("{}ms", duration.as_millis()))
+            .unwrap_or_else(|| "never".to_string());
+        write!(
+            formatter,
+            "phase={}, deadline_ms={}, provider={}, model={}, last_transport_ms_ago={}, \
+             last_semantic_ms_ago={}, semantic_output_started={}, retry_safe={}",
+            self.phase,
+            self.deadline.as_millis(),
+            self.provider.as_deref().unwrap_or("unknown"),
+            self.model.as_deref().unwrap_or("unknown"),
+            self.last_transport.as_millis(),
+            last_semantic,
+            self.semantic_output_started(),
+            self.retry_safe(),
+        )
+    }
+}
 
 /// Errors that can occur during agent operations
 #[derive(Error, Debug)]
@@ -33,10 +146,11 @@ pub enum AgentError {
 
     /// An LLM stream watchdog expired. The attached diagnostic identifies
     /// whether transport liveness, first semantic output, or midstream semantic
-    /// progress stalled. Kept distinct from `LLM` so generic retry logic cannot
-    /// replay partial output or tool-call state (#618).
+    /// progress stalled. Kept distinct from `LLM` so the turn retry policy can
+    /// replay only timeouts that occurred before semantic output, never partial
+    /// text or tool-call state (#618).
     #[error("Stream timed out: {0}")]
-    StreamTimeout(String),
+    StreamTimeout(StreamTimeoutError),
 
     /// Error during tool execution
     #[error("Tool error: {0}")]
@@ -86,7 +200,8 @@ impl AgentError {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentError;
+    use super::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
+    use std::time::Duration;
 
     #[test]
     fn empty_assistant_response_is_typed_and_has_secret_free_diagnostics() {
@@ -108,6 +223,29 @@ mod tests {
         assert_eq!(
             without_id.to_string(),
             "Empty assistant response from LLM (response_id=None)"
+        );
+    }
+
+    #[test]
+    fn stream_timeout_retry_safety_is_structured_not_message_parsed() {
+        let timeout = StreamTimeoutError::new(
+            StreamTimeoutPhase::Bootstrap,
+            Duration::from_secs(120),
+            Some("provider-id".to_string()),
+            Some("model-id".to_string()),
+            Duration::from_secs(120),
+            None,
+            true,
+        );
+
+        assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+        assert!(timeout.retry_safe());
+        assert!(!timeout.semantic_output_started());
+        assert_eq!(
+            AgentError::StreamTimeout(timeout).to_string(),
+            "Stream timed out: phase=bootstrap, deadline_ms=120000, provider=provider-id, \
+             model=model-id, last_transport_ms_ago=120000, last_semantic_ms_ago=never, \
+             semantic_output_started=false, retry_safe=true"
         );
     }
 }

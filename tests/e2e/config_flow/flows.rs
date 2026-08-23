@@ -115,12 +115,34 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
 
-    // 3) Strict provider endpoint: invalid provider config => 400.
-    let req = test::TestRequest::post()
-        .uri("/v1/bamboo/settings/provider")
+    // 3) The canonical provider-settings endpoint is revisioned and validates
+    // instance credentials before committing an enabled default.
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/config/provider-settings")
+        .to_request();
+    let provider_settings: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let provider_revision = provider_settings["revision"].as_u64().unwrap();
+    let mut provider_data = provider_settings["data"].clone();
+    provider_data["provider"] = json!("openai");
+    provider_data["providers"] = json!({});
+    provider_data["provider_instances"] = json!({
+        "openai": {
+            "provider_type": "openai",
+            "label": "OpenAI",
+            "model": "gpt-4",
+            "enabled": true
+        }
+    });
+    provider_data["default_provider_instance_id"] = json!("openai");
+    provider_data["defaults"] = json!({
+        "chat": {"provider": "openai", "model": "gpt-4"}
+    });
+
+    let req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/provider-settings")
         .set_json(json!({
-            "provider": "openai",
-            "providers": { "openai": { "model": "gpt-4" } }
+            "expected_revision": provider_revision,
+            "data": provider_data
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -128,41 +150,54 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
 
     let body = test::read_body(resp).await;
     let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(err["success"], false);
     // Canonical nested error envelope (#251 finding 2 / #507).
     assert_eq!(err["error"]["type"], "api_error");
-    assert!(err["error"]["message"]
-        .as_str()
-        .unwrap_or("")
-        .contains("Invalid configuration"));
+    assert!(!err["error"]["message"].as_str().unwrap_or("").is_empty());
 
-    // 4) Strict provider endpoint: valid provider config => 200 and routes the
-    // secret to credentials.json while providers.json stores only a stable ref.
-    let req = test::TestRequest::post()
-        .uri("/v1/bamboo/settings/provider")
+    // 4) Supplying an explicit credential action commits the same canonical
+    // instance shape and routes the secret to credentials.json while
+    // providers.json stores only a stable reference.
+    let req = test::TestRequest::put()
+        .uri("/v1/bamboo/config/provider-settings")
         .set_json(json!({
-            "provider": "openai",
-            "providers": { "openai": { "api_key": "sk-test-key", "model": "gpt-4" } }
+            "expected_revision": provider_revision,
+            "data": provider_data,
+            "credential_changes": {
+                "provider_instances": {
+                    "openai": {"action": "replace", "value": "sk-test-key"}
+                }
+            }
         }))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert!(resp.status().is_success());
+    let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+    assert!(!body.contains("sk-test-key"));
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["data"]["credential_status"]["provider_instances"]["openai"]["configured"],
+        true
+    );
 
     let providers_document = read_config_json(&providers_path);
     let providers = config_document_data(&providers_document);
     let openai_ref_before = providers
-        .get("openai")
+        .get("provider_instances")
+        .and_then(|instances| instances.get("openai"))
         .and_then(|o| o.get("credential_ref"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    assert_eq!(openai_ref_before, "provider.openai.api_key");
-    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    assert_eq!(openai_ref_before, "provider_instance.openai.api_key");
+    assert!(providers["provider_instances"]["openai"]
+        .get("api_key_encrypted")
+        .is_none());
     let providers_raw = std::fs::read_to_string(&providers_path).unwrap();
     let credentials_raw = std::fs::read_to_string(data_dir.join("credentials.json")).unwrap();
     assert!(!providers_raw.contains("sk-test-key"));
     assert!(!credentials_raw.contains("sk-test-key"));
-    let reference = bamboo_config::credential_ref("provider", "openai", "api_key").unwrap();
+    let reference =
+        bamboo_config::credential_ref("provider_instance", "openai", "api_key").unwrap();
     assert_eq!(
         state
             .credential_store
@@ -174,11 +209,26 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     );
     let reloaded = bamboo_config::Config::from_data_dir_without_env(Some(data_dir.clone()));
     assert_eq!(
-        reloaded.providers().openai.as_ref().unwrap().api_key,
-        "sk-test-key"
+        reloaded.default_provider_instance.as_deref(),
+        Some("openai")
     );
+    let reloaded_openai = reloaded
+        .provider_instances
+        .get("openai")
+        .expect("canonical provider instance should persist");
+    assert_eq!(reloaded_openai.api_key, "sk-test-key");
+    assert_eq!(
+        reloaded_openai
+            .credential_ref
+            .as_ref()
+            .map(|reference| reference.as_str()),
+        Some("provider_instance.openai.api_key")
+    );
+    assert!(reloaded.providers().openai.is_none());
 
-    // Attempt to inject api_key_encrypted via permissive endpoint - must be ignored.
+    // Attempt to inject api_key_encrypted via the permissive endpoint after
+    // the canonical write. It must be ignored without resurrecting the
+    // retired type-keyed alias.
     let req = test::TestRequest::post()
         .uri("/v1/bamboo/config")
         .set_json(json!({
@@ -200,13 +250,17 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     }
     let providers = config_document_data(&providers_document);
     let openai_ref_after = providers
-        .get("openai")
+        .get("provider_instances")
+        .and_then(|instances| instances.get("openai"))
         .and_then(|o| o.get("credential_ref"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     assert_eq!(openai_ref_after, openai_ref_before);
-    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    assert!(providers.get("openai").is_none());
+    assert!(providers["provider_instances"]["openai"]
+        .get("api_key_encrypted")
+        .is_none());
 
     // Ensure the permissive endpoint merges without clobbering prior provider/setup state.
     let req = test::TestRequest::get()
@@ -243,10 +297,14 @@ async fn test_full_setup_and_provider_flow_does_not_conflict() {
     let providers_document = read_config_json(&providers_path);
     let providers = config_document_data(&providers_document);
     assert_eq!(
-        providers["openai"]["credential_ref"], "provider.openai.api_key",
+        providers["provider_instances"]["openai"]["credential_ref"],
+        "provider_instance.openai.api_key",
         "metadata-only updates must preserve the existing credential ref"
     );
-    assert!(providers["openai"].get("api_key_encrypted").is_none());
+    assert!(providers.get("openai").is_none());
+    assert!(providers["provider_instances"]["openai"]
+        .get("api_key_encrypted")
+        .is_none());
 }
 
 #[actix_web::test]

@@ -125,6 +125,14 @@ fn map_store_error(error: ConfigStoreError) -> AppError {
     }
 }
 
+fn require_current_revision(expected: u64, actual: u64) -> Result<(), AppError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(AppError::ConfigConflict { expected, actual })
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct PermissionPolicyResponse {
     pub revision: u64,
@@ -226,6 +234,7 @@ pub async fn create_permission_rule(
     let request = payload.into_inner();
     request.rule.validate().map_err(AppError::BadRequest)?;
     let snapshot = app_state.permission_section.snapshot();
+    require_current_revision(request.expected_revision, snapshot.revision)?;
     if snapshot
         .data
         .durable_rules
@@ -258,6 +267,7 @@ pub async fn update_permission_rule(
     }
     request.rule.validate().map_err(AppError::BadRequest)?;
     let snapshot = app_state.permission_section.snapshot();
+    require_current_revision(request.expected_revision, snapshot.revision)?;
     let mut candidate = snapshot.data.as_ref().clone();
     let Some(existing) = candidate
         .durable_rules
@@ -279,6 +289,7 @@ pub async fn delete_permission_rule(
 ) -> Result<HttpResponse, AppError> {
     let rule_id = rule_id.into_inner();
     let snapshot = app_state.permission_section.snapshot();
+    require_current_revision(query.expected_revision, snapshot.revision)?;
     let mut candidate = snapshot.data.as_ref().clone();
     let before = candidate.durable_rules.len();
     candidate.durable_rules.retain(|rule| rule.id != rule_id);
@@ -596,5 +607,70 @@ mod tests {
         let reopened = bamboo_tools::permission::PermissionSection::open(temp.path()).unwrap();
         assert_eq!(reopened.snapshot().revision, 3);
         assert!(reopened.snapshot().data.durable_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_rule_mutations_report_revision_conflict_before_semantic_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = web::Data::new(
+            AppState::new(temp.path().to_path_buf())
+                .await
+                .expect("app state should initialize"),
+        );
+
+        create_permission_rule(
+            state.clone(),
+            web::Json(PutPermissionRuleRequest {
+                expected_revision: 0,
+                rule: global_rule(bamboo_tools::permission::PermissionRuleEffect::Allow),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stale_duplicate = create_permission_rule(
+            state.clone(),
+            web::Json(PutPermissionRuleRequest {
+                expected_revision: 0,
+                rule: global_rule(bamboo_tools::permission::PermissionRuleEffect::Allow),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale_duplicate,
+            AppError::ConfigConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+
+        delete_permission_rule(
+            state.clone(),
+            web::Path::from("rule-1".to_string()),
+            web::Query(DeletePermissionRuleRequest {
+                expected_revision: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stale_missing = update_permission_rule(
+            state,
+            web::Path::from("rule-1".to_string()),
+            web::Json(PutPermissionRuleRequest {
+                expected_revision: 1,
+                rule: global_rule(bamboo_tools::permission::PermissionRuleEffect::Deny),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            stale_missing,
+            AppError::ConfigConflict {
+                expected: 1,
+                actual: 2
+            }
+        ));
     }
 }

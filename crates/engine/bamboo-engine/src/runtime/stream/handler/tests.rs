@@ -6,16 +6,18 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_agent_core::{AgentError, AgentEvent};
+use bamboo_agent_core::{AgentError, AgentEvent, StreamTimeoutPhase};
 use bamboo_config::StreamTimeoutConfig;
 use bamboo_llm::provider::LLMError;
 use bamboo_llm::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
 use bamboo_llm::providers::common::openai_responses::ResponsesSseParser;
+use bamboo_llm::providers::common::sse::llm_stream_from_sse_multi_requiring_done;
 use bamboo_llm::{LLMChunk, LLMStream};
 
 use super::consume::consume_llm_stream_internal;
 use super::{
-    consume_llm_stream, consume_llm_stream_silent, ProviderUsageSnapshot, StreamTimeoutContext,
+    await_stream_bootstrap, consume_llm_stream, consume_llm_stream_silent, ProviderUsageSnapshot,
+    StreamTimeoutContext,
 };
 
 fn build_stream(items: Vec<bamboo_llm::provider::Result<LLMChunk>>) -> LLMStream {
@@ -36,6 +38,7 @@ fn timeout_context(
         Some("test-provider"),
         Some("test-model"),
     )
+    .allow_turn_retry_before_semantic_output()
 }
 
 #[tokio::test]
@@ -642,6 +645,98 @@ async fn consume_llm_stream_interrupts_blocked_next_on_mid_stream_cancel() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn stalled_stream_bootstrap_times_out_before_response_headers() {
+    let context = timeout_context(2, 20, 20);
+    let result = await_stream_bootstrap(
+        std::future::pending::<()>(),
+        &CancellationToken::new(),
+        "session-bootstrap-timeout",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected bootstrap StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+    assert!(timeout.retry_safe());
+    assert!(!timeout.semantic_output_started());
+    let message = timeout.to_string();
+    assert!(message.contains("phase=bootstrap"));
+    assert!(message.contains("deadline_ms=2000"));
+    assert!(message.contains("provider=test-provider"));
+    assert!(message.contains("model=test-model"));
+    assert!(message.contains("last_transport_ms_ago=2000"));
+    assert!(message.contains("last_semantic_ms_ago=never"));
+    assert!(message.contains("retry_safe=true"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn auxiliary_stream_timeout_does_not_authorize_turn_replay() {
+    let context = StreamTimeoutContext::new(
+        StreamTimeoutConfig {
+            transport_idle_timeout_secs: 2,
+            first_semantic_timeout_secs: 20,
+            semantic_idle_timeout_secs: 20,
+        },
+        Some("aux-provider"),
+        Some("aux-model"),
+    )
+    .begin_request();
+    let result = await_stream_bootstrap(
+        std::future::pending::<()>(),
+        &CancellationToken::new(),
+        "session-aux-bootstrap-timeout",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected bootstrap StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
+    assert!(!timeout.retry_safe());
+    assert!(!timeout.semantic_output_started());
+    assert!(timeout.to_string().contains("retry_safe=false"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn bootstrap_time_counts_toward_first_semantic_deadline() {
+    let started_at = tokio::time::Instant::now();
+    let context = timeout_context(10, 2, 20).begin_request();
+    await_stream_bootstrap(
+        async { tokio::time::sleep(Duration::from_secs(1)).await },
+        &CancellationToken::new(),
+        "session-bootstrap-semantic-budget",
+        &context,
+    )
+    .await
+    .expect("bootstrap should complete inside the transport deadline");
+
+    let result = consume_llm_stream_internal(
+        Box::pin(stream::pending()),
+        None,
+        &CancellationToken::new(),
+        "session-bootstrap-semantic-budget",
+        &context,
+    )
+    .await;
+
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
+        Err(other) => panic!("expected first-semantic StreamTimeout, got {other:?}"),
+        Ok(_) => panic!("expected first-semantic StreamTimeout, got success"),
+    };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::FirstSemantic);
+    assert!(timeout.retry_safe());
+    assert_eq!(started_at.elapsed(), Duration::from_secs(2));
+}
+
+#[tokio::test(start_paused = true)]
 async fn truly_silent_transport_times_out_with_actionable_diagnostic() {
     let stream: LLMStream = Box::pin(stream::pending());
     let context = timeout_context(2, 20, 20);
@@ -655,11 +750,14 @@ async fn truly_silent_transport_times_out_with_actionable_diagnostic() {
     )
     .await;
 
-    let message = match result {
-        Err(AgentError::StreamTimeout(message)) => message,
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
         Err(other) => panic!("expected transport StreamTimeout, got {other:?}"),
         Ok(_) => panic!("expected transport StreamTimeout, got success"),
     };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::TransportIdle);
+    assert!(timeout.retry_safe());
+    let message = timeout.to_string();
     assert!(message.contains("phase=transport_idle"));
     assert!(message.contains("deadline_ms=2000"));
     assert!(message.contains("provider=test-provider"));
@@ -688,11 +786,14 @@ async fn stream_stall_after_semantic_output_is_not_retry_safe() {
     )
     .await;
 
-    let message = match result {
-        Err(AgentError::StreamTimeout(message)) => message,
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
         Err(other) => panic!("expected transport StreamTimeout, got {other:?}"),
         Ok(_) => panic!("expected transport StreamTimeout, got success"),
     };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::TransportIdle);
+    assert!(!timeout.retry_safe());
+    let message = timeout.to_string();
     assert!(message.contains("phase=transport_idle"));
     assert!(message.contains("semantic_output_started=true"));
     assert!(message.contains("retry_safe=false"));
@@ -765,6 +866,78 @@ async fn transport_keepalives_allow_midstream_semantic_gap_after_120_seconds() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn sse_comment_heartbeats_survive_transport_timeout_until_responses_completion() {
+    let chunks = vec![
+        (
+            Duration::ZERO,
+            bytes::Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"first\"}\n\n",
+            ),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(b": keep-alive\n\n"),
+        ),
+        (
+            Duration::from_secs(30),
+            bytes::Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"delta\":\"second\"}\n\n",
+            ),
+        ),
+        (
+            Duration::ZERO,
+            bytes::Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\"}}\n\n",
+            ),
+        ),
+    ];
+    let body_stream = stream::unfold(chunks.into_iter(), |mut chunks| async move {
+        let (delay, chunk) = chunks.next()?;
+        tokio::time::sleep(delay).await;
+        Some((Ok::<_, std::io::Error>(chunk), chunks))
+    });
+    let response = reqwest::Response::from(
+        http::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(reqwest::Body::wrap_stream(body_stream))
+            .expect("http response"),
+    );
+    let mut parser = ResponsesSseParser::new();
+    let stream = llm_stream_from_sse_multi_requiring_done(
+        response,
+        move |event, data| parser.handle_event_multi(event, data),
+        "OpenAI Responses",
+    );
+    let context = timeout_context(45, 200, 200);
+
+    let output = consume_llm_stream_internal(
+        stream,
+        None,
+        &CancellationToken::new(),
+        "session-comment-heartbeat",
+        &context,
+    )
+    .await
+    .expect("comment heartbeats should preserve transport liveness");
+
+    assert_eq!(output.content, "firstsecond");
+    assert_eq!(output.response_id.as_deref(), Some("resp_done"));
+}
+
+#[tokio::test(start_paused = true)]
 async fn keepalives_do_not_make_first_semantic_deadline_unbounded() {
     let stream: LLMStream = Box::pin(stream::unfold((), |_| async {
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -781,11 +954,14 @@ async fn keepalives_do_not_make_first_semantic_deadline_unbounded() {
     )
     .await;
 
-    let message = match result {
-        Err(AgentError::StreamTimeout(message)) => message,
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
         Err(other) => panic!("expected first-semantic StreamTimeout, got {other:?}"),
         Ok(_) => panic!("expected first-semantic StreamTimeout, got success"),
     };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::FirstSemantic);
+    assert!(timeout.retry_safe());
+    let message = timeout.to_string();
     assert!(message.contains("phase=first_semantic"));
     assert!(message.contains("semantic_output_started=false"));
 }
@@ -811,11 +987,14 @@ async fn keepalives_do_not_hide_midstream_semantic_stall() {
     )
     .await;
 
-    let message = match result {
-        Err(AgentError::StreamTimeout(message)) => message,
+    let timeout = match result {
+        Err(AgentError::StreamTimeout(timeout)) => timeout,
         Err(other) => panic!("expected semantic-idle StreamTimeout, got {other:?}"),
         Ok(_) => panic!("expected semantic-idle StreamTimeout, got success"),
     };
+    assert_eq!(timeout.phase(), StreamTimeoutPhase::SemanticIdle);
+    assert!(!timeout.retry_safe());
+    let message = timeout.to_string();
     assert!(message.contains("phase=semantic_idle"));
     assert!(message.contains("semantic_output_started=true"));
     assert!(message.contains("retry_safe=false"));

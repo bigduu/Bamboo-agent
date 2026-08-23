@@ -4,6 +4,8 @@ use crate::handlers::agent::execute::{ExecuteClientSync, ExecuteSyncInfo, Execut
 
 use bamboo_engine::session_app::types::ServerExecuteSnapshot;
 
+use super::resolve_requested_provider;
+
 fn evaluate_client_sync_adapter(
     client_sync: Option<&ExecuteClientSync>,
     server_snapshot: &ServerExecuteSnapshot,
@@ -34,6 +36,27 @@ fn validate_and_normalize_model_treats_empty_value_as_absent() {
     assert_eq!(
         validate_and_normalize_model(Some("   ")).expect("empty model should normalize"),
         None
+    );
+}
+
+#[test]
+fn requested_provider_fallback_uses_default_provider_instance() {
+    let mut config = bamboo_config::Config::default();
+    let instance = serde_json::from_value(serde_json::json!({
+        "provider_type": "openai",
+        "enabled": true
+    }))
+    .unwrap();
+    config.provider = "anthropic".to_string();
+    config
+        .provider_instances
+        .insert("execute-openai".to_string(), instance);
+    config.default_provider_instance = Some("execute-openai".to_string());
+
+    assert_eq!(resolve_requested_provider(&config, None), "execute-openai");
+    assert_eq!(
+        resolve_requested_provider(&config, Some("explicit")),
+        "explicit"
     );
 }
 
@@ -173,6 +196,382 @@ fn evaluate_client_sync_allows_missing_pending_question_tool_call_id() {
         evaluate_client_sync_adapter(Some(&client_sync), &server_snapshot),
         None
     );
+}
+
+mod idempotency_e2e {
+    use actix_web::{http::StatusCode, test, web, App};
+    use async_trait::async_trait;
+    use bamboo_agent_core::{Message, Session};
+    use bamboo_llm::{
+        LLMChunk, LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelRouter,
+        ProviderRegistry,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+
+    use crate::routes::configure_routes;
+    use crate::AppState;
+
+    struct BlockingProvider {
+        calls: AtomicUsize,
+        started: Semaphore,
+        release: Semaphore,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                started: Semaphore::new(0),
+                release: Semaphore::new(0),
+            })
+        }
+
+        async fn response(&self) -> Result<LLMStream, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            let _permit = self
+                .release
+                .acquire()
+                .await
+                .expect("release semaphore remains open");
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(LLMChunk::Token("completed once".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for BlockingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.response().await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            _options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            self.response().await
+        }
+    }
+
+    async fn state_with_provider(provider: Arc<BlockingProvider>) -> web::Data<AppState> {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider = "openai".to_string();
+        config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+            model: Some("execute-model".to_string()),
+            ..Default::default()
+        });
+
+        let provider_trait: Arc<dyn LLMProvider> = provider.clone();
+        let mut state = AppState::new_with_provider(data_dir, config, provider_trait)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert("openai".to_string(), provider as Arc<dyn LLMProvider>);
+        state.provider_registry = Arc::new(ProviderRegistry::new(providers, "openai".to_string()));
+        state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
+        web::Data::new(state)
+    }
+
+    async fn state_with_instance_providers(
+        default_provider: Arc<BlockingProvider>,
+        openai_provider: Arc<BlockingProvider>,
+    ) -> web::Data<AppState> {
+        let data_dir = tempdir().expect("tempdir").keep();
+        bamboo_config::paths::init_bamboo_dir(data_dir.clone());
+        let mut config = bamboo_llm::Config::from_data_dir(Some(data_dir.clone()));
+        config.provider_instances.insert(
+            "main-anthropic".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "anthropic",
+                "model": "claude-main",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.provider_instances.insert(
+            "work-openai".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "model": "gpt-work",
+                "enabled": true
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("main-anthropic".to_string());
+        config.features.provider_model_ref = true;
+
+        let runtime_default: Arc<dyn LLMProvider> = default_provider.clone();
+        let mut state = AppState::new_with_provider(data_dir, config, runtime_default)
+            .await
+            .expect("app state");
+        let mut providers = HashMap::new();
+        providers.insert(
+            "main-anthropic".to_string(),
+            default_provider as Arc<dyn LLMProvider>,
+        );
+        providers.insert(
+            "work-openai".to_string(),
+            openai_provider as Arc<dyn LLMProvider>,
+        );
+        state.provider_registry = Arc::new(ProviderRegistry::new(
+            providers,
+            "main-anthropic".to_string(),
+        ));
+        state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
+        web::Data::new(state)
+    }
+
+    /// #733: execute retries replay the original Accepted response (including
+    /// run_id) instead of entering preparation or spawning another agent loop.
+    #[actix_web::test]
+    async fn idempotency_key_replays_execute_without_duplicate_run() {
+        let provider = BlockingProvider::new();
+        let state = state_with_provider(provider.clone()).await;
+        let session_id = "execute-idempotency-733";
+        let mut session = Session::new(session_id, "execute-model");
+        session.title_generated = true;
+        session.add_message(Message::user("run exactly once"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let request = || {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .insert_header(("Idempotency-Key", "execute-retry-733"))
+                .set_json(serde_json::json!({}))
+                .to_request()
+        };
+
+        let first = test::call_service(&app, request()).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = test::read_body(first).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.started.acquire(),
+        )
+        .await
+        .expect("agent provider started")
+        .expect("started semaphore remains open")
+        .forget();
+
+        let replay = test::call_service(&app, request()).await;
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay_body = test::read_body(replay).await;
+        assert_eq!(
+            replay_body, first_body,
+            "retry must replay the first run_id"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.agent_runners.read().await.len(), 1);
+
+        let cancel = state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .expect("runner remains registered")
+            .cancel_token
+            .clone();
+        cancel.cancel();
+        provider.release.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    #[actix_web::test]
+    async fn execute_builtin_provider_type_routes_to_custom_instance_not_runtime_default() {
+        let default_provider = BlockingProvider::new();
+        let openai_provider = BlockingProvider::new();
+        let state =
+            state_with_instance_providers(default_provider.clone(), openai_provider.clone()).await;
+        let session_id = "execute-provider-type-alias";
+        let mut session = Session::new(session_id, "gpt-work");
+        session.title_generated = true;
+        session.add_message(Message::user("route to the OpenAI instance"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({
+                    "model_ref": {"provider": "openai", "model": "gpt-work"}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            openai_provider.started.acquire(),
+        )
+        .await
+        .expect("OpenAI instance started")
+        .expect("started semaphore remains open")
+        .forget();
+        assert_eq!(openai_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_provider.calls.load(Ordering::SeqCst), 0);
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("session load")
+            .expect("session exists");
+        assert_eq!(
+            persisted
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.provider.as_str()),
+            Some("work-openai")
+        );
+
+        let cancel = state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .expect("runner remains registered")
+            .cancel_token
+            .clone();
+        cancel.cancel();
+        openai_provider.release.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    #[actix_web::test]
+    async fn execute_canonicalizes_legacy_session_provider_ref_before_resume() {
+        let default_provider = BlockingProvider::new();
+        let openai_provider = BlockingProvider::new();
+        let state =
+            state_with_instance_providers(default_provider.clone(), openai_provider.clone()).await;
+        let session_id = "execute-legacy-session-provider-ref";
+        let mut session = Session::new(session_id, "gpt-work");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "gpt-work"));
+        session.set_provider_name("openai");
+        session.title_generated = true;
+        session.add_message(Message::user("resume the migrated session"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            openai_provider.started.acquire(),
+        )
+        .await
+        .expect("migrated OpenAI instance started")
+        .expect("started semaphore remains open")
+        .forget();
+        assert_eq!(openai_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_provider.calls.load(Ordering::SeqCst), 0);
+
+        let persisted = state
+            .storage
+            .load_session(session_id)
+            .await
+            .expect("session load")
+            .expect("session exists");
+        assert_eq!(
+            persisted
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.provider.as_str()),
+            Some("work-openai")
+        );
+
+        let cancel = state
+            .agent_runners
+            .read()
+            .await
+            .get(session_id)
+            .expect("runner remains registered")
+            .cancel_token
+            .clone();
+        cancel.cancel();
+        openai_provider.release.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    #[actix_web::test]
+    async fn execute_unknown_explicit_provider_fails_before_runner_reservation() {
+        let default_provider = BlockingProvider::new();
+        let openai_provider = BlockingProvider::new();
+        let state =
+            state_with_instance_providers(default_provider.clone(), openai_provider.clone()).await;
+        let session_id = "execute-unknown-provider";
+        let mut session = Session::new(session_id, "unknown-model");
+        session.title_generated = true;
+        session.add_message(Message::user("must fail closed"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{session_id}"))
+                .set_json(serde_json::json!({
+                    "model_ref": {"provider": "missing-instance", "model": "unknown-model"}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(default_provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(openai_provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!state.agent_runners.read().await.contains_key(session_id));
+    }
 }
 
 #[actix_web::test]

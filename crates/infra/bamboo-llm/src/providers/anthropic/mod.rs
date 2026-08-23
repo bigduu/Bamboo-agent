@@ -15,8 +15,10 @@ pub use stream::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, PromptBlock, Role};
 use reqwest::{header::HeaderMap, Client};
@@ -32,6 +34,9 @@ use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
 
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
+
 pub(crate) fn reasoning_effort_for_required_tool(
     configured: Option<ReasoningEffort>,
     required_tool: Option<&str>,
@@ -40,6 +45,28 @@ pub(crate) fn reasoning_effort_for_required_tool(
         None
     } else {
         configured
+    }
+}
+
+/// Return the reasoning effort that will still need a numeric thinking budget
+/// after Anthropic's request-scoped compatibility downgrades run.
+///
+/// Keep the original effort for the request builder so it can emit the existing
+/// #520 warning and apply its full history conversion. This helper is only for
+/// deciding whether an impossible Max budget should reject the request before
+/// that builder runs.
+pub(crate) fn reasoning_effort_for_budget_validation(
+    reasoning_effort: Option<ReasoningEffort>,
+    messages: &[Message],
+    thinking_replay_always: bool,
+) -> Option<ReasoningEffort> {
+    if reasoning_effort.is_some()
+        && !thinking_replay_always
+        && must_downgrade_thinking_for_unsigned_tool_turn(messages)
+    {
+        None
+    } else {
+        reasoning_effort
     }
 }
 
@@ -283,6 +310,15 @@ impl AnthropicProvider {
             .or(self.default_reasoning_effort);
         let reasoning_effort =
             reasoning_effort_for_required_tool(configured_reasoning_effort, required_tool);
+        let budget_reasoning_effort = reasoning_effort_for_budget_validation(
+            reasoning_effort,
+            messages,
+            self.thinking_replay_always,
+        );
+        crate::providers::common::validate_max_thinking_budget(
+            budget_reasoning_effort,
+            Some(max_tokens),
+        )?;
         let request_reasoning_effort = reasoning_effort_for_required_tool(
             options.and_then(|o| o.reasoning_effort),
             required_tool,
@@ -686,11 +722,21 @@ pub fn build_anthropic_request_with_cache_blocks(
         && !thinking_replay_always
         && must_downgrade_thinking_for_unsigned_tool_turn(messages);
     if thinking_downgraded {
-        tracing::warn!(
-            "Anthropic request: disabling extended thinking for this request — the final \
-             assistant tool_use turn has no signed thinking block to replay (e.g. it was \
-             minted by another provider before a mid-session model switch, #520)"
-        );
+        let key = ("unsigned-tool-turn-thinking-downgrade", model);
+        let error = "final assistant tool_use turn lacks a signed thinking block";
+        if STATIC_WARNINGS.insert_if_new(&key, error) {
+            tracing::warn!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        } else {
+            tracing::debug!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        }
     }
     let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
 
@@ -857,23 +903,13 @@ fn anthropic_thinking_from_effort(
     reasoning_effort: Option<ReasoningEffort>,
     max_tokens: u32,
 ) -> Option<Value> {
-    let effort = reasoning_effort?;
-    let target_budget = match effort {
-        ReasoningEffort::Low => return None,
-        ReasoningEffort::Medium => 1024,
-        ReasoningEffort::High => 4096,
-        ReasoningEffort::Xhigh | ReasoningEffort::Max => 8192,
-    };
-
-    // Keep some room for final answer tokens.
-    let available_budget = max_tokens.saturating_sub(128);
-    if available_budget == 0 {
-        return None;
-    }
+    let budget = reasoning_effort.and_then(|effort| {
+        crate::providers::common::bounded_thinking_budget(effort, Some(max_tokens))
+    })?;
 
     Some(json!({
         "type": "enabled",
-        "budget_tokens": target_budget.min(available_budget),
+        "budget_tokens": budget,
     }))
 }
 
@@ -1820,6 +1856,81 @@ mod anthropic_request_building {
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
+
+    #[test]
+    fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
+        let xhigh = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            32_000,
+        )
+        .expect("xhigh enables thinking");
+        let max = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            32_000,
+        )
+        .expect("max enables thinking");
+
+        assert_eq!(xhigh["budget_tokens"], 8192);
+        assert_eq!(max["budget_tokens"], 16384);
+
+        let xhigh_at_default = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            16_384,
+        )
+        .expect("xhigh fits the common 16K output limit");
+        let max_at_default = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            16_384,
+        )
+        .expect("max fits while reserving visible output");
+        assert_eq!(xhigh_at_default["budget_tokens"], 8_192);
+        assert_eq!(max_at_default["budget_tokens"], 12_288);
+
+        let xhigh_at_tight = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            8_320,
+        )
+        .expect("xhigh scales under a tight limit");
+        let max_at_tight =
+            super::anthropic_thinking_from_effort(Some(bamboo_domain::ReasoningEffort::Max), 8_320)
+                .expect("max remains distinct under a tight limit");
+        assert_eq!(xhigh_at_tight["budget_tokens"], 4_160);
+        assert_eq!(max_at_tight["budget_tokens"], 6_240);
+
+        assert!(super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            2_048,
+        )
+        .is_none());
+        assert!(super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            1_024,
+        )
+        .is_none());
+
+        let request = super::build_anthropic_request(
+            &[bamboo_domain::Message::user("hello")],
+            &[],
+            "claude-sonnet-4-5",
+            16_384,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+        assert_eq!(request["max_tokens"], 16_384);
+        assert_eq!(request["thinking"]["budget_tokens"], 12_288);
+
+        let impossible = super::build_anthropic_request(
+            &[bamboo_domain::Message::user("hello")],
+            &[],
+            "claude-sonnet-4-5",
+            1_024,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+        assert!(impossible.get("thinking").is_none());
+    }
 
     #[test]
     fn system_messages_are_extracted_into_blocks_with_cache_control() {
@@ -4060,6 +4171,25 @@ mod anthropic_provider_tests {
         }
     }
 
+    fn unsigned_tool_loop_messages() -> Vec<Message> {
+        vec![
+            Message::user("run a tool"),
+            Message::assistant_with_reasoning(
+                "",
+                Some(vec![bamboo_domain::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_domain::FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"test"}"#.to_string(),
+                    },
+                }]),
+                Some("Foreign unsigned reasoning.".to_string()),
+            ),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ]
+    }
+
     #[tokio::test]
     async fn forced_named_tool_retries_exact_thinking_error_with_auto_choice() {
         let server = MockServer::start().await;
@@ -4102,6 +4232,71 @@ mod anthropic_provider_tests {
         assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
         assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
         assert_eq!(fallback["tools"][0]["name"], "load_skill");
+    }
+
+    #[tokio::test]
+    async fn unsigned_tool_turn_disables_max_before_small_budget_validation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::Max));
+
+        let _stream = provider
+            .chat_stream(
+                &unsigned_tool_loop_messages(),
+                &[],
+                Some(2_048),
+                "claude-sonnet-4-5",
+            )
+            .await
+            .expect("unsigned tool turn should disable thinking before Max validation");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 2_048);
+    }
+
+    #[tokio::test]
+    async fn compat_replay_keeps_max_small_budget_validation_enabled() {
+        let server = MockServer::start().await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::Max))
+            .with_thinking_replay_always(true);
+
+        let result = provider
+            .chat_stream(
+                &unsigned_tool_loop_messages(),
+                &[],
+                Some(2_048),
+                "glm-compatible",
+            )
+            .await;
+
+        match result {
+            Err(LLMError::Api(message)) => {
+                assert!(message.contains("requires max_output_tokens of at least 2049"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("compat replay still requires a valid Max thinking budget"),
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .is_empty());
     }
 
     #[test]

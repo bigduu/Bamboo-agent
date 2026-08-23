@@ -18,7 +18,7 @@ pub mod types;
 pub use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
 };
-pub use error::AgentError;
+pub use error::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
 pub use events::{AgentEvent, TokenUsage};
 pub use hooks::AgentHook;
 pub use types::{

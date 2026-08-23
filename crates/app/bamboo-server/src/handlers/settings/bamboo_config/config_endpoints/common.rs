@@ -17,25 +17,6 @@ pub(super) fn model_limits_file_path(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("model_limits.json")
 }
 
-/// The standalone connect.json sibling of config.json (#455) — bamboo-connect
-/// platform-bridge credentials (bot tokens, allowlists) live here, split out
-/// of config.json by `Config::save_to_dir`/`Config::merge_connect_config`.
-pub(super) fn connect_file_path(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("connect.json")
-}
-
-/// The single best-effort backup connect.json's save path creates before an
-/// overwrite (see `bamboo_config::config::save_connect_config`) —
-/// `connect.json.bak`. #457: a full config reset must scrub this too, unlike
-/// `config.json.bak` (which is intentionally left alone — see
-/// `reset_bamboo_config`). connect.json(.bak) holds an encrypted IM bot
-/// token, an immediately-usable remote-control credential; leaving the
-/// backup behind after a reset means that credential stays live and
-/// recoverable even though the user asked for a full reset.
-pub(super) fn connect_backup_file_path(app_data_dir: &Path) -> PathBuf {
-    connect_file_path(app_data_dir).with_extension("json.bak")
-}
-
 pub(super) async fn read_model_limits_file(app_data_dir: &Path) -> Result<Option<Value>, AppError> {
     let path = model_limits_file_path(app_data_dir);
     match tokio::fs::try_exists(&path).await {
@@ -67,7 +48,9 @@ pub(super) async fn write_model_limits_file(
     value: Option<&Value>,
 ) -> Result<(), AppError> {
     let path = model_limits_file_path(app_data_dir);
-    if bamboo_config::section_layout_is_active(app_data_dir).map_err(map_config_store_error)? {
+    if bamboo_config::modular_authority_boundary_present(app_data_dir)
+        .map_err(map_config_store_error)?
+    {
         let rows = match value {
             Some(value) => {
                 let limits: Vec<ModelLimit> = serde_json::from_value(value.clone())?;
@@ -80,7 +63,7 @@ pub(super) async fn write_model_limits_file(
         };
         let data_dir = app_data_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let facade = bamboo_config::ConfigFacade::open(&data_dir)?;
+            let facade = bamboo_config::ConfigFacade::open_or_migrate(&data_dir)?;
             let snapshot = facade.registry().model_limits.snapshot();
             if snapshot.data.0 != rows {
                 facade

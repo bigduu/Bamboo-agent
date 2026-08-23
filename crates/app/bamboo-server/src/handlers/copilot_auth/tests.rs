@@ -1,5 +1,5 @@
 use actix_web::http::StatusCode;
-use bamboo_config::{CopilotConfig, ProviderConfigs};
+use bamboo_config::{CopilotConfig, ProviderConfigs, ProviderInstanceConfig};
 use bamboo_llm::Config;
 
 use super::{client::resolve_headless_auth, status_logout::auth_status_from_token_content};
@@ -31,6 +31,24 @@ fn resolve_headless_auth_falls_back_to_legacy_root_field() {
     let mut config = Config::default();
     config.providers_mut().copilot = None;
     config.headless_auth = true;
+
+    assert!(resolve_headless_auth(&config));
+}
+
+#[test]
+fn resolve_headless_auth_prefers_effective_copilot_instance() {
+    let mut config = Config::default();
+    config.headless_auth = false;
+    let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+        "provider_type": "copilot",
+        "enabled": true,
+        "headless_auth": true
+    }))
+    .unwrap();
+    config
+        .provider_instances
+        .insert("work".to_string(), instance);
+    config.default_provider_instance = Some("work".to_string());
 
     assert!(resolve_headless_auth(&config));
 }

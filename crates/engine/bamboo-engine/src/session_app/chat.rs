@@ -168,6 +168,7 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
         if let Some(project_id) = input.project_id.as_ref() {
             session.set_project_id_meta(project_id.to_string());
         }
+        session.reasoning_effort = input.reasoning_effort;
     }
 
     // ---- Resolve base prompt ----
@@ -489,6 +490,28 @@ pub fn resolve_workflow_selection(
         deactivate_active_workflow(session);
         resolve_selected_skill_ids(session, selected_skill_ids_from_request, message);
         clear_skill_runtime_state(session);
+        return Ok(());
+    }
+
+    // A typed chat candidate is durable authority for the next execute, even
+    // when another ordinary message is appended before execution starts.
+    // Keep its visible selected id aligned with the retained immutable
+    // snapshot; only an explicit replacement/deactivation may cancel it.
+    if let Some(pending) = session
+        .metadata
+        .get(WORKFLOW_SELECTION_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok())
+        .filter(|_| {
+            session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+                .is_some_and(|source| source == "explicit")
+                && session.metadata.contains_key(
+                    bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+                )
+        })
+    {
+        persist_selected_skill_ids_metadata(session, Some(&[pending.id]));
         return Ok(());
     }
 
@@ -852,6 +875,7 @@ mod tests {
             model: "gpt-5".to_string(),
             model_ref: None,
             provider: None,
+            reasoning_effort: None,
             message: "hello".to_string(),
             system_prompt: Some("Base prompt".to_string()),
             enhance_prompt: enhance_prompt.map(ToString::to_string),
@@ -872,6 +896,25 @@ mod tests {
             .find(|message| matches!(message.role, Role::System))
             .map(|message| message.content.clone())
             .expect("session should have a system message")
+    }
+
+    #[test]
+    fn new_chat_session_persists_explicit_reasoning_profile() {
+        let mut input = chat_turn_input(None);
+        input.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Xhigh);
+
+        let session = prepare_chat_turn_from_authoritative_session(
+            None,
+            input,
+            "Global prompt",
+            "Builtin prompt",
+        )
+        .expect("new chat session");
+
+        assert_eq!(
+            session.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Xhigh)
+        );
     }
 
     fn active_workflow(id: &str, revision: u64) -> ActiveWorkflow {
@@ -1025,6 +1068,47 @@ mod tests {
             Some(vec!["review".to_string()])
         );
         assert!(session.metadata.contains_key(ACTIVE_WORKFLOW_METADATA_KEY));
+    }
+
+    #[test]
+    fn pending_typed_workflow_survives_an_ordinary_chat_before_execute() {
+        let mut session = Session::new("pending-selection", "model");
+        let selection = WorkflowSelection {
+            id: "review".to_string(),
+            source: bamboo_skills::WorkflowSource::Builtin,
+            revision: 7,
+            args: serde_json::json!({}),
+        };
+        session.metadata.insert(
+            WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).expect("selection json"),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.to_string(),
+            "opaque durable snapshot".to_string(),
+        );
+
+        resolve_workflow_selection(&mut session, None, None, "one more detail")
+            .expect("retain pending selection");
+
+        assert_eq!(
+            session.selected_skill_ids(),
+            Some(vec!["review".to_string()])
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok()),
+            Some(selection)
+        );
+        assert!(session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY));
     }
 
     #[test]

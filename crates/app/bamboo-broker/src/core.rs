@@ -54,6 +54,13 @@ struct Subscriber {
     role: Option<String>,
 }
 
+/// Opaque proof that one server connection installed the current subscriber.
+/// Cleanup compares the underlying channel identity so an older connection
+/// cannot unregister a newer replacement for the same session. #788.
+pub(crate) struct SubscriptionLease {
+    sink: mpsc::UnboundedSender<PushItem>,
+}
+
 /// In-process routing engine: owns the mailbox root and the live subscriber table.
 pub struct BrokerCore {
     root: PathBuf,
@@ -156,7 +163,21 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
+        self.subscribe_with_lease(session_id, role)
+            .await
+            .map(|(rx, _lease)| rx)
+    }
+
+    /// Server-facing subscription API that returns connection-scoped
+    /// ownership. The lease must be presented to [`unsubscribe_if_owner`] so a
+    /// stale/replaced connection cannot delete the current subscriber.
+    pub(crate) async fn subscribe_with_lease(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+    ) -> BrokerResult<(mpsc::UnboundedReceiver<PushItem>, SubscriptionLease)> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let lease = SubscriptionLease { sink: tx.clone() };
         self.subscribers.lock().await.insert(
             session_id.to_string(),
             Subscriber {
@@ -168,13 +189,21 @@ impl BrokerCore {
         let mb = self.mailbox(session_id);
         // Crash leftovers first (claimed-but-unacked from a previous connection),
         // then newly delivered, all in time order.
-        for d in mb.recover().await? {
-            let _ = tx.send(PushItem::Message(d.msg));
+        let preload: BrokerResult<()> = async {
+            for d in mb.recover().await? {
+                let _ = tx.send(PushItem::Message(d.msg));
+            }
+            for d in mb.drain().await? {
+                let _ = tx.send(PushItem::Message(d.msg));
+            }
+            Ok(())
         }
-        for d in mb.drain().await? {
-            let _ = tx.send(PushItem::Message(d.msg));
+        .await;
+        if let Err(error) = preload {
+            self.unsubscribe_if_owner(session_id, &lease).await;
+            return Err(error);
         }
-        Ok(rx)
+        Ok((rx, lease))
     }
 
     /// Out-of-band cancel: if `to` is currently subscribed, push an ephemeral
@@ -198,6 +227,24 @@ impl BrokerCore {
     /// remain in `cur/` for redelivery on the next subscribe.
     pub async fn unsubscribe(&self, session_id: &str) {
         self.subscribers.lock().await.remove(session_id);
+    }
+
+    /// Remove `session_id` only if `lease` still owns its subscriber entry.
+    /// Returns whether this call removed the entry. This is the connection-safe
+    /// counterpart to unconditional [`unsubscribe`](Self::unsubscribe).
+    pub(crate) async fn unsubscribe_if_owner(
+        &self,
+        session_id: &str,
+        lease: &SubscriptionLease,
+    ) -> bool {
+        let mut subscribers = self.subscribers.lock().await;
+        let owns_current = subscribers
+            .get(session_id)
+            .is_some_and(|subscriber| subscriber.sink.same_channel(&lease.sink));
+        if owns_current {
+            subscribers.remove(session_id);
+        }
+        owns_current
     }
 
     /// Acknowledge a processed message: delete it from `session_id`'s mailbox,

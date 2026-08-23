@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
@@ -17,8 +18,26 @@ use tokio::time::{sleep, Instant};
 
 use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
-use crate::provision::ProvisionSpec;
+use crate::provision::{ProvisionSpec, WorkerOwner};
 use crate::transport::{TransportError, TransportResult};
+
+fn local_owner_instance_id() -> &'static str {
+    static INSTANCE_ID: OnceLock<String> = OnceLock::new();
+    INSTANCE_ID
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .as_str()
+}
+
+/// Stamp physical owner metadata at the last possible moment so a cloned or
+/// cached spec cannot carry a stale PID/instance into a later spawn.
+fn provision_for_local_spawn(spec: &ProvisionSpec) -> ProvisionSpec {
+    let mut provisioned = spec.clone();
+    provisioned.owner = Some(WorkerOwner::for_current_process(
+        local_owner_instance_id().to_string(),
+        spec.identity.parent_id.clone(),
+    ));
+    provisioned
+}
 
 /// A launched actor plus its discovered record.
 ///
@@ -81,7 +100,7 @@ pub async fn spawn_worker(
     let fabric_dir = Path::new(&spec.fabric_dir);
     tokio::fs::create_dir_all(fabric_dir).await.ok();
 
-    let spec_json = spec
+    let spec_json = provision_for_local_spawn(spec)
         .to_json()
         .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
 
@@ -142,7 +161,7 @@ pub async fn spawn_worker_on_bus(
     worker_args: &[String],
     spec: &ProvisionSpec,
 ) -> TransportResult<SpawnedChild> {
-    let spec_json = spec
+    let spec_json = provision_for_local_spawn(spec)
         .to_json()
         .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
 
@@ -181,4 +200,40 @@ pub async fn spawn_worker_on_bus(
         record,
         process: Some(process),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provision::{ChildIdentity, ExecutorSpec};
+
+    #[test]
+    fn local_spawn_stamps_current_process_instance_and_parent_session() {
+        let spec = ProvisionSpec::new(
+            ChildIdentity {
+                child_id: "child".into(),
+                parent_id: Some("parent-session".into()),
+                project_key: None,
+                role: "worker".into(),
+                depth: 1,
+            },
+            ExecutorSpec::Echo,
+            "fabric".into(),
+        );
+
+        let first = provision_for_local_spawn(&spec);
+        let second = provision_for_local_spawn(&spec);
+        assert!(spec.owner.is_none(), "caller-owned spec remains reusable");
+        let first_owner = first.owner.expect("physical owner metadata");
+        let second_owner = second.owner.expect("physical owner metadata");
+        assert_eq!(first_owner.process_id, std::process::id());
+        assert_eq!(first_owner.instance_id, second_owner.instance_id);
+        assert_eq!(first_owner.session_id.as_deref(), Some("parent-session"));
+        #[cfg(windows)]
+        assert!(first_owner.process_start_id.is_some());
+        #[cfg(not(windows))]
+        assert!(first_owner.process_start_id.is_none());
+        assert_eq!(first_owner.process_start_id, second_owner.process_start_id);
+        assert!(second_owner.worker_spawned_at >= first_owner.worker_spawned_at);
+    }
 }

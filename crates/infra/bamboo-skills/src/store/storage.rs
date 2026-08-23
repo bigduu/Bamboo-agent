@@ -1,11 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
+use std::io::Read;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, info, warn};
 
+use crate::clone_publication::{
+    clone_marker_name, parse_clone_marker_journal, std_file_identity, ClonePublicationPhase,
+    MAX_CLONE_MARKER_BYTES,
+};
 use crate::store::parser::{parse_markdown_skill, render_skill_markdown};
 use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
@@ -56,6 +66,148 @@ fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         }
         Ok(file)
     }
+}
+
+fn open_directory_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow clone target is not a directory",
+            ));
+        }
+        Ok(directory)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow clone target is not a real directory",
+            ));
+        }
+        Ok(directory)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let before = std::fs::symlink_metadata(path)?;
+        if before.file_type().is_symlink() || !before.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workflow clone target is not a real directory",
+            ));
+        }
+        std::fs::OpenOptions::new().read(true).open(path)
+    }
+}
+
+fn clone_marker_allows_publication_sync(skill_file: &Path) -> bool {
+    let Some(skill_root) = skill_file.parent() else {
+        return false;
+    };
+    let Some(workflow_id) = skill_root.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(skills_root) = skill_root.parent() else {
+        return false;
+    };
+    let marker_path = skills_root.join(clone_marker_name(workflow_id));
+    let mut marker = match open_file_no_follow(&marker_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(marker) => marker,
+        Err(_) => return false,
+    };
+    let marker_metadata = match marker.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) | Err(_) => return false,
+    };
+    let marker_identity = match std_file_identity(&marker) {
+        Some(identity) => identity,
+        None => return false,
+    };
+    let marker_len = match usize::try_from(marker_metadata.len()) {
+        Ok(len) if len <= MAX_CLONE_MARKER_BYTES => len,
+        _ => return false,
+    };
+    let mut bytes = Vec::with_capacity(marker_len);
+    if marker
+        .by_ref()
+        .take(MAX_CLONE_MARKER_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_CLONE_MARKER_BYTES
+    {
+        return false;
+    }
+    let marker_after = match open_file_no_follow(&marker_path) {
+        Ok(marker) => marker,
+        Err(_) => return false,
+    };
+    if !marker_after
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        || std_file_identity(&marker_after) != Some(marker_identity)
+    {
+        return false;
+    }
+    let Some(journal) = parse_clone_marker_journal(&bytes, workflow_id) else {
+        return false;
+    };
+    if !journal.partial.is_empty() {
+        return false;
+    }
+    let Some(marker) = journal.current() else {
+        return false;
+    };
+    if matches!(
+        marker.phase,
+        ClonePublicationPhase::Aborted | ClonePublicationPhase::Retired
+    ) {
+        return true;
+    }
+    let Some(expected_target) = marker.complete_target_identity(workflow_id) else {
+        return false;
+    };
+
+    let target = match open_directory_no_follow(skill_root) {
+        Ok(target) => target,
+        Err(_) => return false,
+    };
+    if !target.metadata().is_ok_and(|metadata| metadata.is_dir())
+        || std_file_identity(&target) != Some(expected_target)
+    {
+        return false;
+    }
+    let target_after = match open_directory_no_follow(skill_root) {
+        Ok(target) => target,
+        Err(_) => return false,
+    };
+    target_after
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_dir())
+        && std_file_identity(&target_after) == Some(expected_target)
+}
+
+async fn clone_marker_allows_publication(skill_file: &Path) -> bool {
+    let skill_file = skill_file.to_path_buf();
+    tokio::task::spawn_blocking(move || clone_marker_allows_publication_sync(&skill_file))
+        .await
+        .unwrap_or(false)
 }
 
 pub(crate) async fn open_skill_file_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
@@ -183,10 +335,19 @@ async fn find_skill_files(dir: &Path, max_candidates: usize) -> Vec<PathBuf> {
                             break;
                         }
                     } else {
-                        warn!(
-                            "Ignoring symlinked or non-regular skill file: {:?}",
-                            skill_file
-                        );
+                        let key = ("non-regular-skill-file", &skill_file);
+                        let error = "symlink or non-regular file";
+                        if STATIC_WARNINGS.insert_if_new(&key, error) {
+                            warn!(
+                                "Ignoring symlinked or non-regular skill file: {:?}",
+                                skill_file
+                            );
+                        } else {
+                            debug!(
+                                "Ignoring symlinked or non-regular skill file: {:?}",
+                                skill_file
+                            );
+                        }
                     }
                     continue; // Don't recurse into skill directories
                 }
@@ -275,6 +436,24 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
         }
         skill_files.sort();
         for skill_file in skill_files {
+            if !clone_marker_allows_publication(&skill_file).await {
+                let skill_root = skill_file
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                report.failed.push(FailedSkillRecord {
+                    skill_id: skill_root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string),
+                    skill_root,
+                    skill_file,
+                    source: discovery.source,
+                    mode: discovery.mode.clone(),
+                    error: "Workflow clone publication is incomplete".to_string(),
+                });
+                continue;
+            }
             let metadata_bytes = fs::metadata(&skill_file).await?.len() as usize;
             if metadata_bytes > max_skill_file_bytes {
                 let skill_root = skill_file
@@ -327,7 +506,13 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                         });
                     }
                     Err(error) => {
-                        warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        let error_fingerprint = error.to_string();
+                        let key = ("parse-skill-file", &skill_file);
+                        if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+                            warn!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        } else {
+                            debug!("Failed to parse skill file {:?}: {}", skill_file, error);
+                        }
                         let skill_root = skill_file
                             .parent()
                             .map(Path::to_path_buf)
@@ -346,7 +531,13 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                     }
                 },
                 Err(error) => {
-                    warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                    let error_fingerprint = error.to_string();
+                    let key = ("decode-skill-file", &skill_file);
+                    if STATIC_WARNINGS.insert_if_new(&key, &error_fingerprint) {
+                        warn!("Failed to read skill file {:?}: {}", skill_file, error);
+                    } else {
+                        debug!("Failed to read skill file {:?}: {}", skill_file, error);
+                    }
                     let skill_root = skill_file
                         .parent()
                         .map(Path::to_path_buf)
@@ -454,9 +645,160 @@ pub async fn write_skill_file(skills_dir: &Path, skill: &SkillDefinition) -> Ski
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clone_publication::{
+        ClonePublicationMarker, ClonePublicationPhase, CLONE_MARKER_SCHEMA,
+    };
 
     fn valid_skill(name: &str) -> String {
         format!("---\nname: {name}\ndescription: test skill\n---\n\nFollow this skill.")
+    }
+
+    fn clone_marker(
+        root: &Path,
+        workflow_id: &str,
+        phase: ClonePublicationPhase,
+        target_identity: Option<crate::clone_publication::CloneNodeIdentity>,
+    ) {
+        let marker = ClonePublicationMarker {
+            schema: CLONE_MARKER_SCHEMA,
+            workflow_id: workflow_id.to_string(),
+            source_revision: 7,
+            source_content_digest: "a".repeat(64),
+            bundle_digest: "b".repeat(64),
+            staging_name: "txn-12345678-1234-1234-1234-123456789abc".to_string(),
+            phase,
+            stage_identity: (phase != ClonePublicationPhase::Prepared)
+                .then_some(target_identity)
+                .flatten(),
+            target_identity: matches!(
+                phase,
+                ClonePublicationPhase::Complete | ClonePublicationPhase::Retired
+            )
+            .then_some(target_identity)
+            .flatten(),
+        };
+        std::fs::write(
+            root.join(clone_marker_name(workflow_id)),
+            serde_json::to_vec(&marker).expect("marker JSON"),
+        )
+        .expect("clone marker");
+    }
+
+    #[tokio::test]
+    async fn clone_marker_only_allows_complete_exact_target_generation() {
+        let root = tempfile::tempdir().expect("root");
+        let skill = root.path().join("review");
+        fs::create_dir_all(&skill).await.expect("skill dir");
+        fs::write(skill.join("SKILL.md"), valid_skill("review"))
+            .await
+            .expect("skill");
+        clone_marker(root.path(), "review", ClonePublicationPhase::Prepared, None);
+        let discovery = [SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Global,
+            mode: None,
+        }];
+        let blocked = load_skills_from_discovery_dirs_detailed(&discovery)
+            .await
+            .expect("blocked discovery is typed");
+        assert!(blocked.loaded.is_empty());
+        assert_eq!(blocked.failed.len(), 1);
+        assert_eq!(
+            blocked.failed[0].error,
+            "Workflow clone publication is incomplete"
+        );
+
+        let target = open_directory_no_follow(&skill).expect("target handle");
+        let identity = std_file_identity(&target).expect("target identity");
+        clone_marker(
+            root.path(),
+            "review",
+            ClonePublicationPhase::Complete,
+            Some(identity),
+        );
+        let complete = load_skills_from_discovery_dirs_detailed(&discovery)
+            .await
+            .expect("complete discovery");
+        assert_eq!(complete.loaded.len(), 1);
+        assert!(complete.failed.is_empty());
+
+        let other = root.path().join("other");
+        fs::create_dir(&other).await.expect("other generation");
+        let other = open_directory_no_follow(&other).expect("other target handle");
+        let other_identity = std_file_identity(&other).expect("other identity");
+        clone_marker(
+            root.path(),
+            "review",
+            ClonePublicationPhase::Complete,
+            Some(other_identity),
+        );
+        let mismatched = load_skills_from_discovery_dirs_detailed(&discovery)
+            .await
+            .expect("mismatched discovery is typed");
+        assert!(mismatched.loaded.is_empty());
+        assert_eq!(mismatched.failed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_and_retired_markers_release_an_ordinary_target() {
+        for phase in [
+            ClonePublicationPhase::Aborted,
+            ClonePublicationPhase::Retired,
+        ] {
+            let root = tempfile::tempdir().expect("root");
+            let skill = root.path().join("review");
+            fs::create_dir_all(&skill).await.expect("skill dir");
+            fs::write(skill.join("SKILL.md"), valid_skill("review"))
+                .await
+                .expect("skill");
+            let target = open_directory_no_follow(&skill).expect("target handle");
+            let identity = std_file_identity(&target).expect("target identity");
+            clone_marker(root.path(), "review", phase, Some(identity));
+            let report = load_skills_from_discovery_dirs_detailed(&[SkillDiscoveryDir {
+                dir: root.path().to_path_buf(),
+                source: SkillDirectorySource::Global,
+                mode: None,
+            }])
+            .await
+            .expect("terminal marker discovery");
+            assert_eq!(report.loaded.len(), 1);
+            assert!(report.failed.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_or_link_like_clone_marker_fails_closed() {
+        let root = tempfile::tempdir().expect("root");
+        let skill = root.path().join("review");
+        fs::create_dir_all(&skill).await.expect("skill dir");
+        fs::write(skill.join("SKILL.md"), valid_skill("review"))
+            .await
+            .expect("skill");
+        let marker = root.path().join(clone_marker_name("review"));
+        fs::write(&marker, b"not a marker").await.expect("marker");
+        let discovery = [SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Global,
+            mode: None,
+        }];
+        let malformed = load_skills_from_discovery_dirs_detailed(&discovery)
+            .await
+            .expect("malformed marker is typed");
+        assert!(malformed.loaded.is_empty());
+        assert_eq!(malformed.failed.len(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            std::fs::remove_file(&marker).expect("remove malformed marker");
+            let outside = tempfile::NamedTempFile::new().expect("outside marker");
+            symlink(outside.path(), &marker).expect("marker symlink");
+            let linked = load_skills_from_discovery_dirs_detailed(&discovery)
+                .await
+                .expect("link-like marker is typed");
+            assert!(linked.loaded.is_empty());
+            assert_eq!(linked.failed.len(), 1);
+        }
     }
 
     #[tokio::test]

@@ -24,6 +24,12 @@ POST /api/v1/chat
 
 Create a new chat session or add a message to an existing session.
 
+Supply an optional `Idempotency-Key` header when a client may retry after an
+ambiguous timeout. For 10 minutes, an equivalent retry returns the first
+response without appending the message again. Reusing the key with another
+payload returns `409 idempotency_key_conflict`. Receipts are process-local and
+bounded; omitting the header preserves the normal behavior.
+
 **Request Body:**
 
 ```json
@@ -60,6 +66,11 @@ POST /api/v1/execute/{session_id}
 ```
 
 Start the agent execution loop for a session.
+
+`Idempotency-Key` has the same optional 10-minute replay contract as chat. An
+equivalent retry returns the original status, body, and `run_id` without
+starting another run. The canonical nested route
+`POST /api/v1/sessions/{session_id}/execute` shares the same receipt.
 
 **Path Parameters:**
 
@@ -140,6 +151,32 @@ eventSource.onmessage = (event) => {
 ---
 
 ### Session Management
+
+#### Copy Session
+
+```http
+POST /api/v1/sessions/{session_id}/copy
+```
+
+Create an independent root session from an existing session. The copy receives
+a new id and preserves the complete transcript, durable configuration,
+permission mode, Project assignment, Workspace assignment, and attachments.
+Attachment URLs are rewritten to the copied session id. Durable workflow
+selection/activation snapshots are retained so the conversation can be
+reconstructed; workflow run ids, lifecycle outbox/cache data, and other
+transient execution, pending approval/question, child identity, schedule,
+placement, and run-status state are not copied. Copying a child session always
+produces an independent root with no parent chain.
+
+The operation is failure-atomic: storage or attachment-copy failure leaves no
+target session or index entry. Concurrent requests intentionally create
+different copies.
+
+**Response:** `201 Created` with `{ "session": SessionSummary }`, `404 Not
+Found` when the source does not exist, or `500 Internal Server Error` when the
+copy could not be committed.
+
+---
 
 #### Delete Session
 

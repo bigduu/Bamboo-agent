@@ -6,6 +6,9 @@ use bamboo_llm::Config;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[path = "bamboo/nofile_limit.rs"]
+mod nofile_limit;
+
 #[derive(Parser)]
 #[command(name = "bamboo")]
 #[command(version)]
@@ -158,60 +161,6 @@ fn parse_nonzero_u32(s: &str) -> Result<u32, String> {
     Ok(n)
 }
 
-/// Spawn the sidecar orphan guard: a dedicated OS thread that exits the process
-/// when the shell that spawned us goes away.
-///
-/// The primary signal is `getppid()`: when our parent terminates — even via
-/// SIGKILL / force-quit, even while it lingers as an unreaped zombie — the
-/// kernel reparents us to init/launchd *at the moment of termination*, so
-/// `getppid()` changes. That is reap-independent, unlike `kill(pid, 0)` (which
-/// still reports a zombie as alive). The recorded shell PID fully disappearing
-/// is kept as a secondary trigger.
-#[cfg(unix)]
-fn spawn_orphan_guard(shell_pid: u32) {
-    std::thread::spawn(move || {
-        let initial_parent = unsafe { libc::getppid() };
-        loop {
-            let current_parent = unsafe { libc::getppid() };
-            // Reparented away from our original parent (it terminated → the kernel
-            // handed us to init/launchd). This is immediate at the parent's exit and
-            // independent of when its zombie is reaped — unlike `kill(pid, 0)`, which
-            // still reports a not-yet-reaped zombie as alive. The shell PID fully
-            // disappearing is kept as a secondary trigger.
-            let reparented = current_parent != initial_parent || current_parent <= 1;
-            let shell_gone = {
-                let r = unsafe { libc::kill(shell_pid as libc::pid_t, 0) };
-                r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            };
-            if reparented || shell_gone {
-                std::process::exit(0);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    });
-}
-
-#[cfg(windows)]
-fn spawn_orphan_guard(shell_pid: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-    };
-    // Open a synchronizable handle to the shell and block until it exits, then take
-    // the sidecar down with it. Covers normal quit AND hard kills (the shell runs no
-    // cleanup). If the shell is already gone, OpenProcess fails and we exit at once.
-    std::thread::spawn(move || unsafe {
-        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, shell_pid);
-        if handle.is_null() {
-            std::process::exit(0);
-        }
-        // INFINITE (0xFFFF_FFFF): wait until the shell process terminates.
-        WaitForSingleObject(handle, u32::MAX);
-        let _ = CloseHandle(handle);
-        std::process::exit(0);
-    });
-}
-
 #[derive(Subcommand)]
 enum Commands {
     /// Start the Bamboo HTTP server
@@ -270,6 +219,16 @@ enum Commands {
         /// Model to use
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Colour palette: truecolor, system (terminal ANSI colours), or
+        /// no-color. `NO_COLOR` selects no-color when omitted.
+        #[arg(long)]
+        theme: Option<bamboo_tui::ThemePalette>,
+
+        /// JSON keymap override with per-context bindings, leader sequences,
+        /// and unbind support. Invalid maps fall back to safe defaults.
+        #[arg(long, value_name = "PATH")]
+        keymap: Option<PathBuf>,
 
         /// If `--server-url` is unreachable and loopback, start a local
         /// `bamboo serve` automatically instead of asking (y/n). No effect for
@@ -1243,8 +1202,37 @@ fn log_level_to_seed(rust_log_is_set: bool, requested_level: Option<&str>) -> Op
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentWorkerProcessAction {
+    Return,
+    HardExit(i32),
+}
+
+/// A dedicated subagent worker must not fall through `#[tokio::main]` runtime
+/// teardown after a fatal serve error: an async handler may still be inside
+/// synchronous, non-yielding code that `JoinHandle::abort` cannot interrupt.
+/// `process::exit` bypasses runtime Drop and is deliberately confined to this
+/// hidden worker subcommand, never the reusable broker library.
+fn subagent_worker_process_action(
+    result: &std::result::Result<(), String>,
+) -> SubagentWorkerProcessAction {
+    if result.is_ok() {
+        SubagentWorkerProcessAction::Return
+    } else {
+        SubagentWorkerProcessAction::HardExit(1)
+    }
+}
+
+fn main() {
+    // Do this before Tokio constructs its runtime (and therefore before Bamboo
+    // opens any application sockets/files). The adjustment is best-effort and
+    // reports failures directly to stderr because logging is not initialized yet.
+    nofile_limit::raise_nofile_limit_best_effort();
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     let cli = Cli::parse();
 
     // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
@@ -1496,7 +1484,7 @@ async fn main() {
             // how the parent wired our stdio — a Tauri sidecar does not hand us a
             // pipe whose EOF we could watch, so a PID poll is the portable signal.
             if let Some(ppid) = parent_pid {
-                spawn_orphan_guard(ppid);
+                bamboo_agent::process_owner::spawn_orphan_guard(ppid, "bamboo-sidecar", None, None);
             }
             // Desktop notification sink default posture (see
             // `notify_sinks::desktop::desktop_enabled`): a sidecar runs under a
@@ -1539,6 +1527,8 @@ async fn main() {
             server_url,
             session_id,
             model,
+            theme,
+            keymap,
             auto_serve,
             no_auto_serve,
         } => {
@@ -1557,6 +1547,8 @@ async fn main() {
                 session_id,
                 model,
                 auto_serve,
+                theme,
+                keymap,
             })
             .await;
             if let Err(e) = result {
@@ -1573,9 +1565,14 @@ async fn main() {
         }
 
         Commands::SubagentWorker => {
-            if let Err(e) = bamboo_agent::subagent_worker::run().await {
+            let result = bamboo_agent::subagent_worker::run().await;
+            if let Err(e) = &result {
                 eprintln!("subagent-worker failed: {e}");
-                std::process::exit(1);
+            }
+            if let SubagentWorkerProcessAction::HardExit(code) =
+                subagent_worker_process_action(&result)
+            {
+                std::process::exit(code);
             }
         }
 
@@ -2120,11 +2117,24 @@ fn serialize_config_for_cli(
 mod tests {
     use super::{
         log_level_to_seed, requested_log_level, resolve_config_data_dir, serialize_config_for_cli,
+        subagent_worker_process_action, SubagentWorkerProcessAction,
     };
     use bamboo_config::{Config, OpenAIConfig, ProviderConfigs, ProxyAuth};
     use bamboo_mcp::{McpServerConfig, StdioConfig, TransportConfig};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn subagent_worker_errors_require_process_level_hard_exit() {
+        assert_eq!(
+            subagent_worker_process_action(&Ok(())),
+            SubagentWorkerProcessAction::Return
+        );
+        assert_eq!(
+            subagent_worker_process_action(&Err("connection-loss drain timed out".to_string())),
+            SubagentWorkerProcessAction::HardExit(1)
+        );
+    }
 
     #[test]
     fn requested_log_level_prefers_explicit_level_then_verbose_count() {
@@ -2293,6 +2303,7 @@ mod tests {
             "server_url",
             "session_id",
             "model",
+            "theme",
             "auto_serve",
             "no_auto_serve",
         ] {

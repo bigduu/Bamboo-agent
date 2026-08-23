@@ -2,9 +2,9 @@
 //!
 //! bamboo terminates TLS itself via rustls — no reverse proxy. Certificates are
 //! manual PEM files configured under `server.tls` (see
-//! `docs/api-v2-transport.md` §3). When `server.tls` is absent the server keeps
-//! its existing plaintext `.bind()` / `.listen()` path unchanged; this module is
-//! only consulted when TLS is explicitly configured.
+//! `docs/design/api-v2-transport.md` §3). When `server.tls` is absent the server
+//! keeps its plaintext HTTP/1.1 path unchanged; this module is only consulted
+//! when TLS is explicitly configured.
 //!
 //! **Fail-fast invariant:** if `server.tls` is set but the cert/key files are
 //! missing or unparseable, [`build_rustls_config`] returns an `Err` and the
@@ -57,14 +57,23 @@ pub(super) fn build_rustls_config(tls: &TlsConfig) -> Result<ServerConfig, Strin
     // Build against an explicit `ring` provider so we never rely on a process
     // default being installed (avoids the rustls 0.23 no-provider panic).
     let provider = Arc::new(ring::default_provider());
-    ServerConfig::builder_with_provider(provider)
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("TLS: rustls protocol version setup failed: {e}"))?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| {
             format!("TLS: rustls rejected the cert/key pair (cert '{cert_path}', key '{key_path}'): {e}")
-        })
+        })?;
+
+    // Bamboo's inbound Actix face is intentionally HTTP/1.1-only (#849).
+    // Advertising `h2` here would be worse than a clean rejection: the stream
+    // would reach an H1 dispatcher after ALPN had promised HTTP/2. Keep this
+    // explicit even though rustls's empty default would also fall back to H1,
+    // so clients and regression tests can verify the transport contract.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(config)
 }
 
 /// Load the first usable private key from a PEM file, trying PKCS#8, then
@@ -83,30 +92,18 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>, St
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(super) mod test_support {
     use std::path::{Path, PathBuf};
     use std::process::Command;
-
-    fn tmp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bamboo-tls-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// Generate a throwaway X.509 v3 self-signed cert + PKCS#8 key via openssl.
     ///
     /// `Ok(None)` is reserved for an absent openssl executable. A present
     /// executable that fails must fail the test instead of silently skipping
     /// the rustls success path.
-    fn gen_self_signed(dir: &Path) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    pub(in crate::server) fn gen_self_signed(
+        dir: &Path,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
         let output = Command::new("openssl")
@@ -141,7 +138,7 @@ mod tests {
         Ok(Some((cert, key)))
     }
 
-    fn assert_x509_v3(cert: &Path) {
+    pub(in crate::server) fn assert_x509_v3(cert: &Path) {
         let output = Command::new("openssl")
             .args(["x509", "-in"])
             .arg(cert)
@@ -160,6 +157,40 @@ mod tests {
                 .lines()
                 .any(|line| line.trim() == "Version: 3 (0x2)"),
             "expected generated TLS fixture to be X.509 v3:\n{certificate_text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{assert_x509_v3, gen_self_signed};
+    use super::*;
+    use std::path::PathBuf;
+
+    #[cfg(target_os = "macos")]
+    #[inline(never)]
+    fn capture_test_backtrace() -> std::backtrace::Backtrace {
+        std::backtrace::Backtrace::force_capture()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_test_link_keeps_dwarf_backtraces() {
+        // The macOS platform fixture links this crate's monolithic lib-test,
+        // whose build disables only compact-unwind synthesis. Exercise a real
+        // stack walk so the CI guard also proves that the retained __eh_frame
+        // records remain usable for test debugging.
+        let backtrace = capture_test_backtrace();
+        assert_eq!(
+            backtrace.status(),
+            std::backtrace::BacktraceStatus::Captured
+        );
+        assert!(
+            backtrace
+                .to_string()
+                .lines()
+                .any(|line| !line.trim().is_empty()),
+            "captured backtrace should contain at least one frame"
         );
     }
 
@@ -182,9 +213,9 @@ mod tests {
 
     #[test]
     fn build_rustls_config_errors_on_empty_cert_file() {
-        let dir = tmp_dir();
-        let cert = dir.join("cert.pem");
-        let key = dir.join("key.pem");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
         std::fs::write(&cert, "not a pem certificate\n").unwrap();
         std::fs::write(&key, "not a pem key\n").unwrap();
         let tls = TlsConfig {
@@ -200,15 +231,15 @@ mod tests {
 
     #[test]
     fn build_rustls_config_errors_on_missing_key_in_keyfile() {
-        let dir = tmp_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
         // A valid-looking cert file but a key file with no key block.
         let Some((cert, _key)) =
-            gen_self_signed(&dir).expect("present openssl should generate the TLS fixture")
+            gen_self_signed(dir.path()).expect("present openssl should generate the TLS fixture")
         else {
             eprintln!("skipping: openssl unavailable");
             return;
         };
-        let bad_key = dir.join("bad_key.pem");
+        let bad_key = dir.path().join("bad_key.pem");
         std::fs::write(
             &bad_key,
             "-----BEGIN GARBAGE-----\nzz\n-----END GARBAGE-----\n",
@@ -230,9 +261,9 @@ mod tests {
         // Smoke test the full success path (parse + crypto provider + accept the
         // cert/key pair) when openssl is available to mint a throwaway cert.
         // Skips gracefully on environments without openssl.
-        let dir = tmp_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
         let Some((cert, key)) =
-            gen_self_signed(&dir).expect("present openssl should generate the TLS fixture")
+            gen_self_signed(dir.path()).expect("present openssl should generate the TLS fixture")
         else {
             eprintln!("skipping build_rustls_config success test: openssl unavailable");
             return;
@@ -247,6 +278,11 @@ mod tests {
         assert!(
             !cfg.crypto_provider().cipher_suites.is_empty(),
             "expected a non-empty cipher suite set from the ring provider"
+        );
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "the inbound TLS face must never advertise vulnerable HTTP/2 (#849)"
         );
     }
 }

@@ -11,10 +11,12 @@ use bamboo_agent_core::tools::{ToolCall, ToolResult};
 ///   file + read-only gating spread across respond.rs / clarification.rs /
 ///   PLAN_MODE_EXEMPT_TOOLS) and will be redesigned as a first-class concern
 ///   separately. Do NOT fold it into the generic NeedsHuman question path.
-/// - `request_permissions` + the permission-gate synth (`display_preference =
-///   "request_permissions"`) — may migrate to NeedsHuman later (needs the
-///   child→parent approval-delegation branch).
-const PAUSE_TOOLS: [&str; 2] = ["ExitPlanMode", "request_permissions"];
+/// - permission-gate synths (`display_preference = "request_permissions"`) —
+///   including intermediate proactive `request_permissions` contexts — may
+///   migrate to NeedsHuman later (needs the child→parent
+///   approval-delegation branch). A terminal proactive acknowledgement has no
+///   such marker and must continue the loop.
+const PAUSE_TOOLS: [&str; 1] = ["ExitPlanMode"];
 
 #[derive(Debug, Clone)]
 pub(super) struct UserQuestionPayload {
@@ -30,7 +32,8 @@ pub(super) struct UserQuestionPayload {
 ///
 /// Recognises:
 /// - `ExitPlanMode` — plan-mode approval (carved out; redesign later)
-/// - `request_permissions` — permission approval request
+/// - an intermediate `request_permissions` permission approval request, tagged
+///   with the explicit pause display preference
 /// - any tool whose result is a synthesized permission-approval prompt (the
 ///   permission checker gates a mutating tool and returns the same shape as
 ///   `request_permissions`, tagged with `display_preference = "request_permissions"`)
@@ -44,7 +47,10 @@ pub(super) fn should_handle_user_question_tool(tool_call: &ToolCall, result: &To
         return true;
     }
     // A permission gate can synthesize an approval request for any tool; it is
-    // tagged with this display preference (same payload request_permissions returns).
+    // tagged with this display preference. Proactive request_permissions uses
+    // the same tag only while one of its typed contexts is awaiting a decision;
+    // its terminal `permissions_authorized` acknowledgement deliberately has
+    // no tag and must not be parsed as a new generic question.
     result.display_preference.as_deref() == Some("request_permissions")
 }
 

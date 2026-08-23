@@ -12,28 +12,13 @@ use bamboo_engine::gold_auto_answer::{maybe_auto_answer_pending_question, GoldAu
 /// These are cached on the runner and replayed when an SSE client connects
 /// after the live stream has already started.
 fn is_critical_event(event: &AgentEvent) -> bool {
-    matches!(
-        event,
-        AgentEvent::TaskListUpdated { .. }
-            | AgentEvent::TaskListCompleted { .. }
-            | AgentEvent::SubAgentStarted { .. }
-            | AgentEvent::SubAgentCompleted { .. }
-            | AgentEvent::ChildApprovalRequested { .. }
-            | AgentEvent::ChildApprovalChanged { .. }
-            | AgentEvent::BashCompleted { .. }
-            | AgentEvent::SessionTitleUpdated { .. }
-            | AgentEvent::SessionPinnedUpdated { .. }
-            | AgentEvent::PlanModeEntered { .. }
-            | AgentEvent::PlanModeExited { .. }
-            | AgentEvent::BudgetExceeded { .. }
-            | AgentEvent::WorkflowActivated { .. }
-            | AgentEvent::WorkflowDeactivated { .. }
-    )
+    event.is_replayable_session_state()
 }
 
 pub(crate) fn spawn_event_forwarder(
     state: actix_web::web::Data<AppState>,
     session_id: String,
+    run_id: String,
     mut mpsc_rx: mpsc::Receiver<AgentEvent>,
     session_tx: tokio::sync::broadcast::Sender<AgentEvent>,
     gold_config: Option<GoldConfig>,
@@ -56,6 +41,26 @@ pub(crate) fn spawn_event_forwarder(
 
     tokio::spawn(
         async move {
+            // Capture the reservation generation at the call site. This task
+            // may start only after a clarification answer has replaced the
+            // shared runner entry; reading that mutable registry here would
+            // tag the old activation's terminal with the successor run id.
+            let started_event = AgentEvent::ExecutionStarted {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            };
+            {
+                let runners = state.agent_runners.read().await;
+                if runners
+                    .get(&session_id)
+                    .is_none_or(|runner| runner.run_id != run_id)
+                {
+                    return;
+                }
+                state.account_sink.record(Some(&session_id), &started_event);
+                let _ = session_tx.send(started_event);
+            }
             let mut forwarded_lifecycle_ids = HashSet::new();
             while let Some(event) = mpsc_rx.recv().await {
                 let lifecycle_id = match &event {
@@ -72,22 +77,24 @@ pub(crate) fn spawn_event_forwarder(
                     );
                     continue;
                 }
-                // Cache critical events for late-subscriber replay.
-                if is_critical_event(&event) {
+                let needs_runner_update = is_critical_event(&event)
+                    || matches!(&event, AgentEvent::TokenBudgetUpdated { .. });
+                if needs_runner_update {
                     let mut runners = state.agent_runners.write().await;
-                    if let Some(runner) = runners.get_mut(&session_id) {
+                    let Some(runner) = runners
+                        .get_mut(&session_id)
+                        .filter(|runner| runner.run_id == run_id)
+                    else {
+                        return;
+                    };
+                    if is_critical_event(&event) {
                         runner.push_critical_event(event.clone());
                         tracing::trace!(
                             "[{}] Cached critical event for late subscribers",
                             session_id
                         );
                     }
-                }
-
-                // Store budget events for late subscribers.
-                if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) {
-                    let mut runners = state.agent_runners.write().await;
-                    if let Some(runner) = runners.get_mut(&session_id) {
+                    if matches!(&event, AgentEvent::TokenBudgetUpdated { .. }) {
                         runner.last_budget_event = Some(event.clone());
                         // Fires once per agent round — far too hot for debug.
                         tracing::trace!(
@@ -95,27 +102,28 @@ pub(crate) fn spawn_event_forwarder(
                             session_id
                         );
                     }
+                    // Hold exact generation ownership through the synchronous
+                    // account/broadcast publication. A successor reservation
+                    // needs this write lock and therefore cannot interleave a
+                    // new Started before this old frame.
+                    let route_session_id = event.session_id().unwrap_or(&session_id);
+                    state.account_sink.record(Some(route_session_id), &event);
+                    let _ = session_tx.send(event);
+                } else {
+                    let runners = state.agent_runners.read().await;
+                    if runners
+                        .get(&session_id)
+                        .is_none_or(|runner| runner.run_id != run_id)
+                    {
+                        return;
+                    }
+                    // The read guard remains held through both synchronous
+                    // sends, closing the check-then-publish replacement race
+                    // without taking a write lock for token-hot paths.
+                    let route_session_id = event.session_id().unwrap_or(&session_id);
+                    state.account_sink.record(Some(route_session_id), &event);
+                    let _ = session_tx.send(event);
                 }
-
-                // Mirror durable change events onto the account-wide feed
-                // (sequenced + journaled) for resumable multi-client sync. The
-                // sink filters ephemeral events (tokens, etc.) internally, so
-                // this is near-free for the hot path. `session_id` is passed
-                // explicitly so terminal events (which carry no id) still route.
-                // Parent-scoped child lifecycle/approval events carry their
-                // canonical routing id. Prefer it over the forwarder's source
-                // session so a child stream journals the delta under the parent
-                // account-feed envelope and reconnecting parent UIs see it.
-                let route_session_id = event.session_id().unwrap_or(&session_id);
-                state.account_sink.record(Some(route_session_id), &event);
-
-                // Always forward to the broadcast channel regardless of subscriber count.
-                // The broadcast channel's internal capacity (1000 slots) buffers events so
-                // that late or temporarily-disconnected subscribers can catch up when they
-                // resubscribe.  Critical events are *also* cached on the runner above, so
-                // even if the broadcast ring wraps, a fresh subscriber will still receive
-                // the latest state via the replay path.
-                let _ = session_tx.send(event);
             }
 
             // Gold auto-answer responds to a pending clarification that genuinely
@@ -124,14 +132,27 @@ pub(crate) fn spawn_event_forwarder(
             // now happens INSIDE the runner loop's terminal gate (see
             // bamboo-engine `evaluate_gold_terminal`) so the run emits a single
             // terminal `Complete` and the frontend never gets stuck mid-settle.
-            let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
-            let auto_answer_outcome = maybe_auto_answer_pending_question(
-                state.get_ref(),
-                &resume_port,
-                &session_id,
-                gold_config.clone(),
-            )
-            .await;
+            let superseded = state
+                .agent_runners
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|runner| runner.run_id != run_id);
+            let auto_answer_outcome = if superseded {
+                GoldAutoAnswerOutcome::Skipped {
+                    reason: format!("run {run_id} was superseded before post-stop auto-answer"),
+                }
+            } else {
+                let resume_port =
+                    crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+                maybe_auto_answer_pending_question(
+                    state.get_ref(),
+                    &resume_port,
+                    &session_id,
+                    gold_config.clone(),
+                )
+                .await
+            };
             match auto_answer_outcome {
                 GoldAutoAnswerOutcome::Skipped { reason } => {
                     tracing::debug!(
@@ -198,6 +219,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
+            version: Some(1),
         }
     }
 
@@ -207,6 +229,10 @@ mod tests {
             child_session_id: "child-1".into(),
             title: Some("child work".into()),
         }
+    }
+
+    async fn current_run_id(state: &actix_web::web::Data<AppState>, session_id: &str) -> String {
+        state.agent_runners.read().await[session_id].run_id.clone()
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +489,7 @@ mod tests {
             completed_at: Utc::now(),
             total_rounds: 3,
             total_tool_calls: 10,
+            version: Some(2),
         };
         assert!(is_critical_event(&event));
     }
@@ -491,6 +518,7 @@ mod tests {
             session_id: "s".to_string(),
             title: "t".to_string(),
             title_version: 1,
+            title_generated: true,
             source: TitleSource::Manual,
             updated_at: Utc::now(),
         };
@@ -529,6 +557,18 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn clarification_is_replayed_to_late_subscribers() {
+        assert!(is_critical_event(&AgentEvent::NeedClarification {
+            question: "Choose".to_string(),
+            options: Some(vec!["A".to_string()]),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("ConclusionWithOptions".to_string()),
+            allow_custom: false,
+            source: Some(bamboo_agent_core::PendingQuestionSource::PauseTool),
+        }));
+    }
+
     // ── Event forwarder integration ────────────────────────────────────
 
     #[tokio::test]
@@ -560,6 +600,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            current_run_id(&state, session_id).await,
             mpsc_rx,
             session_tx.clone(),
             None,
@@ -599,6 +640,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_server_forwarder_cannot_publish_after_successor_reservation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = actix_web::web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "server-generation-race";
+        let (session_tx, mut session_rx) = tokio::sync::broadcast::channel(16);
+        let mut successor = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
+        successor.run_id = "run-new".to_string();
+        successor.status = bamboo_engine::runtime::execution::runner_state::AgentStatus::Running;
+        successor.event_sender = session_tx.clone();
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), successor);
+
+        session_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: "run-new".to_string(),
+                session_id: session_id.to_string(),
+                started_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let (old_tx, old_rx) = mpsc::channel(4);
+        spawn_event_forwarder(
+            state,
+            session_id.to_string(),
+            "run-old".to_string(),
+            old_rx,
+            session_tx,
+            None,
+        );
+        let _ = old_tx.send(task_list_updated()).await;
+        drop(old_tx);
+
+        assert!(matches!(
+            session_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { ref run_id, .. } if run_id == "run-new"
+        ));
+        assert!(
+            timeout(Duration::from_millis(100), session_rx.recv())
+                .await
+                .is_err(),
+            "superseded server forwarder must not publish Started or stale state"
+        );
+    }
+
+    #[tokio::test]
     async fn event_forwarder_mirrors_durable_events_to_account_feed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let state = AppState::new(temp_dir.path().to_path_buf())
@@ -623,6 +715,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            current_run_id(&state, session_id).await,
             mpsc_rx,
             session_tx,
             None,
@@ -667,23 +760,28 @@ mod tests {
 
         let journaled =
             bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), 0).unwrap();
-        assert_eq!(journaled.len(), 3, "ephemeral Token must be excluded");
+        assert_eq!(journaled.len(), 4, "ephemeral Token must be excluded");
         assert!(matches!(
             journaled[0].event,
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        assert!(matches!(
+            journaled[1].event,
             AgentEvent::TaskListUpdated { .. }
         ));
-        assert!(matches!(journaled[1].event, AgentEvent::Complete { .. }));
+        assert!(matches!(journaled[2].event, AgentEvent::Complete { .. }));
         // The terminal event routed to the right session via caller context.
-        assert_eq!(journaled[1].session_id.as_deref(), Some(session_id));
-        assert_eq!(journaled[2].session_id.as_deref(), Some("parent-session"));
+        assert_eq!(journaled[2].session_id.as_deref(), Some(session_id));
+        assert_eq!(journaled[3].session_id.as_deref(), Some("parent-session"));
         assert!(matches!(
-            journaled[2].event,
+            journaled[3].event,
             AgentEvent::ChildApprovalChanged { .. }
         ));
         // Sequence numbers are monotonic and 1-based.
         assert_eq!(journaled[0].seq, 1);
         assert_eq!(journaled[1].seq, 2);
         assert_eq!(journaled[2].seq, 3);
+        assert_eq!(journaled[3].seq, 4);
     }
 
     #[tokio::test]
@@ -709,6 +807,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            current_run_id(&state, session_id).await,
             mpsc_rx,
             session_tx,
             None,
@@ -724,9 +823,14 @@ mod tests {
         mpsc_tx.send(event).await.unwrap();
         drop(mpsc_tx);
 
+        let started = timeout(Duration::from_secs(1), session_rx.recv())
+            .await
+            .expect("session start event")
+            .expect("broadcast");
+        assert!(matches!(started, AgentEvent::ExecutionStarted { .. }));
         let session_event = timeout(Duration::from_secs(1), session_rx.recv())
             .await
-            .expect("session event")
+            .expect("session lifecycle event")
             .expect("broadcast");
         assert!(matches!(
             session_event,
@@ -740,9 +844,17 @@ mod tests {
             }
         }
         assert_eq!(session_lifecycle_count, 1);
+        let account_started = timeout(Duration::from_secs(1), account_rx.recv())
+            .await
+            .expect("account start event")
+            .expect("account broadcast");
+        assert!(matches!(
+            account_started.event,
+            AgentEvent::ExecutionStarted { .. }
+        ));
         let account_event = timeout(Duration::from_secs(1), account_rx.recv())
             .await
-            .expect("account event")
+            .expect("account lifecycle event")
             .expect("account broadcast");
         assert!(matches!(
             account_event.event,
@@ -787,6 +899,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            current_run_id(&state, session_id).await,
             mpsc_rx,
             session_tx,
             None,
@@ -849,6 +962,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            current_run_id(&state, session_id).await,
             mpsc_rx,
             session_tx.clone(),
             None,
@@ -894,16 +1008,21 @@ mod tests {
     async fn event_forwarder_triggers_gold_auto_answer_when_mpsc_closes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut config = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-        config.provider = String::new();
+        config.provider = "test-provider".to_string();
         config.features.provider_model_ref = true;
         let provider = ScriptedProvider::new("ok.");
         let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-        let mut app_state =
-            AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
-                .await
-                .expect("app state");
-        app_state.provider_registry =
-            Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+        let mut app_state = AppState::new_with_provider(
+            temp_dir.path().to_path_buf(),
+            config,
+            provider_trait.clone(),
+        )
+        .await
+        .expect("app state");
+        app_state.provider_registry = Arc::new(ProviderRegistry::new(
+            HashMap::from([("test-provider".to_string(), provider_trait)]),
+            "test-provider".to_string(),
+        ));
         app_state.provider_router = Arc::new(ProviderModelRouter::new(
             app_state.provider_registry.clone(),
         ));
@@ -926,10 +1045,20 @@ mod tests {
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
+        runner.run_id = "gold-run".to_string();
+        runner.status = AgentStatus::Running;
+        runner.event_sender = session_tx.clone();
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), runner);
 
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            "gold-run".to_string(),
             mpsc_rx,
             session_tx,
             Some(test_gold_config()),
@@ -941,6 +1070,13 @@ mod tests {
             })
             .await
             .expect("should send token before close");
+        state
+            .agent_runners
+            .write()
+            .await
+            .get_mut(session_id)
+            .unwrap()
+            .status = AgentStatus::Completed;
         drop(mpsc_tx);
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;
@@ -1008,16 +1144,21 @@ mod tests {
     async fn event_forwarder_does_not_auto_continue_after_auto_answer_applies() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut config = Config::from_data_dir(Some(temp_dir.path().to_path_buf()));
-        config.provider = String::new();
+        config.provider = "test-provider".to_string();
         config.features.provider_model_ref = true;
         let provider = ScriptedProvider::new("ok.");
         let provider_trait: Arc<dyn LLMProvider> = provider.clone();
-        let mut app_state =
-            AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider_trait)
-                .await
-                .expect("app state");
-        app_state.provider_registry =
-            Arc::new(ProviderRegistry::new(HashMap::new(), String::new()));
+        let mut app_state = AppState::new_with_provider(
+            temp_dir.path().to_path_buf(),
+            config,
+            provider_trait.clone(),
+        )
+        .await
+        .expect("app state");
+        app_state.provider_registry = Arc::new(ProviderRegistry::new(
+            HashMap::from([("test-provider".to_string(), provider_trait)]),
+            "test-provider".to_string(),
+        ));
         app_state.provider_router = Arc::new(ProviderModelRouter::new(
             app_state.provider_registry.clone(),
         ));
@@ -1040,6 +1181,15 @@ mod tests {
 
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<AgentEvent>(64);
         let (session_tx, _session_rx) = tokio::sync::broadcast::channel::<AgentEvent>(1000);
+        let mut runner = bamboo_engine::runtime::execution::runner_state::AgentRunner::new();
+        runner.run_id = "gold-run".to_string();
+        runner.status = AgentStatus::Running;
+        runner.event_sender = session_tx.clone();
+        state
+            .agent_runners
+            .write()
+            .await
+            .insert(session_id.to_string(), runner);
 
         let mut gold_config = test_gold_config();
         gold_config.auto_answer_enabled = true;
@@ -1049,6 +1199,7 @@ mod tests {
         spawn_event_forwarder(
             state.clone(),
             session_id.to_string(),
+            "gold-run".to_string(),
             mpsc_rx,
             session_tx,
             Some(gold_config),
@@ -1060,6 +1211,13 @@ mod tests {
             })
             .await
             .expect("should send token before close");
+        state
+            .agent_runners
+            .write()
+            .await
+            .get_mut(session_id)
+            .unwrap()
+            .status = AgentStatus::Completed;
         drop(mpsc_tx);
 
         let resumed_status = wait_for_resume_activity(state.as_ref(), session_id).await;

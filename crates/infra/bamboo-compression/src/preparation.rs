@@ -63,6 +63,19 @@ pub fn prepare_hybrid_context(
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
 ) -> Result<PreparedContext, BudgetError> {
+    prepare_hybrid_context_with_fixed_tokens(session, budget, counter, 0)
+}
+
+/// Prepare context while reserving tokens for provider-visible fixed content
+/// stored outside `Session::messages` (such as historical context-ledger
+/// events). The returned usage includes that reservation in `system_tokens` and
+/// `total_tokens`, while the returned message vector remains unchanged.
+pub fn prepare_hybrid_context_with_fixed_tokens(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    additional_fixed_tokens: u32,
+) -> Result<PreparedContext, BudgetError> {
     let segmenter = MessageSegmenter::new();
     let summary_message = session
         .conversation_summary
@@ -83,7 +96,7 @@ pub fn prepare_hybrid_context(
         active_messages,
         budget,
         counter,
-        summary_tokens,
+        summary_tokens.saturating_add(additional_fixed_tokens),
     );
     let total_tokens_after_cache = prompt_cache_result.total_tokens_after;
     let active_messages = prompt_cache_result.messages;
@@ -98,7 +111,9 @@ pub fn prepare_hybrid_context(
     let (system_messages, mut segments) = segmenter.segment_with_system(active_messages);
 
     // 2. Count system tokens
-    let system_tokens = counter.count_messages(&system_messages);
+    let system_tokens = counter
+        .count_messages(&system_messages)
+        .saturating_add(additional_fixed_tokens);
 
     // 3. Check if the system prompt alone exceeds the request input limit.
     // The provider's context window covers input + output, so reserve the
@@ -493,6 +508,17 @@ pub fn estimate_prompt_cache_savings(
     counter: &dyn TokenCounter,
     summary_tokens: u32,
 ) -> u32 {
+    estimate_prompt_cache_savings_with_fixed_tokens(session, budget, counter, summary_tokens, 0)
+}
+
+/// Fixed-token-aware variant of [`estimate_prompt_cache_savings`].
+pub fn estimate_prompt_cache_savings_with_fixed_tokens(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+    summary_tokens: u32,
+    additional_fixed_tokens: u32,
+) -> u32 {
     let active_messages = crate::compression_tooling::active_messages_for_budget(session);
     if active_messages.is_empty() {
         return 0;
@@ -515,7 +541,8 @@ pub fn estimate_prompt_cache_savings(
     let trigger_limit = budget.compression_trigger_context_tokens();
     let mut total_tokens = counter
         .count_messages(&active_messages)
-        .saturating_add(summary_tokens);
+        .saturating_add(summary_tokens)
+        .saturating_add(additional_fixed_tokens);
     if total_tokens <= trigger_limit {
         return 0;
     }
@@ -1050,6 +1077,28 @@ mod tests {
             prepared.segments_removed > 0,
             "Should have removed some segments"
         );
+    }
+
+    #[test]
+    fn fixed_provider_context_reduces_window_and_is_included_in_usage() {
+        let counter = DeterministicCounter::new(20).with_message_token("system", 10);
+        let budget =
+            TokenBudget::with_safety_margin(100, 0, BudgetStrategy::Window { size: 50 }, 0);
+        let session = make_session_with_messages(vec![
+            Message::system("system"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+            Message::assistant("a2", None),
+        ]);
+
+        let prepared =
+            prepare_hybrid_context_with_fixed_tokens(&session, &budget, &counter, 40).unwrap();
+
+        assert!(prepared.truncation_occurred);
+        assert_eq!(prepared.token_usage.system_tokens, 50);
+        assert!(prepared.token_usage.total_tokens <= budget.max_request_input_tokens());
+        assert!(prepared.messages.len() < session.messages.len());
     }
 
     #[test]

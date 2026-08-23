@@ -10,6 +10,8 @@ use super::super::{
 use crate::app_state::AppState;
 use bamboo_tools::exposure::canonical_tool_name;
 
+use super::filters::normalize_model_filter;
+
 #[derive(Debug, Clone)]
 struct ParsedMcpAlias {
     server_id: String,
@@ -78,6 +80,7 @@ pub async fn usage_breakdown(
     query: web::Query<MetricsUsageQuery>,
 ) -> impl Responder {
     let session_index_entries = state.session_store.list_index_entries().await;
+    let model_filter = normalize_model_filter(query.model.as_deref());
 
     let mut matched_session_ids: HashSet<String> = HashSet::new();
     let mut total_tool_calls = 0_u64;
@@ -94,7 +97,7 @@ pub async fn usage_breakdown(
     let mut sessions_with_mcp_calls: HashSet<String> = HashSet::new();
 
     for entry in session_index_entries {
-        if let Some(model) = query.model.as_ref() {
+        if let Some(model) = model_filter.as_ref() {
             if entry.model != *model {
                 continue;
             }

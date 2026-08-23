@@ -19,6 +19,21 @@ use serde::{Deserialize, Serialize};
 
 use super::hooks::HookRunner;
 
+/// Default process-wide concurrency ceiling for low-priority auxiliary
+/// evaluations sharing one provider/model allocation.
+pub(crate) const DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY: usize = 2;
+/// Defensive ceiling for operator-provided auxiliary concurrency. This stays
+/// far below Tokio semaphore's implementation maximum and prevents a malformed
+/// flattened config value from panicking process startup.
+pub(crate) const MAX_AUXILIARY_EVALUATION_MAX_CONCURRENCY: usize = 1024;
+
+pub(crate) fn normalize_auxiliary_evaluation_max_concurrency(value: Option<u64>) -> usize {
+    value
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_AUXILIARY_EVALUATION_MAX_CONCURRENCY as u64) as usize)
+        .unwrap_or(DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY)
+}
+
 /// The live disabled tool and skill-id sets resolved at a round boundary.
 pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
 
@@ -382,6 +397,10 @@ pub struct AgentLoopConfig {
     pub(crate) fast_model_name: Option<String>,
     /// Optional provider override for lightweight fast-model LLM calls.
     pub(crate) fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// Process-wide concurrency ceiling for low-priority auxiliary evaluation
+    /// requests sharing the same provider allocation and model. Foreground
+    /// requests do not acquire this budget.
+    pub(crate) auxiliary_evaluation_max_concurrency: usize,
     /// Fast/cheap model for memory/background tasks.
     ///
     /// This must not silently fall back to the main interaction model.
@@ -550,6 +569,7 @@ impl Default for AgentLoopConfig {
             model_name: None,
             fast_model_name: None,
             fast_model_provider: None,
+            auxiliary_evaluation_max_concurrency: DEFAULT_AUXILIARY_EVALUATION_MAX_CONCURRENCY,
             background_model_name: None,
             planning_model_name: None,
             search_model_name: None,

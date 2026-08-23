@@ -13,7 +13,14 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePhase, Role};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+const WIRE_TRACKER_KEY_DOMAIN: &[u8] = b"bamboo/responses-wire-tracker-key/v1\0";
+const WIRE_TOP_LEVEL_DOMAIN: &[u8] = b"bamboo/responses-wire-top-level/v1\0";
+const WIRE_INPUT_PREFIX_DOMAIN: &[u8] = b"bamboo/responses-wire-input-prefix/v1\0";
+const MAX_WIRE_TRACKER_FAMILIES: usize = 1024;
 
 /// Convert internal [`Message`] values to a Responses API `input` array.
 ///
@@ -609,6 +616,278 @@ pub fn supports_openai_explicit_prompt_cache(model: &str) -> bool {
         .and_then(|component| component.parse::<u64>().ok())
         .unwrap_or(0);
     major > 5 || major == 5 && minor >= 6
+}
+
+/// Relationship between two fully-lowered, override-applied, masked Responses
+/// request bodies in the same privacy-preserving cache-affinity family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesWirePrefixRelation {
+    Baseline,
+    Identical,
+    ExactExtension,
+    Rewrite,
+    Untracked,
+}
+
+impl ResponsesWirePrefixRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Identical => "identical",
+            Self::ExactExtension => "exact_extension",
+            Self::Rewrite => "rewrite",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+/// Secret-free observation of the final outbound Responses shape. No prompt
+/// text, tool arguments, session id, or raw cache key is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesWirePrefixDiagnostic {
+    pub relation: ResponsesWirePrefixRelation,
+    pub prefix_epoch: Option<u64>,
+    pub reset_reason: Option<String>,
+    pub cache_key_sha256: Option<String>,
+    pub top_level_sha256: String,
+    pub cumulative_item_sha256: Vec<String>,
+    pub input_item_count: usize,
+    pub previous_input_item_count: Option<usize>,
+    pub first_divergent_item: Option<usize>,
+    pub first_divergent_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredWirePrefix {
+    prefix_epoch: Option<u64>,
+    top_level_sha256: String,
+    cumulative_item_sha256: Vec<String>,
+    item_types: Vec<String>,
+}
+
+/// Provider-instance tracker keyed by a second one-way hash of the already
+/// privacy-preserving cache key. The bounded map stores hashes and structural
+/// labels only.
+#[derive(Clone, Default)]
+pub struct ResponsesWirePrefixTracker {
+    families: Arc<Mutex<HashMap<String, StoredWirePrefix>>>,
+}
+
+impl ResponsesWirePrefixTracker {
+    pub fn observe_final_body(
+        &self,
+        body: &Value,
+        prefix_epoch: Option<u64>,
+        reset_reason: Option<&str>,
+    ) -> ResponsesWirePrefixDiagnostic {
+        let input = body
+            .get("input")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let cumulative_item_sha256 = cumulative_input_hashes(input);
+        let item_types = input.iter().map(responses_item_type).collect::<Vec<_>>();
+        let top_level_sha256 = cache_affecting_top_level_sha256(body);
+        let cache_key_sha256 = body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(|key| domain_sha256(WIRE_TRACKER_KEY_DOMAIN, key.as_bytes()));
+
+        let Some(family) = cache_key_sha256.clone() else {
+            return ResponsesWirePrefixDiagnostic {
+                relation: ResponsesWirePrefixRelation::Untracked,
+                prefix_epoch,
+                reset_reason: reset_reason.map(str::to_string),
+                cache_key_sha256: None,
+                top_level_sha256,
+                cumulative_item_sha256,
+                input_item_count: input.len(),
+                previous_input_item_count: None,
+                first_divergent_item: None,
+                first_divergent_type: None,
+            };
+        };
+
+        let mut families = self
+            .families
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = families.get(&family).cloned();
+        let (relation, first_divergent_item, first_divergent_type) = previous
+            .as_ref()
+            .map(|prior| {
+                classify_wire_prefix(
+                    prior,
+                    prefix_epoch,
+                    &top_level_sha256,
+                    &cumulative_item_sha256,
+                    &item_types,
+                )
+            })
+            .unwrap_or((ResponsesWirePrefixRelation::Baseline, None, None));
+        let previous_input_item_count = previous
+            .as_ref()
+            .map(|prior| prior.cumulative_item_sha256.len());
+
+        if families.len() >= MAX_WIRE_TRACKER_FAMILIES && !families.contains_key(&family) {
+            if let Some(evict) = families.keys().next().cloned() {
+                families.remove(&evict);
+            }
+        }
+        families.insert(
+            family,
+            StoredWirePrefix {
+                prefix_epoch,
+                top_level_sha256: top_level_sha256.clone(),
+                cumulative_item_sha256: cumulative_item_sha256.clone(),
+                item_types,
+            },
+        );
+
+        ResponsesWirePrefixDiagnostic {
+            relation,
+            prefix_epoch,
+            reset_reason: reset_reason.map(str::to_string),
+            cache_key_sha256,
+            top_level_sha256,
+            cumulative_item_sha256,
+            input_item_count: input.len(),
+            previous_input_item_count,
+            first_divergent_item,
+            first_divergent_type,
+        }
+    }
+}
+
+fn classify_wire_prefix(
+    previous: &StoredWirePrefix,
+    current_epoch: Option<u64>,
+    current_top_level_sha256: &str,
+    current_cumulative: &[String],
+    current_types: &[String],
+) -> (ResponsesWirePrefixRelation, Option<usize>, Option<String>) {
+    if previous.prefix_epoch != current_epoch
+        || previous.top_level_sha256 != current_top_level_sha256
+    {
+        return (
+            ResponsesWirePrefixRelation::Rewrite,
+            None,
+            Some("top_level_or_epoch".to_string()),
+        );
+    }
+    let common = previous
+        .cumulative_item_sha256
+        .len()
+        .min(current_cumulative.len());
+    if let Some(index) = (0..common)
+        .find(|index| previous.cumulative_item_sha256[*index] != current_cumulative[*index])
+    {
+        return (
+            ResponsesWirePrefixRelation::Rewrite,
+            Some(index),
+            current_types
+                .get(index)
+                .cloned()
+                .or_else(|| previous.item_types.get(index).cloned()),
+        );
+    }
+    if current_cumulative.len() < previous.cumulative_item_sha256.len() {
+        let index = current_cumulative.len();
+        return (
+            ResponsesWirePrefixRelation::Rewrite,
+            Some(index),
+            previous.item_types.get(index).cloned(),
+        );
+    }
+    if current_cumulative.len() == previous.cumulative_item_sha256.len() {
+        (ResponsesWirePrefixRelation::Identical, None, None)
+    } else {
+        (ResponsesWirePrefixRelation::ExactExtension, None, None)
+    }
+}
+
+fn cumulative_input_hashes(input: &[Value]) -> Vec<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(WIRE_INPUT_PREFIX_DOMAIN);
+    input
+        .iter()
+        .map(|item| {
+            let bytes = serde_json::to_vec(item).expect("Responses input item is serializable");
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+            hex::encode(hasher.clone().finalize())
+        })
+        .collect()
+}
+
+fn cache_affecting_top_level_sha256(body: &Value) -> String {
+    let top_level = body.as_object().map_or_else(
+        || body.clone(),
+        |object| {
+            Value::Object(
+                object
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "input")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        },
+    );
+    let bytes = serde_json::to_vec(&top_level).expect("Responses body is serializable");
+    domain_sha256(WIRE_TOP_LEVEL_DOMAIN, &bytes)
+}
+
+fn responses_item_type(item: &Value) -> String {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if item_type == "message" {
+        let role = item
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|role| {
+                matches!(
+                    *role,
+                    "user" | "assistant" | "system" | "developer" | "tool"
+                )
+            })
+            .unwrap_or("unknown");
+        return format!("message:{role}");
+    }
+
+    // Raw-input compatibility callers can author arbitrary JSON. Log only a
+    // closed set of protocol structural labels so an attacker cannot smuggle
+    // prompt text or credentials into `first_divergent_type`.
+    match item_type {
+        "function_call"
+        | "function_call_output"
+        | "computer_call"
+        | "computer_call_output"
+        | "reasoning"
+        | "item_reference"
+        | "custom_tool_call"
+        | "custom_tool_call_output"
+        | "web_search_call"
+        | "file_search_call"
+        | "code_interpreter_call"
+        | "local_shell_call"
+        | "local_shell_call_output"
+        | "apply_patch_call"
+        | "apply_patch_call_output"
+        | "mcp_call"
+        | "mcp_approval_request"
+        | "mcp_approval_response" => item_type.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn domain_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Default)]
@@ -1890,6 +2169,8 @@ mod tests {
                 prompt_cache_options: None,
                 raw_input_with_cache_breakpoints: None,
                 retain_protocol_events: false,
+                prefix_epoch: None,
+                prefix_reset_reason: None,
             }),
             None,
             None,
@@ -1905,6 +2186,40 @@ mod tests {
         assert_eq!(body["previous_response_id"], "resp_123");
         assert_eq!(body["truncation"], "auto");
         assert_eq!(body["text"]["verbosity"], "high");
+    }
+
+    #[test]
+    fn build_responses_body_preserves_max_reasoning_effort() {
+        let body = build_responses_body(
+            "gpt-5.6-sol",
+            &[],
+            &[],
+            Some(32_000),
+            Some(ReasoningEffort::Max),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["max_output_tokens"], 32_000);
+    }
+
+    #[test]
+    fn build_responses_body_keeps_legacy_models_on_xhigh() {
+        let body = build_responses_body(
+            "gpt-4o",
+            &[],
+            &[],
+            Some(16_384),
+            Some(ReasoningEffort::Max),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["max_output_tokens"], 16_384);
     }
 
     #[test]
@@ -3818,6 +4133,167 @@ mod tests {
 
         assert_eq!(body["prompt_cache_key"], "operator-key");
         assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn four_final_responses_bodies_preserve_exact_prefix_through_tool_loop_override_and_masking() {
+        use bamboo_config::keyword_masking::{KeywordEntry, MatchType};
+        use bamboo_config::{
+            BodyPatch, BodyPatchOp, KeywordMaskingConfig, PatchValue, RequestOverridesConfig,
+            RequestScopeOverride,
+        };
+
+        let options = ResponsesRequestOptions {
+            instructions: Some("stable instructions".to_string()),
+            prompt_cache_key: Some("generated-cache-key".to_string()),
+            prefix_epoch: Some(0),
+            ..Default::default()
+        };
+        let overrides = RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![BodyPatch {
+                    path: "prompt_cache_key".to_string(),
+                    op: BodyPatchOp::Set,
+                    value: Some(PatchValue::Json(json!("operator-cache-key"))),
+                }],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        };
+        let masking = KeywordMaskingConfig {
+            entries: vec![KeywordEntry {
+                pattern: "wire-secret".to_string(),
+                match_type: MatchType::Exact,
+                enabled: true,
+            }],
+        };
+        let tool_call = ToolCall {
+            id: "call_ledger".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: r#"{"query":"wire-secret"}"#.to_string(),
+            },
+        };
+        let rounds = [
+            vec![
+                Message::user("initial host context"),
+                Message::user("first request with wire-secret"),
+            ],
+            vec![
+                Message::user("initial host context"),
+                Message::user("first request with wire-secret"),
+                Message::assistant("checking", Some(vec![tool_call.clone()])),
+                Message::tool_result("call_ledger", "tool output"),
+            ],
+            vec![
+                Message::user("initial host context"),
+                Message::user("first request with wire-secret"),
+                Message::assistant("checking", Some(vec![tool_call.clone()])),
+                Message::tool_result("call_ledger", "tool output"),
+                Message::user("host context revision 2"),
+            ],
+            vec![
+                Message::user("initial host context"),
+                Message::user("first request with wire-secret"),
+                Message::assistant("checking", Some(vec![tool_call])),
+                Message::tool_result("call_ledger", "tool output"),
+                Message::user("host context revision 2"),
+                Message::user("continue"),
+            ],
+        ];
+        let bodies = rounds
+            .iter()
+            .map(|messages| {
+                let mut body = build_responses_body(
+                    "gpt-5.6",
+                    messages,
+                    &[],
+                    None,
+                    None,
+                    Some(&options),
+                    None,
+                    // Compatible-proxy / explicit_prompt_cache=false path.
+                    None,
+                );
+                crate::providers::common::request_overrides::apply_overrides_to_body_with_env(
+                    &mut body,
+                    Some(&overrides),
+                    crate::providers::common::request_overrides::ENDPOINT_RESPONSES,
+                    Some("gpt-5.6"),
+                    &HashMap::new(),
+                );
+                crate::masking::mask_outbound_body(&mut body, &masking);
+                body
+            })
+            .collect::<Vec<_>>();
+
+        for pair in bodies.windows(2) {
+            let old = pair[0]["input"].as_array().unwrap();
+            let new = pair[1]["input"].as_array().unwrap();
+            assert_eq!(old, &new[..old.len()]);
+        }
+        let tool_input = bodies[1]["input"].as_array().unwrap();
+        assert!(tool_input
+            .iter()
+            .any(|item| item["type"] == "function_call"));
+        assert!(tool_input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"));
+        assert_eq!(bodies[3]["prompt_cache_key"], "operator-cache-key");
+        assert!(bodies[3].get("prompt_cache_options").is_none());
+
+        let tracker = ResponsesWirePrefixTracker::default();
+        let diagnostics = bodies
+            .iter()
+            .map(|body| tracker.observe_final_body(body, Some(0), None))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostics[0].relation,
+            ResponsesWirePrefixRelation::Baseline
+        );
+        assert!(diagnostics[1..]
+            .iter()
+            .all(|diagnostic| diagnostic.relation == ResponsesWirePrefixRelation::ExactExtension));
+        let retry = tracker.observe_final_body(&bodies[3], Some(0), None);
+        assert_eq!(retry.relation, ResponsesWirePrefixRelation::Identical);
+        let safe = format!("{retry:?}");
+        assert!(!safe.contains("wire-secret"));
+        assert!(!safe.contains("operator-cache-key"));
+
+        let mut rewritten = bodies[3].clone();
+        rewritten["input"][1]["content"] = json!("rewritten old item");
+        let rewrite = tracker.observe_final_body(&rewritten, Some(0), None);
+        assert_eq!(rewrite.relation, ResponsesWirePrefixRelation::Rewrite);
+        assert_eq!(rewrite.first_divergent_item, Some(1));
+    }
+
+    #[test]
+    fn wire_diagnostic_never_logs_caller_authored_item_type_or_role() {
+        let tracker = ResponsesWirePrefixTracker::default();
+        let baseline = json!({
+            "prompt_cache_key": "family",
+            "input": [{"type": "message", "role": "user", "content": "first"}],
+        });
+        tracker.observe_final_body(&baseline, Some(0), None);
+
+        let rewritten = json!({
+            "prompt_cache_key": "family",
+            "input": [{
+                "type": "wire-secret-item-type",
+                "role": "wire-secret-role",
+                "content": "rewritten"
+            }],
+        });
+        let diagnostic = tracker.observe_final_body(&rewritten, Some(0), None);
+
+        assert_eq!(diagnostic.relation, ResponsesWirePrefixRelation::Rewrite);
+        assert_eq!(diagnostic.first_divergent_item, Some(0));
+        assert_eq!(diagnostic.first_divergent_type.as_deref(), Some("unknown"));
+        let safe = format!("{diagnostic:?}");
+        assert!(!safe.contains("wire-secret-item-type"));
+        assert!(!safe.contains("wire-secret-role"));
     }
 
     #[test]

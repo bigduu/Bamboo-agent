@@ -26,7 +26,8 @@ use super::common::openai_compat::{
     parse_openai_compat_sse_data_strict_multi,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
+    build_responses_body, select_responses_input_messages, ResponsesInputSource,
+    ResponsesSseParser, ResponsesWirePrefixTracker,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -42,6 +43,7 @@ pub struct OpenAIProvider {
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
+    wire_prefix_tracker: ResponsesWirePrefixTracker,
 }
 
 impl OpenAIProvider {
@@ -56,6 +58,7 @@ impl OpenAIProvider {
             explicit_prompt_cache: true,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
+            wire_prefix_tracker: ResponsesWirePrefixTracker::default(),
         }
     }
 
@@ -138,6 +141,48 @@ impl OpenAIProvider {
         m == p
     }
 
+    fn observe_responses_wire(
+        &self,
+        body: &Value,
+        responses_options: Option<&ResponsesRequestOptions>,
+        session_log_id: &str,
+    ) {
+        let diagnostic = self.wire_prefix_tracker.observe_final_body(
+            body,
+            responses_options.and_then(|options| options.prefix_epoch),
+            responses_options
+                .and_then(|options| options.prefix_reset_reason)
+                .map(bamboo_domain::ModelContextResetReason::as_str),
+        );
+        tracing::info!(
+            "[{}] Responses wire prefix: relation={} epoch={} reset_reason={} cache_key_hash={} top_level_hash={} input_items={} previous_input_items={} first_divergent_item={} first_divergent_type={} final_cumulative_hash={}",
+            session_log_id,
+            diagnostic.relation.as_str(),
+            diagnostic
+                .prefix_epoch
+                .map(|epoch| epoch.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.reset_reason.as_deref().unwrap_or("none"),
+            diagnostic.cache_key_sha256.as_deref().unwrap_or("absent"),
+            diagnostic.top_level_sha256,
+            diagnostic.input_item_count,
+            diagnostic
+                .previous_input_item_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic
+                .first_divergent_item
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic.first_divergent_type.as_deref().unwrap_or("none"),
+            diagnostic
+                .cumulative_item_sha256
+                .last()
+                .map(String::as_str)
+                .unwrap_or("empty"),
+        );
+    }
+
     fn uses_responses_api(&self, model: &str) -> bool {
         self.responses_only_models
             .iter()
@@ -209,8 +254,13 @@ impl OpenAIProvider {
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        self.observe_responses_wire(&body, responses_options, session_log_id);
+        let prompt_cache_affinity_hint = body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
         tracing::info!(
-            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} [{}]",
+            "[{}] OpenAI request protocol=responses model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} prompt_cache_affinity_hint={} cache_hit_guaranteed=false [{}]",
             session_log_id,
             model,
             reasoning_effort
@@ -226,6 +276,7 @@ impl OpenAIProvider {
             input_selection.effective_len,
             input_selection.fallback_removed_duplicate_system,
             self.explicit_prompt_cache,
+            prompt_cache_affinity_hint,
             request_purpose
         );
 
@@ -287,6 +338,11 @@ impl OpenAIProvider {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                self.observe_responses_wire(
+                    &fallback_body,
+                    Some(&fallback_options),
+                    session_log_id,
+                );
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback =
@@ -359,6 +415,11 @@ impl OpenAIProvider {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                self.observe_responses_wire(
+                    &fallback_body,
+                    Some(&fallback_options),
+                    session_log_id,
+                );
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback =
@@ -700,6 +761,9 @@ impl LLMProvider for OpenAIProvider {
 mod tests {
     use super::*;
     use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
+    use bamboo_config::{
+        BodyPatch, BodyPatchOp, PatchValue, RequestOverridesConfig, RequestScopeOverride,
+    };
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionSchema, ToolSchema};
 
@@ -1027,6 +1091,8 @@ mod tests {
     const RESPONSES_SSE_OK: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\"}}\n\n";
     const CHAT_SSE_OK: &str =
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+    const SESSION_CACHE_KEY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn load_skill_tool() -> ToolSchema {
         ToolSchema {
@@ -1071,6 +1137,112 @@ mod tests {
         OpenAIProvider::new("test-key")
             .with_base_url(server.uri())
             .with_responses_only_models(vec!["gpt-5*".to_string()])
+    }
+
+    fn planned_agent_loop_options() -> LLMRequestOptions {
+        LLMRequestOptions {
+            session_id: Some("raw-session-must-not-reach-wire".to_string()),
+            request_purpose: Some("agent_loop".to_string()),
+            responses: Some(ResponsesRequestOptions {
+                prompt_cache_key: Some(SESSION_CACHE_KEY.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn prompt_cache_key_override(patch: BodyPatch) -> RequestOverridesConfig {
+        RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![patch],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_cache_affinity_key_reaches_actual_responses_body_without_session_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = responses_provider(&server);
+        let options = planned_agent_loop_options();
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("hello")],
+                &[],
+                None,
+                "gpt-5.6-sol",
+                Some(&options),
+            )
+            .await
+            .expect("agent-loop Responses request");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["prompt_cache_key"], SESSION_CACHE_KEY);
+        assert!(!body.to_string().contains("raw-session-must-not-reach-wire"));
+    }
+
+    #[tokio::test]
+    async fn responses_request_overrides_replace_or_remove_generated_affinity_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE_OK),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let replace_provider = responses_provider(&server).with_request_overrides(Some(
+            prompt_cache_key_override(BodyPatch {
+                path: "prompt_cache_key".to_string(),
+                op: BodyPatchOp::Set,
+                value: Some(PatchValue::Json(json!("operator-key"))),
+            }),
+        ));
+        let remove_provider = responses_provider(&server).with_request_overrides(Some(
+            prompt_cache_key_override(BodyPatch {
+                path: "prompt_cache_key".to_string(),
+                op: BodyPatchOp::Remove,
+                value: None,
+            }),
+        ));
+        let options = planned_agent_loop_options();
+
+        for provider in [&replace_provider, &remove_provider] {
+            let _stream = provider
+                .chat_stream_with_options(
+                    &[Message::user("hello")],
+                    &[],
+                    None,
+                    "gpt-5.6-sol",
+                    Some(&options),
+                )
+                .await
+                .expect("overridden Responses request");
+        }
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        let replaced: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let removed: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(replaced["prompt_cache_key"], "operator-key");
+        assert!(removed.get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]
@@ -1129,7 +1301,13 @@ mod tests {
             .await;
         let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
         let tools = vec![load_skill_tool()];
-        let options = require_load_skill_options();
+        let mut options = require_load_skill_options();
+        options.session_id = Some("raw-session-must-not-reach-chat-wire".to_string());
+        options.request_purpose = Some("agent_loop".to_string());
+        options.responses = Some(ResponsesRequestOptions {
+            prompt_cache_key: Some(SESSION_CACHE_KEY.to_string()),
+            ..Default::default()
+        });
 
         let _stream = provider
             .chat_stream_with_options(
@@ -1153,6 +1331,10 @@ mod tests {
         );
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(!body
+            .to_string()
+            .contains("raw-session-must-not-reach-chat-wire"));
     }
 
     #[tokio::test]
@@ -1305,13 +1487,20 @@ mod tests {
             .await;
 
         let provider = responses_provider(&server);
-        let options = options_with_previous_response_id(Some("resp_stale"));
+        let mut options = options_with_previous_response_id(Some("resp_stale"));
+        options.session_id = Some("resumed-session".to_string());
+        options.request_purpose = Some("agent_loop".to_string());
+        options
+            .responses
+            .as_mut()
+            .expect("Responses options")
+            .prompt_cache_key = Some(SESSION_CACHE_KEY.to_string());
         let stream = provider
             .chat_stream_with_options(
                 &[Message::user("hello")],
                 &[],
                 None,
-                "gpt-5.2",
+                "gpt-5.6",
                 Some(&options),
             )
             .await
@@ -1328,6 +1517,10 @@ mod tests {
         assert_eq!(first["previous_response_id"], "resp_stale");
         assert!(second.get("previous_response_id").is_none());
         assert_eq!(first["input"], second["input"]);
+        assert_eq!(first["prompt_cache_key"], SESSION_CACHE_KEY);
+        assert_eq!(second["prompt_cache_key"], SESSION_CACHE_KEY);
+        assert!(!first.to_string().contains("resumed-session"));
+        assert!(!second.to_string().contains("resumed-session"));
     }
 
     #[tokio::test]

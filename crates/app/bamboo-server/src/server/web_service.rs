@@ -2,11 +2,12 @@ use std::path::PathBuf;
 
 use actix_files as fs;
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
-use actix_web::{web, App, HttpServer};
+use actix_web::{web, App};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
-use super::listeners::DEFAULT_WORKER_COUNT;
+use super::h1::build_h1_server;
+use super::listeners::{build_resolved_listeners, DEFAULT_WORKER_COUNT};
 
 /// Request body size limits, applied on EVERY serve path so the desktop/embedded
 /// server accepts the same payloads (e.g. an inline-image chat request) as the
@@ -91,7 +92,7 @@ impl WebService {
 
     /// Start the web service, terminating TLS itself when `tls` is `Some` (#181).
     ///
-    /// `None` keeps the plaintext `.bind()` path unchanged (desktop loopback).
+    /// `None` keeps the plaintext HTTP/1.1 path unchanged (desktop loopback).
     pub async fn start_with_bind_tls(
         &mut self,
         port: u16,
@@ -120,28 +121,21 @@ impl WebService {
         // Retain a handle so stop()/Drop can stop AppState-owned background tasks. #119
         self.app_state = Some(app_state.clone());
         let bind_addr = bind.to_string();
-        let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
 
-        let server = HttpServer::new(move || {
+        let app_factory = move || {
             with_body_limits(App::new())
                 .app_data(app_state.clone())
                 .wrap(build_cors(&bind_addr, port))
                 .configure(configure_routes) // No rate limiting for WebService
-        })
-        .workers(DEFAULT_WORKER_COUNT);
+        };
 
         // Fail-fast: build the rustls config before binding; `None` → unchanged
-        // plaintext `.bind()` path. #181.
-        let server = match tls {
-            Some(tls) => server
-                .bind_rustls_0_23(&listen_addr, build_rustls_config(tls)?)
-                .map_err(|e| format!("Failed to bind TLS server: {e}"))?,
-            None => server
-                .bind(&listen_addr)
-                .map_err(|e| format!("Failed to bind server: {e}"))?,
-        }
-        .run();
+        // plaintext HTTP/1.1 path. #181.
+        let rustls_config = tls.map(build_rustls_config).transpose()?;
+        let listeners = build_resolved_listeners(bind, port)?;
+        let server = build_h1_server(app_factory, listeners, DEFAULT_WORKER_COUNT, rustls_config)
+            .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
 
         let server_handle = tokio::spawn(async move {
             tokio::select! {
@@ -180,7 +174,7 @@ impl WebService {
     }
 
     /// Like [`WebService::start_with_bind_and_static`], terminating TLS itself
-    /// when `tls` is `Some` (#181). `None` keeps the plaintext path unchanged.
+    /// when `tls` is `Some` (#181). `None` keeps the plaintext HTTP/1.1 path unchanged.
     pub async fn start_with_bind_and_static_tls(
         &mut self,
         port: u16,
@@ -228,10 +222,9 @@ impl WebService {
         // Per-IP rate limiter for the network-exposed production server (#13).
         let rate_limiter = build_rate_limiter();
         let bind_addr = bind.to_string();
-        let listen_addr = format!("{bind}:{port}");
         let bind_for_log = bind_addr.clone();
 
-        let server = HttpServer::new(move || {
+        let app_factory = move || {
             // WRAP ORDER (#169 part 2, #428): Governor + CORS are applied
             // together, in the fixed order enforced by the shared
             // `wrap_governor_and_cors` helper (Governor inner, CORS outer) —
@@ -261,20 +254,14 @@ impl WebService {
                     .disable_content_disposition()
                     .disable_content_disposition(),
             )
-        })
-        .workers(DEFAULT_WORKER_COUNT);
+        };
 
         // Fail-fast: build the rustls config before binding; `None` → unchanged
-        // plaintext `.bind()` path. #181.
-        let server = match tls {
-            Some(tls) => server
-                .bind_rustls_0_23(&listen_addr, build_rustls_config(tls)?)
-                .map_err(|e| format!("Failed to bind TLS server: {e}"))?,
-            None => server
-                .bind(&listen_addr)
-                .map_err(|e| format!("Failed to bind server: {e}"))?,
-        }
-        .run();
+        // plaintext HTTP/1.1 path. #181.
+        let rustls_config = tls.map(build_rustls_config).transpose()?;
+        let listeners = build_resolved_listeners(bind, port)?;
+        let server = build_h1_server(app_factory, listeners, DEFAULT_WORKER_COUNT, rustls_config)
+            .map_err(|e| format!("Failed to build HTTP/1.1 server: {e}"))?;
 
         let server_handle = tokio::spawn(async move {
             tokio::select! {

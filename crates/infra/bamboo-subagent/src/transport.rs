@@ -37,19 +37,55 @@ use crate::proto::{ChildFrame, ParentFrame, RunSpec};
 /// them on [`ParentFrame::ApprovalReply`]).
 type PendingReplies = Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum TransportError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("ws: {0}")]
-    Ws(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("decode: {0}")]
-    Decode(#[from] serde_json::Error),
-    #[error("protocol: {0}")]
+    Io(std::io::Error),
+    Ws(Box<tokio_tungstenite::tungstenite::Error>),
+    Decode(serde_json::Error),
     Protocol(String),
     /// TLS configuration / handshake failure (bad cert/key, provider, etc.).
-    #[error("tls: {0}")]
     Tls(String),
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "io: {error}"),
+            Self::Ws(error) => write!(formatter, "ws: {error}"),
+            Self::Decode(error) => write!(formatter, "decode: {error}"),
+            Self::Protocol(message) => write!(formatter, "protocol: {message}"),
+            Self::Tls(message) => write!(formatter, "tls: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Ws(error) => Some(error.as_ref()),
+            Self::Decode(error) => Some(error),
+            Self::Protocol(_) | Self::Tls(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for TransportError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for TransportError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Ws(Box::new(error))
+    }
+}
+
+impl From<serde_json::Error> for TransportError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Decode(error)
+    }
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -629,7 +665,7 @@ impl ChildClient {
         tls_config: Option<rustls::ClientConfig>,
     ) -> TransportResult<Self> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut request = endpoint.into_client_request().map_err(TransportError::Ws)?;
+        let mut request = endpoint.into_client_request()?;
         if let Some(token) = token {
             let value = format!("Bearer {token}")
                 .parse()
@@ -707,6 +743,65 @@ mod tests {
     use super::*;
     use crate::executor::EchoExecutor;
     use crate::proto::{ChildFrame, TerminalStatus};
+
+    #[test]
+    fn transport_error_conversions_preserve_diagnostics_and_sources() {
+        let io_source = std::io::Error::other("socket unavailable");
+        let io_error = TransportError::from(io_source);
+        assert_eq!(io_error.to_string(), "io: socket unavailable");
+        assert!(
+            std::error::Error::source(&io_error)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some(),
+            "the concrete IO error type must remain discoverable"
+        );
+
+        let decode_source = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the fixture must be invalid JSON");
+        let decode_message = decode_source.to_string();
+        let decode_error = TransportError::from(decode_source);
+        assert_eq!(
+            decode_error.to_string(),
+            format!("decode: {decode_message}")
+        );
+        assert!(
+            std::error::Error::source(&decode_error)
+                .and_then(|source| source.downcast_ref::<serde_json::Error>())
+                .is_some(),
+            "the concrete JSON error type must remain discoverable"
+        );
+
+        let websocket_source = tokio_tungstenite::tungstenite::Error::ConnectionClosed;
+        let websocket_message = websocket_source.to_string();
+        let websocket_error = TransportError::from(websocket_source);
+
+        assert_eq!(
+            websocket_error.to_string(),
+            format!("ws: {websocket_message}")
+        );
+        let reported_source = std::error::Error::source(&websocket_error)
+            .expect("the boxed WebSocket error remains the transport error source");
+        assert_eq!(reported_source.to_string(), websocket_message);
+        assert!(
+            reported_source
+                .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+                .is_some(),
+            "the concrete WebSocket error type must remain discoverable"
+        );
+        assert!(matches!(
+            websocket_error,
+            TransportError::Ws(inner)
+                if matches!(*inner, tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+        ));
+
+        let protocol_error = TransportError::Protocol("unexpected frame".to_string());
+        assert_eq!(protocol_error.to_string(), "protocol: unexpected frame");
+        assert!(std::error::Error::source(&protocol_error).is_none());
+
+        let tls_error = TransportError::Tls("bad certificate".to_string());
+        assert_eq!(tls_error.to_string(), "tls: bad certificate");
+        assert!(std::error::Error::source(&tls_error).is_none());
+    }
 
     /// In-process server + client over a real loopback socket (no subprocess).
     #[tokio::test]

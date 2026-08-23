@@ -46,6 +46,77 @@ pub trait Storage: Send + Sync {
         self.load_session(session_id).await
     }
 
+    /// Recover an interrupted two-session Task control-plane transaction for
+    /// this exact, lexically ordered session pair before either snapshot is
+    /// read. Backends without a recovery journal have nothing to do.
+    ///
+    /// Implementations that retain an undo journal after a failed rollback must
+    /// fail closed on ordinary control-plane reads/writes until this operation
+    /// succeeds; otherwise callers could continue from a permanently divergent
+    /// child/root Task generation in the same process.
+    async fn recover_task_control_plane_transaction(
+        &self,
+        first_session_id: &str,
+        second_session_id: &str,
+    ) -> std::io::Result<()> {
+        let _ = (first_session_id, second_session_id);
+        Ok(())
+    }
+
+    /// Final-CAS one Task-owned control-plane snapshot. The backend must
+    /// re-read the durable Task list/generation under the same lock as its
+    /// atomic sidecar replacement, compare them with `original`, and build the
+    /// physical write from that current snapshot while patching only Task-owned
+    /// fields from `updated`.
+    ///
+    /// `Ok(true)` commits, `Ok(false)` reports a stale/missing target without
+    /// writing, and unsupported backends must fail before mutation. This port
+    /// prevents independent [`crate::RuntimeSessionPersistence`] wrappers from
+    /// both publishing candidates staged from the same generation.
+    async fn save_task_control_plane_if_matches(
+        &self,
+        original: &Session,
+        updated: &Session,
+    ) -> std::io::Result<bool> {
+        let _ = (original, updated);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support atomic Task control-plane CAS",
+        ))
+    }
+
+    /// Commit two already-existing runtime control planes as one recoverable
+    /// Task transaction. Arguments must be ordered lexically by session id and
+    /// each updated snapshot must have the same id as its original snapshot.
+    ///
+    /// `Ok(true)` is the commit point: both Task lists/generations are durable
+    /// and no recovery journal may remain that could later undo them. The
+    /// backend must revalidate both Task-owned original snapshots while holding
+    /// its final transaction lock; `Ok(false)` reports a stale-generation
+    /// conflict and must not write either target or publish a journal. `Err`
+    /// requires both originals to remain durable, or a retained recovery
+    /// journal plus fail-closed access until recovery restores them.
+    /// Implementations unable to provide that contract must return
+    /// `Unsupported` before writing.
+    async fn save_task_control_planes_atomically(
+        &self,
+        first_original: &Session,
+        first_updated: &Session,
+        second_original: &Session,
+        second_updated: &Session,
+    ) -> std::io::Result<bool> {
+        let _ = (
+            first_original,
+            first_updated,
+            second_original,
+            second_updated,
+        );
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support recoverable paired Task control-plane writes",
+        ))
+    }
+
     /// List `(child_session_id, last_run_status)` for every direct child of the
     /// given parent session, sourced from the index/metadata the backend keeps.
     ///

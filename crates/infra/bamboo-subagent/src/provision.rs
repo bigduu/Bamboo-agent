@@ -37,6 +37,13 @@ pub struct ProvisionSpec {
     /// unified actor+mailbox transport); the parent drives it by mailbox id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bus: Option<BusEndpoint>,
+    /// Physical owner of a locally spawned worker. This is independent from
+    /// the durable parent/child session lifecycle: it lets the worker reclaim
+    /// its OS process if the spawning Bamboo instance disappears without
+    /// dropping the `Child` handle normally. Missing for older specs and for
+    /// operator-managed resident workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<WorkerOwner>,
     /// Isolated storage root for this actor's own session/mailbox files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<String>,
@@ -242,6 +249,68 @@ pub struct BusEndpoint {
     pub token: String,
 }
 
+/// Process-instance identity attached immediately before a local worker spawn.
+///
+/// `session_id` is diagnostic context for the activation that caused the
+/// spawn. A reusable worker can later serve other sessions, so durable child
+/// lifecycle remains authoritative elsewhere; `process_id` plus the optional
+/// OS start identity form the physical ownership lease used by the orphan
+/// guard. `instance_id` remains useful for process-scoped diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerOwner {
+    pub process_id: u32,
+    pub instance_id: String,
+    /// Opaque OS process-creation identity used with `process_id` to reject PID
+    /// reuse. Windows represents this as the creation `FILETIME` tick value;
+    /// other platforms currently rely on direct-parent/reparent detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub worker_spawned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl WorkerOwner {
+    pub fn for_current_process(instance_id: String, session_id: Option<String>) -> Self {
+        Self {
+            process_id: std::process::id(),
+            instance_id,
+            process_start_id: current_process_start_id(),
+            session_id,
+            worker_spawned_at: chrono::Utc::now(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn current_process_start_id() -> Option<u64> {
+    None
+}
+
+#[cfg(windows)]
+fn current_process_start_id() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+}
+
 /// How a worker reaches the orchestrator's MCP proxy over the broker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpProxyConfig {
@@ -438,6 +507,7 @@ impl ProvisionSpec {
             executor,
             fabric_dir,
             bus: None,
+            owner: None,
             storage_dir: None,
             workspace: None,
             model: None,
@@ -583,6 +653,7 @@ mod tests {
         assert!(parsed.model.is_none());
         assert!(parsed.secrets.provider_credentials.is_empty());
         assert_eq!(parsed.limits, Limits::default());
+        assert!(parsed.owner.is_none());
         // Placement defaults to Local for a spec that predates the field.
         assert_eq!(parsed.placement, Placement::Local);
     }

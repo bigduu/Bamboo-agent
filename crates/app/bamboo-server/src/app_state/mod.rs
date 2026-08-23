@@ -235,6 +235,16 @@ pub struct AppState {
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
 
+    /// Durable, Bamboo-home-scoped idempotency receipts for root-session
+    /// creation. Kept outside each target session directory so deleting a
+    /// session cannot erase retry truth during the retention window.
+    pub(crate) session_create_operations:
+        Arc<session_create_operations::SessionCreateOperationStore>,
+
+    /// Short-lived, process-local response receipts for `POST /chat` and
+    /// `POST /execute`. Raw caller keys and request payloads are never stored.
+    pub(crate) mutation_idempotency: Arc<mutation_idempotency::MutationIdempotencyStore>,
+
     /// Authoritative first-class Project registry and shared-resource paths.
     pub project_store: Arc<bamboo_projects::ProjectStore>,
 
@@ -436,7 +446,7 @@ pub struct AppState {
     /// Tracks session ids whose auto-title generation is currently in flight.
     ///
     /// Used by [`crate::title_gen`] to dedupe concurrent invocations
-    /// (e.g. execute handler firing while a regenerate-title request is running).
+    /// (e.g. multiple chat messages arriving while a regenerate-title request is running).
     pub title_gen_in_flight: Arc<dashmap::DashSet<String>>,
 
     /// v2-P2 (#181, slice 2): in-memory one-time pairing codes. A 6-digit numeric
@@ -509,6 +519,8 @@ pub mod runner_lifecycle;
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
+pub(crate) mod mutation_idempotency;
+pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
 mod tools;
@@ -517,8 +529,17 @@ pub mod watchers;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
-    pub reload_provider: bool,
-    pub reconcile_mcp: bool,
+    pub reload_provider: bamboo_config::patch::ReloadMode,
+    pub reconcile_mcp: bamboo_config::patch::ReloadMode,
+}
+
+impl Default for ConfigUpdateEffects {
+    fn default() -> Self {
+        Self {
+            reload_provider: bamboo_config::patch::ReloadMode::None,
+            reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+        }
+    }
 }

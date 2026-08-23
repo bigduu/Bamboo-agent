@@ -10,7 +10,7 @@ pub(crate) mod runtime;
 mod types;
 
 pub use defaults::handler as defaults_handler;
-pub use handler::handler;
+pub use handler::{handle_execute, handler};
 pub(crate) use runtime::{spawn_agent_execution, spawn_event_forwarder};
 pub use types::{
     ExecuteClientSync, ExecuteRequest, ExecuteResponse, ExecuteSyncInfo, ExecuteSyncReason,

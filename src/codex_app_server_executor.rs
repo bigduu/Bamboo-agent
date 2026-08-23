@@ -24,7 +24,9 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::codex_discovery::discover_codex_app_server;
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, HostBridge, SteerInbox};
-use bamboo_subagent::executor_util::{build_rehydrated_turn, write_json_atomic};
+use bamboo_subagent::executor_util::{
+    build_rehydrated_turn, spawn_with_etxtbsy_retry, write_json_atomic,
+};
 use bamboo_subagent::proto::RunSpec;
 
 use crate::codex_cli_executor::{
@@ -381,12 +383,15 @@ impl CodexAppServerExecutor {
 
     async fn start_connection(&self) -> Result<AppServerConnection, String> {
         self.prepare_auth_home().await?;
-        let mut child = self.build_command()?.spawn().map_err(|error| {
-            format!(
-                "spawn Codex app-server '{}': {error}",
-                self.binary.display()
-            )
-        })?;
+        let mut child =
+            spawn_with_etxtbsy_retry(|| self.build_command().map_err(std::io::Error::other))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "spawn Codex app-server '{}': {error}",
+                        self.binary.display()
+                    )
+                })?;
         let stdin = child
             .stdin
             .take()

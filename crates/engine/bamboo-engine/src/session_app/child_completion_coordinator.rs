@@ -44,12 +44,13 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    resolve_fast_model, resolve_gold_config, GOLD_CONFIG_METADATA_KEY,
+    resolve_fast_model, resolve_gold_config, resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
 };
-use crate::session_app::provider_model::session_effective_model_ref;
+use crate::session_app::execute::consume_pending_clarification_resume;
+use crate::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
 use crate::session_app::resume::{
     resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
 };
@@ -953,10 +954,21 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         .await
     }
 
+    fn dispatch_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = self.clone();
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
         let ResumeSpawnRequest {
             session_id,
-            session,
+            mut session,
             mut execution_reservation,
             event_sender,
             config,
@@ -976,25 +988,61 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             return;
         };
 
+        let config_snapshot = self.config.read().await.clone();
         let model = session.model.clone();
-        let resolved_provider_name = session_effective_model_ref(&session)
-            .map(|model_ref| model_ref.provider)
-            .unwrap_or(config.provider_name);
-        let provider_override = session_effective_model_ref(&session)
-            .and_then(|model_ref| match self.provider_router.route(&model_ref) {
+        let session_model_ref = session_effective_model_ref(&session);
+        let requested_provider = session_model_ref
+            .as_ref()
+            .map(|model_ref| model_ref.provider.as_str())
+            .unwrap_or(config.provider_name.as_str());
+        let resolved_provider_name = match resolve_provider_routing_key(
+            &config_snapshot,
+            requested_provider,
+            &self.provider_registry,
+        ) {
+            Ok(provider) => provider,
+            Err(error) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    provider = requested_provider,
+                    %error,
+                    "child-completion resume provider is unavailable; refusing to fall back"
+                );
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
+        let provider_override = if let Some(mut model_ref) = session_model_ref {
+            model_ref.provider = resolved_provider_name.clone();
+            persist_model_ref(&mut session, &model_ref);
+            match self.provider_router.route(&model_ref) {
                 Ok(provider) => Some(provider),
                 Err(error) => {
-                    tracing::warn!(
+                    tracing::error!(
                         session_id = %session_id,
                         provider = %model_ref.provider,
                         model = %model_ref.model,
-                        error = %error,
-                        "failed to resolve provider override for child-completion parent resume; falling back to runtime provider"
+                        %error,
+                        "child-completion resume provider routing failed closed"
                     );
-                    None
+                    execution_reservation.abandon().await;
+                    return;
                 }
-            });
-        let config_snapshot = self.config.read().await.clone();
+            }
+        } else {
+            match self.provider_registry.get(&resolved_provider_name) {
+                Some(provider) => Some(provider),
+                None => {
+                    tracing::error!(
+                        session_id = %session_id,
+                        provider = %resolved_provider_name,
+                        "child-completion resume provider disappeared after resolution; refusing to fall back"
+                    );
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+        };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
             &resolved_provider_name,
@@ -1018,6 +1066,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
 
         let (mpsc_tx, _forwarder) = create_event_forwarder(
             session_id.clone(),
+            execution_reservation.run_id().to_string(),
             event_sender,
             self.agent_runners.clone(),
             self.account_feed_inbox.clone(),
@@ -1071,6 +1120,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         let guardian_config = read_guardian_config(&session);
         let guardian_spawner = self.guardian_spawner.read().await.clone();
 
+        consume_pending_clarification_resume(&mut session);
         spawn_session_execution(SessionExecutionArgs {
             agent: self.agent.clone(),
             session_id,
@@ -2646,14 +2696,15 @@ impl ChildCompletionCoordinator {
         status: &str,
         error: Option<String>,
     ) {
-        let parent_tx = crate::execution::session_events::get_or_create_event_sender(
-            &self.session_event_senders,
-            parent_session_id,
-        )
-        .await;
+        let publisher =
+            crate::runtime::execution::session_events::ReplayableSessionEventPublisher::new(
+                self.agent_runners.clone(),
+                self.session_event_senders.clone(),
+                self.account_feed_inbox.clone(),
+            );
         let handler: Arc<dyn ChildCompletionHandler> = Arc::new(self.clone());
         crate::runtime::execution::spawn::publish_child_completion_parts(
-            &parent_tx,
+            &publisher,
             Some(handler),
             parent_session_id.to_string(),
             child_session_id.to_string(),

@@ -11,6 +11,7 @@ use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::{Message, Session};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+use bamboo_metrics::storage::MetricsStorage;
 use bamboo_tools::BuiltinToolExecutorBuilder;
 
 fn task_list_with_in_progress_item(session_id: &str, description: &str) -> TaskList {
@@ -661,15 +662,23 @@ async fn activation_metadata_persistence_failure_releases_pin_before_provider_ca
 
 #[tokio::test]
 async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_pin() {
-    struct FailSecondSave(Arc<std::sync::atomic::AtomicUsize>);
+    struct FailAssistantToolCallSave(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
-    impl bamboo_domain::RuntimeSessionPersistence for FailSecondSave {
-        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
-            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call == 0 {
-                Ok(())
+    impl bamboo_domain::RuntimeSessionPersistence for FailAssistantToolCallSave {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            let is_assistant_tool_call_boundary = session.messages.iter().rev().any(|message| {
+                matches!(message.role, bamboo_agent_core::Role::Assistant)
+                    && message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.function.name == "load_skill")
+                    })
+            });
+            if is_assistant_tool_call_boundary {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::other(
+                    "assistant tool-call checkpoint failed",
+                ))
             } else {
-                Err(std::io::Error::other("second save failed"))
+                Ok(())
             }
         }
     }
@@ -738,7 +747,7 @@ async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_
         AgentLoopConfig {
             skill_manager: Some(manager.clone()),
             selected_skill_ids: Some(vec!["review".to_string()]),
-            persistence: Some(Arc::new(FailSecondSave(save_count.clone()))),
+            persistence: Some(Arc::new(FailAssistantToolCallSave(save_count.clone()))),
             model_name: Some("model".to_string()),
             ..Default::default()
         },
@@ -748,7 +757,7 @@ async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_
         .expect_err("activation tool-call checkpoint must fail")
         .to_string()
         .contains("assistant tool-call checkpoint could not be persisted"));
-    assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(save_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(manager
         .store()
         .activation_descriptor("activation-checkpoint-failure")
@@ -847,4 +856,486 @@ async fn unsuccessful_model_issued_explicit_activation_stops_before_answer_and_r
         .activation_descriptor("unsuccessful-model-activation")
         .await
         .is_none());
+}
+
+struct MetricsQueueProvider {
+    queue: Mutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
+}
+
+#[async_trait]
+impl LLMProvider for MetricsQueueProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        let mut queue = self.queue.lock().await;
+        assert!(!queue.is_empty(), "metrics provider queue exhausted");
+        Ok(Box::pin(stream::iter(queue.remove(0))))
+    }
+}
+
+fn provider_usage(prompt: u64, completion: u64) -> LLMChunk {
+    LLMChunk::ProviderUsage {
+        input_tokens: Some(prompt),
+        output_tokens: Some(completion),
+        total_tokens: Some(prompt.saturating_add(completion)),
+        reasoning_tokens: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+        cache_write_input_tokens: None,
+    }
+}
+
+fn metric_execution_prefix(round_id: &str) -> &str {
+    round_id
+        .rsplit_once("-round-")
+        .map(|(prefix, _)| prefix)
+        .expect("round id suffix")
+}
+
+async fn create_runner_metrics() -> (
+    tempfile::TempDir,
+    bamboo_metrics::MetricsCollector,
+    Arc<bamboo_metrics::SqliteMetricsStorage>,
+) {
+    let directory = tempfile::tempdir().expect("metrics tempdir");
+    let storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+        directory.path().join("metrics.db"),
+    ));
+    storage.init().await.expect("initialize metrics storage");
+    let collector = bamboo_metrics::MetricsCollector::spawn(storage.clone(), 7);
+    (directory, collector, storage)
+}
+
+fn runner_metrics_config(collector: &bamboo_metrics::MetricsCollector) -> AgentLoopConfig {
+    AgentLoopConfig {
+        max_rounds: 2,
+        system_prompt: Some("metrics regression test".to_string()),
+        model_name: Some("test-model".to_string()),
+        metrics_collector: Some(collector.clone()),
+        prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+            project_prompt_injection: false,
+            relevant_recall: false,
+            relevant_recall_rerank: false,
+            project_first_dream: false,
+            ledger_agenda: false,
+        },
+        ..AgentLoopConfig::default()
+    }
+}
+
+async fn wait_for_runner_metrics(
+    storage: &bamboo_metrics::SqliteMetricsStorage,
+    session_id: &str,
+    expected_rounds: usize,
+    expected_usage: bamboo_metrics::types::TokenUsage,
+) -> bamboo_metrics::types::SessionDetail {
+    for _ in 0..100 {
+        if let Some(detail) = storage
+            .session_detail(session_id)
+            .await
+            .expect("session metrics query")
+        {
+            if detail.rounds.len() == expected_rounds
+                && detail
+                    .rounds
+                    .iter()
+                    .all(|round| round.completed_at.is_some())
+                && detail.session.total_token_usage == expected_usage
+            {
+                return detail;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "session {session_id} did not persist {expected_rounds} completed rounds with usage {expected_usage:?}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
+    let session_id = "metrics-repeated-execution";
+    let (_directory, collector, storage) = create_runner_metrics().await;
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(vec![
+            vec![
+                Ok(provider_usage(10, 2)),
+                Ok(LLMChunk::Token("first answer".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(provider_usage(20, 3)),
+                Ok(LLMChunk::Token("second answer".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+        ]),
+    });
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let mut session = Session::new(session_id, "test-model");
+
+    let (first_tx, _first_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut session,
+        "first request".to_string(),
+        first_tx,
+        provider.clone(),
+        tools.clone(),
+        CancellationToken::new(),
+        runner_metrics_config(&collector),
+    )
+    .await
+    .expect("first execution");
+
+    let first_detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        session_id,
+        1,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        },
+    )
+    .await;
+    let first_round_id = first_detail.rounds[0].round_id.clone();
+    assert_eq!(
+        first_detail.rounds[0].status,
+        bamboo_metrics::types::RoundStatus::Success
+    );
+
+    let (second_tx, _second_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut session,
+        "second request".to_string(),
+        second_tx,
+        provider,
+        tools,
+        CancellationToken::new(),
+        runner_metrics_config(&collector),
+    )
+    .await
+    .expect("second execution");
+
+    let detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        session_id,
+        2,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 5,
+            total_tokens: 35,
+        },
+    )
+    .await;
+    let first = detail
+        .rounds
+        .iter()
+        .find(|round| round.round_id == first_round_id)
+        .expect("first execution round remains present");
+    assert_eq!(
+        first.token_usage,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        }
+    );
+
+    let second = detail
+        .rounds
+        .iter()
+        .find(|round| round.round_id != first_round_id)
+        .expect("second execution has a distinct round");
+    assert_ne!(first.round_id, second.round_id);
+    assert!(first.round_id.starts_with(&format!("{session_id}-run-")));
+    assert!(second.round_id.starts_with(&format!("{session_id}-run-")));
+    assert_eq!(
+        second.token_usage,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            total_tokens: 23,
+        }
+    );
+    assert_eq!(
+        session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.round.last_round_id.as_deref()),
+        Some(second.round_id.as_str())
+    );
+}
+
+struct PauseForHumanTool;
+
+#[async_trait]
+impl Tool for PauseForHumanTool {
+    fn name(&self) -> &str {
+        "pause_for_human"
+    }
+
+    fn description(&self) -> &str {
+        "pause this execution until a human responds"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn invoke(
+        &self,
+        _args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome::NeedsHuman {
+            question: bamboo_agent_core::PendingQuestion {
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: self.name().to_string(),
+                question: "Continue?".to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                allow_custom: false,
+                source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+            },
+            result: ToolResult::text(false, "waiting for a response"),
+        })
+    }
+}
+
+struct ResumeCompleteTool;
+
+#[async_trait]
+impl Tool for ResumeCompleteTool {
+    fn name(&self) -> &str {
+        "complete_after_resume"
+    }
+
+    fn description(&self) -> &str {
+        "complete one tool call after the suspended execution resumes"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn invoke(
+        &self,
+        _args: serde_json::Value,
+        _ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            true,
+            "resume tool completed",
+        )))
+    }
+}
+
+#[tokio::test]
+async fn suspended_session_resume_uses_a_new_metric_round_and_preserves_tool_link() {
+    let session_id = "metrics-suspend-resume";
+    let (_directory, collector, storage) = create_runner_metrics().await;
+    let pause_call = bamboo_agent_core::tools::ToolCall {
+        id: "pause-call".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "pause_for_human".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let resume_call = bamboo_agent_core::tools::ToolCall {
+        id: "resume-call".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "complete_after_resume".to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(vec![
+            vec![
+                Ok(provider_usage(7, 2)),
+                Ok(LLMChunk::ToolCalls(vec![pause_call])),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(provider_usage(13, 4)),
+                Ok(LLMChunk::ToolCalls(vec![resume_call])),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(provider_usage(5, 1)),
+                Ok(LLMChunk::Token("resumed answer".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+        ]),
+    });
+    let tools = BuiltinToolExecutorBuilder::new()
+        .with_tool(PauseForHumanTool)
+        .expect("register pause tool")
+        .with_tool(ResumeCompleteTool)
+        .expect("register resume tool")
+        .build();
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(tools);
+    let mut session = Session::new(session_id, "test-model");
+
+    let (first_tx, _first_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut session,
+        "need a decision".to_string(),
+        first_tx,
+        provider.clone(),
+        tools.clone(),
+        CancellationToken::new(),
+        runner_metrics_config(&collector),
+    )
+    .await
+    .expect("suspending execution");
+
+    assert!(session.has_pending_question());
+    assert_eq!(
+        session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str),
+        Some("awaiting_clarification")
+    );
+    assert!(session.agent_runtime_state.as_ref().is_some_and(|state| {
+        matches!(state.status, bamboo_domain::AgentStatusState::Suspended)
+    }));
+
+    let first_detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        session_id,
+        1,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 7,
+            completion_tokens: 2,
+            total_tokens: 9,
+        },
+    )
+    .await;
+    let first_round_id = first_detail.rounds[0].round_id.clone();
+    assert_eq!(first_detail.rounds[0].tool_calls.len(), 1);
+    assert_eq!(
+        first_detail.rounds[0].tool_calls[0].tool_call_id,
+        "pause-call"
+    );
+
+    // Mirror the response boundary: the resolved question and suspend marker
+    // are cleared, while the persisted Suspended control-plane state lets the
+    // next invocation take the real resume path.
+    session.clear_pending_question();
+    session.metadata.remove("runtime.suspend_reason");
+
+    let (second_tx, _second_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut session,
+        "yes".to_string(),
+        second_tx,
+        provider,
+        tools,
+        CancellationToken::new(),
+        runner_metrics_config(&collector),
+    )
+    .await
+    .expect("resumed execution");
+
+    let detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        session_id,
+        3,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 25,
+            completion_tokens: 7,
+            total_tokens: 32,
+        },
+    )
+    .await;
+    let first = detail
+        .rounds
+        .iter()
+        .find(|round| round.round_id == first_round_id)
+        .expect("suspended round remains present");
+    assert_eq!(first.tool_calls.len(), 1);
+    assert_eq!(first.tool_calls[0].tool_call_id, "pause-call");
+    assert_eq!(
+        first.token_usage,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 7,
+            completion_tokens: 2,
+            total_tokens: 9,
+        }
+    );
+
+    let resumed_tool_round = detail
+        .rounds
+        .iter()
+        .find(|round| {
+            round
+                .tool_calls
+                .iter()
+                .any(|tool| tool.tool_call_id == "resume-call")
+        })
+        .expect("resume tool remains linked to its new round");
+    assert_ne!(first.round_id, resumed_tool_round.round_id);
+    assert_eq!(
+        resumed_tool_round.token_usage,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 13,
+            completion_tokens: 4,
+            total_tokens: 17,
+        }
+    );
+    assert_eq!(resumed_tool_round.tool_calls.len(), 1);
+    assert_eq!(resumed_tool_round.tool_calls[0].tool_call_id, "resume-call");
+
+    let final_round_id = session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|state| state.round.last_round_id.as_deref())
+        .expect("resumed final round id");
+    let final_round = detail
+        .rounds
+        .iter()
+        .find(|round| round.round_id == final_round_id)
+        .expect("resumed final round remains present");
+    assert_eq!(
+        final_round.token_usage,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+        }
+    );
+    assert!(final_round.tool_calls.is_empty());
+
+    assert_eq!(
+        metric_execution_prefix(&resumed_tool_round.round_id),
+        metric_execution_prefix(&final_round.round_id),
+        "all rounds in one resumed execution share the namespace"
+    );
+    assert_ne!(
+        metric_execution_prefix(&first.round_id),
+        metric_execution_prefix(&resumed_tool_round.round_id),
+        "the resume receives a fresh execution namespace"
+    );
+    assert_eq!(
+        session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.round.last_round_id.as_deref()),
+        Some(final_round.round_id.as_str())
+    );
 }

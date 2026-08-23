@@ -1,14 +1,26 @@
 //! Helper for creating sessions from schedule run jobs.
 
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_domain::{Message, Session};
+use bamboo_domain::{Message, Session, SessionPermissionMode};
 use bamboo_engine::runner;
 
 use super::manager::ScheduleRunJob;
 
+/// Apply the per-session permission posture required by an unattended root.
+///
+/// This must happen in the factory, before the manager records permission
+/// audit metadata, so every schedule entrypoint starts from the same explicit
+/// Auto request without widening the process-global permission mode.
+fn apply_unattended_permission_posture(session: &mut Session) {
+    let runtime = session.agent_runtime_state.get_or_insert_default();
+    runtime.set_permission_mode(SessionPermissionMode::Auto);
+    runtime.no_human_approver = true;
+}
+
 /// Create and configure a new session for a scheduled run.
 ///
-/// Sets up session metadata, workspace, system prompt, and optional initial user message.
+/// Sets up the unattended permission posture, metadata, workspace, system
+/// prompt, and optional initial user message.
 pub fn create_schedule_session(
     job: &ScheduleRunJob,
     model: &str,
@@ -26,11 +38,13 @@ pub fn create_schedule_session(
     );
 
     let mut session = Session::new(session_id.clone(), model.to_string());
+    apply_unattended_permission_posture(&mut session);
     session.metadata.insert(
         bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY.to_string(),
         "startup".to_string(),
     );
     session.title = title;
+    session.title_generated = true;
     session.metadata.insert(
         "created_by_schedule_id".to_string(),
         job.schedule_id.clone(),
@@ -92,8 +106,129 @@ pub fn create_schedule_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_agent_core::tools::ToolExecutionSessionFlags;
     use bamboo_agent_core::workspace_state::{WorkspaceResolver, WorkspaceRootConfig};
-    use bamboo_domain::ScheduleRunConfig;
+    use bamboo_domain::{PermissionAuditSnapshot, PermissionMode, ScheduleRunConfig};
+    use bamboo_tools::permission::{
+        EffectivePermissionPolicy, PermissionConfig, PermissionDecisionKind,
+        PermissionDecisionSource, PermissionEvaluation, PermissionOutcome, PermissionReasonCode,
+        PermissionRequest, PermissionType, RiskLevel,
+    };
+
+    fn test_job() -> ScheduleRunJob {
+        ScheduleRunJob {
+            run_id: "run-scheduled-auto".to_string(),
+            schedule_id: "schedule-scheduled-auto".to_string(),
+            schedule_name: "scheduled auto".to_string(),
+            run_config: ScheduleRunConfig::default(),
+            scheduled_for: chrono::Utc::now(),
+            claimed_at: chrono::Utc::now(),
+            was_catch_up: false,
+        }
+    }
+
+    fn permission_evaluation(session: &Session, config: &PermissionConfig) -> PermissionEvaluation {
+        let flags =
+            ToolExecutionSessionFlags::from_session_and_configured_mode(session, config.mode());
+        PermissionEvaluation {
+            request_id: format!("request-{}", session.id),
+            session_id: session.id.clone(),
+            workspace_path: None,
+            tool_name: "Bash".to_string(),
+            tool_args: serde_json::json!({"command": "eval 'printf gated'"}),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: "eval 'printf gated'".to_string(),
+            operation_summary: "execute a forced-ask high-risk command".to_string(),
+            risk_level: RiskLevel::High,
+            bypass_requested: flags.bypass_permissions,
+            auto_approve_requested: flags.auto_approve_permissions,
+            platform_hard_deny: None,
+            consume_once: true,
+            supported_decisions: PermissionDecisionKind::all_supported(),
+        }
+    }
+
+    #[test]
+    fn scheduled_factory_sets_typed_auto_mirror_and_no_human_without_widening_global_mode() {
+        let config = PermissionConfig::new();
+        let interactive_before = Session::new("interactive-before", "model");
+        let resolver = WorkspaceResolver::from_process_globals();
+
+        let mut scheduled = create_schedule_session(
+            &test_job(),
+            "model",
+            "system",
+            "base",
+            None,
+            None,
+            &resolver,
+        );
+        crate::permission_audit::record_bamboo_runtime_permission_metadata(&mut scheduled, &config)
+            .unwrap();
+
+        let runtime = scheduled
+            .agent_runtime_state
+            .as_ref()
+            .expect("scheduled root runtime posture");
+        assert_eq!(runtime.permission_mode, SessionPermissionMode::Auto);
+        assert!(runtime.bypass_permissions, "legacy compatibility mirror");
+        assert!(runtime.no_human_approver);
+        let audit = PermissionAuditSnapshot::from_metadata(&scheduled.metadata).unwrap();
+        assert_eq!(audit.resolution.requested, SessionPermissionMode::Auto);
+        assert_eq!(audit.resolution.effective, PermissionMode::Auto);
+
+        assert_eq!(config.mode(), PermissionMode::Default);
+        for interactive in [
+            interactive_before,
+            Session::new("interactive-concurrent", "model"),
+        ] {
+            assert!(interactive.agent_runtime_state.is_none());
+            assert_eq!(
+                ToolExecutionSessionFlags::from_session_and_configured_mode(
+                    &interactive,
+                    config.mode(),
+                ),
+                ToolExecutionSessionFlags::default()
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_auto_allows_forced_ask_high_risk_while_interactive_still_asks() {
+        let config = PermissionConfig::new();
+        let resolver = WorkspaceResolver::from_process_globals();
+        let scheduled = create_schedule_session(
+            &test_job(),
+            "model",
+            "system",
+            "base",
+            None,
+            None,
+            &resolver,
+        );
+        let interactive = Session::new("interactive-gated", "model");
+
+        assert!(matches!(
+            config.evaluate(permission_evaluation(&scheduled, &config)),
+            PermissionOutcome::Allow {
+                source: PermissionDecisionSource::Auto,
+                effective_policy: EffectivePermissionPolicy {
+                    mode: PermissionMode::Auto,
+                    auto_approve_requested: true,
+                    ..
+                }
+            }
+        ));
+        assert!(matches!(
+            config.evaluate(permission_evaluation(&interactive, &config)),
+            PermissionOutcome::Ask(PermissionRequest {
+                reason_code: PermissionReasonCode::HardDangerous,
+                effective_mode: PermissionMode::Default,
+                auto_approve_requested: false,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn schedule_publication_uses_the_validating_instance_workspace_root() {
@@ -110,10 +245,7 @@ mod tests {
             run_id: "run-instance-root".to_string(),
             schedule_id: "schedule-instance-root".to_string(),
             schedule_name: "instance root".to_string(),
-            run_config: ScheduleRunConfig::default(),
-            scheduled_for: chrono::Utc::now(),
-            claimed_at: chrono::Utc::now(),
-            was_catch_up: false,
+            ..test_job()
         };
 
         let session = create_schedule_session(

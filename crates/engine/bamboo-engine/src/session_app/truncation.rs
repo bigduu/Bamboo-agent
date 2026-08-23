@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 
 use bamboo_agent_core::{Message, Role, Session};
+use bamboo_domain::ModelContextResetReason;
 
 /// Find tool call IDs that have no corresponding tool result.
 pub fn unresolved_tool_call_ids(messages: &[Message]) -> HashSet<String> {
@@ -110,7 +111,11 @@ pub fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
         .count();
     let removed_tool_results = before_tool_results.saturating_sub(after_tool_results);
 
-    removed_assistant_calls + removed_tool_results
+    let removed = removed_assistant_calls + removed_tool_results;
+    if removed > 0 {
+        session.reset_model_context_epoch(ModelContextResetReason::Rollback);
+    }
+    removed
 }
 
 /// Truncate all messages after the last user message.
@@ -126,6 +131,7 @@ pub fn truncate_after_last_user(session: &mut Session) -> Option<usize> {
     let removed = session.messages.len().saturating_sub(keep_len);
     if removed > 0 {
         session.messages.truncate(keep_len);
+        session.reset_model_context_epoch(ModelContextResetReason::Rollback);
     }
     Some(removed)
 }
@@ -154,6 +160,7 @@ pub fn truncate_for_unresolved_tool_calls(session: &mut Session) -> Option<usize
     let removed = session.messages.len().saturating_sub(keep_len);
     if removed > 0 {
         session.messages.truncate(keep_len);
+        session.reset_model_context_epoch(ModelContextResetReason::Rollback);
     }
     Some(removed)
 }
@@ -226,6 +233,11 @@ mod tests {
     #[test]
     fn truncate_after_last_user_truncates_tail_messages() {
         let mut session = Session::new("session-1", "gpt-5");
+        session.model_context_state = Some(bamboo_domain::ModelContextState {
+            prefix_epoch: 3,
+            cache_scope_sha256: Some("old-scope".to_string()),
+            ..bamboo_domain::ModelContextState::default()
+        });
         session.add_message(Message::system("system"));
         session.add_message(Message::user("question"));
         session.add_message(Message::assistant("answer", None));
@@ -233,6 +245,14 @@ mod tests {
         let removed = truncate_after_last_user(&mut session).expect("user anchor exists");
         assert_eq!(removed, 1);
         assert_eq!(session.messages.len(), 2);
+        let state = session.model_context_state.as_ref().unwrap();
+        assert_eq!(state.prefix_epoch, 4);
+        assert_eq!(
+            state.last_reset_reason,
+            Some(ModelContextResetReason::Rollback)
+        );
+        assert!(state.events.is_empty());
+        assert!(state.cache_scope_sha256.is_none());
     }
 
     #[test]

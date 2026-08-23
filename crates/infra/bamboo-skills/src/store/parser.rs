@@ -1,10 +1,15 @@
 use std::path::Path;
+use std::sync::LazyLock;
 
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::normalize_tool_ref;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::types::{SkillDefinition, SkillError, SkillResult};
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,10 +107,18 @@ pub fn parse_markdown_skill(path: &Path, content: &str) -> SkillResult<SkillDefi
         match normalize_tool_ref(trimmed) {
             Some(normalized) => tool_refs.push(normalized),
             None => {
-                warn!(
-                    "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
-                    trimmed, path
-                );
+                let key = ("unrecognized-allowed-tool", path);
+                if STATIC_WARNINGS.insert_if_new(&key, trimmed) {
+                    warn!(
+                        "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
+                        trimmed, path
+                    );
+                } else {
+                    debug!(
+                        "Unrecognized allowed-tool '{}' in {:?}; preserving raw value",
+                        trimmed, path
+                    );
+                }
                 tool_refs.push(trimmed.to_string());
             }
         }
@@ -180,17 +193,17 @@ fn validate_skill_name(name: &str) -> SkillResult<()> {
         )));
     }
 
-    if !is_valid_skill_id(primary) {
+    if !is_valid_skill_name_segment(primary) {
         return Err(SkillError::Validation(format!(
-            "Name '{}' must be kebab-case or '<namespace>:kebab-case'",
+            "Name '{}' must use ASCII letters and digits separated by single hyphens, optionally as '<namespace>:<name>'",
             name
         )));
     }
 
     if let Some(suffix) = secondary {
-        if !is_valid_skill_id(suffix) {
+        if !is_valid_skill_name_segment(suffix) {
             return Err(SkillError::Validation(format!(
-                "Name '{}' must be kebab-case or '<namespace>:kebab-case'",
+                "Name '{}' must use ASCII letters and digits separated by single hyphens, optionally as '<namespace>:<name>'",
                 name
             )));
         }
@@ -199,11 +212,15 @@ fn validate_skill_name(name: &str) -> SkillResult<()> {
     Ok(())
 }
 
+fn is_valid_skill_name_segment(segment: &str) -> bool {
+    is_valid_skill_id(&segment.to_ascii_lowercase())
+}
+
 fn matches_skill_name_directory(name: &str, dir_name: &str) -> bool {
-    name == dir_name
+    name.eq_ignore_ascii_case(dir_name)
         || name
             .rsplit_once(':')
-            .is_some_and(|(_, suffix)| suffix == dir_name)
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(dir_name))
 }
 
 fn validate_skill_description(description: &str) -> SkillResult<()> {
@@ -270,8 +287,38 @@ pub(crate) fn is_valid_skill_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     use super::{is_valid_skill_id, parse_markdown_skill};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    struct LevelSubscriber(Arc<Mutex<Vec<Level>>>);
+
+    impl Subscriber for LevelSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event.metadata().level());
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
 
     #[test]
     fn valid_skill_ids() {
@@ -311,6 +358,34 @@ Use this skill when users want to create skills.
     }
 
     #[test]
+    fn repeated_static_warning_for_same_key_and_error_downgrades_to_debug() {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = LevelSubscriber(levels.clone());
+        let content = r#"---
+name: issue-741-warn-dedup
+description: Exercises static warning de-duplication.
+allowed-tools:
+  - default::search
+---
+Test body.
+"#;
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                parse_markdown_skill(Path::new("issue-741-warn-dedup/SKILL.md"), content)
+                    .expect("unknown tool is preserved, not rejected");
+            }
+        });
+
+        assert_eq!(
+            *levels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            [Level::WARN, Level::DEBUG]
+        );
+    }
+
+    #[test]
     fn parse_skill_accepts_namespaced_name_and_argument_hint() {
         let content = r#"---
 name: ckm:design
@@ -325,6 +400,50 @@ Use this skill when users need design support.
         assert_eq!(parsed.id, "design");
         assert_eq!(parsed.name, "ckm:design");
         assert_eq!(parsed.description, "Design workflows.");
+    }
+
+    #[test]
+    fn parse_skill_accepts_mixed_case_name_matching_directory() {
+        let content = r#"---
+name: Surge
+description: Runs deployment workflows.
+---
+Deploy the application safely.
+"#;
+
+        let parsed = parse_markdown_skill(Path::new("surge/SKILL.md"), content)
+            .expect("mixed-case display name should match its directory");
+        assert_eq!(parsed.id, "surge");
+        assert_eq!(parsed.name, "Surge");
+    }
+
+    #[test]
+    fn parse_skill_accepts_mixed_case_namespaced_name() {
+        let content = r#"---
+name: OpenAI:Documents
+description: Creates and edits documents.
+---
+Use this skill for document work.
+"#;
+
+        let parsed = parse_markdown_skill(Path::new("documents/SKILL.md"), content)
+            .expect("mixed-case namespaced display name should parse");
+        assert_eq!(parsed.id, "documents");
+        assert_eq!(parsed.name, "OpenAI:Documents");
+    }
+
+    #[test]
+    fn parse_skill_rejects_malformed_mixed_case_name() {
+        let content = r#"---
+name: Skill_Creator
+description: Helps create and improve skills.
+---
+Use this skill when users want to create skills.
+"#;
+
+        let error = parse_markdown_skill(Path::new("skill-creator/SKILL.md"), content)
+            .expect_err("mixed case must not make malformed names valid");
+        assert!(error.to_string().contains("ASCII letters and digits"));
     }
 
     #[test]

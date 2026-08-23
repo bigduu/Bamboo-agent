@@ -80,7 +80,7 @@
 //! async tasks concurrently. SQLite connections are opened per-operation
 //! to avoid blocking the async runtime.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -91,8 +91,8 @@ use thiserror::Error;
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics, SessionMetricsFilter,
-    SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
+    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
 };
 
 /// Result type for metrics storage operations.
@@ -543,10 +543,49 @@ pub trait MetricsStorage: Send + Sync {
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
 
+    /// Retrieves daily forwarded-request metrics restricted to one model.
+    /// Blank model values have the same meaning as omission.
+    async fn forward_daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(model).is_none() {
+            self.forward_daily_metrics(days, end_date).await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered forward daily metrics are not supported by this storage"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Retrieves daily forwarded-request metrics using the same endpoint/model
+    /// semantics as the other forward metrics queries.
+    async fn forward_daily_metrics_filtered(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        endpoint: Option<String>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(endpoint).is_some() {
+            return Err(MetricsError::InvalidData(
+                "endpoint-filtered forward daily metrics are not supported by this storage"
+                    .to_string(),
+            ));
+        }
+        self.forward_daily_metrics_for_model(days, end_date, model)
+            .await
+    }
+
     /// Retrieves aggregated summary statistics for chat sessions.
     ///
-    /// Returns total sessions, token usage, tool call counts, and
-    /// active session count for sessions matching the filter.
+    /// Session/status counts are filtered by session start. Token/cache/
+    /// compression usage is filtered by each round's start, and tool counts by
+    /// each tool call's start. This intentionally keeps session lifecycle
+    /// dimensions separate from usage occurrence dimensions.
     ///
     /// # Arguments
     ///
@@ -568,10 +607,39 @@ pub trait MetricsStorage: Send + Sync {
     /// ```
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary>;
 
+    /// Retrieves aggregate chat metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.summary(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered summary metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
+
     /// Retrieves metrics grouped by AI model.
     ///
-    /// Returns per-model statistics including session counts,
-    /// rounds, token usage, and tool calls.
+    /// Session counts use the session row's model and start date. Rounds and
+    /// token/cache usage use each round's own model and start date; tool calls
+    /// use their own start date and the model of their owning round. Models
+    /// present in only one side are retained.
     ///
     /// # Arguments
     ///
@@ -590,6 +658,33 @@ pub trait MetricsStorage: Send + Sync {
     /// }
     /// ```
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>>;
+
+    /// Retrieves grouped model metrics with an optional model restriction.
+    ///
+    /// The default preserves compatibility for existing storage
+    /// implementations when no model is selected. Implementations that support
+    /// model filtering should override this method.
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        if normalize_filter_value(model).is_none() {
+            self.by_model(MetricsDateFilter {
+                start_date,
+                end_date,
+            })
+            .await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered grouped metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Retrieves session metrics with filtering and pagination.
     ///
@@ -660,8 +755,10 @@ pub trait MetricsStorage: Send + Sync {
 
     /// Retrieves daily aggregated metrics for chat sessions.
     ///
-    /// Returns per-day statistics including session counts, token usage,
-    /// model breakdown, and tool breakdown for trend analysis.
+    /// Session counts are attributed to the session start date. Round usage and
+    /// model breakdown are attributed to each round's start date, including
+    /// still-running rounds; tool totals/breakdown use each tool call's start
+    /// date. A day with later activity can therefore have zero new sessions.
     ///
     /// # Arguments
     ///
@@ -690,6 +787,24 @@ pub trait MetricsStorage: Send + Sync {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>>;
+
+    /// Retrieves daily chat metrics restricted to one model. Session/status
+    /// dimensions use the session model, while round/cache/token dimensions
+    /// and tool calls use the owning round model. Blank values mean all models.
+    async fn daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        if normalize_filter_value(model).is_none() {
+            self.daily_metrics(days, end_date).await
+        } else {
+            Err(MetricsError::InvalidData(
+                "model-filtered daily metrics are not supported by this storage".to_string(),
+            ))
+        }
+    }
 
     /// Deletes old round records before a cutoff date.
     ///
@@ -922,6 +1037,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 CREATE INDEX IF NOT EXISTS idx_session_started_at ON session_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_session_model ON session_metrics(model);
                 CREATE INDEX IF NOT EXISTS idx_round_session ON round_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name);
@@ -1065,12 +1181,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         let completed_at_str = format_timestamp(completed_at);
 
         self.with_connection(move |connection| {
-            refresh_session_aggregates(connection, &session_id, completed_at)?;
-            connection.execute(
-                "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
-                params![status.as_str(), completed_at_str, session_id],
-            )?;
-            Ok(())
+            with_immediate_transaction(connection, || {
+                refresh_session_aggregates(connection, &session_id, completed_at)?;
+                connection.execute(
+                    "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
+                    params![status.as_str(), completed_at_str, session_id],
+                )?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1088,17 +1206,19 @@ impl MetricsStorage for SqliteMetricsStorage {
         let started_at_str = format_timestamp(started_at);
 
         self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO round_metrics (
-                    round_id, session_id, model, started_at, status
-                ) VALUES (?1, ?2, ?3, ?4, 'running')
-                ON CONFLICT(round_id) DO NOTHING
-                "#,
-                params![round_id, session_id, model, started_at_str],
-            )?;
-            refresh_session_aggregates(connection, &session_id, started_at)?;
-            Ok(())
+            with_immediate_transaction(connection, || {
+                connection.execute(
+                    r#"
+                    INSERT INTO round_metrics (
+                        round_id, session_id, model, started_at, status
+                    ) VALUES (?1, ?2, ?3, ?4, 'running')
+                    ON CONFLICT(round_id) DO NOTHING
+                    "#,
+                    params![round_id, session_id, model, started_at_str],
+                )?;
+                refresh_session_aggregates(connection, &session_id, started_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1115,44 +1235,62 @@ impl MetricsStorage for SqliteMetricsStorage {
     ) -> MetricsResult<()> {
         let round_id = round_id.to_string();
         let completed_at_str = format_timestamp(completed_at);
+        // SQLite INTEGER is signed 64-bit. Normalize before conversion so
+        // extreme provider values saturate instead of wrapping negative.
+        let usage = usage.clamped_for_durable_metrics();
+        let prompt_tokens = durable_token_to_i64(usage.prompt_tokens);
+        let completion_tokens = durable_token_to_i64(usage.completion_tokens);
+        let total_tokens = durable_token_to_i64(usage.total_tokens);
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                params![round_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                #[cfg(test)]
+                signal_complete_round_transaction_entered(&round_id);
 
-            connection.execute(
-                r#"
-                UPDATE round_metrics
-                SET completed_at = ?1,
-                    status = ?2,
-                    prompt_tokens = ?3,
-                    completion_tokens = ?4,
-                    total_tokens = ?5,
-                    prompt_cached_tool_outputs = ?6,
-                    prompt_cached_tool_tokens_saved = COALESCE(prompt_cached_tool_tokens_saved, 0) + ?7,
-                    tokens_saved = COALESCE(tokens_saved, 0) + ?8,
-                    error = ?9
-                WHERE round_id = ?10
-                "#,
-                params![
-                    completed_at_str,
-                    status.as_str(),
-                    usage.prompt_tokens as i64,
-                    usage.completion_tokens as i64,
-                    usage.total_tokens as i64,
-                    i64::from(prompt_cached_tool_outputs),
-                    i64::from(prompt_cached_tool_tokens_saved),
-                    i64::from(prompt_cached_tool_tokens_saved),
-                    error,
-                    round_id,
-                ],
-            )?;
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                    params![round_id],
+                    |row| row.get(0),
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, completed_at)?;
-            Ok(())
+                connection.execute(
+                    r#"
+                    UPDATE round_metrics
+                    SET completed_at = ?1,
+                        status = ?2,
+                        prompt_tokens = ?3,
+                        completion_tokens = ?4,
+                        total_tokens = ?5,
+                        prompt_cached_tool_outputs = ?6,
+                        prompt_cached_tool_tokens_saved = ?7,
+                        -- `RoundCompleted` may be replayed. Replace its prompt-
+                        -- cache contribution while preserving tokens recorded by
+                        -- separate compression events, rather than adding the
+                        -- same completion payload again.
+                        tokens_saved = MAX(
+                            COALESCE(tokens_saved, 0) - COALESCE(prompt_cached_tool_tokens_saved, 0),
+                            0
+                        ) + ?8,
+                        error = ?9
+                    WHERE round_id = ?10
+                    "#,
+                    params![
+                        completed_at_str,
+                        status.as_str(),
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        i64::from(prompt_cached_tool_outputs),
+                        i64::from(prompt_cached_tool_tokens_saved),
+                        i64::from(prompt_cached_tool_tokens_saved),
+                        error,
+                        round_id,
+                    ],
+                )?;
+
+                refresh_session_aggregates(connection, &session_id, completed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1166,24 +1304,26 @@ impl MetricsStorage for SqliteMetricsStorage {
         let round_id = round_id.to_string();
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                params![round_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                    params![round_id],
+                    |row| row.get(0),
+                )?;
 
-            connection.execute(
-                r#"
-                UPDATE round_metrics
-                SET compression_count = COALESCE(compression_count, 0) + 1,
-                    tokens_saved = COALESCE(tokens_saved, 0) + ?1
-                WHERE round_id = ?2
-                "#,
-                params![i64::from(tokens_saved), round_id],
-            )?;
+                connection.execute(
+                    r#"
+                    UPDATE round_metrics
+                    SET compression_count = COALESCE(compression_count, 0) + 1,
+                        tokens_saved = COALESCE(tokens_saved, 0) + ?1
+                    WHERE round_id = ?2
+                    "#,
+                    params![i64::from(tokens_saved), round_id],
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, compressed_at)?;
-            Ok(())
+                refresh_session_aggregates(connection, &session_id, compressed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1238,19 +1378,21 @@ impl MetricsStorage for SqliteMetricsStorage {
         let error = completion.error;
 
         self.with_connection(move |connection| {
-            let session_id: String = connection.query_row(
-                "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
-                params![tool_call_id],
-                |row| row.get(0),
-            )?;
+            with_immediate_transaction(connection, || {
+                let session_id: String = connection.query_row(
+                    "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
+                    params![tool_call_id],
+                    |row| row.get(0),
+                )?;
 
-            connection.execute(
-                "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
-                params![completed_at, success, error, tool_call_id],
-            )?;
+                connection.execute(
+                    "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
+                    params![completed_at, success, error, tool_call_id],
+                )?;
 
-            refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
-            Ok(())
+                refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1596,12 +1738,43 @@ impl MetricsStorage for SqliteMetricsStorage {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.forward_daily_metrics_filtered(days, end_date, None, None)
+            .await
+    }
+
+    async fn forward_daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.forward_daily_metrics_filtered(days, end_date, None, model)
+            .await
+    }
+
+    async fn forward_daily_metrics_filtered(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        endpoint: Option<String>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
         let end_date = end_date.unwrap_or_else(|| Utc::now().date_naive());
         let span = days.max(1) - 1;
         let start_date = end_date - chrono::Duration::days(i64::from(span));
+        let endpoint = normalize_filter_value(endpoint);
+        let model = normalize_filter_value(model);
 
         self.with_connection(move |connection| {
-            let mut stmt = connection.prepare(
+            let mut params_vec = Vec::new();
+            let where_clause = build_forward_where_clause(
+                Some(start_date),
+                Some(end_date),
+                endpoint.as_deref(),
+                model.as_deref(),
+                &mut params_vec,
+            );
+            let sql = format!(
                 r#"
                 SELECT
                     date(started_at) AS date_key,
@@ -1610,13 +1783,15 @@ impl MetricsStorage for SqliteMetricsStorage {
                     COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                     COALESCE(SUM(total_tokens), 0) AS total_tokens
                 FROM forward_request_metrics
-                WHERE started_at >= ?1 AND started_at < ?2
+                {}
                 GROUP BY date_key
                 ORDER BY date_key ASC
                 "#,
-            )?;
+                where_clause
+            );
+            let mut stmt = connection.prepare(&sql)?;
 
-            let mut rows = stmt.query(params![start_date.to_string(), next_day_bound(end_date)])?;
+            let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
             let mut result = Vec::new();
 
             while let Some(row) = rows.next()? {
@@ -1644,123 +1819,277 @@ impl MetricsStorage for SqliteMetricsStorage {
     }
 
     async fn summary(&self, filter: MetricsDateFilter) -> MetricsResult<MetricsSummary> {
+        self.summary_filtered(filter.into()).await
+    }
+
+    async fn summary_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<MetricsSummary> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        let model = normalize_filter_value(model);
         self.with_connection(move |connection| {
-            let mut params_vec = Vec::new();
-            let where_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
+            // Lifecycle dimensions belong to the session start date. Do not
+            // infer status/counts from rounds: a session may have no rounds, or
+            // may continue producing rounds on later days.
+            let mut session_params = Vec::new();
+            let session_clause = build_session_model_where_clause(
+                start_date,
+                end_date,
                 None,
-                &mut params_vec,
+                model.as_deref(),
+                &mut session_params,
             );
-
-            let summary_sql = format!(
-                "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0), COALESCE(SUM(prompt_cached_tool_tokens_saved), 0), COALESCE(SUM(total_compression_events), 0), COALESCE(SUM(total_tokens_saved), 0), COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'awaiting_response' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) FROM session_metrics {}",
-                where_clause
+            let session_sql = format!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'awaiting_response' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) FROM session_metrics {}",
+                session_clause
             );
-
-            let mut stmt = connection.prepare(&summary_sql)?;
-            let mut summary = stmt.query_row(params_from_iter(params_vec.iter()), |row| {
-                Ok(MetricsSummary {
-                    total_sessions: row.get::<_, i64>(0)? as u64,
-                    total_tokens: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(1)? as u64,
-                        completion_tokens: row.get::<_, i64>(2)? as u64,
-                        total_tokens: row.get::<_, i64>(3)? as u64,
-                    },
-                    total_tool_calls: row.get::<_, i64>(4)? as u64,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
-                    tool_context_tokens_saved: row.get::<_, i64>(6)? as u64,
-                    total_compression_events: row.get::<_, i64>(7)? as u64,
-                    total_tokens_saved: row.get::<_, i64>(8)? as u64,
-                    non_tool_compression_tokens_saved: (row.get::<_, i64>(8)? - row.get::<_, i64>(6)?).max(0) as u64,
-                    completed_sessions: row.get::<_, i64>(9)? as u64,
-                    awaiting_response_sessions: row.get::<_, i64>(10)? as u64,
-                    error_sessions: row.get::<_, i64>(11)? as u64,
-                    cancelled_sessions: row.get::<_, i64>(12)? as u64,
-                    total_sync_mismatches: 0,
-                    sync_mismatch_breakdown: HashMap::new(),
-                    active_sessions: 0,
-                })
-            })?;
-
-            let mut mismatch_params = Vec::new();
-            let mismatch_clause = build_execute_sync_mismatch_where_clause(
-                filter.start_date,
-                filter.end_date,
-                None,
-                &mut mismatch_params,
-            );
-            let mismatch_sql = format!(
-                "SELECT COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {}",
-                mismatch_clause
-            );
-            let mut mismatch_stmt = connection.prepare(&mismatch_sql)?;
-            summary.total_sync_mismatches = mismatch_stmt
-                .query_row(params_from_iter(mismatch_params.iter()), |row| row.get::<_, i64>(0))?
-                as u64;
-            summary.sync_mismatch_breakdown = load_execute_sync_mismatch_breakdown(
-                connection,
-                filter.start_date,
-                filter.end_date,
+            let session_stats = connection.query_row(
+                &session_sql,
+                params_from_iter(session_params.iter()),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
             )?;
-            let mut active_params = Vec::new();
-            let active_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
-                Some("running"),
-                &mut active_params,
-            );
-            let active_sql = format!(
-                "SELECT COUNT(*) FROM session_metrics {}",
-                active_clause
-            );
-            let mut active_stmt = connection.prepare(&active_sql)?;
-            let active_sessions = active_stmt.query_row(params_from_iter(active_params.iter()), |row| {
-                row.get::<_, i64>(0)
-            })? as u64;
 
-            Ok(MetricsSummary {
-                active_sessions,
-                ..summary
-            })
+            // Usage dimensions belong to the round occurrence. `started_at`
+            // is non-null for both running and completed rows and records when
+            // the billed model turn began; nullable `completed_at` is therefore
+            // intentionally not used as the attribution key.
+            let mut round_params = Vec::new();
+            let round_clause = build_started_at_model_where_clause(
+                "started_at",
+                "model",
+                start_date,
+                end_date,
+                model.as_deref(),
+                &mut round_params,
+            );
+            let round_sql = format!(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0), COALESCE(SUM(prompt_cached_tool_tokens_saved), 0), COALESCE(SUM(compression_count), 0), COALESCE(SUM(tokens_saved), 0) FROM round_metrics {}",
+                round_clause
+            );
+            let round_stats = connection.query_row(
+                &round_sql,
+                params_from_iter(round_params.iter()),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?;
+
+            let mut tool_params = Vec::new();
+            let tool_clause = if model.is_some() {
+                build_started_at_model_where_clause(
+                    "tool_call_metrics.started_at",
+                    "round_metrics.model",
+                    start_date,
+                    end_date,
+                    model.as_deref(),
+                    &mut tool_params,
+                )
+            } else {
+                build_started_at_where_clause(
+                    "started_at",
+                    start_date,
+                    end_date,
+                    &mut tool_params,
+                )
+            };
+            let tool_sql = if model.is_some() {
+                format!(
+                    "SELECT COUNT(*) FROM tool_call_metrics JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id {}",
+                    tool_clause
+                )
+            } else {
+                format!("SELECT COUNT(*) FROM tool_call_metrics {}", tool_clause)
+            };
+            let total_tool_calls = connection.query_row(
+                &tool_sql,
+                params_from_iter(tool_params.iter()),
+                |row| row.get::<_, i64>(0),
+            )?;
+
+            let mut summary = MetricsSummary {
+                total_sessions: session_stats.0 as u64,
+                total_tokens: TokenUsage {
+                    prompt_tokens: round_stats.0 as u64,
+                    completion_tokens: round_stats.1 as u64,
+                    total_tokens: round_stats.2 as u64,
+                },
+                total_tool_calls: total_tool_calls as u64,
+                active_sessions: session_stats.5 as u64,
+                prompt_cached_tool_outputs: round_stats.3 as u64,
+                tool_context_tokens_saved: round_stats.4 as u64,
+                total_compression_events: round_stats.5 as u64,
+                total_tokens_saved: round_stats.6 as u64,
+                non_tool_compression_tokens_saved: (round_stats.6 - round_stats.4).max(0) as u64,
+                completed_sessions: session_stats.1 as u64,
+                awaiting_response_sessions: session_stats.2 as u64,
+                error_sessions: session_stats.3 as u64,
+                cancelled_sessions: session_stats.4 as u64,
+                total_sync_mismatches: 0,
+                sync_mismatch_breakdown: HashMap::new(),
+            };
+
+            // Sync-mismatch rows currently have no model column or stable
+            // session/round key. Returning their all-model total in a filtered
+            // summary would mix populations, so filtered summaries explicitly
+            // leave this non-attributable dimension at zero.
+            if model.is_none() {
+                let mut mismatch_params = Vec::new();
+                let mismatch_clause = build_execute_sync_mismatch_where_clause(
+                    start_date,
+                    end_date,
+                    None,
+                    &mut mismatch_params,
+                );
+                let mismatch_sql = format!(
+                    "SELECT COALESCE(SUM(count), 0) FROM execute_sync_mismatch_metrics {}",
+                    mismatch_clause
+                );
+                let mut mismatch_stmt = connection.prepare(&mismatch_sql)?;
+                summary.total_sync_mismatches = mismatch_stmt
+                    .query_row(params_from_iter(mismatch_params.iter()), |row| {
+                        row.get::<_, i64>(0)
+                    })? as u64;
+                summary.sync_mismatch_breakdown =
+                    load_execute_sync_mismatch_breakdown(connection, start_date, end_date)?;
+            }
+
+            Ok(summary)
         })
         .await
     }
 
     async fn by_model(&self, filter: MetricsDateFilter) -> MetricsResult<Vec<ModelMetrics>> {
+        self.by_model_filtered(filter.into()).await
+    }
+
+    async fn by_model_filtered(
+        &self,
+        filter: ModelMetricsDateFilter,
+    ) -> MetricsResult<Vec<ModelMetrics>> {
+        let ModelMetricsDateFilter {
+            start_date,
+            end_date,
+            model,
+        } = filter;
+        let model = normalize_filter_value(model);
         self.with_connection(move |connection| {
-            let mut params_vec = Vec::new();
-            let where_clause = build_session_where_clause(
-                filter.start_date,
-                filter.end_date,
+            let mut models: HashMap<String, ModelMetrics> = HashMap::new();
+
+            // Session counts retain the session row's model/start semantics.
+            let mut session_params = Vec::new();
+            let session_clause = build_session_model_where_clause(
+                start_date,
+                end_date,
                 None,
-                &mut params_vec,
+                model.as_deref(),
+                &mut session_params,
             );
-
-            let sql = format!(
-                "SELECT model, COUNT(*), COALESCE(SUM(total_rounds), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(tool_call_count), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM session_metrics {} GROUP BY model ORDER BY SUM(total_tokens) DESC",
-                where_clause
+            let session_sql = format!(
+                "SELECT model, COUNT(*) FROM session_metrics {} GROUP BY model",
+                session_clause
             );
-
-            let mut stmt = connection.prepare(&sql)?;
-            let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
-            let mut models = Vec::new();
-
-            while let Some(row) = rows.next()? {
-                models.push(ModelMetrics {
-                    model: row.get(0)?,
-                    sessions: row.get::<_, i64>(1)? as u64,
-                    rounds: row.get::<_, i64>(2)? as u64,
-                    tokens: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(3)? as u64,
-                        completion_tokens: row.get::<_, i64>(4)? as u64,
-                        total_tokens: row.get::<_, i64>(5)? as u64,
-                    },
-                    tool_calls: row.get::<_, i64>(6)? as u64,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
-                });
+            {
+                let mut stmt = connection.prepare(&session_sql)?;
+                let mut rows = stmt.query(params_from_iter(session_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model))
+                        .sessions = row.get::<_, i64>(1)? as u64;
+                }
             }
 
+            // Round count, token usage and cache values follow each round's own
+            // model and occurrence date, not the session's current model.
+            let mut round_params = Vec::new();
+            let round_clause = build_started_at_model_where_clause(
+                "started_at",
+                "model",
+                start_date,
+                end_date,
+                model.as_deref(),
+                &mut round_params,
+            );
+            let round_sql = format!(
+                "SELECT model, COUNT(*), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_cached_tool_outputs), 0) FROM round_metrics {} GROUP BY model",
+                round_clause
+            );
+            {
+                let mut stmt = connection.prepare(&round_sql)?;
+                let mut rows = stmt.query(params_from_iter(round_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    let entry = models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model));
+                    entry.rounds = row.get::<_, i64>(1)? as u64;
+                    entry.tokens = TokenUsage {
+                        prompt_tokens: row.get::<_, i64>(2)? as u64,
+                        completion_tokens: row.get::<_, i64>(3)? as u64,
+                        total_tokens: row.get::<_, i64>(4)? as u64,
+                    };
+                    entry.prompt_cached_tool_outputs = row.get::<_, i64>(5)? as u64;
+                }
+            }
+
+            // A tool call has no model column, so attribute it through its
+            // owning round while retaining the tool call's own occurrence date.
+            let mut tool_params = Vec::new();
+            let tool_clause = build_started_at_model_where_clause(
+                "tool_call_metrics.started_at",
+                "round_metrics.model",
+                start_date,
+                end_date,
+                model.as_deref(),
+                &mut tool_params,
+            );
+            let tool_sql = format!(
+                "SELECT round_metrics.model, COUNT(*) FROM tool_call_metrics JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id {} GROUP BY round_metrics.model",
+                tool_clause
+            );
+            {
+                let mut stmt = connection.prepare(&tool_sql)?;
+                let mut rows = stmt.query(params_from_iter(tool_params.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let model = row.get::<_, String>(0)?;
+                    models
+                        .entry(model.clone())
+                        .or_insert_with(|| empty_model_metrics(model))
+                        .tool_calls = row.get::<_, i64>(1)? as u64;
+                }
+            }
+
+            let mut models = models.into_values().collect::<Vec<_>>();
+            models.sort_by(|left, right| {
+                right
+                    .tokens
+                    .total_tokens
+                    .cmp(&left.tokens.total_tokens)
+                    .then_with(|| left.model.cmp(&right.model))
+            });
             Ok(models)
         })
         .await
@@ -1768,6 +2097,7 @@ impl MetricsStorage for SqliteMetricsStorage {
 
     async fn sessions(&self, filter: SessionMetricsFilter) -> MetricsResult<Vec<SessionMetrics>> {
         self.with_connection(move |connection| {
+            let model = normalize_filter_value(filter.model);
             let mut params_vec = Vec::new();
             let where_clause = build_session_where_clause(
                 filter.start_date,
@@ -1780,7 +2110,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             } else {
                 vec![where_clause.replacen("WHERE ", "", 1)]
             };
-            if let Some(model) = filter.model {
+            if let Some(model) = model {
                 conditions.push("model = ?".to_string());
                 params_vec.push(model);
             }
@@ -1951,59 +2281,66 @@ impl MetricsStorage for SqliteMetricsStorage {
         days: u32,
         end_date: Option<NaiveDate>,
     ) -> MetricsResult<Vec<DailyMetrics>> {
+        self.daily_metrics_for_model(days, end_date, None).await
+    }
+
+    async fn daily_metrics_for_model(
+        &self,
+        days: u32,
+        end_date: Option<NaiveDate>,
+        model: Option<String>,
+    ) -> MetricsResult<Vec<DailyMetrics>> {
         let end_date = end_date.unwrap_or_else(|| Utc::now().date_naive());
         let span = days.max(1) - 1;
         let start_date = end_date - chrono::Duration::days(i64::from(span));
+        let model = normalize_filter_value(model);
 
         self.with_connection(move |connection| {
             let start_bound = start_date.to_string();
             let end_bound = next_day_bound(end_date);
 
-            // Load the per-day model/tool breakdowns for the WHOLE range in one
-            // grouped query each, instead of two per result day (was 1 + 2N).
-            // Done before the main statement so their borrows of `connection`
-            // don't overlap the main `rows` iterator.
-            let mut model_by_day =
-                load_model_breakdown_by_day(connection, &start_bound, &end_bound)?;
-            let mut tool_by_day = load_tool_breakdown_by_day(connection, &start_bound, &end_bound)?;
-
-            let mut stmt = connection.prepare(
-                r#"
-                SELECT
-                    date(started_at) AS date_key,
-                    COUNT(*) AS total_sessions,
-                    COALESCE(SUM(total_rounds), 0) AS total_rounds,
-                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
-                    COALESCE(SUM(tool_call_count), 0) AS total_tool_calls,
-                    COALESCE(SUM(prompt_cached_tool_outputs), 0) AS prompt_cached_tool_outputs
-                FROM session_metrics
-                WHERE started_at >= ?1 AND started_at < ?2
-                GROUP BY date_key
-                ORDER BY date_key ASC
-                "#,
+            let mut sessions_by_day =
+                load_session_counts_by_day(connection, &start_bound, &end_bound, model.as_deref())?;
+            let mut rounds_by_day = load_round_aggregates_by_day(
+                connection,
+                &start_bound,
+                &end_bound,
+                model.as_deref(),
             )?;
+            let mut model_by_day = load_model_breakdown_by_day(
+                connection,
+                &start_bound,
+                &end_bound,
+                model.as_deref(),
+            )?;
+            let mut tool_by_day =
+                load_tool_breakdown_by_day(connection, &start_bound, &end_bound, model.as_deref())?;
 
-            let mut rows = stmt.query(params![start_bound, end_bound])?;
-            let mut result = Vec::new();
+            // A continuation day may have rounds or tools but no new session.
+            // Build the output keyset from all three occurrence dimensions so
+            // those later-day rows are never dropped by a session-only driver.
+            let mut dates = BTreeSet::new();
+            dates.extend(sessions_by_day.keys().copied());
+            dates.extend(rounds_by_day.keys().copied());
+            dates.extend(tool_by_day.keys().copied());
 
-            while let Some(row) = rows.next()? {
-                let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+            let mut result = Vec::with_capacity(dates.len());
+            for date in dates {
+                let round = rounds_by_day.remove(&date).unwrap_or_default();
                 let model_breakdown = model_by_day.remove(&date).unwrap_or_default();
                 let tool_breakdown = tool_by_day.remove(&date).unwrap_or_default();
+                let total_tool_calls = tool_breakdown
+                    .values()
+                    .copied()
+                    .fold(0u32, u32::saturating_add);
 
                 result.push(DailyMetrics {
                     date,
-                    total_sessions: row.get::<_, i64>(1)? as u32,
-                    total_rounds: row.get::<_, i64>(2)? as u32,
-                    total_token_usage: TokenUsage {
-                        prompt_tokens: row.get::<_, i64>(3)? as u64,
-                        completion_tokens: row.get::<_, i64>(4)? as u64,
-                        total_tokens: row.get::<_, i64>(5)? as u64,
-                    },
-                    total_tool_calls: row.get::<_, i64>(6)? as u32,
-                    prompt_cached_tool_outputs: row.get::<_, i64>(7)? as u64,
+                    total_sessions: sessions_by_day.remove(&date).unwrap_or(0),
+                    total_rounds: round.total_rounds,
+                    total_token_usage: round.token_usage,
+                    total_tool_calls,
+                    prompt_cached_tool_outputs: round.prompt_cached_tool_outputs,
                     model_breakdown,
                     tool_breakdown,
                 });
@@ -2023,8 +2360,7 @@ impl MetricsStorage for SqliteMetricsStorage {
             // SELECT and the DELETE (backfill/replay/clock skew) would be deleted
             // yet miss re-aggregation, leaving session_metrics overcounting. Wrap
             // the whole select→delete→refresh in a single IMMEDIATE transaction.
-            connection.execute_batch("BEGIN IMMEDIATE")?;
-            let outcome = (|| -> MetricsResult<u64> {
+            with_immediate_transaction(connection, || {
                 // Only sessions that actually lose rounds need re-aggregation
                 // (was nine correlated subqueries × ALL sessions per pass).
                 let affected_sessions: Vec<String> = {
@@ -2047,18 +2383,7 @@ impl MetricsStorage for SqliteMetricsStorage {
                 }
 
                 Ok(deleted as u64)
-            })();
-
-            match outcome {
-                Ok(deleted) => {
-                    connection.execute_batch("COMMIT")?;
-                    Ok(deleted)
-                }
-                Err(error) => {
-                    let _ = connection.execute_batch("ROLLBACK");
-                    Err(error)
-                }
-            }
+            })
         })
         .await
     }
@@ -2072,47 +2397,52 @@ impl MetricsStorage for SqliteMetricsStorage {
         let awaiting_response_session_ids = awaiting_response_session_ids.to_vec();
 
         self.with_connection(move |connection| {
-            let reconciled_at = Utc::now();
-            let reconciled_at_str = format_timestamp(reconciled_at);
+            with_immediate_transaction(connection, || {
+                let reconciled_at = Utc::now();
+                let reconciled_at_str = format_timestamp(reconciled_at);
 
-            let mut stmt = connection.prepare(
-                "SELECT session_id FROM session_metrics WHERE status = 'running'",
-            )?;
-            let running_session_ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?;
-
-            for session_id in running_session_ids {
-                if active_session_ids.iter().any(|id| id == &session_id) {
-                    continue;
-                }
-
-                let status = if awaiting_response_session_ids
-                    .iter()
-                    .any(|id| id == &session_id)
-                {
-                    SessionStatus::AwaitingResponse
-                } else {
-                    SessionStatus::Completed
+                let running_session_ids: Vec<String> = {
+                    let mut stmt = connection.prepare(
+                        "SELECT session_id FROM session_metrics WHERE status = 'running'",
+                    )?;
+                    let ids = stmt
+                        .query_map([], |row| row.get(0))?
+                        .collect::<Result<Vec<String>, _>>()?;
+                    ids
                 };
 
+                for session_id in running_session_ids {
+                    if active_session_ids.iter().any(|id| id == &session_id) {
+                        continue;
+                    }
+
+                    let status = if awaiting_response_session_ids
+                        .iter()
+                        .any(|id| id == &session_id)
+                    {
+                        SessionStatus::AwaitingResponse
+                    } else {
+                        SessionStatus::Completed
+                    };
+
+                    connection.execute(
+                        "UPDATE session_metrics SET status = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE session_id = ?3",
+                        params![status.as_str(), reconciled_at_str, session_id],
+                    )?;
+                    refresh_session_aggregates(connection, &session_id, reconciled_at)?;
+                }
+
                 connection.execute(
-                    "UPDATE session_metrics SET status = ?1, completed_at = COALESCE(completed_at, ?2), updated_at = ?2 WHERE session_id = ?3",
-                    params![status.as_str(), reconciled_at_str, session_id],
+                    "UPDATE round_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_round') WHERE status = 'running'",
+                    params![reconciled_at_str],
                 )?;
-                refresh_session_aggregates(connection, &session_id, reconciled_at)?;
-            }
+                connection.execute(
+                    "UPDATE forward_request_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_forward'), updated_at = ?1 WHERE status = 'pending' AND completed_at IS NULL",
+                    params![reconciled_at_str],
+                )?;
 
-            connection.execute(
-                "UPDATE round_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_round') WHERE status = 'running'",
-                params![reconciled_at_str],
-            )?;
-            connection.execute(
-                "UPDATE forward_request_metrics SET status = 'error', completed_at = COALESCE(completed_at, ?1), error = COALESCE(error, 'reconciled_stale_forward'), updated_at = ?1 WHERE status = 'pending' AND completed_at IS NULL",
-                params![reconciled_at_str],
-            )?;
-
-            Ok(())
+                Ok(())
+            })
         })
         .await
     }
@@ -2244,6 +2574,64 @@ fn next_day_bound(end: NaiveDate) -> String {
     end.succ_opt().unwrap_or(end).to_string()
 }
 
+fn normalize_filter_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Builds a half-open UTC date range over an internal `started_at` column.
+///
+/// Round attribution deliberately uses `round_metrics.started_at`: it is the
+/// non-null occurrence timestamp shared by completed and running rows. Tool
+/// attribution likewise uses the tool row's own `started_at`. The column name
+/// is always a static, code-owned SQL identifier, never user input.
+fn build_started_at_where_clause(
+    started_at_column: &'static str,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut conditions = Vec::new();
+
+    if let Some(start) = start_date {
+        conditions.push(format!("{started_at_column} >= ?"));
+        params_vec.push(start.to_string());
+    }
+
+    if let Some(end) = end_date {
+        conditions.push(format!("{started_at_column} < ?"));
+        params_vec.push(next_day_bound(end));
+    }
+
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn build_started_at_model_where_clause(
+    started_at_column: &'static str,
+    model_column: &'static str,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    model: Option<&str>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut where_clause =
+        build_started_at_where_clause(started_at_column, start_date, end_date, params_vec);
+    if let Some(model) = model {
+        if where_clause.is_empty() {
+            where_clause = format!("WHERE {model_column} = ?");
+        } else {
+            where_clause.push_str(&format!(" AND {model_column} = ?"));
+        }
+        params_vec.push(model.to_string());
+    }
+    where_clause
+}
+
 fn build_session_where_clause(
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
@@ -2274,6 +2662,37 @@ fn build_session_where_clause(
         String::new()
     } else {
         format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn build_session_model_where_clause(
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+    required_status: Option<&str>,
+    model: Option<&str>,
+    params_vec: &mut Vec<String>,
+) -> String {
+    let mut where_clause =
+        build_session_where_clause(start_date, end_date, required_status, params_vec);
+    if let Some(model) = model {
+        if where_clause.is_empty() {
+            where_clause = "WHERE model = ?".to_string();
+        } else {
+            where_clause.push_str(" AND model = ?");
+        }
+        params_vec.push(model.to_string());
+    }
+    where_clause
+}
+
+fn empty_model_metrics(model: String) -> ModelMetrics {
+    ModelMetrics {
+        model,
+        sessions: 0,
+        rounds: 0,
+        tokens: TokenUsage::default(),
+        tool_calls: 0,
+        prompt_cached_tool_outputs: 0,
     }
 }
 
@@ -2403,6 +2822,141 @@ fn ensure_nullable_integer_column(
     Ok(())
 }
 
+#[cfg(test)]
+struct SessionTokenFoldPause {
+    session_id: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SESSION_TOKEN_FOLD_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<Option<SessionTokenFoldPause>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_session_token_fold_pause(
+    session_id: &str,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut slot = SESSION_TOKEN_FOLD_PAUSE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("session token fold test hook lock");
+    assert!(slot.is_none(), "session token fold test hook already set");
+    *slot = Some(SessionTokenFoldPause {
+        session_id: session_id.to_string(),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+fn pause_after_session_token_fold(session_id: &str) {
+    let pause = {
+        let mut slot = SESSION_TOKEN_FOLD_PAUSE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("session token fold test hook lock");
+        if slot
+            .as_ref()
+            .is_some_and(|pause| pause.session_id == session_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        let _ = pause.release.recv();
+    }
+}
+
+#[cfg(test)]
+struct CompleteRoundTransactionEnteredHook {
+    round_id: String,
+    entered: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<CompleteRoundTransactionEnteredHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_complete_round_transaction_entered_hook(
+    round_id: &str,
+) -> std::sync::mpsc::Receiver<()> {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let mut slot = COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("complete round transaction test hook lock");
+    assert!(
+        slot.is_none(),
+        "complete round transaction test hook already set"
+    );
+    *slot = Some(CompleteRoundTransactionEnteredHook {
+        round_id: round_id.to_string(),
+        entered: entered_tx,
+    });
+    entered_rx
+}
+
+#[cfg(test)]
+fn signal_complete_round_transaction_entered(round_id: &str) {
+    let hook = {
+        let mut slot = COMPLETE_ROUND_TRANSACTION_ENTERED_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("complete round transaction test hook lock");
+        if slot.as_ref().is_some_and(|hook| hook.round_id == round_id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(hook) = hook {
+        let _ = hook.entered.send(());
+    }
+}
+
+/// Runs a metrics mutation under the SQLite write lock unless the caller
+/// already owns a transaction.
+///
+/// Aggregate refreshes read child rows and then update their cached parent
+/// row. `BEGIN IMMEDIATE` serializes that read-modify-write sequence across
+/// independent connections, while the autocommit check lets larger operations
+/// such as pruning reuse their existing transaction.
+fn with_immediate_transaction<T>(
+    connection: &Connection,
+    operation: impl FnOnce() -> MetricsResult<T>,
+) -> MetricsResult<T> {
+    if !connection.is_autocommit() {
+        return operation();
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    match operation() {
+        Ok(value) => match connection.execute_batch("COMMIT") {
+            Ok(()) => Ok(value),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Refreshes aggregated metrics for a session by recalculating from child entities.
 ///
 /// This function updates the session's aggregate columns by summing values
@@ -2435,26 +2989,83 @@ fn refresh_session_aggregates(
     session_id: &str,
     updated_at: DateTime<Utc>,
 ) -> MetricsResult<()> {
+    with_immediate_transaction(connection, || {
+        refresh_session_aggregates_in_transaction(connection, session_id, updated_at)
+    })
+}
+
+fn refresh_session_aggregates_in_transaction(
+    connection: &Connection,
+    session_id: &str,
+    updated_at: DateTime<Utc>,
+) -> MetricsResult<()> {
+    // Do not use SQLite SUM for token counters: summing otherwise-valid i64
+    // round rows can overflow before an outer MIN/CASE can clamp it. Fold in
+    // Rust with the same signed-64 saturation policy used by the runtime.
+    let token_usage = load_session_token_aggregate(connection, session_id)?;
+    #[cfg(test)]
+    pause_after_session_token_fold(session_id);
     let updated_at = format_timestamp(updated_at);
     connection.execute(
         r#"
         UPDATE session_metrics
         SET
             total_rounds = COALESCE((SELECT COUNT(*) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_tokens = COALESCE((SELECT SUM(prompt_tokens) FROM round_metrics WHERE session_id = ?1), 0),
-            completion_tokens = COALESCE((SELECT SUM(completion_tokens) FROM round_metrics WHERE session_id = ?1), 0),
-            total_tokens = COALESCE((SELECT SUM(total_tokens) FROM round_metrics WHERE session_id = ?1), 0),
+            prompt_tokens = ?2,
+            completion_tokens = ?3,
+            total_tokens = ?4,
             prompt_cached_tool_outputs = COALESCE((SELECT SUM(prompt_cached_tool_outputs) FROM round_metrics WHERE session_id = ?1), 0),
             prompt_cached_tool_tokens_saved = COALESCE((SELECT SUM(prompt_cached_tool_tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
             total_compression_events = COALESCE((SELECT SUM(compression_count) FROM round_metrics WHERE session_id = ?1), 0),
             total_tokens_saved = COALESCE((SELECT SUM(tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
             tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
-            updated_at = ?2
+            updated_at = ?5
         WHERE session_id = ?1
         "#,
-        params![session_id, updated_at],
+        params![
+            session_id,
+            durable_token_to_i64(token_usage.prompt_tokens),
+            durable_token_to_i64(token_usage.completion_tokens),
+            durable_token_to_i64(token_usage.total_tokens),
+            updated_at,
+        ],
     )?;
     Ok(())
+}
+
+fn durable_token_to_i64(value: u64) -> i64 {
+    i64::try_from(value.min(bamboo_domain::MAX_DURABLE_TOKEN_COUNT))
+        .expect("durable token count is clamped to i64::MAX")
+}
+
+fn durable_token_from_i64(column: &str, value: i64) -> MetricsResult<u64> {
+    u64::try_from(value).map_err(|_| {
+        MetricsError::InvalidData(format!(
+            "negative durable token counter in {column}: {value}"
+        ))
+    })
+}
+
+fn load_session_token_aggregate(
+    connection: &Connection,
+    session_id: &str,
+) -> MetricsResult<TokenUsage> {
+    let mut stmt = connection.prepare(
+        "SELECT prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE session_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![session_id])?;
+    let mut aggregate = TokenUsage::default();
+    while let Some(row) = rows.next()? {
+        let prompt = durable_token_from_i64("round_metrics.prompt_tokens", row.get(0)?)?;
+        let completion = durable_token_from_i64("round_metrics.completion_tokens", row.get(1)?)?;
+        let total = durable_token_from_i64("round_metrics.total_tokens", row.get(2)?)?;
+        aggregate.add_assign_durable(TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: total,
+        });
+    }
+    Ok(aggregate)
 }
 
 /// Loads tool call breakdown (tool_name -> count) for a session.
@@ -2596,6 +3207,107 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
     Ok(tools)
 }
 
+#[derive(Debug, Default)]
+struct DailyRoundAggregate {
+    total_rounds: u32,
+    token_usage: TokenUsage,
+    prompt_cached_tool_outputs: u64,
+}
+
+/// Loads new-session counts keyed by the session row's UTC start date.
+fn load_session_counts_by_day(
+    connection: &Connection,
+    start_bound: &str,
+    end_bound: &str,
+    model: Option<&str>,
+) -> MetricsResult<HashMap<NaiveDate, u32>> {
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
+        SELECT date(started_at) AS date_key, COUNT(*)
+        FROM session_metrics
+        WHERE started_at >= ?1 AND started_at < ?2{}
+        GROUP BY date_key
+        "#,
+        model_clause
+    );
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
+    let mut by_day = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day.insert(date, row.get::<_, i64>(1)? as u32);
+    }
+
+    Ok(by_day)
+}
+
+/// Loads round usage keyed by the round row's UTC start date.
+///
+/// `started_at` is present for both completed and running rows. A running row
+/// therefore contributes one round (and its currently persisted, usually-zero
+/// usage) without requiring a nullable completion timestamp.
+fn load_round_aggregates_by_day(
+    connection: &Connection,
+    start_bound: &str,
+    end_bound: &str,
+    model: Option<&str>,
+) -> MetricsResult<HashMap<NaiveDate, DailyRoundAggregate>> {
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        r#"
+        SELECT date(started_at) AS date_key,
+               COUNT(*),
+               COALESCE(SUM(prompt_tokens), 0),
+               COALESCE(SUM(completion_tokens), 0),
+               COALESCE(SUM(total_tokens), 0),
+               COALESCE(SUM(prompt_cached_tool_outputs), 0)
+        FROM round_metrics
+        WHERE started_at >= ?1 AND started_at < ?2{}
+        GROUP BY date_key
+        "#,
+        model_clause
+    );
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
+    let mut by_day = HashMap::new();
+
+    while let Some(row) = rows.next()? {
+        let date = NaiveDate::parse_from_str(&row.get::<_, String>(0)?, "%Y-%m-%d")?;
+        by_day.insert(
+            date,
+            DailyRoundAggregate {
+                total_rounds: row.get::<_, i64>(1)? as u32,
+                token_usage: TokenUsage {
+                    prompt_tokens: row.get::<_, i64>(2)? as u64,
+                    completion_tokens: row.get::<_, i64>(3)? as u64,
+                    total_tokens: row.get::<_, i64>(4)? as u64,
+                },
+                prompt_cached_tool_outputs: row.get::<_, i64>(5)? as u64,
+            },
+        );
+    }
+
+    Ok(by_day)
+}
+
 /// Loads per-model token-usage breakdown for a whole date range in ONE grouped
 /// query (`GROUP BY date_key, model`), returning it keyed by day so callers can
 /// look up each day without a per-day query (avoids the daily-metrics N+1).
@@ -2608,26 +3320,38 @@ fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec
 ///
 /// # Returns
 ///
-/// `date -> (model -> total token usage)` for every day with sessions in range.
+/// `date -> (model -> total token usage)` for every day with rounds in range.
 fn load_model_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, HashMap<String, TokenUsage>>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
         SELECT date(started_at) AS date_key,
                model,
                COALESCE(SUM(prompt_tokens), 0),
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_tokens), 0)
-        FROM session_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        FROM round_metrics
+        WHERE started_at >= ?1 AND started_at < ?2{}
         GROUP BY date_key, model
         "#,
-    )?;
+        model_clause
+    );
 
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day: HashMap<NaiveDate, HashMap<String, TokenUsage>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -2661,17 +3385,30 @@ fn load_tool_breakdown_by_day(
     connection: &Connection,
     start_bound: &str,
     end_bound: &str,
+    model: Option<&str>,
 ) -> MetricsResult<HashMap<NaiveDate, HashMap<String, u32>>> {
-    let mut stmt = connection.prepare(
+    let model_clause = if model.is_some() {
+        " AND round_metrics.model = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
         r#"
-        SELECT date(started_at) AS date_key, tool_name, COUNT(*)
+        SELECT date(tool_call_metrics.started_at) AS date_key, tool_call_metrics.tool_name, COUNT(*)
         FROM tool_call_metrics
-        WHERE started_at >= ?1 AND started_at < ?2
+        JOIN round_metrics ON round_metrics.round_id = tool_call_metrics.round_id
+        WHERE tool_call_metrics.started_at >= ?1 AND tool_call_metrics.started_at < ?2{}
         GROUP BY date_key, tool_name
         "#,
-    )?;
+        model_clause
+    );
 
-    let mut rows = stmt.query(params![start_bound, end_bound])?;
+    let mut params_vec = vec![start_bound.to_string(), end_bound.to_string()];
+    if let Some(model) = model {
+        params_vec.push(model.to_string());
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(params_vec.iter()))?;
     let mut by_day: HashMap<NaiveDate, HashMap<String, u32>> = HashMap::new();
 
     while let Some(row) = rows.next()? {
@@ -2717,8 +3454,8 @@ mod tests {
 
     use super::{MetricsStorage, SqliteMetricsStorage, ToolCallCompletion};
     use crate::metrics::types::{
-        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, RoundStatus,
-        SessionMetricsFilter, SessionStatus, TokenUsage,
+        ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter,
+        ModelMetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
 
     #[test]
@@ -2811,6 +3548,437 @@ mod tests {
         assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
         assert_eq!(detail.rounds.len(), 1);
         assert_eq!(detail.rounds[0].prompt_cached_tool_outputs, 3);
+    }
+
+    #[tokio::test]
+    async fn distinct_rounds_aggregate_and_same_event_replay_is_idempotent() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let session_id = "resumed-session";
+        let first_started = Utc
+            .with_ymd_and_hms(2026, 8, 8, 10, 0, 0)
+            .single()
+            .expect("valid first timestamp");
+        let first_completed = first_started + chrono::Duration::seconds(2);
+        let second_started = first_started + chrono::Duration::minutes(1);
+        let second_completed = second_started + chrono::Duration::seconds(3);
+        let first_round = "resumed-session-run-exec-a-round-1";
+        let second_round = "resumed-session-run-exec-b-round-1";
+
+        storage
+            .upsert_session_start(session_id, "model-a", first_started)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start(first_round, session_id, "model-a", first_started)
+            .await
+            .expect("first round start");
+        storage
+            .insert_tool_start("tool-first", first_round, session_id, "Read", first_started)
+            .await
+            .expect("first tool start");
+        storage
+            .complete_tool_call(
+                "tool-first",
+                ToolCallCompletion {
+                    completed_at: first_completed,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("first tool completion");
+        storage
+            .record_round_compression(first_round, first_completed, 5)
+            .await
+            .expect("compression");
+
+        let first_usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        };
+        storage
+            .complete_round(
+                first_round,
+                first_completed,
+                RoundStatus::Error,
+                first_usage,
+                1,
+                7,
+                Some("first failure".to_string()),
+            )
+            .await
+            .expect("first completion");
+
+        // Replay the exact same metrics events. Starts must remain insert-only,
+        // completion values must remain replacements (not additive), and the
+        // tool must stay linked to this same logical round.
+        storage
+            .insert_round_start(first_round, session_id, "model-a", first_started)
+            .await
+            .expect("replayed round start");
+        storage
+            .insert_tool_start("tool-first", first_round, session_id, "Read", first_started)
+            .await
+            .expect("replayed tool start");
+        storage
+            .complete_tool_call(
+                "tool-first",
+                ToolCallCompletion {
+                    completed_at: first_completed,
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("replayed tool completion");
+        storage
+            .complete_round(
+                first_round,
+                first_completed,
+                RoundStatus::Error,
+                first_usage,
+                1,
+                7,
+                Some("first failure".to_string()),
+            )
+            .await
+            .expect("replayed round completion");
+
+        let second_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 3,
+            total_tokens: 23,
+        };
+        storage
+            .insert_round_start(second_round, session_id, "model-b", second_started)
+            .await
+            .expect("second round start");
+        storage
+            .complete_round(
+                second_round,
+                second_completed,
+                RoundStatus::Success,
+                second_usage,
+                2,
+                11,
+                None,
+            )
+            .await
+            .expect("second completion");
+
+        let detail = storage
+            .session_detail(session_id)
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        assert_eq!(detail.rounds.len(), 2);
+        assert_eq!(detail.session.total_rounds, 2);
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: 30,
+                completion_tokens: 5,
+                total_tokens: 35,
+            }
+        );
+        assert_eq!(detail.session.prompt_cached_tool_outputs, 3);
+        assert_eq!(detail.session.prompt_cached_tool_tokens_saved, 18);
+        assert_eq!(detail.session.total_tokens_saved, 23);
+        assert_eq!(detail.session.tool_call_count, 1);
+
+        let first = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == first_round)
+            .expect("first round remains present");
+        assert_eq!(first.status, RoundStatus::Error);
+        assert_eq!(first.token_usage, first_usage);
+        assert_eq!(first.error.as_deref(), Some("first failure"));
+        assert_eq!(first.prompt_cached_tool_tokens_saved, 7);
+        assert_eq!(first.compression_count, 1);
+        assert_eq!(first.tokens_saved, 12);
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].tool_call_id, "tool-first");
+
+        let second = detail
+            .rounds
+            .iter()
+            .find(|round| round.round_id == second_round)
+            .expect("second round remains present");
+        assert_eq!(second.status, RoundStatus::Success);
+        assert_eq!(second.token_usage, second_usage);
+        assert!(second.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_round_write_and_session_sum_saturate_at_signed_storage_boundary() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage
+            .upsert_session_start("overflow-session", "model", now)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start("overflow-r1", "overflow-session", "model", now)
+            .await
+            .expect("round 1 start");
+        storage
+            .complete_round(
+                "overflow-r1",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: u64::MAX,
+                    completion_tokens: 3,
+                    total_tokens: 1,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("round 1 clamps instead of wrapping");
+        storage
+            .insert_round_start("overflow-r2", "overflow-session", "model", now)
+            .await
+            .expect("round 2 start");
+        storage
+            .complete_round(
+                "overflow-r2",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 7,
+                    completion_tokens: 11,
+                    total_tokens: 18,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("session aggregate saturates instead of SQL SUM overflow");
+
+        let detail = storage
+            .session_detail("overflow-session")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        let max = bamboo_domain::MAX_DURABLE_TOKEN_COUNT;
+        assert_eq!(detail.rounds.len(), 2);
+        assert_eq!(
+            detail.rounds[0].token_usage,
+            TokenUsage {
+                prompt_tokens: max,
+                completion_tokens: 3,
+                total_tokens: max,
+            },
+            "u64 values clamp before the checked SQLite conversion"
+        );
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: max,
+                completion_tokens: 14,
+                total_tokens: max,
+            },
+            "multi-row aggregation uses the same saturation policy without SQLite SUM overflow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_round_completions_serialize_fold_and_session_update() {
+        let dir = tempdir().expect("temp dir");
+        let database_path = dir.path().join("metrics.db");
+        let storage_a = SqliteMetricsStorage::new(&database_path);
+        let storage_b = SqliteMetricsStorage::new(&database_path);
+        storage_a.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage_a
+            .upsert_session_start("concurrent-session", "model", now)
+            .await
+            .expect("session start");
+        storage_a
+            .insert_round_start("concurrent-r1", "concurrent-session", "model", now)
+            .await
+            .expect("round 1 start");
+        storage_a
+            .insert_round_start("concurrent-r2", "concurrent-session", "model", now)
+            .await
+            .expect("round 2 start");
+
+        // Hold the first writer after it has folded round rows but before it
+        // updates session_metrics. A second independent storage/connection must
+        // not enter its complete_round transaction until the first commits.
+        let (first_folded, release_first) =
+            super::install_session_token_fold_pause("concurrent-session");
+        let first_storage = storage_a.clone();
+        let first = tokio::spawn(async move {
+            first_storage
+                .complete_round(
+                    "concurrent-r1",
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 1,
+                        total_tokens: 11,
+                    },
+                    0,
+                    0,
+                    None,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            first_folded.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .expect("wait for first fold task")
+        .expect("first completion reached aggregate fold");
+
+        let second_entered =
+            super::install_complete_round_transaction_entered_hook("concurrent-r2");
+        let second = tokio::spawn(async move {
+            storage_b
+                .complete_round(
+                    "concurrent-r2",
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: 20,
+                        completion_tokens: 2,
+                        total_tokens: 22,
+                    },
+                    0,
+                    0,
+                    None,
+                )
+                .await
+        });
+
+        let (entry_while_first_locked, second_entered) = tokio::task::spawn_blocking(move || {
+            let result = second_entered.recv_timeout(std::time::Duration::from_millis(250));
+            (result, second_entered)
+        })
+        .await
+        .expect("wait for second transaction attempt");
+        let was_serialized = matches!(
+            entry_while_first_locked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+
+        release_first.send(()).expect("release first completion");
+        first
+            .await
+            .expect("first completion task")
+            .expect("first completion");
+        second
+            .await
+            .expect("second completion task")
+            .expect("second completion");
+
+        if was_serialized {
+            tokio::task::spawn_blocking(move || {
+                second_entered.recv_timeout(std::time::Duration::from_secs(2))
+            })
+            .await
+            .expect("wait for serialized second transaction")
+            .expect("second transaction entered after first committed");
+        }
+        assert!(
+            was_serialized,
+            "a competing connection entered between aggregate fold and parent update"
+        );
+
+        let detail = storage_a
+            .session_detail("concurrent-session")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        assert_eq!(
+            detail.session.total_token_usage,
+            TokenUsage {
+                prompt_tokens: 30,
+                completion_tokens: 3,
+                total_tokens: 33,
+            },
+            "the last session writer must include both completed rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_round_rolls_back_child_update_when_aggregate_refresh_fails() {
+        let dir = tempdir().expect("temp dir");
+        let database_path = dir.path().join("metrics.db");
+        let storage = SqliteMetricsStorage::new(&database_path);
+        storage.init().await.expect("init storage");
+        let now = Utc::now();
+
+        storage
+            .upsert_session_start("rollback-session", "model", now)
+            .await
+            .expect("session start");
+        storage
+            .insert_round_start("rollback-target", "rollback-session", "model", now)
+            .await
+            .expect("target round start");
+        storage
+            .insert_round_start("rollback-corrupt", "rollback-session", "model", now)
+            .await
+            .expect("corrupt round start");
+
+        let connection = super::open_connection(&database_path).expect("open database");
+        connection
+            .execute(
+                "UPDATE round_metrics SET prompt_tokens = -1 WHERE round_id = 'rollback-corrupt'",
+                [],
+            )
+            .expect("inject invalid durable counter");
+        drop(connection);
+
+        let error = storage
+            .complete_round(
+                "rollback-target",
+                now,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 12,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect_err("aggregate validation should fail");
+        assert!(
+            matches!(error, super::MetricsError::InvalidData(_)),
+            "unexpected completion error: {error}"
+        );
+
+        let connection = super::open_connection(&database_path).expect("reopen database");
+        let target: (String, Option<String>, i64, i64, i64) = connection
+            .query_row(
+                "SELECT status, completed_at, prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE round_id = 'rollback-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("read rolled-back target round");
+        assert_eq!(
+            target,
+            (String::from("running"), None, 0, 0, 0),
+            "the round mutation must roll back with the failed parent refresh"
+        );
     }
 
     #[tokio::test]
@@ -2966,6 +4134,471 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_filter_scopes_summary_by_model_and_daily_across_all_dimensions() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 10, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        for (suffix, model, tool, tokens, cached, status) in [
+            ("a", "model-a", "Read", 10, 2, SessionStatus::Completed),
+            ("b", "model-b", "Write", 20, 4, SessionStatus::Error),
+        ] {
+            let session_id = format!("filtered-session-{suffix}");
+            let round_id = format!("filtered-round-{suffix}");
+            let tool_id = format!("filtered-tool-{suffix}");
+            storage
+                .upsert_session_start(&session_id, model, now)
+                .await
+                .expect("session start");
+            storage
+                .insert_round_start(&round_id, &session_id, model, now)
+                .await
+                .expect("round start");
+            storage
+                .insert_tool_start(&tool_id, &round_id, &session_id, tool, now)
+                .await
+                .expect("tool start");
+            storage
+                .complete_round(
+                    &round_id,
+                    now,
+                    RoundStatus::Success,
+                    TokenUsage {
+                        prompt_tokens: tokens,
+                        completion_tokens: 0,
+                        total_tokens: tokens,
+                    },
+                    cached,
+                    cached,
+                    None,
+                )
+                .await
+                .expect("round completion");
+            storage
+                .record_round_compression(&round_id, now, if model == "model-a" { 3 } else { 7 })
+                .await
+                .expect("round compression");
+            storage
+                .complete_session(&session_id, status, now)
+                .await
+                .expect("session completion");
+        }
+        storage
+            .increment_execute_sync_mismatch("global-only", now)
+            .await
+            .expect("sync mismatch");
+
+        let selected = ModelMetricsDateFilter {
+            model: Some("model-a".to_string()),
+            ..ModelMetricsDateFilter::default()
+        };
+        let summary = storage
+            .summary_filtered(selected.clone())
+            .await
+            .expect("filtered summary");
+        assert_eq!(summary.total_sessions, 1);
+        assert_eq!(summary.completed_sessions, 1);
+        assert_eq!(summary.error_sessions, 0);
+        assert_eq!(summary.total_tokens.total_tokens, 10);
+        assert_eq!(summary.total_tool_calls, 1);
+        assert_eq!(summary.prompt_cached_tool_outputs, 2);
+        assert_eq!(summary.tool_context_tokens_saved, 2);
+        assert_eq!(summary.total_compression_events, 1);
+        assert_eq!(summary.total_tokens_saved, 5);
+        assert_eq!(summary.non_tool_compression_tokens_saved, 3);
+        assert_eq!(summary.total_sync_mismatches, 0);
+        assert!(summary.sync_mismatch_breakdown.is_empty());
+
+        let by_model = storage
+            .by_model_filtered(selected)
+            .await
+            .expect("filtered by-model");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].model, "model-a");
+        assert_eq!(by_model[0].sessions, 1);
+        assert_eq!(by_model[0].rounds, 1);
+        assert_eq!(by_model[0].tool_calls, 1);
+        assert_eq!(by_model[0].tokens.total_tokens, 10);
+
+        let cleared_by_model = storage
+            .by_model_filtered(ModelMetricsDateFilter {
+                model: Some("\t".to_string()),
+                ..ModelMetricsDateFilter::default()
+            })
+            .await
+            .expect("blank model restores all-model by-model metrics");
+        assert_eq!(cleared_by_model.len(), 2);
+        assert!(cleared_by_model.iter().any(|row| row.model == "model-a"));
+        assert!(cleared_by_model.iter().any(|row| row.model == "model-b"));
+
+        let daily = storage
+            .daily_metrics_for_model(1, Some(now.date_naive()), Some("model-a".to_string()))
+            .await
+            .expect("filtered daily");
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].total_sessions, 1);
+        assert_eq!(daily[0].total_rounds, 1);
+        assert_eq!(daily[0].total_tool_calls, 1);
+        assert_eq!(daily[0].total_token_usage.total_tokens, 10);
+        assert_eq!(
+            daily[0].tool_breakdown,
+            HashMap::from([("Read".to_string(), 1)])
+        );
+        assert_eq!(daily[0].model_breakdown.len(), 1);
+        assert!(daily[0].model_breakdown.contains_key("model-a"));
+
+        let cleared = storage
+            .summary_filtered(ModelMetricsDateFilter {
+                model: Some("   ".to_string()),
+                ..ModelMetricsDateFilter::default()
+            })
+            .await
+            .expect("blank model restores all-model summary");
+        assert_eq!(cleared.total_sessions, 2);
+        assert_eq!(cleared.total_tokens.total_tokens, 30);
+        assert_eq!(cleared.total_tool_calls, 2);
+        assert_eq!(cleared.total_sync_mismatches, 1);
+
+        let cleared_daily = storage
+            .daily_metrics_for_model(1, Some(now.date_naive()), Some(" ".to_string()))
+            .await
+            .expect("blank model restores all-model daily");
+        assert_eq!(cleared_daily[0].total_sessions, 2);
+        assert_eq!(cleared_daily[0].total_rounds, 2);
+        assert_eq!(cleared_daily[0].total_tool_calls, 2);
+        assert_eq!(cleared_daily[0].total_token_usage.total_tokens, 30);
+        assert_eq!(cleared_daily[0].model_breakdown.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn forward_daily_model_filter_matches_forward_summary_scope() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+        let now = Utc
+            .with_ymd_and_hms(2026, 2, 10, 13, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        for (suffix, model, tokens) in [("a", "model-a", 5), ("b", "model-b", 9)] {
+            let id = format!("forward-filtered-{suffix}");
+            storage
+                .insert_forward_start(&id, "openai.responses", model, false, now)
+                .await
+                .expect("forward start");
+            storage
+                .complete_forward(
+                    &id,
+                    now,
+                    Some(200),
+                    ForwardStatus::Success,
+                    Some(TokenUsage {
+                        prompt_tokens: tokens,
+                        completion_tokens: 0,
+                        total_tokens: tokens,
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .expect("forward completion");
+        }
+
+        let selected_summary = storage
+            .forward_summary(ForwardMetricsFilter {
+                model: Some("model-a".to_string()),
+                ..ForwardMetricsFilter::default()
+            })
+            .await
+            .expect("filtered forward summary");
+        let selected_daily = storage
+            .forward_daily_metrics_for_model(1, Some(now.date_naive()), Some("model-a".to_string()))
+            .await
+            .expect("filtered forward daily");
+        assert_eq!(selected_summary.total_requests, 1);
+        assert_eq!(selected_summary.total_tokens.total_tokens, 5);
+        assert_eq!(selected_daily.len(), 1);
+        assert_eq!(selected_daily[0].total_sessions, 1);
+        assert_eq!(selected_daily[0].total_token_usage.total_tokens, 5);
+
+        let cleared = storage
+            .forward_daily_metrics_for_model(1, Some(now.date_naive()), Some("  ".to_string()))
+            .await
+            .expect("blank forward model restores all-model daily");
+        assert_eq!(cleared[0].total_sessions, 2);
+        assert_eq!(cleared[0].total_token_usage.total_tokens, 14);
+    }
+
+    #[tokio::test]
+    async fn round_rollups_follow_round_day_and_model_while_sessions_follow_start() {
+        let dir = tempdir().expect("temp dir");
+        let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
+        storage.init().await.expect("init storage");
+
+        let day_one = Utc
+            .with_ymd_and_hms(2026, 1, 31, 23, 59, 58)
+            .single()
+            .expect("valid first day");
+        let day_two = Utc
+            .with_ymd_and_hms(2026, 2, 1, 11, 0, 0)
+            .single()
+            .expect("valid second day");
+        let day_one_date = day_one.date_naive();
+        let day_two_date = day_two.date_naive();
+
+        storage
+            .upsert_session_start("cross-day", "model-a", day_one)
+            .await
+            .expect("session start");
+
+        storage
+            .insert_round_start("day-one-round", "cross-day", "model-a", day_one)
+            .await
+            .expect("first round start");
+        storage
+            .insert_tool_start(
+                "day-one-tool",
+                "day-one-round",
+                "cross-day",
+                "Read",
+                day_one,
+            )
+            .await
+            .expect("first tool start");
+        storage
+            .complete_tool_call(
+                "day-one-tool",
+                ToolCallCompletion {
+                    completed_at: day_one + chrono::Duration::seconds(1),
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("first tool complete");
+        storage
+            .complete_round(
+                "day-one-round",
+                // Completion crosses midnight, but occurrence attribution is
+                // deliberately locked to the round's non-null start timestamp.
+                day_one + chrono::Duration::seconds(2),
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 1,
+                    total_tokens: 11,
+                },
+                1,
+                0,
+                None,
+            )
+            .await
+            .expect("first round complete");
+
+        storage
+            .insert_round_start("day-two-round", "cross-day", "model-b", day_two)
+            .await
+            .expect("second round start");
+        storage
+            .insert_tool_start(
+                "day-two-tool",
+                "day-two-round",
+                "cross-day",
+                "Write",
+                day_two,
+            )
+            .await
+            .expect("second tool start");
+        storage
+            .complete_tool_call(
+                "day-two-tool",
+                ToolCallCompletion {
+                    completed_at: day_two + chrono::Duration::seconds(1),
+                    success: true,
+                    error: None,
+                },
+            )
+            .await
+            .expect("second tool complete");
+        storage
+            .complete_round(
+                "day-two-round",
+                day_two + chrono::Duration::seconds(2),
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 20,
+                    completion_tokens: 2,
+                    total_tokens: 22,
+                },
+                2,
+                0,
+                None,
+            )
+            .await
+            .expect("second round complete");
+
+        // Running rows have no completion timestamp, but are still real round
+        // occurrences and must be counted on their non-null start date.
+        storage
+            .insert_round_start("day-two-running", "cross-day", "model-b", day_two)
+            .await
+            .expect("running round start");
+        storage
+            .complete_session(
+                "cross-day",
+                SessionStatus::Completed,
+                day_two + chrono::Duration::minutes(1),
+            )
+            .await
+            .expect("session completion");
+
+        let daily = storage
+            .daily_metrics(2, Some(day_two_date))
+            .await
+            .expect("cross-day daily metrics");
+        assert_eq!(daily.len(), 2);
+        let first_day = daily
+            .iter()
+            .find(|day| day.date == day_one_date)
+            .expect("session start day");
+        assert_eq!(first_day.total_sessions, 1);
+        assert_eq!(first_day.total_rounds, 1);
+        assert_eq!(first_day.total_token_usage.total_tokens, 11);
+        assert_eq!(first_day.total_tool_calls, 1);
+        assert_eq!(
+            first_day
+                .model_breakdown
+                .get("model-a")
+                .map(|usage| usage.total_tokens),
+            Some(11)
+        );
+
+        let second_day = daily
+            .iter()
+            .find(|day| day.date == day_two_date)
+            .expect("continuation day");
+        assert_eq!(
+            second_day.total_sessions, 0,
+            "session count remains attributed to session start"
+        );
+        assert_eq!(second_day.total_rounds, 2);
+        assert_eq!(second_day.total_token_usage.total_tokens, 22);
+        assert_eq!(second_day.total_tool_calls, 1);
+        assert_eq!(second_day.prompt_cached_tool_outputs, 2);
+        assert_eq!(
+            second_day
+                .model_breakdown
+                .get("model-b")
+                .map(|usage| usage.total_tokens),
+            Some(22)
+        );
+        assert_eq!(
+            second_day.tool_breakdown,
+            HashMap::from([(String::from("Write"), 1)])
+        );
+
+        let day_two_only = storage
+            .daily_metrics(1, Some(day_two_date))
+            .await
+            .expect("day-two-only daily metrics");
+        assert_eq!(day_two_only.len(), 1);
+        assert_eq!(day_two_only[0].total_sessions, 0);
+        assert_eq!(day_two_only[0].total_rounds, 2);
+        assert_eq!(day_two_only[0].total_token_usage.total_tokens, 22);
+
+        let by_model = storage
+            .by_model(MetricsDateFilter::default())
+            .await
+            .expect("model rollup");
+        let model_a = by_model
+            .iter()
+            .find(|model| model.model == "model-a")
+            .expect("session model");
+        assert_eq!(model_a.sessions, 1);
+        assert_eq!(model_a.rounds, 1);
+        assert_eq!(model_a.tokens.total_tokens, 11);
+        assert_eq!(model_a.tool_calls, 1);
+        assert_eq!(model_a.prompt_cached_tool_outputs, 1);
+
+        let model_b = by_model
+            .iter()
+            .find(|model| model.model == "model-b")
+            .expect("later round model retained without a session count");
+        assert_eq!(model_b.sessions, 0);
+        assert_eq!(model_b.rounds, 2);
+        assert_eq!(model_b.tokens.total_tokens, 22);
+        assert_eq!(model_b.tool_calls, 1);
+        assert_eq!(model_b.prompt_cached_tool_outputs, 2);
+
+        let day_two_models = storage
+            .by_model(MetricsDateFilter {
+                start_date: Some(day_two_date),
+                end_date: Some(day_two_date),
+            })
+            .await
+            .expect("day-two model rollup");
+        assert_eq!(day_two_models.len(), 1);
+        assert_eq!(day_two_models[0].model, "model-b");
+        assert_eq!(day_two_models[0].sessions, 0);
+        assert_eq!(day_two_models[0].rounds, 2);
+        assert_eq!(day_two_models[0].tokens.total_tokens, 22);
+
+        let day_two_summary = storage
+            .summary(MetricsDateFilter {
+                start_date: Some(day_two_date),
+                end_date: Some(day_two_date),
+            })
+            .await
+            .expect("day-two summary");
+        assert_eq!(day_two_summary.total_sessions, 0);
+        assert_eq!(day_two_summary.completed_sessions, 0);
+        assert_eq!(day_two_summary.total_tokens.total_tokens, 22);
+        assert_eq!(day_two_summary.total_tool_calls, 1);
+        assert_eq!(day_two_summary.prompt_cached_tool_outputs, 2);
+
+        // Every usage surface must equal a direct fold of round rows: session
+        // counts are separate and must never multiply the usage contribution.
+        let detail = storage
+            .session_detail("cross-day")
+            .await
+            .expect("session detail query")
+            .expect("session detail");
+        let direct_total = detail
+            .rounds
+            .iter()
+            .map(|round| round.token_usage.total_tokens)
+            .sum::<u64>();
+        assert_eq!(direct_total, 33);
+        assert_eq!(
+            daily
+                .iter()
+                .map(|day| day.total_token_usage.total_tokens)
+                .sum::<u64>(),
+            direct_total
+        );
+        assert_eq!(
+            by_model
+                .iter()
+                .map(|model| model.tokens.total_tokens)
+                .sum::<u64>(),
+            direct_total
+        );
+        assert_eq!(
+            storage
+                .summary(MetricsDateFilter::default())
+                .await
+                .expect("unfiltered summary")
+                .total_tokens
+                .total_tokens,
+            direct_total
+        );
+    }
+
+    #[tokio::test]
     async fn prune_deletes_old_rounds_and_refreshes_affected_session_aggregate() {
         let dir = tempdir().expect("temp dir");
         let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
@@ -3028,8 +4661,9 @@ mod tests {
 
     #[tokio::test]
     async fn daily_metrics_end_date_is_inclusive_and_next_day_excluded() {
-        // Locks the sargable-range rewrite (#234): a session at the very end of
-        // the end date is kept; one at 00:00 the next day is excluded.
+        // Locks the sargable half-open range for both session and round rows: an
+        // occurrence at the very end of the end date is kept; one at 00:00 the
+        // next day is excluded.
         let dir = tempdir().expect("temp dir");
         let storage = SqliteMetricsStorage::new(dir.path().join("metrics.db"));
         storage.init().await.expect("init storage");
@@ -3050,6 +4684,51 @@ mod tests {
             .upsert_session_start("out-of-range", "gpt-4", next_day_midnight)
             .await
             .expect("session start");
+        storage
+            .insert_round_start("in-range-round", "in-range", "gpt-4", end_of_day)
+            .await
+            .expect("in-range round start");
+        storage
+            .complete_round(
+                "in-range-round",
+                end_of_day,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("in-range round completion");
+        storage
+            .insert_round_start(
+                "out-of-range-round",
+                "out-of-range",
+                "gpt-4",
+                next_day_midnight,
+            )
+            .await
+            .expect("out-of-range round start");
+        storage
+            .complete_round(
+                "out-of-range-round",
+                next_day_midnight,
+                RoundStatus::Success,
+                TokenUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                    total_tokens: 4,
+                },
+                0,
+                0,
+                None,
+            )
+            .await
+            .expect("out-of-range round completion");
 
         let daily = storage
             .daily_metrics(
@@ -3065,6 +4744,8 @@ mod tests {
             daily[0].total_sessions, 1,
             "the 23:59:59 session is in range; the next-day 00:00 session is not"
         );
+        assert_eq!(daily[0].total_rounds, 1);
+        assert_eq!(daily[0].total_token_usage.total_tokens, 2);
     }
 
     #[tokio::test]

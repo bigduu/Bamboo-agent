@@ -49,12 +49,43 @@ use crate::codex_cli_executor::CodexExecutor;
 const STORAGE_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Worker entry point: provision from stdin, build the executor, serve one run, clean up.
+fn bus_idle_timeout(spec: &ProvisionSpec) -> Option<std::time::Duration> {
+    spec.limits
+        .idle_timeout_secs
+        .map(std::time::Duration::from_secs)
+        .or_else(|| spec.reusable.then(|| std::time::Duration::from_secs(300)))
+}
+
 pub async fn run() -> std::result::Result<(), String> {
+    let worker_started = std::time::Instant::now();
     // Stage 1: provision (one JSON document on stdin; the parent closes the pipe).
     let mut spec = ProvisionSpec::read_from_stdin()
         .await
         .map_err(|e| format!("read ProvisionSpec from stdin: {e}"))?;
     let provisioned_permission = spec.capabilities.permission_resolution()?;
+    if let Some(owner) = spec.owner.as_ref() {
+        crate::process_owner::spawn_direct_owner_guard(
+            owner.process_id,
+            "subagent-worker",
+            Some(owner.instance_id.clone()),
+            owner.session_id.clone(),
+            owner.process_start_id,
+        );
+        tracing::info!(
+            worker_id = %spec.identity.child_id,
+            owner_pid = owner.process_id,
+            owner_instance_id = %owner.instance_id,
+            owner_process_start_id = owner.process_start_id,
+            owner_session_id = owner.session_id.as_deref().unwrap_or("none"),
+            worker_spawned_at = %owner.worker_spawned_at,
+            "subagent worker owner guard armed"
+        );
+    } else {
+        tracing::debug!(
+            worker_id = %spec.identity.child_id,
+            "subagent worker has no physical owner metadata (legacy or resident spec)"
+        );
+    }
 
     // Preserve an explicit parent-selected storage root. Otherwise bind
     // project workers to `<git-root>/.bamboo/tmp/subagents/<child-id>` and
@@ -227,9 +258,31 @@ pub async fn run() -> std::result::Result<(), String> {
             session_id: spec.identity.child_id.clone(),
             role: Some(spec.identity.role.clone()),
         };
-        return bamboo_broker::serve_executor(&bus.endpoint, me, &bus.token, executor)
-            .await
-            .map_err(|e| format!("bus serve: {e}"));
+        let idle_timeout = bus_idle_timeout(&spec);
+        let reason = bamboo_broker::serve_executor_with_lifecycle(
+            &bus.endpoint,
+            me,
+            &bus.token,
+            executor,
+            CancellationToken::new(),
+            idle_timeout,
+        )
+        .await
+        .map_err(|e| format!("bus serve: {e}"))?;
+        let shutdown_reason = match reason {
+            bamboo_broker::ServeExitReason::ShutdownRequested => "shutdown_requested",
+            bamboo_broker::ServeExitReason::ConnectionClosed => "connection_closed",
+            bamboo_broker::ServeExitReason::IdleTimeout => "idle_timeout",
+        };
+        tracing::info!(
+            worker_id = %spec.identity.child_id,
+            owner_pid = spec.owner.as_ref().map(|owner| owner.process_id),
+            worker_age_ms = worker_started.elapsed().as_millis() as u64,
+            idle_timeout_secs = idle_timeout.map(|timeout| timeout.as_secs()),
+            shutdown_reason,
+            "subagent bus worker stopped"
+        );
+        return Ok(());
     }
 
     // Stage 3 (legacy direct-WS): bind, self-register (with lease renewal), serve.
@@ -1081,6 +1134,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 identity.root_session_id
             };
             session.kind = SessionKind::Child;
+            session.title_generated = true;
         }
         if let Some(project_id) = run.project_id.as_ref() {
             session.set_project_id_meta(project_id.as_str());
@@ -2214,6 +2268,37 @@ mod tests {
             model: m.into(),
         });
         s
+    }
+
+    #[test]
+    fn bus_idle_timeout_uses_provisioned_limit_for_one_shot_and_reusable_workers() {
+        let mut one_shot = spec_with("openai", "sk-test", None);
+        one_shot.limits.idle_timeout_secs = Some(17);
+        assert_eq!(
+            bus_idle_timeout(&one_shot),
+            Some(std::time::Duration::from_secs(17))
+        );
+
+        let mut reusable = spec_with("openai", "sk-test", None);
+        reusable.reusable = true;
+        reusable.limits.idle_timeout_secs = Some(23);
+        assert_eq!(
+            bus_idle_timeout(&reusable),
+            Some(std::time::Duration::from_secs(23))
+        );
+    }
+
+    #[test]
+    fn bus_idle_timeout_preserves_reusable_default_only_when_limit_is_absent() {
+        let one_shot = spec_with("openai", "sk-test", None);
+        assert_eq!(bus_idle_timeout(&one_shot), None);
+
+        let mut reusable = spec_with("openai", "sk-test", None);
+        reusable.reusable = true;
+        assert_eq!(
+            bus_idle_timeout(&reusable),
+            Some(std::time::Duration::from_secs(300))
+        );
     }
 
     #[test]

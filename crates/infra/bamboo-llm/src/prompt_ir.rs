@@ -66,6 +66,11 @@ pub enum SegmentRole {
     /// Tool guide, MCP guidance, workspace, env, skills. Session-stable cacheable
     /// prefix; OMITTED from a continuation delta (the stored turn already has it).
     StablePrefix,
+    /// One chronological provider-visible transcript containing real
+    /// conversation messages interleaved with durable model-context events.
+    /// When present it replaces the legacy DynamicContext/SystemRemainder/
+    /// Conversation/VolatileTail projection for normal request lowering.
+    ModelTranscript,
     /// Conversation summary / per-round dynamic context. After the cache
     /// breakpoint, before history. INCLUDED in a continuation delta.
     DynamicContext,
@@ -137,6 +142,14 @@ impl PromptIR {
     pub fn body_chat(&self) -> Vec<Message> {
         let mut out = Vec::new();
         out.extend_from_slice(self.run(SegmentRole::StablePrefix));
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.role == SegmentRole::ModelTranscript)
+        {
+            out.extend_from_slice(self.run(SegmentRole::ModelTranscript));
+            return out;
+        }
         out.extend_from_slice(self.run(SegmentRole::DynamicContext));
         out.extend_from_slice(self.run(SegmentRole::SystemRemainder));
         out.extend_from_slice(self.run(SegmentRole::Conversation));
@@ -168,6 +181,13 @@ impl PromptIR {
     /// [`body_chat`](Self::body_chat)). Written independently so the two
     /// positions can never be unified by accident.
     pub fn continuation_delta(&self) -> Vec<Message> {
+        if self
+            .segments
+            .iter()
+            .any(|segment| segment.role == SegmentRole::ModelTranscript)
+        {
+            return self.model_transcript_tail().to_vec();
+        }
         let mut out = Vec::new();
         out.extend_from_slice(self.run(SegmentRole::SystemRemainder));
         out.extend_from_slice(self.run(SegmentRole::DynamicContext));
@@ -220,6 +240,21 @@ impl PromptIR {
                 _ => conversation,
             },
             None => conversation,
+        }
+    }
+
+    fn model_transcript_tail(&self) -> &[Message] {
+        let transcript = self.run(SegmentRole::ModelTranscript);
+        match self
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.last_committed_assistant_id.as_deref())
+        {
+            Some(id) => match transcript.iter().rposition(|message| message.id == id) {
+                Some(index) if index + 1 < transcript.len() => &transcript[index + 1..],
+                _ => transcript,
+            },
+            None => transcript,
         }
     }
 }
@@ -372,6 +407,7 @@ mod tests {
         let base = ResponsesRequestOptions {
             store: Some(false),
             text_verbosity: Some("high".to_string()),
+            prompt_cache_key: Some("session-affinity-hash".to_string()),
             ..Default::default()
         };
         let ir = PromptIR {
@@ -386,6 +422,10 @@ mod tests {
         // Policy preserved.
         assert_eq!(options.store, Some(false));
         assert_eq!(options.text_verbosity.as_deref(), Some("high"));
+        assert_eq!(
+            options.prompt_cache_key.as_deref(),
+            Some("session-affinity-hash")
+        );
         // Prompt wire view derived from the IR.
         assert_eq!(options.instructions.as_deref(), Some("SYSTEM"));
         assert_eq!(
@@ -466,5 +506,54 @@ mod tests {
             remainder_delta < dynamic_delta,
             "delta: the system remainder precedes dynamic context (swapped vs chat)"
         );
+    }
+
+    #[test]
+    fn model_transcript_is_chronological_and_supersedes_legacy_mutable_lanes() {
+        let transcript = vec![
+            Message::user("context-v1"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::tool_result("call-1", "tool-output"),
+            Message::user("context-v2"),
+        ];
+        let assistant_id = transcript[2].id.clone();
+        let ir = PromptIR {
+            system_text: "SYSTEM".to_string(),
+            segments: vec![
+                Segment::new(SegmentRole::StablePrefix, vec![Message::user("GUIDE")]),
+                Segment::new(SegmentRole::ModelTranscript, transcript.clone()),
+                // These legacy lanes remain supported when ModelTranscript is
+                // absent, but must never be duplicated into the new engine path.
+                Segment::new(
+                    SegmentRole::DynamicContext,
+                    vec![Message::user("OLD-DYNAMIC")],
+                ),
+                Segment::new(
+                    SegmentRole::Conversation,
+                    vec![Message::user("OLD-CONVERSATION")],
+                ),
+                Segment::new(SegmentRole::VolatileTail, vec![Message::user("OLD-TAIL")]),
+            ],
+            continuation: Some(Continuation {
+                previous_response_id: "resp".to_string(),
+                last_committed_assistant_id: Some(assistant_id),
+            }),
+            ..PromptIR::default()
+        };
+
+        let mut expected_body = vec![Message::user("GUIDE")];
+        expected_body.extend(transcript.clone());
+        assert_eq!(shape(&ir.body_chat()), shape(&expected_body));
+        assert_eq!(shape(&ir.responses_input()), shape(&expected_body));
+        assert_eq!(
+            shape(&ir.continuation_delta()),
+            shape(&transcript[3..]),
+            "continuation slices the single chronological transcript"
+        );
+        assert!(ir
+            .body_chat()
+            .iter()
+            .all(|message| !message.content.starts_with("OLD-")));
     }
 }

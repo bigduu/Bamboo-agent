@@ -27,7 +27,9 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::codex_discovery::discover_codex_cli;
 use bamboo_subagent::executor::{ChildExecutor, ChildOutcome, EventSink, SteerInbox};
-use bamboo_subagent::executor_util::{build_rehydrated_turn, write_json_atomic};
+use bamboo_subagent::executor_util::{
+    build_rehydrated_turn, spawn_with_etxtbsy_retry, write_json_atomic,
+};
 use bamboo_subagent::proto::RunSpec;
 
 /// The oldest Codex CLI schema this executor intentionally supports. The
@@ -1175,6 +1177,7 @@ impl CodexExecutor {
 
         let mut child = match spawn_with_etxtbsy_retry(|| {
             self.build_command(run_provider_token, &policy, resume_id)
+                .map_err(std::io::Error::other)
         })
         .await
         {
@@ -1905,25 +1908,6 @@ fn validate_codex_forward_env(mode: CodexAuthMode, names: &[String]) -> Result<(
         return Err("OPENAI_API_KEY may only be forwarded in Codex api_key auth mode".to_string());
     }
     Ok(())
-}
-
-async fn spawn_with_etxtbsy_retry(
-    mut build: impl FnMut() -> Result<Command, String>,
-) -> Result<Child, String> {
-    let mut last_error = None;
-    for _ in 0..5 {
-        match build()?.spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) if error.raw_os_error() == Some(26) => {
-                last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err(last_error
-        .expect("retry loop records ETXTBSY before exhausting")
-        .to_string())
 }
 
 #[derive(Clone, Copy)]
