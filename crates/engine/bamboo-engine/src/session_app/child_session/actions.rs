@@ -5,11 +5,11 @@ use chrono::Utc;
 use serde_json::json;
 
 use super::helpers::{
-    compute_status_guidance, format_child_assignment, map_child_entry, metadata_text,
+    append_subagent_delegation_contract, compute_status_guidance,
+    format_child_assignment_with_background, map_child_entry, metadata_text,
     normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
     replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
 };
-use super::DELEGATION_NOTE;
 use super::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
 };
@@ -209,12 +209,11 @@ pub async fn create_child_action(
         child.metadata.insert(key, value);
     }
 
-    // Sub-agents are first-class agents: assemble the SAME base system prompt a
-    // top-level (root) session uses, then append a short delegation note. The
-    // runtime context enhancement (workspace / instructions / tool guide /
-    // memory / task list) is applied uniformly by the runner to whatever base
-    // prompt the session carries — there is no root-only gate — so swapping the
-    // base prompt is all that's needed to make a child behave like a full agent.
+    // Preserve the configured global custom template/fallback, then append the
+    // child-only contract idempotently. Deliberately do not inherit the parent
+    // session's per-session prompt: it can contain root-only private policy and
+    // has never been the child-base source. Runtime context enhancement is
+    // applied uniformly by the runner to the resulting child base.
     let base_prompt = {
         let global = crate::prompt_defaults::read_global_default_system_prompt_template();
         if global.trim().is_empty() {
@@ -223,7 +222,7 @@ pub async fn create_child_action(
             global
         }
     };
-    let system_prompt = format!("{base_prompt}\n\n{DELEGATION_NOTE}");
+    let system_prompt = append_subagent_delegation_contract(&base_prompt);
 
     child
         .metadata
@@ -242,22 +241,21 @@ pub async fn create_child_action(
     }
 
     refresh_prompt_snapshot(&mut child);
-    let assignment = format_child_assignment(
+    // Phase 3: optionally fork a slice of the parent's recent context into the
+    // assignment's separately labeled background section (model-controllable
+    // via the SubAgent tool's `fork_last_messages`). `None`/0 keeps the child
+    // on a clean fresh context. Policy and stop/report sections remain after
+    // the fork, so transcript recency never closes the assignment frame.
+    let background = input
+        .context_fork
+        .and_then(|n| render_forked_parent_context(&input.parent_session, n));
+    let assignment = format_child_assignment_with_background(
         &input.title,
         &input.responsibility,
         &input.subagent_type,
         &input.assignment_prompt,
+        background.as_deref(),
     );
-    // Phase 3: optionally fork a slice of the parent's recent context into the
-    // child's task brief (model-controllable via the SubAgent tool's
-    // `fork_last_messages`). `None`/0 keeps the child on a clean fresh context.
-    let assignment = match input
-        .context_fork
-        .and_then(|n| render_forked_parent_context(&input.parent_session, n))
-    {
-        Some(forked) => format!("{forked}\n\n{assignment}"),
-        None => assignment,
-    };
     child.add_message(Message::user(assignment));
 
     if let Some(parent_task_list) = input.parent_session.task_list.clone() {
@@ -265,8 +263,8 @@ pub async fn create_child_action(
     }
 
     // Persist any per-child tool denylist so the spawn path (enqueue_child_run
-    // → SpawnJob.disabled_tools) can trim the child's toolset (e.g. a read-only
-    // Guardian reviewer). Most children carry none and keep the full toolset.
+    // → SpawnJob.disabled_tools) can trim the runtime-exposed toolset (e.g. a
+    // read-only Guardian reviewer). Most children add no child-specific denylist.
     if let Some(ref disabled) = input.disabled_tools {
         if !disabled.is_empty() {
             child.metadata.insert(
@@ -466,6 +464,37 @@ pub async fn update_child_action(
     reset_after_update: Option<bool>,
     reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 ) -> Result<serde_json::Value, ChildSessionError> {
+    update_child_action_with_background(
+        port,
+        parent_id,
+        child_session_id,
+        title,
+        responsibility,
+        prompt,
+        subagent_type,
+        reset_after_update,
+        reasoning_effort,
+        None,
+    )
+    .await
+}
+
+/// Background-aware form used by resident reuse with `fork_last_messages`.
+/// The canonical raw assignment prompt remains in metadata; rendered fork text
+/// only belongs to this task frame, so later reuse cannot compound it.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_child_action_with_background(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+    title: Option<String>,
+    responsibility: Option<String>,
+    prompt: Option<String>,
+    subagent_type: Option<String>,
+    reset_after_update: Option<bool>,
+    reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    assignment_background: Option<String>,
+) -> Result<serde_json::Value, ChildSessionError> {
     let mut child = port
         .load_child_for_parent(parent_id, &child_session_id)
         .await?;
@@ -522,11 +551,12 @@ pub async fn update_child_action(
         child.set_last_run_status("pending");
         child.clear_last_run_error();
 
-        let assignment = format_child_assignment(
+        let assignment = format_child_assignment_with_background(
             &child.title,
             &effective_responsibility,
             &effective_subagent_type,
             &effective_prompt,
+            assignment_background.as_deref(),
         );
         let user_index = replace_or_append_last_user_message(&mut child, assignment);
 
@@ -598,6 +628,15 @@ pub async fn send_message_to_child_action(
         .load_child_for_parent(&parent.id, &child_session_id)
         .await?;
 
+    // Preserve the historical existence/ownership error priority above, then
+    // validate before any runner query or interrupt. Ordinary corrective
+    // content stays byte-for-byte raw through draft and SessionInbox paths.
+    if message.trim().is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "message must be non-empty".to_string(),
+        ));
+    }
+
     let mut is_running = port.is_child_running(&child.id).await;
     let should_interrupt = interrupt_running.unwrap_or(false);
 
@@ -611,8 +650,6 @@ pub async fn send_message_to_child_action(
         // not "wake a successor" based on the pre-cancel snapshot.
         is_running = port.is_child_running(&child.id).await;
     }
-
-    let message = normalize_required_text(Some(message), "message")?;
 
     let should_auto_run = auto_run.unwrap_or(true);
     // `interrupt_running` is meaningful only for an actually-running child.

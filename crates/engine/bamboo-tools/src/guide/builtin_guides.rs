@@ -597,7 +597,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "SubAgent",
             ToolCategory::TaskManagement,
             "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. Use action=create to spawn a new child; use list/get to inspect existing children before creating duplicates; use update/run/send_message/cancel/delete to manage existing children.",
-            "Do not use proactively for simple one-step tasks; do not spawn children from child sessions; do not create multiple overlapping children with unclear responsibilities.",
+            "Do not use proactively for simple one-step tasks; from a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
@@ -742,6 +742,19 @@ mod tests {
                 .and_then(|value| value.as_str())
                 == Some("merge")
         }));
+    }
+
+    #[test]
+    fn subagent_guide_makes_nested_delegation_explicit_and_necessary() {
+        let guide = builtin_guide_spec("SubAgent").expect("SubAgent guide should exist");
+        assert!(guide.when_not_to_use.contains("child session"));
+        assert!(guide
+            .when_not_to_use
+            .contains("explicitly authorizes nested delegation"));
+        assert!(guide.when_not_to_use.contains("it is necessary"));
+        assert!(!guide
+            .when_not_to_use
+            .contains("do not spawn children from child sessions"));
     }
 
     #[test]

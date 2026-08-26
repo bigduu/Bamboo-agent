@@ -45,6 +45,22 @@ async fn invoke_completed(
     }
 }
 
+fn subagent_test_ctx(session_id: &str, tool_call_id: &str) -> ToolCtx {
+    ToolExecutionContext {
+        session_id: Some(session_id),
+        tool_call_id,
+        event_tx: None,
+        available_tool_schemas: None,
+        bypass_permissions: false,
+        auto_approve_permissions: false,
+        plan_read_only: false,
+        can_async_resume: false,
+        bash_completion_sink: None,
+        pre_parsed_args: None,
+    }
+    .to_tool_ctx()
+}
+
 struct NoopProvider;
 
 #[async_trait::async_trait]
@@ -1261,6 +1277,302 @@ async fn resident_create_reuses_same_child_session() {
 }
 
 #[tokio::test]
+async fn root_stays_contract_free_while_oneshot_and_resident_children_get_it_once() {
+    let harness = build_test_harness().await;
+    let mut child_prompts = Vec::new();
+
+    for (title, lifecycle, name, call_id) in [
+        ("One-shot contract", None, None, "contract-oneshot"),
+        (
+            "Resident contract",
+            Some("resident"),
+            Some("contract-resident"),
+            "contract-resident",
+        ),
+    ] {
+        let mut request = json!({
+            "action": "create",
+            "title": title,
+            "responsibility": "Inspect one bounded path",
+            "prompt": "Read one file and report evidence.",
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "auto_run": false
+        });
+        if let Some(lifecycle) = lifecycle {
+            request["lifecycle"] = json!(lifecycle);
+        }
+        if let Some(name) = name {
+            request["name"] = json!(name);
+        }
+
+        let result = invoke_completed(
+            &harness.tool,
+            request,
+            subagent_test_ctx(&harness.parent_session_id, call_id),
+        )
+        .await
+        .expect("child create with delegation contract");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child = harness
+            .storage
+            .load_session(payload["child_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .expect("created child");
+        let base = child
+            .metadata
+            .get("base_system_prompt")
+            .expect("child base prompt")
+            .clone();
+        assert_eq!(
+            base.matches(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            base.matches(child_session::SUBAGENT_DELEGATION_CONTRACT_START_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(
+            child
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::System))
+                .count(),
+            1
+        );
+        assert_eq!(
+            child.messages[0].content, base,
+            "persisted base and child system message must be identical"
+        );
+        let assignment = child.messages.last().expect("assignment message");
+        assert!(matches!(assignment.role, Role::User));
+        assert!(assignment.content.starts_with("Delegated child assignment"));
+        assert_eq!(assignment.content.matches("## ").count(), 6);
+        assert!(!assignment
+            .content
+            .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
+        child_prompts.push(base);
+    }
+
+    assert_eq!(
+        child_prompts[0], child_prompts[1],
+        "one-shot and resident children must receive the same child contract"
+    );
+    let root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .expect("root session");
+    assert!(!root
+        .metadata
+        .values()
+        .any(|value| value.contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)));
+    assert!(!root.messages.iter().any(|message| message
+        .content
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION)));
+}
+
+#[tokio::test]
+async fn resident_create_reset_and_accumulate_share_complete_background_aware_frame() {
+    let harness = build_test_harness().await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .expect("parent");
+    parent.add_message(Message::system("root-only secret policy"));
+    parent.add_message(Message::user("initial parent input"));
+    parent.add_message(Message::assistant("initial parent response", None));
+    harness.storage.save_session(&parent).await.unwrap();
+
+    let first_brief = "First complete brief.\nAcceptance: show first evidence.";
+    let first = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "reset",
+            "title": "First resident task",
+            "responsibility": "Inspect first path",
+            "prompt": first_brief,
+            "subagent_type": "researcher",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 3,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-first"),
+    )
+    .await
+    .expect("first resident create");
+    let first_payload: serde_json::Value = serde_json::from_str(&first.result).unwrap();
+    let resident_id = first_payload["child_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("first resident");
+    let first_background = child_session::render_forked_parent_context(&parent, 3).unwrap();
+    let first_expected = child_session::format_child_assignment_with_background(
+        "First resident task",
+        "Inspect first path",
+        "researcher",
+        first_brief,
+        Some(&first_background),
+    );
+    assert_eq!(first_child.messages.last().unwrap().content, first_expected);
+    assert!(!first_expected.contains("root-only secret policy"));
+    assert!(first_expected.contains("initial parent input"));
+    assert!(first_expected.contains("initial parent response"));
+    assert!(
+        first_expected.find("</forked-parent-background>").unwrap()
+            < first_expected
+                .find("## 3. Allowed actions and mutation scope")
+                .unwrap()
+    );
+    assert_eq!(
+        first_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(first_brief)
+    );
+    harness
+        .adapter
+        .session_store
+        .save_session(&first_child)
+        .await
+        .unwrap();
+
+    parent.add_message(Message::user("reset-only parent background"));
+    harness.storage.save_session(&parent).await.unwrap();
+    let reset_brief = "Reset complete brief.\nAcceptance: show reset evidence.";
+    let reset = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "reset",
+            "title": "Reset resident task",
+            "responsibility": "Inspect reset path",
+            "prompt": reset_brief,
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 1,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-reset"),
+    )
+    .await
+    .expect("resident reset reuse");
+    let reset_payload: serde_json::Value = serde_json::from_str(&reset.result).unwrap();
+    assert_eq!(reset_payload["child_session_id"], resident_id);
+    let reset_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("reset resident");
+    let reset_background = child_session::render_forked_parent_context(&parent, 1).unwrap();
+    let reset_expected = child_session::format_child_assignment_with_background(
+        "Reset resident task",
+        "Inspect reset path",
+        "reviewer",
+        reset_brief,
+        Some(&reset_background),
+    );
+    assert_eq!(reset_child.messages.last().unwrap().content, reset_expected);
+    assert!(!reset_child
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .contains(first_brief));
+    assert_eq!(
+        reset_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(reset_brief)
+    );
+    assert!(!reset_child
+        .metadata
+        .get("assignment_prompt")
+        .unwrap()
+        .contains("forked-parent-background"));
+
+    parent.add_message(Message::user("accumulate-only parent background"));
+    harness.storage.save_session(&parent).await.unwrap();
+    let accumulate_brief = "Accumulated complete brief.\nAcceptance: show accumulated evidence.";
+    let accumulated = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "create",
+            "lifecycle": "resident",
+            "name": "contract-lifecycle",
+            "context": "accumulate",
+            "title": "Accumulated resident task",
+            "responsibility": "Inspect accumulated path",
+            "prompt": accumulate_brief,
+            "subagent_type": "reviewer",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 1,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "resident-contract-accumulate"),
+    )
+    .await
+    .expect("resident accumulate reuse");
+    let accumulated_payload: serde_json::Value = serde_json::from_str(&accumulated.result).unwrap();
+    assert_eq!(accumulated_payload["child_session_id"], resident_id);
+    let accumulated_child = harness
+        .storage
+        .load_session(&resident_id)
+        .await
+        .unwrap()
+        .expect("accumulated resident");
+    let accumulated_background = child_session::render_forked_parent_context(&parent, 1).unwrap();
+    let accumulated_expected = child_session::format_child_assignment_with_background(
+        "Accumulated resident task",
+        "Inspect accumulated path",
+        "reviewer",
+        accumulate_brief,
+        Some(&accumulated_background),
+    );
+    assert_eq!(
+        accumulated_child.messages.last().unwrap().content,
+        accumulated_expected
+    );
+    assert!(accumulated_child
+        .messages
+        .iter()
+        .any(|message| message.content == reset_expected));
+    assert_eq!(
+        accumulated_child
+            .metadata
+            .get("assignment_prompt")
+            .map(String::as_str),
+        Some(reset_brief),
+        "accumulate is an appended task message and must not rewrite canonical reset metadata"
+    );
+    assert!(!accumulated_child
+        .metadata
+        .get("assignment_prompt")
+        .unwrap()
+        .contains("forked-parent-background"));
+}
+
+#[tokio::test]
 async fn resident_reuse_rejects_cross_project_workspace_before_mutating_resident() {
     let harness = build_test_harness().await;
     let workspace_a = tempfile::tempdir().expect("workspace A");
@@ -1789,15 +2101,81 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn direct_update_uses_the_canonical_complete_assignment_frame() {
+    let harness = build_test_harness().await;
+    let task_brief = "Updated complete brief.\nAcceptance: retain both lines.";
+    let mut seeded_child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("seed child");
+    seeded_child.metadata.insert(
+        "responsibility".to_string(),
+        "Inspect the existing path".to_string(),
+    );
+    seeded_child
+        .metadata
+        .insert("subagent_type".to_string(), "reviewer".to_string());
+    seeded_child.metadata.insert(
+        "assignment_prompt".to_string(),
+        "Original complete brief.".to_string(),
+    );
+    harness.storage.save_session(&seeded_child).await.unwrap();
+
+    let result = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "update",
+            "child_session_id": harness.child_session_id,
+            "prompt": task_brief,
+            "reset_after_update": true,
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "direct-update-contract"),
+    )
+    .await
+    .expect("direct child update");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["messages_removed"], 1);
+
+    let child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("updated child");
+    assert_eq!(
+        child.messages.last().unwrap().content,
+        child_session::format_child_assignment(
+            "Child session",
+            "Inspect the existing path",
+            "reviewer",
+            task_brief,
+        )
+    );
+    assert_eq!(child.messages.len(), 2);
+    assert!(!child
+        .messages
+        .iter()
+        .any(|message| matches!(message.role, Role::Assistant)));
+    assert_eq!(
+        child.metadata.get("assignment_prompt").map(String::as_str),
+        Some(task_brief)
+    );
+}
+
+#[tokio::test]
 async fn send_message_appends_follow_up_without_replacing_history() {
     let harness = build_test_harness().await;
+    let raw_message = "\n  continue with the failing parser path  \n";
 
     let result = invoke_completed(
         &harness.tool,
         json!({
             "action": "send_message",
             "child_session_id": harness.child_session_id,
-            "message": "continue with the failing parser path",
+            "message": raw_message,
             "auto_run": false
         }),
         ToolExecutionContext {
@@ -1830,10 +2208,13 @@ async fn send_message_appends_follow_up_without_replacing_history() {
     assert_eq!(child.messages.len(), 4);
     assert!(matches!(child.messages[2].role, Role::Assistant));
     assert!(matches!(child.messages[3].role, Role::User));
-    assert_eq!(
-        child.messages[3].content,
-        "continue with the failing parser path"
-    );
+    assert_eq!(child.messages[3].content, raw_message);
+    assert!(!child.messages[3]
+        .content
+        .contains("Delegated child assignment"));
+    assert!(!child.messages[3]
+        .content
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
     assert_eq!(
         child.metadata.get("last_run_status").map(String::as_str),
         Some("pending")
@@ -1852,8 +2233,77 @@ async fn send_message_appends_follow_up_without_replacing_history() {
 }
 
 #[tokio::test]
+async fn send_message_blank_unknown_child_preserves_not_found_priority() {
+    let harness = build_test_harness().await;
+    let unknown_child_id = Uuid::new_v4().to_string();
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": unknown_child_id,
+            "message": " \n\t  ",
+            "auto_run": false,
+            "interrupt_running": true
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "blank-unknown-child"),
+    )
+    .await
+    .expect_err("unknown child must win over blank-message validation");
+
+    assert!(matches!(error, ToolError::Execution(message)
+            if message.contains("session not found") && message.contains(&unknown_child_id)));
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+    assert!(!harness
+        .agent_runners
+        .read()
+        .await
+        .contains_key(&unknown_child_id));
+}
+
+#[tokio::test]
+async fn send_message_rejects_whitespace_only_without_mutating_the_child() {
+    let harness = build_test_harness().await;
+    let before = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("child before invalid message");
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": harness.child_session_id,
+            "message": " \n\t  ",
+            "auto_run": false
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "whitespace-only-message"),
+    )
+    .await
+    .expect_err("whitespace-only message must fail");
+    assert!(
+        matches!(error, ToolError::InvalidArguments(message) if message.contains("message must be non-empty"))
+    );
+
+    let after = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .expect("child after invalid message");
+    assert_eq!(
+        serde_json::to_value(after.messages).unwrap(),
+        serde_json::to_value(before.messages).unwrap()
+    );
+    assert_eq!(after.metadata, before.metadata);
+}
+
+#[tokio::test]
 async fn send_message_queues_on_running_child_without_interrupt() {
     let harness = build_test_harness().await;
+    let raw_message = "  continue\nwith exact whitespace  \n";
     let run_id = {
         let mut runners = harness.agent_runners.write().await;
         let mut runner = AgentRunner::new();
@@ -1875,7 +2325,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
         json!({
             "action": "send_message",
             "child_session_id": harness.child_session_id,
-            "message": "continue"
+            "message": raw_message
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
@@ -1898,7 +2348,15 @@ async fn send_message_queues_on_running_child_without_interrupt() {
     let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
     assert_eq!(payload["status"], "message_delivered_live");
     assert_eq!(payload["auto_run"], false);
-    assert_eq!(payload["message"], "continue");
+    assert_eq!(payload["message"], raw_message);
+    assert!(!payload["message"]
+        .as_str()
+        .unwrap()
+        .contains("Delegated child assignment"));
+    assert!(!payload["message"]
+        .as_str()
+        .unwrap()
+        .contains(child_session::SUBAGENT_DELEGATION_CONTRACT_VERSION));
 
     let child = harness
         .storage
@@ -1932,7 +2390,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
     assert_eq!(
         envelope.body.clone(),
         bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
-            "continue"
+            raw_message
         ))
     );
 }

@@ -1232,7 +1232,10 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
 async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
     let mut session = Session::new("session-cp-2", "test-model");
     session.token_budget = Some(TokenBudget::new(
-        4_000,
+        // Leave enough protected-token headroom for the invariant core
+        // directives while keeping the repeated history above the automatic
+        // compression trigger.
+        4_500,
         200,
         BudgetStrategy::Window { size: 50 },
     ));
