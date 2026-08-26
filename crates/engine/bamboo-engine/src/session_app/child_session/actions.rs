@@ -624,19 +624,18 @@ pub async fn send_message_to_child_action(
     interrupt_running: Option<bool>,
     idempotency_key: Option<&str>,
 ) -> Result<serde_json::Value, ChildSessionError> {
-    // Validation must not normalize an ordinary corrective send_message: its
-    // payload is caller-authored conversation content and stays byte-for-byte
-    // raw through draft and SessionInbox delivery paths. Validate before any
-    // interrupt so an invalid payload cannot mutate runner state.
+    let mut child = port
+        .load_child_for_parent(&parent.id, &child_session_id)
+        .await?;
+
+    // Preserve the historical existence/ownership error priority above, then
+    // validate before any runner query or interrupt. Ordinary corrective
+    // content stays byte-for-byte raw through draft and SessionInbox paths.
     if message.trim().is_empty() {
         return Err(ChildSessionError::InvalidArguments(
             "message must be non-empty".to_string(),
         ));
     }
-
-    let mut child = port
-        .load_child_for_parent(&parent.id, &child_session_id)
-        .await?;
 
     let mut is_running = port.is_child_running(&child.id).await;
     let should_interrupt = interrupt_running.unwrap_or(false);

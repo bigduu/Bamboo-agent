@@ -2233,6 +2233,35 @@ async fn send_message_appends_follow_up_without_replacing_history() {
 }
 
 #[tokio::test]
+async fn send_message_blank_unknown_child_preserves_not_found_priority() {
+    let harness = build_test_harness().await;
+    let unknown_child_id = Uuid::new_v4().to_string();
+
+    let error = invoke_completed(
+        &harness.tool,
+        json!({
+            "action": "send_message",
+            "child_session_id": unknown_child_id,
+            "message": " \n\t  ",
+            "auto_run": false,
+            "interrupt_running": true
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "blank-unknown-child"),
+    )
+    .await
+    .expect_err("unknown child must win over blank-message validation");
+
+    assert!(matches!(error, ToolError::Execution(message)
+            if message.contains("session not found") && message.contains(&unknown_child_id)));
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+    assert!(!harness
+        .agent_runners
+        .read()
+        .await
+        .contains_key(&unknown_child_id));
+}
+
+#[tokio::test]
 async fn send_message_rejects_whitespace_only_without_mutating_the_child() {
     let harness = build_test_harness().await;
     let before = harness
