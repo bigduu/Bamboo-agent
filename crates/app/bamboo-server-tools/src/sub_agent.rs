@@ -29,7 +29,7 @@ enum SubAgentArgs {
         prompt: String,
         /// Optional free-text label for this child (cosmetic only — used for
         /// display and as the warm-worker reuse key). It has NO effect on the
-        /// child's tools or system prompt; every sub-agent is a full agent.
+        /// child's runtime-exposed tools, permissions, or system prompt.
         #[serde(default)]
         subagent_type: Option<String>,
         /// Working directory for the child. Optional: defaults to the parent
@@ -392,7 +392,7 @@ pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
 pub fn subagent_tool_description() -> &'static str {
-    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session is a full agent that runs independently under the current root session with its own conversation context and the full toolset, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
+    "Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work. A child session runs independently under the current root session with its own conversation context and only the tools and permissions exposed to it by the runtime, streams progress back to the parent via sub_agent_* events, and can be reopened from the Sub-agents panel. \
 PARALLEL FAN-OUT (important): action=create now runs the child in the BACKGROUND and returns immediately WITHOUT suspending the parent. To launch several agents in parallel, call create once per child (ideally several creates in a single turn), then call action=wait ONCE to suspend until they finish. Do NOT pass wait=true on each create for parallel work — that would serialize them (suspend after the first). action=wait defaults to waiting on every active child; if you forget to call it, the runtime auto-waits at the end of the turn so results are never lost. \
 Use list/get to inspect existing children; use update/run/send_message/cancel/delete to manage existing children. Use only when the user explicitly asks for delegation/parallelism or when a side task would otherwise flood the main context. Do not use for simple one-step tasks. IMPORTANT: When a child fails or needs redirection, prefer send_message over creating a duplicate child. Use list before create to avoid spawning redundant children."
 }
@@ -447,7 +447,7 @@ pub fn subagent_parameters_schema() -> serde_json::Value {
             },
             "subagent_type": {
                 "type": "string",
-                "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the child's tools or system prompt; every sub-agent is a full agent. Optional; omit it if you have no useful label."
+                "description": "For create: an optional free-text label for this child (e.g. \"researcher\", \"impl\"), used only for display and as the warm-worker reuse key. Cosmetic — it does NOT change the tools, permissions, or system prompt the runtime exposes to the child. Optional; omit it if you have no useful label."
             },
             "workspace": {
                 "type": "string",
@@ -808,12 +808,27 @@ impl Tool for SubAgentTool {
                             .map_err(tool_error_from_child_session)?;
                         // Reuse: reset => update (truncate + new task) then rerun;
                         // accumulate => send the task as a new message (auto-runs).
+                        // A requested context fork is rendered for this task
+                        // frame only. It never enters `assignment_prompt`
+                        // metadata, so later resident reuse cannot compound it.
+                        let assignment_background = fork_last_messages
+                            .filter(|n| *n > 0)
+                            .and_then(|n| {
+                                child_session::render_forked_parent_context(&parent, n)
+                            });
                         if resident_context == "accumulate" {
+                            let assignment = child_session::format_child_assignment_with_background(
+                                &title,
+                                &responsibility,
+                                &subagent_type,
+                                &prompt,
+                                assignment_background.as_deref(),
+                            );
                             child_session::send_message_to_child_action(
                                 self.sessions.as_ref(),
                                 &parent,
                                 existing_id.clone(),
-                                format!("# Task: {title}\n\n{responsibility}\n\n{prompt}"),
+                                assignment,
                                 Some(should_auto_run),
                                 Some(false),
                                 Some(ctx.tool_call_id.as_ref()),
@@ -821,7 +836,7 @@ impl Tool for SubAgentTool {
                             .await
                             .map_err(tool_error_from_child_session)?;
                         } else {
-                            child_session::update_child_action(
+                            child_session::update_child_action_with_background(
                                 self.sessions.as_ref(),
                                 &parent.id,
                                 existing_id.clone(),
@@ -831,6 +846,7 @@ impl Tool for SubAgentTool {
                                 Some(subagent_type.clone()),
                                 Some(true),
                                 reasoning_effort,
+                                assignment_background,
                             )
                             .await
                             .map_err(tool_error_from_child_session)?;
@@ -1290,6 +1306,75 @@ mod tests {
     fn normalize_title_rejects_both_empty() {
         let err = normalize_title(None, "".to_string()).unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(msg) if msg.contains("title")));
+    }
+
+    #[test]
+    fn subagent_schema_keeps_actions_arguments_and_only_action_required() {
+        let schema = subagent_parameters_schema();
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!([
+                "create",
+                "wait",
+                "list",
+                "get",
+                "update",
+                "run",
+                "send_message",
+                "cancel",
+                "delete",
+                "list_models"
+            ])
+        );
+
+        let actual: std::collections::BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .expect("properties object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = std::collections::BTreeSet::from([
+            "action",
+            "auto_run",
+            "child_session_id",
+            "child_session_ids",
+            "context",
+            "description",
+            "fork_last_messages",
+            "interrupt_running",
+            "lifecycle",
+            "message",
+            "model",
+            "name",
+            "prompt",
+            "reasoning_effort",
+            "reset_after_update",
+            "reset_to_last_user",
+            "responsibility",
+            "subagent_type",
+            "title",
+            "wait",
+            "wait_for",
+            "workspace",
+        ]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn subagent_model_facing_capability_text_is_runtime_scoped() {
+        let description = subagent_tool_description();
+        assert!(description.contains("tools and permissions exposed to it by the runtime"));
+        assert!(!description.contains("full toolset"));
+        assert!(!description.contains("full agent"));
+
+        let schema = subagent_parameters_schema();
+        let label_description = schema["properties"]["subagent_type"]["description"]
+            .as_str()
+            .expect("subagent_type description");
+        assert!(label_description.contains("runtime exposes to the child"));
+        assert!(!label_description.contains("full agent"));
     }
 
     // ---- parse_model_spec ----
