@@ -926,6 +926,53 @@ impl ServerPluginInstaller {
         installed_at: DateTime<Utc>,
         _guard: &PluginOperationGuard,
     ) -> PluginResult<InstalledPlugin> {
+        self.install_with_operation_inner(
+            manifest,
+            plugin_dir,
+            source,
+            disposition,
+            installed_at,
+            _guard,
+            false,
+        )
+        .await
+    }
+
+    /// Deterministic test seam for the final `Installing` -> `Installed`
+    /// provenance commit. It exercises the complete registration and abort
+    /// path without depending on platform-specific chmod/locking behavior.
+    #[cfg(test)]
+    pub(crate) async fn install_with_operation_failing_final_commit(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        source: PluginSource,
+        disposition: InstallDisposition,
+        installed_at: DateTime<Utc>,
+        guard: &PluginOperationGuard,
+    ) -> PluginResult<InstalledPlugin> {
+        self.install_with_operation_inner(
+            manifest,
+            plugin_dir,
+            source,
+            disposition,
+            installed_at,
+            guard,
+            true,
+        )
+        .await
+    }
+
+    async fn install_with_operation_inner(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        source: PluginSource,
+        disposition: InstallDisposition,
+        installed_at: DateTime<Utc>,
+        _guard: &PluginOperationGuard,
+        fail_final_provenance_commit: bool,
+    ) -> PluginResult<InstalledPlugin> {
         let installed_json_path = self.installed_json_path();
 
         // Disposition gate (AlreadyInstalled only for a COMPLETED prior
@@ -1107,8 +1154,19 @@ impl ServerPluginInstaller {
             status: PluginInstallStatus::Installed,
             registered,
         };
-        self.upsert_provenance(entry.clone(), &installed_json_path)
-            .await?;
+        let final_commit = if fail_final_provenance_commit {
+            Err(PluginError::Registration(
+                "injected final Installed provenance commit failure".to_string(),
+            ))
+        } else {
+            self.upsert_provenance(entry.clone(), &installed_json_path)
+                .await
+        };
+        if let Err(error) = final_commit {
+            self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                .await;
+            return Err(error);
+        }
 
         Ok(entry)
     }

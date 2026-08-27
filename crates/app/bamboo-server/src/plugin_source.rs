@@ -1253,6 +1253,8 @@ enum ServerSourceFault {
     ReplaceLiveAfterStop,
     #[cfg(test)]
     RollbackDestinationDirectory,
+    #[cfg(test)]
+    FinalProvenanceCommitFailure,
 }
 
 impl ServerSourceFault {
@@ -1267,6 +1269,8 @@ impl ServerSourceFault {
             Self::ReplaceLiveAfterStop => ActivationFault::None,
             #[cfg(test)]
             Self::RollbackDestinationDirectory => ActivationFault::None,
+            #[cfg(test)]
+            Self::FinalProvenanceCommitFailure => ActivationFault::None,
         }
     }
 
@@ -1306,6 +1310,11 @@ impl ServerSourceFault {
             Self::RollbackDestinationDirectory => RollbackFault::ReplaceDestinationDirectory,
             _ => RollbackFault::None,
         }
+    }
+
+    #[cfg(test)]
+    fn fail_final_provenance_commit(&self) -> bool {
+        matches!(self, Self::FinalProvenanceCommitFailure)
     }
 }
 
@@ -1456,16 +1465,45 @@ async fn install_server_plugin_from_source_inner(
     let install_result = match fault.injected_install_error() {
         Some(error) => Err(error),
         None => {
-            installer
-                .install_with_operation(
-                    &manifest,
-                    &plugin_dir,
-                    source,
-                    disposition,
-                    chrono::Utc::now(),
-                    &guard,
-                )
-                .await
+            #[cfg(test)]
+            {
+                if fault.fail_final_provenance_commit() {
+                    installer
+                        .install_with_operation_failing_final_commit(
+                            &manifest,
+                            &plugin_dir,
+                            source,
+                            disposition,
+                            chrono::Utc::now(),
+                            &guard,
+                        )
+                        .await
+                } else {
+                    installer
+                        .install_with_operation(
+                            &manifest,
+                            &plugin_dir,
+                            source,
+                            disposition,
+                            chrono::Utc::now(),
+                            &guard,
+                        )
+                        .await
+                }
+            }
+            #[cfg(not(test))]
+            {
+                installer
+                    .install_with_operation(
+                        &manifest,
+                        &plugin_dir,
+                        source,
+                        disposition,
+                        chrono::Utc::now(),
+                        &guard,
+                    )
+                    .await
+            }
         }
     };
     match install_result {

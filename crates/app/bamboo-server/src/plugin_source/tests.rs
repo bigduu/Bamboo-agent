@@ -4,8 +4,11 @@ use actix_web::web;
 use async_trait::async_trait;
 use bamboo_config::{PluginTrustConfig, PluginTrustEnforcement, TrustedKey};
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, PluginError, PluginInstaller, PluginManifest,
-    PluginResult, PluginSource,
+    InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
+    PluginInstaller, PluginManifest, PluginResult, PluginSource,
+};
+use bamboo_plugin_protocol::{
+    FILE_CHANGED_SUBSCRIPTION_ID_V1, TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
@@ -1867,6 +1870,28 @@ fn service_plugin_manifest_json(version: &str) -> String {
     .to_string()
 }
 
+fn event_sink_service_plugin_manifest_json(version: &str, sink_id: &str) -> String {
+    serde_json::json!({
+        "id": "svc-plugin",
+        "name": "Service Event Sink Plugin",
+        "version": version,
+        "provides": {
+            "services": [{"id": "svc", "command": "${platform_bin}"}],
+            "event_sinks": [{
+                "id": sink_id,
+                "service_id": "svc",
+                "protocol": {
+                    "name": TOOL_EVENT_PROTOCOL_NAME,
+                    "version": TOOL_EVENT_V1_SCHEMA_VERSION
+                },
+                "subscriptions": [{"id": FILE_CHANGED_SUBSCRIPTION_ID_V1}],
+                "requested_permissions": ["metadata"]
+            }]
+        }
+    })
+    .to_string()
+}
+
 async fn server_upgrade_fixture(
     root: &Path,
 ) -> (
@@ -1921,6 +1946,77 @@ async fn server_upgrade_fixture(
         .unwrap();
 
     (state, installer, plugins_root, live_dir, source_dir)
+}
+
+async fn server_final_commit_upgrade_fixture(
+    root: &Path,
+) -> (
+    web::Data<AppState>,
+    ServerPluginInstaller,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+    InstalledPlugin,
+) {
+    let data_dir = root.join("bamboo-home");
+    let state = AppState::new(data_dir.clone())
+        .await
+        .expect("app state should initialize");
+    state.wait_for_boot_reconcile_services().await;
+    let state = web::Data::new(state);
+    let installer = ServerPluginInstaller::new(state.clone());
+    let plugins_root = data_dir.join("plugins");
+    let live_dir = plugins_root.join("svc-plugin");
+    tokio::fs::create_dir_all(&live_dir).await.unwrap();
+    let old_manifest_json = event_sink_service_plugin_manifest_json("1.0.0", "old-sink");
+    tokio::fs::write(live_dir.join("plugin.json"), &old_manifest_json)
+        .await
+        .unwrap();
+    tokio::fs::write(live_dir.join("OLD_MARKER"), b"old-bundle")
+        .await
+        .unwrap();
+    let old_manifest = PluginManifest::parse_str(&old_manifest_json).unwrap();
+    installer
+        .install(
+            &old_manifest,
+            &live_dir,
+            PluginSource::LocalDir {
+                path: live_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install old event-sink service plugin");
+    assert!(state.service_manager.is_running("svc"));
+    let previous = InstalledPlugins::load(&plugins_root.join("installed.json"))
+        .await
+        .unwrap()
+        .get_unique("svc-plugin")
+        .unwrap()
+        .unwrap()
+        .clone();
+
+    let source_dir = root.join("new-source");
+    tokio::fs::create_dir_all(&source_dir).await.unwrap();
+    tokio::fs::write(
+        source_dir.join("plugin.json"),
+        event_sink_service_plugin_manifest_json("2.0.0", "new-sink"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(source_dir.join("NEW_MARKER"), b"new-bundle")
+        .await
+        .unwrap();
+
+    (
+        state,
+        installer,
+        plugins_root,
+        live_dir,
+        source_dir,
+        previous,
+    )
 }
 
 #[tokio::test]
@@ -2210,6 +2306,86 @@ async fn server_source_transaction_never_restarts_after_verified_activation_rest
         "old-bundle"
     );
     assert!(!live_dir.join("NEW_MARKER").exists());
+}
+
+#[tokio::test]
+async fn final_provenance_commit_failure_aborts_registration_and_restores_exact_upgrade_state() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir, previous) =
+        server_final_commit_upgrade_fixture(root.path()).await;
+    let old_identity = bundle_directory_identity(&live_dir).unwrap();
+    assert_eq!(previous.status, PluginInstallStatus::Installed);
+    assert_eq!(previous.version, "1.0.0");
+    assert_eq!(previous.plugin_dir, live_dir);
+    assert_eq!(
+        previous.source,
+        PluginSource::LocalDir {
+            path: live_dir.clone()
+        }
+    );
+    assert_eq!(previous.registered.service_ids, vec!["svc".to_string()]);
+    assert_eq!(
+        previous.registered.event_sink_ids,
+        vec!["old-sink".to_string()]
+    );
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::FinalProvenanceCommitFailure,
+    )
+    .await
+    .expect_err("the injected final Installed provenance commit must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("injected final Installed provenance commit failure"),
+        "{message}"
+    );
+    assert!(message.contains("service(s) [svc]"), "{message}");
+    assert!(
+        message.contains("remain stopped pending manual recovery"),
+        "{message}"
+    );
+
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "abort_install must stop the service started from the new bundle, and the old service must remain stopped"
+    );
+    assert_eq!(bundle_directory_identity(&live_dir).unwrap(), old_identity);
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    assert!(
+        !live_dir.join("NEW_MARKER").exists(),
+        "the new bundle must not remain at the live path"
+    );
+
+    let restored = InstalledPlugins::load(&plugins_root.join("installed.json"))
+        .await
+        .unwrap()
+        .get_unique("svc-plugin")
+        .unwrap()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        restored, previous,
+        "abort_install must restore the previous Installed row byte-for-byte at the model level"
+    );
+    assert_eq!(restored.status, PluginInstallStatus::Installed);
+    assert_eq!(restored.version, "1.0.0");
+    assert_eq!(restored.plugin_dir, live_dir);
+    assert_eq!(restored.registered.service_ids, vec!["svc".to_string()]);
+    assert_eq!(
+        restored.registered.event_sink_ids,
+        vec!["old-sink".to_string()]
+    );
 }
 
 #[tokio::test]
