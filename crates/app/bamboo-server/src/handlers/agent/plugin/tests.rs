@@ -27,8 +27,6 @@ use chrono::Utc;
 
 use crate::app_state::AppState;
 
-use super::handlers::{install_plugin, list_plugins, remove_plugin, update_plugin};
-
 fn hello_plugin_example_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/bamboo-plugin/examples/hello-plugin")
 }
@@ -41,19 +39,15 @@ async fn test_state(data_dir: &Path) -> web::Data<AppState> {
     )
 }
 
-/// Registers the same 4 routes `routes::agent::plugin_scope` wires under
-/// `/api/v1/plugins` (see that module) directly on a bare `App`, matching
-/// `handlers/agent/stream/tests.rs`'s inline-`App`-per-test style — factoring
-/// this into a shared fn would need to name `App`'s hairy service-factory
-/// generic, which isn't worth it for 4 `.route()` calls repeated 6 times.
+/// Mount the production plugin scope under its production `/api/v1` prefix.
+/// Keeping one route-registration point prevents integration tests from
+/// drifting from production method/path bindings and keeps endpoint analysis
+/// from treating every macro expansion as a distinct handler registration.
 macro_rules! plugin_test_app {
     ($state:expr) => {
         App::new()
             .app_data($state)
-            .route("/api/v1/plugins", web::get().to(list_plugins))
-            .route("/api/v1/plugins/install", web::post().to(install_plugin))
-            .route("/api/v1/plugins/{id}/update", web::post().to(update_plugin))
-            .route("/api/v1/plugins/{id}", web::delete().to(remove_plugin))
+            .service(web::scope("/api/v1").service(crate::routes::plugin_scope()))
     };
 }
 

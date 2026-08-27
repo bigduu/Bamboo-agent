@@ -242,53 +242,83 @@ pub enum PluginSourceInput {
 /// manifest and run shared ownership preflight before [`Self::activate`]
 /// swaps any existing `plugins/<id>` directory.
 #[derive(Debug)]
-pub struct PreparedPlugin {
-    pub manifest: PluginManifest,
-    pub prepared_dir: PathBuf,
-    pub plugin_dir: PathBuf,
-    pub source: PluginSource,
+struct PreparedPlugin {
+    manifest: PluginManifest,
+    prepared_dir: PathBuf,
+    plugin_dir: PathBuf,
+    source: PluginSource,
 }
 
 impl PreparedPlugin {
     /// Atomically make this candidate the plugin's fixed on-disk bundle,
     /// retaining the previous bundle for commit/rollback. Shared ownership
     /// preflight and upgrade service shutdown must happen before this call.
-    pub async fn activate(self) -> PluginResult<StagedPlugin> {
-        let backup_dir = if tokio::fs::try_exists(&self.plugin_dir)
-            .await
-            .unwrap_or(false)
-        {
-            let root = self.plugin_dir.parent().ok_or_else(|| {
-                PluginError::InvalidManifest("plugin directory has no parent".to_string())
-            })?;
-            let backup = root.join(format!(
-                ".backup-{}-{}",
-                self.manifest.id,
-                uuid::Uuid::new_v4()
-            ));
-            if let Err(error) = tokio::fs::rename(&self.plugin_dir, &backup).await {
+    async fn activate(self) -> PluginResult<StagedPlugin> {
+        self.activate_inner(ActivationFault::None).await
+    }
+
+    async fn activate_inner(self, fault: ActivationFault) -> PluginResult<StagedPlugin> {
+        let backup_dir = match tokio::fs::symlink_metadata(&self.plugin_dir).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+                    return Err(PluginError::InvalidManifest(format!(
+                        "existing plugin destination '{}' must be a real directory",
+                        self.plugin_dir.display()
+                    )));
+                }
+                let root = self.plugin_dir.parent().ok_or_else(|| {
+                    PluginError::InvalidManifest("plugin directory has no parent".to_string())
+                })?;
+                let backup = root.join(format!(
+                    ".backup-{}-{}",
+                    self.manifest.id,
+                    uuid::Uuid::new_v4()
+                ));
+                if let Err(error) = rename_noreplace(&self.plugin_dir, &backup) {
+                    let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+                    return Err(PluginError::Io(error));
+                }
+                Some(backup)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
                 let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
                 return Err(PluginError::Io(error));
             }
-            Some(backup)
-        } else {
-            None
         };
 
-        if let Err(rename_error) = tokio::fs::rename(&self.prepared_dir, &self.plugin_dir).await {
-            // Cross-device (e.g. staging on a different mount) — fall back to
-            // a recursive copy, then remove the prepared directory.
-            if let Err(copy_error) = copy_dir_recursive(&self.prepared_dir, &self.plugin_dir).await
-            {
-                let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
-                let _ = tokio::fs::remove_dir_all(&self.plugin_dir).await;
-                if let Some(backup) = &backup_dir {
-                    let _ = tokio::fs::rename(backup, &self.plugin_dir).await;
-                }
-                tracing::warn!(%rename_error, %copy_error, "failed to activate prepared plugin bundle");
-                return Err(copy_error);
-            }
+        fault.install_destination(&self.plugin_dir)?;
+        let rename_result = if fault.fail_candidate_rename() {
+            Err(std::io::Error::other(
+                "injected prepared-plugin activation rename failure",
+            ))
+        } else {
+            rename_noreplace(&self.prepared_dir, &self.plugin_dir)
+        };
+        if let Err(rename_error) = rename_result {
+            // Both paths are siblings below one plugins root, so EXDEV is an
+            // invariant violation, not a reason to merge-copy into a live
+            // destination. Clean only the private UUID candidate. If an old
+            // bundle was backed up, restore it with an atomic NOREPLACE
+            // rename; a race-created destination is never overwritten or
+            // deleted, and a failed restore deliberately leaves the backup
+            // intact for operator recovery.
             let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+            let restore = match &backup_dir {
+                Some(backup) => match rename_noreplace(backup, &self.plugin_dir) {
+                    Ok(()) => "the previous bundle was restored".to_string(),
+                    Err(restore_error) => format!(
+                        "the previous bundle remains safely preserved at '{}' because the live destination could not be restored without replacement: {restore_error}",
+                        backup.display()
+                    ),
+                },
+                None => "there was no previous bundle to restore".to_string(),
+            };
+            return Err(PluginError::Registration(format!(
+                "failed to atomically activate prepared plugin '{}' with a no-replace rename: {rename_error}; {restore}",
+                self.manifest.id
+            )));
         }
 
         Ok(StagedPlugin {
@@ -301,9 +331,155 @@ impl PreparedPlugin {
 
     /// Remove an unactivated candidate after path-id or ownership preflight
     /// refuses it. The live plugin bundle is untouched.
-    pub async fn discard(self) {
+    async fn discard(self) {
         let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
     }
+
+    #[cfg(test)]
+    async fn activate_with_fault(self, fault: ActivationFault) -> PluginResult<StagedPlugin> {
+        self.activate_inner(fault).await
+    }
+}
+
+#[derive(Debug)]
+enum ActivationFault {
+    None,
+    #[cfg(test)]
+    FailCandidateRename,
+    #[cfg(test)]
+    CreateDestinationDirectory,
+    #[cfg(all(test, unix))]
+    CreateDestinationSymlink(PathBuf),
+}
+
+impl ActivationFault {
+    fn fail_candidate_rename(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::FailCandidateRename)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn install_destination(&self, _destination: &Path) -> PluginResult<()> {
+        match self {
+            Self::None => Ok(()),
+            #[cfg(test)]
+            Self::FailCandidateRename => Ok(()),
+            #[cfg(test)]
+            Self::CreateDestinationDirectory => {
+                std::fs::create_dir(_destination)?;
+                std::fs::write(_destination.join("RACE_MARKER"), b"race-owned")?;
+                Ok(())
+            }
+            #[cfg(all(test, unix))]
+            Self::CreateDestinationSymlink(target) => {
+                std::os::unix::fs::symlink(target, _destination)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Atomically rename one sibling entry without replacing any destination that
+/// appeared after preflight. Prepared-bundle publication and its immediate
+/// backup restoration both use this primitive, so neither can overwrite a
+/// race-created directory, file, symlink, or Windows reparse point.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsFd;
+
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if source_parent != destination_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prepared plugin activation paths must be siblings",
+        ));
+    }
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let parent = std::fs::File::open(source_parent)?;
+    rustix::fs::renameat_with(
+        parent.as_fd(),
+        source_name,
+        parent.as_fd(),
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if source_parent != destination_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prepared plugin activation paths must be siblings",
+        ));
+    }
+
+    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plugin activation path contains an interior NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = nul_terminated(source)?;
+    let destination = nul_terminated(destination)?;
+    // No MOVEFILE_REPLACE_EXISTING flag: a destination that appeared after
+    // preflight, including a reparse point, makes this atomic rename fail.
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
+fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace plugin activation is unavailable on this platform",
+    ))
 }
 
 /// The result of staging a [`PluginSourceInput`] into `plugins_dir()/<id>/`:
@@ -346,7 +522,7 @@ impl StagedPlugin {
 /// Prepare a source completely in an isolated scratch directory without
 /// swapping `plugins/<id>`. This is the production seam for callers that must
 /// perform global provenance/ownership checks before any shared mutation.
-pub async fn prepare_plugin_source(
+async fn prepare_plugin_source(
     input: PluginSourceInput,
     plugins_root: &Path,
     trust: &PluginTrustConfig,

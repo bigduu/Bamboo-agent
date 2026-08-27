@@ -1805,6 +1805,158 @@ async fn local_dir_install_ignores_a_hostile_trust_config() {
 }
 
 // ---------------------------------------------------------------------
+// Prepared bundle activation is a rename-only sibling transaction. A failed
+// candidate publication must never merge-copy into, delete, or overwrite a
+// destination that appeared after preflight.
+// ---------------------------------------------------------------------
+
+async fn prepared_upgrade_fixture(root: &Path) -> (PreparedPlugin, PathBuf, PathBuf, PathBuf) {
+    let plugins_root = root.join("plugins");
+    let live_dir = plugins_root.join("hello-plugin");
+    write_hello_plugin_dir(&live_dir, "hello-plugin").await;
+    tokio::fs::write(live_dir.join("OLD_MARKER"), b"old-bundle")
+        .await
+        .unwrap();
+
+    let source_dir = root.join("new-source");
+    write_hello_plugin_dir(&source_dir, "hello-plugin").await;
+    tokio::fs::write(source_dir.join("NEW_MARKER"), b"new-bundle")
+        .await
+        .unwrap();
+    let prepared = prepare_plugin_source(
+        PluginSourceInput::LocalDir(source_dir.clone()),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .expect("prepare candidate");
+    (prepared, plugins_root, live_dir, source_dir)
+}
+
+async fn plugin_root_entry_names(plugins_root: &Path) -> Vec<String> {
+    let mut entries = tokio::fs::read_dir(plugins_root).await.unwrap();
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn activation_second_rename_failure_restores_old_bundle_without_copying_candidate() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+
+    let error = prepared
+        .activate_with_fault(ActivationFault::FailCandidateRename)
+        .await
+        .expect_err("injected candidate rename must fail");
+    assert!(error.to_string().contains("previous bundle was restored"));
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    assert!(
+        !live_dir.join("NEW_MARKER").exists(),
+        "candidate bytes must never be merge-copied into the restored bundle"
+    );
+    assert_eq!(
+        plugin_root_entry_names(&plugins_root).await,
+        vec!["hello-plugin".to_string()],
+        "a safely restored failure must clean only its UUID candidate and consume the backup"
+    );
+}
+
+#[tokio::test]
+async fn activation_destination_race_is_preserved_and_old_bundle_stays_in_backup() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+
+    let error = prepared
+        .activate_with_fault(ActivationFault::CreateDestinationDirectory)
+        .await
+        .expect_err("race-created destination must make no-replace publication fail");
+    assert!(error.to_string().contains("remains safely preserved"));
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("RACE_MARKER"))
+            .await
+            .unwrap(),
+        "race-owned",
+        "activation must not delete or overwrite the unexpected destination"
+    );
+    assert!(!live_dir.join("NEW_MARKER").exists());
+
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert!(
+        names.iter().all(|name| !name.starts_with(".staging-")),
+        "the internal UUID candidate must be cleaned: {names:?}"
+    );
+    let backups: Vec<_> = names
+        .iter()
+        .filter(|name| name.starts_with(".backup-hello-plugin-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "old bundle must remain recoverable");
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join(backups[0]).join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn activation_symlink_race_never_touches_external_target() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+    let external = root.path().join("external-target");
+    tokio::fs::create_dir(&external).await.unwrap();
+    tokio::fs::write(external.join("SENTINEL"), b"external-owned")
+        .await
+        .unwrap();
+
+    let error = prepared
+        .activate_with_fault(ActivationFault::CreateDestinationSymlink(external.clone()))
+        .await
+        .expect_err("symlink destination must make no-replace publication fail");
+    assert!(error.to_string().contains("remains safely preserved"));
+    assert!(
+        tokio::fs::symlink_metadata(&live_dir)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the race-created symlink itself must remain untouched"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(external.join("SENTINEL"))
+            .await
+            .unwrap(),
+        "external-owned"
+    );
+    assert!(
+        !external.join("plugin.json").exists() && !external.join("NEW_MARKER").exists(),
+        "candidate bytes must never be written through the symlink"
+    );
+
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert!(names.iter().all(|name| !name.starts_with(".staging-")));
+    let backup = names
+        .iter()
+        .find(|name| name.starts_with(".backup-hello-plugin-"))
+        .expect("old bundle backup");
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join(backup).join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+}
+
+// ---------------------------------------------------------------------
 // install_plugin_from_source: commit/rollback around a real install() call
 // ---------------------------------------------------------------------
 

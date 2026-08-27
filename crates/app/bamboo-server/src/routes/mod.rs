@@ -10,6 +10,8 @@ mod bamboo_v1;
 mod provider;
 
 pub use agent::agent_routes;
+#[cfg(test)]
+pub(crate) use agent::plugin_scope;
 pub use bamboo_v1::bamboo_v1_routes;
 pub use provider::{anthropic_routes, gemini_routes, openai_prefixed_routes};
 
