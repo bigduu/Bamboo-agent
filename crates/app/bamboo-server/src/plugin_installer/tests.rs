@@ -1877,6 +1877,51 @@ async fn restart_services_after_failed_upgrade_restarts_from_the_still_installed
 }
 
 #[tokio::test]
+async fn restart_services_after_failed_upgrade_rejects_restored_manifest_identity_mismatch() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+
+    let plugin_dir = root.path().join("plugins").join("svc-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+    installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install");
+
+    let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
+    assert_eq!(stopped, vec!["svc".to_string()]);
+    assert!(!state.service_manager.is_running("svc"));
+
+    // Simulate an ambiguous rollback result at the installed path. Even
+    // though it declares the same service id, its plugin identity is not the
+    // installed row's identity and must never be used to restart the process.
+    let mismatched = service_manifest_json("other-plugin", "1.0.0", &["svc"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), mismatched)
+        .await
+        .unwrap();
+    installer
+        .restart_services_after_failed_upgrade("svc-plugin", &stopped)
+        .await;
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "a manifest identity mismatch must keep the stopped service stopped"
+    );
+}
+
+#[tokio::test]
 async fn restart_services_after_failed_upgrade_skips_a_service_the_rolled_back_manifest_disabled() {
     let root = tempfile::tempdir().unwrap();
     let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;

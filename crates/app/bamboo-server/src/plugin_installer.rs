@@ -917,14 +917,14 @@ impl ServerPluginInstaller {
         stopped
     }
 
-    /// Counterpart to [`Self::stop_services_for_upgrade`]: called after a
-    /// FAILED upgrade whose `StagedPlugin::rollback()` already restored
-    /// `plugin_dir` to the pre-upgrade bundle's bytes — re-reads that
-    /// (now-restored) OLD `plugin.json` and restarts exactly the services in
-    /// `stopped` that it still declares as `enabled`. Best-effort/
-    /// log-and-continue: a failure here leaves the affected service stopped
-    /// (a degraded-but-safe outcome — never silently double-runs an old and
-    /// a new instance) rather than panicking the request.
+    /// Counterpart to [`Self::stop_services_for_upgrade`]: called only after
+    /// the source transaction reports that an identity-verified previous
+    /// bundle is live again. Defense in depth re-parses and validates that
+    /// OLD manifest, checks its plugin identity and current-platform gate,
+    /// then restarts exactly the services in `stopped` that it still declares
+    /// as `enabled`. Best-effort/log-and-continue: any mismatch or failure
+    /// leaves the affected service stopped (a degraded-but-safe outcome —
+    /// never silently runs from an ambiguous bundle).
     pub async fn restart_services_after_failed_upgrade(&self, plugin_id: &str, stopped: &[String]) {
         if stopped.is_empty() {
             return;
@@ -969,7 +969,39 @@ impl ServerPluginInstaller {
                 return;
             }
         };
-        let platform = Platform::current().unwrap_or(Platform::Linux);
+        if manifest.id != plugin_id || manifest.id != entry.id {
+            tracing::warn!(
+                %plugin_id,
+                installed_id = %entry.id,
+                manifest_id = %manifest.id,
+                "restart_services_after_failed_upgrade: restored manifest identity mismatch; affected service(s) remain stopped"
+            );
+            return;
+        }
+        if let Err(error) = manifest.validate() {
+            tracing::warn!(
+                %plugin_id,
+                %error,
+                "restart_services_after_failed_upgrade: restored manifest failed validation; affected service(s) remain stopped"
+            );
+            return;
+        }
+        let Some(platform) = Platform::current() else {
+            tracing::warn!(
+                %plugin_id,
+                host_os = std::env::consts::OS,
+                "restart_services_after_failed_upgrade: unknown host platform; affected service(s) remain stopped"
+            );
+            return;
+        };
+        if !manifest.supports_platform(platform) {
+            tracing::warn!(
+                %plugin_id,
+                platform = platform.as_str(),
+                "restart_services_after_failed_upgrade: restored manifest excludes this platform; affected service(s) remain stopped"
+            );
+            return;
+        }
         for svc in &manifest.provides.services {
             if !stopped.contains(&svc.id) || !svc.enabled {
                 continue;

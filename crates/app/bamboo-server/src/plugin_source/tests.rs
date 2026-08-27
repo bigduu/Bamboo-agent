@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use actix_web::web;
 use async_trait::async_trait;
 use bamboo_config::{PluginTrustConfig, PluginTrustEnforcement, TrustedKey};
 use bamboo_plugin::{
@@ -10,6 +11,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 
 use super::*;
+use crate::app_state::AppState;
 
 fn hello_manifest_json(id: &str) -> String {
     serde_json::json!({
@@ -1843,6 +1845,74 @@ async fn plugin_root_entry_names(plugins_root: &Path) -> Vec<String> {
     names
 }
 
+fn service_plugin_manifest_json(version: &str) -> String {
+    serde_json::json!({
+        "id": "svc-plugin",
+        "name": "Service Plugin",
+        "version": version,
+        "provides": {
+            "services": [{"id": "svc", "command": "${platform_bin}"}]
+        }
+    })
+    .to_string()
+}
+
+async fn server_upgrade_fixture(
+    root: &Path,
+) -> (
+    web::Data<AppState>,
+    ServerPluginInstaller,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+) {
+    let data_dir = root.join("bamboo-home");
+    let state = AppState::new(data_dir.clone())
+        .await
+        .expect("app state should initialize");
+    state.wait_for_boot_reconcile_services().await;
+    let state = web::Data::new(state);
+    let installer = ServerPluginInstaller::new(state.clone());
+    let plugins_root = data_dir.join("plugins");
+    let live_dir = plugins_root.join("svc-plugin");
+    tokio::fs::create_dir_all(&live_dir).await.unwrap();
+    let old_manifest_json = service_plugin_manifest_json("1.0.0");
+    tokio::fs::write(live_dir.join("plugin.json"), &old_manifest_json)
+        .await
+        .unwrap();
+    tokio::fs::write(live_dir.join("OLD_MARKER"), b"old-bundle")
+        .await
+        .unwrap();
+    let old_manifest = PluginManifest::parse_str(&old_manifest_json).unwrap();
+    installer
+        .install(
+            &old_manifest,
+            &live_dir,
+            PluginSource::LocalDir {
+                path: live_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install old service plugin");
+    assert!(state.service_manager.is_running("svc"));
+
+    let source_dir = root.join("new-source");
+    tokio::fs::create_dir_all(&source_dir).await.unwrap();
+    tokio::fs::write(
+        source_dir.join("plugin.json"),
+        service_plugin_manifest_json("2.0.0"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(source_dir.join("NEW_MARKER"), b"new-bundle")
+        .await
+        .unwrap();
+
+    (state, installer, plugins_root, live_dir, source_dir)
+}
+
 #[tokio::test]
 async fn activation_second_rename_failure_restores_old_bundle_without_copying_candidate() {
     let root = tempfile::tempdir().unwrap();
@@ -1852,7 +1922,10 @@ async fn activation_second_rename_failure_restores_old_bundle_without_copying_ca
         .activate_with_fault(ActivationFault::FailCandidateRename)
         .await
         .expect_err("injected candidate rename must fail");
-    assert!(error.to_string().contains("previous bundle was restored"));
+    assert!(
+        error.restart_safe(),
+        "an identity-verified restored previous bundle must permit service restart"
+    );
     assert_eq!(
         tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
             .await
@@ -1879,7 +1952,11 @@ async fn activation_destination_race_is_preserved_and_old_bundle_stays_in_backup
         .activate_with_fault(ActivationFault::CreateDestinationDirectory)
         .await
         .expect_err("race-created destination must make no-replace publication fail");
-    assert!(error.to_string().contains("remains safely preserved"));
+    assert!(!error.restart_safe());
+    assert!(error
+        .into_plugin_error()
+        .to_string()
+        .contains("manual bundle recovery is required"));
     assert_eq!(
         tokio::fs::read_to_string(live_dir.join("RACE_MARKER"))
             .await
@@ -1922,7 +1999,11 @@ async fn activation_symlink_race_never_touches_external_target() {
         .activate_with_fault(ActivationFault::CreateDestinationSymlink(external.clone()))
         .await
         .expect_err("symlink destination must make no-replace publication fail");
-    assert!(error.to_string().contains("remains safely preserved"));
+    assert!(!error.restart_safe());
+    assert!(error
+        .into_plugin_error()
+        .to_string()
+        .contains("manual bundle recovery is required"));
     assert!(
         tokio::fs::symlink_metadata(&live_dir)
             .await
@@ -1954,6 +2035,138 @@ async fn activation_symlink_race_never_touches_external_target() {
             .unwrap(),
         "old-bundle"
     );
+}
+
+#[tokio::test]
+async fn server_source_transaction_restarts_only_after_verified_activation_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir) =
+        server_upgrade_fixture(root.path()).await;
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::ActivationRenameFailure,
+    )
+    .await
+    .expect_err("injected candidate publication must fail");
+    assert!(matches!(error, PluginError::Registration(_)));
+    assert!(
+        state.service_manager.is_running("svc"),
+        "an identity-verified restored old bundle permits restarting the service"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    assert!(!live_dir.join("NEW_MARKER").exists());
+}
+
+#[tokio::test]
+async fn server_source_transaction_keeps_service_stopped_when_activation_restore_is_blocked() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir) =
+        server_upgrade_fixture(root.path()).await;
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::ActivationDestinationDirectory,
+    )
+    .await
+    .expect_err("race-created destination must block activation and restore");
+    assert!(error
+        .to_string()
+        .contains("manual bundle recovery is required"));
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "the old service must stay stopped while live and backup paths are ambiguous"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("RACE_MARKER"))
+            .await
+            .unwrap(),
+        "race-owned"
+    );
+    assert!(!live_dir.join("NEW_MARKER").exists());
+    let names = plugin_root_entry_names(&plugins_root).await;
+    let backup = names
+        .iter()
+        .find(|name| name.starts_with(".backup-svc-plugin-"))
+        .expect("old bundle backup must remain recoverable");
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join(backup).join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+}
+
+#[tokio::test]
+async fn server_source_transaction_preserves_rollback_race_and_does_not_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir) =
+        server_upgrade_fixture(root.path()).await;
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::RollbackDestinationDirectory,
+    )
+    .await
+    .expect_err("injected install failure must enter rollback");
+    assert!(error
+        .to_string()
+        .contains("manual bundle recovery is required"));
+    assert!(
+        !state.service_manager.is_running("svc"),
+        "rollback ambiguity must leave the previously-stopped service stopped"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("RACE_MARKER"))
+            .await
+            .unwrap(),
+        "race-owned",
+        "rollback must put the unexpected destination back without modifying it"
+    );
+    assert!(!live_dir.join("NEW_MARKER").exists());
+
+    let names = plugin_root_entry_names(&plugins_root).await;
+    let backup = names
+        .iter()
+        .find(|name| name.starts_with(".backup-svc-plugin-"))
+        .expect("old bundle backup must stay preserved");
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join(backup).join("OLD_MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    let displaced = names
+        .iter()
+        .find(|name| name.starts_with(".fault-displaced-candidate-"))
+        .expect("the known new candidate must also remain preserved");
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join(displaced).join("NEW_MARKER"))
+            .await
+            .unwrap(),
+        "new-bundle"
+    );
+    assert!(names.iter().all(|name| !name.starts_with(".rollback-")));
 }
 
 // ---------------------------------------------------------------------
@@ -2012,9 +2225,12 @@ async fn install_plugin_from_source_rolls_back_new_bundle_on_install_failure() {
         !plugins_root.join("hello-plugin").exists(),
         "a failed install must not leave a half-installed bundle behind"
     );
-    // No stray staging/backup directories left over either.
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(leftovers.next_entry().await.unwrap().is_none());
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert_eq!(names.len(), 1);
+    assert!(
+        names[0].starts_with(".rollback-hello-plugin-"),
+        "the failed candidate is retained only at its inert quarantine path: {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -2048,15 +2264,13 @@ async fn install_plugin_from_source_restores_previous_bundle_on_upgrade_failure(
         existing_dir.join("MARKER").exists(),
         "a failed upgrade must restore the pre-upgrade bundle"
     );
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    let mut names: Vec<String> = Vec::new();
-    while let Some(entry) = leftovers.next_entry().await.unwrap() {
-        names.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    assert_eq!(
-        names,
-        vec!["hello-plugin".to_string()],
-        "no stray staging/backup dirs should remain: {names:?}"
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert!(names.iter().any(|name| name == "hello-plugin"));
+    assert!(
+        names
+            .iter()
+            .any(|name| name.starts_with(".rollback-hello-plugin-")),
+        "the old bundle must be live and the failed candidate retained only in quarantine: {names:?}"
     );
 }
 
