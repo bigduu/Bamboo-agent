@@ -7,6 +7,9 @@ use bamboo_plugin::{
     McpTransportManifest, Platform, PluginError, PluginInstallStatus, PluginInstaller,
     PluginManifest, PluginSource, RegisteredCapabilities,
 };
+use bamboo_plugin_protocol::{
+    FILE_CHANGED_SUBSCRIPTION_ID_V1, TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
+};
 use chrono::Utc;
 
 use super::ServerPluginInstaller;
@@ -106,6 +109,45 @@ fn service_manifest_json(id: &str, version: &str, service_ids: &[&str]) -> Strin
         "version": version,
         "provides": {
             "services": services,
+        }
+    })
+    .to_string()
+}
+
+fn event_sink_manifest_json(
+    id: &str,
+    version: &str,
+    service_id: &str,
+    sink_versions: &[(&str, u16)],
+) -> String {
+    let sinks: Vec<serde_json::Value> = sink_versions
+        .iter()
+        .map(|(sink_id, protocol_version)| {
+            serde_json::json!({
+                "id": sink_id,
+                "service_id": service_id,
+                "protocol": {
+                    "name": TOOL_EVENT_PROTOCOL_NAME,
+                    "version": protocol_version
+                },
+                "subscriptions": [{"id": FILE_CHANGED_SUBSCRIPTION_ID_V1}],
+                "requested_permissions": ["metadata"]
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": id,
+        "name": "Test Event Sink Plugin",
+        "version": version,
+        "provides": {
+            // Disabled is a valid #479 declaration. It avoids process spawn in
+            // these provenance-only #903 tests and must not erase sink ownership.
+            "services": [{
+                "id": service_id,
+                "enabled": false,
+                "command": "${platform_bin}"
+            }],
+            "event_sinks": sinks
         }
     })
     .to_string()
@@ -1140,6 +1182,276 @@ async fn upgrade_deregisters_service_dropped_by_the_new_version_and_frees_the_id
         .await
         .expect("beta must be free for a different plugin to claim after the upgrade dropped it");
     assert_eq!(other_entry.registered.service_ids, vec!["beta".to_string()]);
+}
+
+// ---------------------------------------------------------------------
+// Event sink manifest/provenance foundation (#903). This slice records exact
+// ownership and validates before mutation; it deliberately creates no live
+// router, queue, or service-input channel (#905/#906).
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn install_records_supported_and_future_event_sink_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let plugin_dir = root.path().join("plugins").join("event-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = event_sink_manifest_json(
+        "event-plugin",
+        "1.0.0",
+        "audit-service",
+        &[
+            ("audit-v1", TOOL_EVENT_V1_SCHEMA_VERSION),
+            ("audit-future", TOOL_EVENT_V1_SCHEMA_VERSION + 1),
+        ],
+    );
+    let mut manifest_value: serde_json::Value =
+        serde_json::from_str(&manifest_json).expect("manifest json");
+    manifest_value["provides"]["event_sinks"][1]["subscriptions"] =
+        serde_json::json!([{"id": "tool.symbol_changed.v2", "tool_names": ["FutureTool"]}]);
+    manifest_value["provides"]["event_sinks"][1]["requested_permissions"] =
+        serde_json::json!(["symbol_metadata_v2"]);
+    let manifest_json = manifest_value.to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let entry = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("supported and future sinks should both install");
+    assert_eq!(
+        entry.registered.event_sink_ids,
+        vec!["audit-v1".to_string(), "audit-future".to_string()]
+    );
+    assert_eq!(
+        entry.registered.service_ids,
+        vec!["audit-service".to_string()]
+    );
+
+    let listed = installer.list().await.unwrap();
+    assert_eq!(
+        listed[0].registered.event_sink_ids,
+        entry.registered.event_sink_ids
+    );
+
+    installer
+        .uninstall("event-plugin")
+        .await
+        .expect("uninstall clears sink provenance with the plugin row");
+    assert!(installer.list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn foreign_event_sink_conflict_fails_before_candidate_provenance_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let installed_json = state.app_data_dir.join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::default();
+    store.add(InstalledPlugin {
+        id: "owner-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: PathBuf::from("/tmp/owner-plugin"),
+        },
+        plugin_dir: PathBuf::from("/tmp/owner-plugin"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            event_sink_ids: vec!["shared-sink".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+
+    let plugin_dir = root.path().join("plugins").join("candidate-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = event_sink_manifest_json(
+        "candidate-plugin",
+        "1.0.0",
+        "candidate-service",
+        &[("shared-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect_err("foreign sink ownership must fail before registration");
+    assert!(matches!(
+        error,
+        PluginError::Conflict {
+            kind: "event sink",
+            ..
+        }
+    ));
+    let listed = installer.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "owner-plugin");
+    assert_eq!(listed[0].registered.event_sink_ids, vec!["shared-sink"]);
+}
+
+#[tokio::test]
+async fn invalid_sink_policy_fails_before_mcp_or_service_registration() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let plugin_dir = root.path().join("plugins").join("invalid-event-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let manifest_json = event_sink_manifest_json(
+        "invalid-event-plugin",
+        "1.0.0",
+        "must-not-register-service",
+        &[("invalid-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let mut manifest_value: serde_json::Value =
+        serde_json::from_str(&manifest_json).expect("manifest json");
+    manifest_value["provides"]["event_sinks"][0]["requested_permissions"] =
+        serde_json::json!(["metadata", "unknown-v1-permission"]);
+    manifest_value["provides"]["mcp_servers"] = serde_json::json!([{
+        "id": "must-not-register-mcp",
+        "transport": {"type": "stdio", "command": NONEXISTENT_COMMAND}
+    }]);
+    let manifest_json = manifest_value.to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect_err("invalid sink policy must fail in pure preflight");
+    assert!(matches!(error, PluginError::InvalidManifest(_)));
+    assert!(installer.list().await.unwrap().is_empty());
+    assert!(!state
+        .config
+        .read()
+        .await
+        .mcp
+        .servers
+        .iter()
+        .any(|server| server.id == "must-not-register-mcp"));
+    assert!(!state
+        .service_manager
+        .is_running("must-not-register-service"));
+}
+
+#[tokio::test]
+async fn upgrade_replaces_event_sink_provenance_exactly_and_frees_removed_id() {
+    let root = tempfile::tempdir().unwrap();
+    let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let plugin_dir = root.path().join("plugins").join("event-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let v1_json = event_sink_manifest_json(
+        "event-plugin",
+        "1.0.0",
+        "audit-service",
+        &[
+            ("retained", TOOL_EVENT_V1_SCHEMA_VERSION),
+            ("removed", TOOL_EVENT_V1_SCHEMA_VERSION),
+        ],
+    );
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v1_json)
+        .await
+        .unwrap();
+    let v1 = PluginManifest::parse_str(&v1_json).unwrap();
+    installer
+        .install(
+            &v1,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("install event sink v1");
+
+    let v2_json = event_sink_manifest_json(
+        "event-plugin",
+        "2.0.0",
+        "audit-service",
+        &[
+            ("retained", TOOL_EVENT_V1_SCHEMA_VERSION),
+            ("added", TOOL_EVENT_V1_SCHEMA_VERSION),
+        ],
+    );
+    tokio::fs::write(plugin_dir.join("plugin.json"), &v2_json)
+        .await
+        .unwrap();
+    let v2 = PluginManifest::parse_str(&v2_json).unwrap();
+    let upgraded = installer
+        .install(
+            &v2,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+        )
+        .await
+        .expect("upgrade event sink plugin");
+    assert_eq!(
+        upgraded.registered.event_sink_ids,
+        vec!["retained".to_string(), "added".to_string()]
+    );
+
+    let other_dir = root.path().join("plugins").join("other-event-plugin");
+    tokio::fs::create_dir_all(&other_dir).await.unwrap();
+    let other_json = event_sink_manifest_json(
+        "other-event-plugin",
+        "1.0.0",
+        "other-service",
+        &[("removed", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    tokio::fs::write(other_dir.join("plugin.json"), &other_json)
+        .await
+        .unwrap();
+    let other = PluginManifest::parse_str(&other_json).unwrap();
+    installer
+        .install(
+            &other,
+            &other_dir,
+            PluginSource::LocalDir {
+                path: other_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect("removed sink id must be free for another plugin");
 }
 
 // ---------------------------------------------------------------------

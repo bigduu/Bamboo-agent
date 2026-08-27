@@ -290,6 +290,20 @@ impl ServerPluginInstaller {
             .collect())
     }
 
+    /// Event-sink ids are process/AppState registration keys in #905. Until
+    /// that runtime exists, installed provenance is the authoritative global
+    /// ownership index and lets #903 reject cross-plugin borrowing before any
+    /// install mutation.
+    async fn existing_event_sink_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
+        let store = InstalledPlugins::load(&self.installed_json_path()).await?;
+        Ok(store
+            .list()
+            .iter()
+            .filter(|plugin| plugin.id != exclude_plugin_id)
+            .flat_map(|plugin| plugin.registered.event_sink_ids.iter().cloned())
+            .collect())
+    }
+
     /// Resolve one manifest-declared service entry into a
     /// [`ServiceRuntimeConfig`] ready for `ServiceManager::start_service`.
     fn resolve_service_config(
@@ -898,6 +912,57 @@ impl PluginInstaller for ServerPluginInstaller {
             load_previous_for_disposition(&installed_json_path, &manifest.id, disposition).await?;
         let resolved_mcp_servers = preflight_install(manifest, plugin_dir).await?;
 
+        // Event-sink ownership gates run before the upgrade drop-diff, journal
+        // write, config mutation, or service start. A sink may only use its
+        // own manifest-declared service, and neither the sink id nor that
+        // referenced service id may be owned by another plugin.
+        let previously_owned_event_sinks = previous
+            .as_ref()
+            .map(|plugin| plugin.registered.event_sink_ids.clone())
+            .unwrap_or_default();
+        let declared_event_sink_ids: Vec<String> = manifest
+            .provides
+            .event_sinks
+            .iter()
+            .map(|sink| sink.id.clone())
+            .collect();
+        let event_sink_reconciliation = reconcile_exclusive(
+            &declared_event_sink_ids,
+            &self.existing_event_sink_ids(&manifest.id).await?,
+            &previously_owned_event_sinks,
+        );
+        if !event_sink_reconciliation.foreign_conflicts.is_empty() {
+            return Err(PluginError::Conflict {
+                kind: "event sink",
+                name: event_sink_reconciliation.foreign_conflicts.join(", "),
+                plugin_id: manifest.id.clone(),
+            });
+        }
+        if !manifest.provides.event_sinks.is_empty() {
+            let previously_owned_services = previous
+                .as_ref()
+                .map(|plugin| plugin.registered.service_ids.clone())
+                .unwrap_or_default();
+            let referenced_service_ids: Vec<String> = manifest
+                .provides
+                .event_sinks
+                .iter()
+                .map(|sink| sink.service_id.clone())
+                .collect();
+            let service_reconciliation = reconcile_exclusive(
+                &referenced_service_ids,
+                &self.existing_service_ids(&manifest.id).await?,
+                &previously_owned_services,
+            );
+            if !service_reconciliation.foreign_conflicts.is_empty() {
+                return Err(PluginError::Conflict {
+                    kind: "event sink service",
+                    name: service_reconciliation.foreign_conflicts.join(", "),
+                    plugin_id: manifest.id.clone(),
+                });
+            }
+        }
+
         // The set this install INTENDS to own, by declaration order. Used both
         // for the crash-safety journal row (below) and the step-0 drop-diff.
         let intended = RegisteredCapabilities {
@@ -924,6 +989,7 @@ impl PluginInstaller for ServerPluginInstaller {
                 .iter()
                 .map(|entry| entry.id.clone())
                 .collect(),
+            event_sink_ids: declared_event_sink_ids,
         };
 
         // Step 0: upgrade drop-diff. Computed from the NEW manifest's plain
@@ -942,6 +1008,7 @@ impl PluginInstaller for ServerPluginInstaller {
                     dropped_presets = ?dropped.preset_ids,
                     dropped_workflows = ?dropped.workflow_filenames,
                     dropped_services = ?dropped.service_ids,
+                    dropped_event_sinks = ?dropped.event_sink_ids,
                     "install drop-diff: de-registering capabilities the new/completed version no longer declares"
                 );
                 self.deregister_capabilities(&dropped).await;
@@ -1059,6 +1126,7 @@ impl PluginInstaller for ServerPluginInstaller {
             preset_ids,
             workflow_filenames,
             service_ids,
+            event_sink_ids: event_sink_reconciliation.to_register,
         };
         let entry = InstalledPlugin {
             id: manifest.id.clone(),

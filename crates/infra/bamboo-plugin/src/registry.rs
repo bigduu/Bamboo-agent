@@ -1,10 +1,11 @@
 //! Provenance registry: `~/.bamboo/plugins/installed.json`.
 //!
 //! Records, for each installed plugin, EXACTLY what it registered (which
-//! `mcpServers` ids, which skill dir names, which prompt preset ids, and any
-//! legacy workflow-copy filenames) so uninstall/upgrade can precisely undo only what a
-//! given plugin added — never touching a user's own hand-added entries that
-//! happen to share a config file with plugin-registered ones.
+//! `mcpServers`, services, and event-sink ids; which skill dir names; which
+//! prompt preset ids; and any legacy workflow-copy filenames) so
+//! uninstall/upgrade can precisely undo only what a given plugin added — never
+//! touching a user's own hand-added entries that happen to share a capability
+//! store with plugin-registered ones.
 //!
 //! This module only defines the schema + load/save/add/remove helpers. Wiring
 //! *when* to call `add`/`remove` relative to actually registering/
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::error::{PluginError, PluginResult};
+use crate::manifest::{EventSinkCapabilityState, EventSinkManifestEntry, Platform, PluginManifest};
 
 /// Where a plugin's installed bundle came from. Recorded verbatim so
 /// `update`/reinstall can re-fetch from the same place.
@@ -140,6 +142,11 @@ pub struct RegisteredCapabilities {
     /// before services existed loads with an empty set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_ids: Vec<String>,
+    /// Manifest event-sink ids owned by this plugin, including validated
+    /// inactive/degraded sinks. There is no live sink registry in #903; this
+    /// is exact manifest/lifecycle provenance for the later router.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_sink_ids: Vec<String>,
 }
 
 impl RegisteredCapabilities {
@@ -149,6 +156,7 @@ impl RegisteredCapabilities {
             && self.preset_ids.is_empty()
             && self.workflow_filenames.is_empty()
             && self.service_ids.is_empty()
+            && self.event_sink_ids.is_empty()
     }
 
     /// The capabilities present in `old` (a prior install's registered set)
@@ -168,8 +176,126 @@ impl RegisteredCapabilities {
             preset_ids: subtract(&old.preset_ids, &self.preset_ids),
             workflow_filenames: subtract(&old.workflow_filenames, &self.workflow_filenames),
             service_ids: subtract(&old.service_ids, &self.service_ids),
+            event_sink_ids: subtract(&old.event_sink_ids, &self.event_sink_ids),
         }
     }
+
+    /// Pure uninstall/rollback ordering seam: later runtime code must
+    /// deactivate sinks in the first phase before stopping their services in
+    /// the second. #903 records the plan but performs no runtime mutation.
+    pub fn removal_order(&self) -> EventSinkRemovalOrder {
+        EventSinkRemovalOrder {
+            event_sink_ids_before_services: self.event_sink_ids.clone(),
+            service_ids_after_sinks: self.service_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventSinkRemovalOrder {
+    pub event_sink_ids_before_services: Vec<String>,
+    pub service_ids_after_sinks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledEventSink {
+    pub id: String,
+    pub service_id: String,
+    pub state: EventSinkCapabilityState,
+}
+
+/// Pure install/boot reconciliation plan. It never consults global service
+/// manager state: a sink is eligible only when both its own id and the
+/// referenced same-plugin service id are present in this plugin's provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventSinkReconciliation {
+    /// Stale/unowned sink ids to deactivate before any service is stopped.
+    pub deactivate_before_services: Vec<String>,
+    /// Same-plugin service dependencies that must be live before the
+    /// corresponding sink can be activated by #905.
+    pub service_dependencies_before_sinks: Vec<String>,
+    /// Owned, cross-validated capabilities in manifest declaration order.
+    pub sinks_after_services: Vec<ReconciledEventSink>,
+}
+
+/// Cross-check event-sink manifest declarations against exact plugin
+/// provenance for install/boot recovery. Validation is repeated here so a
+/// boot caller cannot accidentally activate a malformed on-disk manifest by
+/// forgetting the install-time preflight.
+pub fn reconcile_event_sinks(
+    manifest: &PluginManifest,
+    registered: &RegisteredCapabilities,
+    install_status: PluginInstallStatus,
+    platform: Option<Platform>,
+) -> PluginResult<EventSinkReconciliation> {
+    manifest.validate()?;
+    let owned_sink_ids: HashSet<&str> = registered
+        .event_sink_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let owned_service_ids: HashSet<&str> =
+        registered.service_ids.iter().map(String::as_str).collect();
+
+    let mut plan = EventSinkReconciliation::default();
+    let mut reconciled_ids = HashSet::new();
+    let mut service_dependencies = HashSet::new();
+    for sink in &manifest.provides.event_sinks {
+        if !owned_sink_ids.contains(sink.id.as_str()) {
+            continue;
+        }
+        let Some(service) =
+            same_plugin_owned_service(sink, &manifest.provides.services, &owned_service_ids)
+        else {
+            if reconciled_ids.insert(sink.id.as_str()) {
+                plan.deactivate_before_services.push(sink.id.clone());
+            }
+            continue;
+        };
+        if !reconciled_ids.insert(sink.id.as_str()) {
+            continue;
+        }
+        let state = if install_status == PluginInstallStatus::Installing {
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::InstallIncomplete,
+            }
+        } else {
+            sink.capability_state(service, platform)
+        };
+        if matches!(state, EventSinkCapabilityState::Eligible)
+            && service_dependencies.insert(service.id.as_str())
+        {
+            plan.service_dependencies_before_sinks
+                .push(service.id.clone());
+        }
+        plan.sinks_after_services.push(ReconciledEventSink {
+            id: sink.id.clone(),
+            service_id: service.id.clone(),
+            state,
+        });
+    }
+
+    for owned_id in &registered.event_sink_ids {
+        if !reconciled_ids.contains(owned_id.as_str())
+            && !plan.deactivate_before_services.contains(owned_id)
+        {
+            plan.deactivate_before_services.push(owned_id.clone());
+        }
+    }
+    Ok(plan)
+}
+
+fn same_plugin_owned_service<'a>(
+    sink: &EventSinkManifestEntry,
+    services: &'a [crate::manifest::ServiceManifestEntry],
+    owned_service_ids: &HashSet<&str>,
+) -> Option<&'a crate::manifest::ServiceManifestEntry> {
+    if !owned_service_ids.contains(sink.service_id.as_str()) {
+        return None;
+    }
+    services
+        .iter()
+        .find(|service| service.id == sink.service_id)
 }
 
 /// Elements of `from` not present in `remove`, preserving `from`'s order.
@@ -403,8 +529,34 @@ mod tests {
                 preset_ids: vec!["hello_preset".to_string()],
                 workflow_filenames: vec![],
                 service_ids: vec![],
+                event_sink_ids: vec![],
             },
         }
+    }
+
+    fn event_sink_manifest(service_enabled: bool, protocol_version: u16) -> PluginManifest {
+        let json = serde_json::json!({
+            "id": "event-plugin",
+            "name": "Event Plugin",
+            "version": "1.0.0",
+            "provides": {
+                "services": [{
+                    "id": "audit-service",
+                    "enabled": service_enabled,
+                    "command": "${platform_bin}"
+                }],
+                "event_sinks": [{
+                    "id": "audit-events",
+                    "service_id": "audit-service",
+                    "protocol": {"name": "tool_event", "version": protocol_version},
+                    "subscriptions": [{"id": "tool.file_changed.v1"}],
+                    "requested_permissions": ["metadata"]
+                }]
+            }
+        });
+        let manifest = PluginManifest::parse_str(&json.to_string()).expect("parse sink manifest");
+        manifest.validate().expect("validate sink manifest");
+        manifest
     }
 
     #[tokio::test]
@@ -468,6 +620,30 @@ mod tests {
                 path: PathBuf::from("/tmp/source")
             }
         );
+    }
+
+    #[test]
+    fn legacy_provenance_defaults_and_omits_event_sink_ids() {
+        let raw = r#"{
+            "plugins": [{
+                "id": "legacy-plugin",
+                "version": "1.0.0",
+                "source": {"type": "local_dir", "path": "/tmp/legacy"},
+                "plugin_dir": "/tmp/legacy",
+                "installed_at": "2026-07-12T00:00:00Z",
+                "registered": {"service_ids": ["legacy-service"]}
+            }]
+        }"#;
+        let store: InstalledPlugins = serde_json::from_str(raw).expect("load legacy provenance");
+        assert!(store.plugins[0].registered.event_sink_ids.is_empty());
+
+        let serialized = serde_json::to_value(&store).expect("serialize provenance");
+        assert!(serialized["plugins"][0]["registered"]
+            .get("event_sink_ids")
+            .is_none());
+        assert!(!serde_json::to_string(&store)
+            .expect("serialize legacy provenance bytes")
+            .contains("event_sink_ids"));
     }
 
     #[tokio::test]
@@ -554,6 +730,7 @@ mod tests {
             preset_ids: vec!["preset-a".to_string(), "preset-b".to_string()],
             workflow_filenames: vec!["wf-a.md".to_string()],
             service_ids: vec!["svc-a".to_string(), "svc-b".to_string()],
+            event_sink_ids: vec!["sink-a".to_string(), "sink-b".to_string()],
         };
         // New version drops srv-b, preset-a, and svc-b; keeps the rest; adds srv-c.
         let new = RegisteredCapabilities {
@@ -562,6 +739,7 @@ mod tests {
             preset_ids: vec!["preset-b".to_string()],
             workflow_filenames: vec!["wf-a.md".to_string()],
             service_ids: vec!["svc-a".to_string()],
+            event_sink_ids: vec!["sink-a".to_string()],
         };
 
         let removed = new.removed_since(&old);
@@ -570,6 +748,112 @@ mod tests {
         assert_eq!(removed.preset_ids, vec!["preset-a".to_string()]);
         assert!(removed.workflow_filenames.is_empty());
         assert_eq!(removed.service_ids, vec!["svc-b".to_string()]);
+        assert_eq!(removed.event_sink_ids, vec!["sink-b".to_string()]);
+    }
+
+    #[test]
+    fn event_sink_reconciliation_preserves_order_and_same_plugin_ownership() {
+        let manifest = event_sink_manifest(true, 1);
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string(), "orphaned".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile owned sink");
+        assert_eq!(plan.deactivate_before_services, vec!["orphaned"]);
+        assert_eq!(
+            plan.service_dependencies_before_sinks,
+            vec!["audit-service"]
+        );
+        assert_eq!(plan.sinks_after_services.len(), 1);
+        assert_eq!(plan.sinks_after_services[0].id, "audit-events");
+        assert_eq!(
+            plan.sinks_after_services[0].state,
+            EventSinkCapabilityState::Eligible
+        );
+
+        let removal = registered.removal_order();
+        assert_eq!(
+            removal.event_sink_ids_before_services,
+            vec!["audit-events", "orphaned"]
+        );
+        assert_eq!(removal.service_ids_after_sinks, vec!["audit-service"]);
+    }
+
+    #[test]
+    fn event_sink_reconciliation_fails_closed_on_service_ownership_mismatch() {
+        let manifest = event_sink_manifest(true, 1);
+        let registered = RegisteredCapabilities {
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile ownership mismatch");
+        assert_eq!(plan.deactivate_before_services, vec!["audit-events"]);
+        assert!(plan.service_dependencies_before_sinks.is_empty());
+        assert!(plan.sinks_after_services.is_empty());
+
+        let mut malformed = manifest;
+        malformed.provides.event_sinks[0].protocol.name = "tool_evnet".to_string();
+        assert!(reconcile_event_sinks(
+            &malformed,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn installing_and_disabled_sinks_never_request_live_service_dependencies() {
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let installing = reconcile_event_sinks(
+            &event_sink_manifest(true, 1),
+            &registered,
+            PluginInstallStatus::Installing,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile installing sink");
+        assert!(installing.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            installing.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::InstallIncomplete,
+            }
+        );
+
+        let disabled = reconcile_event_sinks(
+            &event_sink_manifest(false, 1),
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile disabled sink");
+        assert!(disabled.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            disabled.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::ServiceDisabled,
+            }
+        );
     }
 
     #[test]
