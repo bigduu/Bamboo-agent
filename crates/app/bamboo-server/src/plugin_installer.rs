@@ -296,12 +296,13 @@ impl ServerPluginInstaller {
         prepared_dir: &Path,
         disposition: InstallDisposition,
         _guard: &PluginOperationGuard,
-    ) -> PluginResult<()> {
-        load_previous_for_disposition(&self.installed_json_path(), &manifest.id, disposition)
-            .await?;
+    ) -> PluginResult<Option<InstalledPlugin>> {
+        let previous =
+            load_previous_for_disposition(&self.installed_json_path(), &manifest.id, disposition)
+                .await?;
         preflight_install(manifest, prepared_dir).await?;
         self.preflight_provenance_ownership(manifest).await?;
-        Ok(())
+        Ok(previous)
     }
 
     fn plugins_dir(&self) -> PathBuf {
@@ -873,13 +874,12 @@ impl ServerPluginInstaller {
     /// stale code after the swap. Net effect: preflight → stop old binary →
     /// swap → start new binary, all in one serialized operation boundary.
     ///
-    /// Best-effort: returns exactly the ids that were actually running and
-    /// got stopped (not e.g. an already-stopped or unknown id), so a
-    /// subsequently-failed upgrade can restart precisely those — see
-    /// [`Self::restart_services_after_failed_upgrade`]. A plugin with no
-    /// prior install (or no services) returns an empty vec and stops
-    /// nothing.
-    pub async fn stop_services_for_upgrade(&self, plugin_id: &str) -> Vec<String> {
+    /// Returns exactly the ids that were actually running and got stopped
+    /// (not e.g. an already-stopped or unknown id). If any later source
+    /// transaction step fails, those services deliberately remain stopped
+    /// for explicit operator recovery. A plugin with no prior install (or no
+    /// services) returns an empty vec and stops nothing.
+    pub(crate) async fn stop_services_for_upgrade(&self, plugin_id: &str) -> Vec<String> {
         let store = match InstalledPlugins::load(&self.installed_json_path()).await {
             Ok(store) => store,
             Err(error) => {
@@ -915,108 +915,6 @@ impl ServerPluginInstaller {
             }
         }
         stopped
-    }
-
-    /// Counterpart to [`Self::stop_services_for_upgrade`]: called only after
-    /// the source transaction reports that an identity-verified previous
-    /// bundle is live again. Defense in depth re-parses and validates that
-    /// OLD manifest, checks its plugin identity and current-platform gate,
-    /// then restarts exactly the services in `stopped` that it still declares
-    /// as `enabled`. Best-effort/log-and-continue: any mismatch or failure
-    /// leaves the affected service stopped (a degraded-but-safe outcome —
-    /// never silently runs from an ambiguous bundle).
-    pub async fn restart_services_after_failed_upgrade(&self, plugin_id: &str, stopped: &[String]) {
-        if stopped.is_empty() {
-            return;
-        }
-        let store = match InstalledPlugins::load(&self.installed_json_path()).await {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!(
-                    %plugin_id,
-                    %error,
-                    "restart_services_after_failed_upgrade: failed to load installed.json"
-                );
-                return;
-            }
-        };
-        let entry = match store.get_unique(plugin_id) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(
-                    %plugin_id,
-                    %error,
-                    "restart_services_after_failed_upgrade: ambiguous plugin provenance; skipping"
-                );
-                return;
-            }
-        };
-        let manifest_path = entry.plugin_dir.join("plugin.json");
-        let manifest = match fs::read_to_string(&manifest_path)
-            .await
-            .ok()
-            .and_then(|raw| PluginManifest::parse_str(&raw).ok())
-        {
-            Some(manifest) => manifest,
-            None => {
-                tracing::warn!(
-                    %plugin_id,
-                    path = %manifest_path.display(),
-                    "restart_services_after_failed_upgrade: failed to read/parse the \
-                     rolled-back plugin.json; affected service(s) remain stopped"
-                );
-                return;
-            }
-        };
-        if manifest.id != plugin_id || manifest.id != entry.id {
-            tracing::warn!(
-                %plugin_id,
-                installed_id = %entry.id,
-                manifest_id = %manifest.id,
-                "restart_services_after_failed_upgrade: restored manifest identity mismatch; affected service(s) remain stopped"
-            );
-            return;
-        }
-        if let Err(error) = manifest.validate() {
-            tracing::warn!(
-                %plugin_id,
-                %error,
-                "restart_services_after_failed_upgrade: restored manifest failed validation; affected service(s) remain stopped"
-            );
-            return;
-        }
-        let Some(platform) = Platform::current() else {
-            tracing::warn!(
-                %plugin_id,
-                host_os = std::env::consts::OS,
-                "restart_services_after_failed_upgrade: unknown host platform; affected service(s) remain stopped"
-            );
-            return;
-        };
-        if !manifest.supports_platform(platform) {
-            tracing::warn!(
-                %plugin_id,
-                platform = platform.as_str(),
-                "restart_services_after_failed_upgrade: restored manifest excludes this platform; affected service(s) remain stopped"
-            );
-            return;
-        }
-        for svc in &manifest.provides.services {
-            if !stopped.contains(&svc.id) || !svc.enabled {
-                continue;
-            }
-            let config = self.resolve_service_config(plugin_id, svc, &entry.plugin_dir, platform);
-            if let Err(error) = self.state.service_manager.start_service(config).await {
-                tracing::warn!(
-                    service_id = %svc.id,
-                    %plugin_id,
-                    %error,
-                    "failed to restart service after a failed upgrade rolled back to the \
-                     previous plugin bundle; service remains stopped"
-                );
-            }
-        }
     }
 
     pub(crate) async fn install_with_operation(

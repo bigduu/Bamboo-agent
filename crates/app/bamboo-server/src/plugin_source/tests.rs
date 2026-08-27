@@ -40,6 +40,15 @@ async fn write_hello_plugin_dir(dir: &Path, id: &str) {
     .unwrap();
 }
 
+async fn assert_single_rejected_staging(plugins_root: &Path, context: &str) {
+    let names = plugin_root_entry_names(plugins_root).await;
+    assert_eq!(names.len(), 1, "{context}: {names:?}");
+    assert!(
+        names[0].starts_with(".rejected-staging-"),
+        "{context}: {names:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // LocalDir
 // ---------------------------------------------------------------------
@@ -685,13 +694,14 @@ async fn url_install_with_wrong_bundle_sha256_is_rejected_before_unpacking() {
     );
     assert!(error.to_string().contains(&url));
 
-    // Nothing committed, and no stray staging dir left under plugins_root.
+    // Nothing is committed. The rejected staging entry is retained under an
+    // inert quarantine name instead of recursively deleted by path.
     assert!(!plugins_root.join("hello-plugin").exists());
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(
-        leftovers.next_entry().await.unwrap().is_none(),
-        "a rejected bundle checksum mismatch must leave nothing under plugins_root"
-    );
+    assert_single_rejected_staging(
+        &plugins_root,
+        "a rejected bundle checksum mismatch must retain only inert staging",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -747,13 +757,13 @@ async fn url_install_without_checksum_or_allow_unverified_is_refused_after_host_
         "expected exactly the bundle GET + the .sig GET attempt, got {received:?}"
     );
 
-    // Nothing committed, and no stray staging dir left under plugins_root.
+    // Nothing is committed; rejected staging is retained inertly.
     assert!(!plugins_root.join("hello-plugin").exists());
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(
-        leftovers.next_entry().await.unwrap().is_none(),
-        "a refused unverified install must leave nothing under plugins_root"
-    );
+    assert_single_rejected_staging(
+        &plugins_root,
+        "a refused unverified install must retain only inert staging",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -996,11 +1006,11 @@ async fn untrusted_host_is_refused_before_any_fetch() {
     );
 
     assert!(!plugins_root.join("hello-plugin").exists());
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(
-        leftovers.next_entry().await.unwrap().is_none(),
-        "a refused untrusted-host install must leave nothing under plugins_root"
-    );
+    assert_single_rejected_staging(
+        &plugins_root,
+        "a refused untrusted-host install must retain only inert staging",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1914,6 +1924,135 @@ async fn server_upgrade_fixture(
 }
 
 #[tokio::test]
+async fn discard_preserves_an_unknown_staging_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+    let prepared_dir = prepared.prepared_dir.clone();
+    let displaced_candidate = plugins_root.join(format!(
+        ".fault-displaced-prepared-{}",
+        uuid::Uuid::new_v4()
+    ));
+    rename_noreplace(&prepared_dir, &displaced_candidate).unwrap();
+    std::fs::create_dir(&prepared_dir).unwrap();
+    std::fs::write(prepared_dir.join("UNKNOWN_MARKER"), b"unknown-owned").unwrap();
+
+    prepared.discard().await;
+
+    assert_eq!(
+        tokio::fs::read_to_string(prepared_dir.join("UNKNOWN_MARKER"))
+            .await
+            .unwrap(),
+        "unknown-owned",
+        "discard must put an unknown replacement back without deleting it"
+    );
+    assert!(displaced_candidate.join("NEW_MARKER").exists());
+    assert!(live_dir.join("OLD_MARKER").exists());
+}
+
+#[tokio::test]
+async fn activation_cleanup_preserves_an_unknown_candidate_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+    let prepared_dir = prepared.prepared_dir.clone();
+    let displaced_candidate = plugins_root.join(format!(
+        ".fault-displaced-prepared-{}",
+        uuid::Uuid::new_v4()
+    ));
+    rename_noreplace(&prepared_dir, &displaced_candidate).unwrap();
+    std::fs::create_dir(&prepared_dir).unwrap();
+    std::fs::write(prepared_dir.join("UNKNOWN_MARKER"), b"unknown-owned").unwrap();
+
+    let error = prepared
+        .activate()
+        .await
+        .expect_err("candidate identity replacement must fail activation");
+    assert!(error
+        .into_plugin_error()
+        .to_string()
+        .contains("manual bundle recovery is required"));
+    assert_eq!(
+        tokio::fs::read_to_string(prepared_dir.join("UNKNOWN_MARKER"))
+            .await
+            .unwrap(),
+        "unknown-owned"
+    );
+    assert!(displaced_candidate.join("NEW_MARKER").exists());
+    assert!(live_dir.join("OLD_MARKER").exists());
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.starts_with(".backup-hello-plugin-")),
+        "candidate identity must be checked before moving the old live bundle: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn fresh_activation_rejects_a_destination_that_appears_after_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let plugins_root = root.path().join("plugins");
+    let source_dir = root.path().join("source");
+    write_hello_plugin_dir(&source_dir, "hello-plugin").await;
+    let prepared = prepare_plugin_source(
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let error = prepared
+        .activate_with_fault(ActivationFault::CreateDestinationDirectory)
+        .await
+        .expect_err("fresh activation must fail closed when its destination appears");
+    assert!(error
+        .into_plugin_error()
+        .to_string()
+        .contains("manual bundle recovery is required"));
+    assert_eq!(
+        tokio::fs::read_to_string(plugins_root.join("hello-plugin").join("RACE_MARKER"))
+            .await
+            .unwrap(),
+        "race-owned"
+    );
+    let names = plugin_root_entry_names(&plugins_root).await;
+    let candidate = names
+        .iter()
+        .find(|name| name.starts_with(".candidate-hello-plugin-"))
+        .expect("fresh candidate must be retained rather than deleted");
+    assert!(plugins_root.join(candidate).join("plugin.json").exists());
+}
+
+#[tokio::test]
+async fn commit_retirement_preserves_an_unknown_backup_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
+    let expected_live = prepared.capture_expected_live().unwrap();
+    let staged = prepared
+        .activate_inner(expected_live, ActivationFault::None)
+        .await
+        .expect("activate prepared upgrade");
+    let backup_path = staged.backup.as_ref().unwrap().path.clone();
+    let displaced_backup =
+        plugins_root.join(format!(".fault-displaced-retired-{}", uuid::Uuid::new_v4()));
+    rename_noreplace(&backup_path, &displaced_backup).unwrap();
+    std::fs::create_dir(&backup_path).unwrap();
+    std::fs::write(backup_path.join("UNKNOWN_MARKER"), b"unknown-owned").unwrap();
+
+    staged.commit().await;
+
+    assert_eq!(
+        tokio::fs::read_to_string(backup_path.join("UNKNOWN_MARKER"))
+            .await
+            .unwrap(),
+        "unknown-owned",
+        "commit retirement must preserve an unknown replacement"
+    );
+    assert!(displaced_backup.join("OLD_MARKER").exists());
+    assert!(live_dir.join("NEW_MARKER").exists());
+}
+
+#[tokio::test]
 async fn activation_second_rename_failure_restores_old_bundle_without_copying_candidate() {
     let root = tempfile::tempdir().unwrap();
     let (prepared, plugins_root, live_dir, _) = prepared_upgrade_fixture(root.path()).await;
@@ -1923,8 +2062,8 @@ async fn activation_second_rename_failure_restores_old_bundle_without_copying_ca
         .await
         .expect_err("injected candidate rename must fail");
     assert!(
-        error.restart_safe(),
-        "an identity-verified restored previous bundle must permit service restart"
+        error.recovery.is_reconciled(),
+        "the previous bundle must be identity-verified at the live path"
     );
     assert_eq!(
         tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
@@ -1936,11 +2075,13 @@ async fn activation_second_rename_failure_restores_old_bundle_without_copying_ca
         !live_dir.join("NEW_MARKER").exists(),
         "candidate bytes must never be merge-copied into the restored bundle"
     );
-    assert_eq!(
-        plugin_root_entry_names(&plugins_root).await,
-        vec!["hello-plugin".to_string()],
-        "a safely restored failure must clean only its UUID candidate and consume the backup"
-    );
+    let names = plugin_root_entry_names(&plugins_root).await;
+    assert!(names.iter().any(|name| name == "hello-plugin"));
+    let candidate = names
+        .iter()
+        .find(|name| name.starts_with(".candidate-hello-plugin-"))
+        .expect("failed candidate must be retained instead of recursively deleted");
+    assert!(plugins_root.join(candidate).join("NEW_MARKER").exists());
 }
 
 #[tokio::test]
@@ -1952,7 +2093,7 @@ async fn activation_destination_race_is_preserved_and_old_bundle_stays_in_backup
         .activate_with_fault(ActivationFault::CreateDestinationDirectory)
         .await
         .expect_err("race-created destination must make no-replace publication fail");
-    assert!(!error.restart_safe());
+    assert!(!error.recovery.is_reconciled());
     assert!(error
         .into_plugin_error()
         .to_string()
@@ -1999,7 +2140,7 @@ async fn activation_symlink_race_never_touches_external_target() {
         .activate_with_fault(ActivationFault::CreateDestinationSymlink(external.clone()))
         .await
         .expect_err("symlink destination must make no-replace publication fail");
-    assert!(!error.restart_safe());
+    assert!(!error.recovery.is_reconciled());
     assert!(error
         .into_plugin_error()
         .to_string()
@@ -2038,7 +2179,7 @@ async fn activation_symlink_race_never_touches_external_target() {
 }
 
 #[tokio::test]
-async fn server_source_transaction_restarts_only_after_verified_activation_restore() {
+async fn server_source_transaction_never_restarts_after_verified_activation_restore() {
     let root = tempfile::tempdir().unwrap();
     let (state, installer, plugins_root, live_dir, source_dir) =
         server_upgrade_fixture(root.path()).await;
@@ -2055,9 +2196,12 @@ async fn server_source_transaction_restarts_only_after_verified_activation_resto
     .await
     .expect_err("injected candidate publication must fail");
     assert!(matches!(error, PluginError::Registration(_)));
+    assert!(error
+        .to_string()
+        .contains("remain stopped pending manual recovery"));
     assert!(
-        state.service_manager.is_running("svc"),
-        "an identity-verified restored old bundle permits restarting the service"
+        !state.service_manager.is_running("svc"),
+        "a failed upgrade must never restart executable code automatically"
     );
     assert_eq!(
         tokio::fs::read_to_string(live_dir.join("OLD_MARKER"))
@@ -2066,6 +2210,115 @@ async fn server_source_transaction_restarts_only_after_verified_activation_resto
         "old-bundle"
     );
     assert!(!live_dir.join("NEW_MARKER").exists());
+}
+
+#[tokio::test]
+async fn server_source_transaction_rejects_live_replacement_after_service_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir) =
+        server_upgrade_fixture(root.path()).await;
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::ReplaceLiveAfterStop,
+    )
+    .await
+    .expect_err("a post-stop replacement must not be accepted as the previous bundle");
+    let message = error.to_string();
+    assert!(message.contains("exact pre-stop snapshot"), "{message}");
+    assert!(
+        message.contains("remain stopped pending manual recovery"),
+        "{message}"
+    );
+    assert!(!state.service_manager.is_running("svc"));
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("RACE_MARKER"))
+            .await
+            .unwrap(),
+        "race-owned"
+    );
+    assert!(!live_dir.join("OLD_MARKER").exists());
+    assert!(!live_dir.join("NEW_MARKER").exists());
+
+    let names = plugin_root_entry_names(&plugins_root).await;
+    let displaced_old = names
+        .iter()
+        .find(|name| name.starts_with(".fault-displaced-live-"))
+        .expect("the pre-stop bundle must remain preserved under its displaced path");
+    assert!(plugins_root.join(displaced_old).join("OLD_MARKER").exists());
+    let retained_candidate = names
+        .iter()
+        .find(|name| name.starts_with(".candidate-svc-plugin-"))
+        .expect("the prepared candidate must be retained without recursive deletion");
+    assert!(plugins_root
+        .join(retained_candidate)
+        .join("NEW_MARKER")
+        .exists());
+}
+
+#[tokio::test]
+async fn server_upgrade_rejects_a_missing_live_bundle_before_stopping_services() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer, plugins_root, live_dir, source_dir) =
+        server_upgrade_fixture(root.path()).await;
+    let displaced_old = plugins_root.join(format!(
+        ".fault-displaced-before-snapshot-{}",
+        uuid::Uuid::new_v4()
+    ));
+    rename_noreplace(&live_dir, &displaced_old).unwrap();
+
+    let error = install_server_plugin_from_source_with_fault(
+        &installer,
+        PluginSourceInput::LocalDir(source_dir),
+        &plugins_root,
+        &PluginTrustConfig::default(),
+        InstallDisposition::Upgrade,
+        Some("svc-plugin"),
+        ServerSourceFault::None,
+    )
+    .await
+    .expect_err("an upgrade requires its exact old live bundle before shutdown");
+    assert!(error.to_string().contains("requires an exact live bundle"));
+    assert!(
+        state.service_manager.is_running("svc"),
+        "the upgrade must fail before stop_services_for_upgrade"
+    );
+    assert!(displaced_old.join("OLD_MARKER").exists());
+}
+
+#[test]
+fn failed_upgrade_with_no_stopped_services_preserves_the_underlying_error() {
+    let error = PluginError::Registration("ordinary failure".to_string());
+    let expected = error.to_string();
+    let actual = stopped_upgrade_failure(error, &[]).to_string();
+    assert_eq!(actual, expected);
+    assert!(!actual.contains("restart"));
+    assert!(!actual.contains("remain stopped"));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_bundle_identity_is_stable_across_a_sibling_rename() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original");
+    let moved = root.path().join("moved");
+    let distinct = root.path().join("distinct");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&distinct).unwrap();
+
+    let (_, before) = capture_bundle_directory(&original).unwrap();
+    rename_noreplace(&original, &moved).unwrap();
+    let (_, after) = capture_bundle_directory(&moved).unwrap();
+    let (_, other) = capture_bundle_directory(&distinct).unwrap();
+
+    assert_eq!(before, after);
+    assert_eq!(before.volume, after.volume);
+    assert_ne!(before.file_id, other.file_id);
 }
 
 #[tokio::test]
@@ -2285,7 +2538,7 @@ fn _use_pathbuf(_p: PathBuf) {}
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn targz_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plugins_root() {
+async fn targz_exceeding_decompressed_cap_is_rejected_and_retained_inertly() {
     let root = tempfile::tempdir().unwrap();
 
     // A valid, small plugin.json plus one wildly compressible "skill" file
@@ -2315,18 +2568,18 @@ async fn targz_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plu
     assert!(matches!(error, PluginError::InvalidManifest(_)));
     assert!(error.to_string().contains("decompress"));
 
-    // Nothing committed under plugins_root: no plugin dir, and no stray
-    // staging/backup directories left behind either.
+    // Nothing is committed under the live id. Partial extraction remains
+    // inert under a rejected-staging quarantine for operator cleanup.
     assert!(!plugins_root.join("hello-plugin").exists());
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(
-        leftovers.next_entry().await.unwrap().is_none(),
-        "a rejected decompression bomb must leave nothing under plugins_root"
-    );
+    assert_single_rejected_staging(
+        &plugins_root,
+        "a rejected decompression bomb must retain only inert staging",
+    )
+    .await;
 }
 
 #[tokio::test]
-async fn zip_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plugins_root() {
+async fn zip_exceeding_decompressed_cap_is_rejected_and_retained_inertly() {
     let root = tempfile::tempdir().unwrap();
 
     let manifest = hello_manifest_json("hello-plugin");
@@ -2353,11 +2606,11 @@ async fn zip_exceeding_decompressed_cap_is_rejected_and_nothing_left_under_plugi
     assert!(error.to_string().contains("decompress"));
 
     assert!(!plugins_root.join("hello-plugin").exists());
-    let mut leftovers = tokio::fs::read_dir(&plugins_root).await.unwrap();
-    assert!(
-        leftovers.next_entry().await.unwrap().is_none(),
-        "a rejected decompression bomb must leave nothing under plugins_root"
-    );
+    assert_single_rejected_staging(
+        &plugins_root,
+        "a rejected decompression bomb must retain only inert staging",
+    )
+    .await;
 }
 
 #[tokio::test]

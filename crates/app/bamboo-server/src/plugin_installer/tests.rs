@@ -1778,13 +1778,10 @@ async fn upgrade_replaces_event_sink_provenance_exactly_and_frees_removed_id() {
 }
 
 // ---------------------------------------------------------------------
-// Same-id upgrade ordering (issue #479): `stop_services_for_upgrade` /
-// `restart_services_after_failed_upgrade` are the seam the HTTP
-// `update_plugin` handler uses after prepared-candidate preflight and BEFORE
-// bundle activation, and to restart them if the upgrade subsequently fails
-// and rolls back to the old bundle. Unit-tested
-// directly here (rather than only through the full HTTP+staging pipeline)
-// so the ordering contract is pinned precisely.
+// Same-id upgrade ordering (issue #479): `stop_services_for_upgrade` is the
+// seam the HTTP update path uses after prepared-candidate preflight and before
+// bundle activation. A later failure deliberately leaves services stopped;
+// only the stop ordering belongs in this installer-level test section.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -1831,141 +1828,4 @@ async fn stop_services_for_upgrade_on_a_plugin_with_no_services_is_a_harmless_no
     let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
     let stopped = installer.stop_services_for_upgrade("never-installed").await;
     assert!(stopped.is_empty());
-}
-
-#[tokio::test]
-async fn restart_services_after_failed_upgrade_restarts_from_the_still_installed_manifest() {
-    let root = tempfile::tempdir().unwrap();
-    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
-
-    let plugin_dir = root.path().join("plugins").join("svc-plugin");
-    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
-    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
-    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
-        .await
-        .unwrap();
-    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
-    installer
-        .install(
-            &manifest,
-            &plugin_dir,
-            PluginSource::LocalDir {
-                path: plugin_dir.clone(),
-            },
-            InstallDisposition::FailIfInstalled,
-            Utc::now(),
-        )
-        .await
-        .expect("install");
-
-    // Simulate the handler's post-preflight, pre-activation stop.
-    let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
-    assert_eq!(stopped, vec!["svc".to_string()]);
-    assert!(!state.service_manager.is_running("svc"));
-
-    // Simulate a FAILED upgrade whose `StagedPlugin::rollback()` restored
-    // `plugin_dir` to the pre-upgrade bundle (here: nothing ever changed
-    // `plugin_dir`'s on-disk `plugin.json`, which is exactly what a
-    // successful rollback leaves behind).
-    installer
-        .restart_services_after_failed_upgrade("svc-plugin", &stopped)
-        .await;
-    assert!(
-        state.service_manager.is_running("svc"),
-        "the previously-stopped service must be running again after a failed upgrade"
-    );
-}
-
-#[tokio::test]
-async fn restart_services_after_failed_upgrade_rejects_restored_manifest_identity_mismatch() {
-    let root = tempfile::tempdir().unwrap();
-    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
-
-    let plugin_dir = root.path().join("plugins").join("svc-plugin");
-    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
-    let manifest_json = service_manifest_json("svc-plugin", "1.0.0", &["svc"]);
-    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
-        .await
-        .unwrap();
-    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
-    installer
-        .install(
-            &manifest,
-            &plugin_dir,
-            PluginSource::LocalDir {
-                path: plugin_dir.clone(),
-            },
-            InstallDisposition::FailIfInstalled,
-            Utc::now(),
-        )
-        .await
-        .expect("install");
-
-    let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
-    assert_eq!(stopped, vec!["svc".to_string()]);
-    assert!(!state.service_manager.is_running("svc"));
-
-    // Simulate an ambiguous rollback result at the installed path. Even
-    // though it declares the same service id, its plugin identity is not the
-    // installed row's identity and must never be used to restart the process.
-    let mismatched = service_manifest_json("other-plugin", "1.0.0", &["svc"]);
-    tokio::fs::write(plugin_dir.join("plugin.json"), mismatched)
-        .await
-        .unwrap();
-    installer
-        .restart_services_after_failed_upgrade("svc-plugin", &stopped)
-        .await;
-    assert!(
-        !state.service_manager.is_running("svc"),
-        "a manifest identity mismatch must keep the stopped service stopped"
-    );
-}
-
-#[tokio::test]
-async fn restart_services_after_failed_upgrade_skips_a_service_the_rolled_back_manifest_disabled() {
-    let root = tempfile::tempdir().unwrap();
-    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
-
-    let plugin_dir = root.path().join("plugins").join("svc-plugin");
-    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
-    // Declare "svc" as DISABLED from the start.
-    let manifest_json = serde_json::json!({
-        "id": "svc-plugin",
-        "name": "Svc",
-        "version": "1.0.0",
-        "provides": {
-            "services": [{"id": "svc", "command": "${platform_bin}", "enabled": false}]
-        }
-    })
-    .to_string();
-    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
-        .await
-        .unwrap();
-    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
-    installer
-        .install(
-            &manifest,
-            &plugin_dir,
-            PluginSource::LocalDir {
-                path: plugin_dir.clone(),
-            },
-            InstallDisposition::FailIfInstalled,
-            Utc::now(),
-        )
-        .await
-        .expect("install");
-    assert!(!state.service_manager.is_running("svc"));
-
-    // Nothing was running to begin with, so `stopped` is empty here — but
-    // exercise `restart_services_after_failed_upgrade` with a fabricated
-    // non-empty `stopped` list to prove it still respects `enabled: false`
-    // in the manifest it reads back, rather than blindly restarting
-    // whatever it's told.
-    installer
-        .restart_services_after_failed_upgrade("svc-plugin", &["svc".to_string()])
-        .await;
-    assert!(
-        !state.service_manager.is_running("svc"),
-        "a disabled service must never be started by the restart-after-rollback path"
-    );
 }
