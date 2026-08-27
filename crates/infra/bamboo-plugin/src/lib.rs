@@ -53,14 +53,17 @@ pub use manifest::{
     McpTransportManifest, ObservationPermissionId, Platform, PluginArtifact, PluginManifest,
     PluginPromptPreset, PluginProvides, ResolvedServiceEntry, ServiceManifestEntry, ShutdownSignal,
     DEFAULT_EVENT_SINK_QUEUE_CAPACITY, MAX_EVENT_SINKS_PER_PLUGIN, MAX_EVENT_SINK_EVENT_BYTES,
-    MAX_EVENT_SINK_ID_BYTES, MAX_EVENT_SINK_MANIFEST_BUFFER_BYTES, MAX_EVENT_SINK_PERMISSIONS,
+    MAX_EVENT_SINK_EXTENSION_FIELDS, MAX_EVENT_SINK_EXTENSION_KEY_BYTES,
+    MAX_EVENT_SINK_EXTENSION_VALUE_BYTES, MAX_EVENT_SINK_ID_BYTES,
+    MAX_EVENT_SINK_MANIFEST_BUFFER_BYTES, MAX_EVENT_SINK_PERMISSIONS,
     MAX_EVENT_SINK_PERMISSION_ID_BYTES, MAX_EVENT_SINK_QUEUE_CAPACITY,
     MAX_EVENT_SINK_SERVICE_ID_BYTES, MAX_EVENT_SINK_SUBSCRIPTIONS, MAX_EVENT_SINK_TOOL_NAMES,
     OBSERVE_CONTENT_PERMISSION, OBSERVE_DIFF_PERMISSION, OBSERVE_METADATA_PERMISSION,
     OBSERVE_PATHS_PERMISSION, OBSERVE_TOOL_NAME_PERMISSION, PLATFORM_BIN_TOKEN,
 };
 pub use registry::{
-    classify_ownership, reconcile_event_sinks, reconcile_exclusive, EventSinkReconciliation,
-    EventSinkRemovalOrder, ExclusiveReconciliation, InstalledPlugin, InstalledPlugins, Ownership,
+    classify_ownership, reconcile_event_sinks, reconcile_exclusive, reconcile_plugin_boot,
+    EventSinkReconciliation, EventSinkRemovalOrder, ExclusiveReconciliation, InstalledPlugin,
+    InstalledPlugins, Ownership, PluginBootCandidate, PluginBootIssue, PluginBootReconciliation,
     PluginInstallStatus, PluginSource, ReconciledEventSink, RegisteredCapabilities,
 };

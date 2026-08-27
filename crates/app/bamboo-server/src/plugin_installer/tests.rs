@@ -1312,6 +1312,220 @@ async fn foreign_event_sink_conflict_fails_before_candidate_provenance_mutation(
 }
 
 #[tokio::test]
+async fn corrupt_self_and_foreign_sink_ownership_fails_closed_for_installed_and_installing_rows() {
+    for current_status in [
+        PluginInstallStatus::Installed,
+        PluginInstallStatus::Installing,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+        let installed_json = state.app_data_dir.join("plugins").join("installed.json");
+        let plugin_dir = root.path().join("plugins").join("candidate-plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        let manifest_json = event_sink_manifest_json(
+            "candidate-plugin",
+            "2.0.0",
+            "candidate-service",
+            &[("shared-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+        );
+        tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+            .await
+            .unwrap();
+        let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+        let current = InstalledPlugin {
+            id: "candidate-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            plugin_dir: plugin_dir.clone(),
+            installed_at: Utc::now(),
+            status: current_status,
+            registered: RegisteredCapabilities {
+                service_ids: vec!["candidate-service".to_string()],
+                event_sink_ids: vec!["shared-sink".to_string()],
+                ..Default::default()
+            },
+        };
+        let foreign = InstalledPlugin {
+            id: "foreign-plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: PathBuf::from("/tmp/foreign-plugin"),
+            },
+            plugin_dir: PathBuf::from("/tmp/foreign-plugin"),
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                event_sink_ids: vec!["shared-sink".to_string()],
+                ..Default::default()
+            },
+        };
+        let mut store = InstalledPlugins::default();
+        store.add(current.clone());
+        store.add(foreign.clone());
+        store.save(&installed_json).await.unwrap();
+        let before = store.plugins.clone();
+
+        let error = installer
+            .install(
+                &manifest,
+                &plugin_dir,
+                PluginSource::LocalDir {
+                    path: plugin_dir.clone(),
+                },
+                InstallDisposition::Upgrade,
+                Utc::now(),
+            )
+            .await
+            .expect_err("foreign row must outrank corrupt self ownership");
+        assert!(matches!(
+            error,
+            PluginError::Conflict {
+                kind: "event sink",
+                ..
+            }
+        ));
+        let after = InstalledPlugins::load(&installed_json).await.unwrap();
+        assert_eq!(after.plugins, before, "status={current_status:?}");
+    }
+}
+
+#[tokio::test]
+async fn corrupt_self_and_foreign_backing_service_ownership_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let installed_json = state.app_data_dir.join("plugins").join("installed.json");
+    let plugin_dir = root.path().join("plugins").join("candidate-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+    let manifest_json = event_sink_manifest_json(
+        "candidate-plugin",
+        "2.0.0",
+        "shared-service",
+        &[("candidate-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&manifest_json).unwrap();
+
+    let mut store = InstalledPlugins::default();
+    for id in ["candidate-plugin", "foreign-plugin"] {
+        store.plugins.push(InstalledPlugin {
+            id: id.to_string(),
+            version: "1.0.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: PathBuf::from(format!("/tmp/{id}")),
+            },
+            plugin_dir: if id == "candidate-plugin" {
+                plugin_dir.clone()
+            } else {
+                PathBuf::from("/tmp/foreign-plugin")
+            },
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                service_ids: vec!["shared-service".to_string()],
+                event_sink_ids: if id == "candidate-plugin" {
+                    vec!["candidate-sink".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+        });
+    }
+    store.save(&installed_json).await.unwrap();
+    let before = store.plugins.clone();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+        )
+        .await
+        .expect_err("foreign service owner must outrank corrupt self ownership");
+    assert!(matches!(
+        error,
+        PluginError::Conflict {
+            kind: "event sink service",
+            ..
+        }
+    ));
+    assert_eq!(
+        InstalledPlugins::load(&installed_json)
+            .await
+            .unwrap()
+            .plugins,
+        before
+    );
+}
+
+#[tokio::test]
+async fn boot_global_audit_blocks_duplicate_sink_backing_services_but_starts_safe_plugins() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let plugins_root = data_dir.path().join("plugins");
+    tokio::fs::create_dir_all(&plugins_root).await.unwrap();
+    let mut store = InstalledPlugins::default();
+
+    for (plugin_id, service_id, sink_id) in [
+        ("first-plugin", "first-service", "shared-sink"),
+        ("second-plugin", "second-service", "shared-sink"),
+        ("safe-plugin", "safe-service", "safe-sink"),
+    ] {
+        let plugin_dir = plugins_root.join(plugin_id);
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        let raw = event_sink_manifest_json(
+            plugin_id,
+            "1.0.0",
+            service_id,
+            &[(sink_id, TOOL_EVENT_V1_SCHEMA_VERSION)],
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+        tokio::fs::write(plugin_dir.join("plugin.json"), value.to_string())
+            .await
+            .unwrap();
+        store.plugins.push(InstalledPlugin {
+            id: plugin_id.to_string(),
+            version: "1.0.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            plugin_dir,
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                service_ids: vec![service_id.to_string()],
+                event_sink_ids: vec![sink_id.to_string()],
+                ..Default::default()
+            },
+        });
+    }
+    store
+        .save(&plugins_root.join("installed.json"))
+        .await
+        .unwrap();
+
+    let state = AppState::new(data_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+    state.wait_for_boot_reconcile_services().await;
+    assert!(!state.service_manager.is_running("first-service"));
+    assert!(!state.service_manager.is_running("second-service"));
+    assert!(
+        state.service_manager.is_running("safe-service"),
+        "a corrupt row must not stop the independent boot reconciliation pass"
+    );
+}
+
+#[tokio::test]
 async fn invalid_sink_policy_fails_before_mcp_or_service_registration() {
     let root = tempfile::tempdir().unwrap();
     let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
@@ -1457,9 +1671,9 @@ async fn upgrade_replaces_event_sink_provenance_exactly_and_frees_removed_id() {
 // ---------------------------------------------------------------------
 // Same-id upgrade ordering (issue #479): `stop_services_for_upgrade` /
 // `restart_services_after_failed_upgrade` are the seam the HTTP
-// `update_plugin` handler uses to stop a plugin's services BEFORE
-// `stage_plugin_source` swaps `plugin_dir`, and to restart them if the
-// upgrade subsequently fails and rolls back to the old bundle. Unit-tested
+// `update_plugin` handler uses after prepared-candidate preflight and BEFORE
+// bundle activation, and to restart them if the upgrade subsequently fails
+// and rolls back to the old bundle. Unit-tested
 // directly here (rather than only through the full HTTP+staging pipeline)
 // so the ordering contract is pinned precisely.
 // ---------------------------------------------------------------------
@@ -1535,7 +1749,7 @@ async fn restart_services_after_failed_upgrade_restarts_from_the_still_installed
         .await
         .expect("install");
 
-    // Simulate the handler's pre-stage stop (see `update_plugin`).
+    // Simulate the handler's post-preflight, pre-activation stop.
     let stopped = installer.stop_services_for_upgrade("svc-plugin").await;
     assert_eq!(stopped, vec!["svc".to_string()]);
     assert!(!state.service_manager.is_running("svc"));

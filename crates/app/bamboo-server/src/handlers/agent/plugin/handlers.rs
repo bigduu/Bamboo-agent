@@ -3,9 +3,9 @@
 //! Every handler constructs a fresh `ServerPluginInstaller::new(state.clone())`
 //! per request — the same pattern every other handler in this crate uses for
 //! `web::Data<AppState>` (it's `Arc`-backed, so cloning is cheap) — and either
-//! calls it directly (`list`/`uninstall`) or drives it through
-//! `crate::plugin_source`'s stage-then-install seam (`install`/`update`),
-//! matching `examples/install_plugin.rs`'s reference usage.
+//! calls it directly (`list`/`uninstall`) or drives the prepared-source
+//! transaction (`install`/`update`): prepare privately, acquire the global
+//! operation guard, audit ownership, activate, install, commit/rollback.
 
 use std::path::PathBuf;
 
@@ -14,7 +14,7 @@ use bamboo_plugin::{InstallDisposition, PluginError, PluginInstaller, PluginSour
 
 use crate::app_state::AppState;
 use crate::plugin_installer::ServerPluginInstaller;
-use crate::plugin_source::{install_plugin_from_source, stage_plugin_source, PluginSourceInput};
+use crate::plugin_source::{prepare_plugin_source, PluginSourceInput};
 
 use super::api_types::{to_view, InstallPluginRequest, PluginListResponse};
 use super::errors::plugin_error_response;
@@ -88,17 +88,49 @@ pub async fn install_plugin(
     let input = to_source_input(body.into_inner().source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    match install_plugin_from_source(
-        &installer,
-        input,
-        &root,
-        &trust,
-        InstallDisposition::FailIfInstalled,
-    )
-    .await
+    let prepared = match prepare_plugin_source(input, &root, &trust).await {
+        Ok(prepared) => prepared,
+        Err(error) => return plugin_error_response(&error),
+    };
+    let guard = installer.begin_operation().await;
+    if let Err(error) = installer
+        .preflight_prepared_candidate(
+            &prepared.manifest,
+            &prepared.prepared_dir,
+            InstallDisposition::FailIfInstalled,
+            &guard,
+        )
+        .await
     {
-        Ok(entry) => HttpResponse::Created().json(to_view(entry, &state.service_manager).await),
-        Err(error) => plugin_error_response(&error),
+        prepared.discard().await;
+        return plugin_error_response(&error);
+    }
+    let staged = match prepared.activate().await {
+        Ok(staged) => staged,
+        Err(error) => return plugin_error_response(&error),
+    };
+    let manifest = staged.manifest.clone();
+    let plugin_dir = staged.plugin_dir.clone();
+    let source = staged.source.clone();
+    match installer
+        .install_with_operation(
+            &manifest,
+            &plugin_dir,
+            source,
+            InstallDisposition::FailIfInstalled,
+            chrono::Utc::now(),
+            &guard,
+        )
+        .await
+    {
+        Ok(entry) => {
+            staged.commit().await;
+            HttpResponse::Created().json(to_view(entry, &state.service_manager).await)
+        }
+        Err(error) => {
+            staged.rollback().await;
+            plugin_error_response(&error)
+        }
     }
 }
 
@@ -122,20 +154,39 @@ pub async fn update_plugin(
     let input = to_source_input(body.into_inner().source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    // Same-id upgrade ordering (issue #479): `stage_plugin_source` below
-    // swaps `plugin_dir`'s ENTIRE contents (old bundle -> `.backup-*`,
-    // staged bundle -> `plugin_dir`) BEFORE `install()` ever runs — so any
-    // service this plugin currently owns must be stopped BEFORE staging,
-    // not after `install()`'s own `register_services` step, or the old
-    // process could still be holding the about-to-be-replaced binary open
-    // (and would otherwise briefly run stale code post-swap either way).
-    // `path_id` is the ONLY point in this flow where the target id is known
-    // up front (a fresh `install_plugin` has no prior id to look up). See
-    // `ServerPluginInstaller::stop_services_for_upgrade`'s doc comment for
-    // the full stop -> swap -> start sequencing this establishes.
-    let stopped_services = installer.stop_services_for_upgrade(&path_id).await;
+    // Download/copy/extract and validate into a private UUID directory first.
+    // The live bundle and old service remain untouched until the globally
+    // serialized ownership audit has accepted the candidate.
+    let prepared = match prepare_plugin_source(input, &root, &trust).await {
+        Ok(prepared) => prepared,
+        Err(error) => return plugin_error_response(&error),
+    };
+    if prepared.manifest.id != path_id {
+        let manifest_id = prepared.manifest.id.clone();
+        prepared.discard().await;
+        return plugin_error_response(&PluginError::InvalidManifest(format!(
+            "path id '{path_id}' does not match the source's manifest id '{manifest_id}'"
+        )));
+    }
 
-    let staged = match stage_plugin_source(input, &root, &trust).await {
+    let guard = installer.begin_operation().await;
+    if let Err(error) = installer
+        .preflight_prepared_candidate(
+            &prepared.manifest,
+            &prepared.prepared_dir,
+            InstallDisposition::Upgrade,
+            &guard,
+        )
+        .await
+    {
+        prepared.discard().await;
+        return plugin_error_response(&error);
+    }
+
+    // Same-id upgrade ordering now runs inside the SAME operation boundary:
+    // ownership audit -> stop old service -> activate bundle -> install.
+    let stopped_services = installer.stop_services_for_upgrade(&path_id).await;
+    let staged = match prepared.activate().await {
         Ok(staged) => staged,
         Err(error) => {
             installer
@@ -144,27 +195,18 @@ pub async fn update_plugin(
             return plugin_error_response(&error);
         }
     };
-    if staged.manifest.id != path_id {
-        let manifest_id = staged.manifest.id.clone();
-        staged.rollback().await;
-        installer
-            .restart_services_after_failed_upgrade(&path_id, &stopped_services)
-            .await;
-        return plugin_error_response(&PluginError::InvalidManifest(format!(
-            "path id '{path_id}' does not match the source's manifest id '{manifest_id}'"
-        )));
-    }
 
     let manifest = staged.manifest.clone();
     let plugin_dir = staged.plugin_dir.clone();
     let source = staged.source.clone();
     match installer
-        .install(
+        .install_with_operation(
             &manifest,
             &plugin_dir,
             source,
             InstallDisposition::Upgrade,
             chrono::Utc::now(),
+            &guard,
         )
         .await
     {

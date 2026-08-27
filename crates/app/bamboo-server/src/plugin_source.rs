@@ -108,17 +108,20 @@
 //! # Swap safety (why an upgrade doesn't lose the old bundle on failure)
 //!
 //! `plugin_dir` is a fixed path per id (`plugins_dir()/<id>/`), so an upgrade
-//! necessarily replaces whatever is already there. [`stage_plugin_source`]
+//! necessarily replaces whatever is already there. [`prepare_plugin_source`]
 //! builds the new bundle in a scratch `.staging-*` directory first (so a bad
 //! source — invalid manifest, failed download, sha256 mismatch — never
-//! touches the existing install), then — only once the new bundle validates
-//! — moves the OLD `plugin_dir` aside to a `.backup-*` directory (not
-//! deleted) before renaming the staging directory into place. The returned
+//! touches the existing install). The HTTP handlers then hold the server's
+//! plugin-operation lock while auditing global ownership; only an accepted
+//! [`PreparedPlugin`] is activated, after which the OLD `plugin_dir` is moved
+//! aside to a `.backup-*` directory (not deleted) and the candidate is renamed
+//! into place. The returned
 //! [`StagedPlugin`] carries that backup path privately: [`StagedPlugin::commit`]
 //! deletes it (call after a successful `install()`), [`StagedPlugin::rollback`]
 //! removes the half-installed new bundle and restores the backup (call after
-//! a failed `install()`). [`install_plugin_from_source`] wires this up
-//! automatically and is the seam CLI/HTTP callers should use end to end.
+//! a failed `install()`). [`stage_plugin_source`] and
+//! [`install_plugin_from_source`] remain convenience seams for standalone
+//! installers that do not share bamboo-server's global capability stores.
 //!
 //! Residual gap (documented, not solved here): the plugin_dir swap itself and
 //! `install()`'s own capability-registration rollback (see
@@ -173,17 +176,12 @@
 //!   `bamboo_plugin::registry::InstalledPlugins::save` (`installed.json`) now
 //!   does; deferred here as a change to a shared, pre-existing storage
 //!   helper rather than this branch's new code.
-//! - **The `plugin_dir` swap in [`stage_plugin_source`] runs BEFORE
-//!   `PLUGIN_OP_LOCK` is acquired** (that lock is taken inside
-//!   `ServerPluginInstaller::install`/`uninstall`, in `crate::plugin_installer`,
-//!   which only runs after staging returns). Two concurrent installs/updates
-//!   of the SAME plugin id could therefore race the backup-rename +
-//!   staging-rename swap itself (not just the capability-registration steps
-//!   the lock does protect). Plugin ops are rare/operator-driven, not
-//!   concurrent by design, so this is accepted as a documented gap rather
-//!   than moving the lock acquisition into this module; a real fix would
-//!   need `stage_plugin_source` and `PluginInstaller::install` to share one
-//!   lock scope (a bigger seam change than this branch's fixes).
+//! - Direct callers of the legacy [`stage_plugin_source`] convenience API are
+//!   responsible for their own serialization. bamboo-server's production
+//!   install/update handlers use [`prepare_plugin_source`] and retain one
+//!   `PLUGIN_OP_LOCK` guard across ownership preflight, service shutdown,
+//!   activation, install, and rollback, so shared server state has no
+//!   preflight-to-swap race.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -235,6 +233,75 @@ pub enum PluginSourceInput {
     },
 }
 
+/// A fully downloaded/copied, extracted, and validated plugin bundle that is
+/// still isolated under a UUID staging directory. Callers can inspect the
+/// manifest and run shared ownership preflight before [`Self::activate`]
+/// swaps any existing `plugins/<id>` directory.
+#[derive(Debug)]
+pub struct PreparedPlugin {
+    pub manifest: PluginManifest,
+    pub prepared_dir: PathBuf,
+    pub plugin_dir: PathBuf,
+    pub source: PluginSource,
+}
+
+impl PreparedPlugin {
+    /// Atomically make this candidate the plugin's fixed on-disk bundle,
+    /// retaining the previous bundle for commit/rollback. Shared ownership
+    /// preflight and upgrade service shutdown must happen before this call.
+    pub async fn activate(self) -> PluginResult<StagedPlugin> {
+        let backup_dir = if tokio::fs::try_exists(&self.plugin_dir)
+            .await
+            .unwrap_or(false)
+        {
+            let root = self.plugin_dir.parent().ok_or_else(|| {
+                PluginError::InvalidManifest("plugin directory has no parent".to_string())
+            })?;
+            let backup = root.join(format!(
+                ".backup-{}-{}",
+                self.manifest.id,
+                uuid::Uuid::new_v4()
+            ));
+            if let Err(error) = tokio::fs::rename(&self.plugin_dir, &backup).await {
+                let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+                return Err(PluginError::Io(error));
+            }
+            Some(backup)
+        } else {
+            None
+        };
+
+        if let Err(rename_error) = tokio::fs::rename(&self.prepared_dir, &self.plugin_dir).await {
+            // Cross-device (e.g. staging on a different mount) — fall back to
+            // a recursive copy, then remove the prepared directory.
+            if let Err(copy_error) = copy_dir_recursive(&self.prepared_dir, &self.plugin_dir).await
+            {
+                let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+                let _ = tokio::fs::remove_dir_all(&self.plugin_dir).await;
+                if let Some(backup) = &backup_dir {
+                    let _ = tokio::fs::rename(backup, &self.plugin_dir).await;
+                }
+                tracing::warn!(%rename_error, %copy_error, "failed to activate prepared plugin bundle");
+                return Err(copy_error);
+            }
+            let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+        }
+
+        Ok(StagedPlugin {
+            manifest: self.manifest,
+            plugin_dir: self.plugin_dir,
+            source: self.source,
+            backup_dir,
+        })
+    }
+
+    /// Remove an unactivated candidate after path-id or ownership preflight
+    /// refuses it. The live plugin bundle is untouched.
+    pub async fn discard(self) {
+        let _ = tokio::fs::remove_dir_all(&self.prepared_dir).await;
+    }
+}
+
 /// The result of staging a [`PluginSourceInput`] into `plugins_dir()/<id>/`:
 /// the validated manifest (so a caller can preview `manifest.provides` —
 /// what the install WILL register — before committing to `install()`), the
@@ -272,6 +339,17 @@ impl StagedPlugin {
     }
 }
 
+/// Prepare a source completely in an isolated scratch directory without
+/// swapping `plugins/<id>`. This is the production seam for callers that must
+/// perform global provenance/ownership checks before any shared mutation.
+pub async fn prepare_plugin_source(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+) -> PluginResult<PreparedPlugin> {
+    prepare_plugin_source_inner(input, plugins_root, trust, MAX_DECOMPRESSED_BYTES).await
+}
+
 /// Stage `input` into `plugins_root/<id>/`, validating the manifest before
 /// anything is committed. Returns a [`StagedPlugin`] ready to hand to
 /// [`bamboo_plugin::PluginInstaller::install`] — call [`StagedPlugin::commit`]
@@ -306,6 +384,18 @@ async fn stage_plugin_source_inner(
     trust: &PluginTrustConfig,
     max_decompressed_bytes: u64,
 ) -> PluginResult<StagedPlugin> {
+    prepare_plugin_source_inner(input, plugins_root, trust, max_decompressed_bytes)
+        .await?
+        .activate()
+        .await
+}
+
+async fn prepare_plugin_source_inner(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    max_decompressed_bytes: u64,
+) -> PluginResult<PreparedPlugin> {
     tokio::fs::create_dir_all(plugins_root).await?;
     let staging_dir = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&staging_dir).await?;
@@ -325,38 +415,11 @@ async fn stage_plugin_source_inner(
     }
 
     let plugin_dir = plugins_root.join(&manifest.id);
-    let backup_dir = if tokio::fs::try_exists(&plugin_dir).await.unwrap_or(false) {
-        let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
-        if let Err(error) = tokio::fs::rename(&plugin_dir, &backup).await {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(PluginError::Io(error));
-        }
-        Some(backup)
-    } else {
-        None
-    };
-
-    if let Err(rename_error) = tokio::fs::rename(&staging_dir, &plugin_dir).await {
-        // Cross-device (e.g. staging on a different mount) — fall back to a
-        // recursive copy, then remove the staging dir.
-        if let Err(copy_error) = copy_dir_recursive(&staging_dir, &plugin_dir).await {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            // Restore the backup we just moved aside, if any, since the swap
-            // never actually happened.
-            if let Some(backup) = &backup_dir {
-                let _ = tokio::fs::rename(backup, &plugin_dir).await;
-            }
-            tracing::warn!(%rename_error, %copy_error, "failed to stage plugin bundle into place");
-            return Err(copy_error);
-        }
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-    }
-
-    Ok(StagedPlugin {
+    Ok(PreparedPlugin {
         manifest,
         plugin_dir,
+        prepared_dir: staging_dir,
         source,
-        backup_dir,
     })
 }
 

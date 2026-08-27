@@ -12,7 +12,7 @@
 //! deregistering capabilities (MCP servers, prompt presets, workflow files)
 //! is the installer's job (see [`crate::installer`] and `PLUGIN_PLAN.md`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -218,6 +218,232 @@ pub struct EventSinkReconciliation {
     pub sinks_after_services: Vec<ReconciledEventSink>,
 }
 
+/// One installed row plus the manifest read from that row's `plugin_dir`.
+/// `None` is explicit corruption/unavailability, not an empty manifest.
+#[derive(Debug, Clone)]
+pub struct PluginBootCandidate {
+    pub installed: InstalledPlugin,
+    pub manifest: Option<PluginManifest>,
+}
+
+/// Fail-closed diagnostics emitted by the global boot provenance audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginBootIssue {
+    ManifestUnavailable,
+    ManifestIdMismatch { manifest_id: String },
+    InvalidManifest { detail: String },
+    InstallIncomplete,
+    UnknownPlatform,
+    PlatformIneligible,
+    DuplicateEventSinkOwner { id: String },
+    DuplicateServiceOwner { id: String },
+}
+
+/// Pure boot plan consumed by bamboo-server before it starts plugin services.
+/// It audits all rows together so duplicate ownership cannot degrade into
+/// first-wins activation. #903 still performs no event delivery mutation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginBootReconciliation {
+    pub plugin_id: String,
+    pub service_ids_to_start: Vec<String>,
+    pub event_sinks: EventSinkReconciliation,
+    pub issues: Vec<PluginBootIssue>,
+}
+
+/// Audit the complete installed registry before boot recovery. A row is only
+/// eligible to start services when its identity, status, platform, manifest,
+/// and global service/sink ownership all agree. A duplicated sink also blocks
+/// its backing service for that row, leaving no process available for a later
+/// router to attach to accidentally.
+pub fn reconcile_plugin_boot(
+    candidates: &[PluginBootCandidate],
+    platform: Option<Platform>,
+) -> Vec<PluginBootReconciliation> {
+    let mut sink_owner_counts: HashMap<&str, usize> = HashMap::new();
+    let mut service_owner_counts: HashMap<&str, usize> = HashMap::new();
+    for candidate in candidates {
+        for id in &candidate.installed.registered.event_sink_ids {
+            *sink_owner_counts.entry(id.as_str()).or_default() += 1;
+        }
+        for id in &candidate.installed.registered.service_ids {
+            *service_owner_counts.entry(id.as_str()).or_default() += 1;
+        }
+    }
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let installed = &candidate.installed;
+            let mut plan = PluginBootReconciliation {
+                plugin_id: installed.id.clone(),
+                event_sinks: EventSinkReconciliation {
+                    deactivate_before_services: unique_strings(
+                        &installed.registered.event_sink_ids,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            if installed.status == PluginInstallStatus::Installing {
+                plan.issues.push(PluginBootIssue::InstallIncomplete);
+                return plan;
+            }
+            let Some(platform) = platform else {
+                plan.issues.push(PluginBootIssue::UnknownPlatform);
+                return plan;
+            };
+            let Some(manifest) = candidate.manifest.as_ref() else {
+                plan.issues.push(PluginBootIssue::ManifestUnavailable);
+                return plan;
+            };
+            if manifest.id != installed.id {
+                plan.issues.push(PluginBootIssue::ManifestIdMismatch {
+                    manifest_id: manifest.id.clone(),
+                });
+                return plan;
+            }
+            if let Err(error) = manifest.validate() {
+                plan.issues.push(PluginBootIssue::InvalidManifest {
+                    detail: error.to_string(),
+                });
+                return plan;
+            }
+            if !manifest.supports_platform(platform) {
+                plan.issues.push(PluginBootIssue::PlatformIneligible);
+                return plan;
+            }
+
+            let mut sink_plan = reconcile_event_sinks(
+                manifest,
+                &installed.registered,
+                installed.status,
+                Some(platform),
+            )
+            .expect("manifest was validated above");
+            let mut unsafe_sink_ids = HashSet::new();
+            let mut unsafe_backing_services = HashSet::new();
+
+            for sink_id in &installed.registered.event_sink_ids {
+                if sink_owner_counts
+                    .get(sink_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    push_issue_once(
+                        &mut plan.issues,
+                        PluginBootIssue::DuplicateEventSinkOwner {
+                            id: sink_id.clone(),
+                        },
+                    );
+                    unsafe_sink_ids.insert(sink_id.as_str());
+                    if let Some(sink) = manifest
+                        .provides
+                        .event_sinks
+                        .iter()
+                        .find(|sink| sink.id == *sink_id)
+                    {
+                        unsafe_backing_services.insert(sink.service_id.as_str());
+                    }
+                }
+            }
+
+            for service_id in &installed.registered.service_ids {
+                if service_owner_counts
+                    .get(service_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    push_issue_once(
+                        &mut plan.issues,
+                        PluginBootIssue::DuplicateServiceOwner {
+                            id: service_id.clone(),
+                        },
+                    );
+                    unsafe_backing_services.insert(service_id.as_str());
+                }
+            }
+            for sink in &manifest.provides.event_sinks {
+                if installed
+                    .registered
+                    .event_sink_ids
+                    .iter()
+                    .any(|id| id == &sink.id)
+                    && service_owner_counts
+                        .get(sink.service_id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        != 1
+                {
+                    unsafe_sink_ids.insert(sink.id.as_str());
+                    unsafe_backing_services.insert(sink.service_id.as_str());
+                }
+            }
+
+            sink_plan.sinks_after_services.retain(|sink| {
+                !unsafe_sink_ids.contains(sink.id.as_str())
+                    && !unsafe_backing_services.contains(sink.service_id.as_str())
+            });
+            sink_plan
+                .service_dependencies_before_sinks
+                .retain(|service_id| !unsafe_backing_services.contains(service_id.as_str()));
+            for sink_id in unsafe_sink_ids {
+                if !sink_plan
+                    .deactivate_before_services
+                    .iter()
+                    .any(|id| id == sink_id)
+                {
+                    sink_plan
+                        .deactivate_before_services
+                        .push(sink_id.to_string());
+                }
+            }
+
+            let owned_services: HashSet<&str> = installed
+                .registered
+                .service_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            plan.service_ids_to_start = manifest
+                .provides
+                .services
+                .iter()
+                .filter(|service| {
+                    service.enabled
+                        && owned_services.contains(service.id.as_str())
+                        && service_owner_counts
+                            .get(service.id.as_str())
+                            .copied()
+                            .unwrap_or_default()
+                            == 1
+                        && !unsafe_backing_services.contains(service.id.as_str())
+                })
+                .map(|service| service.id.clone())
+                .collect();
+            plan.event_sinks = sink_plan;
+            plan
+        })
+        .collect()
+}
+
+fn unique_strings(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .filter(|value| seen.insert(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn push_issue_once(issues: &mut Vec<PluginBootIssue>, issue: PluginBootIssue) {
+    if !issues.contains(&issue) {
+        issues.push(issue);
+    }
+}
+
 /// Cross-check event-sink manifest declarations against exact plugin
 /// provenance for install/boot recovery. Validation is repeated here so a
 /// boot caller cannot accidentally activate a malformed on-disk manifest by
@@ -229,6 +455,8 @@ pub fn reconcile_event_sinks(
     platform: Option<Platform>,
 ) -> PluginResult<EventSinkReconciliation> {
     manifest.validate()?;
+    let plugin_platform_eligible =
+        platform.is_some_and(|platform| manifest.supports_platform(platform));
     let owned_sink_ids: HashSet<&str> = registered
         .event_sink_ids
         .iter()
@@ -258,6 +486,10 @@ pub fn reconcile_event_sinks(
         let state = if install_status == PluginInstallStatus::Installing {
             EventSinkCapabilityState::Inactive {
                 detail: crate::manifest::EventSinkInactiveReason::InstallIncomplete,
+            }
+        } else if !plugin_platform_eligible {
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::PlatformIneligible,
             }
         } else {
             sink.capability_state(service, platform)
@@ -854,6 +1086,182 @@ mod tests {
                 detail: crate::manifest::EventSinkInactiveReason::ServiceDisabled,
             }
         );
+    }
+
+    #[test]
+    fn reconciliation_applies_the_plugin_level_platform_gate() {
+        let mut manifest = event_sink_manifest(true, 1);
+        manifest.platforms = Some(vec![Platform::Macos]);
+        manifest.validate().expect("macOS-only manifest");
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("platform-ineligible plan");
+        assert!(plan.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            plan.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::PlatformIneligible,
+            }
+        );
+    }
+
+    fn boot_candidate(
+        id: &str,
+        manifest: Option<PluginManifest>,
+        service_ids: &[&str],
+        sink_ids: &[&str],
+        status: PluginInstallStatus,
+    ) -> PluginBootCandidate {
+        let mut installed = sample_plugin(id);
+        installed.status = status;
+        installed.registered.service_ids = service_ids.iter().map(|id| (*id).to_string()).collect();
+        installed.registered.event_sink_ids = sink_ids.iter().map(|id| (*id).to_string()).collect();
+        PluginBootCandidate {
+            installed,
+            manifest,
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_sink_owners_and_their_backing_services() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.id = "other-plugin".to_string();
+        second.provides.services[0].id = "other-service".to_string();
+        second.provides.event_sinks[0].service_id = "other-service".to_string();
+        second.validate().expect("second manifest");
+        let candidates = vec![
+            boot_candidate(
+                "event-plugin",
+                Some(first),
+                &["audit-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+            boot_candidate(
+                "other-plugin",
+                Some(second),
+                &["other-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+        ];
+
+        let plans = reconcile_plugin_boot(&candidates, Some(Platform::Linux));
+        assert_eq!(plans.len(), 2);
+        for plan in plans {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert_eq!(
+                plan.event_sinks.deactivate_before_services,
+                ["audit-events"]
+            );
+            assert!(plan.event_sinks.sinks_after_services.is_empty());
+            assert!(plan
+                .issues
+                .contains(&PluginBootIssue::DuplicateEventSinkOwner {
+                    id: "audit-events".to_string(),
+                }));
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_service_owners_and_dependent_sinks() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.id = "other-plugin".to_string();
+        second.provides.event_sinks[0].id = "other-events".to_string();
+        second.validate().expect("second manifest");
+        let candidates = vec![
+            boot_candidate(
+                "event-plugin",
+                Some(first),
+                &["audit-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+            boot_candidate(
+                "other-plugin",
+                Some(second),
+                &["audit-service"],
+                &["other-events"],
+                PluginInstallStatus::Installed,
+            ),
+        ];
+
+        let plans = reconcile_plugin_boot(&candidates, Some(Platform::Linux));
+        assert_eq!(
+            plans[0].event_sinks.deactivate_before_services,
+            ["audit-events"]
+        );
+        assert_eq!(
+            plans[1].event_sinks.deactivate_before_services,
+            ["other-events"]
+        );
+        for plan in plans {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert!(plan.event_sinks.sinks_after_services.is_empty());
+            assert!(plan
+                .issues
+                .contains(&PluginBootIssue::DuplicateServiceOwner {
+                    id: "audit-service".to_string(),
+                }));
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_incomplete_identity_mismatch_and_unknown_platform() {
+        let manifest = event_sink_manifest(true, 1);
+        let installing = boot_candidate(
+            "event-plugin",
+            Some(manifest.clone()),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installing,
+        );
+        let mut mismatch_manifest = manifest.clone();
+        mismatch_manifest.id = "different-plugin".to_string();
+        let mismatch = boot_candidate(
+            "event-plugin",
+            Some(mismatch_manifest),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installed,
+        );
+
+        let installing_plan = reconcile_plugin_boot(&[installing], Some(Platform::Linux));
+        assert_eq!(
+            installing_plan[0].issues,
+            [PluginBootIssue::InstallIncomplete]
+        );
+        assert!(installing_plan[0].service_ids_to_start.is_empty());
+
+        let mismatch_plan = reconcile_plugin_boot(&[mismatch], Some(Platform::Linux));
+        assert!(matches!(
+            mismatch_plan[0].issues.as_slice(),
+            [PluginBootIssue::ManifestIdMismatch { .. }]
+        ));
+        assert!(mismatch_plan[0].service_ids_to_start.is_empty());
+
+        let unknown = boot_candidate(
+            "event-plugin",
+            Some(manifest),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installed,
+        );
+        let unknown_plan = reconcile_plugin_boot(&[unknown], None);
+        assert_eq!(unknown_plan[0].issues, [PluginBootIssue::UnknownPlatform]);
+        assert!(unknown_plan[0].service_ids_to_start.is_empty());
     }
 
     #[test]

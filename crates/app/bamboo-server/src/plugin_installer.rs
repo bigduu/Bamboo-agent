@@ -113,11 +113,12 @@
 //! idempotent/log-and-continue, so a second rollback attempt via a plain
 //! retry can never fail louder than the first).
 //!
-//! One known, accepted gap: `stage_plugin_source`/`install_plugin_from_source`
-//! in [`crate::plugin_source`] additionally guard the ON-DISK `plugin_dir`
-//! swap itself (an upgrade's new bundle replaces the old one's files at a
-//! fixed path) by moving the previous bundle aside instead of deleting it, and
-//! restoring it if `install()` subsequently fails — see that module's docs.
+//! The production HTTP path prepares source bytes in an isolated directory,
+//! then retains [`PluginOperationGuard`] across global ownership preflight,
+//! old-service shutdown, bundle activation, registration, and rollback. The
+//! on-disk swap therefore shares the same serialization boundary as the
+//! provenance/config mutations. Standalone callers of the lower-level trait
+//! remain responsible for staging serialization; see `crate::plugin_source`.
 //!
 //! Prompt-preset drop-diff caveat: the upgrade drop-diff compares the NEW
 //! manifest's nominal preset ids against the OLD install's ACTUAL (possibly
@@ -139,7 +140,9 @@ use tokio::fs;
 use bamboo_domain::mcp_config::McpServerConfig;
 use bamboo_plugin::installer::{load_previous_for_disposition, preflight_install};
 use bamboo_plugin::manifest::{Platform, ServiceManifestEntry};
-use bamboo_plugin::registry::{reconcile_exclusive, RegisteredCapabilities};
+use bamboo_plugin::registry::{
+    reconcile_exclusive, reconcile_plugin_boot, PluginBootCandidate, RegisteredCapabilities,
+};
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
     PluginInstaller, PluginManifest, PluginResult, PluginSource,
@@ -188,6 +191,13 @@ use crate::service_manager::{ServiceManager, ServiceRuntimeConfig};
 /// that's a documented follow-up, not implemented here.
 static PLUGIN_OP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Proof that the caller holds the process-wide plugin-operation boundary.
+/// HTTP source preparation uses this guard across ownership preflight, old
+/// service shutdown, bundle activation, installer mutation, and rollback.
+pub(crate) struct PluginOperationGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
 /// AppState-backed [`PluginInstaller`]. See the module docs for the full
 /// design rationale (borrowing, path derivation, atomicity).
 pub struct ServerPluginInstaller {
@@ -215,6 +225,85 @@ impl ServerPluginInstaller {
         Self { state }
     }
 
+    pub(crate) async fn begin_operation(&self) -> PluginOperationGuard {
+        PluginOperationGuard {
+            _guard: PLUGIN_OP_LOCK.lock().await,
+        }
+    }
+
+    async fn preflight_provenance_ownership(
+        &self,
+        manifest: &PluginManifest,
+    ) -> PluginResult<bamboo_plugin::registry::ExclusiveReconciliation> {
+        let declared_event_sink_ids: Vec<String> = manifest
+            .provides
+            .event_sinks
+            .iter()
+            .map(|sink| sink.id.clone())
+            .collect();
+        // `existing_*` contains ONLY other plugin rows. Any hit is therefore
+        // foreign even when a corrupt current row also claims the same id;
+        // current previous ownership must never override it.
+        let event_sinks = reconcile_exclusive(
+            &declared_event_sink_ids,
+            &self.existing_event_sink_ids(&manifest.id).await?,
+            &[],
+        );
+        if !event_sinks.foreign_conflicts.is_empty() {
+            return Err(PluginError::Conflict {
+                kind: "event sink",
+                name: event_sinks.foreign_conflicts.join(", "),
+                plugin_id: manifest.id.clone(),
+            });
+        }
+
+        let declared_service_ids: Vec<String> = manifest
+            .provides
+            .services
+            .iter()
+            .map(|service| service.id.clone())
+            .collect();
+        let services = reconcile_exclusive(
+            &declared_service_ids,
+            &self.existing_service_ids(&manifest.id).await?,
+            &[],
+        );
+        if !services.foreign_conflicts.is_empty() {
+            return Err(PluginError::Conflict {
+                kind: if manifest.provides.event_sinks.iter().any(|sink| {
+                    services
+                        .foreign_conflicts
+                        .iter()
+                        .any(|id| id == &sink.service_id)
+                }) {
+                    "event sink service"
+                } else {
+                    "service"
+                },
+                name: services.foreign_conflicts.join(", "),
+                plugin_id: manifest.id.clone(),
+            });
+        }
+        Ok(event_sinks)
+    }
+
+    /// Validate an isolated candidate while holding the same operation lock
+    /// that will cover activation and install. No live bundle, service,
+    /// config, or provenance state is mutated here.
+    pub(crate) async fn preflight_prepared_candidate(
+        &self,
+        manifest: &PluginManifest,
+        prepared_dir: &Path,
+        disposition: InstallDisposition,
+        _guard: &PluginOperationGuard,
+    ) -> PluginResult<()> {
+        load_previous_for_disposition(&self.installed_json_path(), &manifest.id, disposition)
+            .await?;
+        preflight_install(manifest, prepared_dir).await?;
+        self.preflight_provenance_ownership(manifest).await?;
+        Ok(())
+    }
+
     fn plugins_dir(&self) -> PathBuf {
         self.state.app_data_dir.join("plugins")
     }
@@ -236,9 +325,9 @@ impl ServerPluginInstaller {
     /// `BAMBOO_PLUGIN_SERVICE_CONFIG` (issue #479 open question 2).
     ///
     /// Deliberately NOT under `plugins_dir()/<plugin_id>/` (the
-    /// swap-managed `plugin_dir`): `plugin_source::stage_plugin_source`
-    /// upgrades a plugin by renaming the ENTIRE old `plugin_dir` aside and
-    /// swapping a freshly-staged directory into its place — any file living
+    /// swap-managed `plugin_dir`): plugin-source activation upgrades a plugin
+    /// by renaming the ENTIRE old `plugin_dir` aside and swapping a prepared
+    /// directory into its place — any file living
     /// inside `plugin_dir` would be swept away with the old bundle on
     /// upgrade (or deleted outright on uninstall) unless bamboo specifically
     /// carried it forward, which it does not. A sibling directory, named
@@ -277,9 +366,9 @@ impl ServerPluginInstaller {
     /// step, which runs before every registration step). Without excluding
     /// it, a plain fresh install would see its own not-yet-committed row as
     /// a foreign owner of its own declared ids and refuse itself.
-    /// `previously_owned` (computed separately, from `previous` BEFORE that
-    /// journal write) is what still correctly classifies an upgrade's
-    /// re-declared ids as `OwnedReinstall` rather than `New`.
+    /// Because this query excludes the current row, every returned id is
+    /// unambiguously foreign. Re-declared ids from the current plugin remain
+    /// absent here and are recorded from the new manifest after preflight.
     async fn existing_service_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
         let store = InstalledPlugins::load(&self.installed_json_path()).await?;
         Ok(store
@@ -590,7 +679,6 @@ impl ServerPluginInstaller {
         &self,
         manifest: &PluginManifest,
         plugin_dir: &Path,
-        previously_owned: &[String],
         rollback: &mut InstallRollback,
     ) -> PluginResult<Vec<String>> {
         if manifest.provides.services.is_empty() {
@@ -604,7 +692,9 @@ impl ServerPluginInstaller {
             .map(|entry| entry.id.clone())
             .collect();
         let existing_ids = self.existing_service_ids(&manifest.id).await?;
-        let reconciliation = reconcile_exclusive(&declared_ids, &existing_ids, previously_owned);
+        // `existing_ids` excludes this plugin row, so every collision is
+        // foreign even if corrupt provenance also records it under self.
+        let reconciliation = reconcile_exclusive(&declared_ids, &existing_ids, &[]);
         if !reconciliation.foreign_conflicts.is_empty() {
             return Err(PluginError::Conflict {
                 kind: "service",
@@ -633,7 +723,7 @@ impl ServerPluginInstaller {
             }
             // Stop any stale running instance first — covers a leftover
             // from a crashed install/upgrade recovery (a genuine same-id
-            // upgrade already had its old service stopped BEFORE staging by
+            // upgrade already had its old service stopped BEFORE activation by
             // `stop_services_for_upgrade`, see the module docs' "Same-id
             // upgrade ordering").
             let _ = self.state.service_manager.stop_service(&entry.id).await;
@@ -772,22 +862,13 @@ impl ServerPluginInstaller {
         Ok(())
     }
 
-    /// **Same-id upgrade ordering** (issue #479 "Install-flow deltas" /
-    /// "Same-id upgrade ordering bug risk"): `plugin_source::stage_plugin_source`
-    /// swaps `plugin_dir`'s ENTIRE contents (old bundle moved to a
-    /// `.backup-*` dir, staged bundle renamed into place) BEFORE
-    /// `install()` — and therefore [`Self::register_services`] — ever runs.
-    /// A still-running old service process holding the old binary open
-    /// during that swap is at best running stale code post-swap and at
-    /// worst (Windows) blocks the rename outright. The minimal seam that
-    /// fixes the ordering without restructuring `stage_plugin_source`/
-    /// `install()`: the HTTP `update_plugin` handler calls this BEFORE
-    /// `stage_plugin_source`, using the URL path's target id (known up
-    /// front for an upgrade, unlike a fresh `install`) to look up the
-    /// CURRENTLY-installed row's `registered.service_ids` and stop each one.
-    /// Net effect: stop (old binary) → swap (new binary) → start (new
-    /// binary, via `register_services` inside `install()`), exactly the
-    /// sequencing the issue calls for.
+    /// **Same-id upgrade ordering** (issue #479): after a source candidate is
+    /// prepared and its global ownership audit succeeds, the HTTP update path
+    /// calls this while retaining [`PluginOperationGuard`], then activates the
+    /// bundle and invokes [`Self::install_with_operation`]. A still-running old
+    /// process can therefore neither hold the replaced binary open nor run
+    /// stale code after the swap. Net effect: preflight → stop old binary →
+    /// swap → start new binary, all in one serialized operation boundary.
     ///
     /// Best-effort: returns exactly the ids that were actually running and
     /// got stopped (not e.g. an already-stopped or unknown id), so a
@@ -884,23 +965,16 @@ impl ServerPluginInstaller {
             }
         }
     }
-}
 
-#[async_trait]
-impl PluginInstaller for ServerPluginInstaller {
-    async fn install(
+    pub(crate) async fn install_with_operation(
         &self,
         manifest: &PluginManifest,
         plugin_dir: &Path,
         source: PluginSource,
         disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
+        _guard: &PluginOperationGuard,
     ) -> PluginResult<InstalledPlugin> {
-        // Serialize the whole op against every other plugin install/uninstall
-        // (process-wide) — held across all steps AND rollback. See module docs
-        // "Concurrency".
-        let _op_guard = PLUGIN_OP_LOCK.lock().await;
-
         let installed_json_path = self.installed_json_path();
 
         // Disposition gate (AlreadyInstalled only for a COMPLETED prior
@@ -912,56 +986,12 @@ impl PluginInstaller for ServerPluginInstaller {
             load_previous_for_disposition(&installed_json_path, &manifest.id, disposition).await?;
         let resolved_mcp_servers = preflight_install(manifest, plugin_dir).await?;
 
-        // Event-sink ownership gates run before the upgrade drop-diff, journal
-        // write, config mutation, or service start. A sink may only use its
-        // own manifest-declared service, and neither the sink id nor that
-        // referenced service id may be owned by another plugin.
-        let previously_owned_event_sinks = previous
-            .as_ref()
-            .map(|plugin| plugin.registered.event_sink_ids.clone())
-            .unwrap_or_default();
-        let declared_event_sink_ids: Vec<String> = manifest
-            .provides
-            .event_sinks
-            .iter()
-            .map(|sink| sink.id.clone())
-            .collect();
-        let event_sink_reconciliation = reconcile_exclusive(
-            &declared_event_sink_ids,
-            &self.existing_event_sink_ids(&manifest.id).await?,
-            &previously_owned_event_sinks,
-        );
-        if !event_sink_reconciliation.foreign_conflicts.is_empty() {
-            return Err(PluginError::Conflict {
-                kind: "event sink",
-                name: event_sink_reconciliation.foreign_conflicts.join(", "),
-                plugin_id: manifest.id.clone(),
-            });
-        }
-        if !manifest.provides.event_sinks.is_empty() {
-            let previously_owned_services = previous
-                .as_ref()
-                .map(|plugin| plugin.registered.service_ids.clone())
-                .unwrap_or_default();
-            let referenced_service_ids: Vec<String> = manifest
-                .provides
-                .event_sinks
-                .iter()
-                .map(|sink| sink.service_id.clone())
-                .collect();
-            let service_reconciliation = reconcile_exclusive(
-                &referenced_service_ids,
-                &self.existing_service_ids(&manifest.id).await?,
-                &previously_owned_services,
-            );
-            if !service_reconciliation.foreign_conflicts.is_empty() {
-                return Err(PluginError::Conflict {
-                    kind: "event sink service",
-                    name: service_reconciliation.foreign_conflicts.join(", "),
-                    plugin_id: manifest.id.clone(),
-                });
-            }
-        }
+        // Re-run under the held operation guard as defense in depth. The HTTP
+        // prepared-source path performs the same audit before bundle swap or
+        // old-service shutdown; direct trait callers still get this gate
+        // before installer-owned provenance/config/runtime mutation.
+        let event_sink_reconciliation = self.preflight_provenance_ownership(manifest).await?;
+        let declared_event_sink_ids = event_sink_reconciliation.to_register.clone();
 
         // The set this install INTENDS to own, by declaration order. Used both
         // for the crash-safety journal row (below) and the step-0 drop-diff.
@@ -1019,11 +1049,6 @@ impl PluginInstaller for ServerPluginInstaller {
             .as_ref()
             .map(|p| p.registered.mcp_server_ids.clone())
             .unwrap_or_default();
-        let previously_owned_services = previous
-            .as_ref()
-            .map(|p| p.registered.service_ids.clone())
-            .unwrap_or_default();
-
         // Crash-safety journal: write an `Installing` provenance row recording
         // the INTENDED ownership set BEFORE mutating any shared store, so a
         // hard kill mid-install leaves a recoverable marker (see module docs
@@ -1066,17 +1091,11 @@ impl PluginInstaller for ServerPluginInstaller {
         // Step 1b: Services (issue #479). Runs right after MCP, before the
         // never-refusing Prompts step, so a services conflict fails the
         // install as early as the other REFUSE-on-conflict kinds do. Note:
-        // for a same-id UPGRADE, the OLD service (if any) was already
-        // stopped by `stop_services_for_upgrade` before `stage_plugin_source`
-        // swapped `plugin_dir` — see that method's doc comment on the
-        // stop→swap→start sequencing.
+        // for a same-id UPGRADE, the OLD service (if any) was already stopped
+        // after prepared-candidate ownership preflight and before bundle
+        // activation — see `stop_services_for_upgrade`'s ordering contract.
         let service_ids = match self
-            .register_services(
-                manifest,
-                plugin_dir,
-                &previously_owned_services,
-                &mut rollback,
-            )
+            .register_services(manifest, plugin_dir, &mut rollback)
             .await
         {
             Ok(ids) => ids,
@@ -1141,6 +1160,29 @@ impl PluginInstaller for ServerPluginInstaller {
             .await?;
 
         Ok(entry)
+    }
+}
+
+#[async_trait]
+impl PluginInstaller for ServerPluginInstaller {
+    async fn install(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        source: PluginSource,
+        disposition: InstallDisposition,
+        installed_at: DateTime<Utc>,
+    ) -> PluginResult<InstalledPlugin> {
+        let guard = self.begin_operation().await;
+        self.install_with_operation(
+            manifest,
+            plugin_dir,
+            source,
+            disposition,
+            installed_at,
+            &guard,
+        )
+        .await
     }
 
     async fn uninstall(&self, id: &str) -> PluginResult<()> {
@@ -1250,37 +1292,52 @@ pub async fn boot_reconcile_services(app_data_dir: &Path, service_manager: &Serv
         }
     };
 
-    let platform = Platform::current().unwrap_or(Platform::Linux);
+    let mut candidates = Vec::with_capacity(store.list().len());
     for plugin in store.list() {
-        if plugin.registered.service_ids.is_empty() {
-            continue;
-        }
         let manifest_path = plugin.plugin_dir.join("plugin.json");
-        let manifest = match fs::read_to_string(&manifest_path)
+        let manifest = fs::read_to_string(&manifest_path)
             .await
             .ok()
-            .and_then(|raw| PluginManifest::parse_str(&raw).ok())
-        {
-            Some(manifest) => manifest,
-            None => {
-                tracing::warn!(
-                    plugin_id = %plugin.id,
-                    path = %manifest_path.display(),
-                    "service boot-reconcile: failed to read/parse plugin.json; skipping this \
-                     plugin's services"
-                );
-                continue;
-            }
+            .and_then(|raw| PluginManifest::parse_str(&raw).ok());
+        candidates.push(PluginBootCandidate {
+            installed: plugin.clone(),
+            manifest,
+        });
+    }
+
+    let platform = Platform::current();
+    let plans = reconcile_plugin_boot(&candidates, platform);
+    let Some(platform) = platform else {
+        tracing::warn!(
+            host_os = std::env::consts::OS,
+            "service boot-reconcile: unknown host platform; all plugin services remain stopped"
+        );
+        return;
+    };
+
+    for (candidate, plan) in candidates.iter().zip(plans) {
+        let plugin = &candidate.installed;
+        for issue in &plan.issues {
+            tracing::warn!(
+                plugin_id = %plugin.id,
+                ?issue,
+                "service boot-reconcile: provenance audit kept capabilities inactive"
+            );
+        }
+        if plan.service_ids_to_start.is_empty() {
+            continue;
+        }
+        let Some(manifest) = candidate.manifest.as_ref() else {
+            continue;
         };
 
-        let owned: HashSet<&str> = plugin
-            .registered
-            .service_ids
+        let to_start: HashSet<&str> = plan
+            .service_ids_to_start
             .iter()
             .map(String::as_str)
             .collect();
         for entry in &manifest.provides.services {
-            if !entry.enabled || !owned.contains(entry.id.as_str()) {
+            if !to_start.contains(entry.id.as_str()) {
                 continue;
             }
             if service_manager.is_running(&entry.id) {

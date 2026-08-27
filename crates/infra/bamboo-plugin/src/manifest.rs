@@ -52,7 +52,7 @@
 //! value in `env` (not env *keys*, and not in `url` for sse/streamable_http —
 //! remote endpoints have no plugin-local path to inject).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -424,6 +424,11 @@ pub struct ServiceManifestEntry {
 pub struct EventSinkProtocolManifest {
     pub name: String,
     pub version: u16,
+    /// Opaque fields reserved for future protocol versions. ToolEventV1 is a
+    /// closed schema and rejects these during validation; a future version is
+    /// kept parseable (and inactive) without silently losing its extensions.
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 /// Declarative queue/event bounds. The router introduced by #905 owns their
@@ -434,6 +439,8 @@ pub struct EventSinkDeliveryLimits {
     pub queue_capacity: u32,
     #[serde(default = "default_event_sink_max_event_bytes")]
     pub max_event_bytes: u32,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 pub const DEFAULT_EVENT_SINK_QUEUE_CAPACITY: u32 = 64;
@@ -447,6 +454,9 @@ pub const MAX_EVENT_SINK_SUBSCRIPTIONS: usize = 32;
 pub const MAX_EVENT_SINK_TOOL_NAMES: usize = 64;
 pub const MAX_EVENT_SINK_PERMISSIONS: usize = 32;
 pub const MAX_EVENT_SINK_PERMISSION_ID_BYTES: usize = 64;
+pub const MAX_EVENT_SINK_EXTENSION_FIELDS: usize = 16;
+pub const MAX_EVENT_SINK_EXTENSION_KEY_BYTES: usize = 64;
+pub const MAX_EVENT_SINK_EXTENSION_VALUE_BYTES: usize = 4096;
 
 fn default_event_sink_queue_capacity() -> u32 {
     DEFAULT_EVENT_SINK_QUEUE_CAPACITY
@@ -461,8 +471,48 @@ impl Default for EventSinkDeliveryLimits {
         Self {
             queue_capacity: default_event_sink_queue_capacity(),
             max_event_bytes: default_event_sink_max_event_bytes(),
+            extensions: BTreeMap::new(),
         }
     }
+}
+
+fn validate_event_sink_extensions(
+    sink_id: &str,
+    scope: &str,
+    extensions: &BTreeMap<String, serde_json::Value>,
+    strict_v1: bool,
+) -> PluginResult<()> {
+    if strict_v1 && !extensions.is_empty() {
+        return Err(PluginError::InvalidManifest(format!(
+            "event sink '{sink_id}' ToolEventV1 {scope} contains unknown field(s): {}",
+            extensions.keys().cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    if extensions.len() > MAX_EVENT_SINK_EXTENSION_FIELDS {
+        return Err(PluginError::InvalidManifest(format!(
+            "event sink '{sink_id}' {scope} exceeds the extension-field limit of {MAX_EVENT_SINK_EXTENSION_FIELDS}"
+        )));
+    }
+    for (key, value) in extensions {
+        if key.trim().is_empty() || key.len() > MAX_EVENT_SINK_EXTENSION_KEY_BYTES {
+            return Err(PluginError::InvalidManifest(format!(
+                "event sink '{sink_id}' {scope} contains an invalid extension key"
+            )));
+        }
+        let value_len = serde_json::to_vec(value)
+            .map_err(|error| {
+                PluginError::InvalidManifest(format!(
+                    "event sink '{sink_id}' {scope} extension '{key}' cannot be serialized: {error}"
+                ))
+            })?
+            .len();
+        if value_len > MAX_EVENT_SINK_EXTENSION_VALUE_BYTES {
+            return Err(PluginError::InvalidManifest(format!(
+                "event sink '{sink_id}' {scope} extension '{key}' exceeds the value-size limit of {MAX_EVENT_SINK_EXTENSION_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Stable v1 observation-permission spellings. These are requests, not grants;
@@ -503,6 +553,8 @@ pub struct EventSinkSubscriptionManifest {
     pub id: ToolEventSubscriptionId,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 /// A ToolEvent consumer backed by this plugin's own verified service.
@@ -521,6 +573,8 @@ pub struct EventSinkManifestEntry {
     /// own gate. A sink is inactive when the current host is not listed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<Platform>>,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -983,6 +1037,20 @@ impl PluginManifest {
                     sink.id
                 )));
             }
+            let strict_v1 = sink.protocol.version == TOOL_EVENT_V1_SCHEMA_VERSION;
+            validate_event_sink_extensions(&sink.id, "declaration", &sink.extensions, strict_v1)?;
+            validate_event_sink_extensions(
+                &sink.id,
+                "protocol",
+                &sink.protocol.extensions,
+                strict_v1,
+            )?;
+            validate_event_sink_extensions(
+                &sink.id,
+                "delivery",
+                &sink.delivery.extensions,
+                strict_v1,
+            )?;
             if sink.subscriptions.is_empty()
                 || sink.subscriptions.len() > MAX_EVENT_SINK_SUBSCRIPTIONS
             {
@@ -993,6 +1061,12 @@ impl PluginManifest {
             }
             let mut seen_subscriptions = std::collections::HashSet::new();
             for subscription in &sink.subscriptions {
+                validate_event_sink_extensions(
+                    &sink.id,
+                    "subscription",
+                    &subscription.extensions,
+                    strict_v1,
+                )?;
                 let subscription_id = subscription.id.as_str();
                 if subscription_id.trim().is_empty()
                     || subscription_id.len() > MAX_TOOL_EVENT_SUBSCRIPTION_ID_BYTES
@@ -1724,6 +1798,7 @@ mod tests {
             EventSinkDeliveryLimits {
                 queue_capacity: DEFAULT_EVENT_SINK_QUEUE_CAPACITY,
                 max_event_bytes: MAX_TOOL_EVENT_JSON_BYTES as u32,
+                extensions: BTreeMap::new(),
             }
         );
         assert_eq!(sink.requested_permissions.len(), 1);
@@ -1744,15 +1819,21 @@ mod tests {
     #[test]
     fn future_tool_event_version_preserves_opaque_values_and_is_inactive() {
         let mut value = event_sink_manifest_value(TOOL_EVENT_V1_SCHEMA_VERSION + 1, true);
+        value["provides"]["event_sinks"][0]["future_sink_option"] =
+            serde_json::json!({ "mode": "v2" });
+        value["provides"]["event_sinks"][0]["protocol"]["negotiation"] =
+            serde_json::json!("optional");
         value["provides"]["event_sinks"][0]["subscriptions"] = serde_json::json!([{
             "id": "tool.symbol_changed.v2",
-            "tool_names": ["FutureTool"]
+            "tool_names": ["FutureTool"],
+            "projection": "symbol"
         }]);
         value["provides"]["event_sinks"][0]["requested_permissions"] =
             serde_json::json!(["symbol_metadata_v2"]);
         value["provides"]["event_sinks"][0]["delivery"] = serde_json::json!({
             "queue_capacity": 64,
-            "max_event_bytes": MAX_EVENT_SINK_EVENT_BYTES
+            "max_event_bytes": MAX_EVENT_SINK_EVENT_BYTES,
+            "batch_size": 8
         });
 
         let manifest = parse_event_sink_manifest(&value);
@@ -1763,6 +1844,23 @@ mod tests {
         assert_eq!(sink.subscriptions[0].id.as_str(), "tool.symbol_changed.v2");
         assert_eq!(sink.requested_permissions.len(), 1);
         assert_eq!(sink.requested_permissions[0].as_str(), "symbol_metadata_v2");
+        let serialized = serde_json::to_value(&manifest).expect("serialize future extensions");
+        assert_eq!(
+            serialized["provides"]["event_sinks"][0]["future_sink_option"]["mode"],
+            "v2"
+        );
+        assert_eq!(
+            serialized["provides"]["event_sinks"][0]["protocol"]["negotiation"],
+            "optional"
+        );
+        assert_eq!(
+            serialized["provides"]["event_sinks"][0]["delivery"]["batch_size"],
+            8
+        );
+        assert_eq!(
+            serialized["provides"]["event_sinks"][0]["subscriptions"][0]["projection"],
+            "symbol"
+        );
         assert_eq!(
             sink.capability_state(&manifest.provides.services[0], Some(Platform::Linux)),
             EventSinkCapabilityState::Inactive {
@@ -1772,6 +1870,38 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn tool_event_v1_rejects_unknown_fields_in_every_nested_scope() {
+        for path in ["sink", "protocol", "delivery", "subscription"] {
+            let mut value = event_sink_manifest_value(TOOL_EVENT_V1_SCHEMA_VERSION, true);
+            match path {
+                "sink" => {
+                    value["provides"]["event_sinks"][0]["platform"] = serde_json::json!(["macos"])
+                }
+                "protocol" => {
+                    value["provides"]["event_sinks"][0]["protocol"]["negotiation"] =
+                        serde_json::json!("required")
+                }
+                "delivery" => {
+                    value["provides"]["event_sinks"][0]["delivery"]["queue_capcity"] =
+                        serde_json::json!(4)
+                }
+                "subscription" => {
+                    value["provides"]["event_sinks"][0]["subscriptions"][0]["projection"] =
+                        serde_json::json!("full")
+                }
+                _ => unreachable!(),
+            }
+            let error = parse_event_sink_manifest(&value)
+                .validate()
+                .expect_err("ToolEventV1 typo/extension must fail closed");
+            assert!(
+                error.to_string().contains("unknown field"),
+                "scope={path}, error={error}"
+            );
+        }
     }
 
     #[test]
