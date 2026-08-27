@@ -371,6 +371,7 @@ impl ServerPluginInstaller {
     /// absent here and are recorded from the new manifest after preflight.
     async fn existing_service_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
         let store = InstalledPlugins::load(&self.installed_json_path()).await?;
+        store.get_unique(exclude_plugin_id)?;
         Ok(store
             .list()
             .iter()
@@ -385,6 +386,7 @@ impl ServerPluginInstaller {
     /// install mutation.
     async fn existing_event_sink_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
         let store = InstalledPlugins::load(&self.installed_json_path()).await?;
+        store.get_unique(exclude_plugin_id)?;
         Ok(store
             .list()
             .iter()
@@ -530,6 +532,7 @@ impl ServerPluginInstaller {
     /// run under [`PLUGIN_OP_LOCK`], so the load/add/save is race-free.
     async fn upsert_provenance(&self, entry: InstalledPlugin, path: &Path) -> PluginResult<()> {
         let mut store = InstalledPlugins::load(path).await?;
+        store.get_unique(&entry.id)?;
         store.add(entry);
         store.save(path).await?;
         Ok(())
@@ -888,8 +891,17 @@ impl ServerPluginInstaller {
                 return Vec::new();
             }
         };
-        let Some(entry) = store.get(plugin_id) else {
-            return Vec::new();
+        let entry = match store.get_unique(plugin_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    %plugin_id,
+                    %error,
+                    "stop_services_for_upgrade: ambiguous plugin provenance; skipping"
+                );
+                return Vec::new();
+            }
         };
         let mut stopped = Vec::with_capacity(entry.registered.service_ids.len());
         for service_id in &entry.registered.service_ids {
@@ -928,8 +940,17 @@ impl ServerPluginInstaller {
                 return;
             }
         };
-        let Some(entry) = store.get(plugin_id) else {
-            return;
+        let entry = match store.get_unique(plugin_id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    %plugin_id,
+                    %error,
+                    "restart_services_after_failed_upgrade: ambiguous plugin provenance; skipping"
+                );
+                return;
+            }
         };
         let manifest_path = entry.plugin_dir.join("plugin.json");
         let manifest = match fs::read_to_string(&manifest_path)
@@ -1193,7 +1214,7 @@ impl PluginInstaller for ServerPluginInstaller {
         let mut store = InstalledPlugins::load(&installed_json_path).await?;
         // Works on an `Installing` (crash-leftover) row too, so a crashed
         // install is never un-uninstallable.
-        let Some(entry) = store.get(id).cloned() else {
+        let Some(entry) = store.get_unique(id)?.cloned() else {
             return Err(PluginError::NotFound(id.to_string()));
         };
 

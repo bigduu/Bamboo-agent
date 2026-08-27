@@ -279,6 +279,57 @@ async fn uninstall_unknown_id_is_not_found() {
 }
 
 #[tokio::test]
+async fn uninstall_duplicate_plugin_rows_fails_before_any_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let installed_json = state.app_data_dir.join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::default();
+    for index in 0..2 {
+        let plugin_dir = state
+            .app_data_dir
+            .join("plugins")
+            .join(format!("duplicate-dir-{index}"));
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("MARKER"), format!("row-{index}"))
+            .await
+            .unwrap();
+        store.plugins.push(InstalledPlugin {
+            id: "duplicate-plugin".to_string(),
+            version: format!("1.0.{index}"),
+            source: PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            plugin_dir,
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                service_ids: vec![format!("service-{index}")],
+                event_sink_ids: vec![format!("sink-{index}")],
+                ..Default::default()
+            },
+        });
+    }
+    store.save(&installed_json).await.unwrap();
+    let before = store.plugins.clone();
+
+    let error = installer
+        .uninstall("duplicate-plugin")
+        .await
+        .expect_err("ambiguous plugin identity must fail closed");
+    assert!(matches!(error, PluginError::Registration(_)));
+    assert_eq!(
+        InstalledPlugins::load(&installed_json)
+            .await
+            .unwrap()
+            .plugins,
+        before
+    );
+    for entry in before {
+        assert!(entry.plugin_dir.join("MARKER").exists());
+    }
+}
+
+#[tokio::test]
 async fn second_install_under_fail_if_installed_is_rejected() {
     let root = tempfile::tempdir().unwrap();
     let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
@@ -1522,6 +1573,64 @@ async fn boot_global_audit_blocks_duplicate_sink_backing_services_but_starts_saf
     assert!(
         state.service_manager.is_running("safe-service"),
         "a corrupt row must not stop the independent boot reconciliation pass"
+    );
+}
+
+#[tokio::test]
+async fn boot_global_audit_blocks_duplicate_plugin_ids_with_distinct_capabilities() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let plugins_root = data_dir.path().join("plugins");
+    tokio::fs::create_dir_all(&plugins_root).await.unwrap();
+    let mut store = InstalledPlugins::default();
+
+    for (dir_name, plugin_id, service_id, sink_id) in [
+        ("duplicate-a", "duplicate-plugin", "service-a", "sink-a"),
+        ("duplicate-b", "duplicate-plugin", "service-b", "sink-b"),
+        ("safe-dir", "safe-plugin", "safe-service", "safe-sink"),
+    ] {
+        let plugin_dir = plugins_root.join(dir_name);
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        let raw = event_sink_manifest_json(
+            plugin_id,
+            "1.0.0",
+            service_id,
+            &[(sink_id, TOOL_EVENT_V1_SCHEMA_VERSION)],
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+        tokio::fs::write(plugin_dir.join("plugin.json"), value.to_string())
+            .await
+            .unwrap();
+        store.plugins.push(InstalledPlugin {
+            id: plugin_id.to_string(),
+            version: "1.0.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            plugin_dir,
+            installed_at: Utc::now(),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                service_ids: vec![service_id.to_string()],
+                event_sink_ids: vec![sink_id.to_string()],
+                ..Default::default()
+            },
+        });
+    }
+    store
+        .save(&plugins_root.join("installed.json"))
+        .await
+        .unwrap();
+
+    let state = AppState::new(data_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+    state.wait_for_boot_reconcile_services().await;
+    assert!(!state.service_manager.is_running("service-a"));
+    assert!(!state.service_manager.is_running("service-b"));
+    assert!(
+        state.service_manager.is_running("safe-service"),
+        "duplicate plugin identity must not poison an unrelated boot candidate"
     );
 }
 

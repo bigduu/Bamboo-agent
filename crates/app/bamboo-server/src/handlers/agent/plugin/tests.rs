@@ -474,6 +474,102 @@ async fn update_event_sink_conflict_is_rejected_before_service_stop_or_bundle_sw
 }
 
 #[actix_web::test]
+async fn update_duplicate_plugin_rows_is_rejected_before_service_stop_or_bundle_swap() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    state.wait_for_boot_reconcile_services().await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let old_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "duplicate-old-source",
+        "event-plugin",
+        "1.0.0",
+        "old-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(local_dir_source(&old_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(state.service_manager.is_running("audit-service"));
+
+    // Corrupt provenance with the same plugin identity but entirely distinct
+    // capability ids. Sink/service owner counts alone cannot catch this.
+    let installed_json = data_dir.path().join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::load(&installed_json).await.unwrap();
+    store.plugins.push(InstalledPlugin {
+        id: "event-plugin".to_string(),
+        version: "0.9.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: PathBuf::from("/tmp/duplicate-event-plugin"),
+        },
+        plugin_dir: PathBuf::from("/tmp/duplicate-event-plugin"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installing,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["other-service".to_string()],
+            event_sink_ids: vec!["other-sink".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+    let provenance_before = store.plugins.clone();
+
+    let new_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "duplicate-new-source",
+        "event-plugin",
+        "2.0.0",
+        "new-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/event-plugin/update")
+        .set_json(local_dir_source(&new_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        state.service_manager.is_running("audit-service"),
+        "ambiguous provenance must fail before stopping the old service"
+    );
+    let live_dir = data_dir.path().join("plugins").join("event-plugin");
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    let live_manifest: serde_json::Value = serde_json::from_str(
+        &tokio::fs::read_to_string(live_dir.join("plugin.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live_manifest["version"], "1.0.0");
+    assert_eq!(
+        InstalledPlugins::load(&installed_json)
+            .await
+            .unwrap()
+            .plugins,
+        provenance_before
+    );
+
+    let mut entries = tokio::fs::read_dir(data_dir.path().join("plugins"))
+        .await
+        .unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with(".staging-"), "leftover {name}");
+        assert!(!name.starts_with(".backup-"), "leftover {name}");
+    }
+}
+
+#[actix_web::test]
 async fn update_with_mismatched_path_id_returns_400_and_rolls_back() {
     let data_dir = tempfile::tempdir().unwrap();
     let state = test_state(data_dir.path()).await;

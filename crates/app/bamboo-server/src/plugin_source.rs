@@ -111,17 +111,18 @@
 //! necessarily replaces whatever is already there. [`prepare_plugin_source`]
 //! builds the new bundle in a scratch `.staging-*` directory first (so a bad
 //! source — invalid manifest, failed download, sha256 mismatch — never
-//! touches the existing install). The HTTP handlers then hold the server's
-//! plugin-operation lock while auditing global ownership; only an accepted
+//! touches the existing install). The server-owned transaction seam then holds
+//! the plugin-operation lock while auditing global ownership; only an accepted
 //! [`PreparedPlugin`] is activated, after which the OLD `plugin_dir` is moved
 //! aside to a `.backup-*` directory (not deleted) and the candidate is renamed
 //! into place. The returned
 //! [`StagedPlugin`] carries that backup path privately: [`StagedPlugin::commit`]
 //! deletes it (call after a successful `install()`), [`StagedPlugin::rollback`]
 //! removes the half-installed new bundle and restores the backup (call after
-//! a failed `install()`). [`stage_plugin_source`] and
-//! [`install_plugin_from_source`] remain convenience seams for standalone
-//! installers that do not share bamboo-server's global capability stores.
+//! a failed `install()`). [`stage_plugin_source`] and the crate-private
+//! standalone helper remain convenience seams for installers that do not
+//! share bamboo-server's global capability stores. Server callers use
+//! [`install_server_plugin_from_source`] instead.
 //!
 //! Residual gap (documented, not solved here): the plugin_dir swap itself and
 //! `install()`'s own capability-registration rollback (see
@@ -188,11 +189,14 @@ use std::sync::OnceLock;
 
 use bamboo_config::PluginTrustConfig;
 use bamboo_plugin::manifest::Platform;
+#[cfg(test)]
+use bamboo_plugin::PluginInstaller;
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, PluginError, PluginInstaller, PluginManifest,
-    PluginResult, PluginSource,
+    InstallDisposition, InstalledPlugin, PluginError, PluginManifest, PluginResult, PluginSource,
 };
 use ed25519_dalek::Verifier;
+
+use crate::plugin_installer::ServerPluginInstaller;
 
 /// What the caller pointed the installer at.
 #[derive(Debug, Clone)]
@@ -354,7 +358,9 @@ pub async fn prepare_plugin_source(
 /// anything is committed. Returns a [`StagedPlugin`] ready to hand to
 /// [`bamboo_plugin::PluginInstaller::install`] — call [`StagedPlugin::commit`]
 /// or [`StagedPlugin::rollback`] once you know whether `install()` succeeded
-/// (or just use [`install_plugin_from_source`], which does both for you).
+/// Crate-internal standalone callers can use `install_plugin_from_source`,
+/// which does both for them; server callers must use
+/// [`install_server_plugin_from_source`].
 pub async fn stage_plugin_source(
     input: PluginSourceInput,
     plugins_root: &Path,
@@ -423,9 +429,96 @@ async fn prepare_plugin_source_inner(
     })
 }
 
-/// Stage + `install()` + commit/rollback, in one call — the seam CLI/HTTP
-/// callers should use. See the module docs.
-pub async fn install_plugin_from_source(
+/// Server-owned source transaction. This is the only public source-install
+/// seam for [`ServerPluginInstaller`]: the same process-wide guard spans
+/// provenance preflight, prior-service shutdown, live-bundle activation,
+/// installer mutation, and commit/rollback/restart.
+///
+/// `expected_plugin_id` binds an HTTP path (or another caller-owned identity)
+/// before any shared mutation. Pass `None` when the source manifest owns the
+/// identity, as in the manual server example.
+pub async fn install_server_plugin_from_source(
+    installer: &ServerPluginInstaller,
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    disposition: InstallDisposition,
+    expected_plugin_id: Option<&str>,
+) -> PluginResult<InstalledPlugin> {
+    let prepared = prepare_plugin_source(input, plugins_root, trust).await?;
+    if let Some(expected_plugin_id) = expected_plugin_id {
+        if prepared.manifest.id != expected_plugin_id {
+            let manifest_id = prepared.manifest.id.clone();
+            prepared.discard().await;
+            return Err(PluginError::InvalidManifest(format!(
+                "path id '{expected_plugin_id}' does not match the source's manifest id '{manifest_id}'"
+            )));
+        }
+    }
+
+    let plugin_id = prepared.manifest.id.clone();
+    let guard = installer.begin_operation().await;
+    if let Err(error) = installer
+        .preflight_prepared_candidate(
+            &prepared.manifest,
+            &prepared.prepared_dir,
+            disposition,
+            &guard,
+        )
+        .await
+    {
+        prepared.discard().await;
+        return Err(error);
+    }
+
+    let stopped_services = if disposition == InstallDisposition::Upgrade {
+        installer.stop_services_for_upgrade(&plugin_id).await
+    } else {
+        Vec::new()
+    };
+    let staged = match prepared.activate().await {
+        Ok(staged) => staged,
+        Err(error) => {
+            installer
+                .restart_services_after_failed_upgrade(&plugin_id, &stopped_services)
+                .await;
+            return Err(error);
+        }
+    };
+
+    let manifest = staged.manifest.clone();
+    let plugin_dir = staged.plugin_dir.clone();
+    let source = staged.source.clone();
+    match installer
+        .install_with_operation(
+            &manifest,
+            &plugin_dir,
+            source,
+            disposition,
+            chrono::Utc::now(),
+            &guard,
+        )
+        .await
+    {
+        Ok(entry) => {
+            staged.commit().await;
+            Ok(entry)
+        }
+        Err(error) => {
+            staged.rollback().await;
+            installer
+                .restart_services_after_failed_upgrade(&plugin_id, &stopped_services)
+                .await;
+            Err(error)
+        }
+    }
+}
+
+/// Stage + `install()` + commit/rollback for a standalone installer that does
+/// not share bamboo-server's capability stores or operation lock. Server code
+/// must use [`install_server_plugin_from_source`] instead.
+#[cfg(test)]
+pub(crate) async fn install_plugin_from_source(
     installer: &dyn PluginInstaller,
     input: PluginSourceInput,
     plugins_root: &Path,

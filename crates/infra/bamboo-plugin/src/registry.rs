@@ -229,6 +229,7 @@ pub struct PluginBootCandidate {
 /// Fail-closed diagnostics emitted by the global boot provenance audit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginBootIssue {
+    DuplicatePluginId { id: String },
     ManifestUnavailable,
     ManifestIdMismatch { manifest_id: String },
     InvalidManifest { detail: String },
@@ -259,9 +260,13 @@ pub fn reconcile_plugin_boot(
     candidates: &[PluginBootCandidate],
     platform: Option<Platform>,
 ) -> Vec<PluginBootReconciliation> {
+    let mut plugin_id_counts: HashMap<&str, usize> = HashMap::new();
     let mut sink_owner_counts: HashMap<&str, usize> = HashMap::new();
     let mut service_owner_counts: HashMap<&str, usize> = HashMap::new();
     for candidate in candidates {
+        *plugin_id_counts
+            .entry(candidate.installed.id.as_str())
+            .or_default() += 1;
         for id in &candidate.installed.registered.event_sink_ids {
             *sink_owner_counts.entry(id.as_str()).or_default() += 1;
         }
@@ -285,6 +290,17 @@ pub fn reconcile_plugin_boot(
                 ..Default::default()
             };
 
+            if plugin_id_counts
+                .get(installed.id.as_str())
+                .copied()
+                .unwrap_or_default()
+                > 1
+            {
+                plan.issues.push(PluginBootIssue::DuplicatePluginId {
+                    id: installed.id.clone(),
+                });
+                return plan;
+            }
             if installed.status == PluginInstallStatus::Installing {
                 plan.issues.push(PluginBootIssue::InstallIncomplete);
                 return plan;
@@ -710,6 +726,20 @@ impl InstalledPlugins {
         self.plugins.iter().find(|plugin| plugin.id == id)
     }
 
+    /// Look up one unambiguous plugin row. Duplicate ids are corrupt
+    /// provenance: callers must fail before touching capabilities or bundle
+    /// bytes rather than guessing which row owns the shared identity.
+    pub fn get_unique(&self, id: &str) -> PluginResult<Option<&InstalledPlugin>> {
+        let mut matches = self.plugins.iter().filter(|plugin| plugin.id == id);
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(PluginError::Registration(format!(
+                "installed plugin registry contains duplicate rows for id '{id}'"
+            )));
+        }
+        Ok(first)
+    }
+
     /// Insert or replace (by id) — an upgrade re-adds the same id with a new
     /// version/registered set, so this is an upsert rather than an append.
     pub fn add(&mut self, plugin: InstalledPlugin) {
@@ -897,6 +927,22 @@ mod tests {
         let loaded = InstalledPlugins::load(&path).await.expect("load");
         assert_eq!(loaded.plugins.len(), 1);
         assert_eq!(loaded.get("hello-plugin").unwrap().version, "0.2.0");
+    }
+
+    #[test]
+    fn unique_lookup_rejects_duplicate_plugin_rows() {
+        let mut store = InstalledPlugins::default();
+        store.plugins.push(sample_plugin("hello-plugin"));
+        let mut duplicate = sample_plugin("hello-plugin");
+        duplicate.plugin_dir = PathBuf::from("/tmp/duplicate-plugin-dir");
+        store.plugins.push(duplicate);
+
+        let error = store
+            .get_unique("hello-plugin")
+            .expect_err("duplicate identity must be ambiguous");
+        assert!(matches!(error, PluginError::Registration(_)));
+        assert!(error.to_string().contains("duplicate rows"));
+        assert!(store.get_unique("missing-plugin").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1216,6 +1262,61 @@ mod tests {
                     id: "audit-service".to_string(),
                 }));
         }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_plugin_rows_but_keeps_safe_plugins() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.provides.services[0].id = "other-service".to_string();
+        second.provides.event_sinks[0].id = "other-events".to_string();
+        second.provides.event_sinks[0].service_id = "other-service".to_string();
+        second.validate().expect("second same-id manifest");
+        let mut safe = event_sink_manifest(true, 1);
+        safe.id = "safe-plugin".to_string();
+        safe.provides.services[0].id = "safe-service".to_string();
+        safe.provides.event_sinks[0].id = "safe-events".to_string();
+        safe.provides.event_sinks[0].service_id = "safe-service".to_string();
+        safe.validate().expect("safe manifest");
+
+        let plans = reconcile_plugin_boot(
+            &[
+                boot_candidate(
+                    "event-plugin",
+                    Some(first),
+                    &["audit-service"],
+                    &["audit-events"],
+                    PluginInstallStatus::Installed,
+                ),
+                boot_candidate(
+                    "event-plugin",
+                    Some(second),
+                    &["other-service"],
+                    &["other-events"],
+                    PluginInstallStatus::Installed,
+                ),
+                boot_candidate(
+                    "safe-plugin",
+                    Some(safe),
+                    &["safe-service"],
+                    &["safe-events"],
+                    PluginInstallStatus::Installed,
+                ),
+            ],
+            Some(Platform::Linux),
+        );
+
+        for plan in &plans[..2] {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert_eq!(
+                plan.issues,
+                [PluginBootIssue::DuplicatePluginId {
+                    id: "event-plugin".to_string(),
+                }]
+            );
+        }
+        assert_eq!(plans[2].service_ids_to_start, ["safe-service"]);
+        assert!(plans[2].issues.is_empty());
     }
 
     #[test]
