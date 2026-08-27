@@ -15,6 +15,7 @@ bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-permission = { path = "../../infra/bamboo-permission" }
+bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = "1"

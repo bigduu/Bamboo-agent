@@ -131,6 +131,7 @@ async fn execute_and_apply_single_tool_call(
             session,
             config.permission_mode.unwrap_or_default(),
         );
+    let root_session_id = session.root_session_id.clone();
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -216,6 +217,7 @@ async fn execute_and_apply_single_tool_call(
                     event_tx,
                     metrics_collector,
                     session_id,
+                    root_session_id: &root_session_id,
                     round_id,
                     round,
                     tools,
@@ -607,6 +609,8 @@ pub(crate) async fn execute_round_tool_calls(
                 session,
                 config.permission_mode.unwrap_or_default(),
             );
+            let root_session_id = session.root_session_id.clone();
+            let root_session_id = root_session_id.as_str();
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -619,6 +623,7 @@ pub(crate) async fn execute_round_tool_calls(
                                 event_tx,
                                 metrics_collector,
                                 session_id,
+                                root_session_id,
                                 round_id,
                                 round,
                                 tools,

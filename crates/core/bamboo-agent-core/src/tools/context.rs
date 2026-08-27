@@ -88,6 +88,10 @@ impl ToolExecutionSessionFlags {
 pub struct ToolExecutionContext<'a> {
     /// Bamboo session id that is executing the tool.
     pub session_id: Option<&'a str>,
+    /// Authoritative root-session identity for the executing session tree.
+    /// Real dispatch snapshots it from `Session.root_session_id`; synthetic or
+    /// opaque direct contexts leave it absent rather than inventing authority.
+    pub root_session_id: Option<&'a str>,
     /// Tool call id from the model (`ToolCall.id`).
     pub tool_call_id: &'a str,
     /// Event sender for streaming progress to clients (agent SSE stream).
@@ -142,6 +146,7 @@ impl std::fmt::Debug for ToolExecutionContext<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolExecutionContext")
             .field("session_id", &self.session_id)
+            .field("root_session_id", &self.root_session_id)
             .field("tool_call_id", &self.tool_call_id)
             .field("event_tx", &self.event_tx)
             .field("available_tool_schemas", &self.available_tool_schemas)
@@ -159,6 +164,7 @@ impl<'a> ToolExecutionContext<'a> {
     pub fn none(tool_call_id: &'a str) -> Self {
         Self {
             session_id: None,
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -179,6 +185,7 @@ impl<'a> ToolExecutionContext<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn for_dispatch(
         session_id: &'a str,
+        root_session_id: &'a str,
         tool_call_id: &'a str,
         event_tx: &'a mpsc::Sender<AgentEvent>,
         available_tool_schemas: &'a [ToolSchema],
@@ -204,6 +211,11 @@ impl<'a> ToolExecutionContext<'a> {
     ) -> Self {
         Self {
             session_id: Some(session_id),
+            root_session_id: Some(if root_session_id.trim().is_empty() {
+                session_id
+            } else {
+                root_session_id
+            }),
             tool_call_id,
             event_tx: Some(event_tx),
             available_tool_schemas: Some(available_tool_schemas),
@@ -227,6 +239,11 @@ impl<'a> ToolExecutionContext<'a> {
     /// borrowed dispatch context.
     pub fn cloned_bash_completion_sink(&self) -> Option<Arc<dyn BashCompletionSink>> {
         self.bash_completion_sink.map(Arc::clone)
+    }
+
+    /// Authoritative root-session identity captured with this dispatch.
+    pub fn root_session_id(&self) -> Option<&'a str> {
+        self.root_session_id
     }
 
     /// TRANSITIONAL bridge to the owned [`ToolCtx`](crate::tools::ToolCtx) that the
@@ -284,6 +301,24 @@ impl<'a> ToolExecutionContext<'a> {
 mod session_flags_tests {
     use super::*;
     use bamboo_domain::{AgentRuntimeState, SessionPermissionMode};
+
+    #[test]
+    fn dispatch_context_falls_back_from_empty_legacy_root_to_session_id() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let ctx = ToolExecutionContext::for_dispatch(
+            "session-id",
+            "  ",
+            "call-id",
+            &event_tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(ctx.root_session_id(), Some("session-id"));
+    }
 
     #[test]
     fn from_session_defaults_false_without_runtime_state() {
@@ -388,6 +423,7 @@ mod session_flags_tests {
         let (tx, _rx) = mpsc::channel(1);
         let ctx = ToolExecutionContext::for_dispatch(
             "s1",
+            "root-s1",
             "call-1",
             &tx,
             &[],
@@ -401,6 +437,7 @@ mod session_flags_tests {
             None,
         );
         assert_eq!(ctx.session_id, Some("s1"));
+        assert_eq!(ctx.root_session_id(), Some("root-s1"));
         assert!(ctx.bypass_permissions);
         assert!(!ctx.auto_approve_permissions);
         assert!(ctx.can_async_resume);
@@ -418,6 +455,7 @@ mod session_flags_tests {
         let parsed = serde_json::json!({"v": "x"});
         let ctx = ToolExecutionContext::for_dispatch(
             "s1",
+            "root-s1",
             "call-1",
             &tx,
             &[],
@@ -444,6 +482,7 @@ mod tests {
         .unwrap();
         let ctx = ToolExecutionContext {
             session_id: Some("session_1"),
+            root_session_id: None,
             tool_call_id: "call_1",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -476,6 +515,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: Some("session_1"),
+            root_session_id: None,
             tool_call_id: "call_123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -510,6 +550,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: Some("session_1"),
+            root_session_id: None,
             tool_call_id: "call_456",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -555,6 +596,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "call_abc",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -611,6 +653,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "call_clone",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -640,6 +683,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: Some("session_multi"),
+            root_session_id: None,
             tool_call_id: "call_multi",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -674,6 +718,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: Some("session_copy"),
+            root_session_id: None,
             tool_call_id: "call_copy",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -707,6 +752,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -737,6 +783,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: Some("会话"),
+            root_session_id: None,
             tool_call_id: "调用_123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -771,6 +818,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "call-with_special.chars:123",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -801,6 +849,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "call_string",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -829,6 +878,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = ToolExecutionContext {
             session_id: None,
+            root_session_id: None,
             tool_call_id: "call_str",
             event_tx: Some(&tx),
             available_tool_schemas: None,

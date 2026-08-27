@@ -490,6 +490,7 @@ async fn execute_sub_actions_with_persistence(
         // context via `for_dispatch` so per-session flags stay in sync.
         let tool_ctx = ToolExecutionContext::for_dispatch(
             &session.id,
+            &session.root_session_id,
             &action.id,
             event_tx,
             available_tools.as_slice(),

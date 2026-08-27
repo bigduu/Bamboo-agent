@@ -596,6 +596,7 @@ Use the dynamic context."#,
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -676,6 +677,7 @@ Use the dynamic context."#,
     let calls_before = provider.calls.load(Ordering::SeqCst);
     let production_context = ToolExecutionContext {
         session_id: Some(production_session_id),
+        root_session_id: None,
         tool_call_id: "production-authority-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -748,6 +750,7 @@ Use the dynamic context."#,
         .with_permission_checked_context_registry(context_tools, Some(permission_config.clone()));
     let typed_context = ToolExecutionContext {
         session_id: Some(typed_session_id),
+        root_session_id: None,
         tool_call_id: "typed-authority-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -862,6 +865,7 @@ Plan must block this provider before dispatch."#,
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-approval-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -900,6 +904,7 @@ Plan must block this provider before dispatch."#,
 
     let plan_read_context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-plan-read-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -930,6 +935,7 @@ Plan must block this provider before dispatch."#,
 
     let invalid_write_context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "dynamic-invalid-write-load",
         event_tx: Some(&event_tx),
         available_tool_schemas: None,
@@ -1135,6 +1141,7 @@ Use this demo skill."#,
     );
     let ctx = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-1",
         event_tx: None,
         available_tool_schemas: None,
@@ -1194,6 +1201,7 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
     let tool = LoadSkillTool::new(skill_manager, config, repo.clone());
     let context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-runtime-allowlist",
         event_tx: None,
         available_tool_schemas: None,
@@ -1305,6 +1313,7 @@ async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_c
     );
     let context = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "runtime-pinned-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -1424,6 +1433,7 @@ Use this demo skill."#,
     );
     let ctx = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-2",
         event_tx: None,
         available_tool_schemas: None,
@@ -1505,6 +1515,7 @@ Use this demo skill."#,
 
     let load_ctx = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-load",
         event_tx: None,
         available_tool_schemas: None,
@@ -1517,6 +1528,7 @@ Use this demo skill."#,
     };
     let read_ctx = ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id: "tool-call-read",
         event_tx: None,
         available_tool_schemas: None,
@@ -1774,6 +1786,7 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
     ] {
         let context = ToolExecutionContext {
             session_id: Some(session_id),
+            root_session_id: None,
             tool_call_id: "workspace-skill-call",
             event_tx: None,
             available_tool_schemas: None,

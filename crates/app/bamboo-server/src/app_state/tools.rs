@@ -17,6 +17,7 @@ use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::AgentEvent;
 use bamboo_llm::Config;
 use bamboo_mcp::manager::McpServerManager;
+use bamboo_plugin_protocol::ToolEventPublisher;
 use bamboo_skills::SkillManager;
 use bamboo_storage::LockedSessionStore;
 use bamboo_storage::SessionStoreV2;
@@ -40,6 +41,7 @@ pub(super) fn build_base_tools(
     project_store: Arc<bamboo_projects::ProjectStore>,
     account_sink: Arc<bamboo_engine::events::AccountEventSink>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    tool_event_publisher: Arc<dyn ToolEventPublisher>,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -48,7 +50,8 @@ pub(super) fn build_base_tools(
         bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
             config.clone(),
             permission_checker.clone(),
-        ),
+        )
+        .with_tool_event_publisher(tool_event_publisher),
     );
     let builtin_tools: Arc<dyn ToolExecutor> = builtin_executor;
 

@@ -37,6 +37,7 @@ use bamboo_mcp::executor::{CompositeToolExecutor, McpToolExecutor};
 use bamboo_mcp::manager::McpServerManager;
 use bamboo_mcp::McpServerConfig;
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
+use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
 use bamboo_tools::permission::{
@@ -191,6 +192,9 @@ pub struct AgentBuilder {
     provider_override: Option<Arc<dyn LLMProvider>>,
     default_tools_override: Option<Arc<dyn ToolExecutor>>,
     config_override: Option<Arc<RwLock<Config>>>,
+    /// Instance-local observation seam. Defaults to a no-op and is applied only
+    /// to built-in executors assembled by this builder.
+    tool_event_publisher: Arc<dyn ToolEventPublisher>,
     /// Defaults assembly records the config and already-connected MCP executor
     /// here; the final built-in executor is created in `build()` from the final
     /// permission policy, so policy setters are order-independent.
@@ -232,6 +236,7 @@ impl AgentBuilder {
             provider_override: None,
             default_tools_override: None,
             config_override: None,
+            tool_event_publisher: Arc::new(NoopToolEventPublisher),
             assembled_config: None,
             assembled_mcp_tools: None,
             session_store: None,
@@ -523,6 +528,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Inject an instance-local, non-blocking publisher for successful
+    /// framework-owned default built-in tool events. The default is a no-op.
+    /// Name-only tools in an explicit/custom registry do not acquire built-in
+    /// provenance, and an injected `default_tools` executor remains authoritative.
+    pub fn tool_event_publisher(mut self, publisher: Arc<dyn ToolEventPublisher>) -> Self {
+        self.tool_event_publisher = publisher;
+        self
+    }
+
     // -- Default dependency assembly ---------------------------------------
 
     /// Assemble the eight runtime dependencies rooted at `data_dir`, using only
@@ -742,14 +756,14 @@ impl AgentBuilder {
             for tool in tools {
                 let _ = registry.register_shared(tool);
             }
-            let executor: Arc<dyn ToolExecutor> = match self.permission_checker.clone() {
-                Some(checker) => Arc::new(
-                    bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
-                        registry, checker,
-                    ),
+            let builtin = match self.permission_checker.clone() {
+                Some(checker) => bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
+                    registry, checker,
                 ),
-                None => Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry)),
+                None => bamboo_tools::BuiltinToolExecutor::with_registry(registry),
             };
+            let executor: Arc<dyn ToolExecutor> =
+                Arc::new(builtin.with_tool_event_publisher(self.tool_event_publisher.clone()));
             self.inner = self.inner.default_tools(executor);
         } else if let Some(executor) = self.default_tools_override.take() {
             self.inner = self.inner.default_tools(executor);
@@ -761,7 +775,8 @@ impl AgentBuilder {
                     )
                 }
                 None => bamboo_tools::BuiltinToolExecutor::new_with_config(config),
-            };
+            }
+            .with_tool_event_publisher(self.tool_event_publisher.clone());
             if let (Some(sessions), Some(projects)) =
                 (self.project_sessions.clone(), self.project_store.clone())
             {
@@ -963,6 +978,7 @@ mod tests {
     };
     use bamboo_agent_core::{Message, ToolSchema};
     use bamboo_llm::{Config, LLMProvider, LLMStream};
+    use bamboo_plugin_protocol::InMemoryToolEventRecorder;
     use bamboo_tools::permission::PermissionMode;
     use bamboo_tools::ToolRegistry;
     use futures::stream;
@@ -976,6 +992,7 @@ mod tests {
     ) -> ToolExecutionContext<'a> {
         ToolExecutionContext {
             session_id: Some(session_id),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1946,6 +1963,119 @@ mod tests {
                 "test provider must not be called".to_string(),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn sdk_builders_keep_injected_tool_event_publishers_instance_local() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let recorder_a = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let recorder_b = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let agent_a = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .tool_event_publisher(recorder_a.clone())
+            .with_defaults_for_data_dir(dir_a.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let agent_b = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .tool_event_publisher(recorder_b.clone())
+            .with_defaults_for_data_dir(dir_b.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let path_a = dir_a.path().join("sdk-a.txt");
+        let call_a = ToolCall {
+            id: "sdk-a-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: serde_json::json!({
+                    "file_path": path_a,
+                    "content": "sdk-a"
+                })
+                .to_string(),
+            },
+        };
+        let result_a = agent_a
+            .inner
+            .default_tools()
+            .execute_with_context(
+                &call_a,
+                ToolExecutionContext {
+                    session_id: Some("sdk-a-session"),
+                    root_session_id: Some("sdk-a-root-session"),
+                    tool_call_id: &call_a.id,
+                    event_tx: None,
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result_a.success);
+        assert_eq!(tokio::fs::read_to_string(path_a).await.unwrap(), "sdk-a");
+        assert_eq!(recorder_a.try_snapshot().unwrap().len(), 1);
+        assert!(recorder_b.try_snapshot().unwrap().is_empty());
+
+        let path_b = dir_b.path().join("sdk-b.txt");
+        let call_b = ToolCall {
+            id: "sdk-b-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Write".to_string(),
+                arguments: serde_json::json!({
+                    "file_path": path_b,
+                    "content": "sdk-b"
+                })
+                .to_string(),
+            },
+        };
+        let result_b = agent_b
+            .inner
+            .default_tools()
+            .execute_with_context(
+                &call_b,
+                ToolExecutionContext {
+                    session_id: Some("sdk-b-session"),
+                    root_session_id: Some("sdk-b-root-session"),
+                    tool_call_id: &call_b.id,
+                    event_tx: None,
+                    available_tool_schemas: None,
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result_b.success);
+        assert_eq!(tokio::fs::read_to_string(path_b).await.unwrap(), "sdk-b");
+
+        let events_a = recorder_a.try_snapshot().unwrap();
+        let events_b = recorder_b.try_snapshot().unwrap();
+        assert_eq!(events_a.len(), 1, "SDK B must not publish into SDK A");
+        assert_eq!(
+            events_b.len(),
+            1,
+            "SDK B must publish into its own recorder"
+        );
+        assert_eq!(events_a[0].context.tool_call_id, "sdk-a-call");
+        assert_eq!(events_a[0].context.root_session_id, "sdk-a-root-session");
+        assert_eq!(events_b[0].context.tool_call_id, "sdk-b-call");
+        assert_eq!(events_b[0].context.root_session_id, "sdk-b-root-session");
     }
 
     #[tokio::test]

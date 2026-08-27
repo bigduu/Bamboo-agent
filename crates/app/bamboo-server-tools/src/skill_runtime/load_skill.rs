@@ -348,6 +348,7 @@ impl LoadSkillTool {
             let event_tx = ctx.event_tx.as_ref().unwrap_or(&fallback_tx);
             let execution_context = ToolExecutionContext::for_dispatch(
                 session.id.as_str(),
+                session.root_session_id.as_str(),
                 &call_id,
                 event_tx,
                 &available,

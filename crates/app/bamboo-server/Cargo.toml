@@ -36,6 +36,7 @@ bamboo-domain = { path = "../../core/bamboo-domain" }
 # build directly on this infra-layer crate's manifest/registry/installer
 # skeleton.
 bamboo-plugin = { path = "../../infra/bamboo-plugin" }
+bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
 bamboo-projects = { path = "../../infra/bamboo-projects" }
 # remote-actor P2a (#181): the server hosts the `/v1/agents` control-plane
 # registry over `bamboo_subagent::proto::AgentRecord`. The engine already pulls

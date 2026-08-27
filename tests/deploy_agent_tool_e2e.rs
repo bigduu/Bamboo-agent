@@ -20,6 +20,7 @@ const TOKEN: &str = "deploy-e2e";
 fn ctx() -> ToolExecutionContext<'static> {
     ToolExecutionContext {
         session_id: Some("root"),
+        root_session_id: None,
         tool_call_id: "tc",
         event_tx: None,
         available_tool_schemas: None,

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +18,9 @@ use crate::tools::{
     TaskTool, ToolRegistry, UpdateGoalTool, WebFetchTool, WebSearchTool, WorkspaceTool, WriteTool,
 };
 use bamboo_llm::Config;
+use bamboo_plugin_protocol::{
+    FileChangedV1, NoopToolEventPublisher, ToolEventContextV1, ToolEventPublisher, ToolEventV1,
+};
 use tokio::sync::RwLock;
 
 fn preview_for_log(value: &str, max_chars: usize) -> String {
@@ -95,26 +100,38 @@ fn resolve_registered_tool_name(registry: &ToolRegistry, raw_tool_name: &str) ->
 pub struct BuiltinToolExecutor {
     registry: ToolRegistry,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    /// Framework-owned mutation tool instances keyed by canonical name. Arc
+    /// identity prevents a registry replacement from inheriting provenance.
+    builtin_mutation_tools: BTreeMap<String, Arc<dyn Tool>>,
+    tool_event_publisher: Arc<dyn ToolEventPublisher>,
 }
 
 impl BuiltinToolExecutor {
+    fn default_tool_event_publisher() -> Arc<dyn ToolEventPublisher> {
+        Arc::new(NoopToolEventPublisher)
+    }
+
     /// Creates a new executor with all built-in tools registered
     pub fn new() -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry, None);
+        let builtin_mutation_tools = Self::register_builtin_tools(&registry, None);
         Self {
             registry,
             permission_checker: None,
+            builtin_mutation_tools,
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
 
     /// Creates a new executor with a permission checker
     pub fn new_with_permissions(permission_checker: Arc<dyn PermissionChecker>) -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry, None);
+        let builtin_mutation_tools = Self::register_builtin_tools(&registry, None);
         Self {
             registry,
             permission_checker: Some(permission_checker),
+            builtin_mutation_tools,
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
 
@@ -124,10 +141,12 @@ impl BuiltinToolExecutor {
     /// `http_request`) honor proxy settings from `config.json`.
     pub fn new_with_config(config: Arc<RwLock<Config>>) -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry, Some(config));
+        let builtin_mutation_tools = Self::register_builtin_tools(&registry, Some(config));
         Self {
             registry,
             permission_checker: None,
+            builtin_mutation_tools,
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
 
@@ -137,10 +156,12 @@ impl BuiltinToolExecutor {
         permission_checker: Arc<dyn PermissionChecker>,
     ) -> Self {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry, Some(config));
+        let builtin_mutation_tools = Self::register_builtin_tools(&registry, Some(config));
         Self {
             registry,
             permission_checker: Some(permission_checker),
+            builtin_mutation_tools,
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
 
@@ -149,6 +170,8 @@ impl BuiltinToolExecutor {
         Self {
             registry,
             permission_checker: None,
+            builtin_mutation_tools: BTreeMap::new(),
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
 
@@ -165,7 +188,15 @@ impl BuiltinToolExecutor {
         Self {
             registry,
             permission_checker: Some(permission_checker),
+            builtin_mutation_tools: BTreeMap::new(),
+            tool_event_publisher: Self::default_tool_event_publisher(),
         }
+    }
+
+    /// Inject an instance-local, non-blocking tool-event publisher.
+    pub fn with_tool_event_publisher(mut self, publisher: Arc<dyn ToolEventPublisher>) -> Self {
+        self.tool_event_publisher = publisher;
+        self
     }
 
     /// Returns a reference to the internal registry
@@ -173,15 +204,70 @@ impl BuiltinToolExecutor {
         &self.registry
     }
 
+    fn pending_file_changed(
+        &self,
+        tool_name: &str,
+        tool: &Arc<dyn Tool>,
+        args: &serde_json::Value,
+    ) -> Option<FileChangedV1> {
+        let builtin = self.builtin_mutation_tools.get(tool_name)?;
+        if !Arc::ptr_eq(builtin, tool) {
+            return None;
+        }
+        let path_field = match tool_name {
+            "Write" | "Edit" => "file_path",
+            "NotebookEdit" => "notebook_path",
+            _ => return None,
+        };
+        let path = args.get(path_field)?.as_str()?.trim();
+        FileChangedV1::bounded_from(path).ok()
+    }
+
+    fn publish_successful_file_change(
+        &self,
+        ctx: &ToolExecutionContext<'_>,
+        tool_name: &str,
+        data: FileChangedV1,
+    ) {
+        let Some(session_id) = ctx.session_id else {
+            return;
+        };
+        let Some(root_session_id) = ctx.root_session_id else {
+            return;
+        };
+        let Ok(context) = ToolEventContextV1::bounded_from(
+            session_id,
+            root_session_id,
+            tool_name,
+            ctx.tool_call_id,
+        ) else {
+            return;
+        };
+        let Ok(event) = ToolEventV1::file_changed(context, data) else {
+            return;
+        };
+
+        // A buggy publisher must not unwind across the tool-result boundary.
+        // Returned failures are deliberately ignored: delivery is best-effort.
+        let publisher = self.tool_event_publisher.as_ref();
+        let _ = catch_unwind(AssertUnwindSafe(|| publisher.try_publish(event)));
+    }
+
     /// Registers all built-in tools to the given registry
-    fn register_builtin_tools(registry: &ToolRegistry, config: Option<Arc<RwLock<Config>>>) {
+    fn register_builtin_tools(
+        registry: &ToolRegistry,
+        config: Option<Arc<RwLock<Config>>>,
+    ) -> BTreeMap<String, Arc<dyn Tool>> {
+        let mut mutation_tools = BTreeMap::new();
         let _ = config;
         // NOTE: apply_patch is now an alias for Edit – no separate registration.
         let _ = registry.register(ConclusionWithOptionsTool::new());
         let _ = registry.register(BashTool::new());
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
-        let _ = registry.register(EditTool::new());
+        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, EditTool::new()) {
+            mutation_tools.insert(name, tool);
+        }
         let _ = registry.register(EnterPlanModeTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
         // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
@@ -192,7 +278,10 @@ impl BuiltinToolExecutor {
         let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(SessionNoteTool::new());
-        let _ = registry.register(NotebookEditTool::new());
+        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, NotebookEditTool::new())
+        {
+            mutation_tools.insert(name, tool);
+        }
         let _ = registry.register(ReadTool::new());
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
@@ -201,13 +290,28 @@ impl BuiltinToolExecutor {
         let _ = registry.register(WebSearchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
         let _ = registry.register(WorkspaceTool::new());
-        let _ = registry.register(WriteTool::new());
+        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, WriteTool::new()) {
+            mutation_tools.insert(name, tool);
+        }
+        mutation_tools
+    }
+
+    fn register_builtin_mutation<T: Tool + 'static>(
+        registry: &ToolRegistry,
+        tool: T,
+    ) -> Result<(String, Arc<dyn Tool>), ToolError> {
+        let name = tool.name().to_string();
+        let tool: Arc<dyn Tool> = Arc::new(tool);
+        registry
+            .register_shared(tool.clone())
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok((name, tool))
     }
 
     /// Returns all built-in tool schemas
     pub fn tool_schemas() -> Vec<ToolSchema> {
         let registry = ToolRegistry::new();
-        Self::register_builtin_tools(&registry, None);
+        let _ = Self::register_builtin_tools(&registry, None);
         registry.list_tools()
     }
 
@@ -326,6 +430,16 @@ impl ToolExecutor for BuiltinToolExecutor {
             return Ok(outcome);
         }
 
+        // Only framework-owned mutation tool instances are eligible. The hint
+        // itself is bounded before allocation and is inert until the real tool
+        // returns a successful terminal result.
+        let publisher_enabled =
+            catch_unwind(AssertUnwindSafe(|| self.tool_event_publisher.is_enabled()))
+                .unwrap_or(false);
+        let pending_file_changed = publisher_enabled
+            .then(|| self.pending_file_changed(&tool_name, &tool, &args))
+            .flatten();
+
         // Rewritten dispatch: build the owned `ToolCtx` at this concrete seam and
         // call the tool's single `invoke`. Unwrap the `ToolOutcome` back to a
         // `ToolResult` so the surrounding dispatch/loop is unchanged for now:
@@ -334,7 +448,16 @@ impl ToolExecutor for BuiltinToolExecutor {
         // be produced (no tool returns it in this phase). Phase B makes the outcome
         // authoritative and removes this unwrap.
         let tool_ctx = ctx.to_tool_ctx();
-        tool.invoke(args, tool_ctx).await
+        let outcome = tool.invoke(args, tool_ctx).await?;
+        if matches!(
+            &outcome,
+            ToolOutcome::Completed(result) if result.success
+        ) {
+            if let Some(data) = pending_file_changed {
+                self.publish_successful_file_change(&ctx, &tool_name, data);
+            }
+        }
+        Ok(outcome)
     }
 
     /// The real permission gate for built-in tools, extracted from the execute
@@ -674,6 +797,8 @@ impl ToolExecutor for BuiltinToolExecutor {
 pub struct BuiltinToolExecutorBuilder {
     registry: ToolRegistry,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    builtin_mutation_tools: BTreeMap<String, Arc<dyn Tool>>,
+    tool_event_publisher: Arc<dyn ToolEventPublisher>,
 }
 
 impl BuiltinToolExecutorBuilder {
@@ -682,26 +807,48 @@ impl BuiltinToolExecutorBuilder {
         Self {
             registry: ToolRegistry::new(),
             permission_checker: None,
+            builtin_mutation_tools: BTreeMap::new(),
+            tool_event_publisher: BuiltinToolExecutor::default_tool_event_publisher(),
         }
     }
 
     /// Registers all default built-in tools
-    pub fn with_default_tools(self) -> Self {
-        BuiltinToolExecutor::register_builtin_tools(&self.registry, None);
+    pub fn with_default_tools(mut self) -> Self {
+        self.builtin_mutation_tools
+            .extend(BuiltinToolExecutor::register_builtin_tools(
+                &self.registry,
+                None,
+            ));
         self
     }
 
     /// Registers a specific filesystem tool by name
-    pub fn with_filesystem_tool(self, name: &str) -> Result<Self, ToolError> {
-        match name {
-            "Read" => self.registry.register(ReadTool::new()),
-            "Write" => self.registry.register(WriteTool::new()),
+    pub fn with_filesystem_tool(mut self, name: &str) -> Result<Self, ToolError> {
+        let marker = match name {
+            "Read" => {
+                self.registry
+                    .register(ReadTool::new())
+                    .map_err(|error| ToolError::Execution(error.to_string()))?;
+                None
+            }
+            "Write" => Some(BuiltinToolExecutor::register_builtin_mutation(
+                &self.registry,
+                WriteTool::new(),
+            )?),
             // apply_patch is now an alias for Edit
-            "Edit" | "apply_patch" => self.registry.register(EditTool::new()),
-            "NotebookEdit" => self.registry.register(NotebookEditTool::new()),
+            "Edit" | "apply_patch" => Some(BuiltinToolExecutor::register_builtin_mutation(
+                &self.registry,
+                EditTool::new(),
+            )?),
+            "NotebookEdit" => Some(BuiltinToolExecutor::register_builtin_mutation(
+                &self.registry,
+                NotebookEditTool::new(),
+            )?),
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
+        };
+        if let Some((name, tool)) = marker {
+            self.builtin_mutation_tools.insert(name, tool);
         }
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
         Ok(self)
     }
 
@@ -732,11 +879,19 @@ impl BuiltinToolExecutorBuilder {
         self
     }
 
+    /// Sets the instance-local tool-event publisher.
+    pub fn with_tool_event_publisher(mut self, publisher: Arc<dyn ToolEventPublisher>) -> Self {
+        self.tool_event_publisher = publisher;
+        self
+    }
+
     /// Builds the executor
     pub fn build(self) -> BuiltinToolExecutor {
         BuiltinToolExecutor {
             registry: self.registry,
             permission_checker: self.permission_checker,
+            builtin_mutation_tools: self.builtin_mutation_tools,
+            tool_event_publisher: self.tool_event_publisher,
         }
     }
 }
@@ -755,6 +910,10 @@ mod tests {
     use bamboo_agent_core::ToolCtx;
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::tool_names::{normalize_tool_ref, BUILTIN_TOOL_NAMES};
+    use bamboo_plugin_protocol::{
+        FileChangedV1, InMemoryToolEventRecorder, ToolEventContextV1, ToolEventPublishError,
+        ToolEventV1, MAX_TOOL_EVENT_PATH_BYTES,
+    };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -764,14 +923,76 @@ mod tests {
     use crate::tools::WriteTool;
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
+        make_tool_call_with_id("call_1", name, args)
+    }
+
+    fn make_tool_call_with_id(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
         ToolCall {
-            id: "call_1".to_string(),
+            id: id.to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
                 name: name.to_string(),
                 arguments: args.to_string(),
             },
         }
+    }
+
+    fn tool_event_context<'a>(
+        call: &'a ToolCall,
+        session_id: Option<&'a str>,
+        root_session_id: Option<&'a str>,
+    ) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            session_id,
+            root_session_id,
+            tool_call_id: &call.id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+    }
+
+    fn assert_single_file_changed(
+        recorder: &InMemoryToolEventRecorder,
+        session_id: &str,
+        root_session_id: &str,
+        tool_name: &str,
+        tool_call_id: &str,
+        path: &str,
+    ) {
+        let events = recorder.try_snapshot().expect("snapshot tool events");
+        assert_eq!(
+            events.len(),
+            1,
+            "successful mutation must emit exactly once"
+        );
+        let event = &events[0];
+        assert_eq!(event.context.session_id, session_id);
+        assert_eq!(event.context.root_session_id, root_session_id);
+        assert_eq!(event.context.tool_name, tool_name);
+        assert_eq!(event.context.tool_call_id, tool_call_id);
+        assert_eq!(
+            event
+                .file_changed_data()
+                .expect("known file_changed event")
+                .expect("valid file_changed payload")
+                .path,
+            path
+        );
+    }
+
+    fn seed_event(call_id: &str) -> ToolEventV1 {
+        ToolEventV1::file_changed(
+            ToolEventContextV1::bounded("seed-session", "seed-root-session", "Write", call_id)
+                .unwrap(),
+            FileChangedV1::bounded("/seed/file.txt").unwrap(),
+        )
+        .unwrap()
     }
 
     fn make_tool_call_with_raw_args(name: &str, raw_args: &str) -> ToolCall {
@@ -783,6 +1004,119 @@ mod tests {
                 arguments: raw_args.to_string(),
             },
         }
+    }
+
+    struct ReturningPublisher(ToolEventPublishError);
+
+    impl ToolEventPublisher for ReturningPublisher {
+        fn try_publish(&self, _event: ToolEventV1) -> Result<(), ToolEventPublishError> {
+            Err(self.0.clone())
+        }
+    }
+
+    struct IsEnabledPanicPublisher;
+
+    impl ToolEventPublisher for IsEnabledPanicPublisher {
+        fn is_enabled(&self) -> bool {
+            panic!("is_enabled publisher panic")
+        }
+
+        fn try_publish(&self, _event: ToolEventV1) -> Result<(), ToolEventPublishError> {
+            unreachable!("disabled publisher must not receive an event")
+        }
+    }
+
+    struct TryPublishPanicPublisher;
+
+    impl ToolEventPublisher for TryPublishPanicPublisher {
+        fn try_publish(&self, _event: ToolEventV1) -> Result<(), ToolEventPublishError> {
+            panic!("try_publish publisher panic")
+        }
+    }
+
+    struct StubWriteTool {
+        success: bool,
+    }
+
+    #[async_trait]
+    impl Tool for StubWriteTool {
+        fn name(&self) -> &str {
+            "Write"
+        }
+
+        fn description(&self) -> &str {
+            "test-only custom tool that deliberately spoofs Write"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {"file_path": {"type": "string"}}})
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
+                success: self.success,
+                result: "stub-write-result".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            }))
+        }
+    }
+
+    fn marked_stub_write_executor(
+        success: bool,
+        publisher: Arc<dyn ToolEventPublisher>,
+    ) -> BuiltinToolExecutor {
+        let registry = ToolRegistry::new();
+        let tool: Arc<dyn Tool> = Arc::new(StubWriteTool { success });
+        registry
+            .register_shared(tool.clone())
+            .expect("register stub Write");
+        BuiltinToolExecutor {
+            registry,
+            permission_checker: None,
+            builtin_mutation_tools: BTreeMap::from([("Write".to_string(), tool)]),
+            tool_event_publisher: publisher,
+        }
+    }
+
+    async fn assert_real_write_succeeds_with_publisher(
+        publisher: Arc<dyn ToolEventPublisher>,
+        label: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("publisher-{label}.txt"));
+        let call = make_tool_call_with_id(
+            &format!("publisher-{label}"),
+            "Write",
+            json!({"file_path": path, "content": label}),
+        );
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Write")
+            .expect("register built-in Write")
+            .with_tool_event_publisher(publisher)
+            .build();
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                tool_event_context(
+                    &call,
+                    Some("publisher-session"),
+                    Some("publisher-root-session"),
+                ),
+            )
+            .await
+            .expect("publisher behavior must not turn tool success into an error");
+
+        assert!(
+            result.success,
+            "publisher must not alter ToolResult.success"
+        );
+        assert_eq!(fs::read_to_string(path).await.unwrap(), label);
     }
 
     fn make_executor(
@@ -809,6 +1143,7 @@ mod tests {
         let call = make_tool_call("Write", args);
         let ctx = ToolExecutionContext {
             session_id: Some(session_id),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: Some(&event_tx),
             available_tool_schemas: None,
@@ -1294,6 +1629,7 @@ mod tests {
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-bypass"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: Some(&event_tx),
             available_tool_schemas: None,
@@ -1338,6 +1674,7 @@ mod tests {
         );
         let ctx = ToolExecutionContext {
             session_id: Some("s-hook-allow"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1388,6 +1725,7 @@ mod tests {
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-hook-hard-dangerous"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1436,6 +1774,7 @@ mod tests {
         );
         let ctx = ToolExecutionContext {
             session_id: Some("s-hook-explicit-deny"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1486,6 +1825,7 @@ mod tests {
         let denied_call = make_tool_call("Bash", json!({"command": denied_command}));
         let denied_ctx = ToolExecutionContext {
             session_id: Some("s-forced"),
+            root_session_id: None,
             tool_call_id: &denied_call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1520,6 +1860,7 @@ mod tests {
         let approved_call = make_tool_call("Bash", json!({"command": approved_command}));
         let approved_ctx = ToolExecutionContext {
             session_id: Some("s-forced"),
+            root_session_id: None,
             tool_call_id: &approved_call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1565,6 +1906,7 @@ mod tests {
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-auto"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: Some(&event_tx),
             available_tool_schemas: None,
@@ -1609,6 +1951,7 @@ mod tests {
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
             session_id: Some("guardian-auto"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1648,6 +1991,7 @@ mod tests {
         );
         let ctx = ToolExecutionContext {
             session_id: Some("s-explicit-deny"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1684,6 +2028,7 @@ mod tests {
         let call = make_tool_call("Bash", json!({"command": "rm child-to-preserve"}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-explicit-delete-deny"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1713,6 +2058,7 @@ mod tests {
         );
         let write_ctx = ToolExecutionContext {
             session_id: Some("plan-auto"),
+            root_session_id: None,
             tool_call_id: &write.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1734,6 +2080,7 @@ mod tests {
         let read = make_tool_call("Read", json!({"file_path": path}));
         let read_ctx = ToolExecutionContext {
             session_id: Some("plan-auto"),
+            root_session_id: None,
             tool_call_id: &read.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1758,6 +2105,7 @@ mod tests {
         let call = make_tool_call("request_permissions", json!({}));
         let ctx = ToolExecutionContext {
             session_id: Some("auto-no-prompt"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: Some(&event_tx),
             available_tool_schemas: None,
@@ -1799,6 +2147,7 @@ mod tests {
         );
         let ctx = ToolExecutionContext {
             session_id: Some("s-interactive"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -1875,6 +2224,7 @@ mod tests {
                 &call,
                 ToolExecutionContext {
                     session_id: Some("proactive-session"),
+                    root_session_id: None,
                     tool_call_id: &call.id,
                     event_tx: Some(&event_tx),
                     available_tool_schemas: None,
@@ -1914,6 +2264,7 @@ mod tests {
                 &call,
                 ToolExecutionContext {
                     session_id: Some("proactive-session"),
+                    root_session_id: None,
                     tool_call_id: &call.id,
                     event_tx: Some(&event_tx),
                     available_tool_schemas: None,
@@ -1945,6 +2296,7 @@ mod tests {
                 &call,
                 ToolExecutionContext {
                     session_id: Some("proactive-session"),
+                    root_session_id: None,
                     tool_call_id: &call.id,
                     event_tx: Some(&event_tx),
                     available_tool_schemas: None,
@@ -2105,6 +2457,7 @@ mod tests {
         let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-worker"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -2145,6 +2498,7 @@ mod tests {
         let call = make_tool_call("Write", json!({"file_path": path_str, "content": "nope"}));
         let ctx = ToolExecutionContext {
             session_id: Some("s-worker"),
+            root_session_id: None,
             tool_call_id: &call.id,
             event_tx: None,
             available_tool_schemas: None,
@@ -2219,6 +2573,7 @@ mod tests {
                 &call,
                 ToolExecutionContext {
                     session_id: Some("s1"),
+                    root_session_id: None,
                     tool_call_id: &call.id,
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
@@ -2338,6 +2693,7 @@ mod tests {
     ) -> ToolExecutionContext<'a> {
         ToolExecutionContext {
             session_id: Some("s-106"),
+            root_session_id: None,
             tool_call_id: call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -2418,5 +2774,531 @@ mod tests {
         assert!(result.success);
         let written = fs::read_to_string(&path).await.expect("file written");
         assert_eq!(written, "recovered content");
+    }
+
+    #[tokio::test]
+    async fn successful_write_emits_one_bounded_file_changed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write-event.txt");
+        let path_string = path.to_string_lossy().into_owned();
+        let padded_path = format!("  {path_string}  ");
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Write")
+            .unwrap()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let call = make_tool_call_with_id(
+            "write-call",
+            "Write",
+            json!({"file_path": padded_path, "content": "written"}),
+        );
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                tool_event_context(&call, Some("write-session"), Some("write-root-session")),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "written");
+        assert_single_file_changed(
+            &recorder,
+            "write-session",
+            "write-root-session",
+            "Write",
+            "write-call",
+            &path_string,
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_edit_emits_one_bounded_file_changed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit-event.txt");
+        fs::write(&path, "before\n").await.unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let padded_path = format!(" {path_string} ");
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutor::new().with_tool_event_publisher(recorder.clone());
+        let read =
+            make_tool_call_with_id("edit-read-call", "Read", json!({"file_path": padded_path}));
+        executor
+            .execute_with_context(
+                &read,
+                tool_event_context(&read, Some("edit-session"), Some("edit-root-session")),
+            )
+            .await
+            .unwrap();
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+
+        let edit = make_tool_call_with_id(
+            "edit-call",
+            "Edit",
+            json!({
+                "file_path": format!(" {path_string} "),
+                "old_string": "before",
+                "new_string": "after"
+            }),
+        );
+        let result = executor
+            .execute_with_context(
+                &edit,
+                tool_event_context(&edit, Some("edit-session"), Some("edit-root-session")),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "after\n");
+        assert_single_file_changed(
+            &recorder,
+            "edit-session",
+            "edit-root-session",
+            "Edit",
+            "edit-call",
+            &path_string,
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_apply_patch_alias_emits_canonical_edit_with_original_call_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("apply-patch-event.txt");
+        fs::write(&path, "alpha\nbeta\n").await.unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutor::new().with_tool_event_publisher(recorder.clone());
+        let read = make_tool_call_with_id(
+            "apply-patch-read-call",
+            "Read",
+            json!({"file_path": path_string}),
+        );
+        executor
+            .execute_with_context(
+                &read,
+                tool_event_context(&read, Some("alias-session"), Some("alias-root-session")),
+            )
+            .await
+            .unwrap();
+
+        let edit = make_tool_call_with_id(
+            "model-original-alias-call",
+            "apply_patch",
+            json!({
+                "path": format!("  {path_string}  "),
+                "old_string": "beta",
+                "new_string": "BETA"
+            }),
+        );
+        let result = executor
+            .execute_with_context(
+                &edit,
+                tool_event_context(&edit, Some("alias-session"), Some("alias-root-session")),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "alpha\nBETA\n");
+        assert_single_file_changed(
+            &recorder,
+            "alias-session",
+            "alias-root-session",
+            "Edit",
+            "model-original-alias-call",
+            &path_string,
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_notebook_edit_emits_one_bounded_file_changed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notebook-event.ipynb");
+        fs::write(
+            &path,
+            r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#,
+        )
+        .await
+        .unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("NotebookEdit")
+            .unwrap()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let call = make_tool_call_with_id(
+            "notebook-call",
+            "NotebookEdit",
+            json!({
+                "notebook_path": format!(" {path_string} "),
+                "new_source": "print('hello')",
+                "cell_type": "code",
+                "edit_mode": "insert"
+            }),
+        );
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                tool_event_context(
+                    &call,
+                    Some("notebook-session"),
+                    Some("notebook-root-session"),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_single_file_changed(
+            &recorder,
+            "notebook-session",
+            "notebook-root-session",
+            "NotebookEdit",
+            "notebook-call",
+            &path_string,
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_and_non_successful_mutations_emit_no_event() {
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Write")
+            .unwrap()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let failed = make_tool_call_with_id(
+            "failed-write-call",
+            "Write",
+            json!({"file_path": "relative.txt", "content": "never"}),
+        );
+        assert!(executor
+            .execute_with_context(
+                &failed,
+                tool_event_context(
+                    &failed,
+                    Some("failure-session"),
+                    Some("failure-root-session"),
+                ),
+            )
+            .await
+            .is_err());
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+
+        let completed_false = marked_stub_write_executor(false, recorder.clone());
+        let call = make_tool_call_with_id(
+            "completed-false-call",
+            "Write",
+            json!({"file_path": "/valid/event/path.txt"}),
+        );
+        let result = completed_false
+            .execute_with_context(
+                &call,
+                tool_event_context(&call, Some("failure-session"), Some("failure-root-session")),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_postverify_failure_emits_no_tool_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("postverify-conflict.txt");
+        fs::write(&path, "before").await.unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let session_id = format!("event-conflict-{}", uuid::Uuid::new_v4());
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor =
+            Arc::new(BuiltinToolExecutor::new().with_tool_event_publisher(recorder.clone()));
+
+        let initial_read = make_tool_call_with_id(
+            "conflict-initial-read",
+            "Read",
+            json!({"file_path": path_string}),
+        );
+        executor
+            .execute_with_context(
+                &initial_read,
+                tool_event_context(
+                    &initial_read,
+                    Some(&session_id),
+                    Some("conflict-root-session"),
+                ),
+            )
+            .await
+            .unwrap();
+        let (advance_reached, resume_advance) =
+            crate::tools::read_tracker::pause_next_advance_for_test(&session_id, &path_string)
+                .await;
+
+        let writer_executor = executor.clone();
+        let writer_session = session_id.clone();
+        let writer_path = path_string.clone();
+        let writer = tokio::spawn(async move {
+            let call = make_tool_call_with_id(
+                "conflict-write-call",
+                "Write",
+                json!({"file_path": writer_path, "content": "intended"}),
+            );
+            writer_executor
+                .execute_with_context(
+                    &call,
+                    tool_event_context(&call, Some(&writer_session), Some("conflict-root-session")),
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            advance_reached.notified(),
+        )
+        .await
+        .expect("Write did not reach post-write baseline advancement");
+        fs::write(&path, "other").await.unwrap();
+        let concurrent_read = make_tool_call_with_id(
+            "conflict-concurrent-read",
+            "Read",
+            json!({"file_path": path_string}),
+        );
+        executor
+            .execute_with_context(
+                &concurrent_read,
+                tool_event_context(
+                    &concurrent_read,
+                    Some(&session_id),
+                    Some("conflict-root-session"),
+                ),
+            )
+            .await
+            .unwrap();
+        fs::write(&path, "intended").await.unwrap();
+        resume_advance.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("Write did not resume")
+            .unwrap();
+        assert!(
+            matches!(outcome, Err(ToolError::Execution(ref message)) if message.contains("Write committed")),
+            "committed postverify conflict must stay an error: {outcome:?}"
+        );
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "intended");
+        assert!(
+            recorder.try_snapshot().unwrap().is_empty(),
+            "an on-disk mutation is not a successful tool outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_pause_does_not_publish_a_success_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approval-gated.txt");
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_ask_rules([format!("Write({}/**)", dir.path().display())]);
+        config.register_session_workspace(
+            "approval-session",
+            dir.path().to_string_lossy().into_owned(),
+        );
+        let checker = Arc::new(crate::permission::ConfigPermissionChecker::new(config));
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Write")
+            .unwrap()
+            .with_permission_checker(checker)
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let call = make_tool_call_with_id(
+            "approval-call",
+            "Write",
+            json!({"file_path": path, "content": "not-yet"}),
+        );
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let mut ctx = tool_event_context(
+            &call,
+            Some("approval-session"),
+            Some("approval-root-session"),
+        );
+        ctx.event_tx = Some(&event_tx);
+
+        let result = executor.execute_with_context(&call, ctx).await.unwrap();
+        assert!(
+            result.success,
+            "approval pause is a synthetic success result"
+        );
+        assert_eq!(
+            result.display_preference.as_deref(),
+            Some("request_permissions")
+        );
+        assert!(!path.exists(), "permission pause must not invoke Write");
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_authority_or_oversize_path_fails_closed_without_event() {
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = marked_stub_write_executor(true, recorder.clone());
+
+        let missing_session = make_tool_call_with_id(
+            "missing-session-call",
+            "Write",
+            json!({"file_path": "/bounded/path.txt"}),
+        );
+        assert!(
+            executor
+                .execute_with_context(
+                    &missing_session,
+                    tool_event_context(&missing_session, None, Some("authority-root-session"),),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        let missing_root = make_tool_call_with_id(
+            "missing-root-call",
+            "Write",
+            json!({"file_path": "/bounded/path.txt"}),
+        );
+        assert!(
+            executor
+                .execute_with_context(
+                    &missing_root,
+                    tool_event_context(&missing_root, Some("authority-session"), None),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        let oversize_path = make_tool_call_with_id(
+            "oversize-path-call",
+            "Write",
+            json!({"file_path": "x".repeat(MAX_TOOL_EVENT_PATH_BYTES + 1)}),
+        );
+        assert!(
+            executor
+                .execute_with_context(
+                    &oversize_path,
+                    tool_event_context(
+                        &oversize_path,
+                        Some("authority-session"),
+                        Some("authority-root-session"),
+                    ),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn custom_write_name_never_acquires_builtin_event_provenance() {
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let registry = ToolRegistry::new();
+        registry.register(StubWriteTool { success: true }).unwrap();
+        let from_registry = BuiltinToolExecutor::with_registry(registry)
+            .with_tool_event_publisher(recorder.clone());
+        let first = make_tool_call_with_id(
+            "spoof-registry-call",
+            "Write",
+            json!({"file_path": "/spoof/path.txt"}),
+        );
+        assert!(
+            from_registry
+                .execute_with_context(
+                    &first,
+                    tool_event_context(&first, Some("spoof-session"), Some("spoof-root-session"),),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        let custom_before_defaults = BuiltinToolExecutorBuilder::new()
+            .with_tool(StubWriteTool { success: true })
+            .unwrap()
+            .with_default_tools()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let second = make_tool_call_with_id(
+            "spoof-builder-order-call",
+            "Write",
+            json!({"file_path": "/spoof/path.txt"}),
+        );
+        assert!(
+            custom_before_defaults
+                .execute_with_context(
+                    &second,
+                    tool_event_context(&second, Some("spoof-session"), Some("spoof-root-session"),),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        let replaced_builtin =
+            BuiltinToolExecutor::new().with_tool_event_publisher(recorder.clone());
+        assert!(replaced_builtin.registry().unregister("Write"));
+        replaced_builtin
+            .register_tool(StubWriteTool { success: true })
+            .unwrap();
+        let third = make_tool_call_with_id(
+            "spoof-replaced-builtin-call",
+            "Write",
+            json!({"file_path": "/spoof/path.txt"}),
+        );
+        assert!(
+            replaced_builtin
+                .execute_with_context(
+                    &third,
+                    tool_event_context(&third, Some("spoof-session"), Some("spoof-root-session"),),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn publisher_rejection_or_panic_never_changes_successful_tool_result() {
+        let full = Arc::new(InMemoryToolEventRecorder::new(1).unwrap());
+        full.try_publish(seed_event("seed-full")).unwrap();
+        assert_real_write_succeeds_with_publisher(full.clone(), "full").await;
+        let retained = full.try_snapshot().unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].context.tool_call_id, "seed-full");
+
+        let publishers: Vec<(&str, Arc<dyn ToolEventPublisher>)> = vec![
+            (
+                "busy",
+                Arc::new(ReturningPublisher(ToolEventPublishError::Busy)),
+            ),
+            (
+                "poisoned",
+                Arc::new(ReturningPublisher(ToolEventPublishError::Poisoned)),
+            ),
+            (
+                "failed",
+                Arc::new(ReturningPublisher(ToolEventPublishError::Failed(
+                    "sink unavailable".to_string(),
+                ))),
+            ),
+            ("enabled-panic", Arc::new(IsEnabledPanicPublisher)),
+            ("publish-panic", Arc::new(TryPublishPanicPublisher)),
+        ];
+        for (label, publisher) in publishers {
+            assert_real_write_succeeds_with_publisher(publisher, label).await;
+        }
     }
 }

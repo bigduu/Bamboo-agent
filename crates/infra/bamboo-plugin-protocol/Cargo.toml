@@ -1,0 +1,15 @@
+[package]
+name = "bamboo-plugin-protocol"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Dependency-light public wire protocols shared by Bamboo and plugin services"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.49.2", default-features = false }

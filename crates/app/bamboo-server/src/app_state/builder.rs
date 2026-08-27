@@ -7,6 +7,7 @@ use super::tools::{build_base_tools, build_root_tools};
 use super::*;
 use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
+use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 
 impl AppState {
     /// Create unified app state with direct provider access
@@ -138,7 +139,14 @@ impl AppState {
             Arc::new(UnconfiguredProvider { message }) as Arc<dyn LLMProvider>
         });
 
-        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, config_facade).await
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            config_facade,
+            Arc::new(NoopToolEventPublisher),
+        )
+        .await
     }
 
     /// Create unified app state with a specific provider
@@ -160,7 +168,32 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
-        Self::new_with_provider_and_facade(bamboo_home_dir, config, provider, None).await
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            None,
+            Arc::new(NoopToolEventPublisher),
+        )
+        .await
+    }
+
+    /// Create a server state with an instance-local tool-event publisher.
+    /// Existing constructors retain the no-op publisher and unchanged behavior.
+    pub async fn new_with_provider_and_tool_event_publisher(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        tool_event_publisher: Arc<dyn ToolEventPublisher>,
+    ) -> Result<Self, AppError> {
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            None,
+            tool_event_publisher,
+        )
+        .await
     }
 
     async fn new_with_provider_and_facade(
@@ -168,6 +201,7 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
+        tool_event_publisher: Arc<dyn ToolEventPublisher>,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -430,6 +464,7 @@ impl AppState {
             project_store.clone(),
             account_sink.clone(),
             workspace_resolver.clone(),
+            tool_event_publisher.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -1005,6 +1040,7 @@ impl AppState {
             );
         Ok(Self {
             app_data_dir: bamboo_home_dir,
+            tool_event_publisher,
             config,
             config_facade,
             config_io_lock,
