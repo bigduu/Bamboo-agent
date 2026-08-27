@@ -735,6 +735,7 @@ mod tests {
                 }),
                 ToolExecutionContext {
                     session_id: Some("session_1"),
+                    root_session_id: None,
                     tool_call_id: "call_1",
                     event_tx: Some(&tx),
                     available_tool_schemas: None,
@@ -1098,6 +1099,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolExecutionContext::for_dispatch(
             "session_84",
+            "session_84",
             "call_84",
             &tx,
             &[],
@@ -1163,6 +1165,7 @@ mod tests {
                 }),
                 ToolExecutionContext {
                     session_id: Some(&session_id),
+                    root_session_id: None,
                     tool_call_id: "call_1",
                     event_tx: None,
                     available_tool_schemas: None,
@@ -1310,6 +1313,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(32);
         let ctx = ToolExecutionContext {
             session_id: Some("session_auto_fast"),
+            root_session_id: None,
             tool_call_id: "call_auto_fast",
             event_tx: Some(&tx),
             available_tool_schemas: None,
@@ -1357,6 +1361,7 @@ mod tests {
         let session_id = "session_auto_promote";
         let (tx, mut rx) = mpsc::channel(8);
         let ctx = ToolExecutionContext::for_dispatch(
+            session_id,
             session_id,
             "call_auto_promote",
             &tx,

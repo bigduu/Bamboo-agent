@@ -1,14 +1,17 @@
-use super::{AppState, DEFAULT_BASE_PROMPT};
+use super::{AppState, UnconfiguredProvider, DEFAULT_BASE_PROMPT};
 use crate::tools::ToolSurface;
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolError};
-use bamboo_agent_core::Session;
+use bamboo_agent_core::{Session, ToolExecutionContext};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+use bamboo_llm::{Config, LLMProvider};
 use bamboo_metrics::{MetricsStorage, SessionStatus, SqliteMetricsStorage};
+use bamboo_plugin_protocol::InMemoryToolEventRecorder;
 use bamboo_storage::SessionStoreV2;
 use bamboo_tools::permission::config::{PermissionConfig, PermissionRule, PermissionType};
 use bamboo_tools::permission::storage::PermissionStorage;
 use serde_json::json;
+use std::sync::Arc;
 
 fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall {
@@ -65,6 +68,98 @@ async fn test_app_state_creation() {
     assert!(state.sessions.is_empty());
     assert!(state.config_facade.is_some());
     assert!(bamboo_config::section_layout_is_active(temp_dir.path()).unwrap());
+}
+
+#[tokio::test]
+async fn injected_tool_event_publishers_are_isolated_between_app_states() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let recorder_a = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+    let recorder_b = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+    let provider: Arc<dyn LLMProvider> = Arc::new(UnconfiguredProvider {
+        message: "test provider is intentionally unconfigured".to_string(),
+    });
+    let state_a = AppState::new_with_provider_and_tool_event_publisher(
+        dir_a.path().to_path_buf(),
+        Config::default(),
+        provider.clone(),
+        recorder_a.clone(),
+    )
+    .await
+    .unwrap();
+    let state_b = AppState::new_with_provider_and_tool_event_publisher(
+        dir_b.path().to_path_buf(),
+        Config::default(),
+        provider,
+        recorder_b.clone(),
+    )
+    .await
+    .unwrap();
+
+    let file_a = dir_a.path().join("state-a.txt");
+    let call_a = make_tool_call("Write", json!({"file_path": file_a, "content": "state-a"}));
+    let result_a = state_a
+        .tools_for(ToolSurface::Base)
+        .execute_with_context(
+            &call_a,
+            ToolExecutionContext {
+                session_id: Some("state-a-session"),
+                root_session_id: Some("state-a-root-session"),
+                tool_call_id: &call_a.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result_a.success);
+    assert_eq!(tokio::fs::read_to_string(file_a).await.unwrap(), "state-a");
+    assert_eq!(recorder_a.try_snapshot().unwrap().len(), 1);
+    assert!(recorder_b.try_snapshot().unwrap().is_empty());
+
+    let file_b = dir_b.path().join("state-b.txt");
+    let call_b = make_tool_call("Write", json!({"file_path": file_b, "content": "state-b"}));
+    let result_b = state_b
+        .tools_for(ToolSurface::Base)
+        .execute_with_context(
+            &call_b,
+            ToolExecutionContext {
+                session_id: Some("state-b-session"),
+                root_session_id: Some("state-b-root-session"),
+                tool_call_id: &call_b.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result_b.success);
+    assert_eq!(tokio::fs::read_to_string(file_b).await.unwrap(), "state-b");
+
+    let events_a = recorder_a.try_snapshot().unwrap();
+    let events_b = recorder_b.try_snapshot().unwrap();
+    assert_eq!(events_a.len(), 1, "state B must not publish into state A");
+    assert_eq!(
+        events_b.len(),
+        1,
+        "state B must publish into its own recorder"
+    );
+    assert_eq!(events_a[0].context.session_id, "state-a-session");
+    assert_eq!(events_a[0].context.root_session_id, "state-a-root-session");
+    assert_eq!(events_b[0].context.session_id, "state-b-session");
+    assert_eq!(events_b[0].context.root_session_id, "state-b-root-session");
 }
 
 #[tokio::test]
@@ -283,6 +378,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
             &write_target,
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-target",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -316,6 +412,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
             &write_source,
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-source",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -348,6 +445,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
             &merge_call,
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -401,6 +499,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-original",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -434,6 +533,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -463,6 +563,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-heuristic-merge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-inspect-heuristic-merge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -509,6 +610,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-target",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -540,6 +642,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-source",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -572,6 +675,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-contradict"),
+                root_session_id: None,
                 tool_call_id: "tool-call-contradict",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -625,6 +729,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-stale",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -655,6 +760,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-mark-stale",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -684,6 +790,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-active",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -716,6 +823,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-batch-purge"),
+                root_session_id: None,
                 tool_call_id: "tool-call-batch-purge",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -763,6 +871,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-write-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -789,6 +898,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-inspect",
                 event_tx: None,
                 available_tool_schemas: None,
@@ -822,6 +932,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some("session-inspect"),
+                root_session_id: None,
                 tool_call_id: "tool-call-rebuild",
                 event_tx: None,
                 available_tool_schemas: None,

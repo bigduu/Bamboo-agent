@@ -173,6 +173,13 @@ pub async fn execute_tool(
             &call,
             ToolExecutionContext {
                 session_id,
+                root_session_id: persisted_session.as_ref().map(|session| {
+                    if session.root_session_id.trim().is_empty() {
+                        session.id.as_str()
+                    } else {
+                        session.root_session_id.as_str()
+                    }
+                }),
                 tool_call_id: &call.id,
                 event_tx: None,
                 available_tool_schemas: Some(available_tool_schemas.as_slice()),

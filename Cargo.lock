@@ -1293,6 +1293,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-plugin-protocol"
+version = "0.0.0"
+dependencies = [
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "bamboo-projects"
 version = "0.0.0"
 dependencies = [
@@ -1328,6 +1338,7 @@ dependencies = [
  "bamboo-mcp",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-plugin-protocol",
  "bamboo-projects",
  "bamboo-server-tools",
  "bamboo-skills",
@@ -1371,6 +1382,7 @@ dependencies = [
  "bamboo-metrics",
  "bamboo-notification",
  "bamboo-plugin",
+ "bamboo-plugin-protocol",
  "bamboo-projects",
  "bamboo-server-tools",
  "bamboo-skills",
@@ -1550,6 +1562,7 @@ dependencies = [
  "bamboo-llm",
  "bamboo-memory",
  "bamboo-permission",
+ "bamboo-plugin-protocol",
  "bamboo-storage",
  "base64 0.23.1",
  "chrono",

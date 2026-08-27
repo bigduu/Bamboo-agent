@@ -160,6 +160,10 @@ pub struct AppState {
     /// Application data directory (configured via `BAMBOO_DATA_DIR`; default `${HOME}/.bamboo`)
     pub app_data_dir: PathBuf,
 
+    /// Instance-local, best-effort tool-event boundary. Never process-global;
+    /// every tool executor assembled for this state receives this exact Arc.
+    pub tool_event_publisher: Arc<dyn bamboo_plugin_protocol::ToolEventPublisher>,
+
     /// Hot-reloadable application configuration
     ///
     /// Can be reloaded from disk at runtime using `reload_config()`.

@@ -19,6 +19,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
     let tool = AskAgentTool::new(endpoint, "tok");
     let ctx = ToolExecutionContext {
         session_id: Some("root-session"),
+        root_session_id: None,
         tool_call_id: "tc1",
         event_tx: None,
         available_tool_schemas: None,
@@ -54,6 +55,7 @@ async fn ask_agent_tool_rejects_unknown_mode() {
     let tool = AskAgentTool::new("ws://127.0.0.1:1", "tok");
     let ctx = ToolExecutionContext {
         session_id: Some("root-session"),
+        root_session_id: None,
         tool_call_id: "tc2",
         event_tx: None,
         available_tool_schemas: None,
@@ -124,6 +126,7 @@ async fn concurrent_asks_to_one_worker_are_each_answered_correctly() {
             let tc = format!("tc-{i}");
             let ctx = ToolExecutionContext {
                 session_id: Some(&sid),
+                root_session_id: None,
                 tool_call_id: &tc,
                 event_tx: None,
                 available_tool_schemas: None,

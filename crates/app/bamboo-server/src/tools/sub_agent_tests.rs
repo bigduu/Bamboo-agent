@@ -48,6 +48,7 @@ async fn invoke_completed(
 fn subagent_test_ctx(session_id: &str, tool_call_id: &str) -> ToolCtx {
     ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id,
         event_tx: None,
         available_tool_schemas: None,
@@ -742,6 +743,7 @@ async fn parent_wait_slots_drain_after_concurrent_registrations() {
 fn ctx_for<'a>(session_id: &'a str, tool_call_id: &'static str) -> ToolExecutionContext<'a> {
     ToolExecutionContext {
         session_id: Some(session_id),
+        root_session_id: None,
         tool_call_id,
         event_tx: None,
         available_tool_schemas: None,
@@ -1010,6 +1012,7 @@ async fn create_publishes_started_before_fast_completion_and_caches_latest() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_1",
             event_tx: None,
             available_tool_schemas: None,
@@ -1120,6 +1123,7 @@ async fn create_uses_async_subagent_model_resolver() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_async_resolver",
             event_tx: None,
             available_tool_schemas: None,
@@ -1168,6 +1172,7 @@ async fn resident_create_reuses_same_child_session() {
     let workspace = tempfile::tempdir().expect("workspace");
     let ctx = |tcid: &'static str| ToolExecutionContext {
         session_id: Some(harness.parent_session_id.as_str()),
+        root_session_id: None,
         tool_call_id: tcid,
         event_tx: None,
         available_tool_schemas: None,
@@ -1617,6 +1622,7 @@ async fn resident_reuse_rejects_cross_project_workspace_before_mutating_resident
     let ctx = |tool_call_id: &'static str| {
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1756,6 +1762,7 @@ async fn resident_reuse_rejects_stale_project_after_root_reassignment_without_mu
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1872,6 +1879,7 @@ async fn same_project_resident_reuse_persists_and_publishes_changed_workspace() 
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -1978,6 +1986,7 @@ async fn resident_reuse_publication_uses_the_validating_instance_workspace_root(
     let context = |tool_call_id: &'static str| {
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id,
             event_tx: None,
             available_tool_schemas: None,
@@ -2076,6 +2085,7 @@ async fn backward_compat_legacy_subagent_call_without_action_defaults_to_create(
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_legacy",
             event_tx: None,
             available_tool_schemas: None,
@@ -2180,6 +2190,7 @@ async fn send_message_appends_follow_up_without_replacing_history() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_send_message",
             event_tx: None,
             available_tool_schemas: None,
@@ -2329,6 +2340,7 @@ async fn send_message_queues_on_running_child_without_interrupt() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_running",
             event_tx: None,
             available_tool_schemas: None,
@@ -2428,6 +2440,7 @@ async fn send_message_can_interrupt_running_child() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_interrupt_running",
             event_tx: None,
             available_tool_schemas: None,
@@ -2494,6 +2507,7 @@ async fn send_message_can_queue_child_immediately() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_queue",
             event_tx: None,
             available_tool_schemas: None,
@@ -2558,6 +2572,7 @@ async fn send_message_same_tool_call_retries_activation_without_duplicate_delive
     let context = || {
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_activation_retry",
             event_tx: None,
             available_tool_schemas: None,
@@ -2687,6 +2702,7 @@ async fn enqueue_child_run_starts_the_notification_relay_for_the_child() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_relay",
             event_tx: None,
             available_tool_schemas: None,
@@ -2766,6 +2782,7 @@ async fn cancel_stops_running_child() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_cancel",
             event_tx: None,
             available_tool_schemas: None,
@@ -2798,6 +2815,7 @@ async fn list_returns_children() {
         json!({"action": "list"}),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_list",
             event_tx: None,
             available_tool_schemas: None,
@@ -2846,6 +2864,7 @@ async fn get_returns_runner_diagnostics() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_get_diagnostics",
             event_tx: None,
             available_tool_schemas: None,
@@ -2888,6 +2907,7 @@ async fn create_returns_duration_hint() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_hint",
             event_tx: None,
             available_tool_schemas: None,
@@ -2942,6 +2962,7 @@ async fn create_persists_explicit_reasoning_effort_to_child_session() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_with_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -2999,6 +3020,7 @@ async fn create_without_reasoning_effort_leaves_child_at_provider_default() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_create_default_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -3061,6 +3083,7 @@ async fn update_can_change_reasoning_effort_on_existing_child() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_update_effort",
             event_tx: None,
             available_tool_schemas: None,
@@ -3101,6 +3124,7 @@ async fn delete_removes_child() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_delete",
             event_tx: None,
             available_tool_schemas: None,
@@ -3143,6 +3167,7 @@ async fn create_requires_workspace() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_no_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -3207,6 +3232,7 @@ async fn assigned_child_without_parent_workspace_uses_project_path() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_project_default_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -3281,6 +3307,7 @@ async fn assigned_child_without_parent_workspace_uses_project_path() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_moved_project_default_workspace",
             event_tx: None,
             available_tool_schemas: None,
@@ -3325,6 +3352,7 @@ async fn create_sets_child_workspace() {
         }),
         ToolExecutionContext {
             session_id: Some(harness.parent_session_id.as_str()),
+            root_session_id: None,
             tool_call_id: "tool_call_workspace",
             event_tx: None,
             available_tool_schemas: None,

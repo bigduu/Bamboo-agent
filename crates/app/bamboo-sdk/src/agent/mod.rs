@@ -518,6 +518,11 @@ impl Agent {
         let exec_result = {
             let ctx = bamboo_agent_core::tools::ToolExecutionContext {
                 session_id: Some(session.id.as_str()),
+                root_session_id: Some(if session.root_session_id.trim().is_empty() {
+                    session.id.as_str()
+                } else {
+                    session.root_session_id.as_str()
+                }),
                 tool_call_id: tool_call_id.as_str(),
                 event_tx: Some(event_tx),
                 available_tool_schemas: None,
