@@ -6,6 +6,8 @@ use thiserror::Error;
 
 /// Wire schema carried by every [`ToolEventV1`].
 pub const TOOL_EVENT_V1_SCHEMA_VERSION: u16 = 1;
+/// Stable protocol-family name used by plugin event-sink manifests.
+pub const TOOL_EVENT_PROTOCOL_NAME: &str = "tool_event";
 /// Stable event-type identifier for a successful supported file mutation.
 pub const FILE_CHANGED_EVENT_TYPE_V1: &str = "file_changed";
 /// Stable manifest subscription identifier for [`FILE_CHANGED_EVENT_TYPE_V1`].

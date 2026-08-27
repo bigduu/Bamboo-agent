@@ -2,9 +2,8 @@
 //! (Wave 2 § HTTP agent, `PLUGIN_PLAN.md`).
 //!
 //! Thin: each handler constructs `ServerPluginInstaller::new(state.clone())`
-//! per request and either calls it directly or drives it through
-//! `crate::plugin_source::install_plugin_from_source` — the exact seam
-//! `crates/app/bamboo-server/examples/install_plugin.rs` already exercises.
+//! per request and either calls it directly or drives a two-phase prepared
+//! source through one serialized ownership/swap/install transaction.
 //! All real install/uninstall/list logic (ownership pre-checks, upgrade
 //! drop-diff, rollback, source staging) lives in `crate::plugin_installer` /
 //! `crate::plugin_source`; this module is wiring + wire-format + HTTP status

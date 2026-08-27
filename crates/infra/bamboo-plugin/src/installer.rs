@@ -290,7 +290,7 @@ pub async fn load_previous_for_disposition(
     use crate::registry::PluginInstallStatus;
 
     let existing = InstalledPlugins::load(installed_json_path).await?;
-    let previous = existing.get(plugin_id).cloned();
+    let previous = existing.get_unique(plugin_id)?.cloned();
     let is_completed = previous
         .as_ref()
         .is_some_and(|plugin| plugin.status == PluginInstallStatus::Installed);
@@ -404,7 +404,7 @@ impl PluginInstaller for LocalPluginInstaller {
 
     async fn uninstall(&self, id: &str) -> PluginResult<()> {
         let installed = InstalledPlugins::load(&self.installed_json_path()).await?;
-        if installed.get(id).is_none() {
+        if installed.get_unique(id)?.is_none() {
             return Err(PluginError::NotFound(id.to_string()));
         }
 
@@ -650,5 +650,54 @@ mod tests {
             .await
             .expect_err("registration wiring is a later-agent TODO");
         assert!(matches!(error, PluginError::NotImplemented(_)));
+    }
+
+    #[tokio::test]
+    async fn disposition_preflight_rejects_duplicate_plugin_rows_for_every_status_mix() {
+        use crate::registry::PluginInstallStatus;
+
+        for statuses in [
+            [
+                PluginInstallStatus::Installed,
+                PluginInstallStatus::Installed,
+            ],
+            [
+                PluginInstallStatus::Installed,
+                PluginInstallStatus::Installing,
+            ],
+            [
+                PluginInstallStatus::Installing,
+                PluginInstallStatus::Installing,
+            ],
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("plugins").join("installed.json");
+            let mut store = InstalledPlugins::default();
+            for (index, status) in statuses.into_iter().enumerate() {
+                store.plugins.push(InstalledPlugin {
+                    id: "hello-plugin".to_string(),
+                    version: format!("0.0.{index}"),
+                    source: PluginSource::LocalDir {
+                        path: dir.path().join(format!("source-{index}")),
+                    },
+                    plugin_dir: dir.path().join(format!("plugin-{index}")),
+                    installed_at: Utc::now(),
+                    status,
+                    registered: RegisteredCapabilities::default(),
+                });
+            }
+            store.save(&path).await.expect("save corrupt registry");
+
+            for disposition in [
+                InstallDisposition::FailIfInstalled,
+                InstallDisposition::Upgrade,
+            ] {
+                let error = load_previous_for_disposition(&path, "hello-plugin", disposition)
+                    .await
+                    .expect_err("duplicate plugin rows must fail before mutation");
+                assert!(matches!(error, PluginError::Registration(_)));
+                assert!(error.to_string().contains("duplicate rows"));
+            }
+        }
     }
 }

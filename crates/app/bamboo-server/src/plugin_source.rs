@@ -108,17 +108,23 @@
 //! # Swap safety (why an upgrade doesn't lose the old bundle on failure)
 //!
 //! `plugin_dir` is a fixed path per id (`plugins_dir()/<id>/`), so an upgrade
-//! necessarily replaces whatever is already there. [`stage_plugin_source`]
+//! necessarily replaces whatever is already there. [`prepare_plugin_source`]
 //! builds the new bundle in a scratch `.staging-*` directory first (so a bad
 //! source — invalid manifest, failed download, sha256 mismatch — never
-//! touches the existing install), then — only once the new bundle validates
-//! — moves the OLD `plugin_dir` aside to a `.backup-*` directory (not
-//! deleted) before renaming the staging directory into place. The returned
-//! [`StagedPlugin`] carries that backup path privately: [`StagedPlugin::commit`]
-//! deletes it (call after a successful `install()`), [`StagedPlugin::rollback`]
-//! removes the half-installed new bundle and restores the backup (call after
-//! a failed `install()`). [`install_plugin_from_source`] wires this up
-//! automatically and is the seam CLI/HTTP callers should use end to end.
+//! touches the existing install). The server-owned transaction seam then holds
+//! the plugin-operation lock while auditing global ownership; only an accepted
+//! [`PreparedPlugin`] is activated, after which the OLD `plugin_dir` is moved
+//! aside to a `.backup-*` directory (not deleted) and the candidate is renamed
+//! into place. The private staged transaction carries exact directory
+//! identities for the candidate and backup. On install failure it quarantines
+//! the live entry, and restores only an identity-verified backup with
+//! NOREPLACE. An ambiguous destination, candidate, or backup is preserved and
+//! requires manual recovery. Once an upgrade has stopped an old service, any
+//! later failure deliberately leaves it stopped for an operator to reconcile;
+//! source recovery never starts executable code automatically. Production
+//! exposes only [`install_server_plugin_from_source`];
+//! low-level staging helpers exist under `cfg(test)` and cannot bypass the
+//! server's ownership preflight or operation lock.
 //!
 //! Residual gap (documented, not solved here): the plugin_dir swap itself and
 //! `install()`'s own capability-registration rollback (see
@@ -173,28 +179,24 @@
 //!   `bamboo_plugin::registry::InstalledPlugins::save` (`installed.json`) now
 //!   does; deferred here as a change to a shared, pre-existing storage
 //!   helper rather than this branch's new code.
-//! - **The `plugin_dir` swap in [`stage_plugin_source`] runs BEFORE
-//!   `PLUGIN_OP_LOCK` is acquired** (that lock is taken inside
-//!   `ServerPluginInstaller::install`/`uninstall`, in `crate::plugin_installer`,
-//!   which only runs after staging returns). Two concurrent installs/updates
-//!   of the SAME plugin id could therefore race the backup-rename +
-//!   staging-rename swap itself (not just the capability-registration steps
-//!   the lock does protect). Plugin ops are rare/operator-driven, not
-//!   concurrent by design, so this is accepted as a documented gap rather
-//!   than moving the lock acquisition into this module; a real fix would
-//!   need `stage_plugin_source` and `PluginInstaller::install` to share one
-//!   lock scope (a bigger seam change than this branch's fixes).
+//!
+//! Production install/update handlers retain one `PLUGIN_OP_LOCK` guard across
+//! ownership preflight, service shutdown, activation, install, and rollback,
+//! so shared server state has no preflight-to-swap race.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use bamboo_config::PluginTrustConfig;
 use bamboo_plugin::manifest::Platform;
+#[cfg(test)]
+use bamboo_plugin::PluginInstaller;
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, PluginError, PluginInstaller, PluginManifest,
-    PluginResult, PluginSource,
+    InstallDisposition, InstalledPlugin, PluginError, PluginManifest, PluginResult, PluginSource,
 };
 use ed25519_dalek::Verifier;
+
+use crate::plugin_installer::ServerPluginInstaller;
 
 /// What the caller pointed the installer at.
 #[derive(Debug, Clone)]
@@ -235,49 +237,904 @@ pub enum PluginSourceInput {
     },
 }
 
-/// The result of staging a [`PluginSourceInput`] into `plugins_dir()/<id>/`:
-/// the validated manifest (so a caller can preview `manifest.provides` —
-/// what the install WILL register — before committing to `install()`), the
-/// final on-disk `plugin_dir`, and the [`PluginSource`] provenance record
-/// `install()` expects. See the module docs for the backup/swap contract.
+/// A fully downloaded/copied, extracted, and validated plugin bundle that is
+/// still isolated under a UUID staging directory. The private server
+/// transaction inspects its manifest and runs shared ownership preflight
+/// before activation swaps any existing `plugins/<id>` directory.
 #[derive(Debug)]
-pub struct StagedPlugin {
-    pub manifest: PluginManifest,
-    pub plugin_dir: PathBuf,
-    pub source: PluginSource,
-    /// The previous `plugin_dir` contents, moved aside rather than deleted
-    /// when staging replaced an existing install (`None` on a fresh
-    /// install). Private: only [`StagedPlugin::commit`] /
-    /// [`StagedPlugin::rollback`] act on it.
-    backup_dir: Option<PathBuf>,
+struct PreparedPlugin {
+    manifest: PluginManifest,
+    prepared_dir: PathBuf,
+    plugin_dir: PathBuf,
+    source: PluginSource,
+    candidate_identity: BundleIdentity,
+    // Keep the directory open for the whole transaction so an unlinked
+    // candidate's device/inode pair cannot be recycled and mistaken for a
+    // replacement directory before activation or rollback finishes.
+    _candidate_handle: std::fs::File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BundleIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
+
+#[derive(Debug)]
+struct BundleSnapshot {
+    path: PathBuf,
+    identity: BundleIdentity,
+    // The open handle pins the directory identity across sibling renames.
+    // Numeric identity alone is insufficient because filesystems may reuse
+    // an inode/file index after deletion.
+    _handle: std::fs::File,
+}
+
+#[derive(Debug)]
+enum BundleRecovery {
+    /// The on-disk transaction has been reconciled to a known state. This is
+    /// only a filesystem statement; it never authorizes starting code.
+    Reconciled,
+    /// At least one path is ambiguous. Every object is preserved until an
+    /// operator reconciles the paths.
+    ManualRecoveryRequired(String),
+}
+
+impl BundleRecovery {
+    fn is_reconciled(&self) -> bool {
+        matches!(self, Self::Reconciled)
+    }
+
+    fn wrap_error(self, error: PluginError) -> PluginError {
+        match self {
+            Self::Reconciled => error,
+            Self::ManualRecoveryRequired(detail) => PluginError::Registration(format!(
+                "{error}; manual bundle recovery is required: {detail}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BundleTransactionFailure {
+    error: PluginError,
+    recovery: BundleRecovery,
+}
+
+impl BundleTransactionFailure {
+    fn into_plugin_error(self) -> PluginError {
+        self.recovery.wrap_error(self.error)
+    }
+}
+
+#[cfg(unix)]
+fn capture_bundle_directory(path: &Path) -> std::io::Result<(std::fs::File, BundleIdentity)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle: std::fs::File = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin bundle path must name a real directory",
+        ));
+    }
+    let mut file_id = [0; 16];
+    file_id[..8].copy_from_slice(&metadata.ino().to_ne_bytes());
+    let identity = BundleIdentity {
+        volume: metadata.dev(),
+        file_id,
+    };
+    Ok((handle, identity))
+}
+
+#[cfg(windows)]
+fn capture_bundle_directory(path: &Path) -> std::io::Result<(std::fs::File, BundleIdentity)> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "plugin bundle path must name a real directory, not a reparse point",
+        ));
+    }
+    let mut identity = MaybeUninit::<FILE_ID_INFO>::zeroed();
+    // SAFETY: `file` remains open for the call, `identity` points to writable
+    // storage of exactly the advertised size, and FileIdInfo initializes a
+    // FILE_ID_INFO on success.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            identity.as_mut_ptr().cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a nonzero return from GetFileInformationByHandleEx means the
+    // FILE_ID_INFO output buffer was initialized.
+    let identity = unsafe { identity.assume_init() };
+    let identity = BundleIdentity {
+        volume: identity.VolumeSerialNumber,
+        file_id: identity.FileId.Identifier,
+    };
+    Ok((file, identity))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn capture_bundle_directory(_path: &Path) -> std::io::Result<(std::fs::File, BundleIdentity)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "identity-bound plugin activation is unavailable on this platform",
+    ))
+}
+
+fn bundle_directory_identity(path: &Path) -> std::io::Result<BundleIdentity> {
+    capture_bundle_directory(path).map(|(_handle, identity)| identity)
+}
+
+fn capture_optional_bundle_snapshot(path: &Path) -> std::io::Result<Option<BundleSnapshot>> {
+    match capture_bundle_directory(path) {
+        Ok((handle, identity)) => Ok(Some(BundleSnapshot {
+            path: path.to_path_buf(),
+            identity,
+            _handle: handle,
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Move an identity-bound transaction entry to a fresh sibling name and
+/// retain it. If the source was replaced before the rename, put the unknown
+/// entry back with NOREPLACE when possible. No recursive deletion occurs.
+fn retain_identity_bound_directory(
+    path: &Path,
+    expected: BundleIdentity,
+    prefix: &str,
+    context: &str,
+) {
+    let Some(parent) = path.parent() else {
+        tracing::warn!(path = %path.display(), %context, "transaction entry has no parent; retaining it in place");
+        return;
+    };
+    let retained = parent.join(format!(".{prefix}-{}", uuid::Uuid::new_v4()));
+    match rename_noreplace(path, &retained) {
+        Ok(()) => match bundle_directory_identity(&retained) {
+            Ok(identity) if identity == expected => tracing::warn!(
+                retained = %retained.display(),
+                %context,
+                "identity-verified transaction entry retained for operator cleanup"
+            ),
+            observed => {
+                let put_back = rename_noreplace(&retained, path);
+                tracing::warn!(
+                    original = %path.display(),
+                    retained = %retained.display(),
+                    ?observed,
+                    ?put_back,
+                    %context,
+                    "transaction entry changed identity; unknown replacement was preserved without deletion"
+                );
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => tracing::warn!(
+            path = %path.display(),
+            %context,
+            "identity-bound transaction entry disappeared before it could be retained"
+        ),
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            %context,
+            "failed to quarantine transaction entry; retaining it in place"
+        ),
+    }
+}
+
+/// Retain a staging directory for which no stable identity was captured.
+/// Renaming an entry is non-recursive and does not follow a symlink/reparse
+/// point; any failure simply leaves the entry at its original private name.
+fn retain_unverified_staging(path: &Path, context: &str) {
+    let Some(parent) = path.parent() else {
+        tracing::warn!(path = %path.display(), %context, "unverified staging entry has no parent; retaining it in place");
+        return;
+    };
+    let retained = parent.join(format!(".rejected-staging-{}", uuid::Uuid::new_v4()));
+    match rename_noreplace(path, &retained) {
+        Ok(()) => tracing::warn!(
+            retained = %retained.display(),
+            %context,
+            "rejected staging directory retained for operator cleanup"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            %context,
+            "failed to quarantine rejected staging directory; retaining it in place"
+        ),
+    }
+}
+
+fn restore_verified_backup(backup: &BundleSnapshot, plugin_dir: &Path) -> BundleRecovery {
+    match bundle_directory_identity(&backup.path) {
+        Ok(identity) if identity == backup.identity => {}
+        Ok(_) => {
+            return BundleRecovery::ManualRecoveryRequired(format!(
+                "the backup at '{}' changed identity and was not moved",
+                backup.path.display()
+            ));
+        }
+        Err(error) => {
+            return BundleRecovery::ManualRecoveryRequired(format!(
+                "the backup at '{}' could not be identity-verified and was not moved: {error}",
+                backup.path.display()
+            ));
+        }
+    }
+    if let Err(error) = rename_noreplace(&backup.path, plugin_dir) {
+        return BundleRecovery::ManualRecoveryRequired(format!(
+            "the previous bundle remains at '{}' because '{}' could not be restored without replacement: {error}",
+            backup.path.display(),
+            plugin_dir.display()
+        ));
+    }
+    match bundle_directory_identity(plugin_dir) {
+        Ok(identity) if identity == backup.identity => BundleRecovery::Reconciled,
+        Ok(_) => BundleRecovery::ManualRecoveryRequired(format!(
+            "the restored destination '{}' does not have the previous bundle identity",
+            plugin_dir.display()
+        )),
+        Err(error) => BundleRecovery::ManualRecoveryRequired(format!(
+            "the restored destination '{}' could not be identity-verified: {error}",
+            plugin_dir.display()
+        )),
+    }
+}
+
+impl PreparedPlugin {
+    fn retain_candidate(&self, context: &str) {
+        retain_identity_bound_directory(
+            &self.prepared_dir,
+            self.candidate_identity,
+            &format!("candidate-{}", self.manifest.id),
+            context,
+        );
+    }
+
+    fn capture_expected_live(&self) -> std::io::Result<Option<BundleSnapshot>> {
+        capture_optional_bundle_snapshot(&self.plugin_dir)
+    }
+
+    /// Atomically make this candidate the plugin's fixed on-disk bundle,
+    /// retaining the previous bundle for commit/rollback. Shared ownership
+    /// preflight must happen before this test-only convenience call. The
+    /// server path captures the expected live snapshot before stopping any
+    /// service and passes it directly to [`Self::activate_inner`].
+    #[cfg(test)]
+    async fn activate(self) -> Result<StagedPlugin, BundleTransactionFailure> {
+        let expected_live = match self.capture_expected_live() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.retain_candidate("live snapshot capture failed before test activation");
+                return Err(BundleTransactionFailure {
+                    error: PluginError::Io(error),
+                    recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                        "the live destination '{}' could not be captured before activation",
+                        self.plugin_dir.display()
+                    )),
+                });
+            }
+        };
+        self.activate_inner(expected_live, ActivationFault::None)
+            .await
+    }
+
+    async fn activate_inner(
+        self,
+        expected_live: Option<BundleSnapshot>,
+        fault: ActivationFault,
+    ) -> Result<StagedPlugin, BundleTransactionFailure> {
+        match bundle_directory_identity(&self.prepared_dir) {
+            Ok(identity) if identity == self.candidate_identity => {}
+            observed => {
+                self.retain_candidate("prepared candidate changed identity before activation");
+                return Err(BundleTransactionFailure {
+                    error: PluginError::Registration(format!(
+                        "prepared plugin '{}' changed identity before activation ({observed:?})",
+                        self.manifest.id
+                    )),
+                    recovery: BundleRecovery::ManualRecoveryRequired(
+                        "the expected candidate and its replacement were preserved".to_string(),
+                    ),
+                });
+            }
+        }
+
+        let backup = match expected_live {
+            Some(mut previous) => {
+                if previous.path != self.plugin_dir {
+                    self.retain_candidate("expected live snapshot path was inconsistent");
+                    return Err(BundleTransactionFailure {
+                        error: PluginError::Registration(
+                            "expected live snapshot did not name this plugin destination"
+                                .to_string(),
+                        ),
+                        recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                            "the candidate at '{}' was retained without touching either live path",
+                            self.prepared_dir.display()
+                        )),
+                    });
+                }
+                match bundle_directory_identity(&self.plugin_dir) {
+                    Ok(identity) if identity == previous.identity => {}
+                    observed => {
+                        self.retain_candidate(
+                            "live bundle changed after its pre-stop snapshot was captured",
+                        );
+                        return Err(BundleTransactionFailure {
+                            error: PluginError::Registration(format!(
+                                "live plugin '{}' no longer matches the exact pre-stop snapshot ({observed:?})",
+                                self.manifest.id
+                            )),
+                            recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                                "the unexpected destination '{}' was left untouched",
+                                self.plugin_dir.display()
+                            )),
+                        });
+                    }
+                }
+                let Some(root) = self.plugin_dir.parent() else {
+                    self.retain_candidate("plugin destination had no parent");
+                    return Err(BundleTransactionFailure {
+                        error: PluginError::InvalidManifest(
+                            "plugin directory has no parent".to_string(),
+                        ),
+                        recovery: BundleRecovery::ManualRecoveryRequired(
+                            "the previous bundle path had no parent".to_string(),
+                        ),
+                    });
+                };
+                let backup = root.join(format!(
+                    ".backup-{}-{}",
+                    self.manifest.id,
+                    uuid::Uuid::new_v4()
+                ));
+                if let Err(error) = rename_noreplace(&self.plugin_dir, &backup) {
+                    self.retain_candidate("previous bundle backup rename failed");
+                    let recovery = match bundle_directory_identity(&self.plugin_dir) {
+                        Ok(identity) if identity == previous.identity => BundleRecovery::Reconciled,
+                        Ok(_) => BundleRecovery::ManualRecoveryRequired(format!(
+                            "the destination '{}' changed identity while the backup rename failed",
+                            self.plugin_dir.display()
+                        )),
+                        Err(verify_error) => BundleRecovery::ManualRecoveryRequired(format!(
+                            "the backup rename failed and the previous bundle at '{}' could not be reverified: {verify_error}",
+                            self.plugin_dir.display()
+                        )),
+                    };
+                    return Err(BundleTransactionFailure {
+                        error: PluginError::Io(error),
+                        recovery,
+                    });
+                }
+                match bundle_directory_identity(&backup) {
+                    Ok(identity) if identity == previous.identity => {}
+                    Ok(_) => {
+                        self.retain_candidate("moved previous bundle changed identity");
+                        return Err(BundleTransactionFailure {
+                            error: PluginError::Registration(format!(
+                                "the previous plugin bundle changed identity while moving to '{}'",
+                                backup.display()
+                            )),
+                            recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                                "the ambiguous backup was preserved at '{}'",
+                                backup.display()
+                            )),
+                        });
+                    }
+                    Err(error) => {
+                        self.retain_candidate("moved previous bundle could not be verified");
+                        return Err(BundleTransactionFailure {
+                            error: PluginError::Io(error),
+                            recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                                "the unverified backup was preserved at '{}'",
+                                backup.display()
+                            )),
+                        });
+                    }
+                }
+                previous.path = backup;
+                Some(previous)
+            }
+            None => match std::fs::symlink_metadata(&self.plugin_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Ok(_) => {
+                    self.retain_candidate("unexpected fresh-install destination appeared");
+                    return Err(BundleTransactionFailure {
+                        error: PluginError::Registration(format!(
+                            "plugin destination '{}' appeared after the no-live snapshot was captured",
+                            self.plugin_dir.display()
+                        )),
+                        recovery: BundleRecovery::ManualRecoveryRequired(
+                            "the unexpected destination was left untouched".to_string(),
+                        ),
+                    });
+                }
+                Err(error) => {
+                    self.retain_candidate("fresh-install destination could not be inspected");
+                    return Err(BundleTransactionFailure {
+                        error: PluginError::Io(error),
+                        recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                            "the destination '{}' could not be inspected",
+                            self.plugin_dir.display()
+                        )),
+                    });
+                }
+            },
+        };
+
+        let rename_result = fault.install_destination(&self.plugin_dir).and_then(|()| {
+            if fault.fail_candidate_rename() {
+                Err(std::io::Error::other(
+                    "injected prepared-plugin activation rename failure",
+                ))
+            } else {
+                rename_noreplace(&self.prepared_dir, &self.plugin_dir)
+            }
+        });
+        if let Err(rename_error) = rename_result {
+            // Both paths are siblings below one plugins root, so EXDEV is an
+            // invariant violation, not a reason to merge-copy into a live
+            // destination. Retain the private UUID candidate without a
+            // path-based recursive delete. If an old bundle was backed up,
+            // restore it with an atomic NOREPLACE rename; a race-created
+            // destination is never overwritten or deleted, and a failed
+            // restore deliberately leaves the backup intact for recovery.
+            self.retain_candidate("candidate publication failed");
+            let recovery = match &backup {
+                Some(backup) => restore_verified_backup(backup, &self.plugin_dir),
+                None => match std::fs::symlink_metadata(&self.plugin_dir) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        BundleRecovery::Reconciled
+                    }
+                    Ok(_) => BundleRecovery::ManualRecoveryRequired(format!(
+                        "an unexpected destination remains at '{}' and there was no previous bundle",
+                        self.plugin_dir.display()
+                    )),
+                    Err(error) => BundleRecovery::ManualRecoveryRequired(format!(
+                        "the destination '{}' could not be inspected after publication failed: {error}",
+                        self.plugin_dir.display()
+                    )),
+                },
+            };
+            return Err(BundleTransactionFailure {
+                error: PluginError::Registration(format!(
+                    "failed to atomically activate prepared plugin '{}' with a no-replace rename: {rename_error}",
+                    self.manifest.id
+                )),
+                recovery,
+            });
+        }
+
+        match bundle_directory_identity(&self.plugin_dir) {
+            Ok(identity) if identity == self.candidate_identity => {}
+            Ok(_) => {
+                return Err(BundleTransactionFailure {
+                    error: PluginError::Registration(format!(
+                        "activated plugin '{}' changed identity during publication",
+                        self.manifest.id
+                    )),
+                    recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                        "the live destination '{}' and backup were preserved",
+                        self.plugin_dir.display()
+                    )),
+                });
+            }
+            Err(error) => {
+                return Err(BundleTransactionFailure {
+                    error: PluginError::Io(error),
+                    recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                        "the activated destination '{}' could not be identity-verified; its backup was preserved",
+                        self.plugin_dir.display()
+                    )),
+                });
+            }
+        }
+
+        Ok(StagedPlugin {
+            manifest: self.manifest,
+            plugin_dir: self.plugin_dir,
+            source: self.source,
+            candidate_identity: self.candidate_identity,
+            _candidate_handle: self._candidate_handle,
+            backup,
+        })
+    }
+
+    /// Quarantine and retain an unactivated candidate after path-id or
+    /// ownership preflight refuses it. The live plugin bundle is untouched;
+    /// path-based recursive deletion is deliberately avoided.
+    async fn discard(self) {
+        self.retain_candidate("prepared plugin candidate was discarded before activation");
+    }
+
+    #[cfg(test)]
+    async fn activate_with_fault(
+        self,
+        fault: ActivationFault,
+    ) -> Result<StagedPlugin, BundleTransactionFailure> {
+        let expected_live = match self.capture_expected_live() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.retain_candidate("live snapshot capture failed before faulted activation");
+                return Err(BundleTransactionFailure {
+                    error: PluginError::Io(error),
+                    recovery: BundleRecovery::ManualRecoveryRequired(format!(
+                        "the live destination '{}' could not be captured before activation",
+                        self.plugin_dir.display()
+                    )),
+                });
+            }
+        };
+        self.activate_inner(expected_live, fault).await
+    }
+}
+
+#[derive(Debug)]
+enum ActivationFault {
+    None,
+    #[cfg(test)]
+    FailCandidateRename,
+    #[cfg(test)]
+    CreateDestinationDirectory,
+    #[cfg(all(test, unix))]
+    CreateDestinationSymlink(PathBuf),
+}
+
+impl ActivationFault {
+    fn fail_candidate_rename(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::FailCandidateRename)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn install_destination(&self, _destination: &Path) -> std::io::Result<()> {
+        match self {
+            Self::None => Ok(()),
+            #[cfg(test)]
+            Self::FailCandidateRename => Ok(()),
+            #[cfg(test)]
+            Self::CreateDestinationDirectory => {
+                std::fs::create_dir(_destination)?;
+                std::fs::write(_destination.join("RACE_MARKER"), b"race-owned")?;
+                Ok(())
+            }
+            #[cfg(all(test, unix))]
+            Self::CreateDestinationSymlink(target) => {
+                std::os::unix::fs::symlink(target, _destination)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Atomically rename one sibling entry without replacing any destination that
+/// appeared after preflight. Prepared-bundle publication and its immediate
+/// backup restoration both use this primitive, so neither can overwrite a
+/// race-created directory, file, symlink, or Windows reparse point.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsFd;
+
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if source_parent != destination_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prepared plugin activation paths must be siblings",
+        ));
+    }
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let parent = std::fs::File::open(source_parent)?;
+    rustix::fs::renameat_with(
+        parent.as_fd(),
+        source_name,
+        parent.as_fd(),
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if source_parent != destination_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "prepared plugin activation paths must be siblings",
+        ));
+    }
+
+    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "plugin activation path contains an interior NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = nul_terminated(source)?;
+    let destination = nul_terminated(destination)?;
+    // No MOVEFILE_REPLACE_EXISTING flag: a destination that appeared after
+    // preflight, including a reparse point, makes this atomic rename fail.
+    let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
+fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace plugin activation is unavailable on this platform",
+    ))
+}
+
+/// Private staged source transaction. Keeping both the type and every field
+/// private prevents callers from swapping a bundle without server ownership
+/// preflight or replacing its identity-bound paths after validation.
+#[derive(Debug)]
+struct StagedPlugin {
+    manifest: PluginManifest,
+    plugin_dir: PathBuf,
+    source: PluginSource,
+    candidate_identity: BundleIdentity,
+    _candidate_handle: std::fs::File,
+    backup: Option<BundleSnapshot>,
+}
+
+#[derive(Debug)]
+enum RollbackFault {
+    None,
+    #[cfg(test)]
+    ReplaceDestinationDirectory,
+}
+
+impl RollbackFault {
+    fn install_destination(&self, _plugin_dir: &Path) -> std::io::Result<()> {
+        match self {
+            Self::None => Ok(()),
+            #[cfg(test)]
+            Self::ReplaceDestinationDirectory => {
+                let parent = _plugin_dir.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "plugin directory has no parent",
+                    )
+                })?;
+                let displaced = parent.join(format!(
+                    ".fault-displaced-candidate-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                rename_noreplace(_plugin_dir, &displaced)?;
+                std::fs::create_dir(_plugin_dir)?;
+                std::fs::write(_plugin_dir.join("RACE_MARKER"), b"race-owned")
+            }
+        }
+    }
 }
 
 impl StagedPlugin {
-    /// Call after a successful `install()`: the swap is final, drop the
-    /// pre-upgrade backup for good. A no-op on a fresh install.
-    pub async fn commit(self) {
-        if let Some(backup) = self.backup_dir {
-            let _ = tokio::fs::remove_dir_all(&backup).await;
+    /// Finalize a successful install. Post-commit backup cleanup is
+    /// best-effort housekeeping, not part of live-bundle selection: a backup
+    /// is moved to a private retirement path and retained. Recursive deletion
+    /// is deliberately excluded from the identity-sensitive transaction.
+    async fn commit(self) {
+        let Some(backup) = self.backup else {
+            return;
+        };
+        let Some(parent) = backup.path.parent() else {
+            tracing::warn!(
+                backup = %backup.path.display(),
+                "committed plugin backup has no parent; leaving it for operator cleanup"
+            );
+            return;
+        };
+        let retired = parent.join(format!(
+            ".retired-{}-{}",
+            self.manifest.id,
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = rename_noreplace(&backup.path, &retired) {
+            tracing::warn!(
+                %error,
+                backup = %backup.path.display(),
+                "failed to retire committed plugin backup; leaving it in place"
+            );
+            return;
+        }
+        match bundle_directory_identity(&retired) {
+            Ok(identity) if identity == backup.identity => tracing::warn!(
+                retired = %retired.display(),
+                "committed plugin backup was retired and retained for operator cleanup"
+            ),
+            identity => {
+                let restored = rename_noreplace(&retired, &backup.path);
+                tracing::warn!(
+                    retired = %retired.display(),
+                    backup = %backup.path.display(),
+                    observed = ?identity,
+                    restore = ?restored,
+                    "retired plugin backup identity was ambiguous; preserved without deletion"
+                );
+            }
         }
     }
 
-    /// Call after a failed `install()`: undo the swap. Removes the
-    /// half-installed new bundle and, on an upgrade, restores the pre-upgrade
-    /// files so the plugin is left exactly as it was.
-    pub async fn rollback(self) {
-        let _ = tokio::fs::remove_dir_all(&self.plugin_dir).await;
-        if let Some(backup) = self.backup_dir {
-            let _ = tokio::fs::rename(&backup, &self.plugin_dir).await;
+    /// Undo a failed install without deleting a path merely because it has
+    /// the expected name. The live entry is atomically quarantined first. A
+    /// verified candidate remains inert in quarantine after recovery; an
+    /// unexpected entry is put back with NOREPLACE and the old backup remains
+    /// preserved for manual recovery.
+    #[cfg(test)]
+    async fn rollback(self) -> BundleRecovery {
+        self.rollback_inner(RollbackFault::None).await
+    }
+
+    async fn rollback_inner(self, fault: RollbackFault) -> BundleRecovery {
+        if let Err(error) = fault.install_destination(&self.plugin_dir) {
+            return BundleRecovery::ManualRecoveryRequired(format!(
+                "rollback fault setup failed without deleting any bundle path: {error}"
+            ));
         }
+
+        let Some(parent) = self.plugin_dir.parent() else {
+            return BundleRecovery::ManualRecoveryRequired(
+                "the live plugin path has no parent".to_string(),
+            );
+        };
+        let quarantine = parent.join(format!(
+            ".rollback-{}-{}",
+            self.manifest.id,
+            uuid::Uuid::new_v4()
+        ));
+        match rename_noreplace(&self.plugin_dir, &quarantine) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return match &self.backup {
+                    Some(backup) => restore_verified_backup(backup, &self.plugin_dir),
+                    None => BundleRecovery::Reconciled,
+                };
+            }
+            Err(error) => {
+                return BundleRecovery::ManualRecoveryRequired(format!(
+                    "the live destination '{}' could not be quarantined without replacement and was left untouched: {error}",
+                    self.plugin_dir.display()
+                ));
+            }
+        }
+
+        match bundle_directory_identity(&quarantine) {
+            Ok(identity) if identity == self.candidate_identity => {}
+            observed => {
+                let put_back = rename_noreplace(&quarantine, &self.plugin_dir);
+                return BundleRecovery::ManualRecoveryRequired(format!(
+                    "the live destination was not this transaction's candidate ({observed:?}); the unexpected object was preserved at '{}' (put-back result: {put_back:?}) and the previous backup was not moved",
+                    if put_back.is_ok() {
+                        self.plugin_dir.display()
+                    } else {
+                        quarantine.display()
+                    }
+                ));
+            }
+        }
+
+        let recovery = match &self.backup {
+            Some(backup) => restore_verified_backup(backup, &self.plugin_dir),
+            None => BundleRecovery::Reconciled,
+        };
+        if !recovery.is_reconciled() {
+            // The known candidate and old backup are both retained. Deleting
+            // either would make an already-ambiguous recovery irreversible.
+            return recovery;
+        }
+
+        // Keep the failed candidate quarantined. Even a second identity check
+        // followed by path-based recursive deletion would leave a
+        // check-to-delete race in which a watcher could replace this UUID
+        // path. The old live bundle is already restored, but executable code
+        // still remains stopped after a failed server-owned upgrade.
+        tracing::warn!(
+            quarantine = %quarantine.display(),
+            "failed plugin candidate was quarantined after rollback and retained for operator cleanup"
+        );
+        recovery
     }
 }
 
-/// Stage `input` into `plugins_root/<id>/`, validating the manifest before
-/// anything is committed. Returns a [`StagedPlugin`] ready to hand to
-/// [`bamboo_plugin::PluginInstaller::install`] — call [`StagedPlugin::commit`]
-/// or [`StagedPlugin::rollback`] once you know whether `install()` succeeded
-/// (or just use [`install_plugin_from_source`], which does both for you).
-pub async fn stage_plugin_source(
+/// Prepare a source completely in an isolated scratch directory without
+/// swapping `plugins/<id>`. This is the production seam for callers that must
+/// perform global provenance/ownership checks before any shared mutation.
+async fn prepare_plugin_source(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+) -> PluginResult<PreparedPlugin> {
+    prepare_plugin_source_inner(input, plugins_root, trust, MAX_DECOMPRESSED_BYTES).await
+}
+
+/// Test-only low-level staging seam. Production callers cannot activate a
+/// bundle outside [`install_server_plugin_from_source`]'s ownership preflight
+/// and operation lock.
+#[cfg(test)]
+async fn stage_plugin_source(
     input: PluginSourceInput,
     plugins_root: &Path,
     trust: &PluginTrustConfig,
@@ -291,7 +1148,7 @@ pub async fn stage_plugin_source(
 /// Exercises the exact same staging/swap machinery as the production path,
 /// just with the archive-extraction ceiling parameterized.
 #[cfg(test)]
-pub(crate) async fn stage_plugin_source_with_decompressed_cap(
+async fn stage_plugin_source_with_decompressed_cap(
     input: PluginSourceInput,
     plugins_root: &Path,
     trust: &PluginTrustConfig,
@@ -300,12 +1157,26 @@ pub(crate) async fn stage_plugin_source_with_decompressed_cap(
     stage_plugin_source_inner(input, plugins_root, trust, max_decompressed_bytes).await
 }
 
+#[cfg(test)]
 async fn stage_plugin_source_inner(
     input: PluginSourceInput,
     plugins_root: &Path,
     trust: &PluginTrustConfig,
     max_decompressed_bytes: u64,
 ) -> PluginResult<StagedPlugin> {
+    prepare_plugin_source_inner(input, plugins_root, trust, max_decompressed_bytes)
+        .await?
+        .activate()
+        .await
+        .map_err(BundleTransactionFailure::into_plugin_error)
+}
+
+async fn prepare_plugin_source_inner(
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    max_decompressed_bytes: u64,
+) -> PluginResult<PreparedPlugin> {
     tokio::fs::create_dir_all(plugins_root).await?;
     let staging_dir = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
     tokio::fs::create_dir_all(&staging_dir).await?;
@@ -314,55 +1185,347 @@ async fn stage_plugin_source_inner(
     let (manifest, source) = match staged {
         Ok(pair) => pair,
         Err(error) => {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            retain_unverified_staging(&staging_dir, "plugin source preparation failed");
             return Err(error);
         }
     };
 
     if let Err(error) = manifest.validate() {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        retain_unverified_staging(&staging_dir, "prepared plugin manifest validation failed");
         return Err(error);
     }
 
-    let plugin_dir = plugins_root.join(&manifest.id);
-    let backup_dir = if tokio::fs::try_exists(&plugin_dir).await.unwrap_or(false) {
-        let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
-        if let Err(error) = tokio::fs::rename(&plugin_dir, &backup).await {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+    let (candidate_handle, candidate_identity) = match capture_bundle_directory(&staging_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            retain_unverified_staging(&staging_dir, "prepared candidate identity capture failed");
             return Err(PluginError::Io(error));
         }
-        Some(backup)
-    } else {
-        None
     };
-
-    if let Err(rename_error) = tokio::fs::rename(&staging_dir, &plugin_dir).await {
-        // Cross-device (e.g. staging on a different mount) — fall back to a
-        // recursive copy, then remove the staging dir.
-        if let Err(copy_error) = copy_dir_recursive(&staging_dir, &plugin_dir).await {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            // Restore the backup we just moved aside, if any, since the swap
-            // never actually happened.
-            if let Some(backup) = &backup_dir {
-                let _ = tokio::fs::rename(backup, &plugin_dir).await;
-            }
-            tracing::warn!(%rename_error, %copy_error, "failed to stage plugin bundle into place");
-            return Err(copy_error);
-        }
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-    }
-
-    Ok(StagedPlugin {
+    let plugin_dir = plugins_root.join(&manifest.id);
+    Ok(PreparedPlugin {
         manifest,
         plugin_dir,
+        prepared_dir: staging_dir,
         source,
-        backup_dir,
+        candidate_identity,
+        _candidate_handle: candidate_handle,
     })
 }
 
-/// Stage + `install()` + commit/rollback, in one call — the seam CLI/HTTP
-/// callers should use. See the module docs.
-pub async fn install_plugin_from_source(
+/// Server-owned source transaction. This is the only public source-install
+/// seam for [`ServerPluginInstaller`]: the same process-wide guard spans
+/// provenance preflight, prior-service shutdown, live-bundle activation,
+/// installer mutation, and commit/rollback. Once an upgrade stops services,
+/// a subsequent failure leaves them stopped for explicit operator recovery.
+///
+/// `expected_plugin_id` binds an HTTP path (or another caller-owned identity)
+/// before any shared mutation. Pass `None` when the source manifest owns the
+/// identity, as in the manual server example.
+pub async fn install_server_plugin_from_source(
+    installer: &ServerPluginInstaller,
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    disposition: InstallDisposition,
+    expected_plugin_id: Option<&str>,
+) -> PluginResult<InstalledPlugin> {
+    install_server_plugin_from_source_inner(
+        installer,
+        input,
+        plugins_root,
+        trust,
+        disposition,
+        expected_plugin_id,
+        ServerSourceFault::None,
+    )
+    .await
+}
+
+#[derive(Debug)]
+enum ServerSourceFault {
+    None,
+    #[cfg(test)]
+    ActivationRenameFailure,
+    #[cfg(test)]
+    ActivationDestinationDirectory,
+    #[cfg(test)]
+    ReplaceLiveAfterStop,
+    #[cfg(test)]
+    RollbackDestinationDirectory,
+    #[cfg(test)]
+    FinalProvenanceCommitFailure,
+}
+
+impl ServerSourceFault {
+    fn activation_fault(&self) -> ActivationFault {
+        match self {
+            Self::None => ActivationFault::None,
+            #[cfg(test)]
+            Self::ActivationRenameFailure => ActivationFault::FailCandidateRename,
+            #[cfg(test)]
+            Self::ActivationDestinationDirectory => ActivationFault::CreateDestinationDirectory,
+            #[cfg(test)]
+            Self::ReplaceLiveAfterStop => ActivationFault::None,
+            #[cfg(test)]
+            Self::RollbackDestinationDirectory => ActivationFault::None,
+            #[cfg(test)]
+            Self::FinalProvenanceCommitFailure => ActivationFault::None,
+        }
+    }
+
+    fn after_stop(&self, _plugin_dir: &Path) -> std::io::Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::ReplaceLiveAfterStop => {
+                let parent = _plugin_dir.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "plugin directory has no parent",
+                    )
+                })?;
+                let displaced =
+                    parent.join(format!(".fault-displaced-live-{}", uuid::Uuid::new_v4()));
+                rename_noreplace(_plugin_dir, &displaced)?;
+                std::fs::create_dir(_plugin_dir)?;
+                std::fs::write(_plugin_dir.join("RACE_MARKER"), b"race-owned")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn injected_install_error(&self) -> Option<PluginError> {
+        match self {
+            #[cfg(test)]
+            Self::RollbackDestinationDirectory => Some(PluginError::Registration(
+                "injected install failure before rollback destination race".to_string(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn rollback_fault(&self) -> RollbackFault {
+        match self {
+            #[cfg(test)]
+            Self::RollbackDestinationDirectory => RollbackFault::ReplaceDestinationDirectory,
+            _ => RollbackFault::None,
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_final_provenance_commit(&self) -> bool {
+        matches!(self, Self::FinalProvenanceCommitFailure)
+    }
+}
+
+fn stopped_upgrade_failure(error: PluginError, stopped_services: &[String]) -> PluginError {
+    if stopped_services.is_empty() {
+        return error;
+    }
+    PluginError::Registration(format!(
+        "{error}; upgrade failed after stopping service(s) [{}]; automatic restart is disabled, so they remain stopped pending manual recovery",
+        stopped_services.join(", ")
+    ))
+}
+
+#[cfg(test)]
+async fn install_server_plugin_from_source_with_fault(
+    installer: &ServerPluginInstaller,
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    disposition: InstallDisposition,
+    expected_plugin_id: Option<&str>,
+    fault: ServerSourceFault,
+) -> PluginResult<InstalledPlugin> {
+    install_server_plugin_from_source_inner(
+        installer,
+        input,
+        plugins_root,
+        trust,
+        disposition,
+        expected_plugin_id,
+        fault,
+    )
+    .await
+}
+
+async fn install_server_plugin_from_source_inner(
+    installer: &ServerPluginInstaller,
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    disposition: InstallDisposition,
+    expected_plugin_id: Option<&str>,
+    fault: ServerSourceFault,
+) -> PluginResult<InstalledPlugin> {
+    let prepared = prepare_plugin_source(input, plugins_root, trust).await?;
+    if let Some(expected_plugin_id) = expected_plugin_id {
+        if prepared.manifest.id != expected_plugin_id {
+            let manifest_id = prepared.manifest.id.clone();
+            prepared.discard().await;
+            return Err(PluginError::InvalidManifest(format!(
+                "path id '{expected_plugin_id}' does not match the source's manifest id '{manifest_id}'"
+            )));
+        }
+    }
+
+    let plugin_id = prepared.manifest.id.clone();
+    let guard = installer.begin_operation().await;
+    let previous = match installer
+        .preflight_prepared_candidate(
+            &prepared.manifest,
+            &prepared.prepared_dir,
+            disposition,
+            &guard,
+        )
+        .await
+    {
+        Ok(previous) => previous,
+        Err(error) => {
+            prepared.discard().await;
+            return Err(error);
+        }
+    };
+    if disposition == InstallDisposition::Upgrade {
+        let Some(previous) = previous else {
+            prepared.discard().await;
+            return Err(PluginError::Registration(format!(
+                "upgrade for '{plugin_id}' has no unique previous provenance row"
+            )));
+        };
+        if previous.plugin_dir != prepared.plugin_dir {
+            let fixed = prepared.plugin_dir.display().to_string();
+            let recorded = previous.plugin_dir.display().to_string();
+            prepared.discard().await;
+            return Err(PluginError::Registration(format!(
+                "upgrade for '{plugin_id}' requires previous provenance at fixed bundle path '{fixed}', but installed.json records '{recorded}'"
+            )));
+        }
+    }
+
+    // Capture the exact old directory identity while services are still
+    // running. Activation must consume this snapshot rather than blessing
+    // whatever happens to occupy the same path after shutdown.
+    let expected_live = match prepared.capture_expected_live() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            prepared.discard().await;
+            return Err(PluginError::Registration(format!(
+                "could not capture the live plugin bundle before service shutdown: {error}"
+            )));
+        }
+    };
+    match disposition {
+        InstallDisposition::Upgrade if expected_live.is_none() => {
+            prepared.discard().await;
+            return Err(PluginError::Registration(format!(
+                "upgrade for '{plugin_id}' requires an exact live bundle at '{}', but none existed before service shutdown",
+                plugins_root.join(&plugin_id).display()
+            )));
+        }
+        InstallDisposition::FailIfInstalled if expected_live.is_some() => {
+            prepared.discard().await;
+            return Err(PluginError::Registration(format!(
+                "fresh install expected no live bundle at '{}', but an existing destination was captured; manual bundle recovery is required",
+                plugins_root.join(&plugin_id).display()
+            )));
+        }
+        _ => {}
+    }
+
+    let stopped_services = if disposition == InstallDisposition::Upgrade {
+        installer.stop_services_for_upgrade(&plugin_id).await
+    } else {
+        Vec::new()
+    };
+    if let Err(error) = fault.after_stop(&prepared.plugin_dir) {
+        prepared.discard().await;
+        return Err(stopped_upgrade_failure(
+            PluginError::Registration(format!(
+                "failed while exercising the post-stop source transaction boundary: {error}; manual bundle recovery is required"
+            )),
+            &stopped_services,
+        ));
+    }
+    let staged = match prepared
+        .activate_inner(expected_live, fault.activation_fault())
+        .await
+    {
+        Ok(staged) => staged,
+        Err(failure) => {
+            let error = failure.into_plugin_error();
+            return Err(stopped_upgrade_failure(error, &stopped_services));
+        }
+    };
+
+    let manifest = staged.manifest.clone();
+    let plugin_dir = staged.plugin_dir.clone();
+    let source = staged.source.clone();
+    let install_result = match fault.injected_install_error() {
+        Some(error) => Err(error),
+        None => {
+            #[cfg(test)]
+            {
+                if fault.fail_final_provenance_commit() {
+                    installer
+                        .install_with_operation_failing_final_commit(
+                            &manifest,
+                            &plugin_dir,
+                            source,
+                            disposition,
+                            chrono::Utc::now(),
+                            &guard,
+                        )
+                        .await
+                } else {
+                    installer
+                        .install_with_operation(
+                            &manifest,
+                            &plugin_dir,
+                            source,
+                            disposition,
+                            chrono::Utc::now(),
+                            &guard,
+                        )
+                        .await
+                }
+            }
+            #[cfg(not(test))]
+            {
+                installer
+                    .install_with_operation(
+                        &manifest,
+                        &plugin_dir,
+                        source,
+                        disposition,
+                        chrono::Utc::now(),
+                        &guard,
+                    )
+                    .await
+            }
+        }
+    };
+    match install_result {
+        Ok(entry) => {
+            staged.commit().await;
+            Ok(entry)
+        }
+        Err(error) => {
+            let recovery = staged.rollback_inner(fault.rollback_fault()).await;
+            Err(stopped_upgrade_failure(
+                recovery.wrap_error(error),
+                &stopped_services,
+            ))
+        }
+    }
+}
+
+/// Stage + `install()` + commit/rollback for a standalone installer that does
+/// not share bamboo-server's capability stores or operation lock. Server code
+/// must use [`install_server_plugin_from_source`] instead.
+#[cfg(test)]
+async fn install_plugin_from_source(
     installer: &dyn PluginInstaller,
     input: PluginSourceInput,
     plugins_root: &Path,
@@ -389,8 +1552,8 @@ pub async fn install_plugin_from_source(
             Ok(entry)
         }
         Err(error) => {
-            staged.rollback().await;
-            Err(error)
+            let recovery = staged.rollback().await;
+            Err(recovery.wrap_error(error))
         }
     }
 }
@@ -858,7 +2021,6 @@ async fn fetch_and_place_artifact(
     };
     let source_bin = scratch_dir.join(&expected_name);
     if !tokio::fs::try_exists(&source_bin).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_dir_all(&scratch_dir).await;
         return Err(PluginError::InvalidManifest(format!(
             "artifact archive for platform '{}' does not contain the expected root executable '{}'",
             platform.as_str(),
@@ -879,7 +2041,13 @@ async fn fetch_and_place_artifact(
         tokio::fs::set_permissions(&dest_bin, perms).await?;
     }
 
-    let _ = tokio::fs::remove_dir_all(&scratch_dir).await;
+    tokio::fs::remove_dir(&scratch_dir).await.map_err(|error| {
+        PluginError::InvalidManifest(format!(
+            "artifact archive for platform '{}' must contain only the expected root executable '{}': {error}",
+            platform.as_str(),
+            expected_name
+        ))
+    })?;
     Ok(())
 }
 
@@ -1174,8 +2342,8 @@ fn extract_zip_sync(
         ) {
             drop(out_file);
             // Defense in depth: remove the partial file we were just writing
-            // even though the caller (`stage_plugin_source`) also wipes the
-            // whole staging directory on any `Err` from this function — a
+            // even though the source transaction also wipes the whole
+            // staging directory on any `Err` from this function — a
             // direct caller of this lower-level helper should never see a
             // half-written entry either.
             let _ = std::fs::remove_file(&out_path);

@@ -7,7 +7,7 @@
 //!
 //! Every test installs from the checked-in
 //! `crates/infra/bamboo-plugin/examples/hello-plugin` fixture as a
-//! `local_dir` source — `stage_plugin_source` COPIES a `LocalDir` source
+//! `local_dir` source — `prepare_plugin_source` COPIES a `LocalDir` source
 //! (see `plugin_source.rs::stage_into`), so the checked-in fixture is never
 //! mutated — and a throwaway `tempfile::tempdir()` `AppState`, never
 //! `~/.bamboo`.
@@ -17,10 +17,15 @@ use std::path::{Path, PathBuf};
 use actix_web::http::StatusCode;
 use actix_web::{test, web, App};
 use bamboo_plugin::manifest::{McpServerManifestEntry, McpTransportManifest, Platform};
+use bamboo_plugin::{
+    InstalledPlugin, InstalledPlugins, PluginInstallStatus, PluginSource, RegisteredCapabilities,
+};
+use bamboo_plugin_protocol::{
+    FILE_CHANGED_SUBSCRIPTION_ID_V1, TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
+};
+use chrono::Utc;
 
 use crate::app_state::AppState;
-
-use super::handlers::{install_plugin, list_plugins, remove_plugin, update_plugin};
 
 fn hello_plugin_example_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/bamboo-plugin/examples/hello-plugin")
@@ -34,19 +39,15 @@ async fn test_state(data_dir: &Path) -> web::Data<AppState> {
     )
 }
 
-/// Registers the same 4 routes `routes::agent::plugin_scope` wires under
-/// `/api/v1/plugins` (see that module) directly on a bare `App`, matching
-/// `handlers/agent/stream/tests.rs`'s inline-`App`-per-test style — factoring
-/// this into a shared fn would need to name `App`'s hairy service-factory
-/// generic, which isn't worth it for 4 `.route()` calls repeated 6 times.
+/// Mount the production plugin scope under its production `/api/v1` prefix.
+/// Keeping one route-registration point prevents integration tests from
+/// drifting from production method/path bindings and keeps endpoint analysis
+/// from treating every macro expansion as a distinct handler registration.
 macro_rules! plugin_test_app {
     ($state:expr) => {
         App::new()
             .app_data($state)
-            .route("/api/v1/plugins", web::get().to(list_plugins))
-            .route("/api/v1/plugins/install", web::post().to(install_plugin))
-            .route("/api/v1/plugins/{id}/update", web::post().to(update_plugin))
-            .route("/api/v1/plugins/{id}", web::delete().to(remove_plugin))
+            .service(web::scope("/api/v1").service(crate::routes::plugin_scope()))
     };
 }
 
@@ -107,6 +108,47 @@ async fn write_mcp_plugin_dir(root: &Path, plugin_id: &str, mcp_id: &str) -> Pat
     )
     .await
     .unwrap();
+    dir
+}
+
+async fn write_event_sink_plugin_dir(
+    root: &Path,
+    source_name: &str,
+    plugin_id: &str,
+    version: &str,
+    marker: &str,
+) -> PathBuf {
+    let dir = root.join(source_name);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(
+        dir.join("plugin.json"),
+        serde_json::json!({
+            "id": plugin_id,
+            "name": "Event Plugin",
+            "version": version,
+            "provides": {
+                "services": [{
+                    "id": "audit-service",
+                    "enabled": true,
+                    "command": "${platform_bin}"
+                }],
+                "event_sinks": [{
+                    "id": "shared-sink",
+                    "service_id": "audit-service",
+                    "protocol": {
+                        "name": TOOL_EVENT_PROTOCOL_NAME,
+                        "version": TOOL_EVENT_V1_SCHEMA_VERSION
+                    },
+                    "subscriptions": [{"id": FILE_CHANGED_SUBSCRIPTION_ID_V1}],
+                    "requested_permissions": ["metadata"]
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(dir.join("MARKER"), marker).await.unwrap();
     dir
 }
 
@@ -325,6 +367,200 @@ async fn update_upgrades_an_installed_plugin() {
     let view = body_json(resp).await;
     assert_eq!(view["id"], "hello-plugin");
     assert_eq!(view["status"], "installed");
+}
+
+#[actix_web::test]
+async fn update_event_sink_conflict_is_rejected_before_service_stop_or_bundle_swap() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    state.wait_for_boot_reconcile_services().await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let old_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "old-source",
+        "event-plugin",
+        "1.0.0",
+        "old-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(local_dir_source(&old_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(state.service_manager.is_running("audit-service"));
+
+    // Corrupt provenance to model a foreign row also claiming the current
+    // plugin's sink id. The current row still owns it too: foreign must win.
+    let installed_json = data_dir.path().join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::load(&installed_json).await.unwrap();
+    store.add(InstalledPlugin {
+        id: "foreign-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: PathBuf::from("/tmp/foreign-plugin"),
+        },
+        plugin_dir: PathBuf::from("/tmp/foreign-plugin"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            event_sink_ids: vec!["shared-sink".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+    let provenance_before = store.plugins.clone();
+
+    let new_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "new-source",
+        "event-plugin",
+        "2.0.0",
+        "new-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/event-plugin/update")
+        .set_json(local_dir_source(&new_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let error = body_json(resp).await;
+    assert!(error_message(&error).contains("shared-sink"));
+
+    assert!(
+        state.service_manager.is_running("audit-service"),
+        "preflight rejection must not stop the old service"
+    );
+    let live_dir = data_dir.path().join("plugins").join("event-plugin");
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle",
+        "preflight rejection must not activate the candidate bundle"
+    );
+    let live_manifest: serde_json::Value = serde_json::from_str(
+        &tokio::fs::read_to_string(live_dir.join("plugin.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live_manifest["version"], "1.0.0");
+    assert_eq!(
+        InstalledPlugins::load(&installed_json)
+            .await
+            .unwrap()
+            .plugins,
+        provenance_before
+    );
+
+    let mut entries = tokio::fs::read_dir(data_dir.path().join("plugins"))
+        .await
+        .unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with(".staging-"), "leftover {name}");
+        assert!(!name.starts_with(".backup-"), "leftover {name}");
+    }
+}
+
+#[actix_web::test]
+async fn update_duplicate_plugin_rows_is_rejected_before_service_stop_or_bundle_swap() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let state = test_state(data_dir.path()).await;
+    state.wait_for_boot_reconcile_services().await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+
+    let old_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "duplicate-old-source",
+        "event-plugin",
+        "1.0.0",
+        "old-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(local_dir_source(&old_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(state.service_manager.is_running("audit-service"));
+
+    // Corrupt provenance with the same plugin identity but entirely distinct
+    // capability ids. Sink/service owner counts alone cannot catch this.
+    let installed_json = data_dir.path().join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::load(&installed_json).await.unwrap();
+    store.plugins.push(InstalledPlugin {
+        id: "event-plugin".to_string(),
+        version: "0.9.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: PathBuf::from("/tmp/duplicate-event-plugin"),
+        },
+        plugin_dir: PathBuf::from("/tmp/duplicate-event-plugin"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installing,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["other-service".to_string()],
+            event_sink_ids: vec!["other-sink".to_string()],
+            ..Default::default()
+        },
+    });
+    store.save(&installed_json).await.unwrap();
+    let provenance_before = store.plugins.clone();
+
+    let new_source = write_event_sink_plugin_dir(
+        data_dir.path(),
+        "duplicate-new-source",
+        "event-plugin",
+        "2.0.0",
+        "new-bundle",
+    )
+    .await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/event-plugin/update")
+        .set_json(local_dir_source(&new_source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        state.service_manager.is_running("audit-service"),
+        "ambiguous provenance must fail before stopping the old service"
+    );
+    let live_dir = data_dir.path().join("plugins").join("event-plugin");
+    assert_eq!(
+        tokio::fs::read_to_string(live_dir.join("MARKER"))
+            .await
+            .unwrap(),
+        "old-bundle"
+    );
+    let live_manifest: serde_json::Value = serde_json::from_str(
+        &tokio::fs::read_to_string(live_dir.join("plugin.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live_manifest["version"], "1.0.0");
+    assert_eq!(
+        InstalledPlugins::load(&installed_json)
+            .await
+            .unwrap()
+            .plugins,
+        provenance_before
+    );
+
+    let mut entries = tokio::fs::read_dir(data_dir.path().join("plugins"))
+        .await
+        .unwrap();
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.starts_with(".staging-"), "leftover {name}");
+        assert!(!name.starts_with(".backup-"), "leftover {name}");
+    }
 }
 
 #[actix_web::test]

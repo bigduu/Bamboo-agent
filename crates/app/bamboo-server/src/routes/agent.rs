@@ -38,7 +38,7 @@ fn mcp_scope() -> impl HttpServiceFactory {
 /// registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
 /// the same `enforce_access_password_middleware` wrap as every other
 /// mutating route here — no new auth was added).
-fn plugin_scope() -> impl HttpServiceFactory {
+pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
