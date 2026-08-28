@@ -372,6 +372,26 @@ impl Default for GracefulShutdown {
     }
 }
 
+/// Optional stdin wire contract for a supervised plugin service.
+///
+/// `None` preserves the original service behavior: stdin is connected to the
+/// null device and Bamboo never creates an input writer. `NdjsonV1` opts the
+/// verified service binary into one JSON value per line over a pipe owned by
+/// the exact supervised process generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceInputProtocol {
+    #[default]
+    None,
+    NdjsonV1,
+}
+
+impl ServiceInputProtocol {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// A long-running service this plugin wants supervised (issue #479, prereq
 /// for epic #477 — standalone connectors distributed as plugins). The
 /// highest-trust artifact kind a plugin can declare: unlike an MCP stdio
@@ -413,6 +433,10 @@ pub struct ServiceManifestEntry {
     pub restart_policy: bamboo_domain::mcp_config::ReconnectConfig,
     #[serde(default)]
     pub graceful_shutdown: GracefulShutdown,
+    /// Explicit opt-in to Bamboo-owned service stdin. Omitted/legacy entries
+    /// remain `none` and retain the pre-input null-stdin behavior.
+    #[serde(default, skip_serializing_if = "ServiceInputProtocol::is_none")]
+    pub input_protocol: ServiceInputProtocol,
 }
 
 /// Protocol family and wire version requested by an event sink.
@@ -643,6 +667,7 @@ pub struct ResolvedServiceEntry {
     pub health_check: HealthCheckSpec,
     pub restart_policy: bamboo_domain::mcp_config::ReconnectConfig,
     pub graceful_shutdown: GracefulShutdown,
+    pub input_protocol: ServiceInputProtocol,
 }
 
 impl ServiceManifestEntry {
@@ -684,6 +709,7 @@ impl ServiceManifestEntry {
             health_check: self.health_check.clone(),
             restart_policy: self.restart_policy.clone(),
             graceful_shutdown: self.graceful_shutdown.clone(),
+            input_protocol: self.input_protocol,
         }
     }
 }
@@ -2084,7 +2110,36 @@ mod tests {
         assert!(entry.enabled);
         assert_eq!(entry.health_check.kind, HealthCheckKind::ProcessAlive);
         assert_eq!(entry.graceful_shutdown.signal, ShutdownSignal::Term);
+        assert_eq!(entry.input_protocol, ServiceInputProtocol::None);
+        assert!(
+            serde_json::to_value(entry)
+                .expect("serialize legacy service")
+                .get("input_protocol")
+                .is_none(),
+            "the default must remain absent from reserialized legacy manifests"
+        );
         assert!(manifest.uses_platform_bin_token());
+    }
+
+    #[test]
+    fn parses_and_resolves_explicit_ndjson_v1_service_input() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&service_manifest_json("svc", PLATFORM_BIN_TOKEN)).unwrap();
+        value["provides"]["services"][0]["input_protocol"] = serde_json::json!("ndjson_v1");
+        let manifest = PluginManifest::parse_str(&value.to_string()).expect("parse ndjson input");
+        manifest.validate().expect("ndjson service is valid");
+        let entry = &manifest.provides.services[0];
+        assert_eq!(entry.input_protocol, ServiceInputProtocol::NdjsonV1);
+        assert_eq!(
+            entry
+                .resolve(
+                    Path::new("/plugins/svc-plugin"),
+                    &manifest.id,
+                    Platform::Linux
+                )
+                .input_protocol,
+            ServiceInputProtocol::NdjsonV1
+        );
     }
 
     #[test]

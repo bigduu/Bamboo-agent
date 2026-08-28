@@ -1010,6 +1010,10 @@ async fn install_and_list_surface_service_status() {
         .expect("service_status array");
     assert_eq!(service_status.len(), 1);
     assert_eq!(service_status[0]["id"], "svc");
+    assert!(
+        service_status[0].get("input").is_none(),
+        "legacy service status must not gain an input field"
+    );
     // The binary doesn't exist on disk in this fixture, so the runtime
     // never reaches `running` — but it MUST be present (best-effort start,
     // ownership recorded regardless — matches the mcp contract) and report

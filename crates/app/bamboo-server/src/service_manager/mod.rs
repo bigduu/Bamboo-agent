@@ -61,14 +61,16 @@
 //! but has no live runtime (the previous `bamboo serve` process died) is
 //! started fresh. See `app_state::builder`'s `boot_reconcile_services`.
 
+mod input;
 mod lifecycle;
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -76,7 +78,12 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use bamboo_domain::mcp_config::ReconnectConfig;
-use bamboo_plugin::manifest::{GracefulShutdown, HealthCheckSpec};
+use bamboo_plugin::manifest::{GracefulShutdown, HealthCheckSpec, ServiceInputProtocol};
+
+pub use input::{
+    ServiceInputHealth, ServiceInputSendError, ServiceInputSender, ServiceInputStatusSnapshot,
+    DEFAULT_SERVICE_INPUT_QUEUE_CAPACITY, MAX_SERVICE_INPUT_LINE_BYTES,
+};
 
 /// Resolved, ready-to-spawn configuration for one service — the output of
 /// `ServiceManifestEntry::resolve` plus the owning plugin id and the
@@ -96,6 +103,9 @@ pub struct ServiceRuntimeConfig {
     pub health_check: HealthCheckSpec,
     pub restart_policy: ReconnectConfig,
     pub graceful_shutdown: GracefulShutdown,
+    /// `None` preserves null stdin; `NdjsonV1` creates a generation-bound,
+    /// bounded writer only after this exact child has spawned successfully.
+    pub input_protocol: ServiceInputProtocol,
     /// `<data_dir>/plugins/<plugin_id>/config.json`, passed to the child as
     /// `BAMBOO_PLUGIN_SERVICE_CONFIG`. bamboo only ever creates the PARENT
     /// directory (`plugin_installer::ServerPluginInstaller::resolve_service_config`)
@@ -130,6 +140,10 @@ pub struct ServiceStatusSnapshot {
     pub pid: Option<u32>,
     pub restart_count: u32,
     pub last_error: Option<String>,
+    /// Omitted for legacy/`none` services so their serialized status shape and
+    /// behavior remain unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<ServiceInputStatusSnapshot>,
 }
 
 /// Errors [`ServiceManager`]'s public API can return. Deliberately tiny
@@ -163,7 +177,14 @@ pub(crate) struct ServiceRuntime {
     /// module docs.
     shutdown: AtomicBool,
     stop_token: CancellationToken,
-    supervisor: RwLock<Option<tokio::task::JoinHandle<()>>>,
+    /// Synchronous because publication ordering is the invariant: the handle
+    /// is stored before `runtimes.insert`, and stop takes it after removal,
+    /// then awaits outside every map/lock guard. No async critical section is
+    /// needed for this single write/single take slot.
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Present only for an explicitly declared `ndjson_v1` service. The slot
+    /// inside is rebound once per successful process spawn.
+    input: Option<input::ServiceInputRuntime>,
 }
 
 /// Owns every supervised service's runtime. Empty/inert until
@@ -173,6 +194,11 @@ pub(crate) struct ServiceRuntime {
 #[derive(Default)]
 pub struct ServiceManager {
     runtimes: DashMap<String, Arc<ServiceRuntime>>,
+    /// Manager-lifetime allocator shared by every runtime. It deliberately
+    /// survives `stop_service` followed by a same-id `start_service`, so an
+    /// old opaque sender can never collide with a new binding via generation
+    /// reuse (ABA across upgrade/reinstall).
+    next_input_generation: Arc<AtomicU64>,
 }
 
 impl ServiceManager {
@@ -190,7 +216,22 @@ impl ServiceManager {
         &self,
         config: ServiceRuntimeConfig,
     ) -> Result<(), ServiceManagerError> {
+        self.start_service_inner(config, || async {}).await
+    }
+
+    async fn start_service_inner<F, Fut>(
+        &self,
+        config: ServiceRuntimeConfig,
+        after_publish: F,
+    ) -> Result<(), ServiceManagerError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let id = config.id.clone();
+        let input = matches!(config.input_protocol, ServiceInputProtocol::NdjsonV1).then(|| {
+            input::ServiceInputRuntime::new(id.clone(), self.next_input_generation.clone())
+        });
         let runtime = Arc::new(ServiceRuntime {
             config,
             state: RwLock::new(ServiceState::Starting),
@@ -199,7 +240,8 @@ impl ServiceManager {
             last_error: RwLock::new(None),
             shutdown: AtomicBool::new(false),
             stop_token: CancellationToken::new(),
-            supervisor: RwLock::new(None),
+            supervisor: Mutex::new(None),
+            input,
         });
         // Atomic check-and-insert via the entry API: a plain
         // contains_key→insert would let two racing callers (boot reconcile —
@@ -212,12 +254,33 @@ impl ServiceManager {
                 return Err(ServiceManagerError::AlreadyRunning(occupied.key().clone()));
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                // `tokio::spawn` may schedule immediately, but no stopper can
+                // discover this runtime until after its handle is synchronously
+                // stored. This prevents stop from removing a published runtime,
+                // seeing `None`, and returning while a detached child starts.
+                let handle = tokio::spawn(lifecycle::run_supervisor(runtime.clone()));
+                *runtime
+                    .supervisor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
                 vacant.insert(runtime.clone());
             }
         }
-        let handle = tokio::spawn(lifecycle::run_supervisor(runtime.clone()));
-        *runtime.supervisor.write().await = Some(handle);
+        after_publish().await;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn start_service_with_publish_hook<F, Fut>(
+        &self,
+        config: ServiceRuntimeConfig,
+        after_publish: F,
+    ) -> Result<(), ServiceManagerError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        self.start_service_inner(config, after_publish).await
     }
 
     /// Stop `id`: marks the runtime `shutdown` (so the supervisor never
@@ -234,9 +297,22 @@ impl ServiceManager {
         let Some((_, runtime)) = self.runtimes.remove(id) else {
             return Err(ServiceManagerError::NotRunning(id.to_string()));
         };
+        // Publish shutdown synchronously before awaiting the input slot. This
+        // prevents the supervisor from deciding to restart while stop is
+        // waiting behind a concurrent bind/status reconciliation.
         runtime.shutdown.store(true, Ordering::SeqCst);
+        // Then revoke/cancel input before waking the supervisor. Upgrade/
+        // uninstall await this method before swapping/removing the verified
+        // binary, so no producer can enqueue after shutdown begins.
+        if let Some(input) = &runtime.input {
+            input.stop_active().await;
+        }
         runtime.stop_token.cancel();
-        let handle = runtime.supervisor.write().await.take();
+        let handle = runtime
+            .supervisor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(handle) = handle {
             let _ = handle.await;
         }
@@ -250,6 +326,15 @@ impl ServiceManager {
     pub async fn status(&self, id: &str) -> Option<ServiceStatusSnapshot> {
         let runtime = self.runtimes.get(id)?.clone();
         Some(lifecycle::snapshot(&runtime).await)
+    }
+
+    /// Acquire the non-blocking sender for the currently live process
+    /// generation. Returns `None` for a legacy/no-input service, while it is
+    /// starting/restarting, or after its stdin writer has been unbound.
+    /// Existing handles deliberately do not follow a restart.
+    pub async fn input_sender(&self, id: &str) -> Option<ServiceInputSender> {
+        let runtime = self.runtimes.get(id)?.clone();
+        runtime.input.as_ref()?.sender().await
     }
 
     /// Snapshot of every currently-supervised service (regardless of which
