@@ -130,7 +130,8 @@ async fn write_event_sink_plugin_dir(
                 "services": [{
                     "id": "audit-service",
                     "enabled": true,
-                    "command": "${platform_bin}"
+                    "command": "${platform_bin}",
+                    "input_protocol": "ndjson_v1"
                 }],
                 "event_sinks": [{
                     "id": "shared-sink",

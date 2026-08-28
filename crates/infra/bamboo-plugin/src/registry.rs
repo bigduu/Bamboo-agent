@@ -805,7 +805,8 @@ mod tests {
                 "services": [{
                     "id": "audit-service",
                     "enabled": service_enabled,
-                    "command": "${platform_bin}"
+                    "command": "${platform_bin}",
+                    "input_protocol": "ndjson_v1"
                 }],
                 "event_sinks": [{
                     "id": "audit-events",

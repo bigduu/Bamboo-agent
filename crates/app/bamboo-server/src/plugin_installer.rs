@@ -10,16 +10,15 @@
 //! downstream `impl PluginInstaller for ServerPluginInstaller` (the trait is
 //! foreign, the type is local — no orphan-rule issue).
 //!
-//! # Why a borrowed `web::Data<AppState>` and no `AppState` struct change
+//! # Why a borrowed `web::Data<AppState>`
 //!
 //! `ServerPluginInstaller` holds a `web::Data<AppState>` clone — the exact
 //! handle every HTTP handler in this crate already receives as an argument
 //! (`web::Data` is `Arc`-backed, so cloning it is cheap). An HTTP handler
 //! constructs one per request: `ServerPluginInstaller::new(state.clone())`.
-//! `AppState` itself is intentionally untouched — no new field, no
-//! coordinated append to `app_state/mod.rs` / `app_state/builder.rs` — so
-//! this branch can never conflict with the other Wave-2 branches that also
-//! stack on `feat/plugin-framework`.
+//! The installer coordinates the AppState-owned service manager and ToolEvent
+//! router, so runtime registration and revocation share the same lifecycle
+//! boundary as durable plugin provenance.
 //!
 //! # Path derivation: `state.app_data_dir`, not the `bamboo_config::paths` globals
 //!
@@ -520,6 +519,32 @@ impl ServerPluginInstaller {
         for service_id in &registered.service_ids {
             self.remove_service(service_id).await;
         }
+    }
+
+    /// Apply an upgrade's id-level drop-diff without ever stopping a service
+    /// beneath a still-live sink generation. A retained sink id may change
+    /// its backing service id, which `RegisteredCapabilities::removed_since`
+    /// cannot express because provenance stores capability ids rather than
+    /// sink-to-service edges. If any old service is being dropped, revoke and
+    /// join every prior sink first; the replacement plan is installed only
+    /// after the new services have been registered.
+    ///
+    /// Returns whether the complete prior sink set was already revoked, so
+    /// the later same-service replacement seam can avoid redundant work.
+    async fn deregister_upgrade_drop_diff(
+        &self,
+        previous: &RegisteredCapabilities,
+        dropped: &RegisteredCapabilities,
+    ) -> bool {
+        let revoked_all_prior_sinks = !dropped.service_ids.is_empty();
+        if revoked_all_prior_sinks {
+            self.state
+                .tool_event_router
+                .unregister_sinks(&previous.event_sink_ids)
+                .await;
+        }
+        self.deregister_capabilities(dropped).await;
+        revoked_all_prior_sinks
     }
 
     /// Best-effort undo of an `install()` that failed partway through steps
@@ -1044,6 +1069,7 @@ impl ServerPluginInstaller {
         // no longer declares BEFORE registering anything new (BLOCKER 2). Also
         // fires for a recovery over an `Installing` leftover: its intended set
         // is diffed the same way, so a crashed attempt's extra ids get cleaned.
+        let mut prior_sinks_revoked_for_service_drop = false;
         if let Some(previous) = &previous {
             let dropped = intended.removed_since(&previous.registered);
             if !dropped.is_empty() {
@@ -1057,7 +1083,9 @@ impl ServerPluginInstaller {
                     dropped_event_sinks = ?dropped.event_sink_ids,
                     "install drop-diff: de-registering capabilities the new/completed version no longer declares"
                 );
-                self.deregister_capabilities(&dropped).await;
+                prior_sinks_revoked_for_service_drop = self
+                    .deregister_upgrade_drop_diff(&previous.registered, &dropped)
+                    .await;
             }
         }
 
@@ -1107,15 +1135,19 @@ impl ServerPluginInstaller {
         // Direct `PluginInstaller::install(..., Upgrade, ...)` callers do not
         // pass through plugin_source's pre-swap stop hook. Revoke every prior
         // sink generation at the last common point before `register_services`
-        // can stop/replace a same-id service. Keeping this after the journal
-        // and MCP step means an earlier failure leaves the still-running old
-        // service and its route intact. The source path may already have
-        // revoked it; unregister is intentionally idempotent.
-        if let Some(previous) = &previous {
-            self.state
-                .tool_event_router
-                .unregister_sinks(&previous.registered.event_sink_ids)
-                .await;
+        // can stop/replace a same-id service. When Step 0 did not drop an old
+        // service, keeping this after the journal and MCP step means an
+        // earlier failure leaves that still-running service and route intact.
+        // If Step 0 did drop a service, all prior sinks were necessarily
+        // revoked before that stop. The source path may also have revoked the
+        // set already; unregister is intentionally idempotent.
+        if !prior_sinks_revoked_for_service_drop {
+            if let Some(previous) = &previous {
+                self.state
+                    .tool_event_router
+                    .unregister_sinks(&previous.registered.event_sink_ids)
+                    .await;
+            }
         }
 
         // Step 1b: Services (issue #479). Runs right after MCP, before the

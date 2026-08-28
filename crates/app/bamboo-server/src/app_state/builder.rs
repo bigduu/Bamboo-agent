@@ -1024,10 +1024,11 @@ impl AppState {
         //
         // The `JoinHandle` is kept (not discarded) purely so tests can
         // deterministically wait it out via
-        // `AppState::wait_for_boot_reconcile_services` instead of racing
-        // this unsynchronized pass — see that method's doc comment and issue
-        // #486. Production code never awaits it; server startup is never
-        // blocked on plugin service spawns.
+        // `AppState::wait_for_boot_reconcile_services`. The pass shares the
+        // plugin operation lock with install/update/uninstall, so its
+        // manifest/provenance generation cannot race a newer mutation; see
+        // that method's doc comment and issue #486. Production code never
+        // awaits it; server startup is never blocked on plugin service spawns.
         let boot_reconcile_services_handle = {
             let service_manager = service_manager.clone();
             let tool_event_router = tool_event_router.clone();

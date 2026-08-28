@@ -1040,17 +1040,17 @@ impl PluginManifest {
                     sink.id, MAX_EVENT_SINK_SERVICE_ID_BYTES
                 )));
             }
-            if !self
+            let Some(service) = self
                 .provides
                 .services
                 .iter()
-                .any(|service| service.id == sink.service_id)
-            {
+                .find(|service| service.id == sink.service_id)
+            else {
                 return Err(PluginError::InvalidManifest(format!(
                     "event sink '{}' references service '{}' which is not declared by the same plugin",
                     sink.id, sink.service_id
                 )));
-            }
+            };
             if sink.protocol.name != TOOL_EVENT_PROTOCOL_NAME {
                 return Err(PluginError::InvalidManifest(format!(
                     "event sink '{}' uses unknown protocol family '{}' (expected '{}')",
@@ -1064,6 +1064,12 @@ impl PluginManifest {
                 )));
             }
             let strict_v1 = sink.protocol.version == TOOL_EVENT_V1_SCHEMA_VERSION;
+            if strict_v1 && service.input_protocol != ServiceInputProtocol::NdjsonV1 {
+                return Err(PluginError::InvalidManifest(format!(
+                    "ToolEventV1 event sink '{}' requires service '{}' to declare input_protocol 'ndjson_v1'",
+                    sink.id, sink.service_id
+                )));
+            }
             validate_event_sink_extensions(&sink.id, "declaration", &sink.extensions, strict_v1)?;
             validate_event_sink_extensions(
                 &sink.id,
@@ -1768,7 +1774,8 @@ mod tests {
                 "services": [{
                     "id": "audit-service",
                     "enabled": service_enabled,
-                    "command": PLATFORM_BIN_TOKEN
+                    "command": PLATFORM_BIN_TOKEN,
+                    "input_protocol": "ndjson_v1"
                 }],
                 "event_sinks": [{
                     "id": "audit-events",
@@ -1845,6 +1852,10 @@ mod tests {
     #[test]
     fn future_tool_event_version_preserves_opaque_values_and_is_inactive() {
         let mut value = event_sink_manifest_value(TOOL_EVENT_V1_SCHEMA_VERSION + 1, true);
+        value["provides"]["services"][0]
+            .as_object_mut()
+            .expect("service object")
+            .remove("input_protocol");
         value["provides"]["event_sinks"][0]["future_sink_option"] =
             serde_json::json!({ "mode": "v2" });
         value["provides"]["event_sinks"][0]["protocol"]["negotiation"] =
@@ -1867,6 +1878,11 @@ mod tests {
             .validate()
             .expect("future version must degrade instead of failing validation");
         let sink = &manifest.provides.event_sinks[0];
+        assert_eq!(
+            manifest.provides.services[0].input_protocol,
+            ServiceInputProtocol::None,
+            "future protocols must remain installable and inactive when the current host input protocol is absent"
+        );
         assert_eq!(sink.subscriptions[0].id.as_str(), "tool.symbol_changed.v2");
         assert_eq!(sink.requested_permissions.len(), 1);
         assert_eq!(sink.requested_permissions[0].as_str(), "symbol_metadata_v2");
@@ -1984,6 +2000,20 @@ mod tests {
             .validate()
             .expect_err("duplicate sink id must fail");
         assert!(error.to_string().contains("duplicate event sink id"));
+    }
+
+    #[test]
+    fn tool_event_v1_requires_ndjson_service_input() {
+        let mut value = event_sink_manifest_value(TOOL_EVENT_V1_SCHEMA_VERSION, true);
+        value["provides"]["services"][0]
+            .as_object_mut()
+            .expect("service object")
+            .remove("input_protocol");
+
+        let error = parse_event_sink_manifest(&value)
+            .validate()
+            .expect_err("ToolEventV1 cannot route into a null-stdin service");
+        assert!(error.to_string().contains("input_protocol 'ndjson_v1'"));
     }
 
     #[test]
