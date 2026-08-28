@@ -989,7 +989,7 @@ impl ServerPluginInstaller {
     /// Deterministic test seam immediately after the Step-0 drop-diff and
     /// crash-safety journal, but before every prior sink is revoked for
     /// possible same-id service replacement.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn install_with_operation_failing_before_service_replacement(
         &self,
         manifest: &PluginManifest,
