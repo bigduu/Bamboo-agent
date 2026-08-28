@@ -64,13 +64,14 @@
 use serde::{Deserialize, Serialize};
 
 use bamboo_plugin::{
-    InstalledPlugin, PluginInstallStatus, PluginManifest, PluginSource, RegisteredCapabilities,
-    ServiceInputProtocol,
+    EventSinkInactiveReason, InstalledPlugin, PluginInstallStatus, PluginManifest, PluginSource,
+    RegisteredCapabilities, ServiceInputProtocol,
 };
 
 use crate::service_manager::{
     ServiceInputHealth, ServiceInputStatusSnapshot, ServiceManager, ServiceState,
 };
+use crate::tool_event_router::{ToolEventRouter, ToolEventSinkState, ToolEventSinkStatusSnapshot};
 
 /// Shared body for `POST /install` and `POST /{id}/update`.
 #[derive(Debug, Deserialize)]
@@ -105,6 +106,47 @@ pub struct InstalledPluginView {
     /// `registered`'s other `Vec` fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_status: Vec<ServiceStatusView>,
+    /// Bounded, payload-free health for provenance-owned event sinks. No
+    /// service stderr, serialized event, path, or OS error is retained here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_sink_status: Vec<ToolEventSinkStatusView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolEventSinkStatusView {
+    pub id: String,
+    pub service_id: String,
+    pub state: ToolEventSinkState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive_reason: Option<EventSinkInactiveReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub queue_capacity: usize,
+    pub max_event_bytes: usize,
+    pub delivered: u64,
+    pub queue_full: u64,
+    pub service_down: u64,
+    pub serialization: u64,
+    pub oversize: u64,
+}
+
+impl From<ToolEventSinkStatusSnapshot> for ToolEventSinkStatusView {
+    fn from(snapshot: ToolEventSinkStatusSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            service_id: snapshot.service_id,
+            state: snapshot.state,
+            inactive_reason: snapshot.inactive_reason,
+            generation: snapshot.generation,
+            queue_capacity: snapshot.queue_capacity,
+            max_event_bytes: snapshot.max_event_bytes,
+            delivered: snapshot.delivered,
+            queue_full: snapshot.queue_full,
+            service_down: snapshot.service_down,
+            serialization: snapshot.serialization,
+            oversize: snapshot.oversize,
+        }
+    }
 }
 
 /// Wire projection of [`crate::service_manager::ServiceStatusSnapshot`] —
@@ -186,6 +228,7 @@ pub struct PluginListResponse {
 pub async fn to_view(
     entry: InstalledPlugin,
     service_manager: &ServiceManager,
+    tool_event_router: &ToolEventRouter,
 ) -> InstalledPluginView {
     let name = read_manifest_name(&entry.plugin_dir).await;
     let mut service_status = Vec::with_capacity(entry.registered.service_ids.len());
@@ -214,6 +257,12 @@ pub async fn to_view(
         };
         service_status.push(view);
     }
+    let event_sink_status = tool_event_router
+        .status_for_ids(&entry.registered.event_sink_ids)
+        .await
+        .into_iter()
+        .map(Into::into)
+        .collect();
     InstalledPluginView {
         id: entry.id,
         name,
@@ -222,6 +271,7 @@ pub async fn to_view(
         status: entry.status,
         registered: entry.registered,
         service_status,
+        event_sink_status,
     }
 }
 

@@ -12,8 +12,9 @@ use bamboo_plugin_protocol::{
 };
 use chrono::Utc;
 
-use super::ServerPluginInstaller;
+use super::{boot_reconcile_services, ServerPluginInstaller, PLUGIN_OP_LOCK};
 use crate::app_state::AppState;
+use crate::tool_event_router::ToolEventSinkState;
 
 /// A never-resolves stdio command: `Command::spawn` fails immediately (ENOENT)
 /// so `mcp_manager.start_server` returns a fast `Err` instead of hanging on a
@@ -26,18 +27,11 @@ async fn new_installer(data_dir: &Path) -> (web::Data<AppState>, ServerPluginIns
         .await
         .expect("app state should initialize");
     // `AppState::new` fires the boot-time service reconcile pass
-    // (`plugin_installer::boot_reconcile_services`) in the background,
-    // unsynchronized against `PLUGIN_OP_LOCK` (see that function's doc
-    // comment). On a fresh `data_dir` it is a same-tick no-op (nothing in
-    // `installed.json` yet) — UNLESS it is still in flight when a
-    // service-lifecycle test below writes `installed.json` and starts/stops
-    // a service moments later, in which case it can race back in and
-    // resurrect (or fail to see) a service the test just
-    // installed/stopped, producing exactly the `is_running` flakes tracked
-    // by issue #486. Draining it here (once, before any test touches
-    // `installed.json`) removes that race entirely: by construction it can
-    // only observe an empty store at this point, so this always resolves
-    // near-instantly.
+    // (`plugin_installer::boot_reconcile_services`) in the background. It now
+    // shares `PLUGIN_OP_LOCK` with installer mutations, preventing a stale
+    // service/sink plan from racing a newer plugin generation. Tests still
+    // drain the one-shot pass here so each fixture starts from deterministic
+    // completed boot state rather than depending on lock-waiter scheduling.
     state.wait_for_boot_reconcile_services().await;
     let data = web::Data::new(state);
     let installer = ServerPluginInstaller::new(data.clone());
@@ -145,7 +139,8 @@ fn event_sink_manifest_json(
             "services": [{
                 "id": service_id,
                 "enabled": false,
-                "command": "${platform_bin}"
+                "command": "${platform_bin}",
+                "input_protocol": "ndjson_v1"
             }],
             "event_sinks": sinks
         }
@@ -1689,6 +1684,68 @@ async fn invalid_sink_policy_fails_before_mcp_or_service_registration() {
 }
 
 #[tokio::test]
+async fn tool_event_v1_without_ndjson_input_fails_before_runtime_or_provenance_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let plugin_dir = root.path().join("plugins").join("null-stdin-event-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let raw = event_sink_manifest_json(
+        "null-stdin-event-plugin",
+        "1.0.0",
+        "must-not-start-service",
+        &[("must-not-register-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    value["provides"]["services"][0]
+        .as_object_mut()
+        .expect("service object")
+        .remove("input_protocol");
+    value["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+    value["provides"]["mcp_servers"] = serde_json::json!([{
+        "id": "must-not-register-mcp",
+        "transport": {"type": "stdio", "command": NONEXISTENT_COMMAND}
+    }]);
+    let raw = value.to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &raw)
+        .await
+        .unwrap();
+    let manifest = PluginManifest::parse_str(&raw).unwrap();
+
+    let error = installer
+        .install(
+            &manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::FailIfInstalled,
+            Utc::now(),
+        )
+        .await
+        .expect_err("a V1 sink backed by null stdin must fail pure preflight");
+    assert!(error.to_string().contains("input_protocol 'ndjson_v1'"));
+    assert!(installer.list().await.unwrap().is_empty());
+    assert!(!state
+        .config
+        .read()
+        .await
+        .mcp
+        .servers
+        .iter()
+        .any(|server| server.id == "must-not-register-mcp"));
+    assert!(!state.service_manager.is_running("must-not-start-service"));
+    assert_eq!(
+        state
+            .tool_event_router
+            .status_for_ids(&["must-not-register-sink".to_string()])
+            .await[0]
+            .state,
+        ToolEventSinkState::Unavailable
+    );
+}
+
+#[tokio::test]
 async fn upgrade_replaces_event_sink_provenance_exactly_and_frees_removed_id() {
     let root = tempfile::tempdir().unwrap();
     let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
@@ -1777,6 +1834,286 @@ async fn upgrade_replaces_event_sink_provenance_exactly_and_frees_removed_id() {
         .expect("removed sink id must be free for another plugin");
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_backing_service_revokes_retained_sink_before_old_service_stop() {
+    use std::time::Duration;
+
+    use bamboo_domain::mcp_config::ReconnectConfig;
+    use bamboo_plugin::manifest::{GracefulShutdown, HealthCheckSpec, ServiceInputProtocol};
+    use bamboo_plugin::reconcile_event_sinks;
+
+    use crate::service_manager::ServiceRuntimeConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let (state, installer) = new_installer(&root.path().join("bamboo-home")).await;
+    let raw = event_sink_manifest_json(
+        "changed-service-plugin",
+        "1.0.0",
+        "old-service",
+        &[("retained-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    value["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+    let old_manifest = PluginManifest::parse_str(&value.to_string()).unwrap();
+    old_manifest.validate().unwrap();
+
+    let previous = RegisteredCapabilities {
+        service_ids: vec!["old-service".to_string()],
+        event_sink_ids: vec!["retained-sink".to_string()],
+        ..Default::default()
+    };
+    let replacement = RegisteredCapabilities {
+        service_ids: vec!["new-service".to_string()],
+        event_sink_ids: vec!["retained-sink".to_string()],
+        ..Default::default()
+    };
+    let dropped = replacement.removed_since(&previous);
+    assert!(dropped.event_sink_ids.is_empty());
+    assert_eq!(dropped.service_ids, vec!["old-service".to_string()]);
+
+    state
+        .service_manager
+        .start_service(ServiceRuntimeConfig {
+            id: "old-service".to_string(),
+            plugin_id: "changed-service-plugin".to_string(),
+            name: None,
+            command: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "while IFS= read -r line; do :; done".to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+            health_check: HealthCheckSpec::default(),
+            restart_policy: ReconnectConfig {
+                enabled: false,
+                ..ReconnectConfig::default()
+            },
+            graceful_shutdown: GracefulShutdown::default(),
+            input_protocol: ServiceInputProtocol::NdjsonV1,
+            user_config_path: root.path().join("service-config.json"),
+        })
+        .await
+        .unwrap();
+    let plan = reconcile_event_sinks(
+        &old_manifest,
+        &previous,
+        PluginInstallStatus::Installed,
+        Platform::current(),
+    )
+    .unwrap();
+    state
+        .tool_event_router
+        .apply_plugin_plan("changed-service-plugin", &old_manifest, &plan)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = state
+                .tool_event_router
+                .status_for_ids(&["retained-sink".to_string()])
+                .await;
+            if status[0].state == ToolEventSinkState::Live {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old sink worker becomes live");
+
+    installer
+        .deregister_upgrade_drop_diff("changed-service-plugin", &previous, &dropped)
+        .await;
+    assert_eq!(
+        state
+            .tool_event_router
+            .status_for_ids(&["retained-sink".to_string()])
+            .await[0]
+            .state,
+        ToolEventSinkState::Unavailable
+    );
+    assert!(!state.service_manager.is_running("old-service"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_upgrade_dropping_unrelated_service_preserves_retained_live_route() {
+    use std::time::Duration;
+
+    use bamboo_domain::mcp_config::ReconnectConfig;
+    use bamboo_plugin::manifest::{GracefulShutdown, HealthCheckSpec, ServiceInputProtocol};
+    use bamboo_plugin::reconcile_event_sinks;
+
+    use crate::service_manager::ServiceRuntimeConfig;
+
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("bamboo-home");
+    let (state, installer) = new_installer(&data_dir).await;
+    let plugin_dir = data_dir.join("plugins").join("rollback-route-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let old_raw = event_sink_manifest_json(
+        "rollback-route-plugin",
+        "1.0.0",
+        "retained-service",
+        &[("retained-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let mut old_value: serde_json::Value = serde_json::from_str(&old_raw).unwrap();
+    old_value["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+    old_value["provides"]["services"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "dropped-service",
+            "enabled": true,
+            "command": "${platform_bin}",
+            "input_protocol": "ndjson_v1"
+        }));
+    let old_manifest = PluginManifest::parse_str(&old_value.to_string()).unwrap();
+    old_manifest.validate().unwrap();
+
+    let mut new_value = old_value.clone();
+    new_value["version"] = serde_json::json!("2.0.0");
+    new_value["provides"]["services"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|service| service["id"] == "retained-service");
+    let new_raw = new_value.to_string();
+    tokio::fs::write(plugin_dir.join("plugin.json"), &new_raw)
+        .await
+        .unwrap();
+    let new_manifest = PluginManifest::parse_str(&new_raw).unwrap();
+    new_manifest.validate().unwrap();
+
+    let previous_registered = RegisteredCapabilities {
+        service_ids: vec![
+            "retained-service".to_string(),
+            "dropped-service".to_string(),
+        ],
+        event_sink_ids: vec!["retained-sink".to_string()],
+        ..Default::default()
+    };
+    let previous_entry = InstalledPlugin {
+        id: "rollback-route-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: plugin_dir.clone(),
+        },
+        plugin_dir: plugin_dir.clone(),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: previous_registered.clone(),
+    };
+    let mut store = InstalledPlugins::default();
+    store.add(previous_entry.clone());
+    store
+        .save(&data_dir.join("plugins").join("installed.json"))
+        .await
+        .unwrap();
+
+    for service_id in ["retained-service", "dropped-service"] {
+        state
+            .service_manager
+            .start_service(ServiceRuntimeConfig {
+                id: service_id.to_string(),
+                plugin_id: "rollback-route-plugin".to_string(),
+                name: None,
+                command: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_string(),
+                    "while IFS= read -r line; do :; done".to_string(),
+                ],
+                cwd: None,
+                env: Default::default(),
+                health_check: HealthCheckSpec::default(),
+                restart_policy: ReconnectConfig {
+                    enabled: false,
+                    ..ReconnectConfig::default()
+                },
+                graceful_shutdown: GracefulShutdown::default(),
+                input_protocol: ServiceInputProtocol::NdjsonV1,
+                user_config_path: root.path().join(format!("{service_id}-config.json")),
+            })
+            .await
+            .unwrap();
+    }
+    let old_plan = reconcile_event_sinks(
+        &old_manifest,
+        &previous_registered,
+        PluginInstallStatus::Installed,
+        Platform::current(),
+    )
+    .unwrap();
+    state
+        .tool_event_router
+        .apply_plugin_plan("rollback-route-plugin", &old_manifest, &old_plan)
+        .await;
+    let prior_generation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = state
+                .tool_event_router
+                .status_for_ids(&["retained-sink".to_string()])
+                .await;
+            if status[0].state == ToolEventSinkState::Live {
+                break status[0].generation.expect("live route generation");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retained route becomes live");
+
+    let guard = installer.begin_operation().await;
+    let error = installer
+        .install_with_operation_failing_before_service_replacement(
+            &new_manifest,
+            &plugin_dir,
+            PluginSource::LocalDir {
+                path: plugin_dir.clone(),
+            },
+            InstallDisposition::Upgrade,
+            Utc::now(),
+            &guard,
+        )
+        .await
+        .expect_err("injected failure must abort before service replacement");
+    drop(guard);
+    assert!(error
+        .to_string()
+        .contains("injected failure before service replacement"));
+
+    let retained_status = state
+        .tool_event_router
+        .status_for_ids(&["retained-sink".to_string()])
+        .await;
+    assert_eq!(retained_status[0].state, ToolEventSinkState::Live);
+    assert_eq!(retained_status[0].generation, Some(prior_generation));
+    assert!(state.service_manager.is_running("retained-service"));
+    assert!(!state.service_manager.is_running("dropped-service"));
+
+    let restored = InstalledPlugins::load(&data_dir.join("plugins").join("installed.json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .get_unique("rollback-route-plugin")
+            .unwrap()
+            .expect("previous provenance restored"),
+        &previous_entry
+    );
+
+    state
+        .tool_event_router
+        .unregister_sinks(&["retained-sink".to_string()])
+        .await;
+    state
+        .service_manager
+        .stop_service("retained-service")
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------
 // Same-id upgrade ordering (issue #479): `stop_services_for_upgrade` is the
 // seam the HTTP update path uses after prepared-candidate preflight and before
@@ -1828,4 +2165,84 @@ async fn stop_services_for_upgrade_on_a_plugin_with_no_services_is_a_harmless_no
     let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
     let stopped = installer.stop_services_for_upgrade("never-installed").await;
     assert!(stopped.is_empty());
+}
+
+#[tokio::test]
+async fn boot_reconcile_takes_plugin_op_lock_before_reading_its_generation_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("bamboo-home");
+    let (state, _installer) = new_installer(&data_dir).await;
+    let plugins_root = data_dir.join("plugins");
+    tokio::fs::create_dir_all(&plugins_root).await.unwrap();
+
+    let old_dir = plugins_root.join("generation-old");
+    let new_dir = plugins_root.join("generation-new");
+    tokio::fs::create_dir_all(&old_dir).await.unwrap();
+    tokio::fs::create_dir_all(&new_dir).await.unwrap();
+    let old_manifest = event_sink_manifest_json(
+        "generation-plugin",
+        "1.0.0",
+        "generation-service",
+        &[("old-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let new_manifest = event_sink_manifest_json(
+        "generation-plugin",
+        "2.0.0",
+        "generation-service",
+        &[("new-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    tokio::fs::write(old_dir.join("plugin.json"), old_manifest)
+        .await
+        .unwrap();
+    tokio::fs::write(new_dir.join("plugin.json"), new_manifest)
+        .await
+        .unwrap();
+
+    let entry = |version: &str, plugin_dir: PathBuf, sink_id: &str| InstalledPlugin {
+        id: "generation-plugin".to_string(),
+        version: version.to_string(),
+        source: PluginSource::LocalDir {
+            path: plugin_dir.clone(),
+        },
+        plugin_dir,
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["generation-service".to_string()],
+            event_sink_ids: vec![sink_id.to_string()],
+            ..Default::default()
+        },
+    };
+    let installed_path = plugins_root.join("installed.json");
+    let op_guard = PLUGIN_OP_LOCK.lock().await;
+    let mut old_store = InstalledPlugins::default();
+    old_store.plugins.push(entry("1.0.0", old_dir, "old-sink"));
+    old_store.save(&installed_path).await.unwrap();
+
+    let boot = {
+        let data_dir = data_dir.clone();
+        let service_manager = state.service_manager.clone();
+        let router = state.tool_event_router.clone();
+        tokio::spawn(async move {
+            boot_reconcile_services(&data_dir, &service_manager, &router).await;
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !boot.is_finished(),
+        "boot must wait for the plugin operation generation lock"
+    );
+
+    let mut new_store = InstalledPlugins::default();
+    new_store.plugins.push(entry("2.0.0", new_dir, "new-sink"));
+    new_store.save(&installed_path).await.unwrap();
+    drop(op_guard);
+    boot.await.unwrap();
+
+    let status = state
+        .tool_event_router
+        .status_for_ids(&["old-sink".to_string(), "new-sink".to_string()])
+        .await;
+    assert_eq!(status[0].state, ToolEventSinkState::Unavailable);
+    assert_eq!(status[1].state, ToolEventSinkState::Inactive);
 }

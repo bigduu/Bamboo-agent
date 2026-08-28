@@ -1876,7 +1876,11 @@ fn event_sink_service_plugin_manifest_json(version: &str, sink_id: &str) -> Stri
         "name": "Service Event Sink Plugin",
         "version": version,
         "provides": {
-            "services": [{"id": "svc", "command": "${platform_bin}"}],
+            "services": [{
+                "id": "svc",
+                "command": "${platform_bin}",
+                "input_protocol": "ndjson_v1"
+            }],
             "event_sinks": [{
                 "id": sink_id,
                 "service_id": "svc",

@@ -130,7 +130,8 @@ async fn write_event_sink_plugin_dir(
                 "services": [{
                     "id": "audit-service",
                     "enabled": true,
-                    "command": "${platform_bin}"
+                    "command": "${platform_bin}",
+                    "input_protocol": "ndjson_v1"
                 }],
                 "event_sinks": [{
                     "id": "shared-sink",
@@ -237,6 +238,48 @@ async fn install_list_reinstall_conflict_then_delete() {
 
     // The real checked-in example fixture must be untouched.
     assert!(hello_plugin_example_dir().join("plugin.json").exists());
+}
+
+#[actix_web::test]
+async fn installed_event_sink_exposes_bounded_sanitized_status() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
+    let source = write_event_sink_plugin_dir(
+        source_root.path(),
+        "status-source",
+        "status-plugin",
+        "1.0.0",
+        "payload-must-not-enter-status",
+    )
+    .await;
+    let manifest_path = source.join("plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&tokio::fs::read_to_string(&manifest_path).await.unwrap()).unwrap();
+    manifest["provides"]["services"][0]["enabled"] = serde_json::json!(false);
+    tokio::fs::write(&manifest_path, manifest.to_string())
+        .await
+        .unwrap();
+
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/plugins/install")
+        .set_json(local_dir_source(&source))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let view = body_json(resp).await;
+    let status = &view["event_sink_status"][0];
+    assert_eq!(status["id"], "shared-sink");
+    assert_eq!(status["service_id"], "audit-service");
+    assert_eq!(status["state"], "inactive");
+    assert_eq!(status["inactive_reason"]["reason"], "service_disabled");
+    assert_eq!(status["queue_capacity"], 64);
+    assert_eq!(status["max_event_bytes"], 16 * 1024);
+    assert_eq!(status["delivered"], 0);
+    let safe = serde_json::to_string(status).unwrap();
+    assert!(!safe.contains("payload-must-not-enter-status"));
+    assert!(!safe.contains(source.to_string_lossy().as_ref()));
 }
 
 // ---------------------------------------------------------------------

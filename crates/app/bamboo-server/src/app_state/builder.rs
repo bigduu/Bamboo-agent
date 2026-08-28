@@ -5,6 +5,7 @@ use super::init::{
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
+use crate::tool_event_router::{CombinedToolEventPublisher, ToolEventRouter};
 use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
@@ -334,6 +335,16 @@ impl AppState {
             init_mcp_manager(config.clone(), &bamboo_home_dir);
         let skill_manager = init_skill_manager(&data_dir).await;
         let metrics_service = init_metrics_service(&data_dir).await?;
+
+        // Service input and ToolEvent routing share one AppState-owned
+        // lifecycle. The router is built before the tool surfaces so every
+        // executor receives the production publisher from its first call;
+        // it remains inert until install/boot reconciliation declares sinks.
+        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
+        let tool_event_router = ToolEventRouter::new(service_manager.clone());
+        let tool_event_publisher: Arc<dyn ToolEventPublisher> = Arc::new(
+            CombinedToolEventPublisher::new(tool_event_router.clone(), tool_event_publisher),
+        );
 
         let startup_sessions = {
             let entries = session_store.list_index_entries().await;
@@ -1006,7 +1017,6 @@ impl AppState {
         // until a plugin install or the boot-time reconcile below starts
         // something — mirrors `mcp_manager`/`connect_manager`'s
         // always-alive lifecycle.
-        let service_manager = Arc::new(crate::service_manager::ServiceManager::new());
         // Backgrounded (mirrors `init_mcp_manager`'s background MCP
         // bootstrap): a service that `installed.json` says should be
         // running but isn't (the previous `bamboo serve` process, if
@@ -1014,16 +1024,22 @@ impl AppState {
         //
         // The `JoinHandle` is kept (not discarded) purely so tests can
         // deterministically wait it out via
-        // `AppState::wait_for_boot_reconcile_services` instead of racing
-        // this unsynchronized pass — see that method's doc comment and issue
-        // #486. Production code never awaits it; server startup is never
-        // blocked on plugin service spawns.
+        // `AppState::wait_for_boot_reconcile_services`. The pass shares the
+        // plugin operation lock with install/update/uninstall, so its
+        // manifest/provenance generation cannot race a newer mutation; see
+        // that method's doc comment and issue #486. Production code never
+        // awaits it; server startup is never blocked on plugin service spawns.
         let boot_reconcile_services_handle = {
             let service_manager = service_manager.clone();
+            let tool_event_router = tool_event_router.clone();
             let app_data_dir = bamboo_home_dir.clone();
             tokio::spawn(async move {
-                crate::plugin_installer::boot_reconcile_services(&app_data_dir, &service_manager)
-                    .await;
+                crate::plugin_installer::boot_reconcile_services(
+                    &app_data_dir,
+                    &service_manager,
+                    &tool_event_router,
+                )
+                .await;
             })
         };
 
@@ -1041,6 +1057,7 @@ impl AppState {
         Ok(Self {
             app_data_dir: bamboo_home_dir,
             tool_event_publisher,
+            tool_event_router,
             config,
             config_facade,
             config_io_lock,
