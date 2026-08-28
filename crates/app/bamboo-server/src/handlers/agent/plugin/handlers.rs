@@ -14,7 +14,9 @@ use bamboo_plugin::{InstallDisposition, PluginInstaller, PluginSource};
 
 use crate::app_state::AppState;
 use crate::plugin_installer::ServerPluginInstaller;
-use crate::plugin_source::{install_server_plugin_from_source, PluginSourceInput};
+use crate::plugin_source::{
+    install_server_plugin_from_source_with_event_sink_grants, PluginSourceInput,
+};
 
 use super::api_types::{to_view, InstallPluginRequest, PluginListResponse};
 use super::errors::plugin_error_response;
@@ -86,16 +88,19 @@ pub async fn install_plugin(
 ) -> impl Responder {
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
-    let input = to_source_input(body.into_inner().source);
+    let request = body.into_inner();
+    let grants = request.event_sink_grants;
+    let input = to_source_input(request.source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    match install_server_plugin_from_source(
+    match install_server_plugin_from_source_with_event_sink_grants(
         &installer,
         input,
         &root,
         &trust,
         InstallDisposition::FailIfInstalled,
         None,
+        grants.as_deref(),
     )
     .await
     {
@@ -122,16 +127,19 @@ pub async fn update_plugin(
     let path_id = path.into_inner();
     let installer = ServerPluginInstaller::new(state.clone());
     let root = plugins_root(&state);
-    let input = to_source_input(body.into_inner().source);
+    let request = body.into_inner();
+    let grants = request.event_sink_grants;
+    let input = to_source_input(request.source);
     let trust = state.config.read().await.plugin_trust.clone();
 
-    match install_server_plugin_from_source(
+    match install_server_plugin_from_source_with_event_sink_grants(
         &installer,
         input,
         &root,
         &trust,
         InstallDisposition::Upgrade,
         Some(&path_id),
+        grants.as_deref(),
     )
     .await
     {

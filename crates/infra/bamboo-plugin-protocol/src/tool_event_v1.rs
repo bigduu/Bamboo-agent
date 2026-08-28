@@ -1,8 +1,14 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
+
+use crate::projected_tool_event_v1::{
+    MAX_PROJECTED_TOOL_EVENT_CONTENT_BYTES, MAX_PROJECTED_TOOL_EVENT_DIFF_BYTES,
+    TOOL_EVENT_PATH_REDACTION_PERMISSION_NOT_GRANTED, TOOL_EVENT_PATH_REDACTION_SENSITIVE,
+    TOOL_EVENT_PATH_REDACTION_UNSAFE,
+};
 
 /// Wire schema carried by every [`ToolEventV1`].
 pub const TOOL_EVENT_V1_SCHEMA_VERSION: u16 = 1;
@@ -229,20 +235,25 @@ impl ToolEventV1 {
         context: ToolEventContextV1,
         data: FileChangedV1,
     ) -> Result<Self, ToolEventBuildError> {
-        // Validate before flatten serialization so a programmatically supplied
-        // extension cannot create a duplicate reserved JSON key.
+        // Validate borrowed/owned fields before moving them into the raw
+        // producer envelope. Build the Value directly: host projection must
+        // get the first and only serialization opportunity for fields that a
+        // plugin may not be authorized to observe.
         context.validate_bounds()?;
         data.validate_bounds()?;
+        let FileChangedV1 { path, extensions } = data;
+        let mut data = Map::new();
+        data.insert("path".to_string(), Value::String(path));
+        data.extend(extensions);
         let event = Self {
             schema_version: TOOL_EVENT_V1_SCHEMA_VERSION,
             event_type: ToolEventTypeV1::file_changed(),
             subscription_id: ToolEventSubscriptionId::file_changed_v1(),
             context,
-            data: serde_json::to_value(data)
-                .map_err(|error| ToolEventBuildError::Serialization(error.to_string()))?,
+            data: Value::Object(data),
             extensions: BTreeMap::new(),
         };
-        event.validate_bounds()?;
+        event.validate_projection_input_bounds()?;
         Ok(event)
     }
 
@@ -257,6 +268,32 @@ impl ToolEventV1 {
 
     /// Revalidate an event before crossing a bounded publisher boundary.
     pub fn validate_bounds(&self) -> Result<(), ToolEventBuildError> {
+        self.validate_projection_input_bounds()?;
+
+        // The complete protocol boundary retains an exact serialized-byte
+        // check. Host policy routers may instead call the field-only method
+        // below, discard unknown/unauthorized extensions without cloning or
+        // serializing them, and size the resulting projection exactly once.
+        let actual = serde_json::to_vec(self)
+            .map_err(|error| ToolEventBuildError::Serialization(error.to_string()))?
+            .len();
+        if actual > MAX_TOOL_EVENT_JSON_BYTES {
+            return Err(ToolEventBuildError::EventTooLarge {
+                actual,
+                max: MAX_TOOL_EVENT_JSON_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate authority-bearing fields and the known payload shape without
+    /// serializing or deep-cloning producer extensions.
+    ///
+    /// This is the input half of a host projection boundary: callers MUST
+    /// construct a new deny-by-default DTO and apply an exact total-byte bound
+    /// to that projection before queueing it. It is intentionally not a
+    /// replacement for [`Self::validate_bounds`] at general wire boundaries.
+    pub fn validate_projection_input_bounds(&self) -> Result<(), ToolEventBuildError> {
         if self.schema_version != TOOL_EVENT_V1_SCHEMA_VERSION {
             return Err(ToolEventBuildError::UnsupportedSchemaVersion {
                 actual: self.schema_version,
@@ -296,19 +333,17 @@ impl ToolEventV1 {
             return Err(ToolEventBuildError::KnownVariantMismatch);
         }
         if event_known {
-            let data: FileChangedV1 = serde_json::from_value(self.data.clone())
-                .map_err(|error| ToolEventBuildError::InvalidKnownPayload(error.to_string()))?;
-            data.validate_bounds()?;
-        }
-
-        let actual = serde_json::to_vec(self)
-            .map_err(|error| ToolEventBuildError::Serialization(error.to_string()))?
-            .len();
-        if actual > MAX_TOOL_EVENT_JSON_BYTES {
-            return Err(ToolEventBuildError::EventTooLarge {
-                actual,
-                max: MAX_TOOL_EVENT_JSON_BYTES,
-            });
+            let path = self
+                .data
+                .as_object()
+                .and_then(|data| data.get("path"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolEventBuildError::InvalidKnownPayload(
+                        "file_changed data.path must be a string".to_string(),
+                    )
+                })?;
+            validate_required("data.path", path, MAX_TOOL_EVENT_PATH_BYTES)?;
         }
         Ok(())
     }
@@ -388,7 +423,7 @@ pub fn tool_event_v1_schema() -> Value {
             "subscription_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": MAX_TOOL_EVENT_SUBSCRIPTION_ID_BYTES },
             "context": {
                 "type": "object",
-                "required": ["session_id", "root_session_id", "tool_name", "tool_call_id"],
+                "required": ["session_id", "root_session_id", "tool_call_id"],
                 "properties": {
                     "session_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": MAX_TOOL_EVENT_SESSION_ID_BYTES },
                     "root_session_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": MAX_TOOL_EVENT_ROOT_SESSION_ID_BYTES },
@@ -397,7 +432,8 @@ pub fn tool_event_v1_schema() -> Value {
                 },
                 "additionalProperties": true
             },
-            "data": { "type": "object" }
+            "data": { "type": "object" },
+            "observation_policy_generation": { "type": "integer", "minimum": 1 }
         },
         "allOf": [{
             "if": {
@@ -411,10 +447,45 @@ pub fn tool_event_v1_schema() -> Value {
                     "subscription_id": { "const": FILE_CHANGED_SUBSCRIPTION_ID_V1 },
                     "data": {
                         "type": "object",
-                        "required": ["path"],
                         "properties": {
-                            "path": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": MAX_TOOL_EVENT_PATH_BYTES }
+                            "path": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": MAX_TOOL_EVENT_PATH_BYTES },
+                            "path_redaction_reason": {
+                                "type": "string",
+                                "enum": [
+                                    TOOL_EVENT_PATH_REDACTION_PERMISSION_NOT_GRANTED,
+                                    TOOL_EVENT_PATH_REDACTION_SENSITIVE,
+                                    TOOL_EVENT_PATH_REDACTION_UNSAFE
+                                ]
+                            },
+                            "diff": { "type": "string", "x-bamboo-maxUtf8Bytes": MAX_PROJECTED_TOOL_EVENT_DIFF_BYTES },
+                            "diff_truncated": { "type": "boolean" },
+                            "content": { "type": "string", "x-bamboo-maxUtf8Bytes": MAX_PROJECTED_TOOL_EVENT_CONTENT_BYTES },
+                            "content_truncated": { "type": "boolean" }
                         },
+                        "oneOf": [{
+                            "required": ["path"],
+                            "not": { "required": ["path_redaction_reason"] }
+                        }, {
+                            "required": ["path_redaction_reason"],
+                            "not": { "required": ["path"] }
+                        }],
+                        "allOf": [{
+                            "if": {
+                                "anyOf": [
+                                    { "required": ["diff"] },
+                                    { "required": ["diff_truncated"] },
+                                    { "required": ["content"] },
+                                    { "required": ["content_truncated"] }
+                                ]
+                            },
+                            "then": { "required": ["path"] }
+                        }, {
+                            "if": { "required": ["diff_truncated"] },
+                            "then": { "required": ["diff"] }
+                        }, {
+                            "if": { "required": ["content_truncated"] },
+                            "then": { "required": ["content"] }
+                        }],
                         "additionalProperties": true
                     }
                 }
@@ -478,6 +549,44 @@ mod tests {
         let mut mismatched = fixture;
         mismatched["subscription_id"] = json!("tool.future.v1");
         assert!(validator.validate(&mismatched).is_err());
+    }
+
+    #[test]
+    fn metadata_only_host_projection_round_trips_and_validates_against_public_schema() {
+        let projection = crate::ProjectedToolEventV1::file_changed(
+            crate::ProjectedToolEventContextV1 {
+                session_id: "session-1".to_string(),
+                root_session_id: "root-session-1".to_string(),
+                tool_name: None,
+                tool_call_id: "call-1".to_string(),
+            },
+            crate::ProjectedFileChangedV1 {
+                path_redaction_reason: Some(
+                    crate::TOOL_EVENT_PATH_REDACTION_PERMISSION_NOT_GRANTED.to_string(),
+                ),
+                ..crate::ProjectedFileChangedV1::default()
+            },
+            3,
+        );
+        let value = serde_json::to_value(&projection).unwrap();
+        assert!(value["context"].get("tool_name").is_none());
+        assert!(value["data"].get("path").is_none());
+        let validator = jsonschema::validator_for(&tool_event_v1_schema()).unwrap();
+        assert!(validator.validate(&value).is_ok());
+        assert_eq!(
+            serde_json::from_value::<crate::ProjectedToolEventV1>(value.clone()).unwrap(),
+            projection
+        );
+
+        let mut path_and_reason = value.clone();
+        path_and_reason["data"]["path"] = json!("/workspace/file.rs");
+        assert!(validator.validate(&path_and_reason).is_err());
+        let mut redacted_payload = value.clone();
+        redacted_payload["data"]["content"] = json!("must-not-be-accepted");
+        assert!(validator.validate(&redacted_payload).is_err());
+        let mut empty_data = value;
+        empty_data["data"] = json!({});
+        assert!(validator.validate(&empty_data).is_err());
     }
 
     #[test]
@@ -558,6 +667,28 @@ mod tests {
             json!("x".repeat(MAX_TOOL_EVENT_JSON_BYTES)),
         );
 
+        assert!(matches!(
+            event.validate_bounds(),
+            Err(ToolEventBuildError::EventTooLarge {
+                actual,
+                max: MAX_TOOL_EVENT_JSON_BYTES,
+            }) if actual > MAX_TOOL_EVENT_JSON_BYTES
+        ));
+    }
+
+    #[test]
+    fn raw_constructor_does_not_serialize_unknown_payload_before_projection() {
+        let mut data = FileChangedV1::bounded("/workspace/file.rs").unwrap();
+        data.extensions.insert(
+            "future_secret".to_string(),
+            json!("secret".repeat(MAX_TOOL_EVENT_JSON_BYTES)),
+        );
+
+        let event = ToolEventV1::file_changed(
+            ToolEventContextV1::bounded("session", "root", "Write", "call").unwrap(),
+            data,
+        )
+        .expect("field-valid raw input is assembled without whole-event serialization");
         assert!(matches!(
             event.validate_bounds(),
             Err(ToolEventBuildError::EventTooLarge {

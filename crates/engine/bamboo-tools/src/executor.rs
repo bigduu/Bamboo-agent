@@ -2964,6 +2964,129 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_intermediate_symlink_fails_and_emits_zero_events() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let linked_dir = workspace.path().join("linked");
+        symlink(external.path(), &linked_dir).unwrap();
+        let target = linked_dir.join("write.txt");
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Write")
+            .unwrap()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let call = make_tool_call_with_id(
+            "symlink-write",
+            "Write",
+            json!({"file_path": target, "content": "must-not-write"}),
+        );
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                tool_event_context(&call, Some("symlink-session"), Some("symlink-root")),
+            )
+            .await;
+        assert!(
+            result.is_err() || result.as_ref().is_ok_and(|result| !result.success),
+            "Write must fail closed through an intermediate symlink"
+        );
+        assert!(!external.path().join("write.txt").exists());
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_of_symlinked_file_fails_and_emits_zero_events() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.txt");
+        let linked = dir.path().join("linked.txt");
+        fs::write(&real, "before\n").await.unwrap();
+        symlink(&real, &linked).unwrap();
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutor::new().with_tool_event_publisher(recorder.clone());
+        let read =
+            make_tool_call_with_id("symlink-edit-read", "Read", json!({"file_path": linked}));
+        let _ = executor
+            .execute_with_context(
+                &read,
+                tool_event_context(&read, Some("symlink-session"), Some("symlink-root")),
+            )
+            .await;
+        let edit = make_tool_call_with_id(
+            "symlink-edit",
+            "Edit",
+            json!({
+                "file_path": linked,
+                "old_string": "before",
+                "new_string": "after"
+            }),
+        );
+
+        let result = executor
+            .execute_with_context(
+                &edit,
+                tool_event_context(&edit, Some("symlink-session"), Some("symlink-root")),
+            )
+            .await;
+        assert!(
+            result.is_err() || result.as_ref().is_ok_and(|result| !result.success),
+            "Edit must fail closed for a symlinked final file"
+        );
+        assert_eq!(fs::read_to_string(&real).await.unwrap(), "before\n");
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notebook_edit_through_intermediate_symlink_fails_and_emits_zero_events() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let real_notebook = external.path().join("real.ipynb");
+        let original = r#"{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        fs::write(&real_notebook, original).await.unwrap();
+        let linked_dir = workspace.path().join("linked");
+        symlink(external.path(), &linked_dir).unwrap();
+        let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("NotebookEdit")
+            .unwrap()
+            .with_tool_event_publisher(recorder.clone())
+            .build();
+        let call = make_tool_call_with_id(
+            "symlink-notebook",
+            "NotebookEdit",
+            json!({
+                "notebook_path": linked_dir.join("real.ipynb"),
+                "new_source": "print('must not write')",
+                "cell_type": "code",
+                "edit_mode": "insert"
+            }),
+        );
+
+        let result = executor
+            .execute_with_context(
+                &call,
+                tool_event_context(&call, Some("symlink-session"), Some("symlink-root")),
+            )
+            .await;
+        assert!(
+            result.is_err() || result.as_ref().is_ok_and(|result| !result.success),
+            "NotebookEdit must fail closed through an intermediate symlink"
+        );
+        assert_eq!(fs::read_to_string(&real_notebook).await.unwrap(), original);
+        assert!(recorder.try_snapshot().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn failed_and_non_successful_mutations_emit_no_event() {
         let recorder = Arc::new(InMemoryToolEventRecorder::new(4).unwrap());

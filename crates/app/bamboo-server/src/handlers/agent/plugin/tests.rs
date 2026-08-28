@@ -153,6 +153,22 @@ async fn write_event_sink_plugin_dir(
     dir
 }
 
+async fn configure_event_sink_fixture(
+    source: &Path,
+    requested_permissions: &[&str],
+    enabled: bool,
+) {
+    let manifest_path = source.join("plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&tokio::fs::read_to_string(&manifest_path).await.unwrap()).unwrap();
+    manifest["provides"]["services"][0]["enabled"] = serde_json::json!(enabled);
+    manifest["provides"]["event_sinks"][0]["requested_permissions"] =
+        serde_json::json!(requested_permissions);
+    tokio::fs::write(manifest_path, manifest.to_string())
+        .await
+        .unwrap();
+}
+
 async fn body_json(response: actix_web::dev::ServiceResponse) -> serde_json::Value {
     let bytes = test::read_body(response).await;
     serde_json::from_slice(&bytes).expect("valid json body")
@@ -280,6 +296,188 @@ async fn installed_event_sink_exposes_bounded_sanitized_status() {
     let safe = serde_json::to_string(status).unwrap();
     assert!(!safe.contains("payload-must-not-enter-status"));
     assert!(!safe.contains(source.to_string_lossy().as_ref()));
+}
+
+#[actix_web::test]
+async fn corrupt_persisted_grant_strings_are_not_reflected_by_plugin_status() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
+    let source = write_event_sink_plugin_dir(
+        source_root.path(),
+        "corrupt-status-source",
+        "corrupt-status-plugin",
+        "1.0.0",
+        "fixture",
+    )
+    .await;
+    configure_event_sink_fixture(&source, &["metadata", "paths"], false).await;
+
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state)).await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(local_dir_source(&source))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let installed_json = data_dir.path().join("plugins").join("installed.json");
+    let mut store = InstalledPlugins::load(&installed_json).await.unwrap();
+    store.plugins[0].registered.event_sink_grants.insert(
+        "shared-sink".to_string(),
+        vec![
+            bamboo_plugin::ObservationPermissionId::new("metadata"),
+            bamboo_plugin::ObservationPermissionId::new("credential-sentinel"),
+        ],
+    );
+    store.save(&installed_json).await.unwrap();
+
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get().uri("/api/v1/plugins").to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed = body_json(response).await;
+    assert!(
+        listed["plugins"][0]["registered"]
+            .get("event_sink_grants")
+            .is_none(),
+        "a corrupt authority map must fail closed instead of being reflected"
+    );
+    assert!(!listed.to_string().contains("credential-sentinel"));
+}
+
+#[actix_web::test]
+async fn install_and_update_surface_exact_requested_and_persisted_grants() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
+    let initial = write_event_sink_plugin_dir(
+        source_root.path(),
+        "grant-v1-source",
+        "grant-plugin",
+        "1.0.0",
+        "v1",
+    )
+    .await;
+    configure_event_sink_fixture(
+        &initial,
+        &["content", "metadata", "tool_name", "paths"],
+        false,
+    )
+    .await;
+
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let mut body = local_dir_source(&initial);
+    body["event_sink_grants"] = serde_json::json!([{
+        "sink_id": "shared-sink",
+        "granted_permissions": ["content", "paths", "metadata", "tool_name"]
+    }]);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(body)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let installed = body_json(response).await;
+    assert_eq!(
+        installed["registered"]["event_sink_grants"]["shared-sink"],
+        serde_json::json!(["metadata", "tool_name", "paths", "content"])
+    );
+    assert_eq!(
+        installed["event_sink_status"][0]["requested_permissions"],
+        serde_json::json!(["content", "metadata", "tool_name", "paths"])
+    );
+    assert_eq!(
+        installed["event_sink_status"][0]["granted_permissions"],
+        serde_json::json!(["metadata", "tool_name", "paths", "content"])
+    );
+    assert!(installed["event_sink_status"][0]["policy_generation"]
+        .as_u64()
+        .is_some_and(|generation| generation > 0));
+
+    let update = write_event_sink_plugin_dir(
+        source_root.path(),
+        "grant-v2-source",
+        "grant-plugin",
+        "2.0.0",
+        "v2",
+    )
+    .await;
+    configure_event_sink_fixture(
+        &update,
+        &["diff", "metadata", "paths", "content", "tool_name"],
+        false,
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/grant-plugin/update")
+            .set_json(local_dir_source(&update))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = body_json(response).await;
+    assert_eq!(
+        updated["registered"]["event_sink_grants"]["shared-sink"],
+        serde_json::json!(["metadata", "tool_name", "paths", "content"]),
+        "an omitted update grant target must not auto-authorize the newly requested diff field"
+    );
+    assert_eq!(
+        updated["event_sink_status"][0]["granted_permissions"],
+        serde_json::json!(["metadata", "tool_name", "paths", "content"])
+    );
+}
+
+#[actix_web::test]
+async fn duplicate_sink_grant_request_is_rejected_before_install_mutation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let source_root = tempfile::tempdir().unwrap();
+    let source = write_event_sink_plugin_dir(
+        source_root.path(),
+        "duplicate-grant-source",
+        "duplicate-grant-plugin",
+        "1.0.0",
+        "must-not-activate",
+    )
+    .await;
+    configure_event_sink_fixture(&source, &["metadata", "paths"], false).await;
+
+    let state = test_state(data_dir.path()).await;
+    let app = test::init_service(plugin_test_app!(state.clone())).await;
+    let mut body = local_dir_source(&source);
+    body["event_sink_grants"] = serde_json::json!([
+        {"sink_id": "shared-sink", "granted_permissions": ["metadata"]},
+        {"sink_id": "shared-sink", "granted_permissions": ["metadata", "paths"]}
+    ]);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/plugins/install")
+            .set_json(body)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = body_json(response).await;
+    assert!(error_message(&error).contains("repeats sink"), "{error}");
+    assert!(!data_dir
+        .path()
+        .join("plugins/duplicate-grant-plugin")
+        .exists());
+    let store = InstalledPlugins::load(&data_dir.path().join("plugins/installed.json"))
+        .await
+        .unwrap();
+    assert!(store.list().is_empty());
 }
 
 // ---------------------------------------------------------------------

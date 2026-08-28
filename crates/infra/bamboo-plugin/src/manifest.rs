@@ -604,10 +604,19 @@ pub struct EventSinkManifestEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum EventSinkInactiveReason {
-    UnsupportedProtocolVersion { requested: u16, supported: u16 },
+    UnsupportedProtocolVersion {
+        requested: u16,
+        supported: u16,
+    },
     InstallIncomplete,
     PlatformIneligible,
     ServiceDisabled,
+    /// The manifest narrows delivery using a field that the host has not
+    /// granted this sink permission to observe. Keeping the sink inactive
+    /// avoids turning delivery versus non-delivery into a side channel.
+    ObservationPermissionNotGranted {
+        permission: ObservationPermissionId,
+    },
 }
 
 /// Eligibility emitted by pure reconciliation. `Eligible` intentionally does

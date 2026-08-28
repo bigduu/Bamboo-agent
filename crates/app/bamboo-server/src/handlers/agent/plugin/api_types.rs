@@ -7,8 +7,9 @@
 //! re-syncing both sides:
 //!
 //! - `GET /api/v1/plugins` -> `200 { "plugins": [InstalledPluginView, ...] }`
-//! - `POST /api/v1/plugins/install` body `{ "source": SourceSpec }` -> `201 InstalledPluginView`
-//! - `POST /api/v1/plugins/{id}/update` body `{ "source": SourceSpec }` -> `200 InstalledPluginView`
+//! - `POST /api/v1/plugins/install` body `{ "source": SourceSpec,
+//!   "event_sink_grants"?: GrantRecord[] }` -> `201 InstalledPluginView`
+//! - `POST /api/v1/plugins/{id}/update` uses the same body -> `200 InstalledPluginView`
 //! - `DELETE /api/v1/plugins/{id}` -> `200 { "id", "removed": true }`
 //!
 //! `SourceSpec` reuses [`bamboo_plugin::PluginSource`]'s own
@@ -64,19 +65,27 @@
 use serde::{Deserialize, Serialize};
 
 use bamboo_plugin::{
-    EventSinkInactiveReason, InstalledPlugin, PluginInstallStatus, PluginManifest, PluginSource,
-    RegisteredCapabilities, ServiceInputProtocol,
+    EventSinkInactiveReason, InstalledPlugin, ObservationPermissionId, PluginInstallStatus,
+    PluginManifest, PluginSource, RegisteredCapabilities, ServiceInputProtocol,
 };
 
 use crate::service_manager::{
     ServiceInputHealth, ServiceInputStatusSnapshot, ServiceManager, ServiceState,
 };
+use crate::tool_event_policy::{canonicalize_persisted_event_sink_grants, EventSinkGrantRequest};
 use crate::tool_event_router::{ToolEventRouter, ToolEventSinkState, ToolEventSinkStatusSnapshot};
 
 /// Shared body for `POST /install` and `POST /{id}/update`.
 #[derive(Debug, Deserialize)]
 pub struct InstallPluginRequest {
     pub source: PluginSource,
+    /// Optional complete ToolEventV1 host-grant target. `Some` means every
+    /// listed sink receives exactly its listed permissions and every omitted
+    /// v1 sink falls back to metadata-only. On update, omission of this field
+    /// preserves only the intersection of prior grants and new requests.
+    /// A list (not a JSON map) keeps duplicate sink ids detectable.
+    #[serde(default)]
+    pub event_sink_grants: Option<Vec<EventSinkGrantRequest>>,
 }
 
 /// `GET /plugins` element, and the body of a successful install/update
@@ -121,6 +130,10 @@ pub struct ToolEventSinkStatusView {
     pub inactive_reason: Option<EventSinkInactiveReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<u64>,
+    pub requested_permissions: Vec<ObservationPermissionId>,
+    pub granted_permissions: Vec<ObservationPermissionId>,
     pub queue_capacity: usize,
     pub max_event_bytes: usize,
     pub delivered: u64,
@@ -138,6 +151,9 @@ impl From<ToolEventSinkStatusSnapshot> for ToolEventSinkStatusView {
             state: snapshot.state,
             inactive_reason: snapshot.inactive_reason,
             generation: snapshot.generation,
+            policy_generation: snapshot.policy_generation,
+            requested_permissions: snapshot.requested_permissions,
+            granted_permissions: snapshot.granted_permissions,
             queue_capacity: snapshot.queue_capacity,
             max_event_bytes: snapshot.max_event_bytes,
             delivered: snapshot.delivered,
@@ -230,9 +246,21 @@ pub async fn to_view(
     service_manager: &ServiceManager,
     tool_event_router: &ToolEventRouter,
 ) -> InstalledPluginView {
-    let name = read_manifest_name(&entry.plugin_dir).await;
-    let mut service_status = Vec::with_capacity(entry.registered.service_ids.len());
-    for service_id in &entry.registered.service_ids {
+    let manifest = read_manifest(&entry.plugin_dir).await;
+    let name = manifest.as_ref().map(|manifest| manifest.name.clone());
+    let mut registered = entry.registered;
+    // `installed.json` is durable authority, not a trusted wire DTO. Only
+    // expose a manifest-validated canonical map; a hand-corrupt value is
+    // omitted here and represented by unavailable sink status instead of
+    // reflecting arbitrary strings back to API callers.
+    registered.event_sink_grants = manifest
+        .as_ref()
+        .and_then(|manifest| {
+            canonicalize_persisted_event_sink_grants(manifest, &registered.event_sink_grants).ok()
+        })
+        .unwrap_or_default();
+    let mut service_status = Vec::with_capacity(registered.service_ids.len());
+    for service_id in &registered.service_ids {
         let view = match service_manager.status(service_id).await {
             Some(snapshot) => ServiceStatusView {
                 id: snapshot.id,
@@ -258,7 +286,7 @@ pub async fn to_view(
         service_status.push(view);
     }
     let event_sink_status = tool_event_router
-        .status_for_ids(&entry.registered.event_sink_ids)
+        .status_for_ids(&registered.event_sink_ids)
         .await
         .into_iter()
         .map(Into::into)
@@ -269,16 +297,15 @@ pub async fn to_view(
         version: entry.version,
         source: entry.source,
         status: entry.status,
-        registered: entry.registered,
+        registered,
         service_status,
         event_sink_status,
     }
 }
 
-async fn read_manifest_name(plugin_dir: &std::path::Path) -> Option<String> {
+async fn read_manifest(plugin_dir: &std::path::Path) -> Option<PluginManifest> {
     let raw = tokio::fs::read_to_string(plugin_dir.join("plugin.json"))
         .await
         .ok()?;
-    let manifest = PluginManifest::parse_str(&raw).ok()?;
-    Some(manifest.name)
+    PluginManifest::parse_str(&raw).ok()
 }

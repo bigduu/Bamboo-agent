@@ -12,7 +12,7 @@
 //! deregistering capabilities (MCP servers, prompt presets, workflow files)
 //! is the installer's job (see [`crate::installer`] and `PLUGIN_PLAN.md`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::error::{PluginError, PluginResult};
-use crate::manifest::{EventSinkCapabilityState, EventSinkManifestEntry, Platform, PluginManifest};
+use crate::manifest::{
+    EventSinkCapabilityState, EventSinkManifestEntry, ObservationPermissionId, Platform,
+    PluginManifest,
+};
 
 /// Where a plugin's installed bundle came from. Recorded verbatim so
 /// `update`/reinstall can re-fetch from the same place.
@@ -115,6 +118,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Exact host-authorized observation permissions keyed by declared sink id.
+/// This is provenance/policy state, never inferred from manifest requests.
+pub type EventSinkPermissionGrants = BTreeMap<String, Vec<ObservationPermissionId>>;
+
 /// Exactly what an installed plugin registered into Bamboo's shared capability
 /// stores. Every id/name here MUST have actually been written by the
 /// installer for THIS plugin — never a superset (that would risk clobbering
@@ -147,6 +154,10 @@ pub struct RegisteredCapabilities {
     /// is exact manifest/lifecycle provenance for the later router.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_sink_ids: Vec<String>,
+    /// Host grants persisted in both Installing and Installed journal rows.
+    /// A legacy absent field is interpreted as metadata-only per v1 sink.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_sink_grants: EventSinkPermissionGrants,
 }
 
 impl RegisteredCapabilities {
@@ -177,6 +188,9 @@ impl RegisteredCapabilities {
             workflow_filenames: subtract(&old.workflow_filenames, &self.workflow_filenames),
             service_ids: subtract(&old.service_ids, &self.service_ids),
             event_sink_ids: subtract(&old.event_sink_ids, &self.event_sink_ids),
+            // Grants are policy provenance for retained/replaced declarations,
+            // not independently deregistered capabilities.
+            event_sink_grants: BTreeMap::new(),
         }
     }
 
@@ -792,6 +806,7 @@ mod tests {
                 workflow_filenames: vec![],
                 service_ids: vec![],
                 event_sink_ids: vec![],
+                event_sink_grants: BTreeMap::new(),
             },
         }
     }
@@ -1010,6 +1025,10 @@ mod tests {
             workflow_filenames: vec!["wf-a.md".to_string()],
             service_ids: vec!["svc-a".to_string(), "svc-b".to_string()],
             event_sink_ids: vec!["sink-a".to_string(), "sink-b".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![ObservationPermissionId::new("metadata")],
+            )]),
         };
         // New version drops srv-b, preset-a, and svc-b; keeps the rest; adds srv-c.
         let new = RegisteredCapabilities {
@@ -1019,6 +1038,13 @@ mod tests {
             workflow_filenames: vec!["wf-a.md".to_string()],
             service_ids: vec!["svc-a".to_string()],
             event_sink_ids: vec!["sink-a".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
         };
 
         let removed = new.removed_since(&old);
@@ -1028,6 +1054,39 @@ mod tests {
         assert!(removed.workflow_filenames.is_empty());
         assert_eq!(removed.service_ids, vec!["svc-b".to_string()]);
         assert_eq!(removed.event_sink_ids, vec!["sink-b".to_string()]);
+        assert!(removed.event_sink_grants.is_empty());
+        assert!(RegisteredCapabilities {
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![ObservationPermissionId::new("metadata")],
+            )]),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn event_sink_grants_round_trip_and_legacy_absence_defaults_empty() {
+        let legacy: RegisteredCapabilities = serde_json::from_value(serde_json::json!({
+            "event_sink_ids": ["audit-events"]
+        }))
+        .unwrap();
+        assert!(legacy.event_sink_grants.is_empty());
+
+        let exact = RegisteredCapabilities {
+            event_sink_ids: vec!["audit-events".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "audit-events".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let round_trip: RegisteredCapabilities =
+            serde_json::from_value(serde_json::to_value(&exact).unwrap()).unwrap();
+        assert_eq!(round_trip, exact);
     }
 
     #[test]

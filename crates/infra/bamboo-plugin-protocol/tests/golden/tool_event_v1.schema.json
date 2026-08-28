@@ -11,7 +11,7 @@
     "subscription_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": 128 },
     "context": {
       "type": "object",
-      "required": ["session_id", "root_session_id", "tool_name", "tool_call_id"],
+      "required": ["session_id", "root_session_id", "tool_call_id"],
       "properties": {
         "session_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": 256 },
         "root_session_id": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": 256 },
@@ -20,7 +20,8 @@
       },
       "additionalProperties": true
     },
-    "data": { "type": "object" }
+    "data": { "type": "object" },
+    "observation_policy_generation": { "type": "integer", "minimum": 1 }
   },
   "allOf": [
     {
@@ -35,10 +36,48 @@
           "subscription_id": { "const": "tool.file_changed.v1" },
           "data": {
             "type": "object",
-            "required": ["path"],
             "properties": {
-              "path": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": 4096 }
+              "path": { "type": "string", "minLength": 1, "x-bamboo-maxUtf8Bytes": 4096 },
+              "path_redaction_reason": {
+                "type": "string",
+                "enum": ["permission_not_granted", "sensitive_path", "unsafe_path"]
+              },
+              "diff": { "type": "string", "x-bamboo-maxUtf8Bytes": 4096 },
+              "diff_truncated": { "type": "boolean" },
+              "content": { "type": "string", "x-bamboo-maxUtf8Bytes": 8192 },
+              "content_truncated": { "type": "boolean" }
             },
+            "oneOf": [
+              {
+                "required": ["path"],
+                "not": { "required": ["path_redaction_reason"] }
+              },
+              {
+                "required": ["path_redaction_reason"],
+                "not": { "required": ["path"] }
+              }
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "anyOf": [
+                    { "required": ["diff"] },
+                    { "required": ["diff_truncated"] },
+                    { "required": ["content"] },
+                    { "required": ["content_truncated"] }
+                  ]
+                },
+                "then": { "required": ["path"] }
+              },
+              {
+                "if": { "required": ["diff_truncated"] },
+                "then": { "required": ["diff"] }
+              },
+              {
+                "if": { "required": ["content_truncated"] },
+                "then": { "required": ["content"] }
+              }
+            ],
             "additionalProperties": true
           }
         }

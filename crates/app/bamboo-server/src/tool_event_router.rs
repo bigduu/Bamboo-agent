@@ -16,12 +16,14 @@ use std::time::Duration;
 
 use bamboo_plugin::manifest::{
     EventSinkCapabilityState, EventSinkInactiveReason, EventSinkManifestEntry,
-    MAX_EVENT_SINKS_PER_PLUGIN, MAX_EVENT_SINK_ID_BYTES,
+    ObservationPermissionId, MAX_EVENT_SINKS_PER_PLUGIN, MAX_EVENT_SINK_ID_BYTES,
+    OBSERVE_TOOL_NAME_PERMISSION,
 };
 use bamboo_plugin::registry::EventSinkReconciliation;
-use bamboo_plugin::PluginManifest;
+use bamboo_plugin::{EventSinkPermissionGrants, PluginManifest};
 use bamboo_plugin_protocol::{
-    ToolEventPublishError, ToolEventPublisher, ToolEventV1, FILE_CHANGED_SUBSCRIPTION_ID_V1,
+    ProjectedToolEventV1, ToolEventPublishError, ToolEventPublisher, ToolEventV1,
+    FILE_CHANGED_SUBSCRIPTION_ID_V1, MAX_TOOL_EVENT_JSON_BYTES,
 };
 use parking_lot::RwLock as ParkingRwLock;
 use serde::Serialize;
@@ -31,6 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::service_manager::{
     ServiceInputHealth, ServiceInputSendError, ServiceInputSender, ServiceManager,
+};
+use crate::tool_event_policy::{
+    canonicalize_persisted_event_sink_grants, project_tool_event, GrantedObservation,
+    ToolEventObservationPolicy,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
@@ -57,6 +63,14 @@ pub struct ToolEventSinkStatusSnapshot {
     pub inactive_reason: Option<EventSinkInactiveReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// Immutable host-policy generation used by every event projected through
+    /// this registration snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_generation: Option<u64>,
+    /// Bounded manifest requests. These ids carry no payload or credential.
+    pub requested_permissions: Vec<ObservationPermissionId>,
+    /// Host grants intersected with this sink's requests.
+    pub granted_permissions: Vec<ObservationPermissionId>,
     pub queue_capacity: usize,
     pub max_event_bytes: usize,
     /// Accepted by the exact live service-generation input queue. This is
@@ -110,7 +124,7 @@ struct SubscriptionFilter {
 }
 
 impl SubscriptionFilter {
-    fn matches(&self, event: &ToolEventV1) -> bool {
+    fn matches(&self, event: &ToolEventV1, can_observe_tool_name: bool) -> bool {
         if self.id != event.subscription_id.as_str() {
             return false;
         }
@@ -120,8 +134,15 @@ impl SubscriptionFilter {
         if self.id == FILE_CHANGED_SUBSCRIPTION_ID_V1 && !event.event_type.is_file_changed() {
             return false;
         }
-        self.tool_names.is_empty()
-            || self
+        if self.tool_names.is_empty() {
+            return true;
+        }
+        // A tool-name filter is itself an observation of the raw tool name:
+        // delivery versus non-delivery would otherwise reveal the name even
+        // when the projected field is omitted. Fail closed until the host has
+        // granted the same permission required to expose that field.
+        can_observe_tool_name
+            && self
                 .tool_names
                 .iter()
                 .any(|name| name == &event.context.tool_name)
@@ -134,6 +155,10 @@ struct SinkRegistration {
     service_id: String,
     capability: EventSinkCapabilityState,
     subscriptions: Vec<SubscriptionFilter>,
+    requested_permissions: Vec<ObservationPermissionId>,
+    granted_permissions: Vec<ObservationPermissionId>,
+    grants: GrantedObservation,
+    policy_generation: u64,
     queue_capacity: usize,
     max_event_bytes: usize,
     counters: Arc<SinkCounters>,
@@ -145,7 +170,30 @@ impl SinkRegistration {
         manifest: &EventSinkManifestEntry,
         capability: EventSinkCapabilityState,
         counters: Arc<SinkCounters>,
+        granted_permissions: &[ObservationPermissionId],
+        policy_generation: u64,
     ) -> Self {
+        let policy = ToolEventObservationPolicy::from_validated_permission_ids(
+            granted_permissions
+                .iter()
+                .map(ObservationPermissionId::as_str),
+        );
+        let grants = policy.grant_requested(&manifest.requested_permissions);
+        let capability = if matches!(capability, EventSinkCapabilityState::Eligible)
+            && !grants.can_observe_tool_name()
+            && manifest
+                .subscriptions
+                .iter()
+                .any(|subscription| !subscription.tool_names.is_empty())
+        {
+            EventSinkCapabilityState::Inactive {
+                detail: EventSinkInactiveReason::ObservationPermissionNotGranted {
+                    permission: ObservationPermissionId::new(OBSERVE_TOOL_NAME_PERMISSION),
+                },
+            }
+        } else {
+            capability
+        };
         Self {
             plugin_id: plugin_id.to_string(),
             id: manifest.id.clone(),
@@ -159,6 +207,10 @@ impl SinkRegistration {
                     tool_names: subscription.tool_names.clone(),
                 })
                 .collect(),
+            requested_permissions: manifest.requested_permissions.clone(),
+            granted_permissions: grants.permission_ids(),
+            grants,
+            policy_generation,
             // PluginManifest::validate has already enforced non-zero absolute
             // bounds. Conversions are lossless on every supported target.
             queue_capacity: manifest.delivery.queue_capacity as usize,
@@ -174,7 +226,7 @@ impl SinkRegistration {
     fn matches(&self, event: &ToolEventV1) -> bool {
         self.subscriptions
             .iter()
-            .any(|subscription| subscription.matches(event))
+            .any(|subscription| subscription.matches(event, self.grants.can_observe_tool_name()))
     }
 }
 
@@ -188,7 +240,7 @@ enum SinkInputError {
 
 trait SinkInput: Send + Sync {
     fn generation(&self) -> u64;
-    fn try_send(&self, event: &ToolEventV1) -> Result<(), SinkInputError>;
+    fn try_send(&self, event: &ProjectedToolEventV1) -> Result<(), SinkInputError>;
 }
 
 impl SinkInput for ServiceInputSender {
@@ -196,7 +248,7 @@ impl SinkInput for ServiceInputSender {
         ServiceInputSender::generation(self)
     }
 
-    fn try_send(&self, event: &ToolEventV1) -> Result<(), SinkInputError> {
+    fn try_send(&self, event: &ProjectedToolEventV1) -> Result<(), SinkInputError> {
         ServiceInputSender::try_send(self, event).map_err(|error| match error {
             ServiceInputSendError::QueueFull { .. } => SinkInputError::QueueFull,
             ServiceInputSendError::StaleGeneration { .. }
@@ -212,7 +264,7 @@ struct LiveSink {
     generation: u64,
     active: Arc<AtomicBool>,
     cancel: CancellationToken,
-    tx: mpsc::Sender<Arc<ToolEventV1>>,
+    tx: mpsc::Sender<Arc<ProjectedToolEventV1>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -259,7 +311,11 @@ impl LiveSink {
         }
     }
 
-    fn try_enqueue(&self, event: Arc<ToolEventV1>, counters: &SinkCounters) -> Result<(), ()> {
+    fn try_enqueue(
+        &self,
+        event: Arc<ProjectedToolEventV1>,
+        counters: &SinkCounters,
+    ) -> Result<(), ()> {
         if !self.is_active() {
             increment(&counters.service_down);
             return Err(());
@@ -284,7 +340,7 @@ async fn run_sink_worker(
     input: Arc<dyn SinkInput>,
     active: Arc<AtomicBool>,
     cancel: CancellationToken,
-    mut rx: mpsc::Receiver<Arc<ToolEventV1>>,
+    mut rx: mpsc::Receiver<Arc<ProjectedToolEventV1>>,
 ) {
     loop {
         let event = tokio::select! {
@@ -328,6 +384,7 @@ struct PublishedSink {
 struct RouterState {
     desired: BTreeMap<String, Arc<SinkRegistration>>,
     active: HashMap<String, Arc<LiveSink>>,
+    next_policy_generation: u64,
 }
 
 /// AppState-owned ToolEvent publisher and plugin-sink lifecycle registry.
@@ -422,7 +479,13 @@ impl ToolEventRouter {
         plugin_id: &str,
         manifest: &PluginManifest,
         plan: &EventSinkReconciliation,
-    ) {
+        event_sink_grants: &EventSinkPermissionGrants,
+    ) -> bamboo_plugin::PluginResult<()> {
+        // Pure preflight precedes snapshot revocation. Only the whole-map
+        // legacy empty case is migrated; any nonempty partial/corrupt map is
+        // rejected before router state changes.
+        let event_sink_grants =
+            canonicalize_persisted_event_sink_grants(manifest, event_sink_grants)?;
         let mut state = self.state.lock().await;
         let prior_counters: HashMap<String, Arc<SinkCounters>> = state
             .desired
@@ -458,10 +521,13 @@ impl ToolEventRouter {
                 }
             }
         }
-        self.rebuild_published(&state);
-        for live in stopped {
-            live.join().await;
-        }
+        // One immutable generation is allocated for the complete replacement
+        // plan. `rebuild_published` performs one old-to-new write-lock swap,
+        // so a publisher can observe either the complete prior generation or
+        // the complete replacement generation, never an intermediate empty or
+        // partially rebuilt plugin registration set.
+        state.next_policy_generation = state.next_policy_generation.wrapping_add(1).max(1);
+        let policy_generation = state.next_policy_generation;
 
         for reconciled in &plan.sinks_after_services {
             let Some(entry) = manifest
@@ -488,6 +554,14 @@ impl ToolEventRouter {
                 .get(&entry.id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(SinkCounters::default()));
+            // The installer/boot reconciliation validates exact grants before
+            // entering the router. A missing value here remains fail-closed:
+            // inactive future sinks report no grants, while a corrupt v1
+            // registration cannot project its required metadata envelope.
+            let granted_permissions = event_sink_grants
+                .get(&entry.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             state.desired.insert(
                 entry.id.clone(),
                 Arc::new(SinkRegistration::from_manifest(
@@ -495,13 +569,23 @@ impl ToolEventRouter {
                     entry,
                     reconciled.state.clone(),
                     counters,
+                    granted_permissions,
+                    policy_generation,
                 )),
             );
         }
         self.rebuild_published(&state);
+        // Old workers were marked inactive before the snapshot swap, and the
+        // swap removes their senders from the hot path. Join them before this
+        // policy update returns so pre-linearization backlog cannot outlive
+        // revocation. Replacement registrations reconcile after the join.
+        for live in stopped {
+            live.join().await;
+        }
         drop(state);
         self.refresh_monitor().await;
         self.reconcile_once().await;
+        Ok(())
     }
 
     /// Remove exact provenance-owned ids. The hot snapshot is revoked first;
@@ -647,6 +731,9 @@ impl ToolEventRouter {
                         state: ToolEventSinkState::Unavailable,
                         inactive_reason: None,
                         generation: None,
+                        policy_generation: None,
+                        requested_permissions: Vec::new(),
+                        granted_permissions: Vec::new(),
                         queue_capacity: 0,
                         max_event_bytes: 0,
                         delivered: 0,
@@ -673,6 +760,9 @@ impl ToolEventRouter {
                     state: state_value,
                     inactive_reason,
                     generation,
+                    policy_generation: Some(registration.policy_generation),
+                    requested_permissions: registration.requested_permissions.clone(),
+                    granted_permissions: registration.granted_permissions.clone(),
                     queue_capacity: registration.queue_capacity,
                     max_event_bytes: registration.max_event_bytes,
                     delivered: counters.delivered,
@@ -722,7 +812,26 @@ impl ToolEventRouter {
         entry: EventSinkManifestEntry,
         capability: EventSinkCapabilityState,
     ) {
+        self.configure_test_sink_with_grants(
+            plugin_id,
+            entry,
+            capability,
+            vec![ObservationPermissionId::new("metadata")],
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    async fn configure_test_sink_with_grants(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        entry: EventSinkManifestEntry,
+        capability: EventSinkCapabilityState,
+        granted_permissions: Vec<ObservationPermissionId>,
+    ) {
         let mut state = self.state.lock().await;
+        state.next_policy_generation = state.next_policy_generation.wrapping_add(1).max(1);
+        let policy_generation = state.next_policy_generation;
         state.desired.insert(
             entry.id.clone(),
             Arc::new(SinkRegistration::from_manifest(
@@ -730,6 +839,8 @@ impl ToolEventRouter {
                 &entry,
                 capability,
                 Arc::new(SinkCounters::default()),
+                &granted_permissions,
+                policy_generation,
             )),
         );
         self.rebuild_published(&state);
@@ -745,7 +856,7 @@ impl ToolEventPublisher for ToolEventRouter {
 
     fn try_publish(&self, event: ToolEventV1) -> Result<(), ToolEventPublishError> {
         event
-            .validate_bounds()
+            .validate_projection_input_bounds()
             .map_err(ToolEventPublishError::InvalidEvent)?;
         let snapshot = self
             .published
@@ -758,24 +869,36 @@ impl ToolEventPublisher for ToolEventRouter {
         if matching.is_empty() {
             return Ok(());
         }
-        let serialized_len = match serde_json::to_vec(&event) {
-            Ok(serialized) => serialized.len(),
-            Err(_) => {
-                for sink in matching {
-                    increment(&sink.registration.counters.serialization);
-                }
-                return Ok(());
-            }
-        };
-        let event = Arc::new(event);
         for sink in matching {
-            if serialized_len > sink.registration.max_event_bytes {
+            let projected = match project_tool_event(
+                &event,
+                sink.registration.grants,
+                sink.registration.policy_generation,
+            ) {
+                Ok(projected) => projected,
+                Err(_) => {
+                    increment(&sink.registration.counters.serialization);
+                    continue;
+                }
+            };
+            // This is the sole exact serialization before the per-sink queue,
+            // and it operates only on the irreversible host projection.
+            let serialized_len = match serde_json::to_vec(&projected) {
+                Ok(serialized) => serialized.len(),
+                Err(_) => {
+                    increment(&sink.registration.counters.serialization);
+                    continue;
+                }
+            };
+            if serialized_len > MAX_TOOL_EVENT_JSON_BYTES
+                || serialized_len > sink.registration.max_event_bytes
+            {
                 increment(&sink.registration.counters.oversize);
                 continue;
             }
             match &sink.live {
                 Some(live) => {
-                    let _ = live.try_enqueue(event.clone(), &sink.registration.counters);
+                    let _ = live.try_enqueue(Arc::new(projected), &sink.registration.counters);
                 }
                 None => increment(&sink.registration.counters.service_down),
             }
@@ -850,9 +973,13 @@ mod tests {
         EventSinkDeliveryLimits, EventSinkProtocolManifest, EventSinkSubscriptionManifest,
         ObservationPermissionId,
     };
+    use bamboo_plugin::{
+        reconcile_event_sinks, Platform, PluginInstallStatus, RegisteredCapabilities,
+    };
     use bamboo_plugin_protocol::{
-        FileChangedV1, ToolEventContextV1, ToolEventSubscriptionId, TOOL_EVENT_PROTOCOL_NAME,
-        TOOL_EVENT_V1_SCHEMA_VERSION,
+        FileChangedV1, ToolEventContextV1, ToolEventSubscriptionId,
+        MAX_PROJECTED_TOOL_EVENT_CONTENT_BYTES, MAX_PROJECTED_TOOL_EVENT_DIFF_BYTES,
+        TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
     };
 
     use super::*;
@@ -880,7 +1007,7 @@ mod tests {
             self.generation
         }
 
-        fn try_send(&self, event: &ToolEventV1) -> Result<(), SinkInputError> {
+        fn try_send(&self, event: &ProjectedToolEventV1) -> Result<(), SinkInputError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -894,6 +1021,35 @@ mod tests {
         entered: AtomicBool,
         release: (Mutex<bool>, Condvar),
         calls: AtomicUsize,
+    }
+
+    struct ProjectedRecordingInput {
+        generation: u64,
+        events: Mutex<Vec<ProjectedToolEventV1>>,
+    }
+
+    impl ProjectedRecordingInput {
+        fn new(generation: u64) -> Self {
+            Self {
+                generation,
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<ProjectedToolEventV1> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SinkInput for ProjectedRecordingInput {
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        fn try_send(&self, event: &ProjectedToolEventV1) -> Result<(), SinkInputError> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
     }
 
     impl BlockingInput {
@@ -918,7 +1074,7 @@ mod tests {
             self.generation
         }
 
-        fn try_send(&self, _event: &ToolEventV1) -> Result<(), SinkInputError> {
+        fn try_send(&self, _event: &ProjectedToolEventV1) -> Result<(), SinkInputError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.store(true, Ordering::SeqCst);
             let mut released = self.release.0.lock().unwrap();
@@ -967,6 +1123,93 @@ mod tests {
         .unwrap()
     }
 
+    fn event_with_payload(
+        tool: &str,
+        call: &str,
+        path: &str,
+        diff: &str,
+        content: &str,
+    ) -> ToolEventV1 {
+        let mut event = ToolEventV1::file_changed(
+            ToolEventContextV1::bounded("session", "root", tool, call).unwrap(),
+            FileChangedV1::bounded(path).unwrap(),
+        )
+        .unwrap();
+        let data = event.data.as_object_mut().unwrap();
+        data.insert(
+            "diff".to_string(),
+            serde_json::Value::String(diff.to_string()),
+        );
+        data.insert(
+            "content".to_string(),
+            serde_json::Value::String(content.to_string()),
+        );
+        data.insert(
+            "unknown_secret".to_string(),
+            serde_json::Value::String("unknown-extension-sentinel".to_string()),
+        );
+        event
+    }
+
+    fn permissions(values: &[&str]) -> Vec<ObservationPermissionId> {
+        values
+            .iter()
+            .map(|value| ObservationPermissionId::new(*value))
+            .collect()
+    }
+
+    fn manifest_for_sinks(entries: &[EventSinkManifestEntry]) -> PluginManifest {
+        let service_ids: BTreeMap<String, ()> = entries
+            .iter()
+            .map(|entry| (entry.service_id.clone(), ()))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": "router-policy-plugin",
+            "name": "Router Policy Plugin",
+            "version": "1.0.0",
+            "provides": {
+                "services": service_ids.keys().map(|id| serde_json::json!({
+                    "id": id,
+                    "enabled": true,
+                    "command": "${platform_bin}",
+                    "input_protocol": "ndjson_v1"
+                })).collect::<Vec<_>>(),
+                "event_sinks": entries
+            }
+        }))
+        .unwrap()
+    }
+
+    fn plan_for(
+        manifest: &PluginManifest,
+        grants: EventSinkPermissionGrants,
+    ) -> (EventSinkReconciliation, RegisteredCapabilities) {
+        let registered = RegisteredCapabilities {
+            service_ids: manifest
+                .provides
+                .services
+                .iter()
+                .map(|service| service.id.clone())
+                .collect(),
+            event_sink_ids: manifest
+                .provides
+                .event_sinks
+                .iter()
+                .map(|sink| sink.id.clone())
+                .collect(),
+            event_sink_grants: grants,
+            ..RegisteredCapabilities::default()
+        };
+        let plan = reconcile_event_sinks(
+            manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Platform::current(),
+        )
+        .unwrap();
+        (plan, registered)
+    }
+
     fn router() -> Arc<ToolEventRouter> {
         ToolEventRouter::new_inner(Arc::new(ServiceManager::new()), false)
     }
@@ -984,30 +1227,81 @@ mod tests {
     #[tokio::test]
     async fn filters_by_event_subscription_and_canonical_tool_name() {
         let router = router();
+        let mut write_sink = sink("write", &["Write"], 4, 16_384);
+        write_sink.requested_permissions = permissions(&["metadata", "tool_name"]);
         router
-            .configure_test_sink(
+            .configure_test_sink_with_grants(
                 "plugin",
-                sink("write", &["Write"], 4, 16_384),
+                write_sink,
                 EventSinkCapabilityState::Eligible,
+                permissions(&["metadata", "tool_name"]),
+            )
+            .await;
+        let mut edit_sink = sink("edit", &["Edit"], 4, 16_384);
+        edit_sink.requested_permissions = permissions(&["metadata", "tool_name"]);
+        router
+            .configure_test_sink_with_grants(
+                "plugin",
+                edit_sink,
+                EventSinkCapabilityState::Eligible,
+                permissions(&["metadata", "tool_name"]),
+            )
+            .await;
+        let mut ungranted_filter = sink("ungranted-filter", &["Write"], 4, 16_384);
+        ungranted_filter.requested_permissions = permissions(&["metadata", "tool_name"]);
+        router
+            .configure_test_sink_with_grants(
+                "plugin",
+                ungranted_filter,
+                EventSinkCapabilityState::Eligible,
+                permissions(&["metadata"]),
             )
             .await;
         router
             .configure_test_sink(
                 "plugin",
-                sink("edit", &["Edit"], 4, 16_384),
+                sink("unfiltered-metadata", &[], 4, 16_384),
                 EventSinkCapabilityState::Eligible,
             )
             .await;
         let write = Arc::new(RecordingInput::new(1));
         let edit = Arc::new(RecordingInput::new(2));
+        let ungranted_filter_input = Arc::new(RecordingInput::new(3));
+        let unfiltered_metadata = Arc::new(RecordingInput::new(4));
         router.install_input_for_test("write", write.clone()).await;
         router.install_input_for_test("edit", edit.clone()).await;
+        router
+            .install_input_for_test("ungranted-filter", ungranted_filter_input.clone())
+            .await;
+        router
+            .install_input_for_test("unfiltered-metadata", unfiltered_metadata.clone())
+            .await;
 
         router.try_publish(event("Write", "write-1", 8)).unwrap();
         router.try_publish(event("Edit", "edit-1", 8)).unwrap();
-        wait_until(|| write.calls().len() == 1 && edit.calls().len() == 1).await;
+        wait_until(|| {
+            write.calls().len() == 1
+                && edit.calls().len() == 1
+                && unfiltered_metadata.calls().len() == 2
+        })
+        .await;
         assert_eq!(write.calls(), vec!["write-1"]);
         assert_eq!(edit.calls(), vec!["edit-1"]);
+        assert!(
+            ungranted_filter_input.calls().is_empty(),
+            "tool-filter delivery must not become a tool-name side channel without a grant"
+        );
+        let ungranted_status = router
+            .status_for_ids(&["ungranted-filter".to_string()])
+            .await;
+        assert_eq!(ungranted_status[0].state, ToolEventSinkState::Inactive);
+        assert_eq!(
+            ungranted_status[0].inactive_reason,
+            Some(EventSinkInactiveReason::ObservationPermissionNotGranted {
+                permission: ObservationPermissionId::new(OBSERVE_TOOL_NAME_PERMISSION),
+            })
+        );
+        assert_eq!(unfiltered_metadata.calls(), vec!["write-1", "edit-1"]);
     }
 
     #[tokio::test]
@@ -1128,11 +1422,14 @@ mod tests {
     #[tokio::test]
     async fn outage_and_sink_event_bound_are_counted_without_payloads() {
         let router = router();
+        let mut entry = sink("down", &[], 2, 256);
+        entry.requested_permissions = permissions(&["metadata", "paths"]);
         router
-            .configure_test_sink(
+            .configure_test_sink_with_grants(
                 "plugin",
-                sink("down", &[], 2, 256),
+                entry,
                 EventSinkCapabilityState::Eligible,
+                permissions(&["metadata", "paths"]),
             )
             .await;
         router.try_publish(event("Write", "down", 8)).unwrap();
@@ -1145,6 +1442,206 @@ mod tests {
         let safe = serde_json::to_string(&status).unwrap();
         assert!(!safe.contains(&"x".repeat(32)));
         assert!(!safe.contains("/xxxxxxxx"));
+    }
+
+    #[tokio::test]
+    async fn one_raw_event_is_independently_projected_for_metadata_and_full_sinks() {
+        let router = router();
+        let requested = permissions(&["metadata", "tool_name", "paths", "diff", "content"]);
+        let mut metadata_entry = sink("metadata", &[], 4, 16_384);
+        metadata_entry.requested_permissions = requested.clone();
+        let mut full_entry = sink("full", &[], 4, 16_384);
+        full_entry.requested_permissions = requested;
+        router
+            .configure_test_sink_with_grants(
+                "plugin",
+                metadata_entry,
+                EventSinkCapabilityState::Eligible,
+                permissions(&["metadata"]),
+            )
+            .await;
+        router
+            .configure_test_sink_with_grants(
+                "plugin",
+                full_entry,
+                EventSinkCapabilityState::Eligible,
+                permissions(&["metadata", "tool_name", "paths", "diff", "content"]),
+            )
+            .await;
+        let metadata = Arc::new(ProjectedRecordingInput::new(1));
+        let full = Arc::new(ProjectedRecordingInput::new(2));
+        router
+            .install_input_for_test("metadata", metadata.clone())
+            .await;
+        router.install_input_for_test("full", full.clone()).await;
+
+        router
+            .try_publish(event_with_payload(
+                "Write",
+                "same-raw",
+                "/workspace/src/lib.rs",
+                "diff-sentinel",
+                "content-sentinel",
+            ))
+            .unwrap();
+        wait_until(|| metadata.events().len() == 1 && full.events().len() == 1).await;
+        let metadata_wire = serde_json::to_value(&metadata.events()[0]).unwrap();
+        assert!(metadata_wire["context"].get("tool_name").is_none());
+        assert!(metadata_wire["data"].get("path").is_none());
+        assert!(metadata_wire["data"].get("diff").is_none());
+        assert!(metadata_wire["data"].get("content").is_none());
+        assert_eq!(
+            metadata_wire["data"]["path_redaction_reason"],
+            "permission_not_granted"
+        );
+        let metadata_text = metadata_wire.to_string();
+        for sentinel in [
+            "diff-sentinel",
+            "content-sentinel",
+            "unknown-extension-sentinel",
+        ] {
+            assert!(!metadata_text.contains(sentinel));
+        }
+
+        let full_wire = serde_json::to_value(&full.events()[0]).unwrap();
+        assert_eq!(full_wire["context"]["tool_name"], "Write");
+        assert_eq!(full_wire["data"]["path"], "/workspace/src/lib.rs");
+        assert_eq!(full_wire["data"]["diff"], "diff-sentinel");
+        assert_eq!(full_wire["data"]["content"], "content-sentinel");
+        assert!(!full_wire.to_string().contains("unknown-extension-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn json_escaping_amplification_is_rejected_after_projection_before_queue() {
+        let router = router();
+        let requested = permissions(&["metadata", "paths", "diff", "content"]);
+        let mut entry = sink("escaped", &[], 4, 16_384);
+        entry.requested_permissions = requested.clone();
+        router
+            .configure_test_sink_with_grants(
+                "plugin",
+                entry,
+                EventSinkCapabilityState::Eligible,
+                requested,
+            )
+            .await;
+        let input = Arc::new(ProjectedRecordingInput::new(1));
+        router
+            .install_input_for_test("escaped", input.clone())
+            .await;
+
+        router
+            .try_publish(event_with_payload(
+                "Write",
+                "escaped",
+                "/workspace/file.rs",
+                &"\"".repeat(MAX_PROJECTED_TOOL_EVENT_DIFF_BYTES),
+                &"\"".repeat(MAX_PROJECTED_TOOL_EVENT_CONTENT_BYTES),
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(input.events().is_empty());
+        let status = router.status_for_ids(&["escaped".to_string()]).await;
+        assert_eq!(status[0].oversize, 1);
+        assert_eq!(status[0].delivered, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_sink_policy_replacement_is_atomic_and_never_queues_raw_authority() {
+        let router = router();
+        let mut first = sink("first", &[], 256, 16_384);
+        first.requested_permissions =
+            permissions(&["content", "tool_name", "metadata", "diff", "paths"]);
+        let mut second = sink("second", &[], 256, 16_384);
+        second.requested_permissions = first.requested_permissions.clone();
+        let manifest = manifest_for_sinks(&[first, second]);
+        let old_grants = EventSinkPermissionGrants::from([
+            ("first".to_string(), permissions(&["metadata"])),
+            ("second".to_string(), permissions(&["metadata"])),
+        ]);
+        let (old_plan, old_registered) = plan_for(&manifest, old_grants);
+        router
+            .apply_plugin_plan(
+                "router-policy-plugin",
+                &manifest,
+                &old_plan,
+                &old_registered.event_sink_grants,
+            )
+            .await
+            .unwrap();
+        let old_status = router
+            .status_for_ids(&["first".to_string(), "second".to_string()])
+            .await;
+        let old_policy_generation = old_status[0].policy_generation.unwrap();
+        assert_eq!(old_status[1].policy_generation, Some(old_policy_generation));
+        let old_input = Arc::new(ProjectedRecordingInput::new(1));
+        router
+            .install_input_for_test("first", old_input.clone())
+            .await;
+
+        let publishing = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                for index in 0..500 {
+                    let _ = router.try_publish(event("Write", &format!("race-{index}"), 12));
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        wait_until(|| !old_input.events().is_empty()).await;
+
+        let all = permissions(&["metadata", "tool_name", "paths", "diff", "content"]);
+        let new_grants = EventSinkPermissionGrants::from([
+            ("first".to_string(), all.clone()),
+            ("second".to_string(), all),
+        ]);
+        let (new_plan, new_registered) = plan_for(&manifest, new_grants);
+        router
+            .apply_plugin_plan(
+                "router-policy-plugin",
+                &manifest,
+                &new_plan,
+                &new_registered.event_sink_grants,
+            )
+            .await
+            .unwrap();
+        let new_input = Arc::new(ProjectedRecordingInput::new(2));
+        router
+            .install_input_for_test("first", new_input.clone())
+            .await;
+        for index in 0..10 {
+            router
+                .try_publish(event("Write", &format!("after-{index}"), 12))
+                .unwrap();
+        }
+        publishing.await.unwrap();
+        wait_until(|| new_input.events().len() >= 10).await;
+
+        let new_status = router
+            .status_for_ids(&["first".to_string(), "second".to_string()])
+            .await;
+        let new_policy_generation = new_status[0].policy_generation.unwrap();
+        assert!(new_policy_generation > old_policy_generation);
+        assert_eq!(new_status[1].policy_generation, Some(new_policy_generation));
+        for projected in old_input.events() {
+            assert_eq!(
+                projected.observation_policy_generation,
+                Some(old_policy_generation)
+            );
+            assert_eq!(projected.context.tool_name, None);
+            assert_eq!(projected.data.path, None);
+            let wire = serde_json::to_string(&projected).unwrap();
+            assert!(!wire.contains("tool_name"));
+            assert!(!wire.contains("/xxxxxxxxxxxx"));
+        }
+        for projected in new_input.events() {
+            assert_eq!(
+                projected.observation_policy_generation,
+                Some(new_policy_generation)
+            );
+            assert_eq!(projected.context.tool_name.as_deref(), Some("Write"));
+            assert_eq!(projected.data.path.as_deref(), Some("/xxxxxxxxxxxx"));
+        }
     }
 
     #[tokio::test]

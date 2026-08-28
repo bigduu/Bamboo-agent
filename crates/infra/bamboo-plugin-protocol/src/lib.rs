@@ -4,9 +4,16 @@
 //! server, plugin-manifest, process-supervision, and tool-result types do not
 //! cross this boundary.
 
+mod projected_tool_event_v1;
 mod publisher;
 mod tool_event_v1;
 
+pub use projected_tool_event_v1::{
+    ProjectedFileChangedV1, ProjectedToolEventContextV1, ProjectedToolEventV1,
+    MAX_PROJECTED_TOOL_EVENT_CONTENT_BYTES, MAX_PROJECTED_TOOL_EVENT_DIFF_BYTES,
+    TOOL_EVENT_PATH_REDACTION_PERMISSION_NOT_GRANTED, TOOL_EVENT_PATH_REDACTION_SENSITIVE,
+    TOOL_EVENT_PATH_REDACTION_UNSAFE,
+};
 pub use publisher::{
     InMemoryToolEventRecorder, NoopToolEventPublisher, ToolEventPublishError, ToolEventPublisher,
 };

@@ -522,4 +522,32 @@ mod tests {
         );
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "external");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_rejects_intermediate_and_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let linked_dir = workspace.path().join("linked-dir");
+        symlink(external.path(), &linked_dir).unwrap();
+        let intermediate_target = linked_dir.join("intermediate.txt");
+        let intermediate = atomic_write_text(&intermediate_target, "nope").await;
+        assert!(
+            matches!(intermediate, Err(ToolError::Execution(message)) if message.contains("symlinked"))
+        );
+        assert!(!external.path().join("intermediate.txt").exists());
+
+        let real = workspace.path().join("real.txt");
+        let linked_file = workspace.path().join("linked-file.txt");
+        tokio::fs::write(&real, "external").await.unwrap();
+        symlink(&real, &linked_file).unwrap();
+        let final_component = atomic_write_text(&linked_file, "nope").await;
+        assert!(matches!(
+            final_component,
+            Err(ToolError::Execution(message)) if message.contains("symlink")
+        ));
+        assert_eq!(tokio::fs::read_to_string(&real).await.unwrap(), "external");
+    }
 }

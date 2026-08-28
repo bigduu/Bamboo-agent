@@ -144,8 +144,8 @@ use bamboo_plugin::registry::{
     RegisteredCapabilities,
 };
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
-    PluginInstaller, PluginManifest, PluginResult, PluginSource,
+    EventSinkPermissionGrants, InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError,
+    PluginInstallStatus, PluginInstaller, PluginManifest, PluginResult, PluginSource,
 };
 
 use crate::app_state::{AppState, ConfigUpdateEffects};
@@ -155,6 +155,9 @@ use crate::handlers::agent::prompt_presets::{
     ensure_unique_preset_id, load_store, save_store, store_file_path, StoredPromptPreset,
 };
 use crate::service_manager::{ServiceManager, ServiceRuntimeConfig};
+use crate::tool_event_policy::{
+    canonicalize_persisted_event_sink_grants, resolve_event_sink_grants,
+};
 use crate::tool_event_router::ToolEventRouter;
 
 /// Process-wide serialization of plugin install/uninstall operations.
@@ -981,6 +984,34 @@ impl ServerPluginInstaller {
             disposition,
             installed_at,
             _guard,
+            None,
+            InstallFailureInjection::default(),
+        )
+        .await
+    }
+
+    /// Prepared-source install seam carrying a preflighted, canonical host
+    /// grant target. The inner transaction validates it again while holding
+    /// the plugin operation lock and before any journal/shared-store/runtime
+    /// mutation.
+    pub(crate) async fn install_with_operation_and_event_sink_grants(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        source: PluginSource,
+        disposition: InstallDisposition,
+        installed_at: DateTime<Utc>,
+        grants: &EventSinkPermissionGrants,
+        guard: &PluginOperationGuard,
+    ) -> PluginResult<InstalledPlugin> {
+        self.install_with_operation_inner(
+            manifest,
+            plugin_dir,
+            source,
+            disposition,
+            installed_at,
+            guard,
+            Some(grants),
             InstallFailureInjection::default(),
         )
         .await
@@ -1006,6 +1037,7 @@ impl ServerPluginInstaller {
             disposition,
             installed_at,
             guard,
+            None,
             InstallFailureInjection {
                 before_service_replacement: true,
                 ..InstallFailureInjection::default()
@@ -1025,6 +1057,7 @@ impl ServerPluginInstaller {
         source: PluginSource,
         disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
+        prepared_event_sink_grants: Option<&EventSinkPermissionGrants>,
         guard: &PluginOperationGuard,
     ) -> PluginResult<InstalledPlugin> {
         self.install_with_operation_inner(
@@ -1034,6 +1067,7 @@ impl ServerPluginInstaller {
             disposition,
             installed_at,
             guard,
+            prepared_event_sink_grants,
             InstallFailureInjection {
                 final_provenance_commit: true,
                 ..InstallFailureInjection::default()
@@ -1050,6 +1084,7 @@ impl ServerPluginInstaller {
         disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
         _guard: &PluginOperationGuard,
+        prepared_event_sink_grants: Option<&EventSinkPermissionGrants>,
         failure_injection: InstallFailureInjection,
     ) -> PluginResult<InstalledPlugin> {
         let installed_json_path = self.installed_json_path();
@@ -1062,6 +1097,14 @@ impl ServerPluginInstaller {
         let previous =
             load_previous_for_disposition(&installed_json_path, &manifest.id, disposition).await?;
         let resolved_mcp_servers = preflight_install(manifest, plugin_dir).await?;
+        let event_sink_grants = match prepared_event_sink_grants {
+            Some(grants) => canonicalize_persisted_event_sink_grants(manifest, grants)?,
+            None => resolve_event_sink_grants(
+                manifest,
+                previous.as_ref().map(|entry| &entry.registered),
+                None,
+            )?,
+        };
 
         // Re-run under the held operation guard as defense in depth. The HTTP
         // prepared-source path performs the same audit before bundle swap or
@@ -1097,6 +1140,7 @@ impl ServerPluginInstaller {
                 .map(|entry| entry.id.clone())
                 .collect(),
             event_sink_ids: declared_event_sink_ids,
+            event_sink_grants: event_sink_grants.clone(),
         };
 
         // Step 0: upgrade drop-diff. Computed from the NEW manifest's plain
@@ -1250,6 +1294,7 @@ impl ServerPluginInstaller {
             workflow_filenames,
             service_ids,
             event_sink_ids: event_sink_reconciliation.to_register,
+            event_sink_grants,
         };
         let runtime_sink_plan = reconcile_event_sinks(
             manifest,
@@ -1283,10 +1328,28 @@ impl ServerPluginInstaller {
         // Provenance is committed before runtime publication. The router
         // records eligible/inactive declarations now, but only creates a live
         // queue after ServiceManager exposes a Ready exact-generation sender.
-        self.state
+        if let Err(error) = self
+            .state
             .tool_event_router
-            .apply_plugin_plan(&manifest.id, manifest, &runtime_sink_plan)
-            .await;
+            .apply_plugin_plan(
+                &manifest.id,
+                manifest,
+                &runtime_sink_plan,
+                &entry.registered.event_sink_grants,
+            )
+            .await
+        {
+            // The same canonical map was validated before any mutation under
+            // the operation guard. A mismatch here therefore indicates an
+            // internal invariant failure; keep delivery fail-closed without
+            // misreporting the already committed plugin transaction as rolled
+            // back.
+            tracing::error!(
+                plugin_id = %manifest.id,
+                %error,
+                "committed plugin event sinks could not be published"
+            );
+        }
 
         Ok(entry)
     }
@@ -1470,6 +1533,24 @@ pub async fn boot_reconcile_services(
             continue;
         };
 
+        // Durable grants are executable authority. Validate the complete map
+        // before starting any plugin-owned process so a corrupt nonempty row
+        // cannot run code while its observation policy remains unavailable.
+        let event_sink_grants = match canonicalize_persisted_event_sink_grants(
+            manifest,
+            &plugin.registered.event_sink_grants,
+        ) {
+            Ok(grants) => grants,
+            Err(error) => {
+                tracing::warn!(
+                    plugin_id = %plugin.id,
+                    %error,
+                    "service boot-reconcile: invalid persisted event-sink grants kept plugin capabilities unavailable"
+                );
+                continue;
+            }
+        };
+
         let to_start: HashSet<&str> = plan
             .service_ids_to_start
             .iter()
@@ -1513,9 +1594,16 @@ pub async fn boot_reconcile_services(
                 ),
             }
         }
-        tool_event_router
-            .apply_plugin_plan(&plugin.id, manifest, &plan.event_sinks)
-            .await;
+        if let Err(error) = tool_event_router
+            .apply_plugin_plan(&plugin.id, manifest, &plan.event_sinks, &event_sink_grants)
+            .await
+        {
+            tracing::warn!(
+                plugin_id = %plugin.id,
+                %error,
+                "service boot-reconcile: event-sink grants failed router preflight"
+            );
+        }
     }
 }
 
