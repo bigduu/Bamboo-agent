@@ -9,7 +9,7 @@
 //! process-generation changes, queue workers, and shutdown joins happen
 //! outside tool execution.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -527,6 +527,53 @@ impl ToolEventRouter {
         self.refresh_monitor().await;
     }
 
+    /// Revoke only the prior plugin sinks whose current declaration is backed
+    /// by a service that an upgrade is about to remove. Provenance records ids
+    /// but not sink-to-service edges, so the live desired registration is the
+    /// authority for this narrow Step-0 ordering seam.
+    ///
+    /// The plugin id and provenance-owned sink ids are both checked before a
+    /// registration can be removed. This prevents a stale/corrupt provenance
+    /// row from borrowing another plugin's route while still guaranteeing
+    /// that every matching worker is joined before its service is stopped.
+    pub(crate) async fn unregister_plugin_sinks_backed_by_services(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        ids: &[String],
+        service_ids: &[String],
+    ) {
+        if ids.is_empty() || service_ids.is_empty() {
+            return;
+        }
+        let ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let service_ids: HashSet<&str> = service_ids.iter().map(String::as_str).collect();
+        let mut state = self.state.lock().await;
+        let matching_ids: Vec<String> = state
+            .desired
+            .values()
+            .filter(|registration| {
+                registration.plugin_id == plugin_id
+                    && ids.contains(registration.id.as_str())
+                    && service_ids.contains(registration.service_id.as_str())
+            })
+            .map(|registration| registration.id.clone())
+            .collect();
+        let mut stopped = Vec::with_capacity(matching_ids.len());
+        for id in matching_ids {
+            state.desired.remove(&id);
+            if let Some(live) = state.active.remove(&id) {
+                live.begin_stop();
+                stopped.push(live);
+            }
+        }
+        self.rebuild_published(&state);
+        for live in stopped {
+            live.join().await;
+        }
+        drop(state);
+        self.refresh_monitor().await;
+    }
+
     /// Reconcile each eligible declaration to the exact currently-ready
     /// `ServiceInputSender` generation. A scheduled/starting service, a
     /// legacy null-stdin service, and a broken/stale generation all remain
@@ -989,6 +1036,60 @@ mod tests {
             .unregister_sinks(&["inactive".to_string(), "eligible".to_string()])
             .await;
         assert!(!router.monitor_is_running());
+    }
+
+    #[tokio::test]
+    async fn service_filtered_unregister_checks_owner_and_preserves_unrelated_route() {
+        let router = router();
+        router
+            .configure_test_sink(
+                "plugin",
+                sink("removed", &[], 4, 16_384),
+                EventSinkCapabilityState::Eligible,
+            )
+            .await;
+        router
+            .configure_test_sink(
+                "plugin",
+                sink("retained", &[], 4, 16_384),
+                EventSinkCapabilityState::Eligible,
+            )
+            .await;
+        let removed = Arc::new(RecordingInput::new(1));
+        let retained = Arc::new(RecordingInput::new(2));
+        router
+            .install_input_for_test("removed", removed.clone())
+            .await;
+        router
+            .install_input_for_test("retained", retained.clone())
+            .await;
+
+        let prior_ids = vec!["removed".to_string(), "retained".to_string()];
+        let dropped_services = vec!["removed-service".to_string()];
+        router
+            .unregister_plugin_sinks_backed_by_services(
+                "other-plugin",
+                &prior_ids,
+                &dropped_services,
+            )
+            .await;
+        assert_eq!(
+            router.status_for_ids(&["removed".to_string()]).await[0].state,
+            ToolEventSinkState::Live,
+            "a mismatched plugin owner must not revoke the route"
+        );
+
+        router
+            .unregister_plugin_sinks_backed_by_services("plugin", &prior_ids, &dropped_services)
+            .await;
+        let statuses = router.status_for_ids(&prior_ids).await;
+        assert_eq!(statuses[0].state, ToolEventSinkState::Unavailable);
+        assert_eq!(statuses[1].state, ToolEventSinkState::Live);
+
+        router.try_publish(event("Write", "after-drop", 8)).unwrap();
+        wait_until(|| retained.calls().len() == 1).await;
+        assert!(removed.calls().is_empty());
+        assert_eq!(retained.calls(), vec!["after-drop"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

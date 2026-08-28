@@ -221,6 +221,12 @@ struct InstallRollback {
     service_ids_started: Vec<String>,
 }
 
+#[derive(Default)]
+struct InstallFailureInjection {
+    before_service_replacement: bool,
+    final_provenance_commit: bool,
+}
+
 impl ServerPluginInstaller {
     pub fn new(state: actix_web::web::Data<AppState>) -> Self {
         Self { state }
@@ -525,26 +531,25 @@ impl ServerPluginInstaller {
     /// beneath a still-live sink generation. A retained sink id may change
     /// its backing service id, which `RegisteredCapabilities::removed_since`
     /// cannot express because provenance stores capability ids rather than
-    /// sink-to-service edges. If any old service is being dropped, revoke and
-    /// join every prior sink first; the replacement plan is installed only
-    /// after the new services have been registered.
-    ///
-    /// Returns whether the complete prior sink set was already revoked, so
-    /// the later same-service replacement seam can avoid redundant work.
+    /// sink-to-service edges. Before stopping dropped services, revoke only
+    /// prior sinks whose current router declaration is actually backed by one
+    /// of those services. Unrelated retained routes must survive failures
+    /// before the later full service-replacement seam.
     async fn deregister_upgrade_drop_diff(
         &self,
+        plugin_id: &str,
         previous: &RegisteredCapabilities,
         dropped: &RegisteredCapabilities,
-    ) -> bool {
-        let revoked_all_prior_sinks = !dropped.service_ids.is_empty();
-        if revoked_all_prior_sinks {
-            self.state
-                .tool_event_router
-                .unregister_sinks(&previous.event_sink_ids)
-                .await;
-        }
+    ) {
+        self.state
+            .tool_event_router
+            .unregister_plugin_sinks_backed_by_services(
+                plugin_id,
+                &previous.event_sink_ids,
+                &dropped.service_ids,
+            )
+            .await;
         self.deregister_capabilities(dropped).await;
-        revoked_all_prior_sinks
     }
 
     /// Best-effort undo of an `install()` that failed partway through steps
@@ -976,7 +981,35 @@ impl ServerPluginInstaller {
             disposition,
             installed_at,
             _guard,
-            false,
+            InstallFailureInjection::default(),
+        )
+        .await
+    }
+
+    /// Deterministic test seam immediately after the Step-0 drop-diff and
+    /// crash-safety journal, but before every prior sink is revoked for
+    /// possible same-id service replacement.
+    #[cfg(test)]
+    pub(crate) async fn install_with_operation_failing_before_service_replacement(
+        &self,
+        manifest: &PluginManifest,
+        plugin_dir: &Path,
+        source: PluginSource,
+        disposition: InstallDisposition,
+        installed_at: DateTime<Utc>,
+        guard: &PluginOperationGuard,
+    ) -> PluginResult<InstalledPlugin> {
+        self.install_with_operation_inner(
+            manifest,
+            plugin_dir,
+            source,
+            disposition,
+            installed_at,
+            guard,
+            InstallFailureInjection {
+                before_service_replacement: true,
+                ..InstallFailureInjection::default()
+            },
         )
         .await
     }
@@ -1001,7 +1034,10 @@ impl ServerPluginInstaller {
             disposition,
             installed_at,
             guard,
-            true,
+            InstallFailureInjection {
+                final_provenance_commit: true,
+                ..InstallFailureInjection::default()
+            },
         )
         .await
     }
@@ -1014,7 +1050,7 @@ impl ServerPluginInstaller {
         disposition: InstallDisposition,
         installed_at: DateTime<Utc>,
         _guard: &PluginOperationGuard,
-        fail_final_provenance_commit: bool,
+        failure_injection: InstallFailureInjection,
     ) -> PluginResult<InstalledPlugin> {
         let installed_json_path = self.installed_json_path();
 
@@ -1069,7 +1105,6 @@ impl ServerPluginInstaller {
         // no longer declares BEFORE registering anything new (BLOCKER 2). Also
         // fires for a recovery over an `Installing` leftover: its intended set
         // is diffed the same way, so a crashed attempt's extra ids get cleaned.
-        let mut prior_sinks_revoked_for_service_drop = false;
         if let Some(previous) = &previous {
             let dropped = intended.removed_since(&previous.registered);
             if !dropped.is_empty() {
@@ -1083,8 +1118,7 @@ impl ServerPluginInstaller {
                     dropped_event_sinks = ?dropped.event_sink_ids,
                     "install drop-diff: de-registering capabilities the new/completed version no longer declares"
                 );
-                prior_sinks_revoked_for_service_drop = self
-                    .deregister_upgrade_drop_diff(&previous.registered, &dropped)
+                self.deregister_upgrade_drop_diff(&manifest.id, &previous.registered, &dropped)
                     .await;
             }
         }
@@ -1132,22 +1166,30 @@ impl ServerPluginInstaller {
             }
         };
 
+        if failure_injection.before_service_replacement {
+            let error = PluginError::Registration(
+                "injected failure before service replacement".to_string(),
+            );
+            self.abort_install(&rollback, &previous, &manifest.id, &installed_json_path)
+                .await;
+            return Err(error);
+        }
+
         // Direct `PluginInstaller::install(..., Upgrade, ...)` callers do not
         // pass through plugin_source's pre-swap stop hook. Revoke every prior
         // sink generation at the last common point before `register_services`
         // can stop/replace a same-id service. When Step 0 did not drop an old
         // service, keeping this after the journal and MCP step means an
         // earlier failure leaves that still-running service and route intact.
-        // If Step 0 did drop a service, all prior sinks were necessarily
-        // revoked before that stop. The source path may also have revoked the
-        // set already; unregister is intentionally idempotent.
-        if !prior_sinks_revoked_for_service_drop {
-            if let Some(previous) = &previous {
-                self.state
-                    .tool_event_router
-                    .unregister_sinks(&previous.registered.event_sink_ids)
-                    .await;
-            }
+        // Step 0 revoked only sinks backed by services it actually dropped;
+        // this full revoke is therefore always required before retained
+        // same-id service replacement. The source path may also have revoked
+        // the set already; unregister is intentionally idempotent.
+        if let Some(previous) = &previous {
+            self.state
+                .tool_event_router
+                .unregister_sinks(&previous.registered.event_sink_ids)
+                .await;
         }
 
         // Step 1b: Services (issue #479). Runs right after MCP, before the
@@ -1224,7 +1266,7 @@ impl ServerPluginInstaller {
             status: PluginInstallStatus::Installed,
             registered,
         };
-        let final_commit = if fail_final_provenance_commit {
+        let final_commit = if failure_injection.final_provenance_commit {
             Err(PluginError::Registration(
                 "injected final Installed provenance commit failure".to_string(),
             ))
