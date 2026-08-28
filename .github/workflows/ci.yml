@@ -133,6 +133,28 @@ jobs:
         if: runner.os != 'macOS'
         run: cargo test --locked -p bamboo-server --lib server::tls::tests -- --nocapture
 
+  tool-event-recorder-e2e:
+    name: ToolEvent Recorder E2E (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Run native recorder lifecycle E2E
+        run: cargo test --locked -p bamboo-tool-event-recorder-example --test tool_event_lifecycle -- --nocapture --test-threads=1
+
   e2e-test:
     name: E2E Tests
     runs-on: ubuntu-latest

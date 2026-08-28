@@ -1,0 +1,29 @@
+[package]
+name = "bamboo-tool-event-recorder-example"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+description = "Public-protocol-only ToolEvent recorder example for Bamboo plugins"
+
+[dependencies]
+bamboo-plugin-protocol = { path = "../../crates/infra/bamboo-plugin-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+actix-web = { version = "4", default-features = false, features = ["macros"] }
+bamboo-agent-core = { path = "../../crates/core/bamboo-agent-core" }
+bamboo-config = { path = "../../crates/infra/bamboo-config" }
+bamboo-plugin = { path = "../../crates/infra/bamboo-plugin" }
+bamboo-server = { path = "../../crates/app/bamboo-server" }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[lib]
+name = "bamboo_tool_event_recorder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tool-event-recorder"
+path = "src/main.rs"

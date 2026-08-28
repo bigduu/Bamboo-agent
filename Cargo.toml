@@ -33,6 +33,7 @@ members = [
     "crates/app/bamboo-tui",
     "crates/app/bamboo-client-core",
     "crates/app/bamboo-broker",
+    "examples/tool-event-recorder",
 ]
 # Bare `cargo build`/`test`/`check` (no `-p`/`--workspace`) operate on these.
 # `bamboo-analytics` is intentionally omitted: it is a dev-only analysis tool

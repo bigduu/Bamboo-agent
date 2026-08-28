@@ -1550,6 +1550,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-tool-event-recorder-example"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "bamboo-agent-core",
+ "bamboo-config",
+ "bamboo-plugin",
+ "bamboo-plugin-protocol",
+ "bamboo-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bamboo-tools"
 version = "0.0.0"
 dependencies = [
