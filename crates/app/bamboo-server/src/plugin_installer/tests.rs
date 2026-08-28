@@ -12,8 +12,9 @@ use bamboo_plugin_protocol::{
 };
 use chrono::Utc;
 
-use super::ServerPluginInstaller;
+use super::{boot_reconcile_services, ServerPluginInstaller, PLUGIN_OP_LOCK};
 use crate::app_state::AppState;
+use crate::tool_event_router::ToolEventSinkState;
 
 /// A never-resolves stdio command: `Command::spawn` fails immediately (ENOENT)
 /// so `mcp_manager.start_server` returns a fast `Err` instead of hanging on a
@@ -26,18 +27,11 @@ async fn new_installer(data_dir: &Path) -> (web::Data<AppState>, ServerPluginIns
         .await
         .expect("app state should initialize");
     // `AppState::new` fires the boot-time service reconcile pass
-    // (`plugin_installer::boot_reconcile_services`) in the background,
-    // unsynchronized against `PLUGIN_OP_LOCK` (see that function's doc
-    // comment). On a fresh `data_dir` it is a same-tick no-op (nothing in
-    // `installed.json` yet) — UNLESS it is still in flight when a
-    // service-lifecycle test below writes `installed.json` and starts/stops
-    // a service moments later, in which case it can race back in and
-    // resurrect (or fail to see) a service the test just
-    // installed/stopped, producing exactly the `is_running` flakes tracked
-    // by issue #486. Draining it here (once, before any test touches
-    // `installed.json`) removes that race entirely: by construction it can
-    // only observe an empty store at this point, so this always resolves
-    // near-instantly.
+    // (`plugin_installer::boot_reconcile_services`) in the background. It now
+    // shares `PLUGIN_OP_LOCK` with installer mutations, preventing a stale
+    // service/sink plan from racing a newer plugin generation. Tests still
+    // drain the one-shot pass here so each fixture starts from deterministic
+    // completed boot state rather than depending on lock-waiter scheduling.
     state.wait_for_boot_reconcile_services().await;
     let data = web::Data::new(state);
     let installer = ServerPluginInstaller::new(data.clone());
@@ -1828,4 +1822,84 @@ async fn stop_services_for_upgrade_on_a_plugin_with_no_services_is_a_harmless_no
     let (_state, installer) = new_installer(&root.path().join("bamboo-home")).await;
     let stopped = installer.stop_services_for_upgrade("never-installed").await;
     assert!(stopped.is_empty());
+}
+
+#[tokio::test]
+async fn boot_reconcile_takes_plugin_op_lock_before_reading_its_generation_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("bamboo-home");
+    let (state, _installer) = new_installer(&data_dir).await;
+    let plugins_root = data_dir.join("plugins");
+    tokio::fs::create_dir_all(&plugins_root).await.unwrap();
+
+    let old_dir = plugins_root.join("generation-old");
+    let new_dir = plugins_root.join("generation-new");
+    tokio::fs::create_dir_all(&old_dir).await.unwrap();
+    tokio::fs::create_dir_all(&new_dir).await.unwrap();
+    let old_manifest = event_sink_manifest_json(
+        "generation-plugin",
+        "1.0.0",
+        "generation-service",
+        &[("old-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let new_manifest = event_sink_manifest_json(
+        "generation-plugin",
+        "2.0.0",
+        "generation-service",
+        &[("new-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    tokio::fs::write(old_dir.join("plugin.json"), old_manifest)
+        .await
+        .unwrap();
+    tokio::fs::write(new_dir.join("plugin.json"), new_manifest)
+        .await
+        .unwrap();
+
+    let entry = |version: &str, plugin_dir: PathBuf, sink_id: &str| InstalledPlugin {
+        id: "generation-plugin".to_string(),
+        version: version.to_string(),
+        source: PluginSource::LocalDir {
+            path: plugin_dir.clone(),
+        },
+        plugin_dir,
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["generation-service".to_string()],
+            event_sink_ids: vec![sink_id.to_string()],
+            ..Default::default()
+        },
+    };
+    let installed_path = plugins_root.join("installed.json");
+    let op_guard = PLUGIN_OP_LOCK.lock().await;
+    let mut old_store = InstalledPlugins::default();
+    old_store.plugins.push(entry("1.0.0", old_dir, "old-sink"));
+    old_store.save(&installed_path).await.unwrap();
+
+    let boot = {
+        let data_dir = data_dir.clone();
+        let service_manager = state.service_manager.clone();
+        let router = state.tool_event_router.clone();
+        tokio::spawn(async move {
+            boot_reconcile_services(&data_dir, &service_manager, &router).await;
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !boot.is_finished(),
+        "boot must wait for the plugin operation generation lock"
+    );
+
+    let mut new_store = InstalledPlugins::default();
+    new_store.plugins.push(entry("2.0.0", new_dir, "new-sink"));
+    new_store.save(&installed_path).await.unwrap();
+    drop(op_guard);
+    boot.await.unwrap();
+
+    let status = state
+        .tool_event_router
+        .status_for_ids(&["old-sink".to_string(), "new-sink".to_string()])
+        .await;
+    assert_eq!(status[0].state, ToolEventSinkState::Unavailable);
+    assert_eq!(status[1].state, ToolEventSinkState::Inactive);
 }

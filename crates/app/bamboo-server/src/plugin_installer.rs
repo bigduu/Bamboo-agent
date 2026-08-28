@@ -141,7 +141,8 @@ use bamboo_domain::mcp_config::McpServerConfig;
 use bamboo_plugin::installer::{load_previous_for_disposition, preflight_install};
 use bamboo_plugin::manifest::{Platform, ServiceManifestEntry};
 use bamboo_plugin::registry::{
-    reconcile_exclusive, reconcile_plugin_boot, PluginBootCandidate, RegisteredCapabilities,
+    reconcile_event_sinks, reconcile_exclusive, reconcile_plugin_boot, PluginBootCandidate,
+    RegisteredCapabilities,
 };
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
@@ -155,6 +156,7 @@ use crate::handlers::agent::prompt_presets::{
     ensure_unique_preset_id, load_store, save_store, store_file_path, StoredPromptPreset,
 };
 use crate::service_manager::{ServiceManager, ServiceRuntimeConfig};
+use crate::tool_event_router::ToolEventRouter;
 
 /// Process-wide serialization of plugin install/uninstall operations.
 ///
@@ -381,10 +383,10 @@ impl ServerPluginInstaller {
             .collect())
     }
 
-    /// Event-sink ids are process/AppState registration keys in #905. Until
-    /// that runtime exists, installed provenance is the authoritative global
-    /// ownership index and lets #903 reject cross-plugin borrowing before any
-    /// install mutation.
+    /// Event-sink ids are process/AppState registration keys. Installed
+    /// provenance remains the authoritative global ownership index; the live
+    /// router only activates a reconciliation plan after this check has
+    /// rejected cross-plugin borrowing before any install mutation.
     async fn existing_event_sink_ids(&self, exclude_plugin_id: &str) -> PluginResult<Vec<String>> {
         let store = InstalledPlugins::load(&self.installed_json_path()).await?;
         store.get_unique(exclude_plugin_id)?;
@@ -499,6 +501,13 @@ impl ServerPluginInstaller {
     /// upgrade drop-diff and for `uninstall`). Skill dirs need no shared-store
     /// action — they are only ever removed by deleting `plugin_dir` itself.
     async fn deregister_capabilities(&self, registered: &RegisteredCapabilities) {
+        // #903's removal contract is authority-bearing: revoke the hot routing
+        // snapshot and await every exact-generation worker before the backing
+        // service can be stopped by the loop below.
+        self.state
+            .tool_event_router
+            .unregister_sinks(&registered.removal_order().event_sink_ids_before_services)
+            .await;
         for mcp_id in &registered.mcp_server_ids {
             self.remove_mcp_server(mcp_id).await;
         }
@@ -904,6 +913,15 @@ impl ServerPluginInstaller {
             }
         };
         let mut stopped = Vec::with_capacity(entry.registered.service_ids.len());
+        self.state
+            .tool_event_router
+            .unregister_sinks(
+                &entry
+                    .registered
+                    .removal_order()
+                    .event_sink_ids_before_services,
+            )
+            .await;
         for service_id in &entry.registered.service_ids {
             match self.state.service_manager.stop_service(service_id).await {
                 Ok(()) => stopped.push(service_id.clone()),
@@ -1086,6 +1104,20 @@ impl ServerPluginInstaller {
             }
         };
 
+        // Direct `PluginInstaller::install(..., Upgrade, ...)` callers do not
+        // pass through plugin_source's pre-swap stop hook. Revoke every prior
+        // sink generation at the last common point before `register_services`
+        // can stop/replace a same-id service. Keeping this after the journal
+        // and MCP step means an earlier failure leaves the still-running old
+        // service and its route intact. The source path may already have
+        // revoked it; unregister is intentionally idempotent.
+        if let Some(previous) = &previous {
+            self.state
+                .tool_event_router
+                .unregister_sinks(&previous.registered.event_sink_ids)
+                .await;
+        }
+
         // Step 1b: Services (issue #479). Runs right after MCP, before the
         // never-refusing Prompts step, so a services conflict fails the
         // install as early as the other REFUSE-on-conflict kinds do. Note:
@@ -1145,6 +1177,12 @@ impl ServerPluginInstaller {
             service_ids,
             event_sink_ids: event_sink_reconciliation.to_register,
         };
+        let runtime_sink_plan = reconcile_event_sinks(
+            manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Platform::current(),
+        )?;
         let entry = InstalledPlugin {
             id: manifest.id.clone(),
             version: manifest.version.clone(),
@@ -1167,6 +1205,14 @@ impl ServerPluginInstaller {
                 .await;
             return Err(error);
         }
+
+        // Provenance is committed before runtime publication. The router
+        // records eligible/inactive declarations now, but only creates a live
+        // queue after ServiceManager exposes a Ready exact-generation sender.
+        self.state
+            .tool_event_router
+            .apply_plugin_plan(&manifest.id, manifest, &runtime_sink_plan)
+            .await;
 
         Ok(entry)
     }
@@ -1289,7 +1335,16 @@ fn resolve_service_config_under(
 /// Deliberately reads `installed.json` + each plugin's on-disk
 /// `plugin.json` directly rather than going through `ServerPluginInstaller`
 /// (which needs a fully-built `web::Data<AppState>` this runs before).
-pub async fn boot_reconcile_services(app_data_dir: &Path, service_manager: &ServiceManager) {
+pub async fn boot_reconcile_services(
+    app_data_dir: &Path,
+    service_manager: &ServiceManager,
+    tool_event_router: &std::sync::Arc<ToolEventRouter>,
+) {
+    // Boot reads a provenance snapshot and then mutates both service and sink
+    // generations from that plan. Serialize the whole pass with install,
+    // update, and uninstall so an old boot plan can never unregister or
+    // overwrite a route those operations just committed.
+    let _op_guard = PLUGIN_OP_LOCK.lock().await;
     let installed_json_path = app_data_dir.join("plugins").join("installed.json");
     let store = match InstalledPlugins::load(&installed_json_path).await {
         Ok(store) => store,
@@ -1327,15 +1382,15 @@ pub async fn boot_reconcile_services(app_data_dir: &Path, service_manager: &Serv
 
     for (candidate, plan) in candidates.iter().zip(plans) {
         let plugin = &candidate.installed;
+        tool_event_router
+            .unregister_sinks(&plan.event_sinks.deactivate_before_services)
+            .await;
         for issue in &plan.issues {
             tracing::warn!(
                 plugin_id = %plugin.id,
                 ?issue,
                 "service boot-reconcile: provenance audit kept capabilities inactive"
             );
-        }
-        if plan.service_ids_to_start.is_empty() {
-            continue;
         }
         let Some(manifest) = candidate.manifest.as_ref() else {
             continue;
@@ -1384,6 +1439,9 @@ pub async fn boot_reconcile_services(app_data_dir: &Path, service_manager: &Serv
                 ),
             }
         }
+        tool_event_router
+            .apply_plugin_plan(&plugin.id, manifest, &plan.event_sinks)
+            .await;
     }
 }
 

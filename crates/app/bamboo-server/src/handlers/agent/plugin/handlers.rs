@@ -68,7 +68,8 @@ pub async fn list_plugins(state: web::Data<AppState>) -> impl Responder {
         Ok(entries) => {
             let mut plugins = Vec::with_capacity(entries.len());
             for entry in entries {
-                plugins.push(to_view(entry, &state.service_manager).await);
+                plugins
+                    .push(to_view(entry, &state.service_manager, &state.tool_event_router).await);
             }
             HttpResponse::Ok().json(PluginListResponse { plugins })
         }
@@ -98,7 +99,8 @@ pub async fn install_plugin(
     )
     .await
     {
-        Ok(entry) => HttpResponse::Created().json(to_view(entry, &state.service_manager).await),
+        Ok(entry) => HttpResponse::Created()
+            .json(to_view(entry, &state.service_manager, &state.tool_event_router).await),
         Err(error) => plugin_error_response(&error),
     }
 }
@@ -133,7 +135,8 @@ pub async fn update_plugin(
     )
     .await
     {
-        Ok(entry) => HttpResponse::Ok().json(to_view(entry, &state.service_manager).await),
+        Ok(entry) => HttpResponse::Ok()
+            .json(to_view(entry, &state.service_manager, &state.tool_event_router).await),
         Err(error) => plugin_error_response(&error),
     }
 }

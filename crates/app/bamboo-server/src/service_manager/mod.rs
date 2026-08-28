@@ -244,11 +244,13 @@ impl ServiceManager {
             input,
         });
         // Atomic check-and-insert via the entry API: a plain
-        // contains_key→insert would let two racing callers (boot reconcile —
-        // spawned outside PLUGIN_OP_LOCK — vs a concurrent install of the
-        // same plugin) both pass the check, the second overwriting the
-        // first's runtime and orphaning its supervisor task + child process
-        // beyond stop_service's reach.
+        // contains_key→insert would let two racing callers (for example,
+        // direct ServiceManager users or any future reconciliation path that
+        // does not share the plugin-operation boundary) both pass the check,
+        // the second overwriting the first's runtime and orphaning its
+        // supervisor task + child process beyond stop_service's reach. Boot
+        // and plugin mutations are now serialized separately, but the manager
+        // still enforces its own invariant at this public boundary.
         match self.runtimes.entry(id) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
                 return Err(ServiceManagerError::AlreadyRunning(occupied.key().clone()));

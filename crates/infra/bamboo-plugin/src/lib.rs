@@ -15,7 +15,7 @@
 //! | Prompt presets | `prompt-presets.json` | copied into shared store |
 //! | Legacy workflows | N/A — discovered **in place** | `~/.bamboo/plugins/*/workflows/*.md` is a read-only Skill adapter source |
 //! | Services | `ServiceManager` | supervised process owned by exact plugin provenance |
-//! | Event sinks | `installed.json` + pure reconciliation plan | runtime routing is added separately by #905 |
+//! | Event sinks | `installed.json` + pure reconciliation plan | `bamboo-server` activates the plan through its AppState-owned `ToolEventRouter` |
 //!
 //! This crate defines the shared skeleton three things build on:
 //!
