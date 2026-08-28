@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "event_type": "file_changed",
+  "subscription_id": "tool.file_changed.v1",
+  "context": {
+    "session_id": "session-example",
+    "root_session_id": "root-example",
+    "tool_call_id": "call-example"
+  },
+  "data": {
+    "path_redaction_reason": "permission_not_granted"
+  },
+  "observation_policy_generation": 1
+}

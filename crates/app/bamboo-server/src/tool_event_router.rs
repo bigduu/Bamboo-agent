@@ -464,11 +464,18 @@ impl ToolEventRouter {
     }
 
     #[cfg(test)]
-    fn monitor_is_running(&self) -> bool {
+    pub(crate) fn monitor_is_running(&self) -> bool {
         self.reconcile_monitor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
+    }
+
+    /// Test-only snapshot of declared registrations and live workers.
+    #[cfg(test)]
+    pub(crate) async fn registration_and_worker_counts(&self) -> (usize, usize) {
+        let state = self.state.lock().await;
+        (state.desired.len(), state.active.len())
     }
 
     /// Replace all runtime declarations owned by `plugin_id` with one pure
