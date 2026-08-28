@@ -4,8 +4,8 @@ use std::sync::Arc;
 use actix_web::web;
 use bamboo_plugin::{
     InstallDisposition, InstalledPlugin, InstalledPlugins, McpServerManifestEntry,
-    McpTransportManifest, Platform, PluginError, PluginInstallStatus, PluginInstaller,
-    PluginManifest, PluginSource, RegisteredCapabilities,
+    McpTransportManifest, ObservationPermissionId, Platform, PluginError, PluginInstallStatus,
+    PluginInstaller, PluginManifest, PluginSource, RegisteredCapabilities,
 };
 use bamboo_plugin_protocol::{
     FILE_CHANGED_SUBSCRIPTION_ID_V1, TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
@@ -14,6 +14,7 @@ use chrono::Utc;
 
 use super::{boot_reconcile_services, ServerPluginInstaller, PLUGIN_OP_LOCK};
 use crate::app_state::AppState;
+use crate::tool_event_policy::canonicalize_persisted_event_sink_grants;
 use crate::tool_event_router::ToolEventSinkState;
 
 /// A never-resolves stdio command: `Command::spawn` fails immediately (ENOENT)
@@ -997,6 +998,15 @@ async fn install_recovers_from_a_crashed_installing_leftover() {
         status: PluginInstallStatus::Installing,
         registered: RegisteredCapabilities {
             mcp_server_ids: vec!["leftover-mcp".to_string()],
+            service_ids: vec!["leftover-event-service".to_string()],
+            event_sink_ids: vec!["leftover-event-sink".to_string()],
+            event_sink_grants: std::collections::BTreeMap::from([(
+                "leftover-event-sink".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
             ..Default::default()
         },
     });
@@ -1007,6 +1017,24 @@ async fn install_recovers_from_a_crashed_installing_leftover() {
     // and must NOT false-Conflict on `leftover-mcp` (recorded as the plugin's
     // own intended entry).
     let manifest_json = mcp_manifest_json("crashed-plugin", "1.0.0", &["leftover-mcp"]);
+    let mut manifest_value: serde_json::Value = serde_json::from_str(&manifest_json).unwrap();
+    manifest_value["provides"]["services"] = serde_json::json!([{
+        "id": "leftover-event-service",
+        "enabled": false,
+        "command": "${platform_bin}",
+        "input_protocol": "ndjson_v1"
+    }]);
+    manifest_value["provides"]["event_sinks"] = serde_json::json!([{
+        "id": "leftover-event-sink",
+        "service_id": "leftover-event-service",
+        "protocol": {
+            "name": TOOL_EVENT_PROTOCOL_NAME,
+            "version": TOOL_EVENT_V1_SCHEMA_VERSION
+        },
+        "subscriptions": [{"id": FILE_CHANGED_SUBSCRIPTION_ID_V1}],
+        "requested_permissions": ["metadata", "paths"]
+    }]);
+    let manifest_json = manifest_value.to_string();
     tokio::fs::write(plugin_dir.join("plugin.json"), &manifest_json)
         .await
         .unwrap();
@@ -1029,6 +1057,14 @@ async fn install_recovers_from_a_crashed_installing_leftover() {
     assert_eq!(
         entry.registered.mcp_server_ids,
         vec!["leftover-mcp".to_string()]
+    );
+    assert_eq!(
+        entry.registered.event_sink_grants["leftover-event-sink"]
+            .iter()
+            .map(ObservationPermissionId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["metadata", "paths"],
+        "Installing recovery must preserve only the exact still-requested host authority"
     );
 
     // Provenance flipped to `installed`; the mcp entry is still owned.
@@ -1903,10 +1939,14 @@ async fn changed_backing_service_revokes_retained_sink_before_old_service_stop()
         Platform::current(),
     )
     .unwrap();
+    let grants =
+        canonicalize_persisted_event_sink_grants(&old_manifest, &previous.event_sink_grants)
+            .unwrap();
     state
         .tool_event_router
-        .apply_plugin_plan("changed-service-plugin", &old_manifest, &plan)
-        .await;
+        .apply_plugin_plan("changed-service-plugin", &old_manifest, &plan, &grants)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = state
@@ -2045,10 +2085,21 @@ async fn failed_upgrade_dropping_unrelated_service_preserves_retained_live_route
         Platform::current(),
     )
     .unwrap();
+    let old_grants = canonicalize_persisted_event_sink_grants(
+        &old_manifest,
+        &previous_registered.event_sink_grants,
+    )
+    .unwrap();
     state
         .tool_event_router
-        .apply_plugin_plan("rollback-route-plugin", &old_manifest, &old_plan)
-        .await;
+        .apply_plugin_plan(
+            "rollback-route-plugin",
+            &old_manifest,
+            &old_plan,
+            &old_grants,
+        )
+        .await
+        .unwrap();
     let prior_generation = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = state
@@ -2191,10 +2242,16 @@ async fn boot_reconcile_takes_plugin_op_lock_before_reading_its_generation_plan(
         "generation-service",
         &[("new-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
     );
-    tokio::fs::write(old_dir.join("plugin.json"), old_manifest)
+    let add_paths_request = |raw: String| {
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["provides"]["event_sinks"][0]["requested_permissions"] =
+            serde_json::json!(["metadata", "paths"]);
+        value.to_string()
+    };
+    tokio::fs::write(old_dir.join("plugin.json"), add_paths_request(old_manifest))
         .await
         .unwrap();
-    tokio::fs::write(new_dir.join("plugin.json"), new_manifest)
+    tokio::fs::write(new_dir.join("plugin.json"), add_paths_request(new_manifest))
         .await
         .unwrap();
 
@@ -2210,6 +2267,13 @@ async fn boot_reconcile_takes_plugin_op_lock_before_reading_its_generation_plan(
         registered: RegisteredCapabilities {
             service_ids: vec!["generation-service".to_string()],
             event_sink_ids: vec![sink_id.to_string()],
+            event_sink_grants: std::collections::BTreeMap::from([(
+                sink_id.to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
             ..Default::default()
         },
     };
@@ -2245,4 +2309,78 @@ async fn boot_reconcile_takes_plugin_op_lock_before_reading_its_generation_plan(
         .await;
     assert_eq!(status[0].state, ToolEventSinkState::Unavailable);
     assert_eq!(status[1].state, ToolEventSinkState::Inactive);
+    assert_eq!(
+        status[1]
+            .granted_permissions
+            .iter()
+            .map(ObservationPermissionId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["metadata", "paths"]
+    );
+    assert!(status[1].policy_generation.is_some());
+}
+
+#[tokio::test]
+async fn boot_rejects_corrupt_nonempty_grants_before_starting_plugin_service() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let plugins_root = data_dir.path().join("plugins");
+    let plugin_dir = plugins_root.join("corrupt-grants-plugin");
+    tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+    let raw = event_sink_manifest_json(
+        "corrupt-grants-plugin",
+        "1.0.0",
+        "must-not-start-service",
+        &[("must-not-route-sink", TOOL_EVENT_V1_SCHEMA_VERSION)],
+    );
+    let mut manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    manifest["provides"]["services"][0]["enabled"] = serde_json::json!(true);
+    manifest["provides"]["event_sinks"][0]["requested_permissions"] =
+        serde_json::json!(["metadata", "paths"]);
+    tokio::fs::write(plugin_dir.join("plugin.json"), manifest.to_string())
+        .await
+        .unwrap();
+
+    let mut store = InstalledPlugins::default();
+    store.plugins.push(InstalledPlugin {
+        id: "corrupt-grants-plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: PluginSource::LocalDir {
+            path: plugin_dir.clone(),
+        },
+        plugin_dir,
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities {
+            service_ids: vec!["must-not-start-service".to_string()],
+            event_sink_ids: vec!["must-not-route-sink".to_string()],
+            event_sink_grants: std::collections::BTreeMap::from([(
+                "must-not-route-sink".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("content"),
+                ],
+            )]),
+            ..Default::default()
+        },
+    });
+    store
+        .save(&plugins_root.join("installed.json"))
+        .await
+        .unwrap();
+
+    let state = AppState::new(data_dir.path().to_path_buf())
+        .await
+        .expect("app state");
+    state.wait_for_boot_reconcile_services().await;
+    assert!(
+        !state.service_manager.is_running("must-not-start-service"),
+        "grant authority must validate before any plugin-owned process starts"
+    );
+    let status = state
+        .tool_event_router
+        .status_for_ids(&["must-not-route-sink".to_string()])
+        .await;
+    assert_eq!(status[0].state, ToolEventSinkState::Unavailable);
+    assert!(status[0].granted_permissions.is_empty());
 }

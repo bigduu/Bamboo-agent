@@ -4,8 +4,9 @@ use actix_web::web;
 use async_trait::async_trait;
 use bamboo_config::{PluginTrustConfig, PluginTrustEnforcement, TrustedKey};
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, InstalledPlugins, PluginError, PluginInstallStatus,
-    PluginInstaller, PluginManifest, PluginResult, PluginSource,
+    EventSinkPermissionGrants, InstallDisposition, InstalledPlugin, InstalledPlugins,
+    ObservationPermissionId, PluginError, PluginInstallStatus, PluginInstaller, PluginManifest,
+    PluginResult, PluginSource,
 };
 use bamboo_plugin_protocol::{
     FILE_CHANGED_SUBSCRIPTION_ID_V1, TOOL_EVENT_PROTOCOL_NAME, TOOL_EVENT_V1_SCHEMA_VERSION,
@@ -1889,7 +1890,7 @@ fn event_sink_service_plugin_manifest_json(version: &str, sink_id: &str) -> Stri
                     "version": TOOL_EVENT_V1_SCHEMA_VERSION
                 },
                 "subscriptions": [{"id": FILE_CHANGED_SUBSCRIPTION_ID_V1}],
-                "requested_permissions": ["metadata"]
+                "requested_permissions": ["metadata", "paths"]
             }]
         }
     })
@@ -1980,8 +1981,16 @@ async fn server_final_commit_upgrade_fixture(
         .await
         .unwrap();
     let old_manifest = PluginManifest::parse_str(&old_manifest_json).unwrap();
+    let old_grants = EventSinkPermissionGrants::from([(
+        "old-sink".to_string(),
+        vec![
+            ObservationPermissionId::new("metadata"),
+            ObservationPermissionId::new("paths"),
+        ],
+    )]);
+    let guard = installer.begin_operation().await;
     installer
-        .install(
+        .install_with_operation_and_event_sink_grants(
             &old_manifest,
             &live_dir,
             PluginSource::LocalDir {
@@ -1989,9 +1998,12 @@ async fn server_final_commit_upgrade_fixture(
             },
             InstallDisposition::FailIfInstalled,
             Utc::now(),
+            &old_grants,
+            &guard,
         )
         .await
         .expect("install old event-sink service plugin");
+    drop(guard);
     assert!(state.service_manager.is_running("svc"));
     let previous = InstalledPlugins::load(&plugins_root.join("installed.json"))
         .await
@@ -2332,6 +2344,13 @@ async fn final_provenance_commit_failure_aborts_registration_and_restores_exact_
         previous.registered.event_sink_ids,
         vec!["old-sink".to_string()]
     );
+    assert_eq!(
+        previous.registered.event_sink_grants["old-sink"]
+            .iter()
+            .map(|permission| permission.as_str())
+            .collect::<Vec<_>>(),
+        vec!["metadata", "paths"]
+    );
 
     let error = install_server_plugin_from_source_with_fault(
         &installer,
@@ -2389,6 +2408,10 @@ async fn final_provenance_commit_failure_aborts_registration_and_restores_exact_
     assert_eq!(
         restored.registered.event_sink_ids,
         vec!["old-sink".to_string()]
+    );
+    assert_eq!(
+        restored.registered.event_sink_grants, previous.registered.event_sink_grants,
+        "rollback must restore exact host grant authority"
     );
 }
 

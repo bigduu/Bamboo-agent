@@ -63,7 +63,8 @@ pub use manifest::{
 };
 pub use registry::{
     classify_ownership, reconcile_event_sinks, reconcile_exclusive, reconcile_plugin_boot,
-    EventSinkReconciliation, EventSinkRemovalOrder, ExclusiveReconciliation, InstalledPlugin,
-    InstalledPlugins, Ownership, PluginBootCandidate, PluginBootIssue, PluginBootReconciliation,
-    PluginInstallStatus, PluginSource, ReconciledEventSink, RegisteredCapabilities,
+    EventSinkPermissionGrants, EventSinkReconciliation, EventSinkRemovalOrder,
+    ExclusiveReconciliation, InstalledPlugin, InstalledPlugins, Ownership, PluginBootCandidate,
+    PluginBootIssue, PluginBootReconciliation, PluginInstallStatus, PluginSource,
+    ReconciledEventSink, RegisteredCapabilities,
 };

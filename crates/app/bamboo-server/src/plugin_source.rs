@@ -192,11 +192,13 @@ use bamboo_plugin::manifest::Platform;
 #[cfg(test)]
 use bamboo_plugin::PluginInstaller;
 use bamboo_plugin::{
-    InstallDisposition, InstalledPlugin, PluginError, PluginManifest, PluginResult, PluginSource,
+    EventSinkPermissionGrants, InstallDisposition, InstalledPlugin, PluginError, PluginManifest,
+    PluginResult, PluginSource,
 };
 use ed25519_dalek::Verifier;
 
 use crate::plugin_installer::ServerPluginInstaller;
+use crate::tool_event_policy::{resolve_event_sink_grants, EventSinkGrantRequest};
 
 /// What the caller pointed the installer at.
 #[derive(Debug, Clone)]
@@ -1230,6 +1232,32 @@ pub async fn install_server_plugin_from_source(
     disposition: InstallDisposition,
     expected_plugin_id: Option<&str>,
 ) -> PluginResult<InstalledPlugin> {
+    install_server_plugin_from_source_with_event_sink_grants(
+        installer,
+        input,
+        plugins_root,
+        trust,
+        disposition,
+        expected_plugin_id,
+        None,
+    )
+    .await
+}
+
+/// Source transaction with an optional complete per-sink host grant target.
+/// Resolution happens against the prepared manifest and prior durable
+/// provenance before service shutdown or bundle activation. The installer
+/// receives the canonical map and validates it again under the same operation
+/// guard before writing the Installing journal row.
+pub async fn install_server_plugin_from_source_with_event_sink_grants(
+    installer: &ServerPluginInstaller,
+    input: PluginSourceInput,
+    plugins_root: &Path,
+    trust: &PluginTrustConfig,
+    disposition: InstallDisposition,
+    expected_plugin_id: Option<&str>,
+    requested_grants: Option<&[EventSinkGrantRequest]>,
+) -> PluginResult<InstalledPlugin> {
     install_server_plugin_from_source_inner(
         installer,
         input,
@@ -1237,6 +1265,7 @@ pub async fn install_server_plugin_from_source(
         trust,
         disposition,
         expected_plugin_id,
+        requested_grants,
         ServerSourceFault::None,
     )
     .await
@@ -1345,6 +1374,7 @@ async fn install_server_plugin_from_source_with_fault(
         trust,
         disposition,
         expected_plugin_id,
+        None,
         fault,
     )
     .await
@@ -1357,6 +1387,7 @@ async fn install_server_plugin_from_source_inner(
     trust: &PluginTrustConfig,
     disposition: InstallDisposition,
     expected_plugin_id: Option<&str>,
+    requested_grants: Option<&[EventSinkGrantRequest]>,
     fault: ServerSourceFault,
 ) -> PluginResult<InstalledPlugin> {
     let prepared = prepare_plugin_source(input, plugins_root, trust).await?;
@@ -1387,8 +1418,19 @@ async fn install_server_plugin_from_source_inner(
             return Err(error);
         }
     };
+    let event_sink_grants: EventSinkPermissionGrants = match resolve_event_sink_grants(
+        &prepared.manifest,
+        previous.as_ref().map(|entry| &entry.registered),
+        requested_grants,
+    ) {
+        Ok(grants) => grants,
+        Err(error) => {
+            prepared.discard().await;
+            return Err(error);
+        }
+    };
     if disposition == InstallDisposition::Upgrade {
-        let Some(previous) = previous else {
+        let Some(previous) = previous.as_ref() else {
             prepared.discard().await;
             return Err(PluginError::Registration(format!(
                 "upgrade for '{plugin_id}' has no unique previous provenance row"
@@ -1475,17 +1517,19 @@ async fn install_server_plugin_from_source_inner(
                             source,
                             disposition,
                             chrono::Utc::now(),
+                            Some(&event_sink_grants),
                             &guard,
                         )
                         .await
                 } else {
                     installer
-                        .install_with_operation(
+                        .install_with_operation_and_event_sink_grants(
                             &manifest,
                             &plugin_dir,
                             source,
                             disposition,
                             chrono::Utc::now(),
+                            &event_sink_grants,
                             &guard,
                         )
                         .await
@@ -1494,12 +1538,13 @@ async fn install_server_plugin_from_source_inner(
             #[cfg(not(test))]
             {
                 installer
-                    .install_with_operation(
+                    .install_with_operation_and_event_sink_grants(
                         &manifest,
                         &plugin_dir,
                         source,
                         disposition,
                         chrono::Utc::now(),
+                        &event_sink_grants,
                         &guard,
                     )
                     .await
