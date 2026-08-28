@@ -12,7 +12,7 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use bamboo_infrastructure::process::hide_window_for_tokio_command;
-use bamboo_plugin::manifest::{HealthCheckKind, ShutdownSignal};
+use bamboo_plugin::manifest::{HealthCheckKind, ServiceInputProtocol, ShutdownSignal};
 
 use super::{ServiceRuntime, ServiceState, ServiceStatusSnapshot};
 
@@ -44,6 +44,17 @@ async fn set_last_error(runtime: &Arc<ServiceRuntime>, message: impl Into<String
 pub(super) async fn snapshot(runtime: &Arc<ServiceRuntime>) -> ServiceStatusSnapshot {
     let state = *runtime.state.read().await;
     let pid_raw = runtime.pid.load(Ordering::SeqCst);
+    let input = match &runtime.input {
+        Some(input) => Some(
+            input
+                .snapshot(matches!(
+                    state,
+                    ServiceState::Stopping | ServiceState::Stopped
+                ))
+                .await,
+        ),
+        None => None,
+    };
     ServiceStatusSnapshot {
         id: runtime.config.id.clone(),
         plugin_id: runtime.config.plugin_id.clone(),
@@ -51,30 +62,38 @@ pub(super) async fn snapshot(runtime: &Arc<ServiceRuntime>) -> ServiceStatusSnap
         pid: if pid_raw == 0 { None } else { Some(pid_raw) },
         restart_count: runtime.restart_count.load(Ordering::SeqCst),
         last_error: runtime.last_error.read().await.clone(),
+        input,
     }
 }
 
 /// Build the child command (`env_clear()`, the minimal allowlist, declared
-/// env, `BAMBOO_PLUGIN_SERVICE_CONFIG`, `kill_on_drop`, hidden window, piped
-/// stdio).
+/// env, `BAMBOO_PLUGIN_SERVICE_CONFIG`, `kill_on_drop`, hidden window, and
+/// piped output). Stdin is piped only for an explicitly declared
+/// `NdjsonV1`; legacy/`None` services retain the null device.
 ///
 /// Spawning (not just building) is done here too, so a spawn failure
 /// (`ENOENT` etc.) is a single `io::Result` the caller can treat as a crash.
 fn spawn_child(config: &super::ServiceRuntimeConfig) -> std::io::Result<Child> {
     let mut cmd = Command::new(&config.command);
     hide_window_for_tokio_command(&mut cmd);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Kill the child if this `Child` is dropped without going through
-        // our own graceful/hard-kill sequence (e.g. the supervisor task is
-        // aborted) — same rationale as `bamboo-mcp`'s stdio transport.
-        .kill_on_drop(true)
-        .args(&config.args)
-        // Security (issue #479 §2): clear bamboo-server's own environment
-        // first — a service must never inherit ambient secrets — then apply
-        // only the minimal allowlist below plus the manifest's declared env.
-        .env_clear();
+    cmd.stdin(
+        if matches!(config.input_protocol, ServiceInputProtocol::NdjsonV1) {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        },
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    // Kill the child if this `Child` is dropped without going through
+    // our own graceful/hard-kill sequence (e.g. the supervisor task is
+    // aborted) — same rationale as `bamboo-mcp`'s stdio transport.
+    .kill_on_drop(true)
+    .args(&config.args)
+    // Security (issue #479 §2): clear bamboo-server's own environment
+    // first — a service must never inherit ambient secrets — then apply
+    // only the minimal allowlist below plus the manifest's declared env.
+    .env_clear();
 
     #[cfg(not(target_os = "windows"))]
     for key in UNIX_ENV_ALLOWLIST {
@@ -102,8 +121,8 @@ fn spawn_child(config: &super::ServiceRuntimeConfig) -> std::io::Result<Child> {
 }
 
 /// Mirrors `bamboo_mcp::transports::stdio`'s stderr-logger pattern, applied
-/// to BOTH streams (a service has no stdin/stdout wire protocol to reserve —
-/// everything it prints is just a log line).
+/// to BOTH output streams. `NdjsonV1` reserves only stdin; everything a
+/// service prints remains a log line.
 fn spawn_stdio_logger(service_id: &str, child: &mut Child) {
     if let Some(stdout) = child.stdout.take() {
         let id = service_id.to_string();
@@ -358,6 +377,29 @@ pub(super) async fn run_supervisor(runtime: Arc<ServiceRuntime>) {
         };
 
         runtime.pid.store(child.id().unwrap_or(0), Ordering::SeqCst);
+        let bound_input = match &runtime.input {
+            Some(input) => match input.bind_child(&mut child).await {
+                Ok(bound) => Some(bound),
+                Err(error) => {
+                    // This should be unreachable after requesting piped stdin,
+                    // but fail closed: never run a declared-input generation
+                    // without the writer capability it promised.
+                    set_last_error(&runtime, format!("failed to bind service input: {error}"))
+                        .await;
+                    terminate_child(&mut child, &runtime.config.graceful_shutdown).await;
+                    runtime.pid.store(0, Ordering::SeqCst);
+                    set_state(&runtime, ServiceState::Crashed).await;
+                    if !maybe_wait_before_restart(&runtime, &stop_token, &mut consecutive_attempts)
+                        .await
+                    {
+                        set_state(&runtime, ServiceState::Stopped).await;
+                        return;
+                    }
+                    continue;
+                }
+            },
+            None => None,
+        };
         spawn_stdio_logger(&runtime.config.id, &mut child);
         set_state(&runtime, ServiceState::Running).await;
         // A genuinely-started child resets the backoff/attempt counter —
@@ -365,11 +407,20 @@ pub(super) async fn run_supervisor(runtime: Arc<ServiceRuntime>) {
         consecutive_attempts = 0;
 
         let outcome = supervise_running_child(&runtime, &mut child, &stop_token).await;
+        let stopping = matches!(&outcome, RunOutcome::StoppedByRequest)
+            || runtime.shutdown.load(Ordering::SeqCst);
+        if stopping {
+            set_state(&runtime, ServiceState::Stopping).await;
+        }
+        if let (Some(input), Some(bound_input)) = (&runtime.input, bound_input) {
+            // Invalidate + cancel + join the exact generation writer before
+            // any signal, hard kill, restart backoff, or replacement spawn.
+            bound_input.close(input, stopping).await;
+        }
         runtime.pid.store(0, Ordering::SeqCst);
 
         match outcome {
             RunOutcome::StoppedByRequest => {
-                set_state(&runtime, ServiceState::Stopping).await;
                 terminate_child(&mut child, &runtime.config.graceful_shutdown).await;
                 set_state(&runtime, ServiceState::Stopped).await;
                 return;

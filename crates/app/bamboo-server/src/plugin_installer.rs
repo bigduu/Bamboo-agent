@@ -1271,6 +1271,7 @@ fn resolve_service_config_under(
         health_check: resolved.health_check,
         restart_policy: resolved.restart_policy,
         graceful_shutdown: resolved.graceful_shutdown,
+        input_protocol: resolved.input_protocol,
         user_config_path: service_config_path_under(app_data_dir, plugin_id),
     }
 }

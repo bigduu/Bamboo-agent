@@ -65,9 +65,12 @@ use serde::{Deserialize, Serialize};
 
 use bamboo_plugin::{
     InstalledPlugin, PluginInstallStatus, PluginManifest, PluginSource, RegisteredCapabilities,
+    ServiceInputProtocol,
 };
 
-use crate::service_manager::{ServiceManager, ServiceState};
+use crate::service_manager::{
+    ServiceInputHealth, ServiceInputStatusSnapshot, ServiceManager, ServiceState,
+};
 
 /// Shared body for `POST /install` and `POST /{id}/update`.
 #[derive(Debug, Deserialize)]
@@ -117,6 +120,52 @@ pub struct ServiceStatusView {
     pub restart_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Present only for an explicitly declared input protocol; legacy service
+    /// status responses retain their previous wire shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<ServiceInputStatusView>,
+}
+
+/// Payload-free NDJSON input health/counters. Kept separate from the internal
+/// snapshot so future supervisor-only fields cannot leak into the HTTP API.
+#[derive(Debug, Clone, Serialize)]
+pub struct ServiceInputStatusView {
+    pub protocol: ServiceInputProtocol,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub health: ServiceInputHealth,
+    pub queue_capacity: usize,
+    pub max_line_bytes: usize,
+    pub accepted_lines: u64,
+    pub written_lines: u64,
+    pub dropped_queue_full: u64,
+    pub dropped_stale_generation: u64,
+    pub dropped_stopped: u64,
+    pub dropped_broken_stdin: u64,
+    pub serialization_failures: u64,
+    pub oversize_lines: u64,
+    pub write_failures: u64,
+}
+
+impl From<ServiceInputStatusSnapshot> for ServiceInputStatusView {
+    fn from(snapshot: ServiceInputStatusSnapshot) -> Self {
+        Self {
+            protocol: snapshot.protocol,
+            generation: snapshot.generation,
+            health: snapshot.health,
+            queue_capacity: snapshot.queue_capacity,
+            max_line_bytes: snapshot.max_line_bytes,
+            accepted_lines: snapshot.accepted_lines,
+            written_lines: snapshot.written_lines,
+            dropped_queue_full: snapshot.dropped_queue_full,
+            dropped_stale_generation: snapshot.dropped_stale_generation,
+            dropped_stopped: snapshot.dropped_stopped,
+            dropped_broken_stdin: snapshot.dropped_broken_stdin,
+            serialization_failures: snapshot.serialization_failures,
+            oversize_lines: snapshot.oversize_lines,
+            write_failures: snapshot.write_failures,
+        }
+    }
 }
 
 /// `GET /api/v1/plugins` response body.
@@ -148,6 +197,7 @@ pub async fn to_view(
                 pid: snapshot.pid,
                 restart_count: snapshot.restart_count,
                 last_error: snapshot.last_error,
+                input: snapshot.input.map(Into::into),
             },
             // Not currently supervised (disabled in the manifest, or its
             // supervisor task already unwound e.g. after `stop_service`) —
@@ -159,6 +209,7 @@ pub async fn to_view(
                 pid: None,
                 restart_count: 0,
                 last_error: None,
+                input: None,
             },
         };
         service_status.push(view);
