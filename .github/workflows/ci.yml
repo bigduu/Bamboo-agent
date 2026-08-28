@@ -152,8 +152,8 @@ jobs:
           shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
           cache-on-failure: true
 
-      - name: Run native recorder lifecycle E2E
-        run: cargo test --locked -p bamboo-tool-event-recorder-example --test tool_event_lifecycle -- --nocapture --test-threads=1
+      - name: Run native recorder contract and lifecycle tests
+        run: cargo test --locked -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
 
   e2e-test:
     name: E2E Tests
