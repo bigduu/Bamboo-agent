@@ -2301,7 +2301,7 @@ mod tests {
                 ProviderTranscriptOrigin::Provider,
                 ProviderTranscriptAuthor::Model,
                 json!({
-                    "type":"tool_search_call","execution":"server","call_id":null,
+                    "type":"tool_search_call","execution":"client","call_id":"search_isolation",
                     "status":"completed","arguments":{"query":"weather"}
                 }),
             )
