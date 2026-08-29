@@ -953,6 +953,38 @@ impl Session {
         &mut self,
         reason: crate::session::model_context::ModelContextResetReason,
     ) {
+        self.reset_provider_transcript_for_model_context(reason);
+        let state = self
+            .model_context_state
+            .get_or_insert_with(Default::default);
+        // Several repair steps can participate in one deliberate history
+        // rewrite before another model request is dispatched. Coalesce those
+        // steps into the already-pending boundary instead of advancing through
+        // multiple unobservable epochs. The latest reason is the most precise
+        // description of the final rewrite that will be seeded next.
+        let reset_is_pending = state.cache_scope_sha256.is_none()
+            && state.baselines.is_empty()
+            && state.events.is_empty()
+            && state.transcript_item_sha256.is_empty()
+            && state.last_reset_reason.is_some();
+        if reset_is_pending {
+            if state.last_reset_reason != Some(reason) {
+                state.last_reset_reason = Some(reason);
+                state.advance_state_revision();
+            }
+        } else {
+            state.reset_epoch(reason);
+        }
+    }
+
+    /// Apply a model-context boundary to the provider-native replay lane.
+    /// Engine reconciliation uses this when it discovers an implicit boundary;
+    /// callers that already declared a full model-context reset use
+    /// [`Self::reset_model_context_epoch`] so both lanes move atomically.
+    pub fn reset_provider_transcript_for_model_context(
+        &mut self,
+        reason: crate::session::model_context::ModelContextResetReason,
+    ) {
         use crate::session::provider_transcript::ProviderTranscriptResetReason;
 
         match reason {
@@ -983,27 +1015,6 @@ impl Session {
             // epoch. Avoid advancing it twice while resetting the PromptIR/cache
             // ledger at the same provider boundary.
             crate::session::model_context::ModelContextResetReason::ProviderSwitch => {}
-        }
-        let state = self
-            .model_context_state
-            .get_or_insert_with(Default::default);
-        // Several repair steps can participate in one deliberate history
-        // rewrite before another model request is dispatched. Coalesce those
-        // steps into the already-pending boundary instead of advancing through
-        // multiple unobservable epochs. The latest reason is the most precise
-        // description of the final rewrite that will be seeded next.
-        let reset_is_pending = state.cache_scope_sha256.is_none()
-            && state.baselines.is_empty()
-            && state.events.is_empty()
-            && state.transcript_item_sha256.is_empty()
-            && state.last_reset_reason.is_some();
-        if reset_is_pending {
-            if state.last_reset_reason != Some(reason) {
-                state.last_reset_reason = Some(reason);
-                state.advance_state_revision();
-            }
-        } else {
-            state.reset_epoch(reason);
         }
     }
 

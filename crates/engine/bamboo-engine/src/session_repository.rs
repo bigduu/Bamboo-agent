@@ -416,12 +416,14 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 if let Some(cached) = self.cache.get(&saved.id) {
                     let mut cached = cached.write();
                     let messages = cached.messages.clone();
+                    let provider_transcript = cached.provider_transcript.clone();
                     let admission = cached
                         .runtime_metadata
                         .as_ref()
                         .and_then(|metadata| metadata.session_inbox_admission.clone());
                     let mut refreshed = saved.clone();
                     refreshed.messages = messages;
+                    refreshed.provider_transcript = provider_transcript;
                     if let Some(admission) = admission {
                         refreshed
                             .runtime_metadata
@@ -1551,6 +1553,23 @@ mod tests {
         let id = "control-plane-ledger-cache";
         let mut initial = Session::new(id, "model");
         initial.add_message(bamboo_agent_core::Message::user("durable transcript"));
+        let assistant = bamboo_agent_core::Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        initial.add_message(assistant);
+        let native_item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","execution":"client","call_id":"cache_native",
+                "status":"completed","arguments":{"query":"CACHE_NATIVE_PAYLOAD_SENTINEL"}
+            }),
+        )
+        .unwrap();
+        initial
+            .append_provider_transcript_group(&anchor, None, vec![native_item])
+            .unwrap();
         storage.save_session(&initial).await.unwrap();
         cache_put(&repo, &initial);
         let mut stale = initial.clone();
@@ -1575,10 +1594,15 @@ mod tests {
             .unwrap();
 
         let expected = runner.model_context_state;
+        let expected_native = runner.provider_transcript;
         let durable = storage.load_session(id).await.unwrap().unwrap();
         let cached = read_cached_session(repo.cache(), id).expect("cached session");
-        for (tier, session) in [("durable", durable), ("cache", cached)] {
+        for (tier, session) in [("durable", durable), ("cache", cached.clone())] {
             assert_eq!(session.model_context_state, expected, "tier={tier}");
+            assert_eq!(
+                session.provider_transcript, expected_native,
+                "tier={tier} must retain the message-anchored native transcript"
+            );
             assert_eq!(
                 session
                     .metadata
@@ -1587,8 +1611,25 @@ mod tests {
                 Some("waiting"),
                 "tier={tier}"
             );
-            assert_eq!(session.messages.len(), 1, "tier={tier}");
+            assert_eq!(session.messages.len(), 2, "tier={tier}");
         }
+
+        let runtime_json =
+            std::fs::read_to_string(temp.path().join("sessions").join(id).join("runtime.json"))
+                .unwrap();
+        assert!(!runtime_json.contains("CACHE_NATIVE_PAYLOAD_SENTINEL"));
+
+        // Prove the cache projection cannot turn a runtime-only update into a
+        // later durable loss when that cached value becomes a full checkpoint.
+        let mut cache_writer = cached;
+        bamboo_domain::RuntimeSessionPersistence::checkpoint_runtime_session(
+            &repo,
+            &mut cache_writer,
+        )
+        .await
+        .unwrap();
+        let restarted = storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(restarted.provider_transcript, expected_native);
     }
 
     #[tokio::test]

@@ -374,6 +374,30 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
 
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ledger-checkpoint-failure", "test-model");
+    let assistant = Message::assistant("prior native response", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let native_item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","execution":"client","call_id":"checkpoint_search",
+            "status":"completed","arguments":{"query":"orders"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![native_item])
+        .unwrap();
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        cache_scope_sha256: Some("stale-scope".to_string()),
+        transcript_item_sha256: vec!["stale-transcript".to_string()],
+        ..Default::default()
+    });
+    let previous_model_context = session.model_context_state.clone();
+    let previous_provider_transcript = session.provider_transcript.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let mut config = test_config("system");
     let persistence = Arc::new(FailOncePersistence(std::sync::atomic::AtomicUsize::new(0)));
@@ -422,9 +446,13 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         .lock()
         .expect("messages lock")
         .is_empty());
-    assert!(
-        session.model_context_state.is_none(),
+    assert_eq!(
+        session.model_context_state, previous_model_context,
         "failed checkpoint must roll the in-memory ledger transaction back"
+    );
+    assert_eq!(
+        session.provider_transcript, previous_provider_transcript,
+        "native invalidation and model-context reset must roll back together"
     );
 
     execute_llm_stream(
@@ -1330,7 +1358,7 @@ fn request_envelope_replays_only_the_selected_provider_family() {
         bamboo_domain::ProviderTranscriptOrigin::Provider,
         bamboo_domain::ProviderTranscriptAuthor::Model,
         serde_json::json!({
-            "type":"tool_search_call","execution":"server","call_id":null,
+            "type":"tool_search_call","execution":"client","call_id":"search_weather",
             "status":"completed","arguments":{"query":"weather"}
         }),
     )

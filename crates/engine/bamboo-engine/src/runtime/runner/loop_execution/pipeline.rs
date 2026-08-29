@@ -1248,6 +1248,7 @@ fn commit_assistant_message(
     native_items: &mut Option<Vec<ProviderTranscriptItem>>,
 ) -> Result<(), AgentError> {
     let anchor = message.id.clone();
+    let previous_updated_at = session.updated_at;
     session.add_message(message);
     let Some(items) = native_items.take().filter(|items| !items.is_empty()) else {
         return Ok(());
@@ -1259,6 +1260,7 @@ fn commit_assistant_message(
             .is_some_and(|message| message.id == anchor)
         {
             session.messages.pop();
+            session.updated_at = previous_updated_at;
         }
         return Err(AgentError::LLM(format!(
             "provider-native transcript group rejected: {error}"
@@ -2955,10 +2957,11 @@ mod tests {
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, build_guardian_review_prompt,
-        check_run_budget_exceeded, is_overflow_recoverable, is_subagent_create_call,
-        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
-        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
-        should_retry_turn_error, suspend_to_wait_for_bash, validate_explicit_activation_first_step,
+        check_run_budget_exceeded, commit_assistant_message, is_overflow_recoverable,
+        is_subagent_create_call, is_terminal_child_status, map_turn_error_status,
+        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
+        validate_explicit_activation_first_step,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
@@ -3007,6 +3010,54 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    fn native_client_search_item() -> bamboo_domain::ProviderTranscriptItem {
+        bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","execution":"client","call_id":"search_1",
+                "status":"completed","arguments":{"query":"orders"}
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn assistant_and_native_group_commit_or_rollback_as_one_unit() {
+        let mut session = Session::new("native-commit", "model");
+        let message = Message::assistant("normalized", None);
+        let anchor = message.id.clone();
+        let mut items = Some(vec![native_client_search_item()]);
+        commit_assistant_message(&mut session, message, &mut items).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        let groups = session.provider_transcript.replayable_groups(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].anchor_message_id(), anchor);
+
+        let mut rejected = Session::new("native-rejected", "model");
+        rejected.activate_provider_transcript_family(bamboo_domain::ProviderFamily::Anthropic);
+        let before = rejected.clone();
+        let mut items = Some(vec![native_client_search_item()]);
+        let error = commit_assistant_message(
+            &mut rejected,
+            Message::assistant("must roll back", None),
+            &mut items,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider-native transcript group rejected"));
+        assert!(rejected.messages.is_empty());
+        assert!(before.messages.is_empty());
+        assert_eq!(rejected.provider_transcript, before.provider_transcript);
+        assert_eq!(rejected.updated_at, before.updated_at);
     }
 
     #[test]

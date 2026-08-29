@@ -38,6 +38,7 @@ pub(super) fn reconcile_model_context(
     let mut state = session.model_context_state.take().unwrap_or_default();
     let original_state = state.clone();
     let original_revision = state.state_revision;
+    let mut automatic_reset_reason = None;
 
     // A reset may already have been declared atomically by compression or a
     // rollback use case.  In that case cache_scope is intentionally empty and
@@ -50,18 +51,28 @@ pub(super) fn reconcile_model_context(
 
     if state.schema_version != MODEL_CONTEXT_SCHEMA_VERSION {
         state.reset_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+        automatic_reset_reason = Some(ModelContextResetReason::ExplicitHistoryRewrite);
     } else if let Some(previous_scope) = state.cache_scope_sha256.as_deref() {
         if previous_scope != cache_scope_sha256 {
             state.reset_epoch(ModelContextResetReason::CacheScopeChanged);
+            automatic_reset_reason = Some(ModelContextResetReason::CacheScopeChanged);
         } else if !current_item_sha256.starts_with(&state.transcript_item_sha256) {
             let reason = if hard_truncation {
                 ModelContextResetReason::HardTruncation
             } else if session.messages.iter().any(|message| message.compressed) {
                 ModelContextResetReason::Compression
-            } else {
+            } else if current_item_sha256.len() < state.transcript_item_sha256.len()
+                && is_ordered_subsequence(&current_item_sha256, &state.transcript_item_sha256)
+            {
                 ModelContextResetReason::Rollback
+            } else {
+                // A semantic rewrite can keep every Message.id intact. Treat
+                // non-subsequence drift as a full history rewrite so native
+                // groups anchored to those surviving ids cannot reappear.
+                ModelContextResetReason::ExplicitHistoryRewrite
             };
             state.reset_epoch(reason);
+            automatic_reset_reason = Some(reason);
         }
     }
 
@@ -89,7 +100,12 @@ pub(super) fn reconcile_model_context(
         || rendered_event_bytes(&state.events) > MAX_MODEL_CONTEXT_RENDERED_BYTES
     {
         state.reset_epoch(ModelContextResetReason::RetentionLimit);
+        automatic_reset_reason = Some(ModelContextResetReason::RetentionLimit);
         append_reconciliation_events(&session.id, &mut state, &current, None);
+    }
+
+    if let Some(reason) = automatic_reset_reason {
+        session.reset_provider_transcript_for_model_context(reason);
     }
 
     state.cache_scope_sha256 = Some(cache_scope_sha256);
@@ -117,6 +133,17 @@ pub(super) fn reconcile_model_context(
         prefix_epoch,
         reset_reason,
     }
+}
+
+fn is_ordered_subsequence<T: PartialEq>(candidate: &[T], original: &[T]) -> bool {
+    let mut candidate = candidate.iter();
+    let mut next = candidate.next();
+    for item in original {
+        if next.is_some_and(|expected| expected == item) {
+            next = candidate.next();
+        }
+    }
+    next.is_none()
 }
 
 fn rendered_event_bytes(events: &[ModelContextEvent]) -> usize {
@@ -308,6 +335,11 @@ fn model_message_sha256(message: &Message) -> String {
 mod tests {
     use super::*;
     use bamboo_agent_core::{ContextBlockPriority, ContextBlockStability, Role};
+    use bamboo_domain::{
+        ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+        ProviderTranscriptOrigin, ProviderTranscriptResetReason,
+    };
+    use serde_json::json;
 
     fn block(content: &str) -> ContextBlock {
         ContextBlock::new(
@@ -317,6 +349,23 @@ mod tests {
             "Task",
             content,
         )
+    }
+
+    fn append_openai_search_group(session: &mut Session, anchor: &str, query: &str) {
+        let item = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","execution":"client","call_id":format!("call_{query}"),
+                "status":"completed","arguments":{"query":query}
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(anchor, None, vec![item])
+            .unwrap();
     }
 
     #[test]
@@ -414,6 +463,9 @@ mod tests {
     fn hard_truncation_resets_epoch_and_coalesces_current_state() {
         let mut session = Session::new("ledger-reset", "model");
         let old = vec![Message::user("one"), Message::assistant("two", None)];
+        for message in &old {
+            session.add_message(message.clone());
+        }
         let first = reconcile_model_context(
             &mut session,
             vec![block("v1")],
@@ -421,6 +473,9 @@ mod tests {
             "scope".to_string(),
             false,
         );
+        let native_anchor = old[1].id.clone();
+        append_openai_search_group(&mut session, &native_anchor, "weather");
+        let native_epoch = session.provider_transcript.epoch();
         let rewritten = vec![Message::user("replacement")];
         let reset = reconcile_model_context(
             &mut session,
@@ -437,6 +492,15 @@ mod tests {
         assert_eq!(reset.transcript.len(), 2);
         assert!(reset.transcript[0].content.contains("prefix_epoch: 1"));
         assert_eq!(reset.transcript[1].content, "replacement");
+        assert_eq!(session.provider_transcript.epoch(), native_epoch + 1);
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::HardTruncation)
+        );
+        assert!(session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .is_empty());
 
         let next = reconcile_model_context(
             &mut session,
@@ -451,8 +515,126 @@ mod tests {
     }
 
     #[test]
+    fn automatic_cache_scope_and_history_rewrite_invalidate_native_replay() {
+        let mut session = Session::new("ledger-native-reset", "model");
+        let assistant = Message::assistant("before", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant.clone());
+        reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            std::slice::from_ref(&assistant),
+            "scope-a".to_string(),
+            false,
+        );
+        append_openai_search_group(&mut session, &anchor, "orders");
+
+        let before_scope = session.provider_transcript.epoch();
+        let scope_reset = reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            std::slice::from_ref(&assistant),
+            "scope-b".to_string(),
+            false,
+        );
+        assert_eq!(
+            scope_reset.reset_reason,
+            Some(ModelContextResetReason::CacheScopeChanged)
+        );
+        assert_eq!(session.provider_transcript.epoch(), before_scope + 1);
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::CacheScopeChanged)
+        );
+
+        let after_scope_anchor = Message::assistant("scope-b answer", None);
+        let after_scope_id = after_scope_anchor.id.clone();
+        session.add_message(after_scope_anchor.clone());
+        append_openai_search_group(&mut session, &after_scope_id, "shipping");
+        reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            &[assistant.clone(), after_scope_anchor],
+            "scope-b".to_string(),
+            false,
+        );
+        let before_rewrite = session.provider_transcript.epoch();
+        session.messages[1].content = "edited answer".to_string();
+        let edited = session.messages[1].clone();
+        let rewrite = reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            &[assistant, edited],
+            "scope-b".to_string(),
+            false,
+        );
+        assert_eq!(
+            rewrite.reset_reason,
+            Some(ModelContextResetReason::ExplicitHistoryRewrite)
+        );
+        assert_eq!(session.provider_transcript.epoch(), before_rewrite + 1);
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::ExplicitHistoryRewrite)
+        );
+        assert!(session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .is_empty());
+    }
+
+    #[test]
+    fn automatic_rollback_prunes_only_groups_whose_anchors_disappeared() {
+        let mut session = Session::new("ledger-native-rollback", "model");
+        let first = Message::assistant("first", None);
+        let first_anchor = first.id.clone();
+        let second = Message::assistant("second", None);
+        let second_anchor = second.id.clone();
+        session.add_message(first.clone());
+        session.add_message(second.clone());
+        reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            &[first.clone(), second],
+            "scope".to_string(),
+            false,
+        );
+        append_openai_search_group(&mut session, &first_anchor, "first");
+        append_openai_search_group(&mut session, &second_anchor, "second");
+        let native_epoch = session.provider_transcript.epoch();
+        session.messages.pop();
+
+        let rollback = reconcile_model_context(
+            &mut session,
+            vec![block("v1")],
+            std::slice::from_ref(&first),
+            "scope".to_string(),
+            false,
+        );
+        assert_eq!(
+            rollback.reset_reason,
+            Some(ModelContextResetReason::Rollback)
+        );
+        assert_eq!(session.provider_transcript.epoch(), native_epoch);
+        let replayable = session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1);
+        assert_eq!(replayable.len(), 1);
+        assert_eq!(replayable[0].anchor_message_id(), first_anchor);
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::Rollback)
+        );
+    }
+
+    #[test]
     fn retention_limit_starts_one_bounded_epoch_with_current_snapshot() {
         let mut session = Session::new("ledger-retention", "model");
+        let assistant = Message::assistant("native", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        append_openai_search_group(&mut session, &anchor, "retention");
+        let native_epoch = session.provider_transcript.epoch();
         let empty_transcript = Vec::<Message>::new();
 
         for revision in 0..=MAX_MODEL_CONTEXT_EVENTS {
@@ -477,6 +659,15 @@ mod tests {
         assert_eq!(state.events[0].sequence, 0);
         assert!(state.events[0].rendered_text.contains("current-v256"));
         assert_eq!(state.next_sequence, 1);
+        assert_eq!(session.provider_transcript.epoch(), native_epoch + 1);
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::RetentionLimit)
+        );
+        assert!(session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .is_empty());
 
         let before = state.clone();
         let retry = reconcile_model_context(
