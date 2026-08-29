@@ -66,6 +66,7 @@ pub(super) fn build_gemini_event_stream(
                 }
                 Ok(LLMChunk::TransportActivity)
                 | Ok(LLMChunk::ResponsesEvent { .. })
+                | Ok(LLMChunk::ProviderTranscriptItem(_))
                 | Ok(LLMChunk::CacheUsage { .. })
                 | Ok(LLMChunk::ProviderUsage { .. })
                 | Ok(LLMChunk::UsageSummary { .. })

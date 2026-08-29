@@ -157,6 +157,7 @@ pub(super) fn convert_llm_chunk_to_openai(
         }),
         bamboo_llm::types::LLMChunk::TransportActivity
         | bamboo_llm::types::LLMChunk::ResponsesEvent { .. }
+        | bamboo_llm::types::LLMChunk::ProviderTranscriptItem(_)
         | bamboo_llm::types::LLMChunk::CacheUsage { .. }
         | bamboo_llm::types::LLMChunk::ProviderUsage { .. }
         | bamboo_llm::types::LLMChunk::UsageSummary { .. }

@@ -84,6 +84,10 @@ pub struct ResponsesRequestOptions {
     /// system message) while preserving backward compatibility for non-Responses
     /// callers and providers.
     pub input_messages: Option<Vec<Message>>,
+    /// Validated provider-native Responses items, grouped by the ordinary
+    /// assistant message they replace. Internal only; the OpenAI adapter lowers
+    /// these at their anchored `input` position.
+    pub provider_transcript_groups: Vec<bamboo_domain::ProviderTranscriptGroup>,
     /// Optional reasoning summary control for Responses API requests
     /// (e.g. "auto", "concise", "detailed").
     pub reasoning_summary: Option<String>,

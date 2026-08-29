@@ -1317,6 +1317,52 @@ fn build_request_envelope_seeds_ledger_without_rewriting_old_breakpoints() {
 }
 
 #[test]
+fn request_envelope_replays_only_the_selected_provider_family() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("native-family", "test-model");
+    session.add_message(Message::user("search"));
+    let assistant = Message::assistant("normalized", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","execution":"server","call_id":null,
+            "status":"completed","arguments":{"query":"weather"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![item])
+        .unwrap();
+    let prepared = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut openai = test_config("system");
+    openai.provider_type = Some("openai".to_string());
+    let openai_envelope = super::build_request_envelope(&session, &prepared, &openai, &[]);
+    assert_eq!(openai_envelope.ir.provider_transcript_groups.len(), 1);
+
+    let mut anthropic = test_config("system");
+    anthropic.provider_type = Some("anthropic".to_string());
+    let anthropic_envelope = super::build_request_envelope(&session, &prepared, &anthropic, &[]);
+    assert!(anthropic_envelope.ir.provider_transcript_groups.is_empty());
+    assert_eq!(
+        anthropic_envelope.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::ProviderSwitch)
+    );
+}
+
+#[test]
 fn stable_prefix_is_byte_stable_across_rounds() {
     // The whole point of relocating the tool guide out of the system prompt is a
     // PREFIX that actually caches: across rounds where only the conversation

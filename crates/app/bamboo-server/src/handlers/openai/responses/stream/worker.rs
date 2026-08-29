@@ -232,6 +232,7 @@ pub(super) async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 cache_write_input_tokens,
             ),
             Ok(LLMChunk::TransportActivity)
+            | Ok(LLMChunk::ProviderTranscriptItem(_))
             | Ok(LLMChunk::CacheUsage { .. })
             | Ok(LLMChunk::UsageSummary { .. })
             | Ok(LLMChunk::ReasoningSignature(_)) => {}

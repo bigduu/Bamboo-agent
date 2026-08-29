@@ -31,7 +31,7 @@ use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
 };
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
+use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ProviderTranscriptItem};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -1242,6 +1242,31 @@ fn refresh_auxiliary_models_for_round(state: &mut LoopRunState, config: &AgentLo
 
 // ---- No-tool-calls path (from round_flow/no_tool_calls.rs) ----
 
+fn commit_assistant_message(
+    session: &mut Session,
+    message: Message,
+    native_items: &mut Option<Vec<ProviderTranscriptItem>>,
+) -> Result<(), AgentError> {
+    let anchor = message.id.clone();
+    session.add_message(message);
+    let Some(items) = native_items.take().filter(|items| !items.is_empty()) else {
+        return Ok(());
+    };
+    if let Err(error) = session.append_provider_transcript_group(&anchor, None, items) {
+        if session
+            .messages
+            .last()
+            .is_some_and(|message| message.id == anchor)
+        {
+            session.messages.pop();
+        }
+        return Err(AgentError::LLM(format!(
+            "provider-native transcript group rejected: {error}"
+        )));
+    }
+    Ok(())
+}
+
 /// Record the terminal `Complete` round metrics for a no-tool-calls turn. Shared
 /// by the gold-continue and the completion branches of [`handle_no_tool_calls`].
 fn record_no_tool_calls_round_completed(
@@ -1292,7 +1317,7 @@ fn record_no_tool_calls_round_completed(
 /// guardian runs exactly as before; with no guardian configured the goal loop
 /// runs exactly as before.
 #[allow(clippy::too_many_arguments)]
-async fn handle_no_tool_calls(
+async fn handle_no_tool_calls_with_native(
     content: String,
     reasoning: Option<String>,
     reasoning_signature: Option<String>,
@@ -1310,6 +1335,7 @@ async fn handle_no_tool_calls(
     eval_model: &str,
     iteration: u32,
     llm: Arc<dyn LLMProvider>,
+    provider_transcript_items: Vec<ProviderTranscriptItem>,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -1324,9 +1350,10 @@ async fn handle_no_tool_calls(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
     );
+    let mut native_items = Some(provider_transcript_items);
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
-            session.add_message(message);
+            commit_assistant_message(session, message, &mut native_items)?;
         }
     }
 
@@ -1425,7 +1452,7 @@ async fn handle_no_tool_calls(
             if runtime_state.stop_hook_forced_continuations < MAX_STOP_HOOK_CONTINUATIONS {
                 runtime_state.stop_hook_forced_continuations += 1;
                 if let Some(message) = deferred_assistant_message.take() {
-                    session.add_message(message);
+                    commit_assistant_message(session, message, &mut native_items)?;
                 }
                 let extra_context = outcome
                     .injected_contexts
@@ -1481,7 +1508,7 @@ async fn handle_no_tool_calls(
     }
 
     if let Some(message) = deferred_assistant_message.take() {
-        session.add_message(message);
+        commit_assistant_message(session, message, &mut native_items)?;
     }
     let _ = event_tx
         .send(AgentEvent::Complete {
@@ -1499,6 +1526,50 @@ async fn handle_no_tool_calls(
         should_break: true,
         sent_complete: true,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_no_tool_calls(
+    content: String,
+    reasoning: Option<String>,
+    reasoning_signature: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    round_usage: MetricsTokenUsage,
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    metrics_collector: Option<&MetricsCollector>,
+    round_id: &str,
+    session_id: &str,
+    config: &AgentLoopConfig,
+    task_context: &Option<TaskLoopContext>,
+    eval_model: &str,
+    iteration: u32,
+    llm: Arc<dyn LLMProvider>,
+) -> Result<TurnOutcome, AgentError> {
+    handle_no_tool_calls_with_native(
+        content,
+        reasoning,
+        reasoning_signature,
+        prompt_tokens,
+        completion_tokens,
+        round_usage,
+        session,
+        runtime_state,
+        event_tx,
+        metrics_collector,
+        round_id,
+        session_id,
+        config,
+        task_context,
+        eval_model,
+        iteration,
+        llm,
+        Vec::new(),
+    )
+    .await
 }
 
 // ---- Tool-calls path (from round_flow/tool_calls.rs) ----
@@ -1522,14 +1593,17 @@ async fn handle_tool_calls_path(
     let reasoning_signature = reasoning
         .as_ref()
         .and_then(|_| stream_output.reasoning_signature.clone());
-    session.add_message(
+    let mut native_items = Some(stream_output.provider_transcript_items.clone());
+    commit_assistant_message(
+        session,
         Message::assistant_with_reasoning(
             stream_output.content,
             Some(stream_output.tool_calls.clone()),
             reasoning,
         )
         .with_reasoning_signature(reasoning_signature),
-    );
+        &mut native_items,
+    )?;
 
     // Tool calls are a durable conversation boundary. In particular,
     // repository-backed tools such as load_skill update metadata through a
@@ -2266,7 +2340,7 @@ async fn run_pipeline_inner(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
-                match handle_no_tool_calls(
+                match handle_no_tool_calls_with_native(
                     stream_output.content,
                     reasoning,
                     reasoning_signature,
@@ -2284,6 +2358,7 @@ async fn run_pipeline_inner(
                     &eval_model,
                     turn_counter + 1,
                     llm.clone(),
+                    stream_output.provider_transcript_items,
                 )
                 .await
                 {
@@ -5345,6 +5420,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 provider_usage: None,
                 input_tokens: input,
+                provider_transcript_items: Vec::new(),
             }
         }
 
@@ -5428,6 +5504,7 @@ mod tests {
                 cache_write_input_tokens: None,
             }),
             input_tokens: 232,
+            provider_transcript_items: Vec::new(),
         };
 
         let mut activity = super::RoundActivity::default();
@@ -5480,6 +5557,7 @@ mod tests {
                 cache_write_input_tokens: None,
             }),
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         };
 
         assert_eq!(
@@ -6712,6 +6790,7 @@ mod tests {
             cache_read_input_tokens: 0,
             provider_usage: None,
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         }
     }
 
@@ -7060,6 +7139,7 @@ mod tests {
             cache_read_input_tokens: 0,
             provider_usage: None,
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         };
 
         let result = tokio::time::timeout(

@@ -702,6 +702,14 @@ pub struct Session {
     /// `messages` or the existing session API/UI transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_state: Option<crate::session::model_context::ModelContextState>,
+    /// Durable provider-native discovery history. This is separate from the
+    /// user-visible `messages` lane and is replayed only through a matching
+    /// provider family/protocol adapter.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::provider_transcript::ProviderTranscriptState::is_empty"
+    )]
+    pub provider_transcript: crate::session::provider_transcript::ProviderTranscriptState,
     /// Custom instructions for conversation summarization at the session level.
     /// Overrides config-level `compression_instructions` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -798,6 +806,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -883,6 +892,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -943,6 +953,30 @@ impl Session {
         &mut self,
         reason: crate::session::model_context::ModelContextResetReason,
     ) {
+        use crate::session::provider_transcript::ProviderTranscriptResetReason;
+
+        match reason {
+            crate::session::model_context::ModelContextResetReason::Compression => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::Compression),
+            crate::session::model_context::ModelContextResetReason::HardTruncation => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::HardTruncation),
+            crate::session::model_context::ModelContextResetReason::CacheScopeChanged => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::CacheScopeChanged),
+            crate::session::model_context::ModelContextResetReason::RetentionLimit => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::RetentionLimit),
+            crate::session::model_context::ModelContextResetReason::Rollback
+            | crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => {
+                self.prune_provider_transcript();
+            }
+            // `activate_provider_transcript_family` already advanced the native
+            // epoch. Avoid advancing it twice while resetting the PromptIR/cache
+            // ledger at the same provider boundary.
+            crate::session::model_context::ModelContextResetReason::ProviderSwitch => {}
+        }
         let state = self
             .model_context_state
             .get_or_insert_with(Default::default);

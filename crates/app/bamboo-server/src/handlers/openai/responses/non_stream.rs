@@ -109,6 +109,7 @@ pub(super) async fn handle_non_streaming_response(
                 cache_write_input_tokens,
             ),
             Ok(bamboo_llm::types::LLMChunk::TransportActivity)
+            | Ok(bamboo_llm::types::LLMChunk::ProviderTranscriptItem(_))
             | Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. })
             | Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. })
             | Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
