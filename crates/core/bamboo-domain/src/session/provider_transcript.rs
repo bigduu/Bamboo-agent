@@ -1514,6 +1514,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_history_rewrite_invalidates_groups_even_when_anchors_survive() {
+        let mut session = Session::new("session-native", "gpt-5.6");
+        let assistant = Message::assistant("before edit", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .append_provider_transcript_group(&anchor, None, openai_output_items())
+            .unwrap();
+        let previous_epoch = session.provider_transcript.epoch();
+
+        session.messages[0].content = "after edit".to_string();
+        session.reset_model_context_epoch(
+            crate::session::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        assert_eq!(session.provider_transcript.groups().len(), 1);
+        assert_eq!(session.provider_transcript.epoch(), previous_epoch + 1);
+        assert!(session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .is_empty());
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::ExplicitHistoryRewrite)
+        );
+    }
+
+    #[test]
     fn durable_and_runner_native_groups_merge_append_safely() {
         let mut base = Session::new("session-native", "gpt-5.6");
         let first = Message::assistant("first", None);

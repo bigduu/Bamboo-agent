@@ -968,10 +968,17 @@ impl Session {
             crate::session::model_context::ModelContextResetReason::RetentionLimit => self
                 .provider_transcript
                 .invalidate(ProviderTranscriptResetReason::RetentionLimit),
-            crate::session::model_context::ModelContextResetReason::Rollback
-            | crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => {
+            crate::session::model_context::ModelContextResetReason::Rollback => {
                 self.prune_provider_transcript();
             }
+            // Editing/replacing history can leave every message id intact while
+            // changing the meaning of the provider-native chain anchored there.
+            // A dangling-anchor prune is therefore insufficient: the complete
+            // loading epoch must become unreachable before the rewritten
+            // transcript is dispatched again.
+            crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::ExplicitHistoryRewrite),
             // `activate_provider_transcript_family` already advanced the native
             // epoch. Avoid advancing it twice while resetting the PromptIR/cache
             // ledger at the same provider boundary.
