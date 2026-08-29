@@ -20,7 +20,10 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::ToolSchema;
-use bamboo_domain::{Message, MessagePart, PromptBlock, Role};
+use bamboo_domain::{
+    Message, MessagePart, PromptBlock, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptOrigin, Role,
+};
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
 
@@ -245,7 +248,7 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        self.stream_messages_inner(messages, &[], tools, max_output_tokens, model, options)
+        self.stream_messages_inner(messages, &[], &[], tools, max_output_tokens, model, options)
             .await
     }
 
@@ -266,13 +269,22 @@ impl LLMProvider for AnthropicProvider {
     ) -> Result<LLMStream> {
         if ir.system_blocks.is_empty() {
             return self
-                .stream_messages_inner(&ir.flatten(), &[], tools, max_output_tokens, model, options)
+                .stream_messages_inner(
+                    &ir.flatten(),
+                    &[],
+                    &ir.provider_transcript_groups,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    options,
+                )
                 .await;
         }
         let messages = ir.body_chat();
         self.stream_messages_inner(
             &messages,
             &ir.system_blocks,
+            &ir.provider_transcript_groups,
             tools,
             max_output_tokens,
             model,
@@ -297,6 +309,7 @@ impl AnthropicProvider {
         &self,
         messages: &[Message],
         system_blocks: &[PromptBlock],
+        native_groups: &[ProviderTranscriptGroup],
         tools: &[ToolSchema],
         max_output_tokens: Option<u32>,
         model: &str,
@@ -346,7 +359,7 @@ impl AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let mut body = build_anthropic_request_with_cache_blocks(
+        let mut body = build_anthropic_request_with_cache_blocks_and_native(
             messages,
             system_blocks,
             tools,
@@ -357,6 +370,7 @@ impl AnthropicProvider {
             parallel_tool_calls,
             cache_plan,
             self.thinking_replay_always,
+            native_groups,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -458,7 +472,7 @@ impl AnthropicProvider {
                     session_log_id,
                     model
                 );
-                let mut fallback_body = build_anthropic_request_with_cache_blocks(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_and_native(
                     messages,
                     system_blocks,
                     tools,
@@ -469,6 +483,7 @@ impl AnthropicProvider {
                     Some(false),
                     cache_plan,
                     false,
+                    native_groups,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -510,7 +525,7 @@ impl AnthropicProvider {
                     model
                 );
 
-                let mut fallback_body = build_anthropic_request_with_cache_blocks(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_and_native(
                     messages,
                     system_blocks,
                     tools,
@@ -521,6 +536,7 @@ impl AnthropicProvider {
                     parallel_tool_calls,
                     cache_plan,
                     self.thinking_replay_always,
+                    native_groups,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -590,10 +606,10 @@ impl AnthropicProvider {
             ..Default::default()
         };
 
-        let stream =
-            crate::providers::common::sse::llm_stream_from_sse(response, move |event, data| {
-                parse_anthropic_sse_event(&mut state, event, data)
-            });
+        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
+        );
 
         Ok(stream)
     }
@@ -697,6 +713,35 @@ pub fn build_anthropic_request_with_cache_blocks(
     cache: Option<&PromptCachePlan>,
     thinking_replay_always: bool,
 ) -> Value {
+    build_anthropic_request_with_cache_blocks_and_native(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_and_native(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+) -> Value {
     let default_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
@@ -797,6 +842,8 @@ pub fn build_anthropic_request_with_cache_blocks(
         }
     }
 
+    apply_anthropic_native_groups(&mut anthropic_messages, &source_spans, native_groups);
+
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -825,6 +872,106 @@ pub fn build_anthropic_request_with_cache_blocks(
     }
 
     body
+}
+
+/// Replace only the normalized source contribution owned by each anchor. Cache
+/// markers are calculated first; an exact provider-owned block deliberately
+/// replaces (and therefore cannot inherit) a generated marker.
+fn apply_anthropic_native_groups(
+    messages: &mut [Value],
+    source_spans: &[Vec<SourceSpan>],
+    groups: &[ProviderTranscriptGroup],
+) {
+    struct Replacement {
+        message_index: usize,
+        start: usize,
+        end: usize,
+        items: Vec<Value>,
+    }
+
+    let mut groups_by_anchor: HashMap<&str, Vec<&ProviderTranscriptGroup>> = HashMap::new();
+    for group in groups.iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+    }) {
+        groups_by_anchor
+            .entry(group.anchor_message_id())
+            .or_default()
+            .push(group);
+    }
+
+    let mut replacements = Vec::new();
+    for (anchor, mut anchor_groups) in groups_by_anchor {
+        let Some((message_index, span_index)) =
+            source_spans
+                .iter()
+                .enumerate()
+                .find_map(|(message_index, spans)| {
+                    spans
+                        .iter()
+                        .position(|span| span.id == anchor)
+                        .map(|span_index| (message_index, span_index))
+                })
+        else {
+            continue;
+        };
+        let spans = &source_spans[message_index];
+        let start = span_index
+            .checked_sub(1)
+            .map(|previous| spans[previous].last_block.saturating_add(1))
+            .unwrap_or(0);
+        let end = spans[span_index].last_block.saturating_add(1);
+
+        anchor_groups.sort_by_key(|group| group.sequence());
+        let has_interior_thinking = start > 0
+            && anchor_groups.iter().any(|group| {
+                group.items().iter().any(|item| {
+                    matches!(
+                        item.payload().get("type").and_then(Value::as_str),
+                        Some("thinking" | "redacted_thinking")
+                    )
+                })
+            });
+        if has_interior_thinking {
+            // Consecutive assistant sources are coalesced to satisfy Anthropic's
+            // alternation rule. Replaying another thinking block in the middle
+            // would create an invalid request, so keep the normalized fallback
+            // for this entire anchor rather than replaying a partial group.
+            continue;
+        }
+
+        replacements.push(Replacement {
+            message_index,
+            start,
+            end,
+            items: anchor_groups
+                .into_iter()
+                .flat_map(|group| group.items())
+                .map(|item| item.payload().clone())
+                .collect(),
+        });
+    }
+
+    // Source spans were calculated before replacement. Apply later spans first
+    // so inserting a multi-block native group cannot shift an earlier index that
+    // another replacement still needs.
+    replacements.sort_by(|left, right| {
+        right
+            .message_index
+            .cmp(&left.message_index)
+            .then_with(|| right.start.cmp(&left.start))
+    });
+    for replacement in replacements {
+        let Some(content) = messages[replacement.message_index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        if replacement.start <= replacement.end && replacement.end <= content.len() {
+            content.splice(replacement.start..replacement.end, replacement.items);
+        }
+    }
 }
 
 /// Build a `cache_control` value, honoring an optional extended TTL.
@@ -1425,6 +1572,10 @@ pub struct AnthropicStreamState {
     requested_reasoning_effort: Option<ReasoningEffort>,
     request_thinking_enabled: bool,
     request_thinking_budget_tokens: Option<u64>,
+    native_blocks_by_index: HashMap<usize, Value>,
+    native_input_json_by_index: HashMap<usize, String>,
+    native_open_indices: HashSet<usize>,
+    native_capture_invalid: bool,
 }
 
 impl AnthropicStreamState {
@@ -1436,6 +1587,201 @@ impl AnthropicStreamState {
     fn thinking_signature_replayable(&self) -> bool {
         self.thinking_blocks_started == 1 && self.redacted_thinking_blocks_started == 0
     }
+}
+
+fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: &str, data: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        if matches!(
+            event_type,
+            "content_block_start" | "content_block_delta" | "content_block_stop"
+        ) {
+            state.native_capture_invalid = true;
+        }
+        return;
+    };
+    let index = value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    match event_type {
+        "content_block_start" => {
+            let Some((index, block)) = index.zip(value.get("content_block")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.insert(index) {
+                state.native_capture_invalid = true;
+            }
+            let supported = matches!(
+                block.get("type").and_then(Value::as_str),
+                Some(
+                    "text"
+                        | "thinking"
+                        | "redacted_thinking"
+                        | "server_tool_use"
+                        | "tool_search_tool_result"
+                        | "tool_use"
+                )
+            );
+            if !supported {
+                state.native_capture_invalid = true;
+                return;
+            }
+            if state
+                .native_blocks_by_index
+                .insert(index, block.clone())
+                .is_some()
+            {
+                state.native_capture_invalid = true;
+            }
+        }
+        "content_block_delta" => {
+            let Some((index, delta)) = index.zip(value.get("delta")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            let Some(block_type) = state
+                .native_blocks_by_index
+                .get(&index)
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            let append = |block: &mut Value, field: &str, fragment: &str| {
+                let current = block.get(field).and_then(Value::as_str).unwrap_or("");
+                block[field] = json!(format!("{current}{fragment}"));
+            };
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") if block_type == "text" => {
+                    let Some(fragment) = delta.get("text").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "text", fragment);
+                    }
+                }
+                Some("thinking_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta
+                        .get("thinking")
+                        .or_else(|| delta.get("text"))
+                        .and_then(Value::as_str)
+                    else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "thinking", fragment);
+                    }
+                }
+                Some("signature_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta.get("signature").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        append(block, "signature", fragment);
+                    }
+                }
+                Some("input_json_delta")
+                    if matches!(block_type.as_str(), "server_tool_use" | "tool_use") =>
+                {
+                    let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    state
+                        .native_input_json_by_index
+                        .entry(index)
+                        .or_default()
+                        .push_str(fragment);
+                }
+                _ => state.native_capture_invalid = true,
+            }
+        }
+        "content_block_stop" => {
+            let Some(index) = index else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.remove(&index) {
+                state.native_capture_invalid = true;
+            }
+            if let Some(input) = state.native_input_json_by_index.remove(&index) {
+                match serde_json::from_str::<Value>(&input) {
+                    Ok(input) if input.is_object() => {
+                        if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                            block["input"] = input;
+                        } else {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                    _ => state.native_capture_invalid = true,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn take_anthropic_provider_transcript_items(state: &mut AnthropicStreamState) -> Vec<LLMChunk> {
+    let mut blocks = std::mem::take(&mut state.native_blocks_by_index)
+        .into_iter()
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|(index, _)| *index);
+    let invalid = std::mem::take(&mut state.native_capture_invalid)
+        || !state.native_open_indices.is_empty()
+        || !state.native_input_json_by_index.is_empty();
+    state.native_open_indices.clear();
+    state.native_input_json_by_index.clear();
+    if invalid
+        || !blocks.iter().any(|(_, block)| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("server_tool_use" | "tool_search_tool_result")
+            )
+        })
+    {
+        return Vec::new();
+    }
+    let mut items = Vec::with_capacity(blocks.len());
+    for (_, payload) in blocks {
+        let author = match payload.get("type").and_then(Value::as_str) {
+            Some("tool_search_tool_result") => ProviderTranscriptAuthor::ToolResult,
+            _ => ProviderTranscriptAuthor::Model,
+        };
+        let Ok(item) = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            author,
+            payload,
+        ) else {
+            tracing::warn!("Anthropic discovery transcript failed closed during validation");
+            return Vec::new();
+        };
+        items.push(LLMChunk::ProviderTranscriptItem(item));
+    }
+    items
+}
+
+fn parse_anthropic_sse_event_multi(
+    state: &mut AnthropicStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
+    capture_anthropic_native_event(state, event_type, data);
+    let normalized = parse_anthropic_sse_event(state, event_type, data)?;
+    let mut chunks = if event_type == "message_stop" {
+        take_anthropic_provider_transcript_items(state)
+    } else {
+        Vec::new()
+    };
+    chunks.extend(normalized);
+    Ok(chunks)
 }
 
 /// Parse a single Anthropic SSE event into an optional [`LLMChunk`].
@@ -1739,6 +2085,20 @@ pub fn parse_anthropic_sse_event(
                         .unwrap_or_default();
 
                     let index = index as usize;
+                    if state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("server_tool_use")
+                    {
+                        // Tool-search server calls are persisted through the
+                        // native lane, not normalized into an executable host
+                        // ToolCall. Their partial arguments may contain paths or
+                        // search terms, so do not route them through the legacy
+                        // "unannounced tool_use" warning that prints raw data.
+                        return Ok(None);
+                    }
                     let Some((id, name)) = state.tool_uses_by_index.get(&index) else {
                         tracing::warn!(
                             "Anthropic input_json_delta for unannounced tool_use index {index}; skipping: {data}"
@@ -1856,6 +2216,207 @@ mod anthropic_request_building {
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn discovery_blocks_are_reassembled_and_replayed_at_their_message_anchor() {
+        let mut state = super::AnthropicStreamState::default();
+        let events = [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"weather\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let mut items = Vec::new();
+        for (event, payload) in events {
+            items.extend(
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|chunk| match chunk {
+                        super::LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                        _ => None,
+                    }),
+            );
+        }
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].payload()["input"]["query"], "weather");
+        assert_eq!(items[2].payload()["input"]["city"], "Paris");
+
+        let expected = items
+            .iter()
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+        let mut session = bamboo_domain::Session::new("native-anthropic", "claude");
+        session.add_message(Message::user("weather"));
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn native_replacements_run_back_to_front_across_coalesced_assistant_sources() {
+        let item = |payload| {
+            super::ProviderTranscriptItem::try_from_payload(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                super::ProviderTranscriptOrigin::Provider,
+                super::ProviderTranscriptAuthor::Model,
+                payload,
+            )
+            .unwrap()
+        };
+        let first_items = vec![
+            item(json!({"type":"text","text":"first preamble"})),
+            item(json!({
+                "type":"server_tool_use","id":"srv_1",
+                "name":"tool_search_tool_regex","input":{"query":"first"}
+            })),
+        ];
+        let second_items = vec![
+            item(json!({"type":"text","text":"second preamble"})),
+            item(json!({
+                "type":"server_tool_use","id":"srv_2",
+                "name":"tool_search_tool_regex","input":{"query":"second"}
+            })),
+        ];
+        let expected = first_items
+            .iter()
+            .chain(second_items.iter())
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+
+        let mut session = bamboo_domain::Session::new("native-coalesced", "claude");
+        session.add_message(Message::user("search twice"));
+        let first = Message::assistant("normalized first", None);
+        let first_anchor = first.id.clone();
+        session.add_message(first);
+        let second = Message::assistant("normalized second", None);
+        let second_anchor = second.id.clone();
+        session.add_message(second);
+        session
+            .append_provider_transcript_group(&first_anchor, None, first_items)
+            .unwrap();
+        session
+            .append_provider_transcript_group(&second_anchor, None, second_items)
+            .unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn native_capture_fails_closed_for_unknown_or_incomplete_blocks() {
+        let run = |events: Vec<(&str, Value)>| {
+            let mut state = super::AnthropicStreamState::default();
+            events
+                .into_iter()
+                .flat_map(|(event, payload)| {
+                    super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                        .unwrap()
+                })
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count()
+        };
+
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+                (
+                    "content_block_start",
+                    json!({"index":1,"content_block":{"type":"future_block","data":"opaque"}}),
+                ),
+                ("content_block_stop", json!({"index":1})),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"weather\"}"}}),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+    }
 
     #[test]
     fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
