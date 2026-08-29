@@ -6285,7 +6285,7 @@ mod tests {
             bamboo_domain::ProviderTranscriptOrigin::Provider,
             bamboo_domain::ProviderTranscriptAuthor::Model,
             serde_json::json!({
-                "type":"tool_search_call","execution":"server","call_id":null,
+                "type":"tool_search_call","execution":"client","call_id":"search_sidecar",
                 "status":"completed","arguments":{"query":"weather"}
             }),
         )
