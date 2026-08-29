@@ -2,6 +2,7 @@
 
 pub mod app_context;
 pub mod auto_dream;
+pub mod capability_discovery;
 pub mod events;
 pub mod external_agents;
 pub mod gardener;
