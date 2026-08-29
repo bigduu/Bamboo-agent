@@ -1134,9 +1134,10 @@ enum OpenAiFunctionDefinitionMode {
     /// A definition returned by OpenAI in a hosted tool-search output. The
     /// generated response model permits optional fields to be absent or null.
     ProviderOutput,
-    /// A complete callable definition Bamboo creates for client search or a
-    /// position-scoped `additional_tools` input item. Bamboo requires an object
-    /// parameter schema before this definition can become callable.
+    /// A callable definition Bamboo creates for client search or a
+    /// position-scoped `additional_tools` input item. OpenAI's request model
+    /// requires both `parameters` and `strict` keys, while permitting either
+    /// value to be null.
     HostInput,
     /// A function nested in a namespace. OpenAI's namespace member contract
     /// intentionally keeps parameters/strict optional and nullable for both
@@ -1163,9 +1164,9 @@ fn validate_openai_function_definition(
         "function definition fields",
     )?;
     let parameters_valid = match mode {
-        OpenAiFunctionDefinitionMode::HostInput => {
-            object.get("parameters").is_some_and(Value::is_object)
-        }
+        OpenAiFunctionDefinitionMode::HostInput => object
+            .get("parameters")
+            .is_some_and(|parameters| parameters.is_null() || parameters.is_object()),
         OpenAiFunctionDefinitionMode::ProviderOutput
         | OpenAiFunctionDefinitionMode::NamespaceMember => object
             .get("parameters")
@@ -1180,7 +1181,15 @@ fn validate_openai_function_definition(
             .and_then(Value::as_str)
             .is_some_and(|name| !name.trim().is_empty())
         || !parameters_valid
-        || !nullable_optional(object.get("strict"), Value::is_boolean)
+        || match mode {
+            OpenAiFunctionDefinitionMode::HostInput => !object
+                .get("strict")
+                .is_some_and(|strict| strict.is_null() || strict.is_boolean()),
+            OpenAiFunctionDefinitionMode::ProviderOutput
+            | OpenAiFunctionDefinitionMode::NamespaceMember => {
+                !nullable_optional(object.get("strict"), Value::is_boolean)
+            }
+        }
         || !nullable_optional(object.get("defer_loading"), Value::is_boolean)
         || !nullable_optional(object.get("description"), Value::is_string)
         || !nullable_optional(object.get("output_schema"), Value::is_object)
@@ -2725,32 +2734,74 @@ mod tests {
             .expect("provider output permits omitted or nullable optional definition fields");
         }
 
-        for (origin, author, payload) in [
-            (
-                ProviderTranscriptOrigin::HostToolSearch,
-                ProviderTranscriptAuthor::ToolResult,
-                json!({
-                    "type":"tool_search_output","execution":"client","call_id":"search_host",
-                    "status":"completed","tools":[{"type":"function","name":"load_skill"}]
-                }),
-            ),
-            (
-                ProviderTranscriptOrigin::DeveloperContext,
-                ProviderTranscriptAuthor::Host,
-                json!({
-                    "type":"additional_tools","role":"developer",
-                    "tools":[{"type":"function","name":"workflow_run"}]
-                }),
-            ),
+        let host_positions = |definition: Value| {
+            [
+                (
+                    ProviderTranscriptOrigin::HostToolSearch,
+                    ProviderTranscriptAuthor::ToolResult,
+                    json!({
+                        "type":"tool_search_output","execution":"client",
+                        "call_id":"search_host","status":"completed",
+                        "tools":[definition.clone()]
+                    }),
+                ),
+                (
+                    ProviderTranscriptOrigin::DeveloperContext,
+                    ProviderTranscriptAuthor::Host,
+                    json!({
+                        "type":"additional_tools","role":"developer","tools":[definition]
+                    }),
+                ),
+            ]
+        };
+
+        for definition in [
+            json!({
+                "type":"function","name":"workflow_run",
+                "parameters":null,"strict":null
+            }),
+            json!({
+                "type":"function","name":"workflow_run",
+                "parameters":{"type":"object"},"strict":false
+            }),
         ] {
-            assert!(ProviderTranscriptItem::try_from_payload(
-                ProviderFamily::OpenAi,
-                ProviderProtocol::OpenAiResponsesV1,
-                origin,
-                author,
-                payload,
-            )
-            .is_err());
+            for (origin, author, payload) in host_positions(definition) {
+                ProviderTranscriptItem::try_from_payload(
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    origin,
+                    author,
+                    payload,
+                )
+                .expect("host input requires both keys and permits nullable values");
+            }
+        }
+
+        for definition in [
+            json!({"type":"function","name":"workflow_run","strict":null}),
+            json!({
+                "type":"function","name":"workflow_run",
+                "parameters":{"type":"object"}
+            }),
+            json!({
+                "type":"function","name":"workflow_run",
+                "parameters":[],"strict":null
+            }),
+            json!({
+                "type":"function","name":"workflow_run",
+                "parameters":null,"strict":"false"
+            }),
+        ] {
+            for (origin, author, payload) in host_positions(definition) {
+                assert!(ProviderTranscriptItem::try_from_payload(
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    origin,
+                    author,
+                    payload,
+                )
+                .is_err());
+            }
         }
 
         let scoped = ProviderTranscriptItem::try_from_payload(
@@ -2762,6 +2813,7 @@ mod tests {
                 "type":"tool_search_output","execution":"client","call_id":"search_scoped",
                 "status":"completed","tools":[{
                     "type":"function","name":"load_skill","defer_loading":true,
+                    "strict":false,
                     "parameters":{
                         "type":"object",
                         "properties":{"skill_id":{"type":"string","const":"skill:pinned@rev-7"}},
@@ -3889,7 +3941,10 @@ mod tests {
             json!({
                 "type":"additional_tools",
                 "role":"developer",
-                "tools":[{"type":"function","name":"x","description":secret,"parameters":{"type":"object"}}]
+                "tools":[{
+                    "type":"function","name":"x","description":secret,
+                    "parameters":{"type":"object"},"strict":false
+                }]
             }),
         )
         .unwrap();
