@@ -443,8 +443,8 @@ pub struct ProviderTranscriptState {
 
 #[derive(Deserialize)]
 struct ProviderTranscriptStateWire {
-    #[serde(default = "default_provider_transcript_schema_version")]
-    schema_version: u32,
+    #[serde(default)]
+    schema_version: Option<u32>,
     #[serde(default)]
     state_revision: u64,
     #[serde(default)]
@@ -459,21 +459,32 @@ struct ProviderTranscriptStateWire {
     last_reset_reason: Option<ProviderTranscriptResetReason>,
 }
 
-fn default_provider_transcript_schema_version() -> u32 {
-    PROVIDER_TRANSCRIPT_SCHEMA_VERSION
-}
-
 impl<'de> Deserialize<'de> for ProviderTranscriptState {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let wire = ProviderTranscriptStateWire::deserialize(deserializer)?;
-        if wire.schema_version != PROVIDER_TRANSCRIPT_SCHEMA_VERSION {
-            return Err(D::Error::custom(
-                "unsupported provider transcript schema version",
-            ));
-        }
+        let wire_is_empty = wire.state_revision == 0
+            && wire.epoch == 0
+            && wire.next_sequence == 0
+            && wire.active_family.is_none()
+            && wire.groups.is_empty()
+            && wire.last_reset_reason.is_none();
+        let schema_version = match wire.schema_version {
+            Some(PROVIDER_TRANSCRIPT_SCHEMA_VERSION) => PROVIDER_TRANSCRIPT_SCHEMA_VERSION,
+            Some(_) => {
+                return Err(D::Error::custom(
+                    "unsupported provider transcript schema version",
+                ))
+            }
+            None if wire_is_empty => PROVIDER_TRANSCRIPT_SCHEMA_VERSION,
+            None => {
+                return Err(D::Error::custom(
+                    "missing provider transcript schema version",
+                ))
+            }
+        };
         let mut ids = HashSet::new();
         if wire
             .groups
@@ -509,7 +520,7 @@ impl<'de> Deserialize<'de> for ProviderTranscriptState {
             ));
         }
         Ok(Self {
-            schema_version: wire.schema_version,
+            schema_version,
             state_revision: wire.state_revision,
             epoch: wire.epoch,
             next_sequence: wire.next_sequence,
@@ -1030,10 +1041,154 @@ fn validate_openai_tool_definitions(value: Option<&Value>) -> Result<(), Provide
     Ok(())
 }
 
-fn validate_openai_message_content(value: &Value) -> Result<(), ProviderTranscriptError> {
-    if value.is_string() {
+fn is_nonempty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_openai_item_status(value: Option<&Value>) -> bool {
+    matches!(
+        value.and_then(Value::as_str),
+        Some("in_progress" | "completed" | "incomplete")
+    )
+}
+
+fn validate_openai_agent(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
         return Ok(());
+    };
+    let agent = value
+        .as_object()
+        .ok_or(ProviderTranscriptError::InvalidItem("agent shape"))?;
+    reject_unknown_fields(agent, &["agent_name"], "agent fields")?;
+    if !is_nonempty_string(agent.get("agent_name")) {
+        return Err(ProviderTranscriptError::InvalidItem("agent name"));
     }
+    Ok(())
+}
+
+fn validate_openai_annotation(value: &Value) -> Result<(), ProviderTranscriptError> {
+    let annotation = value
+        .as_object()
+        .ok_or(ProviderTranscriptError::InvalidItem("output annotation"))?;
+    let string = |field| annotation.get(field).is_some_and(Value::is_string);
+    let index = |field| annotation.get(field).and_then(Value::as_u64).is_some();
+    match annotation.get("type").and_then(Value::as_str) {
+        Some("file_citation") => {
+            reject_unknown_fields(
+                annotation,
+                &["type", "file_id", "filename", "index"],
+                "file citation fields",
+            )?;
+            if !string("file_id") || !string("filename") || !index("index") {
+                return Err(ProviderTranscriptError::InvalidItem("file citation shape"));
+            }
+        }
+        Some("url_citation") => {
+            reject_unknown_fields(
+                annotation,
+                &["type", "start_index", "end_index", "title", "url"],
+                "url citation fields",
+            )?;
+            if !index("start_index") || !index("end_index") || !string("title") || !string("url") {
+                return Err(ProviderTranscriptError::InvalidItem("url citation shape"));
+            }
+        }
+        Some("container_file_citation") => {
+            reject_unknown_fields(
+                annotation,
+                &[
+                    "type",
+                    "container_id",
+                    "start_index",
+                    "end_index",
+                    "file_id",
+                    "filename",
+                ],
+                "container citation fields",
+            )?;
+            if !string("container_id")
+                || !index("start_index")
+                || !index("end_index")
+                || !string("file_id")
+                || !string("filename")
+            {
+                return Err(ProviderTranscriptError::InvalidItem(
+                    "container citation shape",
+                ));
+            }
+        }
+        Some("file_path") => {
+            reject_unknown_fields(
+                annotation,
+                &["type", "file_id", "index"],
+                "file path fields",
+            )?;
+            if !string("file_id") || !index("index") {
+                return Err(ProviderTranscriptError::InvalidItem("file path shape"));
+            }
+        }
+        _ => {
+            return Err(ProviderTranscriptError::InvalidItem(
+                "unsupported output annotation",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_logprob_bytes(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_array).is_some_and(|bytes| {
+        bytes
+            .iter()
+            .all(|byte| byte.as_u64().is_some_and(|byte| byte <= u8::MAX as u64))
+    })
+}
+
+fn validate_openai_logprobs(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let logprobs = value
+        .as_array()
+        .ok_or(ProviderTranscriptError::InvalidItem("output logprobs"))?;
+    for logprob in logprobs {
+        let logprob = logprob
+            .as_object()
+            .ok_or(ProviderTranscriptError::InvalidItem("output logprob"))?;
+        reject_unknown_fields(
+            logprob,
+            &["token", "bytes", "logprob", "top_logprobs"],
+            "output logprob fields",
+        )?;
+        let top_logprobs = logprob
+            .get("top_logprobs")
+            .and_then(Value::as_array)
+            .ok_or(ProviderTranscriptError::InvalidItem("top logprobs"))?;
+        if !logprob.get("token").is_some_and(Value::is_string)
+            || !validate_openai_logprob_bytes(logprob.get("bytes"))
+            || !logprob.get("logprob").is_some_and(Value::is_number)
+        {
+            return Err(ProviderTranscriptError::InvalidItem("output logprob shape"));
+        }
+        for top in top_logprobs {
+            let top = top
+                .as_object()
+                .ok_or(ProviderTranscriptError::InvalidItem("top logprob"))?;
+            reject_unknown_fields(top, &["token", "bytes", "logprob"], "top logprob fields")?;
+            if !top.get("token").is_some_and(Value::is_string)
+                || !validate_openai_logprob_bytes(top.get("bytes"))
+                || !top.get("logprob").is_some_and(Value::is_number)
+            {
+                return Err(ProviderTranscriptError::InvalidItem("top logprob shape"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_message_content(value: &Value) -> Result<(), ProviderTranscriptError> {
     let content = value
         .as_array()
         .ok_or(ProviderTranscriptError::InvalidItem("message content"))?;
@@ -1043,18 +1198,25 @@ fn validate_openai_message_content(value: &Value) -> Result<(), ProviderTranscri
             .ok_or(ProviderTranscriptError::InvalidItem("message content part"))?;
         match part.get("type").and_then(Value::as_str) {
             Some("output_text") => {
-                if !part.get("text").is_some_and(Value::is_string)
-                    || part
-                        .get("annotations")
-                        .is_some_and(|annotations| !annotations.is_array())
-                    || part
-                        .get("logprobs")
-                        .is_some_and(|logprobs| !logprobs.is_array())
-                {
+                reject_unknown_fields(
+                    part,
+                    &["type", "text", "annotations", "logprobs"],
+                    "output text fields",
+                )?;
+                let annotations = part
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .ok_or(ProviderTranscriptError::InvalidItem("output annotations"))?;
+                if !part.get("text").is_some_and(Value::is_string) {
                     return Err(ProviderTranscriptError::InvalidItem("output text content"));
                 }
+                for annotation in annotations {
+                    validate_openai_annotation(annotation)?;
+                }
+                validate_openai_logprobs(part.get("logprobs"))?;
             }
             Some("refusal") => {
+                reject_unknown_fields(part, &["type", "refusal"], "refusal fields")?;
                 if !part.get("refusal").is_some_and(Value::is_string) {
                     return Err(ProviderTranscriptError::InvalidItem("refusal content"));
                 }
@@ -1069,34 +1231,55 @@ fn validate_openai_message_content(value: &Value) -> Result<(), ProviderTranscri
     Ok(())
 }
 
-fn validate_openai_reasoning(object: &serde_json::Map<String, Value>) -> bool {
-    let valid_parts = |value: Option<&Value>, kind: &str| {
-        value.is_some_and(|value| {
-            value.as_array().is_some_and(|parts| {
-                parts.iter().all(|part| {
-                    part.as_object().is_some_and(|part| {
-                        part.get("type").and_then(Value::as_str) == Some(kind)
-                            && part.get("text").is_some_and(Value::is_string)
-                    })
-                })
-            })
-        })
+fn validate_openai_reasoning_parts(
+    value: Option<&Value>,
+    kind: &'static str,
+    required: bool,
+) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
+        return if required {
+            Err(ProviderTranscriptError::InvalidItem("reasoning parts"))
+        } else {
+            Ok(())
+        };
     };
-    object
-        .get("id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.trim().is_empty())
-        && valid_parts(object.get("summary"), "summary_text")
-        && object
-            .get("content")
-            .is_none_or(|_| valid_parts(object.get("content"), "reasoning_text"))
-        && object.get("encrypted_content").is_none_or(Value::is_string)
-        && object.get("status").is_none_or(|status| {
-            matches!(
-                status.as_str(),
-                Some("in_progress" | "completed" | "incomplete")
-            )
-        })
+    let parts = value
+        .as_array()
+        .ok_or(ProviderTranscriptError::InvalidItem("reasoning parts"))?;
+    for part in parts {
+        let part = part
+            .as_object()
+            .ok_or(ProviderTranscriptError::InvalidItem("reasoning part"))?;
+        reject_unknown_fields(part, &["type", "text"], "reasoning part fields")?;
+        if part.get("type").and_then(Value::as_str) != Some(kind)
+            || !part.get("text").is_some_and(Value::is_string)
+        {
+            return Err(ProviderTranscriptError::InvalidItem("reasoning part shape"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_openai_caller(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let caller = value
+        .as_object()
+        .ok_or(ProviderTranscriptError::InvalidItem("function caller"))?;
+    match caller.get("type").and_then(Value::as_str) {
+        Some("direct") => reject_unknown_fields(caller, &["type"], "direct caller fields"),
+        Some("program") => {
+            reject_unknown_fields(caller, &["type", "caller_id"], "program caller fields")?;
+            if !is_nonempty_string(caller.get("caller_id")) {
+                return Err(ProviderTranscriptError::InvalidItem("program caller id"));
+            }
+            Ok(())
+        }
+        _ => Err(ProviderTranscriptError::InvalidItem(
+            "unsupported function caller",
+        )),
+    }
 }
 
 fn validate_openai_item(
@@ -1123,29 +1306,88 @@ fn validate_openai_item(
 
     match item_type {
         "message" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &["type", "id", "content", "role", "status", "agent", "phase"],
+                "provider message fields",
+            )?;
             if author != ProviderTranscriptAuthor::Model
+                || !is_nonempty_string(object.get("id"))
                 || object.get("role").and_then(Value::as_str) != Some("assistant")
+                || !is_openai_item_status(object.get("status"))
+                || object.get("phase").is_some_and(|phase| {
+                    !matches!(phase.as_str(), Some("commentary" | "final_answer"))
+                })
             {
                 return Err(ProviderTranscriptError::InvalidItem(
                     "provider message shape",
                 ));
             }
+            validate_openai_agent(object.get("agent"))?;
             validate_openai_message_content(object.get("content").ok_or(
                 ProviderTranscriptError::InvalidItem("provider message content"),
             )?)?;
             Ok(ProviderTranscriptItemKind::OpenAiMessage)
         }
         "reasoning" if origin == ProviderTranscriptOrigin::Provider => {
-            if author != ProviderTranscriptAuthor::Model || !validate_openai_reasoning(object) {
+            reject_unknown_fields(
+                object,
+                &[
+                    "type",
+                    "id",
+                    "summary",
+                    "agent",
+                    "content",
+                    "encrypted_content",
+                    "status",
+                ],
+                "reasoning fields",
+            )?;
+            if author != ProviderTranscriptAuthor::Model
+                || !is_nonempty_string(object.get("id"))
+                || object
+                    .get("encrypted_content")
+                    .is_some_and(|content| !content.is_string())
+                || object
+                    .get("status")
+                    .is_some_and(|_| !is_openai_item_status(object.get("status")))
+            {
                 return Err(ProviderTranscriptError::InvalidItem("reasoning shape"));
             }
+            validate_openai_agent(object.get("agent"))?;
+            validate_openai_reasoning_parts(object.get("summary"), "summary_text", true)?;
+            validate_openai_reasoning_parts(object.get("content"), "reasoning_text", false)?;
             Ok(ProviderTranscriptItemKind::OpenAiReasoning)
         }
         "function_call" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &[
+                    "type",
+                    "id",
+                    "arguments",
+                    "call_id",
+                    "name",
+                    "agent",
+                    "caller",
+                    "namespace",
+                    "status",
+                ],
+                "function call fields",
+            )?;
             require_nonempty_string("name")?;
             require_nonempty_string("call_id")?;
             let arguments = object.get("arguments").and_then(Value::as_str);
             if author != ProviderTranscriptAuthor::Model
+                || object
+                    .get("id")
+                    .is_some_and(|_| !is_nonempty_string(object.get("id")))
+                || object
+                    .get("namespace")
+                    .is_some_and(|_| !is_nonempty_string(object.get("namespace")))
+                || object
+                    .get("status")
+                    .is_some_and(|_| !is_openai_item_status(object.get("status")))
                 || arguments.is_none()
                 || !arguments.is_some_and(|arguments| {
                     serde_json::from_str::<Value>(arguments)
@@ -1155,27 +1397,40 @@ fn validate_openai_item(
             {
                 return Err(ProviderTranscriptError::InvalidItem("function call shape"));
             }
+            validate_openai_agent(object.get("agent"))?;
+            validate_openai_caller(object.get("caller"))?;
             Ok(ProviderTranscriptItemKind::OpenAiFunctionCall)
         }
         "tool_search_call" if origin == ProviderTranscriptOrigin::Provider => {
-            let execution = execution()?;
+            reject_unknown_fields(
+                object,
+                &[
+                    "type",
+                    "id",
+                    "arguments",
+                    "call_id",
+                    "execution",
+                    "status",
+                    "agent",
+                    "created_by",
+                ],
+                "tool search call fields",
+            )?;
+            execution()?;
+            require_nonempty_string("id")?;
+            require_nonempty_string("call_id")?;
             if author != ProviderTranscriptAuthor::Model
                 || object.get("status").and_then(Value::as_str) != Some("completed")
                 || !object.get("arguments").is_some_and(Value::is_object)
+                || object
+                    .get("created_by")
+                    .is_some_and(|_| !is_nonempty_string(object.get("created_by")))
             {
                 return Err(ProviderTranscriptError::InvalidItem(
                     "tool search call shape",
                 ));
             }
-            let call_id = object.get("call_id");
-            if (execution == "client"
-                && !call_id
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty()))
-                || (execution == "server" && call_id.is_some_and(|value| !value.is_null()))
-            {
-                return Err(ProviderTranscriptError::InvalidItem("tool search call_id"));
-            }
+            validate_openai_agent(object.get("agent"))?;
             Ok(ProviderTranscriptItemKind::OpenAiToolSearchCall)
         }
         "tool_search_output" => {
@@ -1188,30 +1443,56 @@ fn validate_openai_item(
                 ));
             }
             validate_openai_tool_definitions(object.get("tools"))?;
-            let call_id = object.get("call_id");
-            if (execution == "client"
-                && !call_id
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty()))
-                || (execution == "server" && call_id.is_some_and(|value| !value.is_null()))
-            {
-                return Err(ProviderTranscriptError::InvalidItem(
-                    "tool search output call_id",
-                ));
-            }
-            if execution == "client" && origin != ProviderTranscriptOrigin::HostToolSearch {
-                return Err(ProviderTranscriptError::InvalidItem(
-                    "client tool search output origin",
-                ));
-            }
-            if execution == "server" && origin != ProviderTranscriptOrigin::Provider {
-                return Err(ProviderTranscriptError::InvalidItem(
-                    "server tool search output origin",
-                ));
+            match (execution, origin) {
+                ("server", ProviderTranscriptOrigin::Provider) => {
+                    reject_unknown_fields(
+                        object,
+                        &[
+                            "type",
+                            "id",
+                            "call_id",
+                            "execution",
+                            "status",
+                            "tools",
+                            "agent",
+                            "created_by",
+                        ],
+                        "server tool search output fields",
+                    )?;
+                    require_nonempty_string("id")?;
+                    require_nonempty_string("call_id")?;
+                    if object
+                        .get("created_by")
+                        .is_some_and(|_| !is_nonempty_string(object.get("created_by")))
+                    {
+                        return Err(ProviderTranscriptError::InvalidItem(
+                            "tool search output created_by",
+                        ));
+                    }
+                    validate_openai_agent(object.get("agent"))?;
+                }
+                ("client", ProviderTranscriptOrigin::HostToolSearch) => {
+                    reject_unknown_fields(
+                        object,
+                        &["type", "call_id", "execution", "status", "tools"],
+                        "client tool search output fields",
+                    )?;
+                    require_nonempty_string("call_id")?;
+                }
+                _ => {
+                    return Err(ProviderTranscriptError::InvalidItem(
+                        "tool search output origin",
+                    ))
+                }
             }
             Ok(ProviderTranscriptItemKind::OpenAiToolSearchOutput)
         }
         "additional_tools" if origin == ProviderTranscriptOrigin::DeveloperContext => {
+            reject_unknown_fields(
+                object,
+                &["type", "role", "tools"],
+                "additional tools fields",
+            )?;
             if author != ProviderTranscriptAuthor::Host
                 || object.get("role").and_then(Value::as_str) != Some("developer")
             {
@@ -1224,6 +1505,180 @@ fn validate_openai_item(
         }
         _ => Err(ProviderTranscriptError::UnsupportedItemType),
     }
+}
+
+fn validate_anthropic_caller(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let caller = value
+        .as_object()
+        .ok_or(ProviderTranscriptError::InvalidItem("Anthropic caller"))?;
+    match caller.get("type").and_then(Value::as_str) {
+        Some("direct") => reject_unknown_fields(caller, &["type"], "direct caller fields"),
+        Some("code_execution_20250825" | "code_execution_20260120" | "code_execution_20260521") => {
+            reject_unknown_fields(caller, &["type", "tool_id"], "server caller fields")?;
+            if !is_nonempty_string(caller.get("tool_id")) {
+                return Err(ProviderTranscriptError::InvalidItem(
+                    "server caller tool id",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ProviderTranscriptError::InvalidItem(
+            "unsupported Anthropic caller",
+        )),
+    }
+}
+
+fn is_string_or_null(value: Option<&Value>) -> bool {
+    value.is_some_and(|value| value.is_string() || value.is_null())
+}
+
+fn validate_anthropic_text_citation(value: &Value) -> Result<(), ProviderTranscriptError> {
+    let citation = value
+        .as_object()
+        .ok_or(ProviderTranscriptError::InvalidItem("text citation"))?;
+    let string = |field| citation.get(field).is_some_and(Value::is_string);
+    let index = |field| citation.get(field).and_then(Value::as_u64).is_some();
+    match citation.get("type").and_then(Value::as_str) {
+        Some("char_location") => {
+            reject_unknown_fields(
+                citation,
+                &[
+                    "type",
+                    "cited_text",
+                    "document_index",
+                    "document_title",
+                    "start_char_index",
+                    "end_char_index",
+                    "file_id",
+                ],
+                "char citation fields",
+            )?;
+            if !string("cited_text")
+                || !index("document_index")
+                || !is_string_or_null(citation.get("document_title"))
+                || !index("start_char_index")
+                || !index("end_char_index")
+                || !is_string_or_null(citation.get("file_id"))
+            {
+                return Err(ProviderTranscriptError::InvalidItem("char citation shape"));
+            }
+        }
+        Some("page_location") => {
+            reject_unknown_fields(
+                citation,
+                &[
+                    "type",
+                    "cited_text",
+                    "document_index",
+                    "document_title",
+                    "start_page_number",
+                    "end_page_number",
+                    "file_id",
+                ],
+                "page citation fields",
+            )?;
+            if !string("cited_text")
+                || !index("document_index")
+                || !is_string_or_null(citation.get("document_title"))
+                || !index("start_page_number")
+                || !index("end_page_number")
+                || !is_string_or_null(citation.get("file_id"))
+            {
+                return Err(ProviderTranscriptError::InvalidItem("page citation shape"));
+            }
+        }
+        Some("content_block_location") => {
+            reject_unknown_fields(
+                citation,
+                &[
+                    "type",
+                    "cited_text",
+                    "document_index",
+                    "document_title",
+                    "start_block_index",
+                    "end_block_index",
+                    "file_id",
+                ],
+                "content citation fields",
+            )?;
+            if !string("cited_text")
+                || !index("document_index")
+                || !is_string_or_null(citation.get("document_title"))
+                || !index("start_block_index")
+                || !index("end_block_index")
+                || !is_string_or_null(citation.get("file_id"))
+            {
+                return Err(ProviderTranscriptError::InvalidItem(
+                    "content citation shape",
+                ));
+            }
+        }
+        Some("web_search_result_location") => {
+            reject_unknown_fields(
+                citation,
+                &["type", "cited_text", "encrypted_index", "title", "url"],
+                "web citation fields",
+            )?;
+            if !string("cited_text")
+                || !string("encrypted_index")
+                || !is_string_or_null(citation.get("title"))
+                || !string("url")
+            {
+                return Err(ProviderTranscriptError::InvalidItem("web citation shape"));
+            }
+        }
+        Some("search_result_location") => {
+            reject_unknown_fields(
+                citation,
+                &[
+                    "type",
+                    "cited_text",
+                    "start_block_index",
+                    "end_block_index",
+                    "search_result_index",
+                    "source",
+                    "title",
+                ],
+                "search citation fields",
+            )?;
+            if !string("cited_text")
+                || !index("start_block_index")
+                || !index("end_block_index")
+                || !index("search_result_index")
+                || !string("source")
+                || !is_string_or_null(citation.get("title"))
+            {
+                return Err(ProviderTranscriptError::InvalidItem(
+                    "search citation shape",
+                ));
+            }
+        }
+        _ => {
+            return Err(ProviderTranscriptError::InvalidItem(
+                "unsupported text citation",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn validate_anthropic_text_citations(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let citations = value
+        .as_array()
+        .ok_or(ProviderTranscriptError::InvalidItem("text citations"))?;
+    for citation in citations {
+        validate_anthropic_text_citation(citation)?;
+    }
+    Ok(())
 }
 
 fn validate_anthropic_item(
@@ -1242,14 +1697,21 @@ fn validate_anthropic_item(
     };
     match item_type {
         "text" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(object, &["type", "text", "citations"], "text block fields")?;
             if author != ProviderTranscriptAuthor::Model
                 || !object.get("text").is_some_and(Value::is_string)
             {
                 return Err(ProviderTranscriptError::InvalidItem("text block"));
             }
+            validate_anthropic_text_citations(object.get("citations"))?;
             Ok(ProviderTranscriptItemKind::AnthropicText)
         }
         "thinking" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &["type", "thinking", "signature"],
+                "thinking block fields",
+            )?;
             if author != ProviderTranscriptAuthor::Model
                 || !object.get("thinking").is_some_and(Value::is_string)
                 || !object
@@ -1262,6 +1724,7 @@ fn validate_anthropic_item(
             Ok(ProviderTranscriptItemKind::AnthropicThinking)
         }
         "redacted_thinking" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(object, &["type", "data"], "redacted thinking fields")?;
             if author != ProviderTranscriptAuthor::Model
                 || !object.get("data").is_some_and(Value::is_string)
             {
@@ -1272,19 +1735,30 @@ fn validate_anthropic_item(
             Ok(ProviderTranscriptItemKind::AnthropicRedactedThinking)
         }
         "server_tool_use" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &["type", "id", "name", "input", "caller"],
+                "server tool use fields",
+            )?;
             nonempty("id")?;
             let name = nonempty("name")?;
             if author != ProviderTranscriptAuthor::Model
-                || !name.starts_with("tool_search_tool_")
+                || !matches!(name, "tool_search_tool_regex" | "tool_search_tool_bm25")
                 || !object.get("input").is_some_and(Value::is_object)
             {
                 return Err(ProviderTranscriptError::InvalidItem(
                     "tool-search server_tool_use block",
                 ));
             }
+            validate_anthropic_caller(object.get("caller"))?;
             Ok(ProviderTranscriptItemKind::AnthropicServerToolUse)
         }
         "tool_search_tool_result" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &["type", "tool_use_id", "content"],
+                "tool search result fields",
+            )?;
             nonempty("tool_use_id")?;
             if author != ProviderTranscriptAuthor::ToolResult {
                 return Err(ProviderTranscriptError::InvalidItem(
@@ -1295,16 +1769,31 @@ fn validate_anthropic_item(
             Ok(ProviderTranscriptItemKind::AnthropicToolSearchToolResult)
         }
         "tool_use" if origin == ProviderTranscriptOrigin::Provider => {
+            reject_unknown_fields(
+                object,
+                &["type", "id", "name", "input", "caller", "toolset_name"],
+                "tool use fields",
+            )?;
             nonempty("id")?;
             nonempty("name")?;
             if author != ProviderTranscriptAuthor::Model
                 || !object.get("input").is_some_and(Value::is_object)
+                || object.get("toolset_name").is_some_and(|toolset| {
+                    !(toolset.is_null()
+                        || toolset.as_str().is_some_and(|name| !name.trim().is_empty()))
+                })
             {
                 return Err(ProviderTranscriptError::InvalidItem("tool_use block"));
             }
+            validate_anthropic_caller(object.get("caller"))?;
             Ok(ProviderTranscriptItemKind::AnthropicToolUse)
         }
         "tool_result" if origin == ProviderTranscriptOrigin::HostToolSearch => {
+            reject_unknown_fields(
+                object,
+                &["type", "tool_use_id", "content", "is_error"],
+                "custom tool result fields",
+            )?;
             nonempty("tool_use_id")?;
             let Some(content) = object.get("content").and_then(Value::as_array) else {
                 return Err(ProviderTranscriptError::InvalidItem(
@@ -1312,6 +1801,9 @@ fn validate_anthropic_item(
                 ));
             };
             if author != ProviderTranscriptAuthor::ToolResult
+                || object
+                    .get("is_error")
+                    .is_some_and(|is_error| is_error.as_bool().is_none_or(|is_error| is_error))
                 || content.iter().any(|reference| {
                     let Some(reference) = reference.as_object() else {
                         return true;
@@ -1344,6 +1836,11 @@ fn validate_anthropic_search_result_content(
     };
     match content.get("type").and_then(Value::as_str) {
         Some("tool_search_tool_search_result") => {
+            reject_unknown_fields(
+                content,
+                &["type", "tool_references"],
+                "tool reference result fields",
+            )?;
             let Some(references) = content.get("tool_references").and_then(Value::as_array) else {
                 return Err(ProviderTranscriptError::InvalidItem("tool references"));
             };
@@ -1363,9 +1860,23 @@ fn validate_anthropic_search_result_content(
             Ok(())
         }
         Some("tool_search_tool_result_error") => {
-            if content.get("error_code").and_then(Value::as_str).is_none() {
+            reject_unknown_fields(
+                content,
+                &["type", "error_code", "error_message"],
+                "tool search error fields",
+            )?;
+            if !matches!(
+                content.get("error_code").and_then(Value::as_str),
+                Some(
+                    "invalid_tool_input"
+                        | "unavailable"
+                        | "too_many_requests"
+                        | "execution_time_exceeded"
+                )
+            ) || !is_string_or_null(content.get("error_message"))
+            {
                 return Err(ProviderTranscriptError::InvalidItem(
-                    "tool search error code",
+                    "tool search error shape",
                 ));
             }
             Ok(())
@@ -1382,11 +1893,19 @@ fn validate_group_order(
 ) -> Result<(), ProviderTranscriptError> {
     match protocol {
         ProviderProtocol::OpenAiResponsesV1 => {
-            let mut pending_provider_calls = Vec::<(&str, Option<&str>)>::new();
-            let mut pending_client_calls = Vec::<(&str, Option<&str>)>::new();
+            let mut seen_item_ids = HashSet::<&str>::new();
+            let mut seen_search_call_ids = HashSet::<&str>::new();
+            let mut seen_search_outputs = HashSet::<(&str, &str)>::new();
+            let mut pending_provider_calls = HashSet::<&str>::new();
+            let mut pending_client_calls = HashSet::<&str>::new();
             let mut loaded_at = HashMap::<String, usize>::new();
             let mut function_calls = Vec::<(usize, &str)>::new();
             for (index, item) in items.iter().enumerate() {
+                if let Some(id) = item.payload.get("id").and_then(Value::as_str) {
+                    if !seen_item_ids.insert(id) {
+                        return Err(ProviderTranscriptError::InvalidGroupOrder);
+                    }
+                }
                 match item.kind {
                     ProviderTranscriptItemKind::OpenAiToolSearchCall => {
                         let execution = item
@@ -1394,11 +1913,18 @@ fn validate_group_order(
                             .get("execution")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let call_id = item.payload.get("call_id").and_then(Value::as_str);
+                        let call_id = item
+                            .payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !seen_search_call_ids.insert(call_id) {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
                         if execution == "server" {
-                            pending_provider_calls.push((execution, call_id));
+                            pending_provider_calls.insert(call_id);
                         } else {
-                            pending_client_calls.push((execution, call_id));
+                            pending_client_calls.insert(call_id);
                         }
                     }
                     ProviderTranscriptItemKind::OpenAiToolSearchOutput => {
@@ -1407,19 +1933,22 @@ fn validate_group_order(
                             .get("execution")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let call_id = item.payload.get("call_id").and_then(Value::as_str);
+                        let call_id = item
+                            .payload
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !seen_search_outputs.insert((execution, call_id)) {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
                         let pending = if execution == "server" {
                             &mut pending_provider_calls
                         } else {
                             &mut pending_client_calls
                         };
-                        if let Some(pending_index) = pending
-                            .iter()
-                            .position(|candidate| *candidate == (execution, call_id))
-                        {
-                            pending.remove(pending_index);
-                        } else if execution == "server"
-                            || item.origin != ProviderTranscriptOrigin::HostToolSearch
+                        if !pending.remove(call_id)
+                            && (execution == "server"
+                                || item.origin != ProviderTranscriptOrigin::HostToolSearch)
                         {
                             // A client output can be appended in a later host
                             // group after the original model call was committed.
@@ -1652,8 +2181,9 @@ mod tests {
                 ProviderTranscriptAuthor::Model,
                 json!({
                     "type": "tool_search_call",
+                    "id": "tsc_1",
                     "execution": "server",
-                    "call_id": null,
+                    "call_id": "search_1",
                     "status": "completed",
                     "arguments": {"paths": ["crm"]}
                 }),
@@ -1662,8 +2192,9 @@ mod tests {
                 ProviderTranscriptAuthor::ToolResult,
                 json!({
                     "type": "tool_search_output",
+                    "id": "tso_1",
                     "execution": "server",
-                    "call_id": null,
+                    "call_id": "search_1",
                     "status": "completed",
                     "tools": [{"type": "function", "name": "list_open_orders"}]
                 }),
@@ -1742,6 +2273,35 @@ mod tests {
             .unwrap()
         })
         .collect()
+    }
+
+    fn assert_payload_rejected_without_leak(
+        family: ProviderFamily,
+        protocol: ProviderProtocol,
+        origin: ProviderTranscriptOrigin,
+        author: ProviderTranscriptAuthor,
+        payload: Value,
+    ) {
+        let error =
+            ProviderTranscriptItem::try_from_payload(family, protocol, origin, author, payload)
+                .expect_err("payload must fail closed");
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("UNKNOWN_FIELD_SENTINEL"));
+    }
+
+    fn assert_unknown_top_level_rejected(item: &ProviderTranscriptItem) {
+        let mut payload = item.payload().clone();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_string(), json!("UNKNOWN_FIELD_SENTINEL"));
+        assert_payload_rejected_without_leak(
+            item.family(),
+            item.protocol(),
+            item.origin(),
+            item.author(),
+            payload,
+        );
     }
 
     #[test]
@@ -1863,7 +2423,8 @@ mod tests {
                 ProviderTranscriptOrigin::Provider,
                 ProviderTranscriptAuthor::ToolResult,
                 json!({
-                    "type":"tool_search_output","execution":"server","call_id":null,
+                    "type":"tool_search_output","id":"tso_invalid","execution":"server",
+                    "call_id":"search_invalid",
                     "status":"completed","tools":[42],"secret":"TOOLS_SENTINEL"
                 }),
             ),
@@ -1883,7 +2444,7 @@ mod tests {
                 ProviderTranscriptOrigin::Provider,
                 ProviderTranscriptAuthor::Model,
                 json!({
-                    "type":"message","role":"assistant",
+                    "type":"message","id":"msg_invalid","role":"assistant","status":"completed",
                     "content":[{"type":"future_content","secret":"CONTENT_SENTINEL"}]
                 }),
             ),
@@ -1941,6 +2502,229 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_payload_layer_rejects_unknown_fields() {
+        let mut baselines = openai_output_items();
+        baselines.extend(anthropic_items());
+        baselines.extend([
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"message","id":"msg_1","role":"assistant","status":"completed",
+                    "content":[{"type":"output_text","text":"done","annotations":[]}]
+                }),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"reasoning","id":"rs_1","status":"completed",
+                    "summary":[{"type":"summary_text","text":"safe"}]
+                }),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::HostToolSearch,
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","execution":"client","call_id":"search_client",
+                    "status":"completed","tools":[]
+                }),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::DeveloperContext,
+                ProviderTranscriptAuthor::Host,
+                json!({"type":"additional_tools","role":"developer","tools":[]}),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({"type":"thinking","thinking":"private","signature":"opaque"}),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({"type":"redacted_thinking","data":"opaque"}),
+            )
+            .unwrap(),
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::HostToolSearch,
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_result","tool_use_id":"toolu_search","is_error":false,
+                    "content":[{"type":"tool_reference","tool_name":"get_weather"}]
+                }),
+            )
+            .unwrap(),
+        ]);
+        for baseline in &baselines {
+            assert_unknown_top_level_rejected(baseline);
+        }
+
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"message","id":"msg_nested","role":"assistant","status":"completed",
+                "content":[{
+                    "type":"output_text","text":"safe","annotations":[],
+                    "unknown":"UNKNOWN_FIELD_SENTINEL"
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"message","id":"msg_annotation","role":"assistant","status":"completed",
+                "content":[{
+                    "type":"output_text","text":"safe","annotations":[{
+                        "type":"file_citation","file_id":"file_1","filename":"safe.txt","index":0,
+                        "unknown":"UNKNOWN_FIELD_SENTINEL"
+                    }]
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"message","id":"msg_logprob","role":"assistant","status":"completed",
+                "content":[{
+                    "type":"output_text","text":"safe","annotations":[],"logprobs":[{
+                        "token":"safe","bytes":[115],"logprob":-0.1,"top_logprobs":[],
+                        "unknown":"UNKNOWN_FIELD_SENTINEL"
+                    }]
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"reasoning","id":"rs_nested","summary":[{
+                    "type":"summary_text","text":"safe","unknown":"UNKNOWN_FIELD_SENTINEL"
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","id":"tso_nested","execution":"server",
+                "call_id":"search_nested","status":"completed","tools":[{
+                    "type":"function","name":"safe_tool","unknown":"UNKNOWN_FIELD_SENTINEL"
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_agent","execution":"client",
+                "call_id":"search_agent","status":"completed","arguments":{},
+                "agent":{"agent_name":"safe","unknown":"UNKNOWN_FIELD_SENTINEL"}
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"text","text":"safe","citations":[{
+                    "type":"web_search_result_location","cited_text":"safe",
+                    "encrypted_index":"opaque","title":"safe","url":"https://example.invalid",
+                    "unknown":"UNKNOWN_FIELD_SENTINEL"
+                }]
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_use","id":"toolu_caller","name":"safe_tool","input":{},
+                "caller":{"type":"direct","unknown":"UNKNOWN_FIELD_SENTINEL"}
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_tool_result","tool_use_id":"srvtoolu_1",
+                "content":{
+                    "type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"safe_tool"}
+                    ],
+                    "unknown":"UNKNOWN_FIELD_SENTINEL"
+                }
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_tool_result","tool_use_id":"srvtoolu_1",
+                "content":{
+                    "type":"tool_search_tool_search_result","tool_references":[{
+                        "type":"tool_reference","tool_name":"safe_tool",
+                        "unknown":"UNKNOWN_FIELD_SENTINEL"
+                    }]
+                }
+            }),
+        );
+        assert_payload_rejected_without_leak(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_tool_result","tool_use_id":"srvtoolu_1",
+                "content":{
+                    "type":"tool_search_tool_result_error","error_code":"unavailable",
+                    "error_message":null,"unknown":"UNKNOWN_FIELD_SENTINEL"
+                }
+            }),
+        );
+    }
+
+    #[test]
     fn hosted_discovery_chains_reject_dangling_reordered_and_mismatched_uses() {
         let openai = openai_output_items();
         let mut reordered = openai.clone();
@@ -1983,6 +2767,127 @@ mod tests {
             ProviderTranscriptError::InvalidGroupOrder
         );
 
+        let hosted_item = |author, payload| {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let call_two = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_2","execution":"server",
+                "call_id":"search_2","status":"completed","arguments":{"query":"support"}
+            }),
+        );
+        let output_two = hosted_item(
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","id":"tso_2","execution":"server",
+                "call_id":"search_2","status":"completed",
+                "tools":[{"type":"function","name":"list_support_cases"}]
+            }),
+        );
+        let function_two = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"function_call","id":"fc_2","call_id":"function_2",
+                "name":"list_support_cases","arguments":"{}","status":"completed"
+            }),
+        );
+        let parallel = vec![
+            openai[0].clone(),
+            call_two.clone(),
+            openai[1].clone(),
+            output_two.clone(),
+            openai[2].clone(),
+            function_two,
+        ];
+        assert!(
+            ProviderTranscriptGroup::new(0, 0, "openai-parallel".to_string(), None, parallel,)
+                .is_ok()
+        );
+
+        let mismatched_output = hosted_item(
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","id":"tso_mismatch","execution":"server",
+                "call_id":"search_missing","status":"completed","tools":[]
+            }),
+        );
+        assert_eq!(
+            ProviderTranscriptGroup::new(
+                0,
+                0,
+                "openai-mismatch".to_string(),
+                None,
+                vec![openai[0].clone(), mismatched_output],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let duplicate_id_call = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_1","execution":"server",
+                "call_id":"search_duplicate_id","status":"completed","arguments":{}
+            }),
+        );
+        assert_eq!(
+            ProviderTranscriptGroup::new(
+                0,
+                0,
+                "openai-duplicate-id".to_string(),
+                None,
+                vec![openai[0].clone(), duplicate_id_call],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let duplicate_call_id = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_duplicate_call","execution":"server",
+                "call_id":"search_1","status":"completed","arguments":{}
+            }),
+        );
+        assert_eq!(
+            ProviderTranscriptGroup::new(
+                0,
+                0,
+                "openai-duplicate-call".to_string(),
+                None,
+                vec![openai[0].clone(), duplicate_call_id],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        for malformed in [
+            json!({
+                "type":"tool_search_call","execution":"server","call_id":"search_missing_id",
+                "status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_missing_call","execution":"server",
+                "status":"completed","arguments":{}
+            }),
+        ] {
+            assert!(ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                malformed,
+            )
+            .is_err());
+        }
+
         // Client execution intentionally stops after the call. Its host output
         // is committed in a later input group and may therefore stand alone.
         let client_call = ProviderTranscriptItem::try_from_payload(
@@ -1991,7 +2896,7 @@ mod tests {
             ProviderTranscriptOrigin::Provider,
             ProviderTranscriptAuthor::Model,
             json!({
-                "type":"tool_search_call","execution":"client","call_id":"search_1",
+                "type":"tool_search_call","id":"tsc_client_1","execution":"client","call_id":"search_1",
                 "status":"completed","arguments":{"query":"weather"}
             }),
         )
@@ -2048,11 +2953,11 @@ mod tests {
     #[test]
     fn stable_ids_are_canonical_and_isolated_by_provider_identity() {
         let payload_a: Value = serde_json::from_str(
-            r#"{"type":"tool_search_call","execution":"client","call_id":"search_1","status":"completed","arguments":{"b":2,"a":1}}"#,
+            r#"{"type":"tool_search_call","id":"tsc_stable","execution":"client","call_id":"search_1","status":"completed","arguments":{"b":2,"a":1}}"#,
         )
         .unwrap();
         let payload_b: Value = serde_json::from_str(
-            r#"{"arguments":{"a":1,"b":2},"status":"completed","call_id":"search_1","execution":"client","type":"tool_search_call"}"#,
+            r#"{"arguments":{"a":1,"b":2},"status":"completed","call_id":"search_1","execution":"client","id":"tsc_stable","type":"tool_search_call"}"#,
         )
         .unwrap();
         let item = |family, payload| {
@@ -2134,6 +3039,21 @@ mod tests {
         let mut reused = serde_json::to_value(&session).unwrap();
         reused["provider_transcript"]["next_sequence"] = json!(0);
         assert!(serde_json::from_value::<Session>(reused).is_err());
+
+        let mut missing_version = serde_json::to_value(&session).unwrap();
+        missing_version["provider_transcript"]
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        assert!(serde_json::from_value::<Session>(missing_version).is_err());
+
+        let mut future_version = serde_json::to_value(&session).unwrap();
+        future_version["provider_transcript"]["schema_version"] =
+            json!(PROVIDER_TRANSCRIPT_SCHEMA_VERSION + 1);
+        assert!(serde_json::from_value::<Session>(future_version).is_err());
+
+        let explicitly_empty: ProviderTranscriptState = serde_json::from_value(json!({})).unwrap();
+        assert!(explicitly_empty.is_empty());
     }
 
     #[test]
@@ -2232,7 +3152,7 @@ mod tests {
             ProviderTranscriptOrigin::Provider,
             ProviderTranscriptAuthor::Model,
             json!({
-                "type":"tool_search_call","execution":"server","call_id":null,
+                "type":"tool_search_call","id":"tsc_support","execution":"server","call_id":"search_1",
                 "status":"completed","arguments":{"paths":["support"]}
             }),
         )

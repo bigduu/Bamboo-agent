@@ -94,7 +94,7 @@ async fn provider_native_sideband_is_accumulated_without_emitting_ui_events() {
         bamboo_domain::ProviderTranscriptOrigin::Provider,
         bamboo_domain::ProviderTranscriptAuthor::Model,
         serde_json::json!({
-            "type":"tool_search_call","execution":"client","call_id":"search_1",
+            "type":"tool_search_call","id":"tsc_stream_search_1","execution":"client","call_id":"search_1",
             "status":"completed","arguments":{"query":"orders"}
         }),
     )

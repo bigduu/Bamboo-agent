@@ -1562,7 +1562,7 @@ mod tests {
             bamboo_domain::ProviderTranscriptOrigin::Provider,
             bamboo_domain::ProviderTranscriptAuthor::Model,
             serde_json::json!({
-                "type":"tool_search_call","execution":"client","call_id":"cache_native",
+                "type":"tool_search_call","id":"tsc_cache_native","execution":"client","call_id":"cache_native",
                 "status":"completed","arguments":{"query":"CACHE_NATIVE_PAYLOAD_SENTINEL"}
             }),
         )

@@ -383,7 +383,7 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         bamboo_domain::ProviderTranscriptOrigin::Provider,
         bamboo_domain::ProviderTranscriptAuthor::Model,
         serde_json::json!({
-            "type":"tool_search_call","execution":"client","call_id":"checkpoint_search",
+            "type":"tool_search_call","id":"tsc_checkpoint_search","execution":"client","call_id":"checkpoint_search",
             "status":"completed","arguments":{"query":"orders"}
         }),
     )
@@ -1358,7 +1358,7 @@ fn request_envelope_replays_only_the_selected_provider_family() {
         bamboo_domain::ProviderTranscriptOrigin::Provider,
         bamboo_domain::ProviderTranscriptAuthor::Model,
         serde_json::json!({
-            "type":"tool_search_call","execution":"client","call_id":"search_weather",
+            "type":"tool_search_call","id":"tsc_search_weather","execution":"client","call_id":"search_weather",
             "status":"completed","arguments":{"query":"weather"}
         }),
     )

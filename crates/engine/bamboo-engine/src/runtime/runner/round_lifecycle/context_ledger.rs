@@ -358,7 +358,7 @@ mod tests {
             ProviderTranscriptOrigin::Provider,
             ProviderTranscriptAuthor::Model,
             json!({
-                "type":"tool_search_call","execution":"client","call_id":format!("call_{query}"),
+                "type":"tool_search_call","id":format!("tsc_{query}"),"execution":"client","call_id":format!("call_{query}"),
                 "status":"completed","arguments":{"query":query}
             }),
         )

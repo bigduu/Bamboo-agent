@@ -3019,7 +3019,7 @@ mod tests {
             bamboo_domain::ProviderTranscriptOrigin::Provider,
             bamboo_domain::ProviderTranscriptAuthor::Model,
             serde_json::json!({
-                "type":"tool_search_call","execution":"client","call_id":"search_1",
+                "type":"tool_search_call","id":"tsc_pipeline_search_1","execution":"client","call_id":"search_1",
                 "status":"completed","arguments":{"query":"orders"}
             }),
         )
