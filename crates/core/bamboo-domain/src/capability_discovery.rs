@@ -44,6 +44,19 @@ pub enum CapabilityStatus {
     Valid,
 }
 
+/// Public, bounded projection of a catalog entry's invocation policy.
+///
+/// Catalog metadata is extensible JSON, but discovery results are part of the
+/// model-visible boundary. Only the two policy flags Bamboo currently enforces
+/// may cross that boundary; arbitrary bundle keys, nested schemas, paths, or
+/// credentials must remain in the host-owned catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityInvocationPolicy {
+    pub explicit: bool,
+    pub automatic: bool,
+}
+
 /// Provider-neutral target that a provider adapter may load after discovery.
 ///
 /// Skill and Workflow targets carry the exact catalog identity observed by the
@@ -80,7 +93,7 @@ pub struct CapabilityMatch {
     pub revision: Option<u64>,
     pub status: CapabilityStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invocation_policy: Option<serde_json::Value>,
+    pub invocation_policy: Option<CapabilityInvocationPolicy>,
     pub invocation_target: CapabilityInvocationTarget,
 }
 
@@ -115,6 +128,12 @@ mod tests {
         }))
         .expect_err("management actions are not part of discover");
         assert!(error.to_string().contains("unknown field `action`"));
+
+        serde_json::from_value::<DiscoverCapabilitiesRequest>(json!({
+            "query": "git changes",
+            "kinds": ["unknown"]
+        }))
+        .expect_err("unknown capability kinds must fail closed");
     }
 
     #[test]

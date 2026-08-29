@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bamboo_agent_core::ToolSchema;
 use bamboo_domain::{
-    CapabilityInvocationTarget, CapabilityKind, CapabilityMatch, CapabilitySource,
-    CapabilityStatus, DiscoverCapabilitiesRequest, DiscoverCapabilitiesResult,
+    CapabilityInvocationPolicy, CapabilityInvocationTarget, CapabilityKind, CapabilityMatch,
+    CapabilitySource, CapabilityStatus, DiscoverCapabilitiesRequest, DiscoverCapabilitiesResult,
     DISCOVER_CAPABILITY_NAME, MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
 };
 use bamboo_skills::{
@@ -48,19 +48,13 @@ pub enum InvocationEligibility {
 }
 
 impl InvocationEligibility {
-    fn permits(self, policy: ResolvedInvocationPolicy) -> bool {
+    fn permits(self, policy: CapabilityInvocationPolicy) -> bool {
         match self {
             Self::Any => policy.explicit || policy.automatic,
             Self::Explicit => policy.explicit,
             Self::Automatic => policy.automatic,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResolvedInvocationPolicy {
-    explicit: bool,
-    automatic: bool,
 }
 
 /// Host-resolved eligibility for one immutable discovery projection.
@@ -498,7 +492,7 @@ fn index_catalog_entry(entry: &WorkflowCatalogEntry, kind: CapabilityKind) -> In
             source,
             revision: Some(entry.revision),
             status: CapabilityStatus::Valid,
-            invocation_policy: Some(entry.invocation_policy.clone()),
+            invocation_policy: Some(policy),
             invocation_target,
         },
     }
@@ -541,8 +535,8 @@ fn catalog_entry_is_valid(entry: &WorkflowCatalogEntry) -> bool {
         && !entry.name.trim().is_empty()
 }
 
-fn invocation_policy(entry: &WorkflowCatalogEntry) -> ResolvedInvocationPolicy {
-    ResolvedInvocationPolicy {
+fn invocation_policy(entry: &WorkflowCatalogEntry) -> CapabilityInvocationPolicy {
+    CapabilityInvocationPolicy {
         explicit: entry.invocation_policy["explicit"].as_bool() == Some(true),
         automatic: entry.invocation_policy["automatic"].as_bool() == Some(true),
     }
@@ -811,9 +805,11 @@ mod tests {
                 .matches
                 .iter()
                 .find(|candidate| candidate.capability_ref == "skill:review-helper")
-                .and_then(|candidate| candidate.invocation_policy.as_ref())
-                .and_then(|policy| policy["requires_confirmation"].as_bool()),
-            Some(true)
+                .and_then(|candidate| candidate.invocation_policy),
+            Some(CapabilityInvocationPolicy {
+                explicit: true,
+                automatic: true,
+            })
         );
         assert!(result.matches.iter().any(|candidate| matches!(
             &candidate.invocation_target,
@@ -936,6 +932,69 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&first).expect("serialize"),
             serde_json::to_string(&second).expect("serialize")
+        );
+    }
+
+    #[test]
+    fn serialization_is_byte_identical_across_snapshot_input_order() {
+        let tools = vec![
+            ToolCapabilityMetadata {
+                canonical_name: "InspectBeta".to_string(),
+                summary: "inspect source".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            },
+            ToolCapabilityMetadata {
+                canonical_name: "InspectAlpha".to_string(),
+                summary: "inspect source".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            },
+        ];
+        let skills = vec![
+            catalog_entry(
+                "inspect-beta",
+                "Inspect Beta",
+                "inspect source",
+                WorkflowKind::Instruction,
+                WorkflowSource::User,
+                2,
+            ),
+            catalog_entry(
+                "inspect-alpha",
+                "Inspect Alpha",
+                "inspect source",
+                WorkflowKind::Instruction,
+                WorkflowSource::User,
+                1,
+            ),
+        ];
+        let build = |tools: Vec<ToolCapabilityMetadata>, skills: Vec<WorkflowCatalogEntry>| {
+            CapabilityDiscoveryIndex::from_snapshots(
+                tools,
+                &WorkflowCatalogSnapshot {
+                    revision: 1,
+                    entries: skills,
+                },
+                &WorkflowCatalogSnapshot::default(),
+                &CapabilityDiscoveryEligibility::default(),
+            )
+            .discover(&request("inspect source"))
+            .expect("deterministic discovery")
+        };
+
+        let mut reversed_tools = tools.clone();
+        reversed_tools.reverse();
+        let mut reversed_skills = skills.clone();
+        reversed_skills.reverse();
+        let first = build(tools, skills);
+        let second = build(reversed_tools, reversed_skills);
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first"),
+            serde_json::to_vec(&second).expect("serialize second")
         );
     }
 
@@ -1064,6 +1123,147 @@ mod tests {
     }
 
     #[test]
+    fn each_catalog_eligibility_predicate_fails_closed_independently() {
+        let is_visible = |entry: WorkflowCatalogEntry,
+                          eligibility: CapabilityDiscoveryEligibility| {
+            let query = entry.id.clone();
+            !index(&[], vec![entry], Vec::new(), eligibility)
+                .discover(&request(&query))
+                .expect("eligibility query")
+                .matches
+                .is_empty()
+        };
+
+        let eligible = catalog_entry(
+            "eligible-skill",
+            "Eligible Skill",
+            "inspect",
+            WorkflowKind::Instruction,
+            WorkflowSource::User,
+            1,
+        );
+        assert!(is_visible(
+            eligible.clone(),
+            CapabilityDiscoveryEligibility::default()
+        ));
+
+        let mut invalid = eligible.clone();
+        invalid.status = WorkflowStatus::Invalid;
+        assert!(!is_visible(
+            invalid,
+            CapabilityDiscoveryEligibility::default()
+        ));
+
+        let mut shadowed = eligible.clone();
+        shadowed.winner = false;
+        assert!(!is_visible(
+            shadowed,
+            CapabilityDiscoveryEligibility::default()
+        ));
+
+        assert!(!is_visible(
+            eligible.clone(),
+            CapabilityDiscoveryEligibility {
+                disabled_skill_ids: BTreeSet::from([eligible.id.clone()]),
+                ..Default::default()
+            }
+        ));
+
+        let mut denied = eligible.clone();
+        denied.invocation_policy = json!({"explicit": false, "automatic": false});
+        assert!(!is_visible(
+            denied,
+            CapabilityDiscoveryEligibility::default()
+        ));
+
+        let mut explicit_only = eligible.clone();
+        explicit_only.invocation_policy = json!({"explicit": true, "automatic": false});
+        assert!(is_visible(
+            explicit_only.clone(),
+            CapabilityDiscoveryEligibility {
+                skill_invocation: InvocationEligibility::Explicit,
+                ..Default::default()
+            }
+        ));
+        assert!(!is_visible(
+            explicit_only,
+            CapabilityDiscoveryEligibility {
+                skill_invocation: InvocationEligibility::Automatic,
+                ..Default::default()
+            }
+        ));
+
+        assert!(!is_visible(
+            eligible,
+            CapabilityDiscoveryEligibility {
+                skill_gateway_available: false,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_disable_and_surface_allowlist_are_independent() {
+        let tools = [
+            ToolCapabilityMetadata {
+                canonical_name: "DisabledTool".to_string(),
+                summary: "inspect".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            },
+            ToolCapabilityMetadata {
+                canonical_name: "AllowedTool".to_string(),
+                summary: "inspect".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            },
+            ToolCapabilityMetadata {
+                canonical_name: "SurfaceHiddenTool".to_string(),
+                summary: "inspect".to_string(),
+                source: CapabilitySource::Custom,
+                aliases: Vec::new(),
+                available: true,
+            },
+        ];
+        let disabled_result = CapabilityDiscoveryIndex::from_snapshots(
+            tools.clone(),
+            &WorkflowCatalogSnapshot::default(),
+            &WorkflowCatalogSnapshot::default(),
+            &CapabilityDiscoveryEligibility {
+                disabled_tool_names: BTreeSet::from(["DisabledTool".to_string()]),
+                ..Default::default()
+            },
+        )
+        .discover(&request("inspect"))
+        .expect("disabled tool eligibility");
+        assert_eq!(
+            disabled_result
+                .matches
+                .iter()
+                .map(|candidate| candidate.capability_ref.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["tool:AllowedTool", "tool:SurfaceHiddenTool"])
+        );
+
+        let surface_result = CapabilityDiscoveryIndex::from_snapshots(
+            tools,
+            &WorkflowCatalogSnapshot::default(),
+            &WorkflowCatalogSnapshot::default(),
+            &CapabilityDiscoveryEligibility {
+                allowed_tool_names: Some(BTreeSet::from(["AllowedTool".to_string()])),
+                ..Default::default()
+            },
+        )
+        .discover(&request("inspect"))
+        .expect("tool surface eligibility");
+
+        assert_eq!(surface_result.matches.len(), 1);
+        assert_eq!(surface_result.matches[0].capability_ref, "tool:AllowedTool");
+    }
+
+    #[test]
     fn unavailable_tool_metadata_and_skill_gateway_fail_closed() {
         let skill = catalog_entry(
             "hidden-skill",
@@ -1127,6 +1327,14 @@ mod tests {
         skill.argument_schema = json!({"secret": SECRET, "path": PATH});
         skill.content_digest = SECRET.to_string();
         skill.last_error = Some(format!("{SECRET} at {PATH}"));
+        skill.invocation_policy = json!({
+            "explicit": true,
+            "automatic": false,
+            "credential": SECRET,
+            "workspace_path": PATH,
+            "input_schema": {"description": SECRET},
+            "padding": "x".repeat(16_384)
+        });
         skill.shadowed_candidates = vec![ShadowedWorkflowCandidate {
             source: WorkflowSource::Plugin,
             status: WorkflowStatus::Invalid,
@@ -1149,6 +1357,10 @@ mod tests {
         assert!(serialized.contains("\"revision\":42"));
         assert!(serialized.contains("\"source\":\"project\""));
         assert!(serialized.contains("\"invocation_policy\""));
+        assert!(!serialized.contains("credential"));
+        assert!(!serialized.contains("workspace_path"));
+        assert!(!serialized.contains("input_schema"));
+        assert!(serialized.len() < 2_048);
     }
 
     #[test]
