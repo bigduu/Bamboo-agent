@@ -160,19 +160,21 @@ fn messages_to_responses_input_json_with_cache_and_native(
     let mut rendered_breakpoints = 0usize;
 
     for m in messages {
-        let mut anchored_groups = native_groups
-            .iter()
-            .filter(|group| group.anchor_message_id() == m.id)
-            .collect::<Vec<_>>();
-        anchored_groups.sort_by_key(|group| group.sequence());
-        if !anchored_groups.is_empty() {
-            out.extend(
-                anchored_groups
-                    .into_iter()
-                    .flat_map(|group| group.items())
-                    .map(|item| item.payload().clone()),
-            );
-            continue;
+        if m.role == Role::Assistant {
+            let mut anchored_groups = native_groups
+                .iter()
+                .filter(|group| group.anchor_message_id() == m.id)
+                .collect::<Vec<_>>();
+            anchored_groups.sort_by_key(|group| group.sequence());
+            if !anchored_groups.is_empty() {
+                out.extend(
+                    anchored_groups
+                        .into_iter()
+                        .flat_map(|group| group.items())
+                        .map(|item| item.payload().clone()),
+                );
+                continue;
+            }
         }
         match m.role {
             Role::Assistant => {
@@ -1321,9 +1323,19 @@ impl ResponsesSseParser {
                 );
                 return Vec::new();
             };
-            items.push(LLMChunk::ProviderTranscriptItem(item));
+            items.push(item);
+        }
+        if ProviderTranscriptGroup::validate_items(&items).is_err() {
+            tracing::warn!(
+                "{} Responses discovery transcript failed closed during atomic validation",
+                self.provider_label
+            );
+            return Vec::new();
         }
         items
+            .into_iter()
+            .map(LLMChunk::ProviderTranscriptItem)
+            .collect()
     }
 
     fn text_item_id(v: &Value) -> Option<String> {
@@ -2241,14 +2253,76 @@ mod tests {
         assert!(body.get("input").is_some());
     }
 
+    fn discovery_output_fixture() -> Value {
+        json!([
+            {
+                "type":"reasoning",
+                "id":"rs_1",
+                "status":"completed",
+                "summary":[{"type":"summary_text","text":"Search the order index"}],
+                "content":[{"type":"reasoning_text","text":"Use the loaded order tool"}],
+                "encrypted_content":"opaque-reasoning",
+                "agent":{"agent_name":"order-searcher"}
+            },
+            {
+                "type":"message",
+                "id":"msg_1",
+                "role":"assistant",
+                "phase":"commentary",
+                "status":"completed",
+                "agent":{"agent_name":"order-searcher"},
+                "content":[{
+                    "type":"output_text",
+                    "text":"Searching",
+                    "annotations":[],
+                    "logprobs":[]
+                }]
+            },
+            {
+                "type":"tool_search_call",
+                "id":"tsc_1",
+                "execution":"server",
+                "call_id":"search_1",
+                "status":"completed",
+                "arguments":{"query":"orders"},
+                "agent":{"agent_name":"order-searcher"},
+                "created_by":"openai"
+            },
+            {
+                "type":"tool_search_output",
+                "id":"tso_1",
+                "execution":"server",
+                "call_id":"search_1",
+                "status":"completed",
+                "tools":[{
+                    "type":"function",
+                    "name":"get_orders",
+                    "description":"Fetch matching orders",
+                    "parameters":{"type":"object","properties":{}},
+                    "strict":true,
+                    "allowed_callers":["direct"],
+                    "defer_loading":true,
+                    "output_schema":{"type":"object"}
+                }],
+                "agent":{"agent_name":"order-searcher"},
+                "created_by":"openai"
+            },
+            {
+                "type":"function_call",
+                "id":"fc_1",
+                "call_id":"call_1",
+                "name":"get_orders",
+                "arguments":"{}",
+                "status":"completed",
+                "agent":{"agent_name":"order-searcher"},
+                "caller":{"type":"direct"}
+            }
+        ])
+    }
+
     #[test]
     fn discovery_output_is_captured_and_replayed_at_its_message_anchor() {
-        let output = json!([
-            {"type":"message","id":"msg_1","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Searching"}]},
-            {"type":"tool_search_call","execution":"server","call_id":null,"status":"completed","arguments":{"query":"orders"}},
-            {"type":"tool_search_output","execution":"server","call_id":null,"status":"completed","tools":[{"type":"function","name":"get_orders"}]},
-            {"type":"function_call","call_id":"call_1","name":"get_orders","arguments":"{}"}
-        ]);
+        let output = discovery_output_fixture();
         let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
         let chunks = parser
             .handle_event_multi(
@@ -2263,20 +2337,41 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[0].payload()["phase"], "commentary");
+        assert_eq!(items.len(), 5);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.payload()["type"] == "message")
+                .unwrap()
+                .payload()["phase"],
+            "commentary"
+        );
 
         let mut session = bamboo_domain::Session::new("native-openai", "gpt-5.6");
         session.add_message(Message::user("find orders"));
         let assistant = Message::assistant("normalized", None);
         let anchor = assistant.id.clone();
         session.add_message(assistant);
+        let provider_boundary =
+            bamboo_domain::provider_transcript_boundary_sha256(Some("openai-test"), Some("openai"))
+                .unwrap();
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &provider_boundary,
+            )
+            .unwrap();
         session
             .append_provider_transcript_group(&anchor, None, items)
             .unwrap();
         let groups = session
             .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .replayable_groups(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &provider_boundary,
+            )
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -2289,20 +2384,204 @@ mod tests {
     }
 
     #[test]
+    fn discovery_output_preserves_official_nullable_fields_exactly() {
+        let mut output = discovery_output_fixture();
+        let items = output.as_array_mut().unwrap();
+        items[0]["agent"] = Value::Null;
+        items[0]["content"] = Value::Null;
+        items[0]["encrypted_content"] = Value::Null;
+        items[0]["status"] = Value::Null;
+        items[1]["agent"] = Value::Null;
+        items[1]["phase"] = Value::Null;
+        items[1]["content"][0]["logprobs"] = Value::Null;
+        items[2]["agent"] = Value::Null;
+        items[2]["call_id"] = Value::Null;
+        items[2]["created_by"] = Value::Null;
+        items[3]["agent"] = Value::Null;
+        items[3]["call_id"] = Value::Null;
+        items[3]["created_by"] = Value::Null;
+        items[4]["id"] = Value::Null;
+        items[4]["agent"] = Value::Null;
+        items[4]["caller"] = Value::Null;
+        items[4]["namespace"] = Value::Null;
+        items[4]["status"] = Value::Null;
+        items[4]["created_by"] = Value::Null;
+
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
+        let captured = parser
+            .handle_event_multi(
+                "response.completed",
+                &json!({"type":"response.completed","response":{"output":output}}).to_string(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                LLMChunk::ProviderTranscriptItem(item) => Some(item.payload().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(captured, output.as_array().unwrap().clone());
+    }
+
+    fn assert_discovery_output_falls_back(output: Value) {
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                &json!({"type":"response.completed","response":{"output":output}}).to_string(),
+            )
+            .unwrap();
+
+        assert!(!chunks
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ProviderTranscriptItem(_))));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::Token(text) if text == "Searching")));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ToolCalls(calls) if !calls.is_empty())));
+        assert!(chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done)));
+    }
+
+    #[test]
+    fn malformed_discovery_chains_fail_closed_to_normalized_chunks_atomically() {
+        let mut unknown_item = discovery_output_fixture();
+        unknown_item.as_array_mut().unwrap().push(json!({
+            "type":"future_provider_item",
+            "id":"future_1"
+        }));
+
+        let mut malformed_item = discovery_output_fixture();
+        malformed_item[1]["content"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotations");
+
+        let mut output_before_call = discovery_output_fixture();
+        output_before_call.as_array_mut().unwrap().swap(2, 3);
+
+        let mut mismatched_call_id = discovery_output_fixture();
+        mismatched_call_id[3]["call_id"] = json!("search_other");
+
+        let mut duplicate_item_id = discovery_output_fixture();
+        duplicate_item_id[3]["id"] = json!("tsc_1");
+
+        let mut duplicate_search_call_id = discovery_output_fixture();
+        let mut second_call = duplicate_search_call_id[2].clone();
+        second_call["id"] = json!("tsc_2");
+        duplicate_search_call_id
+            .as_array_mut()
+            .unwrap()
+            .insert(3, second_call);
+
+        let mut function_before_output = discovery_output_fixture();
+        function_before_output.as_array_mut().unwrap().swap(3, 4);
+
+        let mut function_not_loaded = discovery_output_fixture();
+        function_not_loaded[3]["tools"][0]["name"] = json!("different_tool");
+
+        for malformed in [
+            unknown_item,
+            malformed_item,
+            output_before_call,
+            mismatched_call_id,
+            duplicate_item_id,
+            duplicate_search_call_id,
+            function_before_output,
+            function_not_loaded,
+        ] {
+            assert_discovery_output_falls_back(malformed);
+        }
+    }
+
+    #[test]
+    fn native_groups_never_replace_non_assistant_anchors() {
+        let item = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_wrong_anchor","execution":"client",
+                "call_id":"search_wrong_anchor","status":"completed","arguments":{}
+            }),
+        )
+        .unwrap();
+        let provider_boundary =
+            bamboo_domain::provider_transcript_boundary_sha256(Some("openai-test"), Some("openai"))
+                .unwrap();
+
+        for message in [
+            Message::system("stable system"),
+            Message::user("important user input"),
+            Message::tool_result("call_1", "important tool output"),
+        ] {
+            let mut session = bamboo_domain::Session::new("wrong-anchor", "gpt-5.6");
+            let anchor = message.id.clone();
+            session.add_message(message);
+            session
+                .activate_provider_transcript_route(
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    &provider_boundary,
+                )
+                .unwrap();
+            session
+                .append_provider_transcript_group(&anchor, None, vec![item.clone()])
+                .unwrap();
+
+            let (expected, _) = messages_to_responses_input_json_with_cache_and_native(
+                &session.messages,
+                None,
+                &[],
+            );
+            let (actual, _) = messages_to_responses_input_json_with_cache_and_native(
+                &session.messages,
+                None,
+                session.provider_transcript.groups(),
+            );
+            assert_eq!(actual, expected);
+            assert!(!actual
+                .iter()
+                .any(|item| item.get("id") == Some(&json!("tsc_wrong_anchor"))));
+        }
+    }
+
+    #[test]
     fn shared_responses_wire_keeps_openai_and_copilot_native_state_isolated() {
         let group = |family| {
             let mut session = bamboo_domain::Session::new("native", "model");
             let assistant = Message::assistant("", None);
             let anchor = assistant.id.clone();
             session.add_message(assistant);
+            let (provider_name, provider_type) = match family {
+                ProviderFamily::OpenAi => ("openai-test", "openai"),
+                ProviderFamily::Copilot => ("copilot-test", "copilot"),
+                _ => unreachable!("test only constructs Responses families"),
+            };
+            let provider_boundary = bamboo_domain::provider_transcript_boundary_sha256(
+                Some(provider_name),
+                Some(provider_type),
+            )
+            .unwrap();
+            session
+                .activate_provider_transcript_route(
+                    family,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    &provider_boundary,
+                )
+                .unwrap();
             let item = ProviderTranscriptItem::try_from_payload(
                 family,
                 ProviderProtocol::OpenAiResponsesV1,
                 ProviderTranscriptOrigin::Provider,
                 ProviderTranscriptAuthor::Model,
                 json!({
-                    "type":"tool_search_call","execution":"client","call_id":"search_isolation",
-                    "status":"completed","arguments":{"query":"weather"}
+                    "type":"tool_search_call","id":"tsc_isolation","execution":"client",
+                    "call_id":"search_isolation","status":"completed",
+                    "arguments":{"query":"weather"}
                 }),
             )
             .unwrap();
@@ -2311,11 +2590,12 @@ mod tests {
                 .unwrap();
             session.provider_transcript.groups()[0].clone()
         };
+        let groups = vec![
+            group(ProviderFamily::OpenAi),
+            group(ProviderFamily::Copilot),
+        ];
         let mut options = ResponsesRequestOptions {
-            provider_transcript_groups: vec![
-                group(ProviderFamily::OpenAi),
-                group(ProviderFamily::Copilot),
-            ],
+            provider_transcript_groups: groups.clone(),
             ..Default::default()
         };
 
@@ -2325,6 +2605,44 @@ mod tests {
             options.provider_transcript_groups[0].family(),
             ProviderFamily::OpenAi
         );
+
+        let mut options = ResponsesRequestOptions {
+            provider_transcript_groups: groups,
+            ..Default::default()
+        };
+        retain_provider_transcript_family(&mut options, ProviderFamily::Copilot);
+        assert_eq!(options.provider_transcript_groups.len(), 1);
+        assert_eq!(
+            options.provider_transcript_groups[0].family(),
+            ProviderFamily::Copilot
+        );
+    }
+
+    #[test]
+    fn discovery_capture_uses_the_concrete_responses_provider_family() {
+        for (provider_label, expected_family) in [
+            ("OpenAI", ProviderFamily::OpenAi),
+            ("Copilot", ProviderFamily::Copilot),
+        ] {
+            let output = discovery_output_fixture();
+            let mut parser =
+                ResponsesSseParser::new_with_context(provider_label, "provider-model", None);
+            let items = parser
+                .handle_event_multi(
+                    "response.completed",
+                    &json!({"type":"response.completed","response":{"output":output}}).to_string(),
+                )
+                .unwrap()
+                .into_iter()
+                .filter_map(|chunk| match chunk {
+                    LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(items.len(), 5);
+            assert!(items.iter().all(|item| item.family() == expected_family));
+        }
     }
 
     #[test]
