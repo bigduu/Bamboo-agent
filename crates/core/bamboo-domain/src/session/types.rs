@@ -1011,7 +1011,7 @@ impl Session {
             crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => self
                 .provider_transcript
                 .invalidate(ProviderTranscriptResetReason::ExplicitHistoryRewrite),
-            // `activate_provider_transcript_family` already advanced the native
+            // `activate_provider_transcript_route` already advanced the native
             // epoch. Avoid advancing it twice while resetting the PromptIR/cache
             // ledger at the same provider boundary.
             crate::session::model_context::ModelContextResetReason::ProviderSwitch => {}

@@ -3034,15 +3034,31 @@ mod tests {
         let mut items = Some(vec![native_client_search_item()]);
         commit_assistant_message(&mut session, message, &mut items).unwrap();
         assert_eq!(session.messages.len(), 1);
+        let boundary = session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .unwrap();
         let groups = session.provider_transcript.replayable_groups(
             bamboo_domain::ProviderFamily::OpenAi,
             bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            boundary,
         );
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].anchor_message_id(), anchor);
 
         let mut rejected = Session::new("native-rejected", "model");
-        rejected.activate_provider_transcript_family(bamboo_domain::ProviderFamily::Anthropic);
+        let rejected_boundary = bamboo_domain::provider_transcript_boundary_sha256(
+            Some("anthropic-rejected"),
+            Some("anthropic"),
+        )
+        .unwrap();
+        rejected
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                &rejected_boundary,
+            )
+            .unwrap();
         let before = rejected.clone();
         let mut items = Some(vec![native_client_search_item()]);
         let error = commit_assistant_message(

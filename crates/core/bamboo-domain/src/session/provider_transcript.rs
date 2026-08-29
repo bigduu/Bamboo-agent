@@ -22,6 +22,7 @@ const ITEM_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-item/v1\0";
 const GROUP_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-group/v1\0";
 const ANCHOR_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-anchor/v1\0";
 const TRANSCRIPT_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-state/v1\0";
+const PROVIDER_BOUNDARY_HASH_DOMAIN: &[u8] = b"bamboo/provider-transcript-boundary/v1\0";
 
 /// Provider identity boundary for native transcript replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,6 +63,43 @@ impl ProviderProtocol {
             Self::AnthropicMessages2023_06_01 => family == ProviderFamily::Anthropic,
         }
     }
+}
+
+/// Derive a secret-free provider routing boundary for native replay. The raw
+/// provider instance id/type is never persisted or emitted by diagnostics; the
+/// digest is sufficient to distinguish same-family instances across restart
+/// and append-safe merge.
+pub fn provider_transcript_boundary_sha256(
+    provider_name: Option<&str>,
+    provider_type: Option<&str>,
+) -> Option<String> {
+    let provider_name = provider_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_type = provider_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if provider_name.is_none() && provider_type.is_none() {
+        return None;
+    }
+    Some(hash_json(
+        PROVIDER_BOUNDARY_HASH_DOMAIN,
+        &serde_json::json!({
+            "provider_name": provider_name,
+            "provider_type": provider_type.map(str::to_ascii_lowercase),
+        }),
+    ))
+}
+
+fn unbound_provider_boundary_sha256() -> String {
+    hash_bytes(PROVIDER_BOUNDARY_HASH_DOMAIN, b"unbound")
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,8 +191,12 @@ pub enum ProviderTranscriptError {
     FutureGroupEpoch,
     #[error("provider transcript state current epoch does not match its active family")]
     CurrentEpochFamilyMismatch,
-    #[error("provider transcript item belongs to a non-active provider family")]
-    InactiveProviderFamily,
+    #[error("provider transcript state current epoch does not match its active protocol")]
+    CurrentEpochProtocolMismatch,
+    #[error("provider transcript state has an invalid provider boundary")]
+    InvalidProviderBoundary,
+    #[error("provider transcript item belongs to a non-active provider route")]
+    InactiveProviderRoute,
 }
 
 /// One exact provider-owned item. `payload` stays private so callers cannot
@@ -290,6 +332,7 @@ pub struct ProviderTranscriptGroup {
     anchor_message_id: String,
     family: ProviderFamily,
     protocol: ProviderProtocol,
+    provider_boundary_sha256: String,
     items: Vec<ProviderTranscriptItem>,
 }
 
@@ -301,6 +344,7 @@ struct ProviderTranscriptGroupWire {
     anchor_message_id: String,
     family: ProviderFamily,
     protocol: ProviderProtocol,
+    provider_boundary_sha256: String,
     items: Vec<ProviderTranscriptItem>,
 }
 
@@ -315,6 +359,7 @@ impl<'de> Deserialize<'de> for ProviderTranscriptGroup {
             wire.sequence,
             wire.anchor_message_id,
             Some(wire.id.as_str()),
+            wire.provider_boundary_sha256,
             wire.items,
         )
         .map_err(D::Error::custom)?;
@@ -333,6 +378,7 @@ impl ProviderTranscriptGroup {
         sequence: u64,
         anchor_message_id: String,
         id_hint: Option<&str>,
+        provider_boundary_sha256: String,
         items: Vec<ProviderTranscriptItem>,
     ) -> Result<Self, ProviderTranscriptError> {
         if anchor_message_id.trim().is_empty() {
@@ -343,6 +389,9 @@ impl ProviderTranscriptGroup {
         };
         let family = first.family;
         let protocol = first.protocol;
+        if !is_sha256_hex(&provider_boundary_sha256) {
+            return Err(ProviderTranscriptError::InvalidProviderBoundary);
+        }
         if items
             .iter()
             .any(|item| item.family != family || item.protocol != protocol)
@@ -354,7 +403,15 @@ impl ProviderTranscriptGroup {
         }
         validate_group_order(protocol, &items)?;
 
-        let id = stable_group_id(epoch, family, protocol, &anchor_message_id, id_hint, &items);
+        let id = stable_group_id(
+            epoch,
+            family,
+            protocol,
+            &provider_boundary_sha256,
+            &anchor_message_id,
+            id_hint,
+            &items,
+        );
         Ok(Self {
             id,
             epoch,
@@ -362,6 +419,7 @@ impl ProviderTranscriptGroup {
             anchor_message_id,
             family,
             protocol,
+            provider_boundary_sha256,
             items,
         })
     }
@@ -390,6 +448,10 @@ impl ProviderTranscriptGroup {
         self.protocol
     }
 
+    pub fn provider_boundary_sha256(&self) -> &str {
+        &self.provider_boundary_sha256
+    }
+
     pub fn items(&self) -> &[ProviderTranscriptItem] {
         &self.items
     }
@@ -408,6 +470,7 @@ impl fmt::Debug for ProviderTranscriptGroup {
             )
             .field("family", &self.family)
             .field("protocol", &self.protocol)
+            .field("provider_boundary_sha256", &self.provider_boundary_sha256)
             .field(
                 "item_kinds",
                 &self.items.iter().map(|item| item.kind).collect::<Vec<_>>(),
@@ -435,6 +498,10 @@ pub struct ProviderTranscriptState {
     next_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_family: Option<ProviderFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_protocol: Option<ProviderProtocol>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_provider_boundary_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     groups: Vec<ProviderTranscriptGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +521,10 @@ struct ProviderTranscriptStateWire {
     #[serde(default)]
     active_family: Option<ProviderFamily>,
     #[serde(default)]
+    active_protocol: Option<ProviderProtocol>,
+    #[serde(default)]
+    active_provider_boundary_sha256: Option<String>,
+    #[serde(default)]
     groups: Vec<ProviderTranscriptGroup>,
     #[serde(default)]
     last_reset_reason: Option<ProviderTranscriptResetReason>,
@@ -469,6 +540,8 @@ impl<'de> Deserialize<'de> for ProviderTranscriptState {
             && wire.epoch == 0
             && wire.next_sequence == 0
             && wire.active_family.is_none()
+            && wire.active_protocol.is_none()
+            && wire.active_provider_boundary_sha256.is_none()
             && wire.groups.is_empty()
             && wire.last_reset_reason.is_none();
         let schema_version = match wire.schema_version {
@@ -485,6 +558,34 @@ impl<'de> Deserialize<'de> for ProviderTranscriptState {
                 ))
             }
         };
+        let active_route_fields = [
+            wire.active_family.is_some(),
+            wire.active_protocol.is_some(),
+            wire.active_provider_boundary_sha256.is_some(),
+        ];
+        if active_route_fields.iter().any(|present| *present)
+            && !active_route_fields.iter().all(|present| *present)
+        {
+            return Err(D::Error::custom(
+                ProviderTranscriptError::InvalidProviderBoundary,
+            ));
+        }
+        if wire
+            .active_provider_boundary_sha256
+            .as_deref()
+            .is_some_and(|boundary| !is_sha256_hex(boundary))
+        {
+            return Err(D::Error::custom(
+                ProviderTranscriptError::InvalidProviderBoundary,
+            ));
+        }
+        if let (Some(family), Some(protocol)) = (wire.active_family, wire.active_protocol) {
+            if !protocol.supports_family(family) {
+                return Err(D::Error::custom(
+                    ProviderTranscriptError::FamilyProtocolMismatch,
+                ));
+            }
+        }
         let mut ids = HashSet::new();
         if wire
             .groups
@@ -502,6 +603,18 @@ impl<'de> Deserialize<'de> for ProviderTranscriptState {
             if wire.active_family != Some(group.family) {
                 return Err(D::Error::custom(
                     ProviderTranscriptError::CurrentEpochFamilyMismatch,
+                ));
+            }
+            if wire.active_protocol != Some(group.protocol) {
+                return Err(D::Error::custom(
+                    ProviderTranscriptError::CurrentEpochProtocolMismatch,
+                ));
+            }
+            if wire.active_provider_boundary_sha256.as_deref()
+                != Some(group.provider_boundary_sha256())
+            {
+                return Err(D::Error::custom(
+                    ProviderTranscriptError::InvalidProviderBoundary,
                 ));
             }
             if !current_sequences.insert(group.sequence) {
@@ -525,6 +638,8 @@ impl<'de> Deserialize<'de> for ProviderTranscriptState {
             epoch: wire.epoch,
             next_sequence: wire.next_sequence,
             active_family: wire.active_family,
+            active_protocol: wire.active_protocol,
+            active_provider_boundary_sha256: wire.active_provider_boundary_sha256,
             groups: wire.groups,
             last_reset_reason: wire.last_reset_reason,
         })
@@ -539,6 +654,8 @@ impl Default for ProviderTranscriptState {
             epoch: 0,
             next_sequence: 0,
             active_family: None,
+            active_protocol: None,
+            active_provider_boundary_sha256: None,
             groups: Vec::new(),
             last_reset_reason: None,
         }
@@ -554,6 +671,11 @@ impl fmt::Debug for ProviderTranscriptState {
             .field("epoch", &self.epoch)
             .field("next_sequence", &self.next_sequence)
             .field("active_family", &self.active_family)
+            .field("active_protocol", &self.active_protocol)
+            .field(
+                "active_provider_boundary_sha256",
+                &self.active_provider_boundary_sha256,
+            )
             .field("groups", &self.groups)
             .field("last_reset_reason", &self.last_reset_reason)
             .finish()
@@ -566,6 +688,8 @@ impl ProviderTranscriptState {
             && self.epoch == 0
             && self.next_sequence == 0
             && self.active_family.is_none()
+            && self.active_protocol.is_none()
+            && self.active_provider_boundary_sha256.is_none()
             && self.groups.is_empty()
             && self.last_reset_reason.is_none()
     }
@@ -582,6 +706,14 @@ impl ProviderTranscriptState {
         self.active_family
     }
 
+    pub fn active_protocol(&self) -> Option<ProviderProtocol> {
+        self.active_protocol
+    }
+
+    pub fn active_provider_boundary_sha256(&self) -> Option<&str> {
+        self.active_provider_boundary_sha256.as_deref()
+    }
+
     pub fn last_reset_reason(&self) -> Option<ProviderTranscriptResetReason> {
         self.last_reset_reason
     }
@@ -590,33 +722,58 @@ impl ProviderTranscriptState {
         &self.groups
     }
 
-    /// Select the provider family for the next request. A switch starts a new
-    /// replay epoch, making all foreign/older raw items unreachable.
-    pub fn activate_family(&mut self, family: ProviderFamily) -> bool {
-        if self.active_family == Some(family) {
-            return false;
+    /// Select the exact provider route for the next request. A family,
+    /// protocol, or same-family instance switch starts a new replay epoch,
+    /// making every older provider-minted item unreachable.
+    pub fn activate_route(
+        &mut self,
+        family: ProviderFamily,
+        protocol: ProviderProtocol,
+        provider_boundary_sha256: &str,
+    ) -> Result<bool, ProviderTranscriptError> {
+        if !protocol.supports_family(family) {
+            return Err(ProviderTranscriptError::FamilyProtocolMismatch);
         }
-        let is_switch = self.active_family.is_some() || !self.groups.is_empty();
+        if !is_sha256_hex(provider_boundary_sha256) {
+            return Err(ProviderTranscriptError::InvalidProviderBoundary);
+        }
+        if self.active_family == Some(family)
+            && self.active_protocol == Some(protocol)
+            && self.active_provider_boundary_sha256.as_deref() == Some(provider_boundary_sha256)
+        {
+            return Ok(false);
+        }
+        let is_switch = self.active_family.is_some()
+            || self.active_protocol.is_some()
+            || self.active_provider_boundary_sha256.is_some()
+            || !self.groups.is_empty();
         if is_switch {
             self.epoch = self.epoch.saturating_add(1);
             self.next_sequence = 0;
             self.last_reset_reason = Some(ProviderTranscriptResetReason::ProviderSwitch);
         }
         self.active_family = Some(family);
+        self.active_protocol = Some(protocol);
+        self.active_provider_boundary_sha256 = Some(provider_boundary_sha256.to_string());
         self.state_revision = self.state_revision.saturating_add(1);
-        true
+        Ok(true)
     }
 
     /// Leave native replay when a session moves to a provider family Bamboo
     /// cannot identify. Older items remain auditable but the new epoch has no
     /// family capable of replaying them.
-    pub fn deactivate_family(&mut self) -> bool {
-        if self.active_family.is_none() {
+    pub fn deactivate_route(&mut self) -> bool {
+        if self.active_family.is_none()
+            && self.active_protocol.is_none()
+            && self.active_provider_boundary_sha256.is_none()
+        {
             return false;
         }
         self.epoch = self.epoch.saturating_add(1);
         self.next_sequence = 0;
         self.active_family = None;
+        self.active_protocol = None;
+        self.active_provider_boundary_sha256 = None;
         self.last_reset_reason = Some(ProviderTranscriptResetReason::ProviderSwitch);
         self.state_revision = self.state_revision.saturating_add(1);
         true
@@ -638,10 +795,25 @@ impl ProviderTranscriptState {
         id_hint: Option<&str>,
         items: Vec<ProviderTranscriptItem>,
     ) -> Result<String, ProviderTranscriptError> {
-        let family = items
-            .first()
-            .ok_or(ProviderTranscriptError::EmptyGroup)?
-            .family;
+        let first = items.first().ok_or(ProviderTranscriptError::EmptyGroup)?;
+        let family = first.family;
+        let protocol = first.protocol;
+        let (provider_boundary_sha256, activates_unbound_route) = match (
+            self.active_family,
+            self.active_protocol,
+            self.active_provider_boundary_sha256.as_deref(),
+        ) {
+            (Some(active_family), Some(active_protocol), Some(boundary))
+                if active_family == family && active_protocol == protocol =>
+            {
+                (boundary.to_string(), false)
+            }
+            (Some(_), Some(_), Some(_)) => {
+                return Err(ProviderTranscriptError::InactiveProviderRoute)
+            }
+            (None, None, None) => (unbound_provider_boundary_sha256(), true),
+            _ => return Err(ProviderTranscriptError::InactiveProviderRoute),
+        };
         // Validate the complete atomic group before mutating provider/epoch
         // state. A malformed provider frame must fail closed without leaving a
         // half-activated transcript lane behind.
@@ -650,6 +822,7 @@ impl ProviderTranscriptState {
             self.next_sequence,
             anchor_message_id.into(),
             id_hint,
+            provider_boundary_sha256.clone(),
             items,
         )?;
         if let Some(existing) = self.groups.iter().find(|current| current.id == group.id) {
@@ -657,21 +830,18 @@ impl ProviderTranscriptState {
                 && existing.anchor_message_id == group.anchor_message_id
                 && existing.family == group.family
                 && existing.protocol == group.protocol
+                && existing.provider_boundary_sha256 == group.provider_boundary_sha256
                 && existing.items == group.items
             {
                 return Ok(group.id);
             }
             return Err(ProviderTranscriptError::DuplicateGroupId);
         }
-        match self.active_family {
-            Some(active) if active != family => {
-                return Err(ProviderTranscriptError::InactiveProviderFamily)
-            }
-            None => {
-                self.active_family = Some(family);
-                self.state_revision = self.state_revision.saturating_add(1);
-            }
-            Some(_) => {}
+        if activates_unbound_route {
+            self.active_family = Some(family);
+            self.active_protocol = Some(protocol);
+            self.active_provider_boundary_sha256 = Some(provider_boundary_sha256);
+            self.state_revision = self.state_revision.saturating_add(1);
         }
         let id = group.id.clone();
         self.groups.push(group);
@@ -698,15 +868,23 @@ impl ProviderTranscriptState {
         &self,
         family: ProviderFamily,
         protocol: ProviderProtocol,
+        provider_boundary_sha256: &str,
     ) -> Vec<&ProviderTranscriptGroup> {
-        if self.active_family != Some(family) || !protocol.supports_family(family) {
+        if self.active_family != Some(family)
+            || self.active_protocol != Some(protocol)
+            || self.active_provider_boundary_sha256.as_deref() != Some(provider_boundary_sha256)
+            || !protocol.supports_family(family)
+        {
             return Vec::new();
         }
         let mut groups = self
             .groups
             .iter()
             .filter(|group| {
-                group.epoch == self.epoch && group.family == family && group.protocol == protocol
+                group.epoch == self.epoch
+                    && group.family == family
+                    && group.protocol == protocol
+                    && group.provider_boundary_sha256 == provider_boundary_sha256
             })
             .collect::<Vec<_>>();
         groups.sort_by_key(|group| group.sequence);
@@ -747,11 +925,16 @@ impl ProviderTranscriptState {
             {
                 let group = group.clone();
                 if group.epoch == merged.epoch {
-                    if merged.active_family != Some(group.family) {
+                    if merged.active_family != Some(group.family)
+                        || merged.active_protocol != Some(group.protocol)
+                        || merged.active_provider_boundary_sha256.as_deref()
+                            != Some(group.provider_boundary_sha256())
+                    {
                         // Concurrent provider branches at the same numeric epoch
-                        // cannot safely share raw state. Keep the durable ordinary
+                        // cannot safely share raw state, even when both routes use
+                        // the same provider family. Keep the durable ordinary
                         // message, but use its normalized fallback instead of
-                        // importing a foreign native group into the winning epoch.
+                        // importing a foreign native group into the winning route.
                         continue;
                     }
                 } else if group.epoch > merged.epoch {
@@ -812,8 +995,9 @@ impl ProviderTranscriptState {
         &self,
         family: ProviderFamily,
         protocol: ProviderProtocol,
+        provider_boundary_sha256: &str,
     ) -> ProviderTranscriptDiagnostics {
-        let groups = self.replayable_groups(family, protocol);
+        let groups = self.replayable_groups(family, protocol, provider_boundary_sha256);
         let item_count = groups.iter().map(|group| group.items.len()).sum();
         let bytes = serde_json::to_vec(&groups).unwrap_or_default();
         ProviderTranscriptDiagnostics {
@@ -826,16 +1010,23 @@ impl ProviderTranscriptState {
 }
 
 impl Session {
-    pub fn activate_provider_transcript_family(&mut self, family: ProviderFamily) -> bool {
-        let changed = self.provider_transcript.activate_family(family);
+    pub fn activate_provider_transcript_route(
+        &mut self,
+        family: ProviderFamily,
+        protocol: ProviderProtocol,
+        provider_boundary_sha256: &str,
+    ) -> Result<bool, ProviderTranscriptError> {
+        let changed =
+            self.provider_transcript
+                .activate_route(family, protocol, provider_boundary_sha256)?;
         if changed {
             self.updated_at = chrono::Utc::now();
         }
-        changed
+        Ok(changed)
     }
 
-    pub fn deactivate_provider_transcript_family(&mut self) -> bool {
-        let changed = self.provider_transcript.deactivate_family();
+    pub fn deactivate_provider_transcript_route(&mut self) -> bool {
+        let changed = self.provider_transcript.deactivate_route();
         if changed {
             self.updated_at = chrono::Utc::now();
         }
@@ -929,16 +1120,33 @@ fn reject_unknown_fields(
 
 fn validate_allowed_callers(value: Option<&Value>) -> bool {
     value.is_none_or(|value| {
-        value.as_array().is_some_and(|callers| {
-            callers
-                .iter()
-                .all(|caller| matches!(caller.as_str(), Some("direct" | "programmatic")))
-        })
+        value.is_null()
+            || value.as_array().is_some_and(|callers| {
+                callers
+                    .iter()
+                    .all(|caller| matches!(caller.as_str(), Some("direct" | "programmatic")))
+            })
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiFunctionDefinitionMode {
+    /// A definition returned by OpenAI in a hosted tool-search output. The
+    /// generated response model permits optional fields to be absent or null.
+    ProviderOutput,
+    /// A complete callable definition Bamboo creates for client search or a
+    /// position-scoped `additional_tools` input item. Bamboo requires an object
+    /// parameter schema before this definition can become callable.
+    HostInput,
+    /// A function nested in a namespace. OpenAI's namespace member contract
+    /// intentionally keeps parameters/strict optional and nullable for both
+    /// request and response projections.
+    NamespaceMember,
 }
 
 fn validate_openai_function_definition(
     object: &serde_json::Map<String, Value>,
+    mode: OpenAiFunctionDefinitionMode,
 ) -> Result<(), ProviderTranscriptError> {
     reject_unknown_fields(
         object,
@@ -954,26 +1162,28 @@ fn validate_openai_function_definition(
         ],
         "function definition fields",
     )?;
+    let parameters_valid = match mode {
+        OpenAiFunctionDefinitionMode::HostInput => {
+            object.get("parameters").is_some_and(Value::is_object)
+        }
+        OpenAiFunctionDefinitionMode::ProviderOutput
+        | OpenAiFunctionDefinitionMode::NamespaceMember => object
+            .get("parameters")
+            .is_none_or(|parameters| parameters.is_null() || parameters.is_object()),
+    };
+    let nullable_optional = |value: Option<&Value>, predicate: fn(&Value) -> bool| {
+        value.is_none_or(|value| value.is_null() || predicate(value))
+    };
     if object.get("type").and_then(Value::as_str) != Some("function")
         || !object
             .get("name")
             .and_then(Value::as_str)
             .is_some_and(|name| !name.trim().is_empty())
-        || object
-            .get("parameters")
-            .is_some_and(|parameters| !parameters.is_object())
-        || object
-            .get("strict")
-            .is_some_and(|strict| !strict.is_boolean())
-        || object
-            .get("defer_loading")
-            .is_some_and(|deferred| !deferred.is_boolean())
-        || object
-            .get("description")
-            .is_some_and(|description| !description.is_string())
-        || object
-            .get("output_schema")
-            .is_some_and(|schema| !schema.is_object())
+        || !parameters_valid
+        || !nullable_optional(object.get("strict"), Value::is_boolean)
+        || !nullable_optional(object.get("defer_loading"), Value::is_boolean)
+        || !nullable_optional(object.get("description"), Value::is_string)
+        || !nullable_optional(object.get("output_schema"), Value::is_object)
         || !validate_allowed_callers(object.get("allowed_callers"))
     {
         return Err(ProviderTranscriptError::InvalidItem(
@@ -983,12 +1193,15 @@ fn validate_openai_function_definition(
     Ok(())
 }
 
-fn validate_openai_tool_definition(value: &Value) -> Result<(), ProviderTranscriptError> {
+fn validate_openai_tool_definition(
+    value: &Value,
+    mode: OpenAiFunctionDefinitionMode,
+) -> Result<(), ProviderTranscriptError> {
     let object = value
         .as_object()
         .ok_or(ProviderTranscriptError::InvalidItem("tool definition"))?;
     match object.get("type").and_then(Value::as_str) {
-        Some("function") => validate_openai_function_definition(object),
+        Some("function") => validate_openai_function_definition(object, mode),
         Some("namespace") => {
             reject_unknown_fields(
                 object,
@@ -1021,7 +1234,10 @@ fn validate_openai_tool_definition(value: &Value) -> Result<(), ProviderTranscri
                 // Bamboo currently lowers canonical callable capabilities as
                 // functions. Other provider tool variants must be explicitly
                 // implemented before they can enter durable replay state.
-                validate_openai_function_definition(nested)?;
+                validate_openai_function_definition(
+                    nested,
+                    OpenAiFunctionDefinitionMode::NamespaceMember,
+                )?;
             }
             Ok(())
         }
@@ -1031,12 +1247,15 @@ fn validate_openai_tool_definition(value: &Value) -> Result<(), ProviderTranscri
     }
 }
 
-fn validate_openai_tool_definitions(value: Option<&Value>) -> Result<(), ProviderTranscriptError> {
+fn validate_openai_tool_definitions(
+    value: Option<&Value>,
+    mode: OpenAiFunctionDefinitionMode,
+) -> Result<(), ProviderTranscriptError> {
     let tools = value
         .and_then(Value::as_array)
         .ok_or(ProviderTranscriptError::InvalidItem("loaded tools"))?;
     for tool in tools {
-        validate_openai_tool_definition(tool)?;
+        validate_openai_tool_definition(tool, mode)?;
     }
     Ok(())
 }
@@ -1442,7 +1661,6 @@ fn validate_openai_item(
                     "tool search output shape",
                 ));
             }
-            validate_openai_tool_definitions(object.get("tools"))?;
             match (execution, origin) {
                 ("server", ProviderTranscriptOrigin::Provider) => {
                     reject_unknown_fields(
@@ -1470,6 +1688,10 @@ fn validate_openai_item(
                         ));
                     }
                     validate_openai_agent(object.get("agent"))?;
+                    validate_openai_tool_definitions(
+                        object.get("tools"),
+                        OpenAiFunctionDefinitionMode::ProviderOutput,
+                    )?;
                 }
                 ("client", ProviderTranscriptOrigin::HostToolSearch) => {
                     reject_unknown_fields(
@@ -1478,6 +1700,10 @@ fn validate_openai_item(
                         "client tool search output fields",
                     )?;
                     require_nonempty_string("call_id")?;
+                    validate_openai_tool_definitions(
+                        object.get("tools"),
+                        OpenAiFunctionDefinitionMode::HostInput,
+                    )?;
                 }
                 _ => {
                     return Err(ProviderTranscriptError::InvalidItem(
@@ -1500,7 +1726,10 @@ fn validate_openai_item(
                     "additional tools shape",
                 ));
             }
-            validate_openai_tool_definitions(object.get("tools"))?;
+            validate_openai_tool_definitions(
+                object.get("tools"),
+                OpenAiFunctionDefinitionMode::HostInput,
+            )?;
             Ok(ProviderTranscriptItemKind::OpenAiAdditionalTools)
         }
         _ => Err(ProviderTranscriptError::UnsupportedItemType),
@@ -1681,6 +1910,49 @@ fn validate_anthropic_text_citations(value: Option<&Value>) -> Result<(), Provid
     Ok(())
 }
 
+fn validate_anthropic_tool_search_input(
+    name: &str,
+    value: Option<&Value>,
+) -> Result<(), ProviderTranscriptError> {
+    let input = value
+        .and_then(Value::as_object)
+        .ok_or(ProviderTranscriptError::InvalidItem(
+            "tool-search server input",
+        ))?;
+    let (query_field, maximum_chars) = match name {
+        "tool_search_tool_regex" => ("pattern", 200usize),
+        "tool_search_tool_bm25" => ("query", 500usize),
+        _ => {
+            return Err(ProviderTranscriptError::InvalidItem(
+                "tool-search server name",
+            ))
+        }
+    };
+    reject_unknown_fields(
+        input,
+        &[query_field, "limit"],
+        "tool-search server input fields",
+    )?;
+    let query = input.get(query_field).and_then(Value::as_str).ok_or(
+        ProviderTranscriptError::InvalidItem("tool-search server query"),
+    )?;
+    if query.chars().count() > maximum_chars {
+        return Err(ProviderTranscriptError::InvalidItem(
+            "tool-search server query length",
+        ));
+    }
+    if input.get("limit").is_some_and(|limit| {
+        !limit
+            .as_u64()
+            .is_some_and(|limit| (1..=10_000).contains(&limit))
+    }) {
+        return Err(ProviderTranscriptError::InvalidItem(
+            "tool-search server result limit",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_anthropic_item(
     item_type: &str,
     origin: ProviderTranscriptOrigin,
@@ -1744,12 +2016,12 @@ fn validate_anthropic_item(
             let name = nonempty("name")?;
             if author != ProviderTranscriptAuthor::Model
                 || !matches!(name, "tool_search_tool_regex" | "tool_search_tool_bm25")
-                || !object.get("input").is_some_and(Value::is_object)
             {
                 return Err(ProviderTranscriptError::InvalidItem(
                     "tool-search server_tool_use block",
                 ));
             }
+            validate_anthropic_tool_search_input(name, object.get("input"))?;
             validate_anthropic_caller(object.get("caller"))?;
             Ok(ProviderTranscriptItemKind::AnthropicServerToolUse)
         }
@@ -2116,6 +2388,7 @@ fn stable_group_id(
     epoch: u64,
     family: ProviderFamily,
     protocol: ProviderProtocol,
+    provider_boundary_sha256: &str,
     anchor_message_id: &str,
     _id_hint: Option<&str>,
     items: &[ProviderTranscriptItem],
@@ -2127,6 +2400,8 @@ fn stable_group_id(
     hasher.update(serde_json::to_vec(&family).unwrap_or_default());
     hasher.update([0]);
     hasher.update(serde_json::to_vec(&protocol).unwrap_or_default());
+    hasher.update([0]);
+    hasher.update(provider_boundary_sha256.as_bytes());
     hasher.update([0]);
     hasher.update(anchor_message_id.as_bytes());
     hasher.update([0]);
@@ -2174,6 +2449,64 @@ mod tests {
 
     use super::*;
     use crate::Message;
+
+    fn test_boundary(provider_name: &str, provider_type: &str) -> String {
+        provider_transcript_boundary_sha256(Some(provider_name), Some(provider_type)).unwrap()
+    }
+
+    fn openai_boundary() -> String {
+        test_boundary("openai-test", "openai")
+    }
+
+    fn anthropic_boundary() -> String {
+        test_boundary("anthropic-test", "anthropic")
+    }
+
+    fn activate_openai(session: &mut Session) {
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &openai_boundary(),
+            )
+            .unwrap();
+    }
+
+    fn activate_anthropic(session: &mut Session) -> bool {
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                &anthropic_boundary(),
+            )
+            .unwrap()
+    }
+
+    fn replayable_openai(session: &Session) -> Vec<&ProviderTranscriptGroup> {
+        let boundary = session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .expect("provider transcript test route must be active");
+        session.provider_transcript.replayable_groups(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            boundary,
+        )
+    }
+
+    fn test_group(
+        anchor_message_id: impl Into<String>,
+        items: Vec<ProviderTranscriptItem>,
+    ) -> Result<ProviderTranscriptGroup, ProviderTranscriptError> {
+        ProviderTranscriptGroup::new(
+            0,
+            0,
+            anchor_message_id.into(),
+            None,
+            unbound_provider_boundary_sha256(),
+            items,
+        )
+    }
 
     fn openai_output_items() -> Vec<ProviderTranscriptItem> {
         [
@@ -2370,6 +2703,155 @@ mod tests {
     }
 
     #[test]
+    fn openai_loaded_definitions_distinguish_provider_output_from_host_input() {
+        for definition in [
+            json!({"type":"function","name":"get_weather"}),
+            json!({
+                "type":"function","name":"get_weather",
+                "parameters":null,"strict":null,"allowed_callers":null,
+                "defer_loading":null,"description":null,"output_schema":null
+            }),
+        ] {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","id":"tso_provider","execution":"server",
+                    "call_id":"search_provider","status":"completed","tools":[definition]
+                }),
+            )
+            .expect("provider output permits omitted or nullable optional definition fields");
+        }
+
+        for (origin, author, payload) in [
+            (
+                ProviderTranscriptOrigin::HostToolSearch,
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","execution":"client","call_id":"search_host",
+                    "status":"completed","tools":[{"type":"function","name":"load_skill"}]
+                }),
+            ),
+            (
+                ProviderTranscriptOrigin::DeveloperContext,
+                ProviderTranscriptAuthor::Host,
+                json!({
+                    "type":"additional_tools","role":"developer",
+                    "tools":[{"type":"function","name":"workflow_run"}]
+                }),
+            ),
+        ] {
+            assert!(ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                origin,
+                author,
+                payload,
+            )
+            .is_err());
+        }
+
+        let scoped = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client","call_id":"search_scoped",
+                "status":"completed","tools":[{
+                    "type":"function","name":"load_skill","defer_loading":true,
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"skill_id":{"type":"string","const":"skill:pinned@rev-7"}},
+                        "required":["skill_id"],"additionalProperties":false
+                    }
+                }]
+            }),
+        )
+        .expect("host input with a complete pinned parameter schema is valid");
+        let encoded = serde_json::to_value(&scoped).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProviderTranscriptItem>(encoded).unwrap(),
+            scoped
+        );
+
+        for nested in [
+            json!({"type":"function","name":"lookup"}),
+            json!({"type":"function","name":"lookup","parameters":null,"strict":null}),
+        ] {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::DeveloperContext,
+                ProviderTranscriptAuthor::Host,
+                json!({
+                    "type":"additional_tools","role":"developer","tools":[{
+                        "type":"namespace","name":"crm","description":"CRM tools","tools":[nested]
+                    }]
+                }),
+            )
+            .expect("namespace member parameters remain optional and nullable");
+        }
+    }
+
+    #[test]
+    fn anthropic_builtin_search_inputs_are_name_typed_and_bounded() {
+        let item = |name: &str, input: Value| {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srvtoolu_boundary","name":name,"input":input
+                }),
+            )
+        };
+
+        for input in [
+            json!({"pattern":"x".repeat(200),"limit":1}),
+            json!({"pattern":"weather","limit":10_000}),
+        ] {
+            item("tool_search_tool_regex", input).expect("regex boundary should be valid");
+        }
+        for input in [
+            json!({"query":"x".repeat(500),"limit":1}),
+            json!({"query":"weather tools","limit":10_000}),
+        ] {
+            item("tool_search_tool_bm25", input).expect("BM25 boundary should be valid");
+        }
+
+        let invalid = [
+            ("tool_search_tool_regex", json!({})),
+            ("tool_search_tool_regex", json!({"pattern":17})),
+            ("tool_search_tool_regex", json!({"pattern":"x".repeat(201)})),
+            ("tool_search_tool_regex", json!({"query":"wrong key"})),
+            (
+                "tool_search_tool_regex",
+                json!({"pattern":"ok","credential":"SEARCH_INPUT_SENTINEL"}),
+            ),
+            ("tool_search_tool_bm25", json!({})),
+            ("tool_search_tool_bm25", json!({"query":17})),
+            ("tool_search_tool_bm25", json!({"query":"x".repeat(501)})),
+            ("tool_search_tool_bm25", json!({"pattern":"wrong key"})),
+            ("tool_search_tool_bm25", json!({"query":"ok","limit":0})),
+            (
+                "tool_search_tool_bm25",
+                json!({"query":"ok","limit":10_001}),
+            ),
+            ("tool_search_tool_bm25", json!({"query":"ok","limit":1.5})),
+            ("tool_search_tool_bm25", json!({"query":"ok","limit":"1"})),
+        ];
+        for (name, input) in invalid {
+            let error = item(name, input).expect_err("invalid search input must fail closed");
+            let diagnostic = format!("{error:?} {error}");
+            assert!(!diagnostic.contains("SEARCH_INPUT_SENTINEL"));
+        }
+    }
+
+    #[test]
     fn unsupported_or_malformed_items_fail_closed() {
         let unsupported = ProviderTranscriptItem::try_from_payload(
             ProviderFamily::OpenAi,
@@ -2400,7 +2882,7 @@ mod tests {
 
         let mut reversed = openai_output_items();
         reversed.swap(0, 1);
-        let group = ProviderTranscriptGroup::new(0, 0, "anchor".to_string(), None, reversed);
+        let group = test_group("anchor", reversed);
         assert_eq!(
             group.unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
@@ -2730,18 +3212,11 @@ mod tests {
         let mut reordered = openai.clone();
         reordered.swap(1, 2);
         assert_eq!(
-            ProviderTranscriptGroup::new(0, 0, "openai".to_string(), None, reordered).unwrap_err(),
+            test_group("openai", reordered).unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "openai".to_string(),
-                None,
-                vec![openai[0].clone()],
-            )
-            .unwrap_err(),
+            test_group("openai", vec![openai[0].clone()]).unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
         let mismatched_call = ProviderTranscriptItem::try_from_payload(
@@ -2756,11 +3231,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "openai".to_string(),
-                None,
+            test_group(
+                "openai",
                 vec![openai[0].clone(), openai[1].clone(), mismatched_call],
             )
             .unwrap_err(),
@@ -2807,10 +3279,7 @@ mod tests {
             openai[2].clone(),
             function_two,
         ];
-        assert!(
-            ProviderTranscriptGroup::new(0, 0, "openai-parallel".to_string(), None, parallel,)
-                .is_ok()
-        );
+        assert!(test_group("openai-parallel", parallel).is_ok());
 
         let mismatched_output = hosted_item(
             ProviderTranscriptAuthor::ToolResult,
@@ -2820,11 +3289,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "openai-mismatch".to_string(),
-                None,
+            test_group(
+                "openai-mismatch",
                 vec![openai[0].clone(), mismatched_output],
             )
             .unwrap_err(),
@@ -2839,11 +3305,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "openai-duplicate-id".to_string(),
-                None,
+            test_group(
+                "openai-duplicate-id",
                 vec![openai[0].clone(), duplicate_id_call],
             )
             .unwrap_err(),
@@ -2858,11 +3321,8 @@ mod tests {
             }),
         );
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "openai-duplicate-call".to_string(),
-                None,
+            test_group(
+                "openai-duplicate-call",
                 vec![openai[0].clone(), duplicate_call_id],
             )
             .unwrap_err(),
@@ -2901,32 +3361,17 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(ProviderTranscriptGroup::new(
-            0,
-            0,
-            "client-call".to_string(),
-            None,
-            vec![client_call],
-        )
-        .is_ok());
+        assert!(test_group("client-call", vec![client_call]).is_ok());
 
         let anthropic = anthropic_items();
         let mut reordered = anthropic.clone();
         reordered.swap(2, 3);
         assert_eq!(
-            ProviderTranscriptGroup::new(0, 0, "anthropic".to_string(), None, reordered)
-                .unwrap_err(),
+            test_group("anthropic", reordered).unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "anthropic".to_string(),
-                None,
-                vec![anthropic[1].clone()],
-            )
-            .unwrap_err(),
+            test_group("anthropic", vec![anthropic[1].clone()]).unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
         let mismatched_use = ProviderTranscriptItem::try_from_payload(
@@ -2938,12 +3383,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            ProviderTranscriptGroup::new(
-                0,
-                0,
-                "anthropic".to_string(),
-                None,
-                vec![anthropic[1].clone(), anthropic[2].clone(), mismatched_use,],
+            test_group(
+                "anthropic",
+                vec![anthropic[1].clone(), anthropic[2].clone(), mismatched_use],
             )
             .unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
@@ -2976,10 +3418,24 @@ mod tests {
         assert_eq!(openai_a.id(), openai_b.id());
         assert_ne!(openai_a.id(), copilot.id());
 
-        let openai_group =
-            ProviderTranscriptGroup::new(0, 0, "anchor".to_string(), None, vec![openai_a]).unwrap();
+        let route_a = test_boundary("openai-route-a", "openai");
+        let route_b = test_boundary("openai-route-b", "openai");
+        let openai_group = ProviderTranscriptGroup::new(
+            0,
+            0,
+            "anchor".to_string(),
+            None,
+            route_a.clone(),
+            vec![openai_a.clone()],
+        )
+        .unwrap();
+        let other_route_group =
+            ProviderTranscriptGroup::new(0, 0, "anchor".to_string(), None, route_b, vec![openai_a])
+                .unwrap();
         let copilot_group =
-            ProviderTranscriptGroup::new(0, 0, "anchor".to_string(), None, vec![copilot]).unwrap();
+            ProviderTranscriptGroup::new(0, 0, "anchor".to_string(), None, route_a, vec![copilot])
+                .unwrap();
+        assert_ne!(openai_group.id(), other_route_group.id());
         assert_ne!(openai_group.id(), copilot_group.id());
 
         let mut tampered = serde_json::to_value(openai_b).unwrap();
@@ -2993,7 +3449,7 @@ mod tests {
         let assistant = Message::assistant("", None);
         let anchor = assistant.id.clone();
         session.add_message(assistant);
-        session.activate_provider_transcript_family(ProviderFamily::OpenAi);
+        activate_openai(&mut session);
         session
             .append_provider_transcript_group(&anchor, Some("resp_123"), openai_output_items())
             .unwrap();
@@ -3001,19 +3457,10 @@ mod tests {
         let encoded = serde_json::to_string(&session).unwrap();
         let decoded: Session = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.provider_transcript, session.provider_transcript);
-        assert_eq!(
-            decoded
-                .provider_transcript
-                .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-                .len(),
-            1
-        );
+        assert_eq!(replayable_openai(&decoded).len(), 1);
         let mut compressed = decoded;
         compressed.reset_model_context_epoch(crate::session::ModelContextResetReason::Compression);
-        assert!(compressed
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai(&compressed).is_empty());
         assert_eq!(compressed.provider_transcript.groups().len(), 1);
 
         let mut old = serde_json::to_value(Session::new("old", "model")).unwrap();
@@ -3062,7 +3509,7 @@ mod tests {
         let assistant = Message::assistant("", None);
         let anchor = assistant.id.clone();
         session.add_message(assistant);
-        session.activate_provider_transcript_family(ProviderFamily::Anthropic);
+        activate_anthropic(&mut session);
         session
             .append_provider_transcript_group(&anchor, None, anthropic_items())
             .unwrap();
@@ -3094,10 +3541,7 @@ mod tests {
 
         assert_eq!(session.provider_transcript.groups().len(), 1);
         assert_eq!(session.provider_transcript.epoch(), previous_epoch + 1);
-        assert!(session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai(&session).is_empty());
         assert_eq!(
             session.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::ExplicitHistoryRewrite)
@@ -3125,9 +3569,7 @@ mod tests {
         crate::session::append_missing_runtime_messages(&mut runner, &durable);
         assert_eq!(runner.provider_transcript.groups().len(), 2);
         assert_eq!(
-            runner
-                .provider_transcript
-                .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            replayable_openai(&runner)
                 .into_iter()
                 .map(ProviderTranscriptGroup::anchor_message_id)
                 .collect::<Vec<_>>(),
@@ -3171,24 +3613,25 @@ mod tests {
             .provider_transcript
             .merge_durable_prefix(&left_original, &ordered);
         assert_eq!(left.provider_transcript, right.provider_transcript);
-        assert_eq!(
-            left.provider_transcript
-                .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-                .len(),
-            2
-        );
+        assert_eq!(replayable_openai(&left).len(), 2);
     }
 
     #[test]
     fn rejected_append_is_atomic_and_reset_reason_survives_new_epoch_append() {
         let mut state = ProviderTranscriptState::default();
-        state.activate_family(ProviderFamily::Anthropic);
+        state
+            .activate_route(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                &anthropic_boundary(),
+            )
+            .unwrap();
         let before = state.clone();
         assert_eq!(
             state
                 .append_group("anchor", None, openai_output_items())
                 .unwrap_err(),
-            ProviderTranscriptError::InactiveProviderFamily
+            ProviderTranscriptError::InactiveProviderRoute
         );
         assert_eq!(state, before, "rejected append must not mutate state");
 
@@ -3202,7 +3645,7 @@ mod tests {
         session
             .append_provider_transcript_group(&first_anchor, None, openai_output_items())
             .unwrap();
-        session.activate_provider_transcript_family(ProviderFamily::Anthropic);
+        activate_anthropic(&mut session);
         session
             .append_provider_transcript_group(&second_anchor, None, anthropic_items())
             .unwrap();
@@ -3218,6 +3661,7 @@ mod tests {
                 .replayable_groups(
                     ProviderFamily::Anthropic,
                     ProviderProtocol::AnthropicMessages2023_06_01,
+                    &anthropic_boundary(),
                 )
                 .len(),
             1
@@ -3247,7 +3691,7 @@ mod tests {
         runner
             .append_provider_transcript_group(&anchors[2], None, openai_output_items())
             .unwrap();
-        runner.activate_provider_transcript_family(ProviderFamily::Anthropic);
+        activate_anthropic(&mut runner);
         let switched_epoch = runner.provider_transcript.epoch();
 
         crate::session::append_missing_runtime_messages(&mut runner, &durable);
@@ -3260,10 +3704,7 @@ mod tests {
             runner.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::ProviderSwitch)
         );
-        assert!(runner
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai(&runner).is_empty());
     }
 
     #[test]
@@ -3272,22 +3713,169 @@ mod tests {
         let assistant = Message::assistant("", None);
         let anchor = assistant.id.clone();
         session.add_message(assistant);
-        session.activate_provider_transcript_family(ProviderFamily::OpenAi);
+        activate_openai(&mut session);
         session
             .append_provider_transcript_group(&anchor, None, openai_output_items())
             .unwrap();
         let old_epoch = session.provider_transcript.epoch();
 
-        assert!(session.activate_provider_transcript_family(ProviderFamily::Anthropic));
+        assert!(activate_anthropic(&mut session));
         assert_eq!(session.provider_transcript.epoch(), old_epoch + 1);
         assert_eq!(
             session.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::ProviderSwitch)
         );
+        assert!(replayable_openai(&session).is_empty());
+    }
+
+    #[test]
+    fn same_family_provider_instance_switch_advances_and_persists_route_boundary() {
+        let route_a_name = "openai-instance-a-sensitive-route";
+        let route_b_name = "openai-instance-b-sensitive-route";
+        let route_a = test_boundary(route_a_name, "openai");
+        let route_b = test_boundary(route_b_name, "openai");
+        assert_ne!(route_a, route_b);
+        assert!(!route_a.contains(route_a_name));
+
+        let mut session = Session::new("same-family-switch", "model");
+        let assistant = Message::assistant("native", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
         assert!(session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_a,
+            )
+            .unwrap());
+        session
+            .append_provider_transcript_group(&anchor, None, openai_output_items())
+            .unwrap();
+        let first_epoch = session.provider_transcript.epoch();
+        assert_eq!(
+            session
+                .provider_transcript
+                .active_provider_boundary_sha256(),
+            Some(route_a.as_str())
+        );
+        assert!(!session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_a,
+            )
+            .unwrap());
+        assert_eq!(session.provider_transcript.epoch(), first_epoch);
+
+        let encoded = serde_json::to_string(&session.provider_transcript).unwrap();
+        assert!(!encoded.contains(route_a_name));
+        assert!(!encoded.contains(route_b_name));
+
+        let mut active_boundary_tamper: Value = serde_json::from_str(&encoded).unwrap();
+        active_boundary_tamper["active_provider_boundary_sha256"] = json!(route_b);
+        assert!(
+            serde_json::from_value::<ProviderTranscriptState>(active_boundary_tamper).is_err(),
+            "a valid but foreign active boundary must not reclassify current groups"
+        );
+
+        let mut group_boundary_tamper: Value = serde_json::from_str(&encoded).unwrap();
+        group_boundary_tamper["groups"][0]["provider_boundary_sha256"] = json!(route_b);
+        assert!(
+            serde_json::from_value::<ProviderTranscriptState>(group_boundary_tamper).is_err(),
+            "a valid but foreign group boundary must invalidate its stable id"
+        );
+
+        let mut resumed: ProviderTranscriptState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            resumed.active_provider_boundary_sha256(),
+            Some(route_a.as_str())
+        );
+        assert!(resumed
+            .activate_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_b,
+            )
+            .unwrap());
+        assert_eq!(resumed.epoch(), first_epoch + 1);
+        assert_eq!(
+            resumed.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::ProviderSwitch)
+        );
+        assert!(resumed
+            .replayable_groups(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_a,
+            )
             .is_empty());
+        assert!(resumed
+            .replayable_groups(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_b,
+            )
+            .is_empty());
+
+        let mut invalid = serde_json::to_value(&resumed).unwrap();
+        invalid["active_provider_boundary_sha256"] = json!("not-a-sha256");
+        assert!(serde_json::from_value::<ProviderTranscriptState>(invalid).is_err());
+    }
+
+    #[test]
+    fn stale_same_family_route_cannot_resurrect_groups_during_merge() {
+        let route_a = test_boundary("openai-instance-a", "openai");
+        let route_b = test_boundary("openai-instance-b", "openai");
+        let mut base = Session::new("same-family-merge", "model");
+        let first = Message::assistant("first", None);
+        let first_anchor = first.id.clone();
+        let second = Message::assistant("second", None);
+        let second_anchor = second.id.clone();
+        base.add_message(first);
+        base.add_message(second);
+        base.activate_provider_transcript_route(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            &route_a,
+        )
+        .unwrap();
+        base.append_provider_transcript_group(&first_anchor, None, openai_output_items())
+            .unwrap();
+
+        let mut durable = base.clone();
+        durable
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_b,
+            )
+            .unwrap();
+        let switched_epoch = durable.provider_transcript.epoch();
+
+        let mut stale_runner = base;
+        stale_runner
+            .append_provider_transcript_group(&second_anchor, None, openai_output_items())
+            .unwrap();
+        stale_runner.merge_provider_transcript_from_durable(&durable);
+        assert_eq!(stale_runner.provider_transcript.epoch(), switched_epoch);
+        assert_eq!(
+            stale_runner
+                .provider_transcript
+                .active_provider_boundary_sha256(),
+            Some(route_b.as_str())
+        );
+        assert!(stale_runner
+            .provider_transcript
+            .replayable_groups(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &route_b,
+            )
+            .is_empty());
+        assert_eq!(
+            stale_runner.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::ProviderSwitch)
+        );
     }
 
     #[test]
@@ -3301,13 +3889,12 @@ mod tests {
             json!({
                 "type":"additional_tools",
                 "role":"developer",
-                "tools":[{"type":"function","name":"x","description":secret}]
+                "tools":[{"type":"function","name":"x","description":secret,"parameters":{"type":"object"}}]
             }),
         )
         .unwrap();
         assert!(!format!("{item:?}").contains(secret));
-        let group =
-            ProviderTranscriptGroup::new(0, 0, secret.to_string(), None, vec![item]).unwrap();
+        let group = test_group(secret, vec![item]).unwrap();
         assert!(!format!("{group:?}").contains(secret));
 
         let error = ProviderTranscriptItem::try_from_payload(

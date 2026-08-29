@@ -368,6 +368,18 @@ mod tests {
             .unwrap();
     }
 
+    fn replayable_openai_groups(session: &Session) -> Vec<&bamboo_domain::ProviderTranscriptGroup> {
+        let boundary = session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .expect("native test group establishes an opaque route boundary");
+        session.provider_transcript.replayable_groups(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            boundary,
+        )
+    }
+
     #[test]
     fn unchanged_update_removal_and_retry_are_append_only_and_deterministic() {
         let mut session = Session::new("ledger-session", "model");
@@ -497,10 +509,7 @@ mod tests {
             session.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::HardTruncation)
         );
-        assert!(session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai_groups(&session).is_empty());
 
         let next = reconcile_model_context(
             &mut session,
@@ -577,10 +586,7 @@ mod tests {
             session.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::ExplicitHistoryRewrite)
         );
-        assert!(session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai_groups(&session).is_empty());
     }
 
     #[test]
@@ -616,9 +622,7 @@ mod tests {
             Some(ModelContextResetReason::Rollback)
         );
         assert_eq!(session.provider_transcript.epoch(), native_epoch);
-        let replayable = session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1);
+        let replayable = replayable_openai_groups(&session);
         assert_eq!(replayable.len(), 1);
         assert_eq!(replayable[0].anchor_message_id(), first_anchor);
         assert_eq!(
@@ -664,10 +668,7 @@ mod tests {
             session.provider_transcript.last_reset_reason(),
             Some(ProviderTranscriptResetReason::RetentionLimit)
         );
-        assert!(session
-            .provider_transcript
-            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
-            .is_empty());
+        assert!(replayable_openai_groups(&session).is_empty());
 
         let before = state.clone();
         let retry = reconcile_model_context(

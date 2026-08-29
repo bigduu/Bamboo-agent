@@ -29,8 +29,8 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_domain::{
-    ModelContextResetReason, ProviderFamily, ProviderProtocol, ReasoningEffort,
-    MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    provider_transcript_boundary_sha256, ModelContextResetReason, ProviderFamily, ProviderProtocol,
+    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
@@ -476,25 +476,35 @@ fn build_request_envelope_reconciled(
     model: &str,
 ) -> PreparedRequestEnvelope {
     let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
-    let active_family = session.provider_transcript.active_family();
-    let provider_changed = match (active_family, requested_family) {
-        (Some(active), Some(requested)) if active != requested => {
-            session.activate_provider_transcript_family(requested);
-            session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
-            true
-        }
-        (Some(_), None) => {
-            session.deactivate_provider_transcript_family();
-            session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
-            true
-        }
-        (None, Some(requested)) if !session.provider_transcript.groups().is_empty() => {
-            session.activate_provider_transcript_family(requested);
-            session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
-            true
-        }
-        _ => false,
+    let requested_protocol = requested_family.map(|family| match family {
+        ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
+        ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+    });
+    let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
+        config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
+    );
+    let had_prior_provider_route = session.provider_transcript.active_family().is_some()
+        || session.provider_transcript.active_protocol().is_some()
+        || session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .is_some()
+        || !session.provider_transcript.groups().is_empty();
+    let provider_route_changed = match (
+        requested_family,
+        requested_protocol,
+        requested_provider_boundary_sha256.as_deref(),
+    ) {
+        (Some(family), Some(protocol), Some(boundary)) => session
+            .activate_provider_transcript_route(family, protocol, boundary)
+            .expect("canonical provider family/protocol/boundary must be valid"),
+        _ => session.deactivate_provider_transcript_route(),
     };
+    let provider_changed = provider_route_changed && had_prior_provider_route;
+    if provider_changed {
+        session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
+    }
     let activated = activated_discoverable_tools(session);
     let (stable_frame, stable_prefix_sections) =
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
@@ -727,6 +737,7 @@ fn build_request_envelope_reconciled(
     real_transcript.extend(conversation_messages);
     let cache_scope = serde_json::json!({
         "model": model,
+        "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
         "stable_prefix": stable_prefix_messages
             .iter()
@@ -749,16 +760,12 @@ fn build_request_envelope_reconciled(
     // model transcript. Legacy lanes remain supported by PromptIR for external
     // callers, but the normal engine path no longer rebuilds them per round.
     let provider_transcript_groups = requested_family
-        .map(|family| {
-            let protocol = match family {
-                ProviderFamily::OpenAi | ProviderFamily::Copilot => {
-                    ProviderProtocol::OpenAiResponsesV1
-                }
-                ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
-            };
+        .zip(requested_protocol)
+        .zip(requested_provider_boundary_sha256.as_deref())
+        .map(|((family, protocol), boundary)| {
             session
                 .provider_transcript
-                .replayable_groups(family, protocol)
+                .replayable_groups(family, protocol, boundary)
                 .into_iter()
                 .cloned()
                 .collect()
