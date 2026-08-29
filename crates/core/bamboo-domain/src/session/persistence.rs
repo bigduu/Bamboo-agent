@@ -28,6 +28,10 @@ pub fn append_missing_runtime_messages(session: &mut Session, durable: &Session)
         .collect::<Vec<_>>();
     let appended = missing.len();
     session.messages = durable.messages.iter().cloned().chain(missing).collect();
+    // Provider-native groups are message-anchored and append-only as well. A
+    // concurrent durable prefix must not be erased by a stale runner save, and
+    // a runner's newly completed group must remain paired with its new message.
+    session.merge_provider_transcript_from_durable(durable);
     appended
 }
 

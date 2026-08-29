@@ -21,6 +21,7 @@ pub(super) struct StreamAccumulationState {
     cache_read_input_tokens: u64,
     provider_usage: Option<ProviderUsageSnapshot>,
     input_tokens: u64,
+    provider_transcript_items: Vec<bamboo_domain::ProviderTranscriptItem>,
 }
 
 impl StreamAccumulationState {
@@ -39,6 +40,7 @@ impl StreamAccumulationState {
             cache_read_input_tokens: 0,
             provider_usage: None,
             input_tokens: 0,
+            provider_transcript_items: Vec::new(),
         }
     }
 
@@ -66,6 +68,13 @@ impl StreamAccumulationState {
 
     pub(super) fn set_response_id(&mut self, response_id: String) {
         self.response_id = Some(response_id);
+    }
+
+    pub(super) fn push_provider_transcript_item(
+        &mut self,
+        item: bamboo_domain::ProviderTranscriptItem,
+    ) {
+        self.provider_transcript_items.push(item);
     }
 
     pub(super) fn extend_tool_calls(
@@ -223,6 +232,7 @@ impl StreamAccumulationState {
             cache_read_input_tokens: self.cache_read_input_tokens,
             provider_usage: self.provider_usage,
             input_tokens: self.input_tokens,
+            provider_transcript_items: self.provider_transcript_items,
         }
     }
 

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::sync::Arc;
 
@@ -27,8 +28,10 @@ use bamboo_agent_core::{
     ContextBlockType, Message, MessagePhase, Role, Session,
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
-use bamboo_domain::ReasoningEffort;
-use bamboo_domain::MAX_MODEL_CONTEXT_RENDERED_BYTES;
+use bamboo_domain::{
+    provider_transcript_boundary_sha256, ModelContextResetReason, ProviderFamily, ProviderProtocol,
+    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+};
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR, Segment,
@@ -383,7 +386,29 @@ fn measure_request_usage(
     session: &Session,
     envelope: &PreparedRequestEnvelope,
 ) -> ProjectedRequestUsage {
-    let input_tokens = TiktokenTokenCounter::default().count_messages(&envelope.ir.flatten());
+    let counter = TiktokenTokenCounter::default();
+    let messages = envelope.ir.flatten();
+    let mut input_tokens = counter.count_messages(&messages);
+    let mut replaced_anchors = HashSet::new();
+    for group in &envelope.ir.provider_transcript_groups {
+        if replaced_anchors.insert(group.anchor_message_id()) {
+            if let Some(anchor) = messages
+                .iter()
+                .find(|message| message.id == group.anchor_message_id())
+            {
+                input_tokens = input_tokens.saturating_sub(counter.count_message(anchor));
+            }
+        }
+        let payloads = group
+            .items()
+            .iter()
+            .map(|item| item.payload())
+            .collect::<Vec<_>>();
+        let wire = serde_json::to_string(&payloads).unwrap_or_default();
+        input_tokens = input_tokens
+            .saturating_add(counter.count_text(&wire))
+            .saturating_add((group.items().len() as u32).saturating_mul(4));
+    }
     let ledger_rendered_bytes = session
         .model_context_state
         .as_ref()
@@ -450,6 +475,36 @@ fn build_request_envelope_reconciled(
     tool_schemas: &[ToolSchema],
     model: &str,
 ) -> PreparedRequestEnvelope {
+    let requested_family = ProviderFamily::from_provider_type(config.provider_type.as_deref());
+    let requested_protocol = requested_family.map(|family| match family {
+        ProviderFamily::OpenAi | ProviderFamily::Copilot => ProviderProtocol::OpenAiResponsesV1,
+        ProviderFamily::Anthropic => ProviderProtocol::AnthropicMessages2023_06_01,
+    });
+    let requested_provider_boundary_sha256 = provider_transcript_boundary_sha256(
+        config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
+    );
+    let had_prior_provider_route = session.provider_transcript.active_family().is_some()
+        || session.provider_transcript.active_protocol().is_some()
+        || session
+            .provider_transcript
+            .active_provider_boundary_sha256()
+            .is_some()
+        || !session.provider_transcript.groups().is_empty();
+    let provider_route_changed = match (
+        requested_family,
+        requested_protocol,
+        requested_provider_boundary_sha256.as_deref(),
+    ) {
+        (Some(family), Some(protocol), Some(boundary)) => session
+            .activate_provider_transcript_route(family, protocol, boundary)
+            .expect("canonical provider family/protocol/boundary must be valid"),
+        _ => session.deactivate_provider_transcript_route(),
+    };
+    let provider_changed = provider_route_changed && had_prior_provider_route;
+    if provider_changed {
+        session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
+    }
     let activated = activated_discoverable_tools(session);
     let (stable_frame, stable_prefix_sections) =
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
@@ -682,6 +737,7 @@ fn build_request_envelope_reconciled(
     real_transcript.extend(conversation_messages);
     let cache_scope = serde_json::json!({
         "model": model,
+        "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
         "stable_prefix": stable_prefix_messages
             .iter()
@@ -703,6 +759,18 @@ fn build_request_envelope_reconciled(
     // The single canonical request: stable prefix followed by one chronological
     // model transcript. Legacy lanes remain supported by PromptIR for external
     // callers, but the normal engine path no longer rebuilds them per round.
+    let provider_transcript_groups = requested_family
+        .zip(requested_protocol)
+        .zip(requested_provider_boundary_sha256.as_deref())
+        .map(|((family, protocol), boundary)| {
+            session
+                .provider_transcript
+                .replayable_groups(family, protocol, boundary)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let ir = PromptIR {
         system_text: lane_system,
         system_blocks,
@@ -710,6 +778,7 @@ fn build_request_envelope_reconciled(
             Segment::new(SegmentRole::StablePrefix, stable_prefix_messages),
             Segment::new(SegmentRole::ModelTranscript, ledger.transcript),
         ],
+        provider_transcript_groups,
         cache: cache_plan,
         continuation: None,
     };
@@ -717,7 +786,7 @@ fn build_request_envelope_reconciled(
     PreparedRequestEnvelope {
         ir,
         stable_prefix_sections,
-        ledger_changed: ledger.changed,
+        ledger_changed: ledger.changed || provider_changed,
         prefix_epoch: ledger.prefix_epoch,
         prefix_reset_reason: ledger.reset_reason,
     }
@@ -926,6 +995,7 @@ pub(super) async fn execute_llm_stream(
     };
 
     let previous_model_context_state = session.model_context_state.clone();
+    let previous_provider_transcript = session.provider_transcript.clone();
     let mut prepared_envelope =
         build_request_envelope_reconciled(session, prepared_context, config, tool_schemas, model);
     // `prepare_round_context` reserves the already-durable ledger history. The
@@ -939,6 +1009,7 @@ pub(super) async fn execute_llm_stream(
         || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
     {
         session.model_context_state = previous_model_context_state;
+        session.provider_transcript = previous_provider_transcript;
         return Err(AgentError::Budget(format!(
             "final PromptIR message input exceeds ledger-safe limits: input_tokens={}, input_limit={request_input_limit}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
             final_usage.input_tokens, final_usage.ledger_rendered_bytes,
@@ -956,6 +1027,7 @@ pub(super) async fn execute_llm_stream(
                 // retry cannot mistake the failed candidate for a committed
                 // ledger and bypass persistence on its next attempt.
                 session.model_context_state = previous_model_context_state;
+                session.provider_transcript = previous_provider_transcript;
                 return Err(AgentError::LLM(format!(
                     "model-context ledger checkpoint failed before provider dispatch: {error}"
                 )));

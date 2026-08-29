@@ -702,6 +702,14 @@ pub struct Session {
     /// `messages` or the existing session API/UI transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_state: Option<crate::session::model_context::ModelContextState>,
+    /// Durable provider-native discovery history. This is separate from the
+    /// user-visible `messages` lane and is replayed only through a matching
+    /// provider family/protocol adapter.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::provider_transcript::ProviderTranscriptState::is_empty"
+    )]
+    pub provider_transcript: crate::session::provider_transcript::ProviderTranscriptState,
     /// Custom instructions for conversation summarization at the session level.
     /// Overrides config-level `compression_instructions` when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -798,6 +806,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -883,6 +892,7 @@ impl Session {
             prompt_snapshot: None,
             compression_events: Vec::new(),
             model_context_state: None,
+            provider_transcript: Default::default(),
             compression_instructions: None,
             agent_runtime_state: None,
             runtime_metadata: None,
@@ -943,6 +953,7 @@ impl Session {
         &mut self,
         reason: crate::session::model_context::ModelContextResetReason,
     ) {
+        self.reset_provider_transcript_for_model_context(reason);
         let state = self
             .model_context_state
             .get_or_insert_with(Default::default);
@@ -963,6 +974,47 @@ impl Session {
             }
         } else {
             state.reset_epoch(reason);
+        }
+    }
+
+    /// Apply a model-context boundary to the provider-native replay lane.
+    /// Engine reconciliation uses this when it discovers an implicit boundary;
+    /// callers that already declared a full model-context reset use
+    /// [`Self::reset_model_context_epoch`] so both lanes move atomically.
+    pub fn reset_provider_transcript_for_model_context(
+        &mut self,
+        reason: crate::session::model_context::ModelContextResetReason,
+    ) {
+        use crate::session::provider_transcript::ProviderTranscriptResetReason;
+
+        match reason {
+            crate::session::model_context::ModelContextResetReason::Compression => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::Compression),
+            crate::session::model_context::ModelContextResetReason::HardTruncation => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::HardTruncation),
+            crate::session::model_context::ModelContextResetReason::CacheScopeChanged => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::CacheScopeChanged),
+            crate::session::model_context::ModelContextResetReason::RetentionLimit => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::RetentionLimit),
+            crate::session::model_context::ModelContextResetReason::Rollback => {
+                self.prune_provider_transcript();
+            }
+            // Editing/replacing history can leave every message id intact while
+            // changing the meaning of the provider-native chain anchored there.
+            // A dangling-anchor prune is therefore insufficient: the complete
+            // loading epoch must become unreachable before the rewritten
+            // transcript is dispatched again.
+            crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite => self
+                .provider_transcript
+                .invalidate(ProviderTranscriptResetReason::ExplicitHistoryRewrite),
+            // `activate_provider_transcript_route` already advanced the native
+            // epoch. Avoid advancing it twice while resetting the PromptIR/cache
+            // ledger at the same provider boundary.
+            crate::session::model_context::ModelContextResetReason::ProviderSwitch => {}
         }
     }
 

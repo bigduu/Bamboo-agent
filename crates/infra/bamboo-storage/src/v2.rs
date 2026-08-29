@@ -267,6 +267,10 @@ pub struct SessionCopyProjectionGuard {
 fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
+    // Native transcript groups are committed atomically with the ordinary
+    // message that anchors them. Never let runtime.json expose a load/search
+    // item without the corresponding session.json history boundary.
+    snapshot.provider_transcript = Default::default();
     if let Some(metadata) = snapshot.runtime_metadata.as_mut() {
         // Admission ids must be committed atomically with their transcript
         // messages in session.json. Duplicating them into runtime.json would
@@ -291,6 +295,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
                 .as_ref()
                 .and_then(|metadata| metadata.session_inbox_admission.clone());
             side.messages = main.messages;
+            side.provider_transcript = main.provider_transcript;
             if let Some(admission) = admission {
                 side.runtime_metadata
                     .get_or_insert_with(Default::default)
@@ -1121,6 +1126,9 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         copy.messages.pop();
     }
     copy.clear_derived_context_state();
+    // A copied conversation is a normalized history fork, not a continuation
+    // of the source provider's native loading/cache epoch.
+    copy.provider_transcript = Default::default();
     copy.model_context_state = None;
     copy.prompt_snapshot = None;
     for message in &mut copy.messages {
@@ -6267,7 +6275,23 @@ mod tests {
     #[tokio::test]
     async fn save_session_writes_runtime_sidecar() -> io::Result<()> {
         let (storage, _t) = create_temp_storage().await?;
-        let s = session_with_history("sc-1", 2, "run-A");
+        let mut s = session_with_history("sc-1", 2, "run-A");
+        let assistant = Message::assistant("discovery", None);
+        let anchor = assistant.id.clone();
+        s.add_message(assistant);
+        let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::Provider,
+            bamboo_domain::ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type":"tool_search_call","id":"tsc_search_sidecar","execution":"client","call_id":"search_sidecar",
+                "status":"completed","arguments":{"query":"weather"}
+            }),
+        )
+        .unwrap();
+        s.append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
         storage.save_session(&s).await?;
 
         let sidecar_path = storage.runtime_json_path("sc-1").await?.unwrap();
@@ -6279,7 +6303,10 @@ mod tests {
         // Sidecar must NOT carry the message history.
         let side = storage.read_runtime_sidecar("sc-1").await?.unwrap();
         assert!(side.messages.is_empty(), "sidecar messages must be cleared");
+        assert!(side.provider_transcript.is_empty());
         assert_eq!(side.agent_runtime_state.as_ref().unwrap().run_id, "run-A");
+        let loaded = storage.load_session("sc-1").await?.unwrap();
+        assert_eq!(loaded.provider_transcript.groups().len(), 1);
         Ok(())
     }
 

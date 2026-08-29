@@ -169,6 +169,7 @@ pub enum ModelContextResetReason {
     CacheScopeChanged,
     RetentionLimit,
     ExplicitHistoryRewrite,
+    ProviderSwitch,
 }
 
 impl ModelContextResetReason {
@@ -180,6 +181,7 @@ impl ModelContextResetReason {
             Self::CacheScopeChanged => "cache_scope_changed",
             Self::RetentionLimit => "retention_limit",
             Self::ExplicitHistoryRewrite => "explicit_history_rewrite",
+            Self::ProviderSwitch => "provider_switch",
         }
     }
 }

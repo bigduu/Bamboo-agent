@@ -86,6 +86,44 @@ async fn consume_llm_stream_accumulates_tokens_and_tool_calls() {
     assert!(matches!(token_event, AgentEvent::Token { .. }));
 }
 
+#[tokio::test]
+async fn provider_native_sideband_is_accumulated_without_emitting_ui_events() {
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_stream_search_1","execution":"client","call_id":"search_1",
+            "status":"completed","arguments":{"query":"orders"}
+        }),
+    )
+    .unwrap();
+    let stream = build_stream(vec![
+        Ok(LLMChunk::ProviderTranscriptItem(item.clone())),
+        Ok(LLMChunk::Token("visible".to_string())),
+        Ok(LLMChunk::Done),
+    ]);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    let output = consume_llm_stream(
+        stream,
+        &event_tx,
+        &CancellationToken::new(),
+        "session-native-sideband",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.provider_transcript_items, vec![item]);
+    assert_eq!(output.content, "visible");
+    assert!(matches!(
+        event_rx.recv().await,
+        Some(AgentEvent::Token { content }) if content == "visible"
+    ));
+    assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+}
+
 /// #520: a provider-minted reasoning signature is surfaced on the output so
 /// the persisted assistant message can replay a SIGNED thinking block.
 #[tokio::test]

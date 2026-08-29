@@ -374,6 +374,30 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
 
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-ledger-checkpoint-failure", "test-model");
+    let assistant = Message::assistant("prior native response", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let native_item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_checkpoint_search","execution":"client","call_id":"checkpoint_search",
+            "status":"completed","arguments":{"query":"orders"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![native_item])
+        .unwrap();
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        cache_scope_sha256: Some("stale-scope".to_string()),
+        transcript_item_sha256: vec!["stale-transcript".to_string()],
+        ..Default::default()
+    });
+    let previous_model_context = session.model_context_state.clone();
+    let previous_provider_transcript = session.provider_transcript.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let mut config = test_config("system");
     let persistence = Arc::new(FailOncePersistence(std::sync::atomic::AtomicUsize::new(0)));
@@ -422,9 +446,13 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         .lock()
         .expect("messages lock")
         .is_empty());
-    assert!(
-        session.model_context_state.is_none(),
+    assert_eq!(
+        session.model_context_state, previous_model_context,
         "failed checkpoint must roll the in-memory ledger transaction back"
+    );
+    assert_eq!(
+        session.provider_transcript, previous_provider_transcript,
+        "native invalidation and model-context reset must roll back together"
     );
 
     execute_llm_stream(
@@ -1314,6 +1342,145 @@ fn build_request_envelope_seeds_ledger_without_rewriting_old_breakpoints() {
     // The stable prefix uses the 1-hour extended TTL so the cache survives
     // pauses longer than the 5-minute default and big tool results keep hitting.
     assert_eq!(envelope.ir.cache.ttl, bamboo_llm::CacheTtl::Extended);
+}
+
+#[test]
+fn request_envelope_replays_only_the_selected_provider_family() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("native-family", "test-model");
+    session.add_message(Message::user("search"));
+    let assistant = Message::assistant("normalized", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let openai_route = bamboo_domain::provider_transcript_boundary_sha256(None, Some("openai"))
+        .expect("provider type establishes a route boundary");
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &openai_route,
+        )
+        .unwrap();
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_search_weather","execution":"client","call_id":"search_weather",
+            "status":"completed","arguments":{"query":"weather"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![item])
+        .unwrap();
+    let prepared = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut openai = test_config("system");
+    openai.provider_type = Some("openai".to_string());
+    let openai_envelope = super::build_request_envelope(&session, &prepared, &openai, &[]);
+    assert_eq!(openai_envelope.ir.provider_transcript_groups.len(), 1);
+
+    let mut anthropic = test_config("system");
+    anthropic.provider_type = Some("anthropic".to_string());
+    let anthropic_envelope = super::build_request_envelope(&session, &prepared, &anthropic, &[]);
+    assert!(anthropic_envelope.ir.provider_transcript_groups.is_empty());
+    assert_eq!(
+        anthropic_envelope.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::ProviderSwitch)
+    );
+}
+
+#[test]
+fn same_family_provider_instance_switch_invalidates_native_replay() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let route_a = bamboo_domain::provider_transcript_boundary_sha256(
+        Some("openai-instance-a"),
+        Some("openai"),
+    )
+    .unwrap();
+    let route_b = bamboo_domain::provider_transcript_boundary_sha256(
+        Some("openai-instance-b"),
+        Some("openai"),
+    )
+    .unwrap();
+    let mut session = Session::new("native-provider-route", "test-model");
+    session.add_message(Message::user("search"));
+    let assistant = Message::assistant("normalized", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &route_a,
+        )
+        .unwrap();
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_route","execution":"client",
+            "call_id":"search_route","status":"completed","arguments":{"query":"weather"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![item])
+        .unwrap();
+    let prepared = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut config = test_config("system");
+    config.provider_name = Some("openai-instance-a".to_string());
+    config.provider_type = Some("openai".to_string());
+    let model = session.model.clone();
+
+    let first =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert_eq!(first.ir.provider_transcript_groups.len(), 1);
+    let route_a_epoch = session.provider_transcript.epoch();
+
+    let unchanged =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert_eq!(unchanged.ir.provider_transcript_groups.len(), 1);
+    assert_eq!(session.provider_transcript.epoch(), route_a_epoch);
+
+    config.provider_name = Some("openai-instance-b".to_string());
+    let switched =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert!(switched.ir.provider_transcript_groups.is_empty());
+    assert_eq!(session.provider_transcript.epoch(), route_a_epoch + 1);
+    assert_eq!(
+        session
+            .provider_transcript
+            .active_provider_boundary_sha256(),
+        Some(route_b.as_str())
+    );
+    assert_eq!(
+        session.provider_transcript.last_reset_reason(),
+        Some(bamboo_domain::ProviderTranscriptResetReason::ProviderSwitch)
+    );
+    assert_eq!(
+        switched.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::ProviderSwitch)
+    );
 }
 
 #[test]

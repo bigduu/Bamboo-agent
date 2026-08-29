@@ -20,6 +20,10 @@ pub enum LLMChunk {
         event_type: String,
         data: Box<serde_json::Value>,
     },
+    /// One validated provider-native discovery item. The engine buffers these
+    /// until the ordinary assistant message for the round commits, then stores
+    /// the complete ordered set as one atomic transcript group.
+    ProviderTranscriptItem(bamboo_domain::ProviderTranscriptItem),
     Token(String),
     ReasoningToken(String),
     /// Provider-minted cryptographic signature covering the turn's accumulated
@@ -101,6 +105,7 @@ impl LLMChunk {
             Self::TransportActivity
             | Self::ResponseId(_)
             | Self::ResponsesEvent { .. }
+            | Self::ProviderTranscriptItem(_)
             | Self::ReasoningSignature(_)
             | Self::CacheUsage { .. }
             | Self::ProviderUsage { .. }

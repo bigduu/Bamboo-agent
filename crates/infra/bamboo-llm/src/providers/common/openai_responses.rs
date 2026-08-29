@@ -2159,6 +2159,7 @@ mod tests {
             Some(&ResponsesRequestOptions {
                 instructions: Some("You are helpful".to_string()),
                 input_messages: None,
+                provider_transcript_groups: Vec::new(),
                 reasoning_summary: Some("detailed".to_string()),
                 include: Some(vec!["reasoning.encrypted_content".to_string()]),
                 store: Some(true),
