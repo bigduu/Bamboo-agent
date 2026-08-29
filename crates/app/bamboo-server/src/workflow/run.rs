@@ -298,6 +298,15 @@ impl WorkflowRunAccess {
                 bundle,
             )
             .await?;
+        self.index_started_run_or_compensate(session_id, snapshot)
+            .await
+    }
+
+    async fn index_started_run_or_compensate(
+        &self,
+        session_id: &str,
+        snapshot: WorkflowRunSnapshot,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         if let Err(error) = self.remember_run_id(session_id, &snapshot.run_id).await {
             return match self.engine.cancel(&snapshot.run_id).await {
                 Ok(cancelled) if cancelled.status.is_terminal() => Err(WorkflowRunError::Storage(
@@ -509,8 +518,10 @@ impl WorkflowRunAccess {
         session_id: &str,
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.progress_for_session(session_id, run_id, u64::MAX)
+        let progress = self
+            .progress_for_session(session_id, run_id, u64::MAX)
             .await?;
+        ensure_workflow_cancel_allowed(&progress.snapshot)?;
         self.engine.cancel(run_id).await
     }
 
@@ -519,11 +530,17 @@ impl WorkflowRunAccess {
         session_id: &str,
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
-        self.progress_for_session(session_id, run_id, u64::MAX)
+        let progress = self
+            .progress_for_session(session_id, run_id, u64::MAX)
             .await?;
+        ensure_workflow_restart_as_new_run_allowed(&progress.snapshot)?;
+        self.ensure_run_index_capacity(session_id).await?;
         let (_, workspace_trusted) = self.session_context(session_id).await?;
-        self.engine
+        let snapshot = self
+            .engine
             .restart(run_id, workspace_trusted, vec!["read".to_string()])
+            .await?;
+        self.index_started_run_or_compensate(session_id, snapshot)
             .await
     }
 
@@ -558,6 +575,28 @@ impl WorkflowRunAccess {
             ));
         }
         self.restart_for_session(session_id, run_id).await
+    }
+}
+
+fn ensure_workflow_cancel_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(), WorkflowRunError> {
+    match snapshot.status {
+        WorkflowRunStatus::Succeeded | WorkflowRunStatus::Failed => Err(WorkflowRunError::Terminal),
+        WorkflowRunStatus::Queued
+        | WorkflowRunStatus::Running
+        | WorkflowRunStatus::Suspended
+        | WorkflowRunStatus::Cancelled => Ok(()),
+    }
+}
+
+fn ensure_workflow_restart_as_new_run_allowed(
+    snapshot: &WorkflowRunSnapshot,
+) -> Result<(), WorkflowRunError> {
+    match (snapshot.status, snapshot.suspension.as_ref()) {
+        (WorkflowRunStatus::Suspended, Some(WorkflowSuspensionContext::Recovery { .. })) => Ok(()),
+        (status, _) if status.is_terminal() => Err(WorkflowRunError::Terminal),
+        _ => Err(WorkflowRunError::Preflight(
+            "only recovery-suspended workflows can restart as a new run".to_string(),
+        )),
     }
 }
 
@@ -636,6 +675,8 @@ pub(crate) struct PublicWorkflowRunSnapshot {
     pub workflow_revision: u64,
     pub definition_bundle_hash: String,
     pub status: WorkflowRunStatus,
+    pub can_cancel: bool,
+    pub can_restart_as_new_run: bool,
     pub planned_steps: BTreeMap<String, PublicWorkflowPlannedStep>,
     pub plan: PublicWorkflowPlan,
     pub steps: BTreeMap<String, PublicWorkflowStepSnapshot>,
@@ -846,6 +887,8 @@ fn public_workflow_phase(name: &str) -> &'static str {
 }
 
 pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicWorkflowRunSnapshot {
+    let can_cancel = ensure_workflow_cancel_allowed(&snapshot).is_ok();
+    let can_restart_as_new_run = ensure_workflow_restart_as_new_run_allowed(&snapshot).is_ok();
     let planned_steps = public_planned_steps(&snapshot.definition);
     let plan = public_workflow_plan(&snapshot.definition.plan);
     let child_agent_count = snapshot.usage.agents;
@@ -858,6 +901,8 @@ pub(crate) fn public_workflow_snapshot(snapshot: WorkflowRunSnapshot) -> PublicW
         workflow_revision: snapshot.definition.revision,
         definition_bundle_hash: snapshot.definition_bundle_hash,
         status: snapshot.status,
+        can_cancel,
+        can_restart_as_new_run,
         planned_steps,
         plan,
         steps: snapshot
@@ -1206,6 +1251,7 @@ mod tests {
         FunctionSchema, ToolCall, ToolExecutor, ToolResult, ToolSchema,
     };
     use bamboo_agent_core::Session;
+    use bamboo_engine::WorkflowRunRepository;
     use bamboo_llm::protocol::{gemini::GeminiTool, ToProvider};
     use std::collections::HashMap;
     use tokio::sync::{RwLock, Semaphore};
@@ -1213,11 +1259,23 @@ mod tests {
     #[derive(Default)]
     struct WorkflowTestStorage {
         sessions: RwLock<HashMap<String, Session>>,
+        fail_saves: AtomicBool,
+    }
+
+    impl WorkflowTestStorage {
+        fn set_fail_saves(&self, fail: bool) {
+            self.fail_saves.store(fail, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
     impl Storage for WorkflowTestStorage {
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            if self.fail_saves.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other(
+                    "injected workflow session persistence failure",
+                ));
+            }
             self.sessions
                 .write()
                 .await
@@ -1283,6 +1341,18 @@ mod tests {
         bamboo_engine::SessionRepository,
         tempfile::TempDir,
     ) {
+        let (access, repo, directory, _) = workflow_test_access_with_tools_and_storage(tools).await;
+        (access, repo, directory)
+    }
+
+    async fn workflow_test_access_with_tools_and_storage(
+        tools: Arc<dyn ToolExecutor>,
+    ) -> (
+        WorkflowRunAccess,
+        bamboo_engine::SessionRepository,
+        tempfile::TempDir,
+        Arc<WorkflowTestStorage>,
+    ) {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("skills");
         let root = skills_dir.join("review-flow");
@@ -1302,14 +1372,17 @@ mod tests {
             ..Default::default()
         }));
         skills.initialize().await.expect("skills initialize");
-        let storage: Arc<dyn Storage> = Arc::new(WorkflowTestStorage::default());
-        let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let storage = Arc::new(WorkflowTestStorage::default());
+        let storage_port: Arc<dyn Storage> = storage.clone();
+        let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
+            storage_port.clone(),
+        ));
         let cache = Arc::new(dashmap::DashMap::new());
-        let repo = bamboo_engine::SessionRepository::new(cache, storage, persistence);
+        let repo = bamboo_engine::SessionRepository::new(cache, storage_port, persistence);
         let access = WorkflowRunAccess::new(directory.path(), tools, skills, repo.clone())
             .await
             .expect("workflow access");
-        (access, repo, directory)
+        (access, repo, directory, storage)
     }
 
     async fn workflow_test_access() -> (
@@ -1318,6 +1391,148 @@ mod tests {
         tempfile::TempDir,
     ) {
         workflow_test_access_with_tools(Arc::new(WorkflowReadTool)).await
+    }
+
+    async fn seed_durable_workflow_run(
+        access: &WorkflowRunAccess,
+        directory: &Path,
+        workspace: &Path,
+        session_id: &str,
+        run_id: &str,
+        status: WorkflowRunStatus,
+        suspension: Option<WorkflowSuspensionContext>,
+    ) -> WorkflowRunSnapshot {
+        let bundle = access
+            .skills
+            .pin_workflow_definition_bundle(Some(workspace), "review-flow", 42)
+            .await
+            .expect("pin workflow test bundle");
+        let definition = bundle.root().cloned().expect("pinned root definition");
+        let step_status = match status {
+            WorkflowRunStatus::Queued => WorkflowStepStatus::Queued,
+            WorkflowRunStatus::Running => WorkflowStepStatus::Running,
+            WorkflowRunStatus::Suspended => WorkflowStepStatus::Suspended,
+            WorkflowRunStatus::Succeeded => WorkflowStepStatus::Succeeded,
+            WorkflowRunStatus::Failed => WorkflowStepStatus::Failed,
+            WorkflowRunStatus::Cancelled => WorkflowStepStatus::Cancelled,
+        };
+        let now = chrono::Utc::now();
+        let failure = (status == WorkflowRunStatus::Failed).then(|| WorkflowFailure {
+            code: WorkflowFailureCode::ExecutionFailed,
+            message: "seeded workflow failure".to_string(),
+            retryable: false,
+        });
+        let snapshot = WorkflowRunSnapshot {
+            run_id: run_id.to_string(),
+            parent_run_id: None,
+            parent_step_id: None,
+            session_id: session_id.to_string(),
+            definition: definition.clone(),
+            definition_bundle: bundle,
+            definition_bundle_hash: "seeded-public-bundle-hash".to_string(),
+            validated_args: json!({}),
+            status,
+            steps: definition
+                .steps
+                .iter()
+                .map(|step| {
+                    (
+                        step.id.clone(),
+                        WorkflowStepSnapshot {
+                            id: step.id.clone(),
+                            status: step_status,
+                            input_hash: "seeded-input-hash".to_string(),
+                            output: None,
+                            failure: failure.clone(),
+                            attempts: 0,
+                        },
+                    )
+                })
+                .collect(),
+            usage: WorkflowBudgetUsage::default(),
+            last_sequence: 1,
+            output: None,
+            failure: failure.clone(),
+            suspension,
+            created_at: now,
+            updated_at: now,
+        };
+        persist_durable_workflow_run(directory, &snapshot).await;
+        snapshot
+    }
+
+    async fn persist_durable_workflow_run(directory: &Path, snapshot: &WorkflowRunSnapshot) {
+        let kind = match snapshot.status {
+            WorkflowRunStatus::Queued => WorkflowRunEventKind::RunQueued,
+            WorkflowRunStatus::Running => WorkflowRunEventKind::RunStarted,
+            WorkflowRunStatus::Suspended => WorkflowRunEventKind::RunSuspended {
+                reason: "seeded suspension".to_string(),
+            },
+            WorkflowRunStatus::Succeeded => WorkflowRunEventKind::RunSucceeded {
+                output: Value::Null,
+            },
+            WorkflowRunStatus::Failed => WorkflowRunEventKind::RunFailed {
+                failure: snapshot.failure.clone().expect("failed run has failure"),
+            },
+            WorkflowRunStatus::Cancelled => WorkflowRunEventKind::RunCancelled,
+        };
+        let repository = FileWorkflowRunRepository::new(directory.join("workflow-runs"))
+            .expect("open workflow test repository");
+        repository
+            .create(
+                snapshot,
+                &WorkflowRunEvent {
+                    run_id: snapshot.run_id.clone(),
+                    sequence: snapshot.last_sequence,
+                    at: snapshot.updated_at,
+                    step_id: None,
+                    kind,
+                },
+            )
+            .await
+            .expect("seed durable workflow run");
+    }
+
+    async fn replace_workflow_run_index(
+        repo: &bamboo_engine::SessionRepository,
+        session_id: &str,
+        run_ids: Vec<String>,
+    ) {
+        repo.update_runtime_session(
+            session_id,
+            &[bamboo_skills::WORKFLOW_RUN_IDS_METADATA_KEY],
+            move |session| {
+                session.metadata.insert(
+                    bamboo_skills::WORKFLOW_RUN_IDS_METADATA_KEY.to_string(),
+                    serde_json::to_string(&run_ids).expect("run index json"),
+                );
+            },
+        )
+        .await
+        .expect("replace workflow run index")
+        .expect("workflow session");
+    }
+
+    async fn wait_for_workflow_run_to_settle(
+        access: &WorkflowRunAccess,
+        run_id: &str,
+    ) -> WorkflowRunSnapshot {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = access
+                    .engine
+                    .progress(run_id, u64::MAX)
+                    .await
+                    .expect("workflow progress")
+                    .snapshot;
+                if snapshot.status.is_terminal() && !access.engine.is_run_active(run_id) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("workflow run settles")
     }
 
     fn private_workflow_snapshot(status: WorkflowRunStatus) -> WorkflowRunSnapshot {
@@ -1424,20 +1639,22 @@ mod tests {
     #[test]
     fn public_workflow_snapshot_is_stable_metadata_only_for_every_status() {
         let statuses = [
-            (WorkflowRunStatus::Queued, "queued"),
-            (WorkflowRunStatus::Running, "running"),
-            (WorkflowRunStatus::Suspended, "suspended"),
-            (WorkflowRunStatus::Succeeded, "succeeded"),
-            (WorkflowRunStatus::Failed, "failed"),
-            (WorkflowRunStatus::Cancelled, "cancelled"),
+            (WorkflowRunStatus::Queued, "queued", true),
+            (WorkflowRunStatus::Running, "running", true),
+            (WorkflowRunStatus::Suspended, "suspended", true),
+            (WorkflowRunStatus::Succeeded, "succeeded", false),
+            (WorkflowRunStatus::Failed, "failed", false),
+            (WorkflowRunStatus::Cancelled, "cancelled", true),
         ];
 
-        for (status, wire_status) in statuses {
+        for (status, wire_status, can_cancel) in statuses {
             let public =
                 serde_json::to_value(public_workflow_snapshot(private_workflow_snapshot(status)))
                     .expect("public snapshot serializes");
             let text = public.to_string();
             assert_eq!(public["status"], wire_status);
+            assert_eq!(public["can_cancel"], can_cancel);
+            assert_eq!(public["can_restart_as_new_run"], false);
             assert_eq!(public["workflow_id"], "review-flow");
             assert_eq!(public["workflow_revision"], 42);
             assert_eq!(public["definition_bundle_hash"], "public-bundle-hash");
@@ -1479,6 +1696,413 @@ mod tests {
                 );
             }
         }
+
+        let mut recovery = private_workflow_snapshot(WorkflowRunStatus::Suspended);
+        recovery.suspension = Some(WorkflowSuspensionContext::Recovery {
+            reason: "PRIVATE-RECOVERY-REASON-SENTINEL".to_string(),
+        });
+        let public = serde_json::to_value(public_workflow_snapshot(recovery))
+            .expect("public recovery snapshot serializes");
+        let text = public.to_string();
+        assert_eq!(public["can_cancel"], true);
+        assert_eq!(public["can_restart_as_new_run"], true);
+        assert_eq!(public["suspension"]["type"], "recovery");
+        assert!(!text.contains("PRIVATE-RECOVERY-REASON-SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn public_workflow_actions_match_cancel_and_restart_endpoint_acceptance() {
+        let (access, repo, directory) = workflow_test_access().await;
+        let workspace = directory.path().join("action-workspace");
+        std::fs::create_dir_all(&workspace).expect("action workspace");
+        let session_id = "workflow-action-matrix";
+        let mut session = Session::new(session_id, "model");
+        session.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut session).await.expect("save action session");
+
+        let cases = vec![
+            ("queued", WorkflowRunStatus::Queued, None, true, false),
+            ("running", WorkflowRunStatus::Running, None, true, false),
+            (
+                "suspended_without_context",
+                WorkflowRunStatus::Suspended,
+                None,
+                true,
+                false,
+            ),
+            (
+                "tool_approval",
+                WorkflowRunStatus::Suspended,
+                Some(WorkflowSuspensionContext::ToolApproval {
+                    step_id: "inspect".to_string(),
+                    tool: "Read".to_string(),
+                    tool_call_id: "approval-call".to_string(),
+                }),
+                true,
+                false,
+            ),
+            (
+                "tool_running",
+                WorkflowRunStatus::Suspended,
+                Some(WorkflowSuspensionContext::ToolRunning {
+                    step_id: "inspect".to_string(),
+                    tool: "Read".to_string(),
+                    tool_call_id: "running-call".to_string(),
+                    killed: true,
+                }),
+                true,
+                false,
+            ),
+            (
+                "recovery",
+                WorkflowRunStatus::Suspended,
+                Some(WorkflowSuspensionContext::Recovery {
+                    reason: "process restarted".to_string(),
+                }),
+                true,
+                true,
+            ),
+            (
+                "succeeded",
+                WorkflowRunStatus::Succeeded,
+                None,
+                false,
+                false,
+            ),
+            ("failed", WorkflowRunStatus::Failed, None, false, false),
+            ("cancelled", WorkflowRunStatus::Cancelled, None, true, false),
+        ];
+
+        for (name, status, suspension, can_cancel, can_restart_as_new_run) in cases {
+            let cancel_run_id = format!("action-cancel-{name}");
+            let cancel_snapshot = seed_durable_workflow_run(
+                &access,
+                directory.path(),
+                &workspace,
+                session_id,
+                &cancel_run_id,
+                status,
+                suspension.clone(),
+            )
+            .await;
+            let cancel_public = public_workflow_snapshot(cancel_snapshot);
+            assert_eq!(
+                cancel_public.can_cancel, can_cancel,
+                "cancel projection mismatch for {name}"
+            );
+            assert_eq!(
+                access
+                    .cancel_for_session(session_id, &cancel_run_id)
+                    .await
+                    .is_ok(),
+                can_cancel,
+                "cancel endpoint mismatch for {name}"
+            );
+
+            let restart_run_id = format!("action-restart-{name}");
+            let restart_snapshot = seed_durable_workflow_run(
+                &access,
+                directory.path(),
+                &workspace,
+                session_id,
+                &restart_run_id,
+                status,
+                suspension,
+            )
+            .await;
+            let restart_public = public_workflow_snapshot(restart_snapshot);
+            assert_eq!(
+                restart_public.can_restart_as_new_run, can_restart_as_new_run,
+                "restart projection mismatch for {name}"
+            );
+            let restarted = access
+                .restart_for_session(session_id, &restart_run_id)
+                .await;
+            assert_eq!(
+                restarted.is_ok(),
+                can_restart_as_new_run,
+                "restart endpoint mismatch for {name}: {restarted:?}"
+            );
+            if let Ok(restarted) = restarted {
+                let _ = access
+                    .cancel_for_session(session_id, &restarted.run_id)
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_as_new_run_is_indexed_isolated_and_survives_reconstruction() {
+        let (access, repo, directory, storage) =
+            workflow_test_access_with_tools_and_storage(Arc::new(WorkflowReadTool)).await;
+        let workspace = directory.path().join("restart-workspace");
+        std::fs::create_dir_all(&workspace).expect("restart workspace");
+        let session_id = "restart-owner";
+        let mut session = Session::new(session_id, "model");
+        session.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut session).await.expect("save restart owner");
+        let mut other = Session::new("restart-other", "model");
+        other.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut other).await.expect("save other session");
+
+        let original = seed_durable_workflow_run(
+            &access,
+            directory.path(),
+            &workspace,
+            session_id,
+            "recovery-original",
+            WorkflowRunStatus::Suspended,
+            Some(WorkflowSuspensionContext::Recovery {
+                reason: "process restarted".to_string(),
+            }),
+        )
+        .await;
+        replace_workflow_run_index(&repo, session_id, vec![original.run_id.clone()]).await;
+
+        let restarted = access
+            .restart_for_session(session_id, &original.run_id)
+            .await
+            .expect("restart recovery suspension as a new run");
+        assert_ne!(restarted.run_id, original.run_id);
+        assert_eq!(restarted.session_id, session_id);
+        assert_eq!(
+            access
+                .progress_for_session(session_id, &original.run_id, u64::MAX)
+                .await
+                .expect("original progress")
+                .snapshot,
+            original,
+            "restart-as-new must not mutate the original suspended run"
+        );
+
+        let immediate = access
+            .list_for_session(session_id)
+            .await
+            .expect("immediate owner list");
+        let immediate_ids = immediate
+            .iter()
+            .map(|snapshot| snapshot.run_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            immediate_ids,
+            BTreeSet::from([original.run_id.as_str(), restarted.run_id.as_str()])
+        );
+        assert!(access
+            .list_for_session("restart-other")
+            .await
+            .expect("isolated other list")
+            .is_empty());
+        assert!(matches!(
+            access
+                .progress_for_session("restart-other", &restarted.run_id, u64::MAX)
+                .await,
+            Err(WorkflowRunError::NotFound)
+        ));
+        assert!(matches!(
+            access
+                .restart_for_session("restart-other", &original.run_id)
+                .await,
+            Err(WorkflowRunError::NotFound)
+        ));
+
+        let settled = wait_for_workflow_run_to_settle(&access, &restarted.run_id).await;
+        assert_eq!(settled.status, WorkflowRunStatus::Succeeded);
+        let skills = access.skills.clone();
+        drop(access);
+        drop(repo);
+
+        let storage_port: Arc<dyn Storage> = storage;
+        let reopened_repo = bamboo_engine::SessionRepository::new(
+            Arc::new(dashmap::DashMap::new()),
+            storage_port.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage_port)),
+        );
+        let reopened = WorkflowRunAccess::new(
+            directory.path(),
+            Arc::new(WorkflowReadTool),
+            skills,
+            reopened_repo,
+        )
+        .await
+        .expect("reconstruct workflow access");
+        let reconstructed = reopened
+            .list_for_session(session_id)
+            .await
+            .expect("list after reconstruction");
+        let reconstructed_ids = reconstructed
+            .iter()
+            .map(|snapshot| snapshot.run_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reconstructed_ids,
+            BTreeSet::from([original.run_id.as_str(), restarted.run_id.as_str()])
+        );
+        assert_eq!(
+            reopened
+                .progress_for_session(session_id, &original.run_id, u64::MAX)
+                .await
+                .expect("reconstructed original")
+                .snapshot,
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_capacity_preflight_creates_no_new_run_or_active_orphan() {
+        let (access, repo, directory) = workflow_test_access().await;
+        let workspace = directory.path().join("restart-capacity-workspace");
+        std::fs::create_dir_all(&workspace).expect("restart capacity workspace");
+        let session_id = "restart-capacity";
+        let mut session = Session::new(session_id, "model");
+        session.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut session)
+            .await
+            .expect("save restart capacity session");
+
+        let original = seed_durable_workflow_run(
+            &access,
+            directory.path(),
+            &workspace,
+            session_id,
+            "capacity-run-0",
+            WorkflowRunStatus::Suspended,
+            Some(WorkflowSuspensionContext::Recovery {
+                reason: "process restarted".to_string(),
+            }),
+        )
+        .await;
+        let mut run_ids = vec![original.run_id.clone()];
+        for index in 1..MAX_WORKFLOW_RUN_IDS_PER_SESSION {
+            let mut snapshot = original.clone();
+            snapshot.run_id = format!("capacity-run-{index}");
+            snapshot.created_at = chrono::Utc::now();
+            snapshot.updated_at = snapshot.created_at;
+            persist_durable_workflow_run(directory.path(), &snapshot).await;
+            run_ids.push(snapshot.run_id);
+        }
+        replace_workflow_run_index(&repo, session_id, run_ids).await;
+        let before = access
+            .engine
+            .list_run_ids()
+            .await
+            .expect("run ids before capacity rejection")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert!(matches!(
+            access
+                .restart_for_session(session_id, &original.run_id)
+                .await,
+            Err(WorkflowRunError::Preflight(message))
+                if message == "workflow run index is full of active runs"
+        ));
+        let after = access
+            .engine
+            .list_run_ids()
+            .await
+            .expect("run ids after capacity rejection")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            after, before,
+            "capacity rejection must precede run creation"
+        );
+        assert!(after
+            .iter()
+            .all(|run_id| !access.engine.is_run_active(run_id)));
+        assert_eq!(
+            access
+                .progress_for_session(session_id, &original.run_id, u64::MAX)
+                .await
+                .expect("original after capacity rejection")
+                .snapshot,
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_index_persistence_failure_cancels_the_unindexed_new_run() {
+        let (access, repo, directory, storage) =
+            workflow_test_access_with_tools_and_storage(Arc::new(BlockingWorkflowReadTool {
+                entered: Arc::new(Semaphore::new(0)),
+            }))
+            .await;
+        let workspace = directory.path().join("restart-failure-workspace");
+        std::fs::create_dir_all(&workspace).expect("restart failure workspace");
+        let session_id = "restart-index-failure";
+        let mut session = Session::new(session_id, "model");
+        session.workspace = Some(workspace.to_string_lossy().into_owned());
+        repo.save(&mut session)
+            .await
+            .expect("save restart failure session");
+        let original = seed_durable_workflow_run(
+            &access,
+            directory.path(),
+            &workspace,
+            session_id,
+            "failure-original",
+            WorkflowRunStatus::Suspended,
+            Some(WorkflowSuspensionContext::Recovery {
+                reason: "process restarted".to_string(),
+            }),
+        )
+        .await;
+        replace_workflow_run_index(&repo, session_id, vec![original.run_id.clone()]).await;
+        let before = access
+            .engine
+            .list_run_ids()
+            .await
+            .expect("run ids before injected failure")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        storage.set_fail_saves(true);
+        let error = access
+            .restart_for_session(session_id, &original.run_id)
+            .await
+            .expect_err("injected index persistence failure");
+        storage.set_fail_saves(false);
+        assert!(matches!(error, WorkflowRunError::Storage(_)));
+
+        let after = access
+            .engine
+            .list_run_ids()
+            .await
+            .expect("run ids after injected failure")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let created = after.difference(&before).cloned().collect::<Vec<_>>();
+        assert_eq!(created.len(), 1, "restart should have created one new run");
+        let unindexed_run_id = &created[0];
+        let compensated = wait_for_workflow_run_to_settle(&access, unindexed_run_id).await;
+        assert_eq!(compensated.status, WorkflowRunStatus::Cancelled);
+        assert!(!access.engine.is_run_active(unindexed_run_id));
+        assert_eq!(
+            access
+                .progress_for_session(session_id, &original.run_id, u64::MAX)
+                .await
+                .expect("original after index failure")
+                .snapshot,
+            original
+        );
+        let listed = access
+            .list_for_session(session_id)
+            .await
+            .expect("owner list after index failure");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].run_id, original.run_id);
+        let durable = storage
+            .load_session(session_id)
+            .await
+            .expect("load durable owner")
+            .expect("durable owner");
+        let durable_ids = durable
+            .metadata
+            .get(bamboo_skills::WORKFLOW_RUN_IDS_METADATA_KEY)
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .expect("durable run index");
+        assert_eq!(durable_ids, vec![original.run_id]);
+        assert!(!durable_ids.contains(unindexed_run_id));
     }
 
     #[test]
