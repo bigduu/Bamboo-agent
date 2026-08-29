@@ -2302,29 +2302,71 @@ mod anthropic_request_building {
 
     #[test]
     fn native_replacements_run_back_to_front_across_coalesced_assistant_sources() {
-        let item = |payload| {
+        let item = |author, payload| {
             super::ProviderTranscriptItem::try_from_payload(
                 super::ProviderFamily::Anthropic,
                 super::ProviderProtocol::AnthropicMessages2023_06_01,
                 super::ProviderTranscriptOrigin::Provider,
-                super::ProviderTranscriptAuthor::Model,
+                author,
                 payload,
             )
             .unwrap()
         };
         let first_items = vec![
-            item(json!({"type":"text","text":"first preamble"})),
-            item(json!({
-                "type":"server_tool_use","id":"srv_1",
-                "name":"tool_search_tool_regex","input":{"query":"first"}
-            })),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"first preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"query":"first"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_first"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_1","name":"get_first","input":{}
+                }),
+            ),
         ];
         let second_items = vec![
-            item(json!({"type":"text","text":"second preamble"})),
-            item(json!({
-                "type":"server_tool_use","id":"srv_2",
-                "name":"tool_search_tool_regex","input":{"query":"second"}
-            })),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"second preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_2",
+                    "name":"tool_search_tool_regex","input":{"query":"second"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_2",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_second"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_2","name":"get_second","input":{}
+                }),
+            ),
         ];
         let expected = first_items
             .iter()
