@@ -11,7 +11,10 @@ use crate::types::LLMChunk;
 use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
-use bamboo_domain::{Message, MessagePhase, Role};
+use bamboo_domain::{
+    Message, MessagePhase, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptOrigin, Role,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -134,6 +137,14 @@ fn messages_to_responses_input_json_with_cache(
     messages: &[Message],
     cache_plan: Option<&PromptCachePlan>,
 ) -> (Vec<Value>, usize) {
+    messages_to_responses_input_json_with_cache_and_native(messages, cache_plan, &[])
+}
+
+fn messages_to_responses_input_json_with_cache_and_native(
+    messages: &[Message],
+    cache_plan: Option<&PromptCachePlan>,
+    native_groups: &[ProviderTranscriptGroup],
+) -> (Vec<Value>, usize) {
     // If any message contains image parts, emit a "typed" content array shape so
     // multimodal inputs have a chance to reach upstream Responses implementations.
     let has_images = messages.iter().any(|m| {
@@ -149,6 +160,20 @@ fn messages_to_responses_input_json_with_cache(
     let mut rendered_breakpoints = 0usize;
 
     for m in messages {
+        let mut anchored_groups = native_groups
+            .iter()
+            .filter(|group| group.anchor_message_id() == m.id)
+            .collect::<Vec<_>>();
+        anchored_groups.sort_by_key(|group| group.sequence());
+        if !anchored_groups.is_empty() {
+            out.extend(
+                anchored_groups
+                    .into_iter()
+                    .flat_map(|group| group.items())
+                    .map(|item| item.payload().clone()),
+            );
+            continue;
+        }
         match m.role {
             Role::Assistant => {
                 // Emit assistant text content as a message item (even if empty, for completeness).
@@ -436,6 +461,18 @@ pub fn select_responses_input_messages<'a>(
     }
 }
 
+/// Apply the final provider-family boundary before a shared Responses request
+/// is lowered. OpenAI and Copilot use the same wire protocol but must never
+/// share native loading/cache state.
+pub fn retain_provider_transcript_family(
+    options: &mut ResponsesRequestOptions,
+    family: ProviderFamily,
+) {
+    options.provider_transcript_groups.retain(|group| {
+        group.family() == family && group.protocol() == ProviderProtocol::OpenAiResponsesV1
+    });
+}
+
 /// Build a standard Responses API streaming request body.
 #[allow(clippy::too_many_arguments)]
 pub fn build_responses_body(
@@ -461,20 +498,25 @@ pub fn build_responses_body(
             responses_options.and_then(|options| options.raw_input_with_cache_breakpoints.as_ref())
         })
         .flatten();
-    let (input, rendered_breakpoints, generated_breakpoints) =
-        if let Some(raw_input) = caller_cache_input {
-            (
-                raw_input.clone(),
-                count_responses_explicit_breakpoints(raw_input),
-                false,
-            )
-        } else {
-            let (input, rendered_breakpoints) = messages_to_responses_input_json_with_cache(
-                effective_messages,
-                explicit_cache_supported.then_some(cache_plan).flatten(),
-            );
-            (Value::Array(input), rendered_breakpoints, true)
-        };
+    let (input, rendered_breakpoints, generated_breakpoints) = if let Some(raw_input) =
+        caller_cache_input
+    {
+        (
+            raw_input.clone(),
+            count_responses_explicit_breakpoints(raw_input),
+            false,
+        )
+    } else {
+        let native_groups = responses_options
+            .map(|options| options.provider_transcript_groups.as_slice())
+            .unwrap_or_default();
+        let (input, rendered_breakpoints) = messages_to_responses_input_json_with_cache_and_native(
+            effective_messages,
+            explicit_cache_supported.then_some(cache_plan).flatten(),
+            native_groups,
+        );
+        (Value::Array(input), rendered_breakpoints, true)
+    };
     let mut body = json!({
         "model": model,
         "input": input,
@@ -1232,6 +1274,56 @@ impl ResponsesSseParser {
             }
         }
         chunks
+    }
+
+    fn completed_provider_transcript_items(&self, value: &Value) -> Vec<LLMChunk> {
+        let Some(output) = value
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .or_else(|| value.get("output"))
+            .and_then(Value::as_array)
+        else {
+            return Vec::new();
+        };
+        if !output.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("tool_search_call" | "tool_search_output")
+            )
+        }) {
+            return Vec::new();
+        }
+
+        let family = if self.provider_label.eq_ignore_ascii_case("copilot") {
+            ProviderFamily::Copilot
+        } else {
+            ProviderFamily::OpenAi
+        };
+        let mut items = Vec::with_capacity(output.len());
+        for payload in output {
+            let author = match payload.get("type").and_then(Value::as_str) {
+                Some("tool_search_output") => ProviderTranscriptAuthor::ToolResult,
+                Some("message" | "reasoning" | "function_call" | "tool_search_call") => {
+                    ProviderTranscriptAuthor::Model
+                }
+                _ => return Vec::new(),
+            };
+            let Ok(item) = ProviderTranscriptItem::try_from_payload(
+                family,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload.clone(),
+            ) else {
+                tracing::warn!(
+                    "{} Responses discovery transcript failed closed during validation",
+                    self.provider_label
+                );
+                return Vec::new();
+            };
+            items.push(LLMChunk::ProviderTranscriptItem(item));
+        }
+        items
     }
 
     fn text_item_id(v: &Value) -> Option<String> {
@@ -2090,6 +2182,7 @@ impl ResponsesSseParser {
 
         if event_type == "response.completed" {
             self.terminal_seen = true;
+            chunks.extend(self.completed_provider_transcript_items(&v));
             chunks.extend(self.completed_output_chunks(&v));
             let usage = v
                 .get("response")
@@ -2146,6 +2239,92 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 123);
         assert_eq!(body["store"], false);
         assert!(body.get("input").is_some());
+    }
+
+    #[test]
+    fn discovery_output_is_captured_and_replayed_at_its_message_anchor() {
+        let output = json!([
+            {"type":"message","id":"msg_1","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Searching"}]},
+            {"type":"tool_search_call","execution":"server","call_id":null,"status":"completed","arguments":{"query":"orders"}},
+            {"type":"tool_search_output","execution":"server","call_id":null,"status":"completed","tools":[{"type":"function","name":"get_orders"}]},
+            {"type":"function_call","call_id":"call_1","name":"get_orders","arguments":"{}"}
+        ]);
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
+        let chunks = parser
+            .handle_event_multi(
+                "response.completed",
+                &json!({"type":"response.completed","response":{"output":output}}).to_string(),
+            )
+            .unwrap();
+        let items = chunks
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].payload()["phase"], "commentary");
+
+        let mut session = bamboo_domain::Session::new("native-openai", "gpt-5.6");
+        session.add_message(Message::user("find orders"));
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(ProviderFamily::OpenAi, ProviderProtocol::OpenAiResponsesV1)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (input, _) = messages_to_responses_input_json_with_cache_and_native(
+            &session.messages,
+            None,
+            &groups,
+        );
+        assert_eq!(input[1..], output.as_array().unwrap()[..]);
+    }
+
+    #[test]
+    fn shared_responses_wire_keeps_openai_and_copilot_native_state_isolated() {
+        let group = |family| {
+            let mut session = bamboo_domain::Session::new("native", "model");
+            let assistant = Message::assistant("", None);
+            let anchor = assistant.id.clone();
+            session.add_message(assistant);
+            let item = ProviderTranscriptItem::try_from_payload(
+                family,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","execution":"server","call_id":null,
+                    "status":"completed","arguments":{"query":"weather"}
+                }),
+            )
+            .unwrap();
+            session
+                .append_provider_transcript_group(&anchor, None, vec![item])
+                .unwrap();
+            session.provider_transcript.groups()[0].clone()
+        };
+        let mut options = ResponsesRequestOptions {
+            provider_transcript_groups: vec![
+                group(ProviderFamily::OpenAi),
+                group(ProviderFamily::Copilot),
+            ],
+            ..Default::default()
+        };
+
+        retain_provider_transcript_family(&mut options, ProviderFamily::OpenAi);
+        assert_eq!(options.provider_transcript_groups.len(), 1);
+        assert_eq!(
+            options.provider_transcript_groups[0].family(),
+            ProviderFamily::OpenAi
+        );
     }
 
     #[test]

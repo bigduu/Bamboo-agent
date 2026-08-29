@@ -26,8 +26,8 @@ use super::common::openai_compat::{
     parse_openai_compat_sse_data_strict_multi,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource,
-    ResponsesSseParser, ResponsesWirePrefixTracker,
+    build_responses_body, retain_provider_transcript_family, select_responses_input_messages,
+    ResponsesInputSource, ResponsesSseParser, ResponsesWirePrefixTracker,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -225,6 +225,11 @@ impl OpenAIProvider {
         request_purpose: &str,
         session_log_id: &str,
     ) -> Result<LLMStream> {
+        let mut effective_responses_options = responses_options.cloned();
+        if let Some(options) = effective_responses_options.as_mut() {
+            retain_provider_transcript_family(options, bamboo_domain::ProviderFamily::OpenAi);
+        }
+        let responses_options = effective_responses_options.as_ref();
         let retain_protocol_events =
             responses_options.is_some_and(|options| options.retain_protocol_events);
         let input_selection = select_responses_input_messages(messages, responses_options);

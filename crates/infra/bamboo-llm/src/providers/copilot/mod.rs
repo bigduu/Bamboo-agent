@@ -24,7 +24,8 @@ use super::common::openai_compat::{
     tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
-    build_responses_body, select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
+    build_responses_body, retain_provider_transcript_family, select_responses_input_messages,
+    ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -594,6 +595,10 @@ impl CopilotProvider {
         effective_responses_options.prompt_cache_key = None;
         effective_responses_options.prompt_cache_options = None;
         effective_responses_options.raw_input_with_cache_breakpoints = None;
+        retain_provider_transcript_family(
+            &mut effective_responses_options,
+            bamboo_domain::ProviderFamily::Copilot,
+        );
         let input_selection =
             select_responses_input_messages(messages, Some(&effective_responses_options));
         let input_source = match input_selection.source {
