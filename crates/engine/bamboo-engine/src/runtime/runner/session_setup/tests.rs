@@ -345,13 +345,12 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
         .export_activation_snapshot("selection-publish")
         .await
         .expect("immutable automatic candidate pin");
-    assert!(
-        serde_json::to_vec(&candidate_snapshot)
-            .expect("serialize candidate snapshot")
-            .len()
-            > bamboo_skills::MAX_DURABLE_WORKFLOW_ACTIVATION_BYTES,
-        "fixture must include enough unselected builtin resources to catch candidate persistence"
+    assert_eq!(
+        candidate_snapshot.skills.len(),
+        1,
+        "automatic activation must pin only the unique matched Skill"
     );
+    assert!(candidate_snapshot.skills.contains_key("review"));
     assert!(
         !session
             .metadata

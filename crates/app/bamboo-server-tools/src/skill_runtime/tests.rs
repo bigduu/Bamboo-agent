@@ -1721,10 +1721,20 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         )
         .await
         .expect("auto selection two");
-    assert!(auto_one.iter().any(|skill| skill.id == "only-alpha"));
-    assert!(!auto_one.iter().any(|skill| skill.id == "only-beta"));
-    assert!(auto_two.iter().any(|skill| skill.id == "only-beta"));
-    assert!(!auto_two.iter().any(|skill| skill.id == "only-alpha"));
+    assert_eq!(
+        auto_one
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shared-workflow"]
+    );
+    assert_eq!(
+        auto_two
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["shared-workflow"]
+    );
     assert_eq!(
         auto_one
             .iter()
