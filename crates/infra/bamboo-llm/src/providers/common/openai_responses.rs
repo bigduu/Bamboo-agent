@@ -2502,6 +2502,15 @@ mod tests {
             .unwrap()
             .push(discovery_output_fixture()[4].clone());
         assert_discovery_output_falls_back(premature_function);
+
+        let mut function_before_client =
+            client_discovery_output_fixture(Some(json!("search_client_1")));
+        let client_call_index = function_before_client.as_array().unwrap().len() - 1;
+        function_before_client
+            .as_array_mut()
+            .unwrap()
+            .insert(client_call_index, discovery_output_fixture()[4].clone());
+        assert_discovery_output_falls_back(function_before_client);
     }
 
     #[test]

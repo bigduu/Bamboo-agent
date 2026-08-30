@@ -2218,7 +2218,8 @@ fn validate_group_order(
             let mut pending_provider_calls = HashSet::<&str>::new();
             let mut pending_client_calls = HashSet::<&str>::new();
             let mut pending_unkeyed_provider_calls = 0usize;
-            let mut saw_client_search_call = false;
+            let mut has_client_search_call = false;
+            let mut has_client_search_output = false;
             let mut loaded_at = HashMap::<String, usize>::new();
             let mut function_calls = Vec::<(usize, &str)>::new();
             for (index, item) in items.iter().enumerate() {
@@ -2256,7 +2257,7 @@ fn validate_group_order(
                                 pending_client_calls.insert(call_id);
                             }
                         }
-                        saw_client_search_call |= execution == "client";
+                        has_client_search_call |= execution == "client";
                     }
                     ProviderTranscriptItemKind::OpenAiToolSearchOutput => {
                         let execution = item
@@ -2289,9 +2290,7 @@ fn validate_group_order(
                             };
                             pending.remove(call_id)
                         };
-                        if execution == "client" && saw_client_search_call {
-                            return Err(ProviderTranscriptError::InvalidGroupOrder);
-                        }
+                        has_client_search_output |= execution == "client";
                         if !matched_pending
                             && (execution == "server"
                                 || item.origin != ProviderTranscriptOrigin::HostToolSearch)
@@ -2307,9 +2306,6 @@ fn validate_group_order(
                         }
                     }
                     ProviderTranscriptItemKind::OpenAiFunctionCall => {
-                        if saw_client_search_call {
-                            return Err(ProviderTranscriptError::InvalidGroupOrder);
-                        }
                         let name = item
                             .payload
                             .get("name")
@@ -2321,6 +2317,14 @@ fn validate_group_order(
                 }
             }
             if !pending_provider_calls.is_empty() || pending_unkeyed_provider_calls != 0 {
+                return Err(ProviderTranscriptError::InvalidGroupOrder);
+            }
+            // Client execution is a suspension boundary: the provider-owned
+            // response stops at tool_search_call, and the host resumes it in a
+            // later standalone HostToolSearch output group. Express this as an
+            // order-independent group invariant so reversed malformed output
+            // cannot bypass a forward-only state check.
+            if has_client_search_call && (has_client_search_output || !function_calls.is_empty()) {
                 return Err(ProviderTranscriptError::InvalidGroupOrder);
             }
             let mut matched_loaded_call = false;
@@ -3644,11 +3648,48 @@ mod tests {
         assert_eq!(
             test_group(
                 "client-call-must-stop",
-                vec![client_call, premature_function_call],
+                vec![client_call.clone(), premature_function_call.clone()],
             )
             .unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
+        assert_eq!(
+            test_group(
+                "function-cannot-precede-client-call",
+                vec![premature_function_call, client_call.clone()],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let host_client_output = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client",
+                "call_id":"search_1","status":"completed","tools":[]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            test_group(
+                "client-call-cannot-contain-host-output",
+                vec![client_call.clone(), host_client_output.clone()],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        assert_eq!(
+            test_group(
+                "host-output-cannot-precede-client-call",
+                vec![host_client_output.clone(), client_call],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        assert!(test_group("standalone-host-output", vec![host_client_output]).is_ok());
 
         let anthropic = anthropic_items();
         let mut reordered = anthropic.clone();
