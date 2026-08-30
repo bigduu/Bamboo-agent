@@ -1157,6 +1157,296 @@ mod tests {
                 .map(String::as_str),
             Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
         );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Registered.as_str())
+        );
+        let project_path = updated_project
+            .project_path
+            .as_deref()
+            .expect("moved Project path");
+        let system = fired_session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("Schedule System");
+        assert!(!system.content.contains(project_path));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        assert!(!system.content.contains("BAMBOO_PROJECT_CONTEXT"));
+        let snapshot = fired_session
+            .prompt_snapshot
+            .as_ref()
+            .expect("Schedule first prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, system.content);
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Schedule Workspace context");
+        assert!(workspace_context.contains(project_path));
+        assert!(workspace_context.contains("Workspace source: project_default"));
+        assert!(workspace_context.contains("Binding status: registered"));
+    }
+
+    #[tokio::test]
+    async fn fired_unassigned_explicit_workspace_is_published_before_clean_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(dir.path().to_path_buf());
+        let state = crate::AppState::new(dir.path().to_path_buf())
+            .await
+            .expect("AppState");
+        let explicit_workspace = tempfile::tempdir().expect("explicit Schedule Workspace");
+        let canonical = explicit_workspace
+            .path()
+            .canonicalize()
+            .expect("canonical explicit Workspace");
+        let display = bamboo_config::paths::path_to_display_string(&canonical);
+        let caller = Session::new("unassigned-explicit-scheduler-caller", "model");
+        state.storage.save_session(&caller).await.unwrap();
+        let tool = ScheduleTasksTool::new(
+            state.schedule_store.clone(),
+            state.schedule_manager.clone(),
+            state.session_store.clone(),
+            state.storage.clone(),
+            state.config.clone(),
+            state.project_store.clone(),
+            state.workspace_resolver.clone(),
+        );
+
+        tool.invoke(
+            json!({
+                "action": "create",
+                "name": "unassigned explicit Workspace",
+                "trigger": {"type": "interval", "every_seconds": 3600},
+                "enabled": false,
+                "run_config": {
+                    "auto_execute": false,
+                    "model": "test-model",
+                    "workspace_path": display
+                }
+            }),
+            context(&caller.id),
+        )
+        .await
+        .expect("create explicit Schedule");
+        let schedules = state.schedule_store.list_schedules().await;
+        let schedule = schedules.first().expect("created Schedule");
+        assert!(schedule.run_config.project_id.is_none());
+        assert_eq!(
+            schedule.run_config.workspace_path.as_deref(),
+            Some(display.as_str())
+        );
+
+        tool.invoke(
+            json!({"action": "run_now", "schedule_id": schedule.id}),
+            context(&caller.id),
+        )
+        .await
+        .expect("run explicit Schedule");
+
+        let fired = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = state
+                    .session_store
+                    .list_index_entries()
+                    .await
+                    .into_iter()
+                    .find(|entry| {
+                        entry.created_by_schedule_id.as_deref() == Some(schedule.id.as_str())
+                    })
+                {
+                    break entry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("explicit scheduled session should be persisted");
+        let fired_session = state
+            .storage
+            .load_session(&fired.id)
+            .await
+            .expect("load explicit fired session")
+            .expect("explicit fired session");
+
+        assert!(fired_session.project_id_meta().is_none());
+        assert_eq!(
+            fired_session.workspace_path_meta().as_deref(),
+            Some(display.as_str())
+        );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Explicit.as_str())
+        );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&fired_session.id),
+            Some(canonical)
+        );
+        let system = fired_session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("clean Schedule System");
+        assert!(!system.content.contains(&display));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = fired_session
+            .prompt_snapshot
+            .as_ref()
+            .expect("first explicit Schedule snapshot");
+        assert_eq!(snapshot.effective_system_prompt, system.content);
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed explicit Schedule Workspace context");
+        assert!(workspace_context.contains(&display));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: unregistered"));
+    }
+
+    #[tokio::test]
+    async fn fired_assigned_explicit_project_workspace_is_registered_before_clean_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        bamboo_config::paths::init_bamboo_dir(dir.path().to_path_buf());
+        let state = crate::AppState::new(dir.path().to_path_buf())
+            .await
+            .expect("AppState");
+        let project_path = tempfile::tempdir().expect("explicit Project Workspace");
+        let canonical = project_path
+            .path()
+            .canonicalize()
+            .expect("canonical explicit Project Workspace");
+        let display = bamboo_config::paths::path_to_display_string(&canonical);
+        let project = state
+            .project_store
+            .create_with_project_path("Explicit Scheduled", None, &display, Vec::new())
+            .expect("Project with explicit Workspace");
+        let mut caller = Session::new("assigned-explicit-scheduler-caller", "model");
+        caller.set_project_id_meta(project.id.to_string());
+        state.storage.save_session(&caller).await.unwrap();
+        let tool = ScheduleTasksTool::new(
+            state.schedule_store.clone(),
+            state.schedule_manager.clone(),
+            state.session_store.clone(),
+            state.storage.clone(),
+            state.config.clone(),
+            state.project_store.clone(),
+            state.workspace_resolver.clone(),
+        );
+
+        tool.invoke(
+            json!({
+                "action": "create",
+                "name": "assigned explicit Project Workspace",
+                "trigger": {"type": "interval", "every_seconds": 3600},
+                "enabled": false,
+                "run_config": {
+                    "auto_execute": false,
+                    "model": "test-model",
+                    "workspace_path": display
+                }
+            }),
+            context(&caller.id),
+        )
+        .await
+        .expect("create assigned explicit Schedule");
+        let schedules = state.schedule_store.list_schedules().await;
+        let schedule = schedules.first().expect("created assigned Schedule");
+        assert_eq!(schedule.run_config.project_id.as_ref(), Some(&project.id));
+        assert_eq!(
+            schedule.run_config.workspace_path.as_deref(),
+            Some(display.as_str())
+        );
+
+        tool.invoke(
+            json!({"action": "run_now", "schedule_id": schedule.id}),
+            context(&caller.id),
+        )
+        .await
+        .expect("run assigned explicit Schedule");
+
+        let fired = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = state
+                    .session_store
+                    .list_index_entries()
+                    .await
+                    .into_iter()
+                    .find(|entry| {
+                        entry.created_by_schedule_id.as_deref() == Some(schedule.id.as_str())
+                    })
+                {
+                    break entry;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("assigned explicit scheduled session should be persisted");
+        let fired_session = state
+            .storage
+            .load_session(&fired.id)
+            .await
+            .expect("load assigned explicit fired session")
+            .expect("assigned explicit fired session");
+
+        assert_eq!(
+            fired_session.project_id_meta().as_deref(),
+            Some(project.id.as_str())
+        );
+        assert_eq!(
+            fired_session.workspace_path_meta().as_deref(),
+            Some(display.as_str())
+        );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Explicit.as_str())
+        );
+        assert_eq!(
+            fired_session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Registered.as_str())
+        );
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&fired_session.id),
+            Some(canonical)
+        );
+        let system = fired_session
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .expect("clean assigned Schedule System");
+        assert!(!system.content.contains(&display));
+        assert!(!system.content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        assert!(!system.content.contains("BAMBOO_PROJECT_CONTEXT"));
+        let snapshot = fired_session
+            .prompt_snapshot
+            .as_ref()
+            .expect("first assigned explicit Schedule snapshot");
+        assert_eq!(snapshot.effective_system_prompt, system.content);
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed assigned explicit Schedule Workspace context");
+        assert!(workspace_context.contains(&display));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: registered"));
     }
 
     #[tokio::test]

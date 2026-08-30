@@ -356,20 +356,7 @@ async fn run_schedule_job(
         }
         _ => bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered,
     };
-    let workspace_source = job.run_config.project_id.as_ref().map(|_| {
-        if explicit_workspace.is_some() {
-            bamboo_engine::project_context::WorkspaceSource::Explicit
-        } else {
-            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
-        }
-    });
-    resolved.system_prompt =
-        bamboo_engine::runtime::context::upsert_workspace_prompt_context_with_source(
-            &resolved.system_prompt,
-            resolved.workspace_path.as_deref(),
-            binding_status,
-            workspace_source,
-        );
+    let workspace_source = schedule_workspace_source(&job.run_config);
     // Primary model is required for a schedule run; the roster stores it as
     // `Option<String>`, so recover the owned String once for the checks/logging
     // below (an absent primary is treated as the old empty-string skip).
@@ -400,7 +387,13 @@ async fn run_schedule_job(
         &resolved_model,
         &resolved.system_prompt,
         &resolved.base_system_prompt,
-        resolved.workspace_path.as_deref(),
+        final_workspace.as_deref().map(|path| {
+            bamboo_engine::session_app::execution_prep::ResolvedExecutionWorkspace {
+                path,
+                source: workspace_source,
+                binding_status,
+            }
+        }),
         resolved.reasoning_effort,
         &ctx.workspace_resolver,
     );
@@ -707,6 +700,22 @@ async fn run_schedule_job(
     Ok(ScheduleRunLifecycleResult::BackgroundExecutionInProgress)
 }
 
+fn schedule_workspace_source(
+    run_config: &ScheduleRunConfig,
+) -> bamboo_engine::project_context::WorkspaceSource {
+    if run_config
+        .workspace_path
+        .as_deref()
+        .is_some_and(|workspace| !workspace.trim().is_empty())
+    {
+        bamboo_engine::project_context::WorkspaceSource::Explicit
+    } else if run_config.project_id.is_some() {
+        bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+    } else {
+        bamboo_engine::project_context::WorkspaceSource::Session
+    }
+}
+
 fn validate_schedule_project_at_fire(
     store: &bamboo_projects::ProjectStore,
     run_config: &ScheduleRunConfig,
@@ -856,7 +865,10 @@ fn resolve_run_config_from_config(
 #[cfg(test)]
 mod build_context_tests {
     use super::ScheduleRunJob;
-    use super::{resolve_run_config_from_config, validate_schedule_project_at_fire};
+    use super::{
+        resolve_run_config_from_config, schedule_workspace_source,
+        validate_schedule_project_at_fire,
+    };
     use bamboo_config::DefaultsConfig;
     use bamboo_config::{OpenAIConfig, ProviderConfigs};
     use bamboo_domain::{ProviderModelRef, ScheduleRunConfig};
@@ -901,6 +913,32 @@ mod build_context_tests {
         store.archive(&project.id, project.revision).unwrap();
         let error = validate_schedule_project_at_fire(&store, &run_config).unwrap_err();
         assert!(error.contains("archived at execution time"));
+    }
+
+    #[test]
+    fn schedule_workspace_source_matrix_is_explicit_project_default_or_session() {
+        let explicit = ScheduleRunConfig {
+            workspace_path: Some(" /tmp/explicit ".to_string()),
+            ..ScheduleRunConfig::default()
+        };
+        assert_eq!(
+            schedule_workspace_source(&explicit),
+            bamboo_engine::project_context::WorkspaceSource::Explicit
+        );
+
+        let assigned = ScheduleRunConfig {
+            project_id: Some("project-schedule-source".parse().unwrap()),
+            ..ScheduleRunConfig::default()
+        };
+        assert_eq!(
+            schedule_workspace_source(&assigned),
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+        );
+
+        assert_eq!(
+            schedule_workspace_source(&ScheduleRunConfig::default()),
+            bamboo_engine::project_context::WorkspaceSource::Session
+        );
     }
 
     #[test]

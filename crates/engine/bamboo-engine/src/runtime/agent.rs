@@ -73,7 +73,26 @@ impl Agent {
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
         let lease = self.begin_direct_execution(&session.id).await?;
+        self.prepare_external_session_for_execution(session).await?;
         self.execute_direct_registered(session, req, lease).await
+    }
+
+    /// Validate and publish Project/Workspace context for a caller-owned
+    /// session before any external pre-execution side effect.
+    ///
+    /// SDK facades that acquire a direct lease themselves call this before
+    /// approved-tool replay. [`execute_direct`](Self::execute_direct) also calls
+    /// it, so the lower-level escape hatch cannot bypass legacy migration,
+    /// Project validation, or runtime workspace publication.
+    pub async fn prepare_external_session_for_execution(
+        &self,
+        session: &mut Session,
+    ) -> crate::runtime::runner::Result<()> {
+        crate::session_app::execution_prep::prepare_external_session_for_execution(
+            session,
+            self.runtime.project_context_resolver.as_deref(),
+        )
+        .await
     }
 
     /// Acquire direct logical-session ownership before an SDK facade performs
