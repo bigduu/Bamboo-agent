@@ -176,33 +176,24 @@ impl McpServerManager {
     }
 
     /// Internal method to reconnect a single server.
-    async fn reconnect_server(&self, runtime: Arc<ServerRuntime>) -> Result<bool> {
+    pub(super) async fn reconnect_server(&self, runtime: Arc<ServerRuntime>) -> Result<bool> {
         let server_id = runtime.config.id.clone();
 
         info!("Attempting to reconnect MCP server '{}'", server_id);
-
-        // Disconnect existing client if connected
-        {
-            let mut client = runtime.client.write().await;
-            if client.is_connected().await {
-                let _ = client.disconnect().await;
-            }
-        }
 
         let (client, tools, instructions, notification_rx) = self
             .bootstrap_server_client(&server_id, &runtime.config, "reconnect")
             .await?;
 
-        Ok(self
-            .publish_reconnected_runtime_if_current(
-                &server_id,
-                &runtime,
-                client,
-                tools,
-                instructions,
-                notification_rx,
-            )
-            .await)
+        self.publish_reconnected_runtime_if_current(
+            &server_id,
+            &runtime,
+            client,
+            tools,
+            instructions,
+            notification_rx,
+        )
+        .await
     }
 
     pub(super) async fn publish_reconnected_runtime_if_current(
@@ -213,7 +204,7 @@ impl McpServerManager {
         tools: Vec<McpTool>,
         instructions: Option<String>,
         notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
-    ) -> bool {
+    ) -> Result<bool> {
         // Bootstrap may span a replacement. Serialize this final generation
         // check with transactional commit before touching runtime state or the
         // shared tool index.
@@ -221,14 +212,50 @@ impl McpServerManager {
         if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
             drop(_reconcile);
             let _ = client.disconnect().await;
-            return false;
+            return Ok(false);
         }
 
-        // Update client
+        let catalog = match self.index.plan_server_tools(
+            server_id,
+            &tools,
+            &runtime.config.allowed_tools,
+            &runtime.config.denied_tools,
+        ) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                drop(_reconcile);
+                let _ = client.disconnect().await;
+                return Err(error.into());
+            }
+        };
+        let aliases = catalog.aliases();
+        let catalog_update = match self
+            .index
+            .preflight_catalog_update(std::slice::from_ref(&catalog), &[])
         {
-            let mut client_lock = runtime.client.write().await;
-            *client_lock = client;
-        }
+            Ok(update) => update,
+            Err(error) => {
+                drop(_reconcile);
+                let _ = client.disconnect().await;
+                return Err(error.into());
+            }
+        };
+
+        // Acquire every suspending guard before the publication point. Once
+        // the new client is swapped, the index and runtime metadata are updated
+        // without another await, so registration failure preserves the entire
+        // prior generation.
+        let mut client_lock = runtime.client.write().await;
+        let mut tools_lock = runtime.tools.write().await;
+        let mut info = runtime.info.write().await;
+        let mut old_client = std::mem::replace(&mut *client_lock, client);
+        self.index.commit_catalog_update(catalog_update);
+        *tools_lock = tools;
+        info.instructions = instructions;
+        info.tool_count = tools_lock.len();
+        drop(info);
+        drop(tools_lock);
+        drop(client_lock);
 
         // Spawn the notification drain only AFTER the new client is swapped in, so
         // an immediate `tools/list_changed` refreshes against the NEW connection
@@ -237,34 +264,19 @@ impl McpServerManager {
             self.spawn_notification_drain(server_id.to_string(), runtime.clone(), rx);
         }
 
-        // Update tools
-        {
-            let mut tools_lock = runtime.tools.write().await;
-            *tools_lock = tools.clone();
-        }
-
-        // Refresh the server's prompt instructions from the new init result.
-        {
-            let mut info = runtime.info.write().await;
-            info.instructions = instructions;
-        }
-
-        // Re-register tools in index
-        self.index.remove_server_tools(server_id);
-        let aliases = self.index.register_server_tools(
-            server_id,
-            &tools,
-            &runtime.config.allowed_tools,
-            &runtime.config.denied_tools,
-        );
-
         info!(
             "Re-registered {} MCP tools for server '{}'",
             aliases.len(),
             server_id
         );
 
-        // Emit tools changed event
+        // Transport shutdown and event-channel backpressure are post-commit
+        // cleanup, so cancellation cannot strand a half-published reconnect.
+        tokio::spawn(async move {
+            if old_client.disconnect().await.is_err() {
+                warn!("Failed to disconnect replaced MCP client");
+            }
+        });
         if let Some(ref tx) = self.event_tx {
             let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
             let _ = tx
@@ -274,8 +286,9 @@ impl McpServerManager {
                 })
                 .await;
         }
+        drop(_reconcile);
 
-        true
+        Ok(true)
     }
 
     pub(super) async fn bootstrap_server_client(

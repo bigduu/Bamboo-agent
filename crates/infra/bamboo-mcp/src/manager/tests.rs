@@ -1,7 +1,10 @@
 use super::fingerprint::proxy_fingerprint;
 use super::*;
 use crate::config::{ReconnectConfig, SseConfig, StdioConfig};
+use crate::executor::McpToolExecutor;
 use async_trait::async_trait;
+use bamboo_agent_core::{FunctionCall, ToolCall, ToolExecutor};
+use bamboo_domain::ClassifiedToolIdentity;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -486,6 +489,17 @@ impl McpTransport for NotifyingMockTransport {
                 "result": { "tools": tools }
             });
             let _ = self.to_client_tx.send(resp.to_string()).await;
+        } else if req["method"].as_str() == Some("tools/call") {
+            let called_name = req["params"]["name"].as_str().unwrap_or_default();
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": req["id"].clone(),
+                "result": {
+                    "content": [{"type": "text", "text": called_name}],
+                    "isError": false
+                }
+            });
+            let _ = self.to_client_tx.send(resp.to_string()).await;
         }
         Ok(())
     }
@@ -500,16 +514,16 @@ impl McpTransport for NotifyingMockTransport {
     }
 }
 
-/// Inserts a `ServerRuntime` backed by an already-connected `client`, starting
-/// with zero registered tools. Returns the runtime so the test can take the
-/// client's notification receiver.
-fn insert_mock_runtime(
-    manager: &McpServerManager,
-    server_id: &str,
+fn mock_runtime(server_id: &str, client: McpProtocolClient) -> Arc<ServerRuntime> {
+    mock_runtime_with_config(create_test_server_config(server_id), client)
+}
+
+fn mock_runtime_with_config(
+    config: McpServerConfig,
     client: McpProtocolClient,
 ) -> Arc<ServerRuntime> {
-    let runtime = Arc::new(ServerRuntime {
-        config: create_test_server_config(server_id),
+    Arc::new(ServerRuntime {
+        config,
         client: RwLock::new(client),
         info: RwLock::new(RuntimeInfo {
             status: ServerStatus::Ready,
@@ -526,7 +540,18 @@ fn insert_mock_runtime(
         reconnecting: AtomicBool::new(false),
         qos: McpServerQos::new(McpQosConfig::default()),
         proxy_fingerprint: None,
-    });
+    })
+}
+
+/// Inserts a `ServerRuntime` backed by an already-connected `client`, starting
+/// with zero registered tools. Returns the runtime so the test can take the
+/// client's notification receiver.
+fn insert_mock_runtime(
+    manager: &McpServerManager,
+    server_id: &str,
+    client: McpProtocolClient,
+) -> Arc<ServerRuntime> {
+    let runtime = mock_runtime(server_id, client);
     manager
         .runtimes
         .insert(server_id.to_string(), runtime.clone());
@@ -550,6 +575,62 @@ fn marker_tool(name: &str) -> McpTool {
 }
 
 #[tokio::test]
+async fn install_registration_failure_preserves_existing_publication() {
+    let manager = McpServerManager::new();
+    let old_runtime = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let old_tool = marker_tool("old_tool");
+    *old_runtime.tools.write().await = vec![old_tool.clone()];
+    old_runtime.info.write().await.tool_count = 1;
+    let old_aliases = manager
+        .index
+        .register_server_tools("stable", std::slice::from_ref(&old_tool), &[], &[])
+        .unwrap();
+
+    // A real 130-bit tag collision is not a practical fixture. Corrupt only the
+    // staged test catalog to exercise the runtime ownership guard and install
+    // rollback path deterministically.
+    let candidate_tool = marker_tool("candidate_tool");
+    let mut candidate_catalog = manager
+        .index
+        .plan_server_tools("candidate", std::slice::from_ref(&candidate_tool), &[], &[])
+        .unwrap();
+    candidate_catalog.replace_first_canonical_alias_for_test(old_aliases[0].alias.clone());
+    let candidate_runtime = mock_runtime("candidate", connected_mock_client().await);
+    *candidate_runtime.tools.write().await = vec![candidate_tool];
+    candidate_runtime.info.write().await.tool_count = 1;
+    let prepared = PreparedServerRuntime {
+        runtime: candidate_runtime.clone(),
+        catalog: candidate_catalog,
+        notification_rx: None,
+    };
+
+    let error = match manager.install_prepared_runtime(prepared).await {
+        Err(error) => error,
+        Ok(_) => panic!("colliding install catalog must fail"),
+    };
+
+    assert!(matches!(
+        error,
+        McpError::ToolRegistration(crate::error::ToolRegistrationError::AliasCollision {
+            ref alias
+        }) if alias == &old_aliases[0].alias
+    ));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &old_runtime
+    ));
+    assert!(!manager.runtimes.contains_key("candidate"));
+    assert_eq!(manager.index.all_aliases(), old_aliases);
+    assert!(old_runtime.client.read().await.is_connected().await);
+    assert!(candidate_runtime.shutdown.load(Ordering::SeqCst));
+    assert!(!candidate_runtime.client.read().await.is_connected().await);
+    assert_eq!(
+        candidate_runtime.info.read().await.status,
+        ServerStatus::Stopped
+    );
+}
+
+#[tokio::test]
 async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_index() {
     let manager = McpServerManager::new();
     let transport = NotifyingMockTransport::new(&[], &[]);
@@ -564,7 +645,8 @@ async fn transactional_reconcile_bootstrap_failure_keeps_old_runtime_and_tool_in
     };
     manager
         .index
-        .register_server_tools("stable", &[old_tool], &[], &[]);
+        .register_server_tools("stable", &[old_tool], &[], &[])
+        .unwrap();
     let alias = manager.index.generate_alias("stable", "still_available");
 
     let mut replacement = create_test_server_config("stable");
@@ -708,7 +790,8 @@ async fn committed_reconcile_publishes_all_removals_before_blocked_cleanup() {
     for id in ["first", "second"] {
         manager
             .index
-            .register_server_tools(id, &[marker_tool("old")], &[], &[]);
+            .register_server_tools(id, &[marker_tool("old")], &[], &[])
+            .unwrap();
     }
 
     let durable = Arc::new(AtomicBool::new(false));
@@ -744,6 +827,52 @@ async fn committed_reconcile_publishes_all_removals_before_blocked_cleanup() {
 }
 
 #[tokio::test]
+async fn manager_stop_preserves_colliding_survivor_and_historical_legacy_ambiguity() {
+    let manager = McpServerManager::new();
+    let removed_runtime = insert_mock_runtime(&manager, "a::b", connected_mock_client().await);
+    let survivor_runtime = insert_mock_runtime(&manager, "a__b", connected_mock_client().await);
+    let remote_tool = marker_tool("c");
+    let removed_alias = manager
+        .index
+        .register_server_tools("a::b", std::slice::from_ref(&remote_tool), &[], &[])
+        .unwrap()
+        .pop()
+        .unwrap();
+    let survivor_alias = manager
+        .index
+        .register_server_tools("a__b", std::slice::from_ref(&remote_tool), &[], &[])
+        .unwrap()
+        .pop()
+        .unwrap();
+    let legacy = "mcp__a__b__c";
+    assert!(manager.index.lookup(legacy).is_none());
+
+    manager.stop_server("a::b").await.unwrap();
+
+    assert!(!manager.runtimes.contains_key("a::b"));
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("a__b").unwrap().value(),
+        &survivor_runtime
+    ));
+    assert!(removed_runtime.shutdown.load(Ordering::SeqCst));
+    assert!(manager.index.lookup(&removed_alias.alias).is_none());
+    assert_eq!(
+        manager
+            .index
+            .lookup(&survivor_alias.alias)
+            .expect("survivor canonical alias remains")
+            .server_id,
+        "a__b"
+    );
+    assert!(
+        manager.index.lookup(legacy).is_none(),
+        "a historically ambiguous legacy alias must not retarget to the survivor"
+    );
+
+    manager.stop_server("a__b").await.unwrap();
+}
+
+#[tokio::test]
 async fn detached_refresh_cannot_overwrite_replacement_tool_index() {
     let manager = McpServerManager::new();
     let old = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
@@ -751,13 +880,13 @@ async fn detached_refresh_cannot_overwrite_replacement_tool_index() {
     manager.index.remove_server_tools("stable");
     manager
         .index
-        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[])
+        .unwrap();
 
-    assert!(
-        !manager
-            .publish_refreshed_tools_if_current("stable", &old, vec![marker_tool("stale_refresh")])
-            .await
-    );
+    assert!(!manager
+        .publish_refreshed_tools_if_current("stable", &old, vec![marker_tool("stale_refresh")])
+        .await
+        .unwrap());
     assert!(manager
         .index
         .contains(&manager.index.generate_alias("stable", "replacement")));
@@ -778,20 +907,20 @@ async fn detached_reconnect_cannot_overwrite_replacement_tool_index() {
     manager.index.remove_server_tools("stable");
     manager
         .index
-        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[]);
+        .register_server_tools("stable", &[marker_tool("replacement")], &[], &[])
+        .unwrap();
 
-    assert!(
-        !manager
-            .publish_reconnected_runtime_if_current(
-                "stable",
-                &old,
-                connected_mock_client().await,
-                vec![marker_tool("stale_reconnect")],
-                Some("stale instructions".to_string()),
-                None,
-            )
-            .await
-    );
+    assert!(!manager
+        .publish_reconnected_runtime_if_current(
+            "stable",
+            &old,
+            connected_mock_client().await,
+            vec![marker_tool("stale_reconnect")],
+            Some("stale instructions".to_string()),
+            None,
+        )
+        .await
+        .unwrap());
     assert!(manager
         .index
         .contains(&manager.index.generate_alias("stable", "replacement")));
@@ -802,6 +931,203 @@ async fn detached_reconnect_cannot_overwrite_replacement_tool_index() {
         manager.runtimes.get("stable").unwrap().value(),
         &replacement
     ));
+}
+
+#[tokio::test]
+async fn refresh_registration_failure_preserves_old_catalog_and_runtime_tools() {
+    let manager = McpServerManager::new();
+    let runtime = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let old_tool = marker_tool("old_tool");
+    *runtime.tools.write().await = vec![old_tool.clone()];
+    runtime.info.write().await.tool_count = 1;
+    let old_aliases = manager
+        .index
+        .register_server_tools("stable", std::slice::from_ref(&old_tool), &[], &[])
+        .unwrap();
+
+    let error = manager
+        .publish_refreshed_tools_if_current(
+            "stable",
+            &runtime,
+            vec![marker_tool("duplicate"), marker_tool("duplicate")],
+        )
+        .await
+        .expect_err("duplicate refresh catalog must fail registration");
+
+    assert!(matches!(
+        error,
+        McpError::ToolRegistration(crate::error::ToolRegistrationError::DuplicateToolIdentity {
+            first_position: 0,
+            duplicate_position: 1,
+        })
+    ));
+    assert_eq!(
+        runtime
+            .tools
+            .read()
+            .await
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["old_tool"]
+    );
+    assert_eq!(runtime.info.read().await.tool_count, 1);
+    assert_eq!(manager.index.all_aliases(), old_aliases);
+    assert!(manager.index.lookup(&old_aliases[0].alias).is_some());
+    assert!(!manager
+        .index
+        .contains_exact_alias(&manager.index.generate_alias("stable", "duplicate")));
+}
+
+#[tokio::test]
+async fn reconnect_registration_failure_preserves_old_generation_and_catalog() {
+    let manager = McpServerManager::new();
+    let runtime = insert_mock_runtime(&manager, "stable", connected_mock_client().await);
+    let old_tool = marker_tool("old_tool");
+    *runtime.tools.write().await = vec![old_tool.clone()];
+    {
+        let mut info = runtime.info.write().await;
+        info.tool_count = 1;
+        info.instructions = Some("old instructions".to_string());
+    }
+    let old_aliases = manager
+        .index
+        .register_server_tools("stable", std::slice::from_ref(&old_tool), &[], &[])
+        .unwrap();
+
+    let error = manager
+        .publish_reconnected_runtime_if_current(
+            "stable",
+            &runtime,
+            connected_mock_client().await,
+            vec![marker_tool("duplicate"), marker_tool("duplicate")],
+            Some("replacement instructions".to_string()),
+            None,
+        )
+        .await
+        .expect_err("duplicate reconnect catalog must fail registration");
+
+    assert!(matches!(
+        error,
+        McpError::ToolRegistration(crate::error::ToolRegistrationError::DuplicateToolIdentity {
+            first_position: 0,
+            duplicate_position: 1,
+        })
+    ));
+    assert!(runtime.client.read().await.is_connected().await);
+    assert_eq!(
+        runtime
+            .tools
+            .read()
+            .await
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["old_tool"]
+    );
+    let info = runtime.info.read().await;
+    assert_eq!(info.tool_count, 1);
+    assert_eq!(info.instructions.as_deref(), Some("old instructions"));
+    drop(info);
+    assert_eq!(manager.index.all_aliases(), old_aliases);
+    assert!(manager.index.lookup(&old_aliases[0].alias).is_some());
+    assert!(!manager
+        .index
+        .contains_exact_alias(&manager.index.generate_alias("stable", "duplicate")));
+}
+
+#[tokio::test]
+async fn reconnect_bootstrap_failure_keeps_old_client_and_catalog_published() {
+    let manager = McpServerManager::new();
+    let mut config = create_test_server_config("stable");
+    config.transport = TransportConfig::Stdio(StdioConfig {
+        command: "definitely-not-a-real-mcp-command-990".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: std::collections::HashMap::new(),
+        env_encrypted: std::collections::HashMap::new(),
+        env_credential_refs: std::collections::HashMap::new(),
+        startup_timeout_ms: 100,
+    });
+    let runtime = mock_runtime_with_config(config, connected_mock_client().await);
+    manager
+        .runtimes
+        .insert("stable".to_string(), runtime.clone());
+    let old_tool = marker_tool("old_tool");
+    *runtime.tools.write().await = vec![old_tool.clone()];
+    runtime.info.write().await.tool_count = 1;
+    let old_aliases = manager
+        .index
+        .register_server_tools("stable", std::slice::from_ref(&old_tool), &[], &[])
+        .unwrap();
+
+    manager
+        .reconnect_server(runtime.clone())
+        .await
+        .expect_err("candidate transport bootstrap must fail");
+
+    assert!(runtime.client.read().await.is_connected().await);
+    assert_eq!(
+        runtime
+            .tools
+            .read()
+            .await
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["old_tool"]
+    );
+    assert_eq!(manager.index.all_aliases(), old_aliases);
+    assert!(manager.index.lookup(&old_aliases[0].alias).is_some());
+    assert!(Arc::ptr_eq(
+        manager.runtimes.get("stable").unwrap().value(),
+        &runtime
+    ));
+}
+
+#[tokio::test]
+async fn canonical_identity_is_exact_from_listing_through_execution() {
+    let manager = Arc::new(McpServerManager::new());
+    let transport = NotifyingMockTransport::new(&[], &[]);
+    let mut client = McpProtocolClient::new(Box::new(transport));
+    client.connect().await.expect("connect execution fixture");
+    let runtime = insert_mock_runtime(&manager, "a::b", client);
+    let remote_tool = marker_tool("c");
+    *runtime.tools.write().await = vec![remote_tool.clone()];
+    runtime.info.write().await.tool_count = 1;
+    let alias = manager
+        .index
+        .register_server_tools("a::b", std::slice::from_ref(&remote_tool), &[], &[])
+        .unwrap()
+        .pop()
+        .unwrap();
+    let executor = McpToolExecutor::new(manager.clone(), manager.tool_index());
+
+    let listed = executor.list_tools();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].function.name, alias.alias);
+    let identity = ClassifiedToolIdentity::from_schema_name(&listed[0].function.name)
+        .expect("listed canonical MCP alias is a loadable identity");
+    assert_eq!(identity.execution_name(), alias.alias);
+    assert_eq!(manager.index.lookup(&alias.alias).unwrap(), alias);
+    assert!(manager.index.contains_exact_alias(&alias.alias));
+
+    let result = executor
+        .execute(&ToolCall {
+            id: "call-exact-mcp-alias".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: alias.alias.clone(),
+                arguments: "{}".to_string(),
+            },
+        })
+        .await
+        .expect("canonical provider identity executes");
+    assert!(result.success);
+    assert_eq!(
+        result.result, remote_tool.name,
+        "transport must receive the original MCP tool name"
+    );
 }
 
 #[tokio::test]

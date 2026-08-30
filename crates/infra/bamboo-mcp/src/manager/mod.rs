@@ -10,7 +10,7 @@ use crate::config::{McpConfig, McpServerConfig, TransportConfig};
 use crate::error::{McpError, Result};
 use crate::protocol::models::JsonRpcNotification;
 use crate::protocol::{McpProtocolClient, McpTransport};
-use crate::tool_index::ToolIndex;
+use crate::tool_index::{ServerToolCatalog, ToolIndex};
 use crate::transports::{SseTransport, StdioTransport, StreamableHttpTransport};
 use crate::types::{McpEvent, McpTool, RuntimeInfo, ServerStatus};
 use bamboo_llm::Config;
@@ -161,7 +161,7 @@ struct ServerRuntime {
 /// working runtime.
 struct PreparedServerRuntime {
     runtime: Arc<ServerRuntime>,
-    tools: Vec<McpTool>,
+    catalog: ServerToolCatalog,
     notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
 }
 

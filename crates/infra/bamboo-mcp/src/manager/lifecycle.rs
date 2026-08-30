@@ -28,7 +28,7 @@ impl McpServerManager {
 
         let prepared = self.prepare_server_runtime(config, "start").await?;
         debug_assert_eq!(prepared.runtime.config.id, server_id);
-        let replaced = self.install_prepared_runtime(prepared).await;
+        let replaced = self.install_prepared_runtime(prepared).await?;
         debug_assert!(replaced.is_none());
 
         Ok(())
@@ -41,9 +41,21 @@ impl McpServerManager {
     ) -> Result<PreparedServerRuntime> {
         let server_id = config.id.clone();
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
-        let (client, tools, instructions, notification_rx) = self
+        let (mut client, tools, instructions, notification_rx) = self
             .bootstrap_server_client(&server_id, &config, phase)
             .await?;
+        let catalog = match self.index.plan_server_tools(
+            &server_id,
+            &tools,
+            &config.allowed_tools,
+            &config.denied_tools,
+        ) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let _ = client.disconnect().await;
+                return Err(error.into());
+            }
+        };
         let runtime = Arc::new(ServerRuntime {
             config,
             client: RwLock::new(client),
@@ -65,7 +77,7 @@ impl McpServerManager {
         });
         Ok(PreparedServerRuntime {
             runtime,
-            tools,
+            catalog,
             notification_rx,
         })
     }
@@ -75,11 +87,30 @@ impl McpServerManager {
     pub(super) async fn install_prepared_runtime(
         &self,
         prepared: PreparedServerRuntime,
-    ) -> Option<Arc<ServerRuntime>> {
+    ) -> Result<Option<Arc<ServerRuntime>>> {
+        let transaction = match self
+            .index
+            .preflight_catalog_update(std::slice::from_ref(&prepared.catalog), &[])
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let server_id = prepared.runtime.config.id.clone();
+                self.shutdown_detached_runtime(&server_id, prepared.runtime)
+                    .await;
+                return Err(error.into());
+            }
+        };
         let (server_id, tool_names, replaced) = self.publish_prepared_runtime(prepared);
+        self.index.commit_catalog_update(transaction);
+
+        info!(
+            "Registered {} MCP tools for server '{}'",
+            tool_names.len(),
+            server_id
+        );
 
         self.emit_runtime_ready_events(server_id, tool_names).await;
-        replaced
+        Ok(replaced)
     }
 
     /// Publish a fully initialized runtime without suspending. Configuration
@@ -91,26 +122,18 @@ impl McpServerManager {
     ) -> (String, Vec<String>, Option<Arc<ServerRuntime>>) {
         let PreparedServerRuntime {
             runtime,
-            tools,
+            catalog,
             notification_rx,
         } = prepared;
         let config = &runtime.config;
         let server_id = config.id.clone();
         let healthcheck_interval_ms = config.healthcheck_interval_ms;
 
-        self.index.remove_server_tools(&server_id);
-        let aliases = self.index.register_server_tools(
-            &server_id,
-            &tools,
-            &config.allowed_tools,
-            &config.denied_tools,
-        );
-
-        info!(
-            "Registered {} MCP tools for server '{}'",
-            aliases.len(),
-            server_id
-        );
+        let tool_names = catalog
+            .aliases()
+            .into_iter()
+            .map(|alias| alias.alias)
+            .collect();
 
         // Store runtime only after its client initialized and tools were read.
         let replaced = self.runtimes.insert(server_id.clone(), runtime.clone());
@@ -130,7 +153,6 @@ impl McpServerManager {
             old.shutdown.store(true, Ordering::SeqCst);
         }
 
-        let tool_names = aliases.into_iter().map(|alias| alias.alias).collect();
         (server_id, tool_names, replaced)
     }
 
@@ -165,22 +187,35 @@ impl McpServerManager {
 
     pub(super) async fn stop_server_unlocked(&self, server_id: &str) -> Result<()> {
         info!("Stopping MCP server '{}'", server_id);
-        let runtime = self.detach_runtime(server_id)?;
+        // `stop_server` owns the reconciliation lock. Preflight the catalog
+        // removal before detaching the runtime, then publish both changes with
+        // no suspension/cancellation point. Another OS thread may briefly see
+        // the old alias after runtime removal, but execution then fails closed
+        // on the missing runtime; it can never resolve to a different owner.
+        // The checked commit is infallible under the single-writer invariant
+        // and fail-stops before swapping if violated.
+        let transaction = self
+            .index
+            .preflight_catalog_update(&[], &[server_id.to_string()])?;
+        let runtime = self.detach_runtime_without_index(server_id)?;
+        self.index.commit_catalog_update(transaction);
         self.finish_detached_stop(server_id.to_string(), runtime, true)
             .await;
         info!("MCP server '{}' stopped", server_id);
         Ok(())
     }
 
-    /// Remove a runtime and all of its externally visible tools without
-    /// suspending. The returned client can be disconnected afterward.
-    pub(super) fn detach_runtime(&self, server_id: &str) -> Result<Arc<ServerRuntime>> {
+    /// Detach only the runtime. Transactional configuration reconciliation uses
+    /// this while a preflighted whole-index replacement is waiting to commit.
+    pub(super) fn detach_runtime_without_index(
+        &self,
+        server_id: &str,
+    ) -> Result<Arc<ServerRuntime>> {
         let (_, runtime) = self
             .runtimes
             .remove(server_id)
             .ok_or_else(|| McpError::NotRunning(server_id.to_string()))?;
         runtime.shutdown.store(true, Ordering::SeqCst);
-        self.index.remove_server_tools(server_id);
         Ok(runtime)
     }
 
@@ -340,7 +375,7 @@ impl McpServerManager {
 
         if !self
             .publish_refreshed_tools_if_current(server_id, &runtime, new_tools)
-            .await
+            .await?
         {
             tracing::debug!(
                 "Discarding tool refresh for detached MCP runtime '{}'",
@@ -355,32 +390,36 @@ impl McpServerManager {
         server_id: &str,
         runtime: &Arc<ServerRuntime>,
         new_tools: Vec<McpTool>,
-    ) -> bool {
+    ) -> Result<bool> {
         // Serialize the generation check with transactional replacement. The
         // list_tools await above may span a replacement, so checking only when
         // the refresh starts is insufficient.
         let _reconcile = self.reconcile_lock.lock().await;
         if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
-            return false;
+            return Ok(false);
         }
 
-        // Update tools
-        let mut tools = runtime.tools.write().await;
-        *tools = new_tools.clone();
-        drop(tools);
-
-        // Update info
-        let mut info = runtime.info.write().await;
-        info.tool_count = new_tools.len();
-
-        // Re-register tools
-        self.index.remove_server_tools(server_id);
-        let aliases = self.index.register_server_tools(
+        let catalog = self.index.plan_server_tools(
             server_id,
             &new_tools,
             &runtime.config.allowed_tools,
             &runtime.config.denied_tools,
-        );
+        )?;
+        let aliases = catalog.aliases();
+        let transaction = self
+            .index
+            .preflight_catalog_update(std::slice::from_ref(&catalog), &[])?;
+
+        // Acquire every fallible/suspending guard before the publication point.
+        // From the index swap through the runtime metadata update there is no
+        // await, so a failed preflight leaves the prior catalog untouched.
+        let mut tools = runtime.tools.write().await;
+        let mut info = runtime.info.write().await;
+        self.index.commit_catalog_update(transaction);
+        *tools = new_tools.clone();
+        info.tool_count = new_tools.len();
+        drop(info);
+        drop(tools);
 
         info!(
             "Refreshed {} tools for MCP server '{}'",
@@ -399,7 +438,7 @@ impl McpServerManager {
                 .await;
         }
 
-        true
+        Ok(true)
     }
 
     fn start_health_check(&self, runtime: Arc<ServerRuntime>, interval_ms: u64) {

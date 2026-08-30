@@ -13,10 +13,10 @@ pub mod transports;
 pub mod types;
 
 pub use config::*;
-pub use error::{McpError, Result};
+pub use error::{McpError, Result, ToolRegistrationError};
 pub use executor::{CompositeToolExecutor, McpToolExecutor};
 pub use manager::McpServerManager;
 pub use protocol::*;
-pub use tool_index::ToolIndex;
+pub use tool_index::{ToolIndex, MAX_MCP_OWNERSHIP_LEDGER_RELATIONSHIPS};
 pub use transports::*;
 pub use types::*;
