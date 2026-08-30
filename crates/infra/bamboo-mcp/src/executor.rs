@@ -16,12 +16,23 @@ use crate::types::{McpContentItem, McpContentMetadata, McpStructuredContent};
 /// MCP tool executor that delegates to the MCP server manager
 pub struct McpToolExecutor {
     manager: Arc<McpServerManager>,
-    index: Arc<ToolIndex>,
+    authority_matches: bool,
 }
 
 impl McpToolExecutor {
     pub fn new(manager: Arc<McpServerManager>, index: Arc<ToolIndex>) -> Self {
-        Self { manager, index }
+        let authority_matches = manager.has_same_authority(&index);
+        Self {
+            manager,
+            authority_matches,
+        }
+    }
+
+    pub fn from_manager(manager: Arc<McpServerManager>) -> Self {
+        Self {
+            manager,
+            authority_matches: true,
+        }
     }
 
     fn preview_for_log(value: &str, max_chars: usize) -> String {
@@ -141,10 +152,14 @@ impl McpToolExecutor {
 impl ToolExecutor for McpToolExecutor {
     async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
         let tool_name = &call.function.name;
-
-        // Lookup the tool alias
-        let alias = match self.index.lookup(tool_name) {
-            Some(alias) => alias,
+        if !self.authority_matches {
+            return Err(ToolError::NotFound(
+                "MCP executor uses a detached tool-index authority".to_string(),
+            ));
+        }
+        let snapshot = self.manager.snapshot();
+        let resolved = match snapshot.resolve_call(tool_name) {
+            Some(resolved) => resolved,
             None => {
                 return Err(ToolError::NotFound(format!(
                     "MCP tool '{}' not found",
@@ -155,7 +170,9 @@ impl ToolExecutor for McpToolExecutor {
 
         debug!(
             "Executing MCP tool: {} (server: {}, original: {})",
-            tool_name, alias.server_id, alias.original_name
+            tool_name,
+            resolved.server_id(),
+            resolved.original_name()
         );
 
         // Parse arguments
@@ -166,7 +183,7 @@ impl ToolExecutor for McpToolExecutor {
                 "MCP tool argument parsing fallback applied: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", warning={}",
                 call.id,
                 tool_name,
-                alias.server_id,
+                resolved.server_id(),
                 args_raw.len(),
                 Self::preview_for_log(args_raw, 180),
                 warning
@@ -174,11 +191,7 @@ impl ToolExecutor for McpToolExecutor {
         }
 
         // Execute via manager
-        match self
-            .manager
-            .call_tool(&alias.server_id, &alias.original_name, args)
-            .await
-        {
+        match self.manager.call_resolved_tool(&resolved, args).await {
             Ok(result) => {
                 let (text, images) = Self::format_result_content(&result.content);
                 let text = Self::append_structured_content(text, &result.structured_content);
@@ -214,34 +227,25 @@ impl ToolExecutor for McpToolExecutor {
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
-        self.index
-            .all_aliases()
-            .into_iter()
-            .filter_map(|alias| {
-                // Get tool info from manager
-                self.manager
-                    .get_tool_info(&alias.server_id, &alias.original_name)
-                    .map(|tool| ToolSchema {
-                        schema_type: "function".to_string(),
-                        function: bamboo_agent_core::FunctionSchema {
-                            name: alias.alias,
-                            description: tool.description,
-                            parameters: tool.parameters,
-                        },
-                    })
-            })
-            .collect()
+        if self.authority_matches {
+            self.manager.snapshot().list_tools()
+        } else {
+            Vec::new()
+        }
     }
 
     fn owns_exact_tool(&self, tool_name: &str) -> bool {
-        self.index.contains_exact_alias(tool_name)
+        self.authority_matches && self.manager.snapshot().contains_exact_alias(tool_name)
     }
 
     /// Each connected MCP server's `instructions`, rendered as a labeled block.
     /// Only ready servers contribute, so this guidance is automatically scoped to
     /// whatever is loaded for the run.
     fn tool_guidance(&self) -> Option<String> {
-        let servers = self.manager.connected_server_instructions();
+        if !self.authority_matches {
+            return None;
+        }
+        let servers = self.manager.snapshot().connected_server_instructions();
         if servers.is_empty() {
             return None;
         }

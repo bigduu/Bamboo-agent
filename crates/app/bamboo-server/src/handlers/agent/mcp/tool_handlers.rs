@@ -8,14 +8,14 @@ use crate::app_state::AppState;
 /// # HTTP Route
 /// `GET /mcp/tools`
 pub async fn list_tools(state: web::Data<AppState>) -> impl Responder {
-    let aliases = state.mcp_manager.tool_index().all_aliases();
+    let snapshot = state.mcp_manager.snapshot();
+    let aliases = snapshot.aliases();
 
     let tools: Vec<ToolInfo> = aliases
         .into_iter()
         .filter_map(|alias| {
-            state
-                .mcp_manager
-                .get_tool_info(&alias.server_id, &alias.original_name)
+            snapshot
+                .tool(&alias.server_id, &alias.original_name)
                 .map(|tool| ToolInfo {
                     alias: alias.alias,
                     server_id: alias.server_id,
@@ -38,19 +38,17 @@ pub async fn get_server_tools(
     path: web::Path<String>,
 ) -> impl Responder {
     let server_id = path.into_inner();
+    let snapshot = state.mcp_manager.snapshot();
 
-    match state.mcp_manager.get_server_info(&server_id) {
+    match snapshot.server_info(&server_id) {
         Some(_) => {
-            let tools: Vec<ToolInfo> = state
-                .mcp_manager
-                .tool_index()
-                .all_aliases()
+            let tools: Vec<ToolInfo> = snapshot
+                .aliases()
                 .into_iter()
                 .filter(|alias| alias.server_id == server_id)
                 .filter_map(|alias| {
-                    state
-                        .mcp_manager
-                        .get_tool_info(&alias.server_id, &alias.original_name)
+                    snapshot
+                        .tool(&alias.server_id, &alias.original_name)
                         .map(|tool| ToolInfo {
                             alias: alias.alias,
                             server_id: alias.server_id,

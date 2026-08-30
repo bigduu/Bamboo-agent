@@ -1,37 +1,101 @@
+use tokio::sync::{oneshot, OwnedMutexGuard};
 use tokio::time::{interval, Duration};
 
 use super::fingerprint::desired_proxy_fingerprint;
+use super::generation::{admit_resolved, AdmittedMcpCall};
 use super::*;
 use crate::protocol::models::JsonRpcNotification;
 
-/// MCP methods a server sends when its tool list changes. Per the MCP spec the
-/// wire method is `notifications/tools/list_changed`; the bare `tools/list_changed`
-/// is accepted defensively for servers that omit the `notifications/` prefix. #366.
 const TOOLS_LIST_CHANGED_METHODS: [&str; 2] =
     ["notifications/tools/list_changed", "tools/list_changed"];
 
+pub(super) struct RetiredRuntimeCleanup {
+    pub(super) runtime: Arc<TransportRuntime>,
+}
+
+/// One already-validated event batch. The task owns the global publication
+/// sequencer before it can observe the activation gate. Generation writers can
+/// therefore finish without waiting for bounded output capacity, while a
+/// successor cannot publish until every event in this batch has been delivered.
+pub(super) struct PreparedEventBatch {
+    gate: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PreparedEventBatch {
+    pub(super) fn activate(mut self) {
+        if let Some(gate) = self.gate.take() {
+            let _ = gate.send(());
+        }
+        // Dropping a JoinHandle detaches rather than aborts the activated task.
+        self.task = None;
+    }
+}
+
+impl Drop for PreparedEventBatch {
+    fn drop(&mut self) {
+        self.gate = None;
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl McpServerManager {
-    /// Start a new MCP server connection.
+    /// Start and publish one fully initialized MCP server.
     pub async fn start_server(&self, config: McpServerConfig) -> Result<()> {
-        let _reconcile = self.reconcile_lock.lock().await;
-        self.start_server_unlocked(config).await
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        let events = self.start_server_unlocked(config, sequence).await;
+        drop(reconcile);
+        match events {
+            Ok(events) => {
+                events.activate();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    pub(super) async fn start_server_unlocked(&self, config: McpServerConfig) -> Result<()> {
+    async fn start_server_unlocked(
+        &self,
+        config: McpServerConfig,
+        sequence: OwnedMutexGuard<()>,
+    ) -> Result<PreparedEventBatch> {
         let server_id = config.id.clone();
-
-        if self.runtimes.contains_key(&server_id) {
+        if self.is_server_running(&server_id) {
             return Err(McpError::AlreadyRunning(server_id));
         }
 
         info!("Starting MCP server '{}'", server_id);
-
         let prepared = self.prepare_server_runtime(config, "start").await?;
-        debug_assert_eq!(prepared.runtime.config.id, server_id);
-        let replaced = self.install_prepared_runtime(prepared).await?;
-        debug_assert!(replaced.is_none());
-
-        Ok(())
+        let publication = prepared.publication().clone();
+        let base = self.authority.generation();
+        let next = McpRuntimeGeneration::plan(
+            &base,
+            std::slice::from_ref(&publication),
+            &[],
+            self.authority.ledger_relationship_limit,
+            true,
+        )?;
+        let events = self.prepare_event_batch(
+            sequence,
+            self.runtime_ready_events(&publication),
+            Vec::new(),
+        );
+        let mut commit = prepared.into_commit();
+        debug_assert!(self.authority.is_current(&base));
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::BeforeFenceAndSwap);
+        self.authority.replace_prevalidated_with(&base, next, || {
+            #[cfg(test)]
+            self.observe_publish(PublishProbePhase::AfterFencesBeforeSwap);
+        });
+        commit.mark_published();
+        commit.activate();
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::AfterTransferAndSwapBeforeUnlock);
+        Ok(events)
     }
 
     pub(super) async fn prepare_server_runtime(
@@ -39,584 +103,572 @@ impl McpServerManager {
         config: McpServerConfig,
         phase: &'static str,
     ) -> Result<PreparedServerRuntime> {
+        self.prepare_server_runtime_with_restart(config, phase, 0)
+            .await
+    }
+
+    pub(super) async fn prepare_server_runtime_with_restart(
+        &self,
+        config: McpServerConfig,
+        phase: &'static str,
+        restart_count: u32,
+    ) -> Result<PreparedServerRuntime> {
         let server_id = config.id.clone();
         let runtime_proxy_fingerprint = desired_proxy_fingerprint(self.config.as_ref()).await;
-        let (mut client, tools, instructions, notification_rx) = self
+        let (client, tools, instructions, notification_rx) = self
             .bootstrap_server_client(&server_id, &config, phase)
             .await?;
-        let catalog = match self.index.plan_server_tools(
+        let catalog = self.index.plan_server_tools(
             &server_id,
             &tools,
             &config.allowed_tools,
             &config.denied_tools,
-        ) {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                let _ = client.disconnect().await;
-                return Err(error.into());
-            }
-        };
-        let runtime = Arc::new(ServerRuntime {
+        )?;
+        #[cfg(test)]
+        let mut catalog = catalog;
+        #[cfg(test)]
+        if let Some(probe) = &self.catalog_plan_probe {
+            probe(&server_id, &mut catalog);
+        }
+        let tool_count = catalog.aliases().len();
+        let runtime = ServerRuntime {
             config,
-            client: RwLock::new(client),
-            info: RwLock::new(RuntimeInfo {
+            info: tokio::sync::RwLock::new(RuntimeInfo {
                 status: ServerStatus::Ready,
                 last_error: None,
                 connected_at: Some(Utc::now()),
                 disconnected_at: None,
-                tool_count: tools.len(),
-                restart_count: 0,
+                tool_count,
+                restart_count,
                 last_ping_at: Some(Utc::now()),
                 instructions,
             }),
-            tools: RwLock::new(tools.clone()),
-            shutdown: AtomicBool::new(false),
             reconnecting: AtomicBool::new(false),
             qos: McpServerQos::new(McpQosConfig::default()),
             proxy_fingerprint: runtime_proxy_fingerprint,
-        });
+        };
+        let runtime = TransportRuntime::new(self.allocate_runtime_id()?, runtime, client);
+        let publication =
+            ServerPublication::new(self.allocate_publication_id()?, runtime, catalog, &tools)?;
+        let activation = self.prepare_runtime_tasks(publication.clone(), notification_rx);
         Ok(PreparedServerRuntime {
-            runtime,
-            catalog,
-            notification_rx,
+            publication: Some(publication),
+            activation: Some(activation),
         })
     }
 
-    /// Publish a fully initialized runtime. No fallible initialization remains
-    /// in this method, so callers can stage all candidates before committing.
-    pub(super) async fn install_prepared_runtime(
+    pub(super) fn prepare_runtime_tasks(
         &self,
-        prepared: PreparedServerRuntime,
-    ) -> Result<Option<Arc<ServerRuntime>>> {
-        let transaction = match self
-            .index
-            .preflight_catalog_update(std::slice::from_ref(&prepared.catalog), &[])
-        {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                let server_id = prepared.runtime.config.id.clone();
-                self.shutdown_detached_runtime(&server_id, prepared.runtime)
-                    .await;
-                return Err(error.into());
-            }
+        publication: Arc<ServerPublication>,
+        notification_rx: Option<tokio::sync::mpsc::Receiver<JsonRpcNotification>>,
+    ) -> RuntimeActivation {
+        let (gate, health_gate) = tokio::sync::watch::channel(false);
+        let runtime = publication.runtime.clone();
+        let mut handles = vec![self.spawn_health_check(runtime.clone(), health_gate)];
+        if let Some(receiver) = notification_rx {
+            handles.push(self.spawn_notification_drain(
+                runtime.clone(),
+                receiver,
+                gate.subscribe(),
+            ));
+        }
+        #[cfg(test)]
+        let task_count = handles.len();
+        runtime.install_tasks(handles);
+        let activation = RuntimeActivation {
+            gate: Some(gate),
+            #[cfg(test)]
+            task_count,
+            #[cfg(test)]
+            probe: self.task_probe.clone(),
         };
-        let (server_id, tool_names, replaced) = self.publish_prepared_runtime(prepared);
-        self.index.commit_catalog_update(transaction);
-
-        info!(
-            "Registered {} MCP tools for server '{}'",
-            tool_names.len(),
-            server_id
-        );
-
-        self.emit_runtime_ready_events(server_id, tool_names).await;
-        Ok(replaced)
+        #[cfg(test)]
+        activation.observe(TaskProbePhase::PreparedAndGated);
+        activation
     }
 
-    /// Publish a fully initialized runtime without suspending. Configuration
-    /// reconciliation uses this after its durable CAS boundary so cancellation
-    /// cannot leave only part of a committed runtime set visible.
-    pub(super) fn publish_prepared_runtime(
+    pub(super) fn runtime_ready_events(
         &self,
-        prepared: PreparedServerRuntime,
-    ) -> (String, Vec<String>, Option<Arc<ServerRuntime>>) {
-        let PreparedServerRuntime {
-            runtime,
-            catalog,
-            notification_rx,
-        } = prepared;
-        let config = &runtime.config;
-        let server_id = config.id.clone();
-        let healthcheck_interval_ms = config.healthcheck_interval_ms;
-
-        let tool_names = catalog
-            .aliases()
-            .into_iter()
-            .map(|alias| alias.alias)
-            .collect();
-
-        // Store runtime only after its client initialized and tools were read.
-        let replaced = self.runtimes.insert(server_id.clone(), runtime.clone());
-
-        // Spawn the notification drain only AFTER the runtime is registered, so an
-        // immediate `tools/list_changed` resolves via `refresh_tools` instead of
-        // racing `ServerNotFound`. (#420)
-        if let Some(rx) = notification_rx {
-            self.spawn_notification_drain(server_id.clone(), runtime.clone(), rx);
-        }
-
-        // The new generation's health task and the old generation's shutdown
-        // flag are part of the synchronous publication boundary. Event delivery
-        // and client disconnection may suspend and happen afterward.
-        self.start_health_check(runtime, healthcheck_interval_ms);
-        if let Some(ref old) = replaced {
-            old.shutdown.store(true, Ordering::SeqCst);
-        }
-
-        (server_id, tool_names, replaced)
+        publication: &Arc<ServerPublication>,
+    ) -> Vec<McpEvent> {
+        vec![
+            McpEvent::ServerStatusChanged {
+                server_id: publication.server_id.clone(),
+                status: ServerStatus::Ready,
+                error: None,
+            },
+            McpEvent::ToolsChanged {
+                server_id: publication.server_id.clone(),
+                tools: publication
+                    .catalog
+                    .aliases()
+                    .into_iter()
+                    .map(|alias| alias.alias)
+                    .collect(),
+            },
+        ]
     }
 
-    pub(super) async fn emit_runtime_ready_events(
+    pub(super) fn prepare_event_batch(
         &self,
-        server_id: String,
-        tool_names: Vec<String>,
-    ) {
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx
-                .send(McpEvent::ServerStatusChanged {
-                    server_id: server_id.clone(),
-                    status: ServerStatus::Ready,
-                    error: None,
-                })
-                .await;
-
-            let _ = tx
-                .send(McpEvent::ToolsChanged {
-                    server_id,
-                    tools: tool_names,
-                })
-                .await;
-        }
-    }
-
-    /// Stop an MCP server connection.
-    pub async fn stop_server(&self, server_id: &str) -> Result<()> {
-        let _reconcile = self.reconcile_lock.lock().await;
-        self.stop_server_unlocked(server_id).await
-    }
-
-    pub(super) async fn stop_server_unlocked(&self, server_id: &str) -> Result<()> {
-        info!("Stopping MCP server '{}'", server_id);
-        // `stop_server` owns the reconciliation lock. Preflight the catalog
-        // removal before detaching the runtime, then publish both changes with
-        // no suspension/cancellation point. Another OS thread may briefly see
-        // the old alias after runtime removal, but execution then fails closed
-        // on the missing runtime; it can never resolve to a different owner.
-        // The checked commit is infallible under the single-writer invariant
-        // and fail-stops before swapping if violated.
-        let transaction = self
-            .index
-            .preflight_catalog_update(&[], &[server_id.to_string()])?;
-        let runtime = self.detach_runtime_without_index(server_id)?;
-        self.index.commit_catalog_update(transaction);
-        self.finish_detached_stop(server_id.to_string(), runtime, true)
-            .await;
-        info!("MCP server '{}' stopped", server_id);
-        Ok(())
-    }
-
-    /// Detach only the runtime. Transactional configuration reconciliation uses
-    /// this while a preflighted whole-index replacement is waiting to commit.
-    pub(super) fn detach_runtime_without_index(
-        &self,
-        server_id: &str,
-    ) -> Result<Arc<ServerRuntime>> {
-        let (_, runtime) = self
-            .runtimes
-            .remove(server_id)
-            .ok_or_else(|| McpError::NotRunning(server_id.to_string()))?;
-        runtime.shutdown.store(true, Ordering::SeqCst);
-        Ok(runtime)
-    }
-
-    pub(super) async fn finish_detached_stop(
-        &self,
-        server_id: String,
-        runtime: Arc<ServerRuntime>,
-        emit_stopped: bool,
-    ) {
-        self.shutdown_detached_runtime(&server_id, runtime).await;
-        if emit_stopped {
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx
-                    .send(McpEvent::ServerStatusChanged {
-                        server_id,
-                        status: ServerStatus::Stopped,
-                        error: None,
-                    })
-                    .await;
+        sequence: OwnedMutexGuard<()>,
+        events: Vec<McpEvent>,
+        retired: Vec<RetiredRuntimeCleanup>,
+    ) -> PreparedEventBatch {
+        #[cfg(test)]
+        self.observe_event(EventProbePhase::BeforeBatchValidation);
+        let tx = self.event_tx.clone();
+        #[cfg(test)]
+        let event_probe = self.event_probe.clone();
+        let (gate, activated) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _sequence = sequence;
+            if activated.await.is_err() {
+                return;
             }
+            #[cfg(test)]
+            if let Some(probe) = &event_probe {
+                probe(EventProbePhase::AcceptedBatchBeforeFirstDelivery);
+            }
+            for cleanup in retired {
+                cleanup.runtime.retire();
+                let mut info = cleanup.runtime.runtime.info.write().await;
+                info.status = ServerStatus::Stopped;
+                info.disconnected_at = Some(Utc::now());
+            }
+            let Some(tx) = tx else {
+                return;
+            };
+            for event in events {
+                #[cfg(test)]
+                if let Some(probe) = &event_probe {
+                    probe(EventProbePhase::BeforeOutputSend);
+                }
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+        });
+        PreparedEventBatch {
+            gate: Some(gate),
+            task: Some(task),
         }
     }
 
-    /// Stop a runtime that has already been detached/replaced. This deliberately
-    /// does not touch the runtime map or tool index, which now belong to its
-    /// successfully committed replacement.
-    pub(super) async fn shutdown_detached_runtime(
+    /// Remove one server publication and retire its exact transport runtime.
+    pub async fn stop_server(&self, server_id: &str) -> Result<()> {
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        let events = self.stop_server_unlocked(server_id, sequence);
+        drop(reconcile);
+        match events {
+            Ok(events) => {
+                events.activate();
+                info!("MCP server '{}' stopped", server_id);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn stop_server_unlocked(
         &self,
         server_id: &str,
-        runtime: Arc<ServerRuntime>,
-    ) {
-        runtime.shutdown.store(true, Ordering::SeqCst);
-        let mut client = runtime.client.write().await;
-        if let Err(error) = client.disconnect().await {
-            warn!(
-                "Error disconnecting replaced MCP server '{}': {}",
-                server_id, error
-            );
-        }
-        let mut info = runtime.info.write().await;
-        info.status = ServerStatus::Stopped;
-        info.disconnected_at = Some(Utc::now());
+        sequence: OwnedMutexGuard<()>,
+    ) -> Result<PreparedEventBatch> {
+        info!("Stopping MCP server '{}'", server_id);
+        let base = self.authority.generation();
+        let publication = base
+            .servers
+            .get(server_id)
+            .cloned()
+            .ok_or_else(|| McpError::NotRunning(server_id.to_string()))?;
+        let next = McpRuntimeGeneration::plan(
+            &base,
+            &[],
+            &[server_id.to_string()],
+            self.authority.ledger_relationship_limit,
+            true,
+        )?;
+        let events = self.prepare_event_batch(
+            sequence,
+            vec![McpEvent::ServerStatusChanged {
+                server_id: server_id.to_string(),
+                status: ServerStatus::Stopped,
+                error: None,
+            }],
+            vec![RetiredRuntimeCleanup {
+                runtime: publication.runtime.clone(),
+            }],
+        );
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::BeforeFenceAndSwap);
+        self.authority.replace_prevalidated_with(&base, next, || {
+            publication.retire_with_runtime();
+            #[cfg(test)]
+            self.observe_publish(PublishProbePhase::AfterFencesBeforeSwap);
+        });
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::AfterTransferAndSwapBeforeUnlock);
+        Ok(events)
     }
 
-    /// Call a tool on a specific server.
+    /// Execute an original server tool name through one resolved generation.
     pub async fn call_tool(
         &self,
         server_id: &str,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<crate::types::McpCallResult> {
-        let runtime = self
-            .runtimes
-            .get(server_id)
-            .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
+        let snapshot = self.snapshot();
+        let resolved = snapshot
+            .resolve_server_tool(server_id, tool_name)
+            .ok_or_else(|| {
+                if snapshot.contains_server(server_id) {
+                    McpError::ToolNotFound(tool_name.to_string())
+                } else {
+                    McpError::ServerNotFound(server_id.to_string())
+                }
+            })?;
+        self.call_resolved_tool(&resolved, args).await
+    }
 
-        runtime.qos.check_circuit(server_id, tool_name).await?;
-        let _permit = runtime.qos.acquire_permit().await?;
+    /// Execute a passive exact ticket after linearizable admission.
+    pub async fn call_resolved_tool(
+        &self,
+        resolved: &ResolvedMcpCall,
+        args: serde_json::Value,
+    ) -> Result<crate::types::McpCallResult> {
+        let admitted = admit_resolved(&self.authority, resolved)?;
+        self.call_admitted_tool(admitted, args).await
+    }
 
-        let client = runtime.client.read().await;
-        let timeout = runtime.config.request_timeout_ms;
-        let result = client.call_tool(tool_name, args, timeout).await;
-        drop(client);
+    /// Execute one already-admitted exact lease without any live name lookup.
+    async fn call_admitted_tool(
+        &self,
+        admitted: AdmittedMcpCall,
+        args: serde_json::Value,
+    ) -> Result<crate::types::McpCallResult> {
+        if !admitted.resolved.belongs_to(&self.authority) {
+            return Err(McpError::ForeignRuntimeAuthority);
+        }
+        let server_id = admitted.resolved.server_id().to_string();
+        let tool_name = admitted.resolved.original_name().to_string();
+        let runtime = admitted.runtime().clone();
+        runtime
+            .runtime
+            .qos
+            .check_circuit(&server_id, &tool_name)
+            .await?;
+        let _permit = runtime.runtime.qos.acquire_permit().await?;
+        let timeout = runtime.runtime.config.request_timeout_ms;
+        let result = admitted.client().call_tool(&tool_name, args, timeout).await;
 
         let result = match result {
-            // A tool that RAN but reported failure (`is_error`) is still `Ok` at
-            // the protocol level — so without this the QoS/health path would count
-            // it as a success and a server with a wedged capability (e.g. nova when
-            // its capture pipeline is stuck: it answers pings and returns an error
-            // RESULT well within request_timeout_ms, so it never trips a protocol
-            // timeout) would fail forever without ever being recycled.
             Ok(result) if result.is_error => {
                 let synthetic =
                     McpError::ToolExecution(format!("tool '{tool_name}' returned an error result"));
                 let should_recycle = runtime
+                    .runtime
                     .qos
-                    .record_failure(server_id, tool_name, &synthetic)
+                    .record_failure(&server_id, &tool_name, &synthetic)
                     .await;
-                self.maybe_recycle_server(runtime.value(), should_recycle);
+                self.maybe_recycle_server(admitted.resolved.expected(), should_recycle);
                 result
             }
             Ok(result) => {
-                runtime.qos.record_success().await;
+                runtime.runtime.qos.record_success().await;
                 result
             }
             Err(error) => {
                 let should_recycle = runtime
+                    .runtime
                     .qos
-                    .record_failure(server_id, tool_name, &error)
+                    .record_failure(&server_id, &tool_name, &error)
                     .await;
-                self.maybe_recycle_server(runtime.value(), should_recycle);
+                self.maybe_recycle_server(admitted.resolved.expected(), should_recycle);
                 return Err(error);
             }
         };
 
-        // Emit event
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx
-                .send(McpEvent::ToolExecuted {
-                    server_id: server_id.to_string(),
-                    tool_name: tool_name.to_string(),
+        let expected = admitted.resolved.expected();
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        let events = self.is_current_publication(&expected).then(|| {
+            self.prepare_event_batch(
+                sequence,
+                vec![McpEvent::ToolExecuted {
+                    server_id,
+                    tool_name,
                     success: !result.is_error,
-                })
-                .await;
+                }],
+                Vec::new(),
+            )
+        });
+        drop(reconcile);
+        if let Some(events) = events {
+            events.activate();
         }
-
         Ok(result)
     }
 
-    /// Recycle a server that has failed too many times in a row — disconnect (the
-    /// existing child process is killed) and reconnect (a fresh one is spawned).
-    /// Non-blocking: runs in its own task with its own backoff, guarded against
-    /// concurrent runs by `ServerRuntime::reconnecting`. Skipped when recycling
-    /// isn't warranted, reconnect is disabled for the server, or it's shutting down.
-    fn maybe_recycle_server(&self, runtime: &Arc<ServerRuntime>, should_recycle: bool) {
+    pub(super) fn maybe_recycle_server(&self, expected: ExpectedPublication, should_recycle: bool) {
+        let runtime = expected.runtime();
         if !should_recycle
-            || !runtime.config.reconnect.enabled
-            || runtime.shutdown.load(Ordering::SeqCst)
+            || !runtime.runtime.config.reconnect.enabled
+            || !self.is_current_publication(&expected)
         {
             return;
         }
         let manager = self.clone();
-        let runtime = runtime.clone();
-        let server_id = runtime.config.id.clone();
+        let server_id = expected.server_id().to_string();
         warn!(
             "Recycling MCP server '{}' after repeated tool failures (disconnect + reconnect)",
             server_id
         );
         tokio::spawn(async move {
-            if let Err(e) = manager.attempt_reconnection(runtime).await {
-                warn!("MCP server '{}' recycle failed: {}", server_id, e);
+            if let Err(error) = manager.attempt_reconnection(expected).await {
+                warn!("MCP server '{}' recycle failed: {}", server_id, error);
             }
         });
     }
 
-    /// Get tool info for a specific tool.
+    /// Return one published tool's immutable provider metadata.
     pub fn get_tool_info(&self, server_id: &str, tool_name: &str) -> Option<McpTool> {
-        self.runtimes.get(server_id).and_then(|runtime| {
-            let tools = runtime.tools.try_read().ok()?;
-            tools.iter().find(|t| t.name == tool_name).cloned()
-        })
+        self.snapshot().tool(server_id, tool_name)
     }
 
-    /// Refresh tools from a server.
+    /// Refresh a server's catalog using its exact currently-published runtime.
     pub async fn refresh_tools(&self, server_id: &str) -> Result<()> {
-        let runtime = self
-            .runtimes
-            .get(server_id)
-            .map(|runtime| runtime.value().clone())
+        let expected = self
+            .current_expected(server_id)
             .ok_or_else(|| McpError::ServerNotFound(server_id.to_string()))?;
+        self.refresh_tools_for_expected(expected).await.map(|_| ())
+    }
 
+    async fn refresh_tools_for_expected(&self, expected: ExpectedPublication) -> Result<bool> {
+        let server_id = expected.server_id().to_string();
         info!("Refreshing tools for MCP server '{}'", server_id);
-
-        let client = runtime.client.read().await;
-        let new_tools = client.list_tools(runtime.config.request_timeout_ms).await?;
-        drop(client);
-
-        if !self
-            .publish_refreshed_tools_if_current(server_id, &runtime, new_tools)
-            .await?
-        {
-            tracing::debug!(
-                "Discarding tool refresh for detached MCP runtime '{}'",
-                server_id
-            );
-        }
-        Ok(())
+        let client = expected.runtime().client_if_open()?;
+        let new_tools = client
+            .list_tools(expected.runtime().runtime.config.request_timeout_ms)
+            .await?;
+        self.publish_refreshed_tools_if_current(expected, new_tools)
+            .await
     }
 
     pub(super) async fn publish_refreshed_tools_if_current(
         &self,
-        server_id: &str,
-        runtime: &Arc<ServerRuntime>,
+        expected: ExpectedPublication,
         new_tools: Vec<McpTool>,
     ) -> Result<bool> {
-        // Serialize the generation check with transactional replacement. The
-        // list_tools await above may span a replacement, so checking only when
-        // the refresh starts is insufficient.
-        let _reconcile = self.reconcile_lock.lock().await;
-        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        if !self.is_current_publication(&expected) {
             return Ok(false);
         }
-
+        let server_id = expected.server_id().to_string();
+        let config = &expected.runtime().runtime.config;
         let catalog = self.index.plan_server_tools(
-            server_id,
+            &server_id,
             &new_tools,
-            &runtime.config.allowed_tools,
-            &runtime.config.denied_tools,
+            &config.allowed_tools,
+            &config.denied_tools,
         )?;
-        let aliases = catalog.aliases();
-        let transaction = self
-            .index
-            .preflight_catalog_update(std::slice::from_ref(&catalog), &[])?;
-
-        // Acquire every fallible/suspending guard before the publication point.
-        // From the index swap through the runtime metadata update there is no
-        // await, so a failed preflight leaves the prior catalog untouched.
-        let mut tools = runtime.tools.write().await;
-        let mut info = runtime.info.write().await;
-        self.index.commit_catalog_update(transaction);
-        *tools = new_tools.clone();
-        info.tool_count = new_tools.len();
-        drop(info);
-        drop(tools);
-
-        info!(
-            "Refreshed {} tools for MCP server '{}'",
-            aliases.len(),
-            server_id
-        );
-
-        // Emit event
-        if let Some(ref tx) = self.event_tx {
-            let tool_names: Vec<String> = aliases.into_iter().map(|a| a.alias).collect();
-            let _ = tx
-                .send(McpEvent::ToolsChanged {
-                    server_id: server_id.to_string(),
-                    tools: tool_names,
-                })
-                .await;
+        let replacement = ServerPublication::new(
+            self.allocate_publication_id()?,
+            expected.runtime().clone(),
+            catalog,
+            &new_tools,
+        )?;
+        let base = self.authority.generation();
+        if !Arc::ptr_eq(
+            base.servers
+                .get(&server_id)
+                .expect("validated current server"),
+            &expected.publication,
+        ) {
+            return Ok(false);
         }
-
+        let next = McpRuntimeGeneration::plan(
+            &base,
+            std::slice::from_ref(&replacement),
+            &[],
+            self.authority.ledger_relationship_limit,
+            true,
+        )?;
+        let events = self.prepare_event_batch(
+            sequence,
+            vec![McpEvent::ToolsChanged {
+                server_id,
+                tools: replacement
+                    .catalog
+                    .aliases()
+                    .into_iter()
+                    .map(|alias| alias.alias)
+                    .collect(),
+            }],
+            Vec::new(),
+        );
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::BeforeFenceAndSwap);
+        self.authority.replace_prevalidated_with(&base, next, || {
+            expected.publication.close_admission();
+            #[cfg(test)]
+            self.observe_publish(PublishProbePhase::AfterFencesBeforeSwap);
+        });
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::AfterTransferAndSwapBeforeUnlock);
+        drop(reconcile);
+        events.activate();
         Ok(true)
     }
 
-    fn start_health_check(&self, runtime: Arc<ServerRuntime>, interval_ms: u64) {
-        let server_id = runtime.config.id.clone();
-        let manager = Arc::new(self.clone());
-
+    fn spawn_health_check(
+        &self,
+        runtime: Arc<TransportRuntime>,
+        mut activation: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = self.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(interval_ms));
-
+            if !Self::wait_for_runtime_activation(&mut activation).await {
+                return;
+            }
+            let mut ticker = interval(Duration::from_millis(
+                runtime.runtime.config.healthcheck_interval_ms,
+            ));
             loop {
-                interval.tick().await;
-
-                if runtime.shutdown.load(Ordering::SeqCst)
-                    || !manager.is_current_runtime(&server_id, &runtime)
-                {
+                ticker.tick().await;
+                let Some(expected) = manager.current_expected_for_runtime(&runtime) else {
                     break;
-                }
-
-                // Skip health check if currently reconnecting
-                if runtime.reconnecting.load(Ordering::SeqCst) {
+                };
+                if runtime.runtime.reconnecting.load(Ordering::SeqCst) {
                     continue;
                 }
-
-                let ping_result = {
-                    let client = runtime.client.read().await;
-                    client.ping(runtime.config.request_timeout_ms).await
+                let result = match runtime.client_if_open() {
+                    Ok(client) => client
+                        .ping(runtime.runtime.config.request_timeout_ms)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(_) => break,
                 };
-
                 let Some(should_reconnect) = manager
-                    .publish_health_result_if_current(
-                        &server_id,
-                        &runtime,
-                        ping_result.map_err(|error| error.to_string()),
-                    )
+                    .publish_health_result_if_current(expected.clone(), result)
                     .await
                 else {
-                    break;
+                    continue;
                 };
-
                 if should_reconnect {
-                    if let Err(reconnect_err) = manager.attempt_reconnection(runtime.clone()).await
-                    {
-                        error!(
-                            "Reconnection failed for MCP server '{}': {}",
-                            server_id, reconnect_err
-                        );
+                    if let Err(error) = manager.attempt_reconnection(expected).await {
+                        error!("MCP health-triggered reconnection failed: {}", error);
                     }
                 }
             }
-        });
+        })
     }
 
     pub(super) async fn publish_health_result_if_current(
         &self,
-        server_id: &str,
-        runtime: &Arc<ServerRuntime>,
+        expected: ExpectedPublication,
         result: std::result::Result<(), String>,
     ) -> Option<bool> {
-        // A ping may span a transactional replacement. Keep this generation
-        // check and all status/event publication serialized with replacement.
-        let _reconcile = self.reconcile_lock.lock().await;
-        if runtime.shutdown.load(Ordering::SeqCst) || !self.is_current_runtime(server_id, runtime) {
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
+        if !self.is_current_publication(&expected) {
             return None;
         }
-
-        match result {
+        let runtime = expected.runtime();
+        let (should_reconnect, event) = match result {
             Ok(()) => {
-                let mut info = runtime.info.write().await;
+                let mut info = runtime.runtime.info.write().await;
                 info.last_ping_at = Some(Utc::now());
                 let recovered = info.status == ServerStatus::Degraded;
                 if recovered {
                     info.status = ServerStatus::Ready;
                 }
                 drop(info);
-                if recovered {
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx
-                            .send(McpEvent::ServerStatusChanged {
-                                server_id: server_id.to_string(),
-                                status: ServerStatus::Ready,
-                                error: None,
-                            })
-                            .await;
-                    }
-                }
-                Some(false)
+                let event = recovered.then(|| McpEvent::ServerStatusChanged {
+                    server_id: expected.server_id().to_string(),
+                    status: ServerStatus::Ready,
+                    error: None,
+                });
+                (false, event)
             }
             Err(error) => {
                 warn!(
                     "Health check failed for MCP server '{}': {}",
-                    server_id, error
+                    expected.server_id(),
+                    error
                 );
                 {
-                    let mut info = runtime.info.write().await;
+                    let mut info = runtime.runtime.info.write().await;
                     info.status = ServerStatus::Degraded;
                     info.last_error = Some(error.clone());
                 }
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx
-                        .send(McpEvent::ServerStatusChanged {
-                            server_id: server_id.to_string(),
-                            status: ServerStatus::Degraded,
-                            error: Some(error),
-                        })
-                        .await;
-                }
-                Some(runtime.config.reconnect.enabled)
+                (
+                    runtime.runtime.config.reconnect.enabled,
+                    Some(McpEvent::ServerStatusChanged {
+                        server_id: expected.server_id().to_string(),
+                        status: ServerStatus::Degraded,
+                        error: Some(error),
+                    }),
+                )
             }
+        };
+        let events = event.map(|event| self.prepare_event_batch(sequence, vec![event], Vec::new()));
+        drop(reconcile);
+        if let Some(events) = events {
+            events.activate();
         }
+        Some(should_reconnect)
     }
 
-    /// Spawns the per-connection task that DRAINS this client's server-notification
-    /// queue and dispatches each notification. #366.
-    ///
-    /// The task owns the receiver (taken from the client) so it parks on
-    /// `recv().await` with zero wakeups while idle — no client lock held across the
-    /// await, no polling. It exits cleanly when every notification sender closes
-    /// (the client is disconnected/replaced on reconnect, or dropped on shutdown),
-    /// mirroring the message-handler's channel-close contract.
-    ///
-    /// Without this consumer the queue would silently fill to capacity and drop
-    /// every later notification (the #363 non-blocking send is a safety valve, not
-    /// a drain), so any capability driven by server notifications — here,
-    /// `tools/list_changed` -> tool-list refresh — would be inert.
-    pub(super) fn spawn_notification_drain(
+    fn spawn_notification_drain(
         &self,
-        server_id: String,
-        expected_runtime: Arc<ServerRuntime>,
+        runtime: Arc<TransportRuntime>,
         mut receiver: tokio::sync::mpsc::Receiver<JsonRpcNotification>,
-    ) {
+        mut activation: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move {
-            while let Some(notification) = receiver.recv().await {
-                let still_current = manager
-                    .runtimes
-                    .get(&server_id)
-                    .is_some_and(|runtime| Arc::ptr_eq(runtime.value(), &expected_runtime));
-                if !still_current {
+            if !Self::wait_for_runtime_activation(&mut activation).await {
+                return;
+            }
+            loop {
+                let Some(expected) = manager.current_expected_for_runtime(&runtime) else {
                     break;
-                }
+                };
+                let Some(notification) = receiver.recv().await else {
+                    break;
+                };
                 manager
-                    .dispatch_server_notification(&server_id, notification)
+                    .dispatch_server_notification(expected, notification)
                     .await;
             }
-            tracing::trace!(
-                "MCP notification drain for server '{}' exited (channel closed)",
-                server_id
-            );
-        });
+        })
     }
 
-    /// Dispatches a single server-initiated notification. Handles
-    /// `tools/list_changed` by refreshing the server's tool list (re-registering
-    /// the tool index + emitting `ToolsChanged`); all other methods are drained and
-    /// traced so the queue can never saturate. #366.
-    async fn dispatch_server_notification(
+    async fn wait_for_runtime_activation(
+        activation: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        if *activation.borrow() {
+            return true;
+        }
+        activation.changed().await.is_ok() && *activation.borrow()
+    }
+
+    pub(super) async fn dispatch_server_notification(
         &self,
-        server_id: &str,
+        expected: ExpectedPublication,
         notification: JsonRpcNotification,
     ) {
         let method = notification.method.as_str();
         if TOOLS_LIST_CHANGED_METHODS.contains(&method) {
-            info!(
-                "MCP server '{}' announced '{}'; refreshing tool list",
-                server_id, method
-            );
-            if let Err(e) = self.refresh_tools(server_id).await {
-                warn!(
-                    "Failed to refresh tools for MCP server '{}' after '{}': {}",
-                    server_id, method, e
-                );
+            if let Err(error) = self.refresh_tools_for_expected(expected).await {
+                warn!("Failed to refresh MCP tools after notification: {}", error);
             }
         } else {
-            tracing::trace!(
-                "MCP server '{}' notification '{}' drained (no dispatcher)",
-                server_id,
-                method
-            );
+            tracing::trace!("MCP notification '{}' drained (no dispatcher)", method);
         }
     }
 }
