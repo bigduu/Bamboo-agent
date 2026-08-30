@@ -92,6 +92,59 @@ fn execute_request_builder_defaults_run_budget_to_none() {
 }
 
 #[test]
+fn completed_tool_trace_observation_gate_requires_normal_durable_completion() {
+    let successful: crate::runtime::runner::Result<()> = Ok(());
+    let mut session = Session::new("reuse-observation-gate", "test-model");
+    let mut completed = bamboo_domain::AgentRuntimeState::new(&session.id);
+    completed.status = bamboo_domain::AgentStatusState::Completed;
+    session.agent_runtime_state = Some(completed);
+
+    assert!(super::runtime::should_observe_completed_tool_trace(
+        &successful,
+        true,
+        &session,
+    ));
+    assert!(!super::runtime::should_observe_completed_tool_trace(
+        &successful,
+        false,
+        &session,
+    ));
+
+    session.metadata.insert(
+        "runtime.completion_reason".to_string(),
+        "future_non_normal_reason".to_string(),
+    );
+    assert!(
+        !super::runtime::should_observe_completed_tool_trace(&successful, true, &session),
+        "any exceptional completion reason must not feed reuse discovery"
+    );
+    session.metadata.remove("runtime.completion_reason");
+
+    session.metadata.insert(
+        "runtime.suspend_reason".to_string(),
+        "awaiting_clarification".to_string(),
+    );
+    if let Some(state) = session.agent_runtime_state.as_mut() {
+        state.status = bamboo_domain::AgentStatusState::Suspended;
+    }
+    assert!(!super::runtime::should_observe_completed_tool_trace(
+        &successful,
+        true,
+        &session,
+    ));
+
+    session.metadata.remove("runtime.suspend_reason");
+    if let Some(state) = session.agent_runtime_state.as_mut() {
+        state.status = bamboo_domain::AgentStatusState::Completed;
+    }
+    let cancelled: crate::runtime::runner::Result<()> =
+        Err(bamboo_agent_core::AgentError::Cancelled);
+    assert!(!super::runtime::should_observe_completed_tool_trace(
+        &cancelled, true, &session,
+    ));
+}
+
+#[test]
 fn skip_initial_message_flag() {
     let config = AgentLoopConfig {
         skip_initial_user_message: true,
@@ -343,6 +396,10 @@ struct MidLoopThenPartialErrorProvider {
     calls: AtomicUsize,
 }
 
+struct CompletedReuseTraceProvider {
+    calls: AtomicUsize,
+}
+
 struct RetryBeforeStreamThenSuccessProvider {
     calls: AtomicUsize,
 }
@@ -500,7 +557,35 @@ impl LLMProvider for MidLoopThenPartialErrorProvider {
     }
 }
 
+#[async_trait]
+impl LLMProvider for CompletedReuseTraceProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    make_tool_call("reuse-read", "Read", r#"{"file_path":"demo.txt"}"#),
+                    make_tool_call("reuse-grep", "Grep", r#"{"pattern":"needle","path":"."}"#),
+                ])),
+                Ok(LLMChunk::Done),
+            ]))),
+            1 => Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("reuse trace completed".to_string())),
+                Ok(LLMChunk::Done),
+            ]))),
+            call => panic!("unexpected LLM call {call}"),
+        }
+    }
+}
+
 struct SuccessfulReadToolExecutor;
+
+struct SuccessfulReuseTraceToolExecutor;
 
 #[async_trait]
 impl ToolExecutor for SuccessfulReadToolExecutor {
@@ -526,7 +611,38 @@ impl ToolExecutor for SuccessfulReadToolExecutor {
     }
 }
 
+#[async_trait]
+impl ToolExecutor for SuccessfulReuseTraceToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        assert!(matches!(call.function.name.as_str(), "Read" | "Grep"));
+        Ok(ToolResult {
+            success: true,
+            result: format!("{} completed", call.function.name),
+            display_preference: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        ["Read", "Grep"]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: name.to_string(),
+                    description: format!("test {name}"),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            })
+            .collect()
+    }
+}
+
 struct FailingCheckpointPersistence {
+    attempts: AtomicUsize,
+}
+
+struct FailingCompletedCheckpointPersistence {
     attempts: AtomicUsize,
 }
 
@@ -544,6 +660,28 @@ impl RuntimeSessionPersistence for FailingCheckpointPersistence {
             // The model-context ledger has its own fail-closed checkpoint test.
             // This mock targets only the shared post-execution checkpoint whose
             // failure must not replace the provider's original error.
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for FailingCompletedCheckpointPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| matches!(state.status, bamboo_domain::AgentStatusState::Completed))
+        {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "intentional final checkpoint failure",
+            ))
+        } else {
             Ok(())
         }
     }
@@ -569,6 +707,23 @@ async fn build_direct_execute_agent_with_config(
     tools_override: Option<Arc<dyn ToolExecutor>>,
     config: bamboo_llm::Config,
 ) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
+    build_direct_execute_agent_with_config_and_skill_manager(
+        provider,
+        persistence_override,
+        tools_override,
+        config,
+        Arc::new(bamboo_skills::SkillManager::new()),
+    )
+    .await
+}
+
+async fn build_direct_execute_agent_with_config_and_skill_manager(
+    provider: Arc<dyn LLMProvider>,
+    persistence_override: Option<Arc<dyn RuntimeSessionPersistence>>,
+    tools_override: Option<Arc<dyn ToolExecutor>>,
+    config: bamboo_llm::Config,
+    skill_manager: Arc<bamboo_skills::SkillManager>,
+) -> (tempfile::TempDir, crate::runtime::Agent, Arc<dyn Storage>) {
     let temp = tempfile::tempdir().expect("tempdir");
     let session_store = Arc::new(
         bamboo_storage::SessionStoreV2::new(temp.path().join("sessions"))
@@ -590,7 +745,7 @@ async fn build_direct_execute_agent_with_config(
         .storage(storage.clone())
         .persistence(persistence)
         .attachment_reader(session_store)
-        .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+        .skill_manager(skill_manager)
         .metrics_collector(metrics)
         .config(Arc::new(RwLock::new(config)))
         .provider(provider)
@@ -678,6 +833,120 @@ async fn direct_execute_checkpoints_normal_completion_without_task_context() {
     assert!(saved.agent_runtime_state.as_ref().is_some_and(|state| {
         matches!(state.status, bamboo_domain::AgentStatusState::Completed)
     }));
+}
+
+#[tokio::test]
+async fn direct_execute_observes_normal_completed_tool_trace_after_checkpoint() {
+    let draft_temp = tempfile::tempdir().expect("draft tempdir");
+    let skills_dir = draft_temp.path().join("skills");
+    let skill_manager = Arc::new(bamboo_skills::SkillManager::with_config_and_reuse_drafts(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir,
+            project_dir: None,
+            active_mode: None,
+        },
+        bamboo_skills::ReuseDraftConfig {
+            repetition_threshold: 1,
+            ..Default::default()
+        },
+    ));
+
+    let provider = Arc::new(CompletedReuseTraceProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let (_session_temp, agent, storage) = build_direct_execute_agent_with_config_and_skill_manager(
+        provider.clone(),
+        None,
+        Some(Arc::new(SuccessfulReuseTraceToolExecutor)),
+        bamboo_llm::Config::default(),
+        skill_manager,
+    )
+    .await;
+    let mut session = Session::new("reuse-trace-runtime", "test-model");
+    session.add_message(Message::user("repeat the successful trace"));
+    storage.save_session(&session).await.unwrap();
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("normal tool trace execute");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let candidates_dir = draft_temp.path().join("reuse-drafts/candidates");
+    let mut entries = tokio::fs::read_dir(&candidates_dir)
+        .await
+        .expect("candidate directory");
+    let candidate = entries
+        .next_entry()
+        .await
+        .expect("read candidate")
+        .expect("one candidate");
+    assert!(entries
+        .next_entry()
+        .await
+        .expect("read trailing candidate")
+        .is_none());
+    for file_name in ["draft.json", "SKILL.md", "validation.json"] {
+        assert!(
+            candidate.path().join(file_name).is_file(),
+            "missing {file_name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn direct_execute_does_not_observe_tool_trace_when_final_checkpoint_fails() {
+    let draft_temp = tempfile::tempdir().expect("draft tempdir");
+    let skills_dir = draft_temp.path().join("skills");
+    let skill_manager = Arc::new(bamboo_skills::SkillManager::with_config_and_reuse_drafts(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir,
+            project_dir: None,
+            active_mode: None,
+        },
+        bamboo_skills::ReuseDraftConfig {
+            repetition_threshold: 1,
+            ..Default::default()
+        },
+    ));
+    let provider = Arc::new(CompletedReuseTraceProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let persistence = Arc::new(FailingCompletedCheckpointPersistence {
+        attempts: AtomicUsize::new(0),
+    });
+    let (_session_temp, agent, storage) = build_direct_execute_agent_with_config_and_skill_manager(
+        provider.clone(),
+        Some(persistence.clone()),
+        Some(Arc::new(SuccessfulReuseTraceToolExecutor)),
+        bamboo_llm::Config::default(),
+        skill_manager,
+    )
+    .await;
+    let mut session = Session::new("reuse-trace-checkpoint-failure", "test-model");
+    session.add_message(Message::user("do not observe an undurable trace"));
+    session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(&session.id));
+    storage.save_session(&session).await.unwrap();
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    agent
+        .execute(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect("checkpoint failure must not replace normal execution result");
+
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(persistence.attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        !draft_temp.path().join("reuse-drafts/candidates").exists(),
+        "an uncheckpointed trace must not create a reuse candidate"
+    );
 }
 
 #[tokio::test]

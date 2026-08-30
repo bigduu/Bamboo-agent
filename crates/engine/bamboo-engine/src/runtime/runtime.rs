@@ -668,6 +668,21 @@ fn extract_system_prompt(session: &Session) -> Option<String> {
         .map(|m| m.content.clone())
 }
 
+pub(super) fn should_observe_completed_tool_trace(
+    result: &crate::runtime::runner::Result<()>,
+    final_checkpoint_succeeded: bool,
+    session: &Session,
+) -> bool {
+    final_checkpoint_succeeded
+        && result.is_ok()
+        && session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| matches!(state.status, bamboo_domain::AgentStatusState::Completed))
+        && !session.metadata.contains_key("runtime.suspend_reason")
+        && !session.metadata.contains_key("runtime.completion_reason")
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -850,6 +865,7 @@ impl AgentRuntime {
 
         drop(config);
 
+        let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
         let result = run_agent_loop_with_config(
@@ -882,19 +898,38 @@ impl AgentRuntime {
         // particular, callers need the original LLM/cancellation error for
         // retry and terminal-status mapping; the failed durability attempt is
         // recorded separately.
-        if let Err(checkpoint_error) = self.persistence.checkpoint_runtime_session(session).await {
-            match &result {
-                Ok(()) => tracing::warn!(
+        let final_checkpoint_succeeded =
+            match self.persistence.checkpoint_runtime_session(session).await {
+                Ok(()) => true,
+                Err(checkpoint_error) => {
+                    match &result {
+                        Ok(()) => tracing::warn!(
+                            session_id = %session.id,
+                            error = %checkpoint_error,
+                            "failed to checkpoint session transcript after successful execution"
+                        ),
+                        Err(execution_error) => tracing::warn!(
+                            session_id = %session.id,
+                            error = %checkpoint_error,
+                            execution_error = %execution_error,
+                            "failed to checkpoint session transcript after execution error"
+                        ),
+                    }
+                    false
+                }
+            };
+
+        if should_observe_completed_tool_trace(&result, final_checkpoint_succeeded, session) {
+            if let Err(error) = self
+                .skill_manager
+                .observe_completed_tool_trace(session, trace_message_start)
+                .await
+            {
+                tracing::warn!(
                     session_id = %session.id,
-                    error = %checkpoint_error,
-                    "failed to checkpoint session transcript after successful execution"
-                ),
-                Err(execution_error) => tracing::warn!(
-                    session_id = %session.id,
-                    error = %checkpoint_error,
-                    execution_error = %execution_error,
-                    "failed to checkpoint session transcript after execution error"
-                ),
+                    %error,
+                    "failed to observe completed tool trace for reuse draft discovery"
+                );
             }
         }
 

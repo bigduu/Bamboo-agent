@@ -8,6 +8,7 @@ pub mod clone_publication;
 pub mod context;
 pub mod legacy;
 pub mod resource_helpers;
+pub mod reuse_draft;
 pub mod runtime_metadata;
 pub mod selection;
 pub mod session_port;
@@ -20,6 +21,7 @@ pub use catalog::{
     WorkflowCatalogEvent, WorkflowCatalogEventKind, WorkflowCatalogSnapshot, WorkflowKind,
     WorkflowSource, WorkflowStatus,
 };
+pub use reuse_draft::{ReuseDraftArtifact, ReuseDraftConfig, ReuseDraftRepresentation};
 pub use store::{
     SkillActivationDescriptor, SkillActivationSnapshot, SkillActivationSnapshotEntry, SkillStore,
     SkillUpdate,
@@ -277,6 +279,7 @@ fn invocation_allowed_skill_ids<'a>(
 pub struct SkillManager {
     store: Arc<SkillStore>,
     activation_scope_coordinator: Arc<tokio::sync::Mutex<()>>,
+    reuse_draft_collector: Arc<reuse_draft::ReuseDraftCollector>,
 }
 
 #[derive(Debug, Clone)]
@@ -290,18 +293,43 @@ pub struct SkillActivationSelection {
 impl SkillManager {
     /// Create a new skill manager with default configuration.
     pub fn new() -> Self {
-        Self {
-            store: Arc::new(SkillStore::default()),
-            activation_scope_coordinator: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        Self::with_config_and_reuse_drafts(SkillStoreConfig::default(), ReuseDraftConfig::default())
     }
 
     /// Create a new skill manager with custom configuration.
     pub fn with_config(config: SkillStoreConfig) -> Self {
+        Self::with_config_and_reuse_drafts(config, ReuseDraftConfig::default())
+    }
+
+    /// Create a manager with an explicit repeated-trace draft policy.
+    pub fn with_config_and_reuse_drafts(
+        config: SkillStoreConfig,
+        reuse_draft_config: ReuseDraftConfig,
+    ) -> Self {
+        let reuse_draft_collector = Arc::new(reuse_draft::ReuseDraftCollector::for_skills_dir(
+            &config.skills_dir,
+            reuse_draft_config,
+        ));
         Self {
             store: Arc::new(SkillStore::new(config)),
             activation_scope_coordinator: Arc::new(tokio::sync::Mutex::new(())),
+            reuse_draft_collector,
         }
+    }
+
+    /// Observe one successfully checkpointed execute-run transcript slice.
+    ///
+    /// Invalid or insufficient traces and repeated sessions return `Ok(None)`.
+    /// The first distinct session that reaches the configured threshold returns
+    /// the newly persisted, review-only draft artifact.
+    pub async fn observe_completed_tool_trace(
+        &self,
+        session: &bamboo_domain::Session,
+        message_start: usize,
+    ) -> SkillResult<Option<ReuseDraftArtifact>> {
+        self.reuse_draft_collector
+            .observe(session, message_start)
+            .await
     }
 
     /// Initialize the manager.
