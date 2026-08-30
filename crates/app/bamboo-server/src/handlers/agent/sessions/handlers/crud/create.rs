@@ -2780,6 +2780,17 @@ mod tests {
         assert!(prompt["project_context"]
             .as_str()
             .is_some_and(|value| value.contains(owner.id.as_str())));
+        let project_context = prompt["project_context"]
+            .as_str()
+            .expect("typed Project context");
+        assert!(!project_context.contains(&nested_workspace_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = prompt["workspace_context"]
+            .as_str()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&nested_workspace_display));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: registered"));
         let effective = prompt["effective_system_prompt"]
             .as_str()
             .expect("effective prompt");
@@ -2787,15 +2798,15 @@ mod tests {
             effective
                 .matches("<!-- BAMBOO_PROJECT_CONTEXT_START -->")
                 .count(),
-            1
+            0
         );
         assert_eq!(
             effective
                 .matches("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")
                 .count(),
-            1
+            0
         );
-        assert!(effective.contains("Binding status: registered"));
+        assert!(!effective.contains(&nested_workspace_display));
     }
 
     #[actix_web::test]
@@ -2917,7 +2928,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn same_project_default_workspace_is_persisted_with_prompt_marker() {
+    async fn same_project_default_workspace_is_persisted_with_dynamic_context() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
         let foreign_default = tempdir().expect("foreign global default");
@@ -2998,22 +3009,33 @@ mod tests {
             .project_context
             .as_deref()
             .expect("Project context");
-        assert!(project_context.contains(&format!("Project path: {canonical_display}")));
-        assert!(project_context.contains("Project home (Bamboo data):"));
+        assert!(project_context.contains(project.id.as_str()));
+        assert!(!project_context.contains(&canonical_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("Workspace context");
+        assert!(workspace_context.contains(&canonical_display));
+        assert!(workspace_context.contains("Binding status: registered"));
+        assert!(workspace_context.contains("Workspace source: project_default"));
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_PROJECT_CONTEXT_START")
                 .count(),
-            1
+            0
         );
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_WORKSPACE_CONTEXT_START")
                 .count(),
-            1
+            0
         );
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(&canonical_display));
     }
 
     #[actix_web::test]

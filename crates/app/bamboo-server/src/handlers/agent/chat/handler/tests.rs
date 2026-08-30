@@ -1066,6 +1066,9 @@ mod optional_model_e2e {
             .await
             .expect("load")
             .expect("session");
+        let workspace_display = session
+            .workspace_path_meta()
+            .expect("persisted workspace path");
         let resolved = state
             .project_context_resolver
             .resolve(&session, None)
@@ -1076,26 +1079,47 @@ mod optional_model_e2e {
             resolved.binding_status,
             bamboo_engine::project_context::WorkspaceBindingStatus::Registered
         );
+        assert!(session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .all(|message| {
+                !message.content.contains("BAMBOO_PROJECT_CONTEXT_START")
+                    && !message.content.contains("BAMBOO_WORKSPACE_CONTEXT_START")
+                    && !message.content.contains(&workspace_display)
+            }));
         let snapshot = session.prompt_snapshot.expect("immediate prompt snapshot");
-        assert!(snapshot
+        let project_context = snapshot
             .project_context
             .as_deref()
-            .is_some_and(|context| context.contains(owner.id.as_str())));
+            .expect("typed Project context");
+        assert!(project_context.contains(owner.id.as_str()));
+        assert!(!project_context.contains(&workspace_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&workspace_display));
+        assert!(workspace_context.contains("Workspace source: explicit"));
+        assert!(workspace_context.contains("Binding status: registered"));
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("<!-- BAMBOO_PROJECT_CONTEXT_START -->")
                 .count(),
-            1
+            0
         );
-        assert!(
+        assert_eq!(
             snapshot
-                .workspace_context
-                .as_deref()
-                .is_some_and(|context| context.contains("Binding status: registered")),
-            "unexpected workspace context: {:?}",
-            snapshot.workspace_context
+                .effective_system_prompt
+                .matches("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")
+                .count(),
+            0
         );
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(&workspace_display));
     }
 
     #[actix_web::test]
@@ -1413,7 +1437,7 @@ mod optional_model_e2e {
     }
 
     #[actix_web::test]
-    async fn chat_persists_same_project_configured_default_and_prompt_marker() {
+    async fn chat_persists_same_project_configured_default_and_dynamic_context() {
         let state = new_state().await;
         let workspace = tempdir().expect("default workspace");
         let foreign_default = tempdir().expect("foreign global default");
@@ -1466,18 +1490,47 @@ mod optional_model_e2e {
             bamboo_agent_core::workspace_state::get_workspace("chat-default-owned").as_deref(),
             Some(canonical.as_path())
         );
+        assert!(session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .all(|message| {
+                !message.content.contains("BAMBOO_PROJECT_CONTEXT_START")
+                    && !message.content.contains("BAMBOO_WORKSPACE_CONTEXT_START")
+                    && !message.content.contains(&canonical_display)
+            }));
         let snapshot = session.prompt_snapshot.expect("prompt snapshot");
-        assert!(snapshot.workspace_context.as_deref().is_some_and(|value| {
-            value.contains("Binding status: registered")
-                && value.contains("Workspace source: project_default")
-        }));
+        let project_context = snapshot
+            .project_context
+            .as_deref()
+            .expect("typed Project context");
+        assert!(project_context.contains(project.id.as_str()));
+        assert!(!project_context.contains(&canonical_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&canonical_display));
+        assert!(workspace_context.contains("Binding status: registered"));
+        assert!(workspace_context.contains("Workspace source: project_default"));
+        assert_eq!(
+            snapshot
+                .effective_system_prompt
+                .matches("BAMBOO_PROJECT_CONTEXT_START")
+                .count(),
+            0
+        );
         assert_eq!(
             snapshot
                 .effective_system_prompt
                 .matches("BAMBOO_WORKSPACE_CONTEXT_START")
                 .count(),
-            1
+            0
         );
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(&canonical_display));
     }
 
     #[actix_web::test]
