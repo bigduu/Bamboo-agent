@@ -383,6 +383,8 @@ mod project_prompt_tests {
         let second = directory.path().join("worktree");
         std::fs::create_dir_all(&first).expect("first");
         std::fs::create_dir_all(&second).expect("second");
+        let first = first.canonicalize().expect("canonical first workspace");
+        let second = second.canonicalize().expect("canonical second workspace");
         let project_id = ProjectId::parse("project-1").expect("project id");
         let descriptor = ProjectDescriptor {
             id: project_id.clone(),
@@ -469,7 +471,7 @@ mod project_prompt_tests {
                 .metadata
                 .get(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
                 .map(String::as_str),
-            Some(crate::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+            Some(crate::project_context::WorkspaceBindingStatus::Registered.as_str())
         );
     }
 
