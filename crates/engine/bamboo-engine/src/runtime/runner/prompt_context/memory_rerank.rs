@@ -42,8 +42,8 @@ pub(super) struct MemoryRecallRerankContext {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MemoryRecallRerankEnvelope {
-    #[serde(default)]
     ids: Vec<String>,
 }
 
@@ -180,26 +180,28 @@ async fn rerank_candidate_ids(
         cache: None,
     };
 
-    let mut stream = context
-        .llm
-        .chat_stream_with_options(&messages, &[], Some(8192), model, Some(&options))
-        .await
-        .map_err(|error| format!("rerank provider call failed: {error}"))?;
-
     let content = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut stream = context
+            .llm
+            .chat_stream_with_options(&messages, &[], Some(8192), model, Some(&options))
+            .await
+            .map_err(|error| format!("rerank provider call failed: {error}"))?;
+
         let mut content = String::new();
+        let mut terminal_done = false;
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(LLMChunk::Token(text)) => content.push_str(&text),
-                Ok(LLMChunk::Done) => break,
-                Ok(_) => {}
-                Err(error) => {
-                    if !content.trim().is_empty() {
-                        break;
-                    }
-                    return Err(format!("rerank stream failed: {error}"));
+                Ok(LLMChunk::Done) => {
+                    terminal_done = true;
+                    break;
                 }
+                Ok(_) => {}
+                Err(error) => return Err(format!("rerank stream failed: {error}")),
             }
+        }
+        if !terminal_done {
+            return Err("rerank stream ended without terminal completion".to_string());
         }
         Ok(content)
     })
@@ -262,6 +264,7 @@ fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option
         .map(|value| value.ids)
         .or_else(|_| serde_json::from_str::<Vec<String>>(fragment))
         .ok()?;
+    let explicit_empty_selection = ids.is_empty();
 
     let allowed = candidates
         .iter()
@@ -276,6 +279,10 @@ fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option
             continue;
         }
         out.push(trimmed.to_string());
+    }
+
+    if out.is_empty() && !explicit_empty_selection {
+        return None;
     }
 
     Some(out)
@@ -354,7 +361,10 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FailingProvider {
         Call,
+        PendingCall,
         PendingStream,
+        PartialThenError,
+        EofWithoutDone,
     }
 
     #[async_trait]
@@ -368,7 +378,15 @@ mod tests {
         ) -> Result<LLMStream, LLMError> {
             match self {
                 Self::Call => Err(LLMError::Api("rerank unavailable".to_string())),
+                Self::PendingCall => std::future::pending::<Result<LLMStream, LLMError>>().await,
                 Self::PendingStream => Ok(Box::pin(stream::pending())),
+                Self::PartialThenError => Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("{\"ids\":[]}".to_string())),
+                    Err(LLMError::Stream("connection reset".to_string())),
+                ]))),
+                Self::EofWithoutDone => Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+                    "{\"ids\":[]}".to_string(),
+                ))]))),
             }
         }
     }
@@ -397,6 +415,31 @@ mod tests {
         .expect("reranked ids should parse");
 
         assert_eq!(parsed, vec!["mem-b".to_string(), "mem-a".to_string()]);
+    }
+
+    #[test]
+    fn parse_reranked_ids_requires_an_explicit_well_typed_ids_field() {
+        let candidates = vec![candidate("mem-a", 10.0)];
+
+        assert!(parse_reranked_ids("{}", &candidates).is_none());
+        assert!(parse_reranked_ids("{\"other\":[]}", &candidates).is_none());
+        assert!(parse_reranked_ids("{\"ids\":\"mem-a\"}", &candidates).is_none());
+        assert!(
+            parse_reranked_ids("{\"ids\":[],\"error\":\"rate limited\"}", &candidates).is_none()
+        );
+    }
+
+    #[test]
+    fn parse_reranked_ids_accepts_only_explicit_empty_selections() {
+        let candidates = vec![candidate("mem-a", 10.0)];
+
+        assert_eq!(
+            parse_reranked_ids("{\"ids\":[]}", &candidates),
+            Some(Vec::new())
+        );
+        assert_eq!(parse_reranked_ids("[]", &candidates), Some(Vec::new()));
+        assert!(parse_reranked_ids("{\"ids\":[\"unknown\",\" \"]}", &candidates).is_none());
+        assert!(parse_reranked_ids("[\"unknown\",\"\"]", &candidates).is_none());
     }
 
     #[test]
@@ -499,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_model_response_falls_back_to_deterministic_shortlist() {
+    async fn invalid_or_empty_after_filter_response_falls_back_to_deterministic_shortlist() {
         let (_dir, store) = recall_store().await;
         let options = MemoryRecallOptions {
             shortlist_limit: 2,
@@ -515,39 +558,49 @@ mod tests {
         .await
         .expect("deterministic shortlist");
 
-        let selection = select_relevant_memories(
-            &store,
-            Some("proj-1"),
-            "release freeze for mobile",
-            &options,
-            Some(&rerank_context("not valid json")),
-        )
-        .await
-        .expect("fallback selection");
+        for response in [
+            "not valid json",
+            "{}",
+            "{\"other\":[]}",
+            "{\"ids\":[],\"error\":\"rate limited\"}",
+            "{\"ids\":[\"unknown\",\" \"]}",
+        ] {
+            let selection = select_relevant_memories(
+                &store,
+                Some("proj-1"),
+                "release freeze for mobile",
+                &options,
+                Some(&rerank_context(response)),
+            )
+            .await
+            .expect("fallback selection");
 
-        assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
-        assert_eq!(selection.candidates, expected);
+            assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
+            assert_eq!(selection.candidates, expected);
+        }
     }
 
     #[tokio::test]
     async fn valid_empty_model_selection_surfaces_no_memories() {
         let (_dir, store) = recall_store().await;
-        let selection = select_relevant_memories(
-            &store,
-            Some("proj-1"),
-            "release freeze for mobile",
-            &MemoryRecallOptions {
-                shortlist_limit: 2,
-                include_global_fallback: false,
-                max_candidates_per_scope: 12,
-            },
-            Some(&rerank_context("{\"ids\":[]}")),
-        )
-        .await
-        .expect("reranked selection");
+        for response in ["{\"ids\":[]}", "[]"] {
+            let selection = select_relevant_memories(
+                &store,
+                Some("proj-1"),
+                "release freeze for mobile",
+                &MemoryRecallOptions {
+                    shortlist_limit: 2,
+                    include_global_fallback: false,
+                    max_candidates_per_scope: 12,
+                },
+                Some(&rerank_context(response)),
+            )
+            .await
+            .expect("reranked selection");
 
-        assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
-        assert!(selection.candidates.is_empty());
+            assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
+            assert!(selection.candidates.is_empty());
+        }
     }
 
     #[tokio::test]
@@ -558,6 +611,117 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn rerank_timeout_falls_back_to_deterministic_shortlist() {
         assert_lexical_fallback(Arc::new(FailingProvider::PendingStream)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_connect_timeout_falls_back_to_deterministic_shortlist() {
+        assert_lexical_fallback(Arc::new(FailingProvider::PendingCall)).await;
+    }
+
+    #[tokio::test]
+    async fn partial_tokens_followed_by_stream_error_fall_back_to_deterministic_shortlist() {
+        assert_lexical_fallback(Arc::new(FailingProvider::PartialThenError)).await;
+    }
+
+    #[tokio::test]
+    async fn eof_without_done_falls_back_to_deterministic_shortlist() {
+        assert_lexical_fallback(Arc::new(FailingProvider::EofWithoutDone)).await;
+    }
+
+    #[derive(Default)]
+    struct PromptCaptureProvider {
+        candidate_ids: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PromptCaptureProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let prompt = messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
+                .map(|message| message.content.as_str())
+                .unwrap_or_default();
+            let ids = prompt
+                .lines()
+                .filter_map(|line| {
+                    let (position, id) = line.split_once(". id=")?;
+                    position.trim().parse::<usize>().ok()?;
+                    Some(id.trim().to_string())
+                })
+                .collect::<Vec<_>>();
+            *self
+                .candidate_ids
+                .lock()
+                .expect("lock should not be poisoned") = ids.clone();
+            let response = serde_json::json!({ "ids": ids }).to_string();
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(response)),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_sees_candidate_pool_but_final_selection_respects_shortlist_limit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = MemoryStore::new(dir.path());
+        for index in 0..12 {
+            store
+                .write_memory(
+                    MemoryScope::Project,
+                    Some("proj-1"),
+                    DurableMemoryType::Project,
+                    &format!("Release freeze component {index}"),
+                    &format!(
+                        "Release freeze evidence for independent component {index} with unique-marker-{index}."
+                    ),
+                    &[format!("component-{index}")],
+                    Some("session-1"),
+                    "main-model",
+                    false,
+                    None,
+                )
+                .await
+                .expect("write matching memory");
+        }
+
+        let provider = Arc::new(PromptCaptureProvider::default());
+        let selection = select_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze",
+            &MemoryRecallOptions {
+                shortlist_limit: 3,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+            Some(&MemoryRecallRerankContext {
+                llm: provider.clone(),
+                model: "rerank-fast-model".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        )
+        .await
+        .expect("reranked selection");
+
+        assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
+        assert_eq!(
+            provider
+                .candidate_ids
+                .lock()
+                .expect("lock should not be poisoned")
+                .len(),
+            12,
+            "the model should see the configured rerank candidate pool"
+        );
+        assert_eq!(selection.candidates.len(), 3);
     }
 
     #[derive(Default)]
