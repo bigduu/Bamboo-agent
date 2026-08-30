@@ -31,7 +31,10 @@ use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
 };
-use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ProviderTranscriptItem};
+use bamboo_domain::{
+    AgentHookPoint, CapabilityLoadingMode, ClassifiedToolSchema, EffectiveCallableSet, HookPayload,
+    HookResult, ProviderFamily, ProviderProtocol, ProviderTranscriptItem,
+};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
     MetricsCollector, RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -72,6 +75,45 @@ fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError>
     Some(AgentError::LLM(
         "transient test-injected post-LLM handler failure".to_string(),
     ))
+}
+
+fn effective_callable_set_for_round(
+    session: &Session,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> EffectiveCallableSet {
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
+    }
+
+    let transcript = &session.provider_transcript;
+    let progressive_route = transcript.active_family() == Some(ProviderFamily::Anthropic)
+        && transcript.active_protocol() == Some(ProviderProtocol::AnthropicMessages2023_06_01);
+    let groups = transcript
+        .active_provider_boundary_sha256()
+        .filter(|_| progressive_route)
+        .map(|boundary| {
+            transcript.replayable_groups(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                boundary,
+            )
+        })
+        .unwrap_or_default();
+    let loaded_names = bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
+        groups.iter().copied(),
+        tool_schemas,
+    );
+    let catalog = tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+    EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        loaded_names.iter().map(String::as_str),
+    )
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -1631,10 +1673,20 @@ async fn handle_tool_calls_path(
             frame.session_id
         );
     }
-    let tool_schemas =
+    let eligible_tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
+    let required_tool = crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
+    let request_tool_schemas = crate::runtime::runner::round_lifecycle::effective_tool_schemas(
+        session,
+        &eligible_tool_schemas,
+    );
+    let tool_schemas = request_tool_schemas.as_ref();
+    let capability_loading_mode = frame
+        .llm
+        .capability_loading_mode(model_name, required_tool)
+        .await;
     let effective_callable_set =
-        crate::runtime::runner::tool_execution::legacy_effective_callable_set(&tool_schemas);
+        effective_callable_set_for_round(session, tool_schemas, capability_loading_mode);
 
     // Tool execution can block for a long time (up to parallel_batch_timeout_secs,
     // default 300s, and per_tool_timeout_secs for single tools). The loop only
@@ -1667,7 +1719,7 @@ async fn handle_tool_calls_path(
                     .summarization_model_provider
                     .as_ref()
                     .or(auxiliary_models.background_model_provider.as_ref()),
-                tool_schemas: &tool_schemas,
+                tool_schemas,
                 effective_callable_set: &effective_callable_set,
             },
         ) => result?,
@@ -2909,9 +2961,9 @@ mod tests {
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, build_guardian_review_prompt,
-        check_run_budget_exceeded, commit_assistant_message, is_overflow_recoverable,
-        is_subagent_create_call, is_terminal_child_status, map_turn_error_status,
-        maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        check_run_budget_exceeded, commit_assistant_message, effective_callable_set_for_round,
+        is_overflow_recoverable, is_subagent_create_call, is_terminal_child_status,
+        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
         maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
         validate_explicit_activation_first_step,
     };
@@ -2985,6 +3037,154 @@ mod tests {
             }),
         )
         .unwrap()
+    }
+
+    fn loading_test_schema(name: &str) -> bamboo_agent_core::tools::ToolSchema {
+        bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }
+    }
+
+    #[test]
+    fn anthropic_history_drives_progressive_round_membership_while_legacy_stays_full() {
+        const BOUNDARY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("get_weather"),
+            loading_test_schema("Glob"),
+        ];
+
+        let mut first_round = Session::new("anthropic-first-round", "model");
+        first_round
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                BOUNDARY,
+            )
+            .unwrap();
+        let first_effective = effective_callable_set_for_round(
+            &first_round,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(first_effective.contains_execution_name("Bash"));
+        assert!(!first_effective.contains_execution_name("get_weather"));
+
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        first_round.add_message(assistant);
+        let item = |author, payload| {
+            bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                bamboo_domain::ProviderFamily::Anthropic,
+                bamboo_domain::ProviderProtocol::AnthropicMessages2023_06_01,
+                bamboo_domain::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        first_round
+            .append_provider_transcript_group(
+                &anchor,
+                None,
+                vec![
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"server_tool_use","id":"srv_1",
+                            "name":"tool_search_tool_regex","input":{"pattern":"weather"}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                            "content":{"type":"tool_search_tool_search_result","tool_references":[
+                                {"type":"tool_reference","tool_name":"get_weather"}
+                            ]}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_use","id":"tool_1","name":"get_weather","input":{}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_use","id":"ordinary_tool_use",
+                            "name":"Glob","input":{}
+                        }),
+                    ),
+                ],
+            )
+            .unwrap();
+        let loaded_effective = effective_callable_set_for_round(
+            &first_round,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(loaded_effective.contains_execution_name("Bash"));
+        assert!(loaded_effective.contains_execution_name("get_weather"));
+        assert!(!loaded_effective.contains_execution_name("Glob"));
+
+        let legacy = Session::new("legacy-round", "model");
+        let legacy_effective = effective_callable_set_for_round(
+            &legacy,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        );
+        assert!(legacy_effective.contains_execution_name("Bash"));
+        assert!(legacy_effective.contains_execution_name("get_weather"));
+        assert!(legacy_effective.contains_execution_name("Glob"));
+    }
+
+    #[tokio::test]
+    async fn explicit_activation_uses_one_legacy_request_slice_for_wire_and_admission() {
+        let tools = vec![
+            loading_test_schema("load_skill"),
+            loading_test_schema("Read"),
+        ];
+        let mut session = Session::new("anthropic-explicit-activation", "claude-sonnet-4-6");
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            "[\"review\"]".to_string(),
+        );
+
+        let required_tool =
+            crate::runtime::runner::round_lifecycle::required_tool_for_session(&session);
+        assert_eq!(required_tool, Some("load_skill"));
+        let request_tools =
+            crate::runtime::runner::round_lifecycle::effective_tool_schemas(&session, &tools);
+        assert_eq!(
+            request_tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["load_skill"]
+        );
+
+        let provider = bamboo_llm::providers::anthropic::AnthropicProvider::new("test-key");
+        let mode = provider
+            .capability_loading_mode("claude-sonnet-4-6", required_tool)
+            .await;
+        assert_eq!(
+            mode,
+            bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let effective = effective_callable_set_for_round(&session, request_tools.as_ref(), mode);
+        assert!(effective.contains_execution_name("load_skill"));
+        assert!(!effective.contains_execution_name("Read"));
     }
 
     #[test]

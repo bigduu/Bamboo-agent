@@ -6,8 +6,8 @@
 use crate::prompt_ir::PromptIR;
 use crate::types::LLMChunk;
 use async_trait::async_trait;
-use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
+use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
 use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
 use std::pin::Pin;
@@ -210,6 +210,18 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Select the provider's callable-catalog policy for one model request.
+    ///
+    /// Providers must opt in explicitly. The default preserves the complete
+    /// legacy function catalog for compatibility endpoints and unknown models.
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        CapabilityLoadingMode::LegacyFullCatalog
+    }
+
     /// Stream chat completion from the LLM
     ///
     /// This is the primary method for interacting with LLMs, returning
@@ -368,6 +380,10 @@ mod tests {
         }
 
         let cap = Capture::default();
+        assert_eq!(
+            cap.capability_loading_mode("any-model", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
         let ir = PromptIR {
             system_text: "sys".into(),
             segments: vec![
