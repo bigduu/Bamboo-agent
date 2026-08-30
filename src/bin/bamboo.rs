@@ -2266,7 +2266,11 @@ mod tests {
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "****...****"
         );
-        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+        assert_eq!(
+            value["tools"]["disabled"],
+            json!(["bash", "read_file"]),
+            "CLI serialization must preserve exact references for catalog-aware resolution"
+        );
     }
 
     #[test]
@@ -2283,7 +2287,11 @@ mod tests {
             value["mcpServers"]["stdio-server"]["env"]["TOKEN"],
             "super-secret"
         );
-        assert_eq!(value["tools"]["disabled"], json!(["Bash", "Read"]));
+        assert_eq!(
+            value["tools"]["disabled"],
+            json!(["bash", "read_file"]),
+            "including secrets must not change exact disabled-tool references"
+        );
     }
 
     #[test]

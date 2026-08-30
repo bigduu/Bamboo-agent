@@ -2,8 +2,8 @@ use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
-    canonical_tool_name, resolve_tool_reference_name, CapabilityLoadingClass,
-    ClassifiedToolIdentity, ClassifiedToolSchema,
+    resolve_tool_reference_name, CapabilityLoadingClass, ClassifiedToolIdentity,
+    ClassifiedToolSchema,
 };
 use bamboo_skills::runtime_metadata::{
     LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
@@ -79,8 +79,7 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     // tempts the model when no goal is set.
     if !config.goal_loop_active() {
         tool_schemas.retain(|schema| {
-            !canonical_tool_name(&schema.function.name)
-                .eq_ignore_ascii_case(bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME)
+            schema.function.name != bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME
         });
     }
 
@@ -112,9 +111,7 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
             .metadata
             .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
     if explicit_activation_is_current || explicit_activation_degraded {
-        tool_schemas.retain(|schema| {
-            !canonical_tool_name(&schema.function.name).eq_ignore_ascii_case("load_skill")
-        });
+        tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
 
     let activated = activated_discoverable_tools(session);

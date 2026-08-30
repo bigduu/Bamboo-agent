@@ -1165,6 +1165,8 @@ fn session_eligibility_is_shared_by_model_and_discovery_projections() {
         schemas: vec![
             schema("update_goal"),
             schema("load_skill"),
+            schema("default::update_goal"),
+            schema("default::load_skill"),
             schema("Glob"),
             schema("Workspace"),
         ],
@@ -1190,7 +1192,12 @@ fn session_eligibility_is_shared_by_model_and_discovery_projections() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         catalog_names,
-        std::collections::BTreeSet::from(["Glob", "Workspace"])
+        std::collections::BTreeSet::from([
+            "Glob",
+            "Workspace",
+            "default::load_skill",
+            "default::update_goal",
+        ])
     );
 
     let model_names = resolve_available_tool_schemas_for_session(&config, &tools, &session)
@@ -1204,7 +1211,11 @@ fn session_eligibility_is_shared_by_model_and_discovery_projections() {
             .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         model_names,
-        std::collections::BTreeSet::from(["Glob".to_string()])
+        std::collections::BTreeSet::from([
+            "Glob".to_string(),
+            "default::load_skill".to_string(),
+            "default::update_goal".to_string(),
+        ])
     );
     assert_eq!(discovery_names, model_names);
 }
