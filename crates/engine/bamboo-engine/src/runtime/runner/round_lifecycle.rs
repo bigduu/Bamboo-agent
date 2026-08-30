@@ -27,6 +27,17 @@ pub(in crate::runtime::runner) use stream_execution::{
     effective_tool_schemas, required_tool_for_session,
 };
 
+pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
+    items: &[bamboo_domain::ProviderTranscriptItem],
+) -> bool {
+    items.iter().any(|item| {
+        item.family() == bamboo_domain::ProviderFamily::OpenAi
+            && item.protocol() == bamboo_domain::ProviderProtocol::OpenAiResponsesV1
+            && item.kind() == bamboo_domain::ProviderTranscriptItemKind::OpenAiToolSearchCall
+            && item.payload()["execution"].as_str() == Some("client")
+    })
+}
+
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,
@@ -126,11 +137,14 @@ pub(crate) async fn execute_llm_round(
     // This is a terminal validation error, but the completed stream was still
     // billed. Return it alongside the canonical attempt usage so the runner can
     // account for the attempt before ending the round.
+    let openai_client_search_boundary =
+        is_openai_client_tool_search_boundary(&stream_output.provider_transcript_items);
     let terminal_validation_error = (stream_output.tool_calls.is_empty()
-        && stream_output.content.trim().is_empty())
-    .then(|| AgentError::EmptyAssistantResponse {
-        response_id: stream_output.response_id.clone(),
-    });
+        && stream_output.content.trim().is_empty()
+        && !openai_client_search_boundary)
+        .then(|| AgentError::EmptyAssistantResponse {
+            response_id: stream_output.response_id.clone(),
+        });
 
     let prompt_tokens = estimate_prompt_tokens(&prepared.prepared_context.messages);
     let completion_tokens =
@@ -176,4 +190,39 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
         "mid-turn",
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_openai_client_tool_search_boundary;
+    use bamboo_domain::{
+        ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+        ProviderTranscriptOrigin,
+    };
+    use serde_json::json;
+
+    fn client_search_item(family: ProviderFamily) -> ProviderTranscriptItem {
+        ProviderTranscriptItem::try_from_payload(
+            family,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_boundary","execution":"client",
+                "call_id":"search_boundary","status":"completed",
+                "arguments":{"query":"files"}
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn client_search_boundary_is_exactly_openai_responses() {
+        assert!(is_openai_client_tool_search_boundary(&[
+            client_search_item(ProviderFamily::OpenAi)
+        ]));
+        assert!(!is_openai_client_tool_search_boundary(&[
+            client_search_item(ProviderFamily::Copilot)
+        ]));
+    }
 }

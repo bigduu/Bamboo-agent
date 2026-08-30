@@ -166,6 +166,17 @@ pub async fn create_provider_from_instance(
                     provider.with_responses_only_models(instance.responses_only_models.clone());
             }
 
+            let tool_search_execution = instance
+                .extra
+                .get("tool_search_execution")
+                .and_then(serde_json::Value::as_str)
+                .and_then(
+                    crate::providers::common::openai_responses::ResponsesToolSearchExecution::from_config,
+                );
+            if let Some(tool_search_execution) = tool_search_execution {
+                provider = provider.with_tool_search_execution(tool_search_execution);
+            }
+
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_explicit_prompt_cache(
                 instance
@@ -548,6 +559,49 @@ mod tests {
 
         let result = create_provider(&config).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn openai_tool_search_execution_requires_a_valid_explicit_instance_value() {
+        for (execution, expected) in [
+            (
+                None,
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some("invalid"),
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some("client"),
+                bamboo_domain::CapabilityLoadingMode::Progressive,
+            ),
+            (
+                Some("server"),
+                bamboo_domain::CapabilityLoadingMode::Progressive,
+            ),
+        ] {
+            let mut value = serde_json::json!({
+                "provider_type":"openai",
+                "api_key":"sk-test",
+                "base_url":"https://api.openai.com/v1",
+                "responses_only_models":["gpt-5*"],
+                "enabled":true
+            });
+            if let Some(execution) = execution {
+                value["tool_search_execution"] = serde_json::json!(execution);
+            }
+            let instance: ProviderInstanceConfig = serde_json::from_value(value).unwrap();
+            let provider =
+                create_provider_from_instance(&Config::default(), &instance, std::env::temp_dir())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                provider.capability_loading_mode("gpt-5.6", None).await,
+                expected,
+                "execution={execution:?}"
+            );
+        }
     }
 
     #[tokio::test]

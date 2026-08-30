@@ -12,8 +12,9 @@ use bamboo_domain::MessagePart;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{
-    Message, MessagePhase, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
-    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptOrigin, Role,
+    CapabilityLoadingClass, CapabilityLoadingMode, ClassifiedToolSchema, Message, MessagePhase,
+    ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptGroup,
+    ProviderTranscriptItem, ProviderTranscriptOrigin, Role,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,6 +25,25 @@ const WIRE_TRACKER_KEY_DOMAIN: &[u8] = b"bamboo/responses-wire-tracker-key/v1\0"
 const WIRE_TOP_LEVEL_DOMAIN: &[u8] = b"bamboo/responses-wire-top-level/v1\0";
 const WIRE_INPUT_PREFIX_DOMAIN: &[u8] = b"bamboo/responses-wire-input-prefix/v1\0";
 const MAX_WIRE_TRACKER_FAMILIES: usize = 1024;
+
+/// Who executes OpenAI's native Responses tool-search gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesToolSearchExecution {
+    Client,
+    Server,
+}
+
+impl ResponsesToolSearchExecution {
+    pub fn from_config(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("client") {
+            Some(Self::Client)
+        } else if value.eq_ignore_ascii_case("server") {
+            Some(Self::Server)
+        } else {
+            None
+        }
+    }
+}
 
 /// Convert internal [`Message`] values to a Responses API `input` array.
 ///
@@ -404,6 +424,92 @@ pub fn tools_to_responses_json(tools: &[ToolSchema]) -> Vec<Value> {
         .collect()
 }
 
+fn tool_to_progressive_responses_json(
+    tool: &ToolSchema,
+    loading_class: CapabilityLoadingClass,
+) -> Value {
+    let mut value = json!({
+        "type": tool.schema_type,
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "parameters": sanitize_openai_function_parameters_schema(&tool.function.parameters),
+        "strict": false,
+    });
+    if loading_class == CapabilityLoadingClass::Deferred {
+        value["defer_loading"] = Value::Bool(true);
+    }
+    value
+}
+
+/// Lower one discovered Bamboo function into the complete definition required
+/// by a client-executed `tool_search_output` item.
+pub fn loaded_tool_to_responses_json(tool: &ToolSchema) -> Value {
+    tool_to_progressive_responses_json(tool, CapabilityLoadingClass::Deferred)
+}
+
+fn responses_tool_search_json(execution: ResponsesToolSearchExecution) -> Value {
+    match execution {
+        ResponsesToolSearchExecution::Server => json!({
+            "type": "tool_search",
+            "execution": "server",
+        }),
+        ResponsesToolSearchExecution::Client => json!({
+            "type": "tool_search",
+            "execution": "client",
+            "description": "Search the current Bamboo tool, Skill, and Workflow catalog by capability.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "maxLength": bamboo_domain::MAX_DISCOVERY_QUERY_CHARS,
+                        "description": "Short capability query, such as git status, browser testing, or release workflow."
+                    },
+                    "kinds": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["tool", "skill", "workflow"]}
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": bamboo_domain::MAX_DISCOVERY_RESULTS
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+    }
+}
+
+/// Project Bamboo's classified catalog into OpenAI Responses progressive
+/// loading. Hosted search receives the full eligible catalog with Deferred
+/// functions marked; client search receives only Core functions. The search
+/// gateway itself is always present and never deferred.
+pub fn tools_to_progressive_responses_json(
+    tools: &[ToolSchema],
+    execution: ResponsesToolSearchExecution,
+) -> Vec<Value> {
+    let mut projected = tools
+        .iter()
+        .filter_map(|tool| {
+            let classified = ClassifiedToolSchema::new(tool.clone())?;
+            let loading_class = classified.loading_class();
+            let visible = match execution {
+                ResponsesToolSearchExecution::Client => {
+                    loading_class == CapabilityLoadingClass::Core
+                }
+                ResponsesToolSearchExecution::Server => {
+                    loading_class != CapabilityLoadingClass::HostOnly
+                }
+            };
+            visible.then(|| tool_to_progressive_responses_json(tool, loading_class))
+        })
+        .collect::<Vec<_>>();
+    projected.push(responses_tool_search_json(execution));
+    projected
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesInputSource {
     Explicit,
@@ -487,6 +593,36 @@ pub fn build_responses_body(
     parallel_tool_calls: Option<bool>,
     cache_plan: Option<&PromptCachePlan>,
 ) -> Value {
+    build_responses_body_with_capability_loading(
+        model,
+        messages,
+        tools,
+        max_output_tokens,
+        reasoning_effort,
+        responses_options,
+        parallel_tool_calls,
+        cache_plan,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        ResponsesToolSearchExecution::Client,
+    )
+}
+
+/// Build a Responses request with an explicit provider-native capability
+/// loading projection. The legacy wrapper above remains byte-compatible for
+/// direct callers and compatibility fallbacks.
+#[allow(clippy::too_many_arguments)]
+pub fn build_responses_body_with_capability_loading(
+    model: &str,
+    messages: &[Message],
+    tools: &[ToolSchema],
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
+    responses_options: Option<&ResponsesRequestOptions>,
+    parallel_tool_calls: Option<bool>,
+    cache_plan: Option<&PromptCachePlan>,
+    capability_loading_mode: CapabilityLoadingMode,
+    tool_search_execution: ResponsesToolSearchExecution,
+) -> Value {
     let instructions = responses_options
         .and_then(|opts| opts.instructions.as_deref())
         .map(str::trim)
@@ -537,8 +673,14 @@ pub fn build_responses_body(
         body["previous_response_id"] = json!(previous_response_id);
     }
 
-    if !tools.is_empty() {
-        body["tools"] = json!(tools_to_responses_json(tools));
+    let projected_tools = match capability_loading_mode {
+        CapabilityLoadingMode::LegacyFullCatalog => tools_to_responses_json(tools),
+        CapabilityLoadingMode::Progressive => {
+            tools_to_progressive_responses_json(tools, tool_search_execution)
+        }
+    };
+    if !projected_tools.is_empty() {
+        body["tools"] = json!(projected_tools);
         // Best-effort default; upstreams may ignore/override.
         body["tool_choice"] = json!("auto");
     }
@@ -3009,6 +3151,91 @@ mod tests {
         assert_eq!(out[0]["description"], "Search things");
         assert!(out[0].get("function").is_none());
         assert!(out[0].get("parameters").is_some());
+    }
+
+    fn loading_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("Use {name}"),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn progressive_server_tools_keep_full_eligible_catalog_and_defer_non_core() {
+        let tools = vec![
+            loading_schema("Read"),
+            loading_schema("Glob"),
+            loading_schema("Workspace"),
+        ];
+        let out = tools_to_progressive_responses_json(&tools, ResponsesToolSearchExecution::Server);
+
+        assert_eq!(out.len(), 3, "Read + Glob + non-deferred search");
+        assert_eq!(out[0]["name"], "Read");
+        assert!(out[0].get("defer_loading").is_none());
+        assert_eq!(out[1]["name"], "Glob");
+        assert_eq!(out[1]["defer_loading"], true);
+        assert_eq!(out[2]["type"], "tool_search");
+        assert_eq!(out[2]["execution"], "server");
+        assert!(out[2].get("description").is_none());
+        assert!(out[2].get("parameters").is_none());
+        assert!(out[2].get("defer_loading").is_none());
+        assert!(out.iter().all(|tool| tool["name"] != "Workspace"));
+    }
+
+    #[test]
+    fn progressive_client_tools_are_sticky_core_plus_search_only() {
+        let tools = vec![
+            loading_schema("Read"),
+            loading_schema("Glob"),
+            loading_schema("Workspace"),
+        ];
+        let body = build_responses_body_with_capability_loading(
+            "gpt-5.6",
+            &[Message::user("find files")],
+            &tools,
+            None,
+            None,
+            None,
+            None,
+            None,
+            CapabilityLoadingMode::Progressive,
+            ResponsesToolSearchExecution::Client,
+        );
+        let projected = body["tools"].as_array().unwrap();
+
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["name"], "Read");
+        assert_eq!(projected[1]["type"], "tool_search");
+        assert_eq!(projected[1]["execution"], "client");
+        assert!(projected[1]["description"].is_string());
+        assert_eq!(projected[1]["parameters"]["required"], json!(["query"]));
+        assert_eq!(
+            projected[1]["parameters"]["properties"]["query"]["maxLength"],
+            bamboo_domain::MAX_DISCOVERY_QUERY_CHARS
+        );
+        assert_eq!(
+            projected[1]["parameters"]["properties"]["limit"]["maximum"],
+            bamboo_domain::MAX_DISCOVERY_RESULTS
+        );
+        assert!(projected.iter().all(|tool| tool["name"] != "Glob"));
+        assert!(projected.iter().all(|tool| tool["name"] != "Workspace"));
+    }
+
+    #[test]
+    fn discovered_client_function_definition_is_complete_and_remains_deferred() {
+        let loaded = loaded_tool_to_responses_json(&loading_schema("Glob"));
+        assert_eq!(loaded["type"], "function");
+        assert_eq!(loaded["name"], "Glob");
+        assert_eq!(loaded["strict"], false);
+        assert_eq!(loaded["defer_loading"], true);
+        assert!(loaded["parameters"].is_object());
     }
 
     #[test]

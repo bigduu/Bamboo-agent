@@ -5,6 +5,7 @@
 //!
 //! "Round" is kept only as a counter for metrics compatibility.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,8 +33,11 @@ use bamboo_domain::session::runtime_state::{
     WaitingForChildrenState,
 };
 use bamboo_domain::{
-    AgentHookPoint, CapabilityLoadingMode, ClassifiedToolSchema, EffectiveCallableSet, HookPayload,
-    HookResult, ProviderFamily, ProviderProtocol, ProviderTranscriptItem,
+    AgentHookPoint, CapabilityInvocationTarget, CapabilityLoadingClass, CapabilityLoadingMode,
+    CapabilityMatch, CapabilitySource, ClassifiedToolSchema, DiscoverCapabilitiesRequest,
+    EffectiveCallableSet, HookPayload, HookResult, ProviderFamily, ProviderProtocol,
+    ProviderTranscriptAuthor, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    ProviderTranscriptOrigin,
 };
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
@@ -87,23 +91,30 @@ fn effective_callable_set_for_round(
     }
 
     let transcript = &session.provider_transcript;
-    let progressive_route = transcript.active_family() == Some(ProviderFamily::Anthropic)
-        && transcript.active_protocol() == Some(ProviderProtocol::AnthropicMessages2023_06_01);
-    let groups = transcript
-        .active_provider_boundary_sha256()
-        .filter(|_| progressive_route)
-        .map(|boundary| {
-            transcript.replayable_groups(
-                ProviderFamily::Anthropic,
-                ProviderProtocol::AnthropicMessages2023_06_01,
-                boundary,
+    let family = transcript.active_family();
+    let protocol = transcript.active_protocol();
+    let groups = match (
+        family,
+        protocol,
+        transcript.active_provider_boundary_sha256(),
+    ) {
+        (Some(family), Some(protocol), Some(boundary)) => {
+            transcript.replayable_groups(family, protocol, boundary)
+        }
+        _ => Vec::new(),
+    };
+    let loaded_names = match (family, protocol) {
+        (Some(ProviderFamily::Anthropic), Some(ProviderProtocol::AnthropicMessages2023_06_01)) => {
+            bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
+                groups.iter().copied(),
+                tool_schemas,
             )
-        })
-        .unwrap_or_default();
-    let loaded_names = bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
-        groups.iter().copied(),
-        tool_schemas,
-    );
+        }
+        (Some(family @ ProviderFamily::OpenAi), Some(ProviderProtocol::OpenAiResponsesV1)) => {
+            bamboo_domain::validated_openai_loaded_tool_names(groups.iter().copied(), family)
+        }
+        _ => Vec::new(),
+    };
     let catalog = tool_schemas
         .iter()
         .cloned()
@@ -114,6 +125,312 @@ fn effective_callable_set_for_round(
         CapabilityLoadingMode::Progressive,
         loaded_names.iter().map(String::as_str),
     )
+}
+
+fn openai_client_tool_search_requests(
+    items: &[ProviderTranscriptItem],
+) -> Result<Vec<(String, DiscoverCapabilitiesRequest)>, AgentError> {
+    items
+        .iter()
+        .filter(|item| {
+            item.family() == ProviderFamily::OpenAi
+                && item.protocol() == ProviderProtocol::OpenAiResponsesV1
+                && item.kind() == ProviderTranscriptItemKind::OpenAiToolSearchCall
+                && item.payload()["execution"].as_str() == Some("client")
+        })
+        .map(|item| {
+            let call_id = item.payload()["call_id"]
+                .as_str()
+                .expect("validated client tool_search_call has call_id")
+                .to_string();
+            let request = serde_json::from_value::<DiscoverCapabilitiesRequest>(
+                item.payload()["arguments"].clone(),
+            )
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "OpenAI client tool-search arguments are invalid: {error}"
+                ))
+            })?;
+            Ok((call_id, request))
+        })
+        .collect()
+}
+
+fn capability_source_name(source: CapabilitySource) -> &'static str {
+    match source {
+        CapabilitySource::Builtin => "builtin",
+        CapabilitySource::Server => "server",
+        CapabilitySource::Mcp => "mcp",
+        CapabilitySource::Custom => "custom",
+        CapabilitySource::Project => "project",
+        CapabilitySource::Workspace => "workspace",
+        CapabilitySource::User => "user",
+        CapabilitySource::Plugin => "plugin",
+    }
+}
+
+/// Keep the real gateway definition while narrowing its catalog identity
+/// argument to this bounded discovery result. Revision/source stay descriptive
+/// metadata because `load_skill` has no revision argument and multiple workflow
+/// IDs can legitimately carry different revisions.
+fn scope_discovered_gateway_definition(
+    entry: &ClassifiedToolSchema,
+    matches: &[&CapabilityMatch],
+) -> serde_json::Value {
+    let mut definition =
+        bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+            entry.schema(),
+        );
+    let (catalog_kind, id_property) = match entry.execution_name() {
+        "load_skill" => ("skill", "skill_id"),
+        "workflow_run" => ("workflow", "workflow_id"),
+        _ => return definition,
+    };
+    let mut ids = Vec::new();
+    let mut workflow_revisions = Vec::new();
+    let mut metadata = Vec::new();
+    for matched in matches {
+        let scoped = match &matched.invocation_target {
+            CapabilityInvocationTarget::Skill {
+                skill_id,
+                source,
+                revision,
+                ..
+            } if catalog_kind == "skill" => Some((skill_id, *source, *revision)),
+            CapabilityInvocationTarget::Workflow {
+                workflow_id,
+                source,
+                revision,
+                ..
+            } if catalog_kind == "workflow" => {
+                if !workflow_revisions.contains(revision) {
+                    workflow_revisions.push(*revision);
+                }
+                Some((workflow_id, *source, *revision))
+            }
+            _ => None,
+        };
+        let Some((id, source, revision)) = scoped else {
+            continue;
+        };
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+        let detail = format!(
+            "{id} — {} — {} [revision={revision}, source={}]",
+            matched.display_name,
+            matched.summary,
+            capability_source_name(source)
+        );
+        if !metadata.contains(&detail) {
+            metadata.push(detail);
+        }
+    }
+    if ids.is_empty() {
+        return definition;
+    }
+
+    let parameters = definition
+        .get_mut("parameters")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("loaded function definitions always have object parameters");
+    let properties = parameters
+        .entry("properties")
+        .or_insert_with(|| serde_json::json!({}));
+    if !properties.is_object() {
+        *properties = serde_json::json!({});
+    }
+    let properties = properties
+        .as_object_mut()
+        .expect("scoped gateway properties are an object");
+    let id_schema = properties
+        .entry(id_property)
+        .or_insert_with(|| serde_json::json!({"type": "string"}));
+    if !id_schema.is_object() {
+        *id_schema = serde_json::json!({"type": "string"});
+    }
+    id_schema["enum"] = serde_json::json!(ids);
+    id_schema["description"] = serde_json::json!(format!(
+        "Use only the {id_property} values advertised by this discovery output."
+    ));
+
+    if catalog_kind == "workflow" && !workflow_revisions.is_empty() {
+        let revision_schema = properties
+            .entry("revision")
+            .or_insert_with(|| serde_json::json!({"type": "integer", "minimum": 1}));
+        if !revision_schema.is_object() {
+            *revision_schema = serde_json::json!({"type": "integer", "minimum": 1});
+        }
+        revision_schema["enum"] = serde_json::json!(workflow_revisions);
+    }
+
+    definition["description"] = serde_json::json!(format!(
+        "{}. Scoped {catalog_kind} matches in discovery relevance order: {}.",
+        entry.schema().function.description.trim_end_matches('.'),
+        metadata.join("; ")
+    ));
+    definition
+}
+
+async fn build_openai_client_tool_search_outputs(
+    session: &Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    provider_items: &[ProviderTranscriptItem],
+) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+    let requests = openai_client_tool_search_requests(provider_items)?;
+    let catalog = tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+    let searchable_tool_catalog = catalog
+        .iter()
+        .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (_, disabled_skill_ids) = config.resolve_disabled_filters();
+    let catalog_names = catalog
+        .iter()
+        .map(|entry| entry.execution_name())
+        .collect::<BTreeSet<_>>();
+    let eligibility = crate::capability_discovery::CapabilityDiscoveryEligibility {
+        disabled_skill_ids: disabled_skill_ids.into_owned(),
+        allowed_skill_ids: config
+            .selected_skill_ids
+            .as_ref()
+            .map(|ids| ids.iter().cloned().collect()),
+        skill_gateway_available: catalog_names.contains("load_skill"),
+        workflow_gateway_available: catalog_names.contains("workflow_run"),
+        ..Default::default()
+    };
+    let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+        config, session,
+    )
+    .await
+    .map_err(AgentError::Tool)?
+    {
+        Some(store) => {
+            crate::capability_discovery::CapabilityDiscoveryIndex::from_resolved_classified_store(
+                &searchable_tool_catalog,
+                store.as_ref(),
+                &eligibility,
+            )
+            .await
+        }
+        None => {
+            let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
+            let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
+            crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                crate::capability_discovery::project_classified_tool_capability_metadata(
+                    &searchable_tool_catalog,
+                ),
+                &empty_skills,
+                &empty_workflows,
+                &eligibility,
+            )
+        }
+    };
+
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (call_id, request) in requests {
+        let result = index
+            .discover(&request)
+            .map_err(|error| AgentError::LLM(format!("capability discovery failed: {error}")))?;
+        let mut matches_by_function = Vec::<(String, Vec<_>)>::new();
+        for matched in &result.matches {
+            let name = match &matched.invocation_target {
+                CapabilityInvocationTarget::Tool { name }
+                | CapabilityInvocationTarget::Skill { name, .. }
+                | CapabilityInvocationTarget::Workflow { name, .. } => name,
+            };
+            if let Some((_, matches)) = matches_by_function
+                .iter_mut()
+                .find(|(function, _)| function == name)
+            {
+                matches.push(matched);
+            } else {
+                matches_by_function.push((name.clone(), vec![matched]));
+            }
+        }
+        let tools = matches_by_function
+            .into_iter()
+            .filter_map(|(name, matches)| {
+                let entry = catalog
+                    .iter()
+                    .find(|entry| entry.execution_name() == name)?;
+                if entry.loading_class() != CapabilityLoadingClass::Deferred {
+                    return None;
+                }
+                Some(scope_discovered_gateway_definition(entry, &matches))
+            })
+            .collect::<Vec<_>>();
+        let item = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({
+                "type": "tool_search_output",
+                "execution": "client",
+                "call_id": call_id,
+                "status": "completed",
+                "tools": tools,
+            }),
+        )
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "OpenAI client tool-search output could not be constructed: {error}"
+            ))
+        })?;
+        outputs.push(item);
+    }
+    Ok(outputs)
+}
+
+async fn commit_openai_client_tool_search_round(
+    stream_output: StreamHandlingOutput,
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<(), AgentError> {
+    let host_outputs = build_openai_client_tool_search_outputs(
+        session,
+        config,
+        tool_schemas,
+        &stream_output.provider_transcript_items,
+    )
+    .await?;
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
+    let message = Message::assistant_with_reasoning(stream_output.content, None, reasoning)
+        .with_reasoning_signature(reasoning_signature);
+    let anchor = message.id.clone();
+    let mut provider_items = Some(stream_output.provider_transcript_items);
+    commit_assistant_message(session, message, &mut provider_items)?;
+    for output in host_outputs {
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .map_err(|error| {
+                AgentError::LLM(format!(
+                    "OpenAI client tool-search result could not be committed: {error}"
+                ))
+            })?;
+    }
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "OpenAI client tool-search checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -2308,6 +2625,34 @@ async fn run_pipeline_inner(
                 };
 
             if stream_output.tool_calls.is_empty() {
+                if crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
+                    &stream_output.provider_transcript_items,
+                ) {
+                    match commit_openai_client_tool_search_round(
+                        stream_output,
+                        session,
+                        config,
+                        &tool_schemas,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            record_no_tool_calls_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session,
+                                round_activity.token_usage(),
+                            );
+                            turn_outcome = Some(TurnOutcome {
+                                should_break: false,
+                                sent_complete: false,
+                            });
+                        }
+                        Err(error) => terminal_error = Some(error),
+                    }
+                    break;
+                }
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
@@ -2961,10 +3306,12 @@ mod tests {
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, build_guardian_review_prompt,
-        check_run_budget_exceeded, commit_assistant_message, effective_callable_set_for_round,
-        is_overflow_recoverable, is_subagent_create_call, is_terminal_child_status,
-        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
-        maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
+        build_openai_client_tool_search_outputs, check_run_budget_exceeded,
+        commit_assistant_message, commit_openai_client_tool_search_round,
+        effective_callable_set_for_round, is_overflow_recoverable, is_subagent_create_call,
+        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
+        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
+        scope_discovered_gateway_definition, should_retry_turn_error, suspend_to_wait_for_bash,
         validate_explicit_activation_first_step,
     };
     use crate::project_context::{
@@ -3025,29 +3372,270 @@ mod tests {
         }
     }
 
-    fn native_client_search_item() -> bamboo_domain::ProviderTranscriptItem {
+    fn native_client_search_item_with_arguments(
+        call_id: &str,
+        arguments: serde_json::Value,
+    ) -> bamboo_domain::ProviderTranscriptItem {
         bamboo_domain::ProviderTranscriptItem::try_from_payload(
             bamboo_domain::ProviderFamily::OpenAi,
             bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
             bamboo_domain::ProviderTranscriptOrigin::Provider,
             bamboo_domain::ProviderTranscriptAuthor::Model,
             serde_json::json!({
-                "type":"tool_search_call","id":"tsc_pipeline_search_1","execution":"client","call_id":"search_1",
-                "status":"completed","arguments":{"query":"orders"}
+                "type":"tool_search_call","id":format!("tsc_pipeline_{call_id}"),
+                "execution":"client","call_id":call_id,
+                "status":"completed","arguments":arguments
             }),
         )
         .unwrap()
     }
 
+    fn native_client_search_item_for(
+        call_id: &str,
+        query: &str,
+    ) -> bamboo_domain::ProviderTranscriptItem {
+        native_client_search_item_with_arguments(call_id, serde_json::json!({"query":query}))
+    }
+
+    fn native_client_search_item() -> bamboo_domain::ProviderTranscriptItem {
+        native_client_search_item_for("search_1", "orders")
+    }
+
     fn loading_test_schema(name: &str) -> bamboo_agent_core::tools::ToolSchema {
+        loading_test_schema_with_description(name, "")
+    }
+
+    fn loading_test_schema_with_description(
+        name: &str,
+        description: &str,
+    ) -> bamboo_agent_core::tools::ToolSchema {
         bamboo_agent_core::tools::ToolSchema {
             schema_type: "function".to_string(),
             function: bamboo_agent_core::tools::FunctionSchema {
                 name: name.to_string(),
-                description: String::new(),
+                description: description.to_string(),
                 parameters: serde_json::json!({"type":"object"}),
             },
         }
+    }
+
+    #[test]
+    fn discovered_catalog_gateways_are_scoped_to_matching_ids_and_metadata() {
+        let skill_gateway =
+            bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "Load one instruction Skill".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{
+                            "skill_id":{"type":"string"},
+                            "detail":{"type":"string"}
+                        },
+                        "required":["skill_id"]
+                    }),
+                },
+            })
+            .unwrap();
+        let skill_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "skill:review-helper".to_string(),
+            kind: bamboo_domain::CapabilityKind::Skill,
+            display_name: "Review Helper".to_string(),
+            summary: "Review a change".to_string(),
+            source: bamboo_domain::CapabilitySource::User,
+            revision: Some(7),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                name: "load_skill".to_string(),
+                skill_id: "review-helper".to_string(),
+                source: bamboo_domain::CapabilitySource::User,
+                revision: 7,
+            },
+        };
+        let second_skill_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "skill:lint-helper".to_string(),
+            kind: bamboo_domain::CapabilityKind::Skill,
+            display_name: "Lint Helper".to_string(),
+            summary: "Run focused lint checks".to_string(),
+            source: bamboo_domain::CapabilitySource::Project,
+            revision: Some(3),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                name: "load_skill".to_string(),
+                skill_id: "lint-helper".to_string(),
+                source: bamboo_domain::CapabilitySource::Project,
+                revision: 3,
+            },
+        };
+        let skill = scope_discovered_gateway_definition(
+            &skill_gateway,
+            &[&skill_match, &second_skill_match],
+        );
+        assert_eq!(
+            skill["parameters"]["properties"]["skill_id"]["enum"],
+            serde_json::json!(["review-helper", "lint-helper"])
+        );
+        assert!(!skill["parameters"]["properties"]["skill_id"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("unmatched-skill")));
+        assert_eq!(
+            skill["parameters"]["properties"]["detail"]["type"], "string",
+            "the rest of the real gateway schema remains complete"
+        );
+        assert!(skill["description"]
+            .as_str()
+            .unwrap()
+            .contains("revision=7"));
+        assert!(skill["description"]
+            .as_str()
+            .unwrap()
+            .contains("source=user"));
+        let skill_description = skill["description"].as_str().unwrap();
+        let first_skill = skill_description
+            .find("review-helper — Review Helper — Review a change [revision=7, source=user]")
+            .unwrap();
+        let second_skill = skill_description
+            .find(
+                "lint-helper — Lint Helper — Run focused lint checks [revision=3, source=project]",
+            )
+            .unwrap();
+        assert!(
+            first_skill < second_skill,
+            "discovery relevance order is kept"
+        );
+
+        let workflow_gateway =
+            bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "workflow_run".to_string(),
+                    description: "Run a catalog Workflow".to_string(),
+                    parameters: serde_json::json!({
+                        "type":"object",
+                        "properties":{
+                            "action":{"type":"string","enum":["start","list"]},
+                            "workflow_id":{"type":"string"},
+                            "revision":{"type":"integer","minimum":1}
+                        },
+                        "required":["action"],
+                        "additionalProperties":false
+                    }),
+                },
+            })
+            .unwrap();
+        let workflow_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "workflow:review-pipeline".to_string(),
+            kind: bamboo_domain::CapabilityKind::Workflow,
+            display_name: "Review Pipeline".to_string(),
+            summary: "Review a repository".to_string(),
+            source: bamboo_domain::CapabilitySource::Workspace,
+            revision: Some(9),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Workflow {
+                name: "workflow_run".to_string(),
+                workflow_id: "review-pipeline".to_string(),
+                source: bamboo_domain::CapabilitySource::Workspace,
+                revision: 9,
+            },
+        };
+        let second_workflow_match = bamboo_domain::CapabilityMatch {
+            capability_ref: "workflow:lint-pipeline".to_string(),
+            kind: bamboo_domain::CapabilityKind::Workflow,
+            display_name: "Lint Pipeline".to_string(),
+            summary: "Lint the selected package".to_string(),
+            source: bamboo_domain::CapabilitySource::Project,
+            revision: Some(4),
+            status: bamboo_domain::CapabilityStatus::Valid,
+            invocation_policy: None,
+            invocation_target: bamboo_domain::CapabilityInvocationTarget::Workflow {
+                name: "workflow_run".to_string(),
+                workflow_id: "lint-pipeline".to_string(),
+                source: bamboo_domain::CapabilitySource::Project,
+                revision: 4,
+            },
+        };
+        let workflow = scope_discovered_gateway_definition(
+            &workflow_gateway,
+            &[&workflow_match, &second_workflow_match],
+        );
+        assert_eq!(
+            workflow["parameters"]["properties"]["workflow_id"]["enum"],
+            serde_json::json!(["review-pipeline", "lint-pipeline"])
+        );
+        assert_eq!(
+            workflow["parameters"]["properties"]["revision"]["enum"],
+            serde_json::json!([9, 4])
+        );
+        assert!(!workflow["parameters"]["properties"]["workflow_id"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("unmatched-workflow")));
+        assert_eq!(
+            workflow["parameters"]["properties"]["action"]["enum"],
+            serde_json::json!(["start", "list"])
+        );
+        assert!(workflow["description"]
+            .as_str()
+            .unwrap()
+            .contains("revision=9"));
+        assert!(workflow["description"]
+            .as_str()
+            .unwrap()
+            .contains("source=workspace"));
+        let workflow_description = workflow["description"].as_str().unwrap();
+        let first_workflow = workflow_description
+            .find(
+                "review-pipeline — Review Pipeline — Review a repository [revision=9, source=workspace]",
+            )
+            .unwrap();
+        let second_workflow = workflow_description
+            .find(
+                "lint-pipeline — Lint Pipeline — Lint the selected package [revision=4, source=project]",
+            )
+            .unwrap();
+        assert!(
+            first_workflow < second_workflow,
+            "workflow relevance order is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_search_filters_core_before_applying_the_result_limit() {
+        let tools = vec![
+            loading_test_schema_with_description("Read", "Read repository files"),
+            loading_test_schema_with_description("ReadArchive", "Read archived repository files"),
+        ];
+        let call = native_client_search_item_with_arguments(
+            "search_deferred_limit",
+            serde_json::json!({"query":"read","kinds":["tool"],"limit":1}),
+        );
+        let outputs = build_openai_client_tool_search_outputs(
+            &Session::new("deferred-before-limit", "gpt-5.6"),
+            &AgentLoopConfig::default(),
+            &tools,
+            &[call],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].payload()["tools"],
+            serde_json::json!([{
+                "type":"function",
+                "name":"ReadArchive",
+                "description":"Read archived repository files",
+                "parameters":{"type":"object","properties":{}},
+                "strict":false,
+                "defer_loading":true
+            }]),
+            "the initially visible Core candidate must not consume limit=1"
+        );
     }
 
     #[test]
@@ -3143,6 +3731,249 @@ mod tests {
         assert!(legacy_effective.contains_execution_name("Bash"));
         assert!(legacy_effective.contains_execution_name("get_weather"));
         assert!(legacy_effective.contains_execution_name("Glob"));
+    }
+
+    #[test]
+    fn openai_search_output_drives_progressive_membership_across_resume() {
+        const BOUNDARY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let mut session = Session::new("openai-loaded-round", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let first = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(first.contains_execution_name("Bash"));
+        assert!(!first.contains_execution_name("search_orders"));
+
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .append_provider_transcript_group(&anchor, None, vec![native_client_search_item()])
+            .unwrap();
+        let output = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            bamboo_domain::ProviderTranscriptOrigin::HostToolSearch,
+            bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+            serde_json::json!({
+                "type":"tool_search_output","execution":"client","call_id":"search_1",
+                "status":"completed","tools":[{
+                    "type":"function","name":"search_orders","description":"Search orders",
+                    "parameters":{"type":"object"},"strict":false,"defer_loading":true
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+
+        let loaded = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(loaded.contains_execution_name("Bash"));
+        assert!(loaded.contains_execution_name("search_orders"));
+        assert!(!loaded.contains_execution_name("Glob"));
+
+        let resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let resumed_loaded = effective_callable_set_for_round(
+            &resumed,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(resumed_loaded.contains_execution_name("search_orders"));
+        assert!(!resumed_loaded.contains_execution_name("Glob"));
+    }
+
+    #[test]
+    fn hosted_search_output_enables_its_same_response_function_but_not_an_ordinary_call() {
+        const BOUNDARY: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let tools = vec![
+            loading_test_schema("Bash"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let mut session = Session::new("openai-hosted-search", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        let item = |author, payload| {
+            bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                bamboo_domain::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        session
+            .append_provider_transcript_group(
+                &anchor,
+                None,
+                vec![
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"tool_search_call","id":"tsc_hosted","execution":"server",
+                            "call_id":"search_hosted","status":"completed",
+                            "arguments":{"query":"orders"}
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_output","id":"tso_hosted","execution":"server",
+                            "call_id":"search_hosted","status":"completed",
+                            "tools":[{"type":"function","name":"search_orders"}]
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"function_call","id":"fc_loaded","call_id":"call_loaded",
+                            "name":"search_orders","arguments":"{}","status":"completed"
+                        }),
+                    ),
+                    item(
+                        bamboo_domain::ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"function_call","id":"fc_ordinary","call_id":"call_ordinary",
+                            "name":"Glob","arguments":"{}","status":"completed"
+                        }),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let effective = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(effective.contains_execution_name("Bash"));
+        assert!(effective.contains_execution_name("search_orders"));
+        assert!(
+            !effective.contains_execution_name("Glob"),
+            "an ordinary function_call cannot manufacture loaded state"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_search_builds_host_output_and_commits_an_internal_next_round_boundary() {
+        const BOUNDARY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let tools = vec![
+            loading_test_schema("Read"),
+            loading_test_schema("search_orders"),
+            loading_test_schema("Glob"),
+        ];
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("client-search-next-round", "gpt-5.6");
+        session
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                BOUNDARY,
+            )
+            .unwrap();
+        let call = native_client_search_item();
+        let outputs = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            &tools,
+            std::slice::from_ref(&call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].payload()["type"], "tool_search_output");
+        assert_eq!(outputs[0].payload()["execution"], "client");
+        assert_eq!(outputs[0].payload()["call_id"], "search_1");
+        assert_eq!(outputs[0].payload()["status"], "completed");
+        let discovered = outputs[0].payload()["tools"].as_array().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0]["name"], "search_orders");
+        assert_eq!(discovered[0]["strict"], false);
+        assert_eq!(discovered[0]["defer_loading"], true);
+
+        let empty_call = native_client_search_item_for("search_empty", "zzqxvplmn");
+        let empty_outputs = build_openai_client_tool_search_outputs(
+            &session,
+            &config,
+            &tools,
+            std::slice::from_ref(&empty_call),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty_outputs.len(), 1);
+        assert_eq!(empty_outputs[0].payload()["call_id"], "search_empty");
+        assert_eq!(
+            empty_outputs[0].payload()["tools"],
+            serde_json::json!([]),
+            "an empty discovery result remains an explicit completed tools array"
+        );
+
+        let stream_output = crate::runtime::stream::handler::StreamHandlingOutput {
+            response_id: Some("resp_client_search".to_string()),
+            content: String::new(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 0,
+            tool_calls: Vec::new(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: None,
+            input_tokens: 0,
+            provider_transcript_items: vec![call],
+        };
+        commit_openai_client_tool_search_round(stream_output, &mut session, &config, &tools)
+            .await
+            .unwrap();
+
+        assert_eq!(session.messages.len(), 1);
+        let groups = session.provider_transcript.replayable_groups(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            BOUNDARY,
+        );
+        assert_eq!(groups.len(), 2, "provider call then host output");
+        assert_eq!(groups[0].anchor_message_id(), groups[1].anchor_message_id());
+        assert_eq!(groups[0].items()[0].payload()["type"], "tool_search_call");
+        assert_eq!(groups[1].items()[0].payload()["type"], "tool_search_output");
+
+        let effective = effective_callable_set_for_round(
+            &session,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::Progressive,
+        );
+        assert!(effective.contains_execution_name("Read"));
+        assert!(effective.contains_execution_name("search_orders"));
+        assert!(!effective.contains_execution_name("Glob"));
     }
 
     #[tokio::test]
