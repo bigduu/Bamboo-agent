@@ -373,6 +373,14 @@ impl<'de> Deserialize<'de> for ProviderTranscriptGroup {
 }
 
 impl ProviderTranscriptGroup {
+    /// Validate an atomic provider-native batch before any item is exposed to
+    /// the engine stream. Provider adapters use this same admission path as
+    /// durable group construction so malformed ordering cannot fail later,
+    /// after the normalized assistant response has already been committed.
+    pub fn validate_items(items: &[ProviderTranscriptItem]) -> Result<(), ProviderTranscriptError> {
+        validated_group_identity(items).map(|_| ())
+    }
+
     fn new(
         epoch: u64,
         sequence: u64,
@@ -392,16 +400,7 @@ impl ProviderTranscriptGroup {
         if !is_sha256_hex(&provider_boundary_sha256) {
             return Err(ProviderTranscriptError::InvalidProviderBoundary);
         }
-        if items
-            .iter()
-            .any(|item| item.family != family || item.protocol != protocol)
-        {
-            return Err(ProviderTranscriptError::MixedProviderGroup);
-        }
-        if !items.iter().any(|item| item.kind.is_discovery()) {
-            return Err(ProviderTranscriptError::MissingDiscoveryItem);
-        }
-        validate_group_order(protocol, &items)?;
+        Self::validate_items(&items)?;
 
         let id = stable_group_id(
             epoch,
@@ -1275,6 +1274,16 @@ fn is_nonempty_string(value: Option<&Value>) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn is_optional_nullable_nonempty_string(value: Option<&Value>) -> bool {
+    value.is_none_or(|value| {
+        value.is_null() || value.as_str().is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn is_optional_nullable_item_status(value: Option<&Value>) -> bool {
+    value.is_none_or(|value| value.is_null() || is_openai_item_status(Some(value)))
+}
+
 fn is_openai_item_status(value: Option<&Value>) -> bool {
     matches!(
         value.and_then(Value::as_str),
@@ -1286,6 +1295,9 @@ fn validate_openai_agent(value: Option<&Value>) -> Result<(), ProviderTranscript
     let Some(value) = value else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
     let agent = value
         .as_object()
         .ok_or(ProviderTranscriptError::InvalidItem("agent shape"))?;
@@ -1378,6 +1390,9 @@ fn validate_openai_logprobs(value: Option<&Value>) -> Result<(), ProviderTranscr
     let Some(value) = value else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
     let logprobs = value
         .as_array()
         .ok_or(ProviderTranscriptError::InvalidItem("output logprobs"))?;
@@ -1471,6 +1486,9 @@ fn validate_openai_reasoning_parts(
             Ok(())
         };
     };
+    if value.is_null() && !required {
+        return Ok(());
+    }
     let parts = value
         .as_array()
         .ok_or(ProviderTranscriptError::InvalidItem("reasoning parts"))?;
@@ -1492,6 +1510,9 @@ fn validate_openai_caller(value: Option<&Value>) -> Result<(), ProviderTranscrip
     let Some(value) = value else {
         return Ok(());
     };
+    if value.is_null() {
+        return Ok(());
+    }
     let caller = value
         .as_object()
         .ok_or(ProviderTranscriptError::InvalidItem("function caller"))?;
@@ -1544,7 +1565,8 @@ fn validate_openai_item(
                 || object.get("role").and_then(Value::as_str) != Some("assistant")
                 || !is_openai_item_status(object.get("status"))
                 || object.get("phase").is_some_and(|phase| {
-                    !matches!(phase.as_str(), Some("commentary" | "final_answer"))
+                    !phase.is_null()
+                        && !matches!(phase.as_str(), Some("commentary" | "final_answer"))
                 })
             {
                 return Err(ProviderTranscriptError::InvalidItem(
@@ -1573,12 +1595,10 @@ fn validate_openai_item(
             )?;
             if author != ProviderTranscriptAuthor::Model
                 || !is_nonempty_string(object.get("id"))
-                || object
+                || !object
                     .get("encrypted_content")
-                    .is_some_and(|content| !content.is_string())
-                || object
-                    .get("status")
-                    .is_some_and(|_| !is_openai_item_status(object.get("status")))
+                    .is_none_or(|content| content.is_null() || content.is_string())
+                || !is_optional_nullable_item_status(object.get("status"))
             {
                 return Err(ProviderTranscriptError::InvalidItem("reasoning shape"));
             }
@@ -1600,6 +1620,7 @@ fn validate_openai_item(
                     "caller",
                     "namespace",
                     "status",
+                    "created_by",
                 ],
                 "function call fields",
             )?;
@@ -1607,15 +1628,10 @@ fn validate_openai_item(
             require_nonempty_string("call_id")?;
             let arguments = object.get("arguments").and_then(Value::as_str);
             if author != ProviderTranscriptAuthor::Model
-                || object
-                    .get("id")
-                    .is_some_and(|_| !is_nonempty_string(object.get("id")))
-                || object
-                    .get("namespace")
-                    .is_some_and(|_| !is_nonempty_string(object.get("namespace")))
-                || object
-                    .get("status")
-                    .is_some_and(|_| !is_openai_item_status(object.get("status")))
+                || !is_optional_nullable_nonempty_string(object.get("id"))
+                || !is_optional_nullable_nonempty_string(object.get("namespace"))
+                || !is_optional_nullable_item_status(object.get("status"))
+                || !is_optional_nullable_nonempty_string(object.get("created_by"))
                 || arguments.is_none()
                 || !arguments.is_some_and(|arguments| {
                     serde_json::from_str::<Value>(arguments)
@@ -1644,15 +1660,18 @@ fn validate_openai_item(
                 ],
                 "tool search call fields",
             )?;
-            execution()?;
+            let execution = execution()?;
             require_nonempty_string("id")?;
-            require_nonempty_string("call_id")?;
+            let call_id_valid = if execution == "client" {
+                is_nonempty_string(object.get("call_id"))
+            } else {
+                is_optional_nullable_nonempty_string(object.get("call_id"))
+            };
             if author != ProviderTranscriptAuthor::Model
                 || object.get("status").and_then(Value::as_str) != Some("completed")
                 || !object.get("arguments").is_some_and(Value::is_object)
-                || object
-                    .get("created_by")
-                    .is_some_and(|_| !is_nonempty_string(object.get("created_by")))
+                || !call_id_valid
+                || !is_optional_nullable_nonempty_string(object.get("created_by"))
             {
                 return Err(ProviderTranscriptError::InvalidItem(
                     "tool search call shape",
@@ -1687,13 +1706,11 @@ fn validate_openai_item(
                         "server tool search output fields",
                     )?;
                     require_nonempty_string("id")?;
-                    require_nonempty_string("call_id")?;
-                    if object
-                        .get("created_by")
-                        .is_some_and(|_| !is_nonempty_string(object.get("created_by")))
+                    if !is_optional_nullable_nonempty_string(object.get("call_id"))
+                        || !is_optional_nullable_nonempty_string(object.get("created_by"))
                     {
                         return Err(ProviderTranscriptError::InvalidItem(
-                            "tool search output created_by",
+                            "tool search output metadata",
                         ));
                     }
                     validate_openai_agent(object.get("agent"))?;
@@ -2168,6 +2185,27 @@ fn validate_anthropic_search_result_content(
     }
 }
 
+fn validated_group_identity(
+    items: &[ProviderTranscriptItem],
+) -> Result<(ProviderFamily, ProviderProtocol), ProviderTranscriptError> {
+    let Some(first) = items.first() else {
+        return Err(ProviderTranscriptError::EmptyGroup);
+    };
+    let family = first.family;
+    let protocol = first.protocol;
+    if items
+        .iter()
+        .any(|item| item.family != family || item.protocol != protocol)
+    {
+        return Err(ProviderTranscriptError::MixedProviderGroup);
+    }
+    if !items.iter().any(|item| item.kind.is_discovery()) {
+        return Err(ProviderTranscriptError::MissingDiscoveryItem);
+    }
+    validate_group_order(protocol, items)?;
+    Ok((family, protocol))
+}
+
 fn validate_group_order(
     protocol: ProviderProtocol,
     items: &[ProviderTranscriptItem],
@@ -2179,6 +2217,9 @@ fn validate_group_order(
             let mut seen_search_outputs = HashSet::<(&str, &str)>::new();
             let mut pending_provider_calls = HashSet::<&str>::new();
             let mut pending_client_calls = HashSet::<&str>::new();
+            let mut pending_unkeyed_provider_calls = 0usize;
+            let mut has_client_search_call = false;
+            let mut has_client_search_output = false;
             let mut loaded_at = HashMap::<String, usize>::new();
             let mut function_calls = Vec::<(usize, &str)>::new();
             for (index, item) in items.iter().enumerate() {
@@ -2199,14 +2240,24 @@ fn validate_group_order(
                             .get("call_id")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        if !seen_search_call_ids.insert(call_id) {
-                            return Err(ProviderTranscriptError::InvalidGroupOrder);
-                        }
-                        if execution == "server" {
-                            pending_provider_calls.insert(call_id);
+                        if call_id.is_empty() {
+                            if execution == "server" {
+                                pending_unkeyed_provider_calls =
+                                    pending_unkeyed_provider_calls.saturating_add(1);
+                            } else {
+                                return Err(ProviderTranscriptError::InvalidGroupOrder);
+                            }
                         } else {
-                            pending_client_calls.insert(call_id);
+                            if !seen_search_call_ids.insert(call_id) {
+                                return Err(ProviderTranscriptError::InvalidGroupOrder);
+                            }
+                            if execution == "server" {
+                                pending_provider_calls.insert(call_id);
+                            } else {
+                                pending_client_calls.insert(call_id);
+                            }
                         }
+                        has_client_search_call |= execution == "client";
                     }
                     ProviderTranscriptItemKind::OpenAiToolSearchOutput => {
                         let execution = item
@@ -2219,15 +2270,28 @@ fn validate_group_order(
                             .get("call_id")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        if !seen_search_outputs.insert((execution, call_id)) {
+                        if !call_id.is_empty() && !seen_search_outputs.insert((execution, call_id))
+                        {
                             return Err(ProviderTranscriptError::InvalidGroupOrder);
                         }
-                        let pending = if execution == "server" {
-                            &mut pending_provider_calls
+                        let matched_pending = if call_id.is_empty() {
+                            if execution != "server" || pending_unkeyed_provider_calls == 0 {
+                                false
+                            } else {
+                                pending_unkeyed_provider_calls =
+                                    pending_unkeyed_provider_calls.saturating_sub(1);
+                                true
+                            }
                         } else {
-                            &mut pending_client_calls
+                            let pending = if execution == "server" {
+                                &mut pending_provider_calls
+                            } else {
+                                &mut pending_client_calls
+                            };
+                            pending.remove(call_id)
                         };
-                        if !pending.remove(call_id)
+                        has_client_search_output |= execution == "client";
+                        if !matched_pending
                             && (execution == "server"
                                 || item.origin != ProviderTranscriptOrigin::HostToolSearch)
                         {
@@ -2252,7 +2316,15 @@ fn validate_group_order(
                     _ => {}
                 }
             }
-            if !pending_provider_calls.is_empty() {
+            if !pending_provider_calls.is_empty() || pending_unkeyed_provider_calls != 0 {
+                return Err(ProviderTranscriptError::InvalidGroupOrder);
+            }
+            // Client execution is a suspension boundary: the provider-owned
+            // response stops at tool_search_call, and the host resumes it in a
+            // later standalone HostToolSearch output group. Express this as an
+            // order-independent group invariant so reversed malformed output
+            // cannot bypass a forward-only state check.
+            if has_client_search_call && (has_client_search_output || !function_calls.is_empty()) {
                 return Err(ProviderTranscriptError::InvalidGroupOrder);
             }
             let mut matched_loaded_call = false;
@@ -2666,6 +2738,80 @@ mod tests {
     }
 
     #[test]
+    fn openai_provider_output_preserves_official_nullable_fields() {
+        let payloads = [
+            (
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"reasoning","id":"rs_nullable","summary":[],
+                    "agent":null,"content":null,"encrypted_content":null,"status":null
+                }),
+            ),
+            (
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"message","id":"msg_nullable","role":"assistant",
+                    "status":"completed","agent":null,"phase":null,
+                    "content":[{
+                        "type":"output_text","text":"Searching",
+                        "annotations":[],"logprobs":null
+                    }]
+                }),
+            ),
+            (
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","id":"tsc_nullable","execution":"server",
+                    "call_id":null,"status":"completed","arguments":{"query":"orders"},
+                    "agent":null,"created_by":null
+                }),
+            ),
+            (
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","id":"tso_nullable","execution":"server",
+                    "call_id":null,"status":"completed","agent":null,"created_by":null,
+                    "tools":[{"type":"function","name":"get_orders"}]
+                }),
+            ),
+            (
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"function_call","id":null,"call_id":"call_nullable",
+                    "name":"get_orders","arguments":"{}","agent":null,"caller":null,
+                    "namespace":null,"status":null,"created_by":null
+                }),
+            ),
+        ];
+        let expected = payloads
+            .iter()
+            .map(|(_, payload)| payload.clone())
+            .collect::<Vec<_>>();
+        let items = payloads
+            .into_iter()
+            .map(|(author, payload)| {
+                ProviderTranscriptItem::try_from_payload(
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    ProviderTranscriptOrigin::Provider,
+                    author,
+                    payload,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        ProviderTranscriptGroup::validate_items(&items).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.payload().clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn anthropic_reference_chain_round_trips_without_schema_expansion() {
         let items = anthropic_items();
         let encoded = serde_json::to_value(&items).unwrap();
@@ -2709,6 +2855,8 @@ mod tests {
             additional.kind(),
             ProviderTranscriptItemKind::OpenAiAdditionalTools
         );
+        ProviderTranscriptGroup::validate_items(std::slice::from_ref(&client))
+            .expect("a client output is a standalone host-owned continuation group");
     }
 
     #[test]
@@ -3333,6 +3481,38 @@ mod tests {
         ];
         assert!(test_group("openai-parallel", parallel).is_ok());
 
+        let unkeyed_parallel = vec![
+            hosted_item(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","id":"tsc_unkeyed_1","execution":"server",
+                    "call_id":null,"status":"completed","arguments":{"query":"first"}
+                }),
+            ),
+            hosted_item(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","id":"tsc_unkeyed_2","execution":"server",
+                    "status":"completed","arguments":{"query":"second"}
+                }),
+            ),
+            hosted_item(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","id":"tso_unkeyed_1","execution":"server",
+                    "call_id":null,"status":"completed","tools":[]
+                }),
+            ),
+            hosted_item(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_output","id":"tso_unkeyed_2","execution":"server",
+                    "status":"completed","tools":[]
+                }),
+            ),
+        ];
+        assert!(test_group("openai-unkeyed-parallel", unkeyed_parallel).is_ok());
+
         let mismatched_output = hosted_item(
             ProviderTranscriptAuthor::ToolResult,
             json!({
@@ -3380,14 +3560,58 @@ mod tests {
             .unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
-        for malformed in [
+        assert!(ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
             json!({
                 "type":"tool_search_call","execution":"server","call_id":"search_missing_id",
                 "status":"completed","arguments":{}
             }),
+        )
+        .is_err());
+        for call_id in [json!(""), json!(7)] {
+            assert!(ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_search_call","id":"tsc_invalid_call","execution":"server",
+                    "call_id":call_id,"status":"completed","arguments":{}
+                }),
+            )
+            .is_err());
+        }
+        ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
             json!({
                 "type":"tool_search_call","id":"tsc_missing_call","execution":"server",
                 "status":"completed","arguments":{}
+            }),
+        )
+        .expect("the official hosted output model permits an omitted call_id");
+
+        for malformed_client in [
+            json!({
+                "type":"tool_search_call","id":"tsc_client_missing","execution":"client",
+                "status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_null","execution":"client",
+                "call_id":null,"status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_empty","execution":"client",
+                "call_id":"","status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_typed","execution":"client",
+                "call_id":7,"status":"completed","arguments":{}
             }),
         ] {
             assert!(ProviderTranscriptItem::try_from_payload(
@@ -3395,7 +3619,7 @@ mod tests {
                 ProviderProtocol::OpenAiResponsesV1,
                 ProviderTranscriptOrigin::Provider,
                 ProviderTranscriptAuthor::Model,
-                malformed,
+                malformed_client,
             )
             .is_err());
         }
@@ -3413,7 +3637,59 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(test_group("client-call", vec![client_call]).is_ok());
+        assert!(test_group("client-call", vec![client_call.clone()]).is_ok());
+        let premature_function_call = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"function_call","id":"fc_client_premature","call_id":"function_1",
+                "name":"get_weather","arguments":"{}","status":"completed"
+            }),
+        );
+        assert_eq!(
+            test_group(
+                "client-call-must-stop",
+                vec![client_call.clone(), premature_function_call.clone()],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        assert_eq!(
+            test_group(
+                "function-cannot-precede-client-call",
+                vec![premature_function_call, client_call.clone()],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let host_client_output = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client",
+                "call_id":"search_1","status":"completed","tools":[]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            test_group(
+                "client-call-cannot-contain-host-output",
+                vec![client_call.clone(), host_client_output.clone()],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        assert_eq!(
+            test_group(
+                "host-output-cannot-precede-client-call",
+                vec![host_client_output.clone(), client_call],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+        assert!(test_group("standalone-host-output", vec![host_client_output]).is_ok());
 
         let anthropic = anthropic_items();
         let mut reordered = anthropic.clone();
