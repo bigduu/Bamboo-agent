@@ -123,6 +123,28 @@ impl McpServerManager {
             .filter(|id| !desired_enabled.contains(id.as_str()))
             .collect();
 
+        // Validate the complete resulting catalog before crossing the durable
+        // configuration boundary. This catches cross-server alias conflicts as
+        // one unit and leaves every currently published runtime/index entry
+        // untouched on failure.
+        let replacement_catalogs: Vec<_> = replacements
+            .iter()
+            .map(|prepared| prepared.catalog.clone())
+            .collect();
+        let catalog_update = match self
+            .index
+            .preflight_catalog_update(&replacement_catalogs, &removals)
+        {
+            Ok(update) => update,
+            Err(error) => {
+                for prepared in replacements {
+                    let id = prepared.runtime.config.id.clone();
+                    self.shutdown_detached_runtime(&id, prepared.runtime).await;
+                }
+                return Err(error.into());
+            }
+        };
+
         if let Err(error) = before_publish().await {
             for prepared in replacements {
                 let id = prepared.runtime.config.id.clone();
@@ -147,7 +169,7 @@ impl McpServerManager {
         }
         let mut removed = Vec::new();
         for id in removals {
-            match self.detach_runtime(&id) {
+            match self.detach_runtime_without_index(&id) {
                 Ok(runtime) => removed.push((id, runtime)),
                 Err(error) => {
                     // The reconcile lock makes this unreachable for ordinary
@@ -157,6 +179,7 @@ impl McpServerManager {
                 }
             }
         }
+        self.index.commit_catalog_update(catalog_update);
 
         // Event channel backpressure and transport shutdown are post-commit
         // cleanup. They must never delay section health publication by the

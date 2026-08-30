@@ -488,19 +488,23 @@ impl Default for RuntimeInfo {
     }
 }
 
-/// Tool alias mapping for namespaced tool access.
+/// Tool alias mapping for collision-safe MCP tool access.
 ///
-/// Maps a fully-qualified tool name (with server prefix) to the original
-/// tool name on a specific server. This enables multiple servers to provide
-/// tools with the same name without conflicts.
+/// Maps a deterministic provider-visible identity to the exact original tool
+/// and server tuple. This enables multiple servers to provide identical or
+/// punctuation-heavy names without collisions.
 ///
 /// # Format
 ///
-/// The alias format is: `mcp__<server_id>__<original_name>`
+/// Canonical aliases use `mcp__v1_<server-tag>_<owner-tag>`. Both tags are
+/// domain-separated, length-framed SHA-256 pseudonyms truncated to 130 bits,
+/// and the complete alias is bounded to provider function-name limits.
+/// Historical `mcp__<server>__<tool>` names are compatibility lookup inputs
+/// only when they resolve to exactly one owner.
 ///
 /// # Fields
 ///
-/// * `alias` - Fully-qualified tool name with server prefix
+/// * `alias` - Canonical provider-visible tool identity
 /// * `server_id` - Identifier of the server providing this tool
 /// * `original_name` - Original tool name on the server
 ///
@@ -508,17 +512,16 @@ impl Default for RuntimeInfo {
 ///
 /// ```ignore
 /// let alias = ToolAlias {
-///     alias: "mcp__filesystem__read_file".to_string(),
+///     alias: "mcp__v1_<server-tag>_<owner-tag>".to_string(),
 ///     server_id: "filesystem".to_string(),
 ///     original_name: "read_file".to_string(),
 /// };
 ///
-/// // When the user calls "mcp__filesystem__read_file",
-/// // it maps to the "read_file" tool on the "filesystem" server
+/// // The canonical alias maps to the exact "read_file" owner tuple.
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolAlias {
-    /// Fully-qualified tool name (mcp__<server>__<tool>)
+    /// Canonical provider-visible identity (or a resolved legacy lookup input).
     pub alias: String,
     /// Server providing this tool
     pub server_id: String,

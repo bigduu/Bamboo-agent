@@ -18,6 +18,13 @@ struct ParsedMcpAlias {
     tool_name: String,
 }
 
+fn is_v1_alias_tag(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+}
+
 fn parse_mcp_tool_alias(value: &str) -> Option<ParsedMcpAlias> {
     let trimmed = value.trim();
     if !trimmed.starts_with("mcp__") {
@@ -25,6 +32,20 @@ fn parse_mcp_tool_alias(value: &str) -> Option<ParsedMcpAlias> {
     }
 
     let rest = &trimmed["mcp__".len()..];
+    if let Some((server_tag, owner_tag)) = rest
+        .strip_prefix("v1_")
+        .and_then(|tags| tags.split_once('_'))
+    {
+        if is_v1_alias_tag(server_tag) && is_v1_alias_tag(owner_tag) {
+            // V1 exposes only stable pseudonyms. Preserve real per-server
+            // grouping without putting raw MCP labels into metrics.
+            return Some(ParsedMcpAlias {
+                server_id: format!("v1_{server_tag}"),
+                tool_name: owner_tag.to_string(),
+            });
+        }
+    }
+
     let sep = rest.find("__")?;
     if sep == 0 {
         return None;
@@ -248,4 +269,56 @@ pub async fn usage_breakdown(
         top_mcp_servers,
         top_mcp_tools,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mcp_tool_alias;
+
+    #[test]
+    fn parses_v1_canonical_alias_as_secret_safe_mcp_pseudonyms() {
+        let alias =
+            bamboo_mcp::ToolIndex::new().generate_alias("secret-server-label", "secret-tool-label");
+        let (server_tag, owner_tag) = alias
+            .strip_prefix("mcp__v1_")
+            .and_then(|tags| tags.split_once('_'))
+            .unwrap();
+        let parsed =
+            parse_mcp_tool_alias(&alias).expect("canonical v1 aliases remain in MCP metrics");
+
+        assert_eq!(parsed.server_id, format!("v1_{server_tag}"));
+        assert_eq!(parsed.tool_name, owner_tag);
+        assert!(!parsed.server_id.contains("secret"));
+        assert!(!parsed.tool_name.contains("secret"));
+    }
+
+    #[test]
+    fn v1_metrics_group_same_server_and_separate_distinct_servers() {
+        let index = bamboo_mcp::ToolIndex::new();
+        let first = parse_mcp_tool_alias(&index.generate_alias("server-a", "tool-one")).unwrap();
+        let sibling = parse_mcp_tool_alias(&index.generate_alias("server-a", "tool-two")).unwrap();
+        let other = parse_mcp_tool_alias(&index.generate_alias("server-b", "tool-one")).unwrap();
+
+        assert_eq!(first.server_id, sibling.server_id);
+        assert_ne!(first.tool_name, sibling.tool_name);
+        assert_ne!(first.server_id, other.server_id);
+        assert_ne!(first.tool_name, other.tool_name);
+    }
+
+    #[test]
+    fn preserves_legacy_alias_parsing_and_rejects_malformed_v1_names() {
+        let legacy = parse_mcp_tool_alias("mcp__filesystem__read_file").unwrap();
+        assert_eq!(legacy.server_id, "filesystem");
+        assert_eq!(legacy.tool_name, "read_file");
+
+        let legacy_v1_prefix = parse_mcp_tool_alias("mcp__v1_server__tool").unwrap();
+        assert_eq!(legacy_v1_prefix.server_id, "v1_server");
+        assert_eq!(legacy_v1_prefix.tool_name, "tool");
+
+        assert!(parse_mcp_tool_alias("mcp__v1_too_short").is_none());
+        assert!(
+            parse_mcp_tool_alias(&format!("mcp__v1_{}_{}", "a".repeat(26), "0".repeat(26)))
+                .is_none()
+        );
+    }
 }
