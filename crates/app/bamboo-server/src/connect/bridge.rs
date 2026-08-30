@@ -1715,14 +1715,30 @@ mod tests {
                 .map(String::as_str),
             Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
         );
+        let project_path_display = project.project_path.as_deref().expect("Project path");
         let system_prompt = session
             .messages
             .iter()
             .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
             .expect("Connect system prompt");
-        assert!(system_prompt
+        assert!(!system_prompt.content.contains(project_path_display));
+        assert!(!system_prompt
             .content
-            .contains("Workspace source: project_default"));
+            .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
+        assert!(!system_prompt
+            .content
+            .contains("BAMBOO_PROJECT_CONTEXT_START"));
+        let snapshot = session.prompt_snapshot.as_ref().expect("prompt snapshot");
+        assert!(snapshot
+            .workspace_context
+            .as_deref()
+            .is_some_and(|value| value.contains(project_path_display)));
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(project_path_display));
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
     }
 
     #[tokio::test]

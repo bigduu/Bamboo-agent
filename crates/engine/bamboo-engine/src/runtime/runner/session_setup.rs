@@ -32,6 +32,10 @@ pub fn refresh_prompt_snapshot(session: &mut Session) {
     prompt_setup::refresh_prompt_snapshot_from_session(session)
 }
 
+pub(crate) fn migrate_legacy_workspace_prompt(session: &mut Session) -> bool {
+    prompt_setup::migrate_legacy_workspace_prompt(session)
+}
+
 async fn publish_pending_workflow_lifecycle_event(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -127,6 +131,9 @@ pub(crate) async fn prepare_session_for_loop(
     must_resume_pinned_activation: bool,
     event_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
 ) -> super::Result<Option<TaskLoopContext>> {
+    // Resume compatibility: recover metadata before any workspace-scoped skill
+    // or instruction lookup, then permanently remove the legacy prompt marker.
+    migrate_legacy_workspace_prompt(session);
     publish_pending_workflow_lifecycle_event(session, config, event_tx).await?;
     let skill_result = match skill_context::load_skill_context(
         config,

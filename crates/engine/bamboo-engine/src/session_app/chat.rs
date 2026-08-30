@@ -1,6 +1,6 @@
 //! Chat use case: prepare a chat turn for execution.
 
-use crate::context::{build_env_prompt_context, build_workspace_prompt_context};
+use crate::context::build_env_prompt_context;
 use crate::runner::refresh_prompt_snapshot;
 use bamboo_agent_core::{Role, Session};
 use bamboo_config::paths::path_to_display_string;
@@ -29,7 +29,7 @@ const PROMPT_FINGERPRINT_KEY: &str = "prompt_fingerprint";
 const PROMPT_COMPONENT_FLAGS_KEY: &str = "prompt_component_flags";
 const PROMPT_COMPONENT_LENGTHS_KEY: &str = "prompt_component_lengths";
 
-const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v2";
+const PROMPT_COMPOSER_VERSION: &str = "bamboo.prompt-composer.v3";
 pub const SESSION_START_SOURCE_METADATA_KEY: &str = "runtime.session_start_source";
 
 /// Prepare a chat turn: load/create session, resolve prompts, update metadata,
@@ -160,6 +160,7 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
         crate::project_context::SessionProjectIdentity::Assigned(_)
         | crate::project_context::SessionProjectIdentity::Unassigned => {}
     }
+    crate::runtime::runner::session_setup::migrate_legacy_workspace_prompt(&mut session);
     session.metadata.insert(
         SESSION_START_SOURCE_METADATA_KEY.to_string(),
         session_start_source.to_string(),
@@ -242,10 +243,25 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     );
 
     // ---- Upsert system prompt message ----
-    session
+    // A workspace-only switch leaves this stable text byte-identical and must
+    // not rewrite Session.messages.
+    let system_messages = session
         .messages
-        .retain(|message| !matches!(message.role, Role::System));
-    session.messages.insert(0, Message::system(system_prompt));
+        .iter()
+        .filter(|message| matches!(message.role, Role::System))
+        .collect::<Vec<_>>();
+    let system_is_current = system_messages.len() == 1
+        && system_messages[0].content == system_prompt
+        && session
+            .messages
+            .first()
+            .is_some_and(|message| matches!(message.role, Role::System));
+    if !system_is_current {
+        session
+            .messages
+            .retain(|message| !matches!(message.role, Role::System));
+        session.messages.insert(0, Message::system(system_prompt));
+    }
     refresh_prompt_snapshot(&mut session);
 
     // ---- Persist model/provider selection ----
@@ -302,6 +318,8 @@ pub fn resolve_base_prompt(
                 trimmed.to_string()
             }
         });
+    let resolved =
+        crate::runtime::runner::session_setup::prompt_setup::normalize_base_prompt(&resolved);
 
     session
         .metadata
@@ -353,25 +371,21 @@ fn resolve_workspace_path_with_default(
     data_dir: Option<&Path>,
     allow_legacy_fallback: bool,
 ) -> Option<String> {
-    if let Some(path) = workspace_path_from_request {
-        session.set_workspace_path_meta(path);
-        session.metadata.insert(
-            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
-            crate::project_context::WorkspaceSource::Explicit
-                .as_str()
-                .to_string(),
-        );
-    }
-
-    let resolved = workspace_path_from_request
-        .map(ToString::to_string)
-        .or_else(|| session.workspace_path_meta())
-        .or_else(|| {
-            allow_legacy_fallback
-                .then(|| default_workspace_path.map(ToString::to_string))
-                .flatten()
+    let explicit = workspace_path_from_request
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let persisted = session.workspace_path_meta();
+    let configured_default = allow_legacy_fallback
+        .then(|| {
+            default_workspace_path
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
         })
-        .or_else(|| {
+        .flatten();
+    let fallback = (explicit.is_none() && persisted.is_none() && configured_default.is_none())
+        .then(|| {
             allow_legacy_fallback
                 .then(|| {
                     resolve_workspace_fallback_with(fallback_policy, || {
@@ -379,13 +393,56 @@ fn resolve_workspace_path_with_default(
                     })
                 })
                 .flatten()
-        });
+        })
+        .flatten();
+    let (resolved, source, binding_reset) = if let Some(workspace) = explicit {
+        (
+            Some(workspace),
+            crate::project_context::WorkspaceSource::Explicit,
+            true,
+        )
+    } else if let Some(workspace) = persisted {
+        (
+            Some(workspace),
+            crate::project_context::WorkspaceSource::from_metadata(
+                session
+                    .metadata
+                    .get(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                    .map(String::as_str),
+            ),
+            false,
+        )
+    } else if let Some(workspace) = configured_default {
+        (
+            Some(workspace),
+            crate::project_context::WorkspaceSource::Session,
+            true,
+        )
+    } else {
+        (
+            fallback,
+            crate::project_context::WorkspaceSource::Session,
+            true,
+        )
+    };
     if let Some(workspace) = resolved.as_ref() {
         // Persist the effective post-lock choice, including a live-config or
         // session-root fallback. Otherwise the subsequent Project resolver
         // would see no metadata and independently pick a different global
         // fallback.
         session.set_workspace_path_meta(workspace.clone());
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            source.as_str().to_string(),
+        );
+        if binding_reset {
+            session.metadata.insert(
+                crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+                crate::project_context::WorkspaceBindingStatus::Unregistered
+                    .as_str()
+                    .to_string(),
+            );
+        }
     }
     resolved
 }
@@ -697,22 +754,13 @@ impl PromptCompositionProfile {
     }
 }
 
-fn build_prompt_fingerprint(
-    base_prompt: &str,
-    enhancement: Option<&str>,
-    workspace: Option<&str>,
-    env_context: Option<&str>,
-) -> String {
+fn build_prompt_fingerprint(base_prompt: &str, enhancement: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(PROMPT_COMPOSER_VERSION.as_bytes());
     hasher.update([0u8]);
     hasher.update(base_prompt.as_bytes());
     hasher.update([0u8]);
     hasher.update(enhancement.unwrap_or_default().as_bytes());
-    hasher.update([0u8]);
-    hasher.update(workspace.unwrap_or_default().as_bytes());
-    hasher.update([0u8]);
-    hasher.update(env_context.unwrap_or_default().as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -732,36 +780,25 @@ fn build_enhanced_system_prompt_with_profile(
         merged_prompt.push_str(enhancement.as_str());
     }
 
-    let workspace_context = workspace_path
+    let has_workspace_context = workspace_path
         .map(str::trim)
-        .filter(|workspace_path| !workspace_path.is_empty())
-        .and_then(build_workspace_prompt_context);
-    if let Some(workspace_context) = workspace_context.as_ref() {
-        merged_prompt.push_str("\n\n");
-        merged_prompt.push_str(workspace_context.as_str());
-    }
+        .is_some_and(|workspace_path| !workspace_path.is_empty());
 
-    let env_context = build_env_prompt_context();
-    if let Some(env_context) = env_context.as_ref() {
-        merged_prompt.push_str("\n\n");
-        merged_prompt.push_str(env_context.as_str());
-    }
+    // Environment details are discovered from the same authority during round
+    // assembly and emitted as a typed EnvSnapshot. Keep the compatibility flag
+    // observable without copying those details into System or its fingerprint.
+    let has_env_context = build_env_prompt_context().is_some();
 
     let profile = PromptCompositionProfile {
         version: PROMPT_COMPOSER_VERSION,
-        fingerprint: build_prompt_fingerprint(
-            base_prompt,
-            enhancement.as_deref(),
-            workspace_context.as_deref(),
-            env_context.as_deref(),
-        ),
+        fingerprint: build_prompt_fingerprint(base_prompt, enhancement.as_deref()),
         has_enhancement: enhancement.is_some(),
-        has_workspace_context: workspace_context.is_some(),
-        has_env_context: env_context.is_some(),
+        has_workspace_context,
+        has_env_context,
         base_len: base_prompt.len(),
         enhancement_len: enhancement.as_ref().map(|s| s.len()).unwrap_or(0),
-        workspace_context_len: workspace_context.as_ref().map(|s| s.len()).unwrap_or(0),
-        env_context_len: env_context.as_ref().map(|s| s.len()).unwrap_or(0),
+        workspace_context_len: 0,
+        env_context_len: 0,
         final_len: merged_prompt.len(),
     };
 
@@ -1144,6 +1181,13 @@ mod tests {
         let system_prompt = system_message_content(&session);
         assert!(system_prompt.starts_with("Base prompt"));
         assert!(system_prompt.contains("Extra enhancement guidance"));
+        assert!(!system_prompt.contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER));
+        assert!(!system_prompt.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+        assert!(!system_prompt
+            .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+        assert!(!system_prompt.contains(crate::runtime::context::ENV_CONTEXT_START_MARKER));
+        assert!(!system_prompt.contains("BAMBOO_SKILL_CONTEXT_START"));
+        assert!(!system_prompt.contains("BAMBOO_TOOL_GUIDE_START"));
         assert_eq!(
             session.enhance_prompt().as_deref(),
             Some("Extra enhancement guidance")
@@ -1172,6 +1216,68 @@ mod tests {
             .metadata
             .get(PROMPT_COMPONENT_FLAGS_KEY)
             .is_some_and(|flags| flags.contains("enhance=0")));
+    }
+
+    #[test]
+    fn workspace_switch_preserves_system_identity_and_prompt_fingerprint() {
+        let first_workspace = "/workspace/first-private";
+        let second_workspace = "/workspace/second-private";
+        let mut first_input = chat_turn_input(Some("Stable enhancement"));
+        first_input.workspace_path = Some(first_workspace.to_string());
+        let first = prepare_chat_turn_from_authoritative_session(
+            None,
+            first_input,
+            "Global prompt",
+            "Builtin prompt",
+        )
+        .expect("first workspace turn");
+        let first_system = first
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, Role::System))
+            .expect("first system message")
+            .clone();
+        let first_fingerprint = first
+            .metadata
+            .get(PROMPT_FINGERPRINT_KEY)
+            .expect("first prompt fingerprint")
+            .clone();
+
+        let mut switched_input = chat_turn_input(Some("Stable enhancement"));
+        switched_input.workspace_path = Some(second_workspace.to_string());
+        let switched = prepare_chat_turn_from_authoritative_session(
+            Some(first),
+            switched_input,
+            "Global prompt",
+            "Builtin prompt",
+        )
+        .expect("switched workspace turn");
+        let switched_system = switched
+            .messages
+            .iter()
+            .find(|message| matches!(message.role, Role::System))
+            .expect("switched system message");
+
+        assert_eq!(switched_system.id, first_system.id);
+        assert_eq!(switched_system.content, first_system.content);
+        assert_eq!(
+            switched.metadata.get(PROMPT_FINGERPRINT_KEY),
+            Some(&first_fingerprint)
+        );
+        assert_eq!(
+            switched.workspace_path_meta().as_deref(),
+            Some(second_workspace)
+        );
+        assert!(!switched_system.content.contains(first_workspace));
+        assert!(!switched_system.content.contains(second_workspace));
+        assert!(!switched_system
+            .content
+            .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+        assert!(switched
+            .prompt_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace_context.as_deref())
+            .is_some_and(|context| context.contains(second_workspace)));
     }
 
     #[test]
@@ -1211,8 +1317,8 @@ mod tests {
         );
         let system_prompt = system_message_content(&session);
         assert!(
-            system_prompt.contains(&session_fallback_display),
-            "session fallback must participate in prepare-stage prompt composition"
+            !system_prompt.contains(&session_fallback_display),
+            "workspace path must stay out of the persisted System message"
         );
         assert!(
             !system_prompt.contains(foreign_default.to_string_lossy().as_ref()),
@@ -1270,6 +1376,18 @@ mod tests {
                 .canonicalize()
                 .expect("configured canonical")
         );
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::project_context::WorkspaceSource::Session.as_str())
+        );
+        assert!(session
+            .prompt_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace_context.as_deref())
+            .is_some_and(|context| context.contains("Workspace source: session")));
     }
 
     // The non-server disk fallback (`default_workspace_from_data_dir`) tested

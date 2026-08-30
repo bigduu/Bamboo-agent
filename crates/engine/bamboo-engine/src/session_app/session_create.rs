@@ -68,6 +68,18 @@ pub fn build_new_session(input: &CreateSessionInput, config: &CreateSessionConfi
     }
     if let Some(workspace_path) = trimmed_non_empty(input.workspace_path.as_deref()) {
         session.set_workspace_path_meta(workspace_path);
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            crate::project_context::WorkspaceSource::Explicit
+                .as_str()
+                .to_string(),
+        );
+        session.metadata.insert(
+            crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+            crate::project_context::WorkspaceBindingStatus::Unregistered
+                .as_str()
+                .to_string(),
+        );
     }
     if let Some(project_id) = input.project_id.as_ref() {
         session.set_project_id_meta(project_id.to_string());

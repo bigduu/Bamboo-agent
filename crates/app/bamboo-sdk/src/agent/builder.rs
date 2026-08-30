@@ -2114,14 +2114,12 @@ mod tests {
         assert!(error
             .to_string()
             .contains("test provider must not be called"));
+        let canonical_display = bamboo_config::paths::path_to_display_string(
+            &project_path.path().canonicalize().unwrap(),
+        );
         assert_eq!(
             session.workspace_path_meta().as_deref(),
-            Some(
-                bamboo_config::paths::path_to_display_string(
-                    &project_path.path().canonicalize().unwrap()
-                )
-                .as_str()
-            )
+            Some(canonical_display.as_str())
         );
         assert_eq!(
             session
@@ -2130,16 +2128,33 @@ mod tests {
                 .map(String::as_str),
             Some("project_default")
         );
-        let prompt = session
+        assert!(session
             .messages
             .iter()
-            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-            .expect("runtime system prompt")
-            .content
-            .as_str();
-        assert!(prompt.contains("Project path:"));
-        assert!(prompt.contains("Project home (Bamboo data):"));
-        assert!(prompt.contains("Workspace source: project_default"));
+            .filter(|message| matches!(message.role, bamboo_agent_core::Role::System))
+            .all(|message| {
+                !message.content.contains(&canonical_display)
+                    && !message.content.contains("BAMBOO_PROJECT_CONTEXT_START")
+                    && !message.content.contains("BAMBOO_WORKSPACE_CONTEXT_START")
+            }));
+        let snapshot = session.prompt_snapshot.as_ref().expect("prompt snapshot");
+        let project_context = snapshot
+            .project_context
+            .as_deref()
+            .expect("typed Project context");
+        assert!(project_context.contains(project.id.as_str()));
+        assert!(!project_context.contains(&canonical_display));
+        assert!(!project_context.contains("Project home (Bamboo data):"));
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed Workspace context");
+        assert!(workspace_context.contains(&canonical_display));
+        assert!(workspace_context.contains("Workspace source: project_default"));
+        assert!(workspace_context.contains("Binding status: registered"));
+        assert!(!snapshot
+            .effective_system_prompt
+            .contains(&canonical_display));
     }
 
     #[test]

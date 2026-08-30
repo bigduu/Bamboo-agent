@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     build_compression_context_blocks, emit_context_pressure_notification,
@@ -22,6 +22,13 @@ use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderMo
 use bamboo_llm::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
+
+fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
+    let guard = crate::runtime::tests::env_cache_lock_acquire();
+    let empty_data_dir = tempfile::tempdir().expect("temp dir for empty config");
+    let _ = bamboo_config::Config::from_data_dir(Some(empty_data_dir.path().to_path_buf()));
+    guard
+}
 
 /// A no-op LLM provider for tests that returns an empty stream.
 struct NoopLlmProvider;
@@ -944,8 +951,10 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
     assert!(persisted_user.content_parts.is_some());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_relocation_does_not_double_reserve_large_system_env_context() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let large_env = "stable environment inventory and capability detail ".repeat(900);
     let configured_system = format!(
         "system\n\n<!-- BAMBOO_ENV_CONTEXT_START -->\n{large_env}\n<!-- BAMBOO_ENV_CONTEXT_END -->"
@@ -956,13 +965,16 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
         ..Default::default()
     };
     let mut session = Session::new("session-cp-relocated-env", "test-model");
-    let (stable_frame, _) =
+    let (stable_frame, sections) =
         crate::runtime::runner::session_setup::prompt_setup::build_stable_prompt_frame_with_sections(
             &session,
             &config,
             &[],
             &Default::default(),
         );
+    assert!(!stable_frame
+        .stable_instructions
+        .contains("stable environment inventory"));
     session
         .messages
         .push(Message::system(stable_frame.stable_instructions));
@@ -971,9 +983,22 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
         .push(Message::user("inspect the environment"));
 
     let counter = TiktokenTokenCounter::default();
-    let fitted_system_tokens = counter.count_messages(&session.messages[..1]);
+    let env_context = sections
+        .iter()
+        .find(|section| section.name == "env")
+        .map(|section| section.content.clone())
+        .expect("relocated environment section");
+    let env_message = bamboo_agent_core::ContextBlock::new(
+        ContextBlockType::EnvSnapshot,
+        bamboo_agent_core::ContextBlockPriority::High,
+        bamboo_agent_core::ContextBlockStability::SessionStable,
+        "Environment Snapshot",
+        env_context,
+    )
+    .render_runtime_context_message();
+    let fitted_prefix_tokens = counter.count_messages(&[session.messages[0].clone(), env_message]);
     let max_output_tokens = 256;
-    let request_input_limit = fitted_system_tokens.saturating_add(768);
+    let request_input_limit = fitted_prefix_tokens.saturating_add(768);
     session.token_budget = Some(TokenBudget::with_safety_margin(
         request_input_limit.saturating_add(max_output_tokens),
         max_output_tokens,
@@ -1008,8 +1033,10 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let summary_content =
         "compressed decisions requirements and verification evidence ".repeat(900);
     let mut session = Session::new("session-cp-relocated-summary", "test-model");
@@ -1082,8 +1109,10 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-vision-refit", "test-model");
     session.messages.push(Message::system("system"));
     for index in 0..20 {

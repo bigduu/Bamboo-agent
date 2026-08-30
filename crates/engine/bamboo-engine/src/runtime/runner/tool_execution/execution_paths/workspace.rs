@@ -40,7 +40,6 @@ pub(super) async fn maybe_apply_workspace_update(
                                         "message": format!(
                                             "Session carries an invalid Project identity '{raw}': {message}"
                                         ),
-                                        "workspace": update.path,
                                     })
                                     .to_string();
                                     let _ = event_tx
@@ -56,7 +55,6 @@ pub(super) async fn maybe_apply_workspace_update(
                                 let error = serde_json::json!({
                                 "code": "project_workspace_conflict",
                                 "message": "Tool result workspace belongs to another Project; session workspace was not changed",
-                                "workspace": update.path,
                                 "owner_project_id": owner,
                                 "session_project_id": current,
                             })
@@ -81,10 +79,37 @@ pub(super) async fn maybe_apply_workspace_update(
                             }
                         }
                         Err(error) => {
+                            let error_kind = match &error {
+                                crate::project_context::ProjectContextError::Source(_) => "source",
+                                crate::project_context::ProjectContextError::IdentityMismatch {
+                                    ..
+                                } => "identity_mismatch",
+                                crate::project_context::ProjectContextError::WorkspaceConflict {
+                                    ..
+                                } => "workspace_conflict",
+                                crate::project_context::ProjectContextError::UnassignedWorkspaceConflict {
+                                    ..
+                                } => "unassigned_workspace_conflict",
+                                crate::project_context::ProjectContextError::InvalidProjectIdentity {
+                                    ..
+                                } => "invalid_project_identity",
+                                crate::project_context::ProjectContextError::ProjectUnavailable {
+                                    ..
+                                } => "project_unavailable",
+                                crate::project_context::ProjectContextError::ProjectPathMissing {
+                                    ..
+                                } => "project_path_missing",
+                                crate::project_context::ProjectContextError::ProjectPathUnavailable {
+                                    ..
+                                } => "project_path_unavailable",
+                                crate::project_context::ProjectContextError::WorkspaceInvalid {
+                                    ..
+                                } => "workspace_invalid",
+                            };
                             tracing::warn!(
                                 session_id,
                                 tool = %tool_call.function.name,
-                                %error,
+                                error_kind,
                                 "failed closed while checking implicit workspace ownership"
                             );
                             return;
@@ -98,10 +123,10 @@ pub(super) async fn maybe_apply_workspace_update(
                 update.binding_status,
             );
             tracing::info!(
-                "[{}] Updated session workspace_path via {}: {}",
                 session_id,
-                tool_call.function.name,
-                update.path
+                tool = %tool_call.function.name,
+                workspace_changed = true,
+                "updated session workspace metadata"
             );
         }
     }
