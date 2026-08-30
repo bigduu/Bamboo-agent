@@ -6,12 +6,12 @@
 
 ### The local-first AI agent runtime, in Rust.
 
-**Persistent memory, 22 built-in tools, skills, MCP, workflows & schedules — behind one HTTP + SSE API.**
+**Persistent memory, 22 built-in tools, skills, MCP, workflows & schedules — behind HTTP + WebSocket + SSE APIs.**
 Run it as a server, or embed the same agent loop as a Rust crate. Your data stays on your machine.
 
 [![Crates.io](https://img.shields.io/crates/v/bamboo-agent.svg?logo=rust)](https://crates.io/crates/bamboo-agent)
 [![docs.rs](https://img.shields.io/docsrs/bamboo-agent?logo=docsdotrs&label=docs.rs)](https://docs.rs/bamboo-agent)
-[![CI](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=main&logo=github&label=CI)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/bigduu/Bamboo-agent/ci.yml?branch=dev&logo=github&label=CI)](https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml)
 [![License MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![中文 README](https://img.shields.io/badge/lang-中文-red)](./README.zh-CN.md)
 
@@ -37,7 +37,7 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 | 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in docx / pdf / pptx / xlsx / skill-creator |
 | 🔌 **MCP** | Model Context Protocol client that hooks into external tool servers |
 | ⏰ **Workflows & schedules** | Declarative workflow loading + a cron-style schedule trigger engine |
-| 🌐 **HTTP / SSE** | Actix server, REST API, Server-Sent Events streaming, compatible with OpenAI / Anthropic / Gemini endpoints |
+| 🌐 **HTTP / WebSocket / SSE** | Actix server, REST API, shared `/v2/stream` WebSocket, legacy SSE feeds, and OpenAI / Anthropic / Gemini-compatible endpoints |
 | 🏗️ **Multi-provider** | anthropic (default), openai, gemini, copilot, bodhi routing |
 
 ---
@@ -48,7 +48,7 @@ Bamboo is a Cargo **workspace**: a thin root binary (`bamboo-agent`, which expos
 
 ```mermaid
 graph TD
-  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + SSE, routes, schedules, workflows]
+  CLI["bamboo (root bin)<br/>serve / config / -p headless / actor / broker"] --> SRV[bamboo-server<br/>Actix HTTP + WebSocket + SSE, routes, schedules, workflows]
   SRV --> ENG[bamboo-engine<br/>agent runtime, auto-dream, gardener, metrics]
   ENG --> CORE[bamboo-agent-core<br/>core abstractions]
   CORE --> DOM[bamboo-domain<br/>pure domain types]
@@ -75,7 +75,7 @@ graph TD
 
 …plus the root `bamboo-agent` binary.
 
-**Place in the Zenith stack:** lotus (the React UI) and bamboo communicate over **HTTP**; bodhi (the Tauri shell) is just the container that hosts the interface. Bamboo is the execution engine, and bodhi-server (Go) handles accounts/persistence/billing and the LLM proxy.
+**Place in the Zenith stack:** Bodhi is the Tauri desktop shell that starts or reuses a local `bamboo serve`, waits for `GET /api/v1/health`, and manages the sidecar lifecycle. In packaged builds, Bamboo serves the embedded Lotus frontend. Lotus sends requests over HTTP and receives live events through one shared `/v2/stream` WebSocket by default; the legacy account and session SSE feeds are fallbacks when the v2 transport is explicitly disabled or its initial WebSocket connection cannot be established. Bamboo remains the execution engine. `bodhi-server` is a separate, optional hosted account and provider path; the local Bodhi → Bamboo → Lotus path does not require it.
 
 ---
 
@@ -165,7 +165,7 @@ Arguments supported by `bamboo serve` (all override the config file):
 
 | Command | What it does |
 |---|---|
-| `bamboo serve` | Start the HTTP/SSE server (above). |
+| `bamboo serve` | Start the HTTP/WebSocket/SSE server (above). |
 | `bamboo tui` | Full-screen terminal client (chat, sessions, MCP, schedules, skills, config) over a running server; offers to auto-start a local one when unreachable (`--auto-serve`/`--no-auto-serve`). |
 | `bamboo init` | First-run setup: write `config.json` with a provider + API key (interactive, or `--non-interactive` for CI). |
 | `bamboo doctor` | Diagnose the install (config present, provider keyed, server reachable); exits non-zero on a blocking problem. |
@@ -307,7 +307,7 @@ dirs = "5"
 anyhow = "1"
 ```
 
-> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the HTTP API above — it drives the exact same loop. The full SDK type reference is the rustdoc at [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) (the published crate re-exports the facade as `bamboo_agent::agent`); [`docs/guides/API.md`](./docs/guides/API.md) covers the HTTP/SSE surface.
+> Prefer not to manage these dependencies yourself? Run `bamboo serve` and use the server APIs above — they drive the exact same loop. The full SDK type reference is the rustdoc at [docs.rs/bamboo-agent](https://docs.rs/bamboo-agent) (the published crate re-exports the facade as `bamboo_agent::agent`); [`docs/guides/API.md`](./docs/guides/API.md) covers the HTTP/WebSocket/SSE surface.
 
 ### Example configuration
 
@@ -345,6 +345,7 @@ curl http://localhost:9562/api/v1/health
 ### Selected API routes
 
 REST prefix `/api/v1`: `chat`, `execute/{session_id}`, `stream`, `sessions`, `skills`, `tools`, `tools/execute`, `models`, `commands`, `workflows`, `metrics/*`, `mcp`, `servers`, `stop/{session_id}`, `health`.
+The shared live transport is WebSocket `/v2/stream`; `/api/v1/stream` and `/api/v1/events/{session_id}` remain the legacy SSE feeds.
 There are also provider-compatible endpoints: `/openai/v1`, `/anthropic/v1`, `/gemini/v1beta`, `/v1/{chat/completions,responses,messages}`.
 
 ### Tests & quality
@@ -359,16 +360,19 @@ cargo build --release
 
 ## The Rest of the Stack
 
-Zenith is a monorepo, and bamboo is the execution-engine submodule within it.
+[`Zenith`](https://github.com/bigduu/Zenith) is a thin monorepo, and Bamboo is its execution-engine submodule.
 
 | Module | Role |
 |---|---|
-| [**bodhi**](../bodhi) | Desktop AI product surface (Tauri shell) |
-| [**lotus**](../lotus) | React+Vite UI layer (talks to bamboo over HTTP) |
-| **bamboo** | Local-first Rust agent runtime (this repo) |
-| [**bodhi-server**](../bodhi-server) | Go backend: auth, persistence, billing+quota, LLM proxy |
-| [**pavilion**](../pavilion) | Official website & docs |
-| [**Zenith (root)**](../) | Monorepo entry, submodule pointers, release train |
+| [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri desktop shell: starts or reuses Bamboo, waits for health, manages the sidecar lifecycle, and displays Lotus served by Bamboo |
+| [**Lotus**](https://github.com/bigduu/Lotus) | Current React + Vite UI: HTTP requests, shared `/v2/stream` WebSocket by default, legacy SSE fallback |
+| [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | Local-first Rust agent runtime and packaged Lotus host (this repo) |
+| [**bodhi-server**](https://github.com/bigduu/bodhi-server) | Optional hosted service for accounts, API keys, encrypted provider credentials, model routing, billing/quota, and provider proxy |
+| [**Pavilion**](https://github.com/bigduu/Pavilion) | Official website and documentation surface |
+| [**Jiandu**](https://github.com/bigduu/Jiandu) | Small filesystem-backed shared-memory boundary: Rust library plus stdio MCP server |
+| [**Nova**](https://github.com/bigduu/Nova) | Native computer-use capabilities exposed through MCP |
+| [**Lotus Next**](https://github.com/bigduu/lotus-next) | Experimental next-generation frontend developed alongside Lotus; not the current Bodhi default |
+| [**Magpie**](https://github.com/bigduu/Magpie) | IM connector for Bamboo, available standalone and as a Bamboo service plugin |
 
 **In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:
 - Getting started: [`docs/guides/GETTING_STARTED.md`](./docs/guides/GETTING_STARTED.md)
