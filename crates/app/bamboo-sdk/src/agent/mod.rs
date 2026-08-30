@@ -378,6 +378,17 @@ impl Agent {
                 session.set_project_id_meta(project_id.to_string());
             }
         }
+
+        // Complete the external Project/Workspace handoff before replaying an
+        // approved mutating tool. The replay executor reads the runtime
+        // workspace registry, so deferring this until the loop's first round
+        // would execute against stale process state. Assigned sessions fail
+        // closed here when this runtime has no Project resolver; the pending
+        // replay marker remains intact for a correctly configured retry.
+        self.inner
+            .prepare_external_session_for_execution(session)
+            .await?;
+
         // If `answer()` just approved a gated tool call, `session.metadata` carries
         // the re-execution marker `submit_pending_response` set — the gated tool
         // never actually ran (the permission gate intercepted it before
@@ -389,12 +400,12 @@ impl Agent {
         self.reexecute_approved_tool_if_pending(session, &event_tx)
             .await?;
 
-        // Apply the instruction as the session's leading System message and set
-        // the configured model via the single authoritative pre-execution
-        // mutation point. The builder's prompt is AUTHORITATIVE: it replaces a
-        // leading System message, otherwise inserts one at index 0, so a
-        // caller-supplied session can't silently shadow the configured
-        // instruction.
+        // Apply the instruction as the session's leading System message, set
+        // the configured model, and refresh the typed prompt snapshot via the
+        // single authoritative pre-execution mutation point. This intentionally
+        // follows replay: a failed replay remains observable without replacing
+        // caller System bytes, while a successful handoff always reaches the
+        // provider with one clean configured System message.
         bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
             session,
             self.system_prompt.as_deref(),
@@ -1323,6 +1334,7 @@ mod reexecute_and_child_approval_tests {
     struct RealOutputTool {
         calls: AtomicUsize,
         flags: StdMutex<Vec<ToolExecutionSessionFlags>>,
+        workspaces: StdMutex<Vec<Option<std::path::PathBuf>>>,
     }
 
     impl RealOutputTool {
@@ -1330,6 +1342,7 @@ mod reexecute_and_child_approval_tests {
             Self {
                 calls: AtomicUsize::new(0),
                 flags: StdMutex::new(Vec::new()),
+                workspaces: StdMutex::new(Vec::new()),
             }
         }
     }
@@ -1370,6 +1383,10 @@ mod reexecute_and_child_approval_tests {
 
     struct ImmediateDoneProvider;
 
+    struct CountingDoneProvider {
+        calls: AtomicUsize,
+    }
+
     #[async_trait]
     impl bamboo_llm::LLMProvider for ImmediateDoneProvider {
         async fn chat_stream(
@@ -1379,6 +1396,23 @@ mod reexecute_and_child_approval_tests {
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[async_trait]
+    impl bamboo_llm::LLMProvider for CountingDoneProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(futures::stream::iter([
                 Ok(bamboo_llm::LLMChunk::Token("done".to_string())),
                 Ok(bamboo_llm::LLMChunk::Done),
@@ -1411,6 +1445,11 @@ mod reexecute_and_child_approval_tests {
                 auto_approve_permissions: ctx.auto_approve_permissions,
                 plan_read_only: ctx.plan_read_only,
             });
+            self.workspaces.lock().unwrap().push(
+                ctx.session_id
+                    .as_deref()
+                    .and_then(bamboo_agent_core::workspace_state::get_workspace),
+            );
             Ok(ToolOutcome::Completed(
                 bamboo_agent_core::tools::ToolResult::text(true, format!("REAL TOOL OUTPUT #{n}")),
             ))
@@ -1636,6 +1675,332 @@ mod reexecute_and_child_approval_tests {
             .find(|m| m.tool_call_id.as_deref() == Some("call-reexec-1"))
             .expect("tool result message present");
         assert_eq!(reloaded_result.content, "REAL TOOL OUTPUT #0");
+    }
+
+    #[tokio::test]
+    async fn normal_run_prepares_project_workspace_before_approved_tool_replay() {
+        let data_dir = tempfile::tempdir().expect("SDK data dir");
+        let project_path = tempfile::tempdir().expect("SDK Project path");
+        let project = bamboo_projects::ProjectStore::open(data_dir.path())
+            .expect("Project store")
+            .create_with_project_path(
+                "Replay Project",
+                None,
+                project_path.path().to_string_lossy(),
+                Vec::new(),
+            )
+            .expect("Replay Project");
+        std::fs::write(
+            data_dir.path().join("config.json"),
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                }
+            }"#,
+        )
+        .expect("SDK config");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .model("claude-test")
+            .instruction("configured System")
+            .project_id(project.id.to_string())
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("Project-backed SDK agent");
+
+        let seed = seed_gated_tool_session("sdk-project-replay", "project-replay-call");
+        agent
+            .storage()
+            .save_session(&seed)
+            .await
+            .expect("seed replay session");
+        let outcome = agent
+            .answer("sdk-project-replay", "Approve")
+            .await
+            .expect("approve replay");
+        let mut session = outcome.session;
+        session.add_message(Message::user("continue after replay"));
+
+        agent
+            .run_session(&mut session)
+            .await
+            .expect("normal run should complete");
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        let canonical = project_path
+            .path()
+            .canonicalize()
+            .expect("canonical Project workspace");
+        assert_eq!(
+            tool.workspaces.lock().unwrap().as_slice(),
+            &[Some(canonical.clone())],
+            "approved replay must observe the published Project workspace on its first call"
+        );
+        assert_eq!(
+            session.project_id_meta().as_deref(),
+            Some(project.id.as_str())
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(bamboo_config::paths::path_to_display_string(&canonical).as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Registered.as_str())
+        );
+        let systems = session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0].content, "configured System");
+        assert!(!systems[0]
+            .content
+            .contains(canonical.to_string_lossy().as_ref()));
+        assert!(!systems[0].content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("SDK prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "configured System");
+        let workspace_context = snapshot
+            .workspace_context
+            .as_deref()
+            .expect("typed SDK Workspace context");
+        assert!(workspace_context.contains(canonical.to_string_lossy().as_ref()));
+        assert!(workspace_context.contains("Workspace source: project_default"));
+        assert!(workspace_context.contains("Binding status: registered"));
+    }
+
+    #[tokio::test]
+    async fn normal_run_recovers_serialized_legacy_workspace_before_replay_and_replaces_system() {
+        let data_dir = tempfile::tempdir().expect("SDK data dir");
+        let legacy_workspace = tempfile::tempdir().expect("legacy SDK Workspace");
+        let canonical = legacy_workspace
+            .path()
+            .canonicalize()
+            .expect("canonical legacy Workspace");
+        let display = bamboo_config::paths::path_to_display_string(&canonical);
+        std::fs::write(
+            data_dir.path().join("config.json"),
+            r#"{
+                "provider": "anthropic",
+                "providers": {
+                    "anthropic": { "api_key": "test-key", "model": "claude-test" }
+                }
+            }"#,
+        )
+        .expect("SDK config");
+        let tool = Arc::new(RealOutputTool::new());
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(ImmediateDoneProvider))
+            .model("claude-test")
+            .instruction("configured System")
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.path().to_path_buf())
+            .await
+            .expect("defaults should assemble")
+            .build()
+            .expect("SDK agent");
+
+        let mut legacy = seed_gated_tool_session("sdk-legacy-replay", "legacy-replay-call");
+        legacy.messages.insert(
+            0,
+            Message::system(
+                bamboo_engine::runtime::context::build_workspace_prompt_context(&display)
+                    .expect("legacy Workspace marker"),
+            ),
+        );
+        assert!(legacy.workspace_path_meta().is_none());
+        let serialized = serde_json::to_vec(&legacy).expect("serialize legacy SDK session");
+        let legacy: Session =
+            serde_json::from_slice(&serialized).expect("deserialize legacy SDK session");
+        agent
+            .storage()
+            .save_session(&legacy)
+            .await
+            .expect("seed serialized legacy session");
+        let outcome = agent
+            .answer("sdk-legacy-replay", "Approve")
+            .await
+            .expect("approve legacy replay");
+        let mut session = outcome.session;
+        session.add_message(Message::user("continue after legacy replay"));
+
+        agent
+            .run_session(&mut session)
+            .await
+            .expect("normal legacy run should complete");
+
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tool.workspaces.lock().unwrap().as_slice(),
+            &[Some(canonical.clone())],
+            "legacy Workspace must be published before the approved tool is replayed"
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(display.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceSource::Session.as_str())
+        );
+        assert_eq!(
+            session
+                .metadata
+                .get(bamboo_engine::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(bamboo_engine::project_context::WorkspaceBindingStatus::Unregistered.as_str())
+        );
+        let systems = session
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::System))
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0].content, "configured System");
+        assert!(!systems[0].content.contains(&display));
+        assert!(!systems[0].content.contains("BAMBOO_WORKSPACE_CONTEXT"));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("SDK prompt snapshot");
+        assert_eq!(snapshot.effective_system_prompt, "configured System");
+        assert!(snapshot
+            .workspace_context
+            .as_deref()
+            .is_some_and(|context| context.contains(&display)));
+    }
+
+    #[tokio::test]
+    async fn missing_project_resolver_stops_sdk_before_replay_system_replacement_or_provider() {
+        let data_dir = tempfile::tempdir().expect("manual SDK data dir");
+        let legacy_workspace = tempfile::tempdir().expect("retryable legacy Workspace");
+        let legacy_display = bamboo_config::paths::path_to_display_string(legacy_workspace.path());
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(data_dir.path().join("sessions"))
+                .await
+                .expect("session store"),
+        );
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                data_dir.path().join("metrics.db"),
+            )),
+            7,
+        );
+        let tool = Arc::new(RealOutputTool::new());
+        let registry = bamboo_tools::ToolRegistry::new();
+        registry
+            .register_shared(tool.clone())
+            .expect("register replay tool");
+        let provider = Arc::new(CountingDoneProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = bamboo_engine::Agent::builder()
+            .storage(store.clone())
+            .persistence(persistence)
+            .attachment_reader(store.clone())
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+            .metrics_collector(metrics)
+            .config(Arc::new(tokio::sync::RwLock::new(
+                bamboo_llm::Config::default(),
+            )))
+            .provider(provider.clone())
+            .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(
+                registry,
+            )))
+            .build()
+            .expect("manual runtime without Project resolver");
+        let agent = Agent::from_runtime_with_config(
+            runtime,
+            Some("configured System".to_string()),
+            Some("configured-model".to_string()),
+            None,
+            None,
+            None,
+            None,
+            PermissionMode::Default,
+        );
+
+        let mut session = seed_gated_tool_session("sdk-missing-resolver", "missing-resolver-call");
+        let legacy_block =
+            bamboo_engine::runtime::context::build_workspace_prompt_context(&legacy_display)
+                .expect("retryable legacy Workspace marker");
+        session.messages.insert(
+            0,
+            Message::system(format!("caller System\n\n{legacy_block}")),
+        );
+        session.set_project_id_meta("project-missing-resolver");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "missing-resolver-call".to_string(),
+        );
+        session.prompt_snapshot = Some(
+            serde_json::from_value(serde_json::json!({
+                "base_system_prompt": "stale SDK snapshot",
+                "effective_system_prompt": "stale SDK snapshot"
+            }))
+            .expect("synthetic stale SDK prompt snapshot"),
+        );
+        agent
+            .storage()
+            .save_session(&session)
+            .await
+            .expect("seed assigned replay session");
+        let before = serde_json::to_vec(&session).expect("serialize retryable SDK session");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        let error = agent
+            .execute_internal(&mut session, event_tx, CancellationToken::new())
+            .await
+            .expect_err("assigned SDK session must fail without Project resolver");
+
+        assert!(matches!(error, AgentError::ProjectContext(_)));
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            event_rx.try_recv().is_err(),
+            "prep failure must emit no events"
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).expect("serialize failed SDK session"),
+            before,
+            "missing resolver must preserve the full serialized retry state"
+        );
+        assert!(session.messages[0].content.contains(&legacy_display));
+        assert!(session.messages[0]
+            .content
+            .contains("BAMBOO_WORKSPACE_CONTEXT"));
+        assert_eq!(
+            session
+                .metadata
+                .get(PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some("missing-resolver-call"),
+            "approval replay marker must remain retryable"
+        );
     }
 
     #[tokio::test]

@@ -610,6 +610,46 @@ fn direct_request(
 }
 
 #[tokio::test]
+async fn public_execute_direct_fails_closed_for_assigned_session_without_project_resolver() {
+    let (_temp, agent, _storage) =
+        build_direct_execute_agent(Arc::new(NeverCalledTranscriptProvider), None, None).await;
+    let mut session = Session::new("direct-assigned-no-resolver", "test-model");
+    session.set_project_id_meta("project-direct-no-resolver");
+    session.add_message(Message::system("caller System"));
+    session.add_message(Message::user("must not reach provider"));
+    session.metadata.insert(
+        crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+        "retryable-tool-call".to_string(),
+    );
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+
+    let error = agent
+        .execute_direct(
+            &mut session,
+            direct_request(event_tx, CancellationToken::new()),
+        )
+        .await
+        .expect_err("assigned direct execution must require Project resolver authority");
+
+    assert!(matches!(
+        error,
+        bamboo_agent_core::AgentError::ProjectContext(_)
+    ));
+    assert_eq!(session.messages[0].content, "caller System");
+    assert_eq!(
+        session
+            .metadata
+            .get(crate::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+            .map(String::as_str),
+        Some("retryable-tool-call")
+    );
+    assert!(
+        event_rx.try_recv().is_err(),
+        "prep failure must emit no events"
+    );
+}
+
+#[tokio::test]
 async fn direct_execute_checkpoints_normal_completion_without_task_context() {
     let (_temp, agent, storage) =
         build_direct_execute_agent(Arc::new(CompletedTranscriptProvider), None, None).await;
