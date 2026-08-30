@@ -270,7 +270,7 @@ impl BodhiProvider {
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let reasoning_effort = reasoning_effort_for_required_tool(reasoning_effort, required_tool);
         let budget_reasoning_effort =
-            reasoning_effort_for_budget_validation(reasoning_effort, messages, false);
+            reasoning_effort_for_budget_validation(reasoning_effort, messages, false, &[]);
         crate::providers::common::validate_max_thinking_budget(
             budget_reasoning_effort,
             Some(max_tokens),
