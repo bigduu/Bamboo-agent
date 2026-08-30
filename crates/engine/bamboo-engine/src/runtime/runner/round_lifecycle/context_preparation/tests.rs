@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     build_compression_context_blocks, emit_context_pressure_notification,
@@ -22,6 +22,13 @@ use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderMo
 use bamboo_llm::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
+
+fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
+    let guard = crate::runtime::tests::env_cache_lock_acquire();
+    let empty_data_dir = tempfile::tempdir().expect("temp dir for empty config");
+    let _ = bamboo_config::Config::from_data_dir(Some(empty_data_dir.path().to_path_buf()));
+    guard
+}
 
 /// A no-op LLM provider for tests that returns an empty stream.
 struct NoopLlmProvider;
@@ -944,8 +951,10 @@ async fn prepare_round_context_applies_placeholder_fallback_only_to_prepared_con
     assert!(persisted_user.content_parts.is_some());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_relocation_does_not_double_reserve_large_system_env_context() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let large_env = "stable environment inventory and capability detail ".repeat(900);
     let configured_system = format!(
         "system\n\n<!-- BAMBOO_ENV_CONTEXT_START -->\n{large_env}\n<!-- BAMBOO_ENV_CONTEXT_END -->"
@@ -1024,8 +1033,10 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let summary_content =
         "compressed decisions requirements and verification evidence ".repeat(900);
     let mut session = Session::new("session-cp-relocated-summary", "test-model");
@@ -1098,8 +1109,10 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-vision-refit", "test-model");
     session.messages.push(Message::system("system"));
     for index in 0..20 {
