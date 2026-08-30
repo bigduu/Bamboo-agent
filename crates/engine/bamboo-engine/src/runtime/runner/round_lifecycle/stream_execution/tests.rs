@@ -1747,12 +1747,28 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
     // system field and ride as a typed context-block message positioned AFTER the
     // large invariant tool guide — so it never shifts the cached head.
     let _env_lock = isolate_prompt_safe_env_cache();
+    let mut env_config = Config::default();
+    env_config.env_vars = vec![bamboo_config::EnvVarEntry {
+        name: "ENV_AUTHORITY_MARKER".to_string(),
+        value: "dynamic environment".to_string(),
+        secret: false,
+        value_encrypted: None,
+        credential_ref: None,
+        configured: true,
+        description: Some("authority-owned environment context".to_string()),
+    }];
+    env_config.publish_env_vars();
     let mut session = Session::new("session-sessionctx", "test-model");
     session.metadata.insert(
         "skill.context".to_string(),
         "SKILL_CONTEXT_MARKER loaded skill body".to_string(),
     );
     let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.system_prompt = Some(format!(
+        "BASE_SYSTEM_IDENTITY\n\n{}\nSTALE_SYSTEM_ENV_MARKER\n{}",
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_END_MARKER,
+    ));
     config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
     let prepared_context = PreparedContext {
         messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
@@ -1771,6 +1787,7 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
         !envelope.ir.system_text.contains("SKILL_CONTEXT_MARKER"),
         "session-variable skill context must leave the system prompt"
     );
+    assert!(!envelope.ir.system_text.contains("STALE_SYSTEM_ENV_MARKER"));
 
     // The immutable guide remains the stable prefix; mutable skill state is a
     // typed event in the chronological ledger.
@@ -1783,7 +1800,19 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
     assert!(transcript[skill_pos]
         .content
         .contains("context_type: skill_context"));
+    assert!(transcript[skill_pos]
+        .content
+        .contains("scope: round_dynamic"));
     assert!(!transcript[skill_pos].never_compress);
+    let env = transcript
+        .iter()
+        .find(|message| message.content.contains("ENV_AUTHORITY_MARKER"))
+        .expect("environment context reconciled into the model transcript");
+    assert!(env.content.contains("context_type: env_snapshot"));
+    assert!(env.content.contains("scope: session_stable"));
+    assert!(!transcript
+        .iter()
+        .any(|message| message.content.contains("STALE_SYSTEM_ENV_MARKER")));
 
     // Provider lowering places the stable guide before the ledger event.
     let guide_pos = stable
@@ -1805,6 +1834,246 @@ fn build_request_envelope_relocates_session_context_after_tool_guide() {
         .messages
         .iter()
         .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+}
+
+fn workspace_session(id: &str, workspace: &std::path::Path) -> Session {
+    let mut session = Session::new(id, "test-model");
+    session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(workspace));
+    session.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        crate::project_context::WorkspaceSource::Explicit
+            .as_str()
+            .to_string(),
+    );
+    session.metadata.insert(
+        crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+        crate::project_context::WorkspaceBindingStatus::Registered
+            .as_str()
+            .to_string(),
+    );
+    session
+}
+
+fn workspace_prepared_context() -> PreparedContext {
+    PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    }
+}
+
+#[test]
+fn openai_responses_places_one_workspace_block_after_stable_prefix() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join(".git")).expect("git marker");
+    std::fs::write(
+        workspace.path().join("AGENTS.md"),
+        "WORKSPACE_POLICY_MARKER",
+    )
+    .expect("workspace policy");
+    let workspace_path = bamboo_config::paths::path_to_display_string(workspace.path());
+    let session = workspace_session("workspace-openai", workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("openai".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+
+    let envelope =
+        super::build_request_envelope(&session, &workspace_prepared_context(), &config, &[]);
+    assert!(envelope.stable_prefix_sections.iter().all(|section| {
+        matches!(section.name, "base" | "core_directives" | "tool_guide")
+            && !section.content.contains(&workspace_path)
+    }));
+    let responses = envelope.ir.responses_request_options(None);
+    let instructions = responses.instructions.expect("Responses instructions");
+    assert!(!instructions.contains(&workspace_path));
+    assert!(!instructions.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    let input = responses.input_messages.expect("Responses input");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|message| message.content.contains("context_type: workspace"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        input
+            .iter()
+            .map(|message| message.content.matches(&workspace_path).count())
+            .sum::<usize>(),
+        1,
+        "the absolute active path appears only in the Workspace block"
+    );
+    let guide = input
+        .iter()
+        .position(|message| message.content.contains("STABLE_GUIDE_MARKER"))
+        .expect("stable guide");
+    let workspace_position = input
+        .iter()
+        .position(|message| message.content.contains("context_type: workspace"))
+        .expect("workspace block");
+    let conversation = input
+        .iter()
+        .position(|message| message.content == "go")
+        .expect("conversation");
+    assert!(guide < workspace_position && workspace_position < conversation);
+    let instruction = input
+        .iter()
+        .find(|message| message.content.contains("WORKSPACE_POLICY_MARKER"))
+        .expect("instruction overlay");
+    assert!(instruction.content.contains("Source: AGENTS.md"));
+    assert!(!instruction.content.contains(&workspace_path));
+}
+
+#[test]
+fn anthropic_body_places_workspace_after_stable_prefix_not_system() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = bamboo_config::paths::path_to_display_string(workspace.path());
+    let session = workspace_session("workspace-anthropic", workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("anthropic".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+
+    let envelope =
+        super::build_request_envelope(&session, &workspace_prepared_context(), &config, &[]);
+    assert!(!envelope.ir.system_text.contains(&workspace_path));
+    assert!(!envelope
+        .ir
+        .system_text
+        .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    let body = envelope.ir.body_chat();
+    assert_eq!(
+        body.iter()
+            .filter(|message| message.content.contains("context_type: workspace"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        body.iter()
+            .map(|message| message.content.matches(&workspace_path).count())
+            .sum::<usize>(),
+        1
+    );
+    let guide = body
+        .iter()
+        .position(|message| message.content.contains("STABLE_GUIDE_MARKER"))
+        .expect("stable guide");
+    let workspace_position = body
+        .iter()
+        .position(|message| message.content.contains("context_type: workspace"))
+        .expect("workspace block");
+    assert!(guide < workspace_position);
+}
+
+#[test]
+fn no_workspace_emits_no_workspace_context_block() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("workspace-none", "test-model");
+    let envelope = super::build_request_envelope(
+        &session,
+        &workspace_prepared_context(),
+        &test_config("BASE_IDENTITY"),
+        &[],
+    );
+    assert!(envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: workspace")));
+}
+
+#[test]
+fn workspace_switch_supersedes_dynamic_context_without_resetting_cache_prefix() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let first_workspace = tempfile::tempdir().expect("first workspace");
+    let second_workspace = tempfile::tempdir().expect("second workspace");
+    let first_path = bamboo_config::paths::path_to_display_string(first_workspace.path());
+    let second_path = bamboo_config::paths::path_to_display_string(second_workspace.path());
+    let mut session = workspace_session("workspace-switch", first_workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("openai".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let first = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let first_cache_scope = session
+        .model_context_state
+        .as_ref()
+        .and_then(|state| state.cache_scope_sha256.clone())
+        .expect("first cache scope");
+    let first_state_revision = session
+        .model_context_state
+        .as_ref()
+        .map(|state| state.state_revision)
+        .expect("first state revision");
+    let first_next_sequence = session
+        .model_context_state
+        .as_ref()
+        .map(|state| state.next_sequence)
+        .expect("first context sequence");
+
+    session.set_workspace_path_meta(&second_path);
+    let switched = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let state = session.model_context_state.as_ref().expect("context state");
+    let workspace_events = state
+        .events
+        .iter()
+        .filter(|event| event.block_type == bamboo_domain::ContextBlockType::Workspace)
+        .collect::<Vec<_>>();
+
+    assert_eq!(switched.ir.system_text, first.ir.system_text);
+    assert_eq!(
+        message_shape(switched.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(first.ir.run(bamboo_llm::SegmentRole::StablePrefix))
+    );
+    assert_eq!(switched.prefix_epoch, first.prefix_epoch);
+    assert!(switched.prefix_reset_reason.is_none());
+    assert_eq!(
+        state.cache_scope_sha256.as_deref(),
+        Some(first_cache_scope.as_str())
+    );
+    assert!(state.state_revision > first_state_revision);
+    assert!(state.next_sequence > first_next_sequence);
+    assert!(switched.ledger_changed);
+    assert_eq!(workspace_events.len(), 2);
+    assert_eq!(workspace_events[0].revision, 1);
+    assert_eq!(workspace_events[1].revision, 2);
+    assert_eq!(workspace_events[1].supersedes_revision, Some(1));
+    assert!(workspace_events[1].anchor_message_id.is_some());
+    assert!(workspace_events
+        .iter()
+        .all(|event| event.rendered_text.contains("scope: round_dynamic")));
+    assert_eq!(
+        switched
+            .ir
+            .body_chat()
+            .iter()
+            .map(|message| message.content.matches(&second_path).count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(first
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content.contains(&first_path)));
 }
 
 #[test]

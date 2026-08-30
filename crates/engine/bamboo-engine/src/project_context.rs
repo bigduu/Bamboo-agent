@@ -14,7 +14,9 @@ use bamboo_domain::{ProjectId, ProjectResourceKind, ProjectResourceSummary, Work
 use serde::{Deserialize, Serialize};
 
 pub const PROJECT_ID_METADATA_KEY: &str = "project_id";
+pub const PROJECT_CONTEXT_RENDERED_KEY: &str = "project_context_rendered";
 pub const PROJECT_RESOURCES_RENDERED_KEY: &str = "project_resources_rendered";
+pub const WORKSPACE_BINDING_STATUS_METADATA_KEY: &str = "workspace_binding_status";
 pub const WORKSPACE_SOURCE_METADATA_KEY: &str = "workspace_source";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +31,13 @@ impl WorkspaceBindingStatus {
         match self {
             Self::Registered => "registered",
             Self::Unregistered => "unregistered",
+        }
+    }
+
+    pub fn from_metadata(value: Option<&str>) -> Self {
+        match value {
+            Some("registered") => Self::Registered,
+            _ => Self::Unregistered,
         }
     }
 }
@@ -74,6 +83,14 @@ impl WorkspaceSource {
             Self::Explicit => "explicit",
             Self::Session => "session",
             Self::ProjectDefault => "project_default",
+        }
+    }
+
+    pub fn from_metadata(value: Option<&str>) -> Self {
+        match value {
+            Some("explicit") => Self::Explicit,
+            Some("project_default") => Self::ProjectDefault,
+            _ => Self::Session,
         }
     }
 }
@@ -542,13 +559,15 @@ impl ProjectContextResolver {
         self.source.find_workspace_owner(workspace).await
     }
 
-    /// Resolve and persist the stable Project and mutable Workspace prompt
-    /// markers immediately.
+    /// Resolve and persist stable Project identity plus mutable Workspace
+    /// metadata immediately.
     ///
     /// Session-create and chat APIs call this before their first response so a
     /// freshly-created assigned session is already self-describing when read
     /// back, rather than waiting for the first execution round. The round
-    /// prelude calls the same helper to keep the markers current.
+    /// prelude calls the same helper to keep the metadata current. Provider
+    /// context is rendered later from this authority; this method never injects
+    /// Project or Workspace markers into a System message.
     pub async fn refresh_session_prompt(
         &self,
         session: &mut Session,
@@ -556,7 +575,7 @@ impl ProjectContextResolver {
         self.refresh_session_prompt_inner(session, true).await
     }
 
-    /// Resolve Project/Workspace prompt markers on an in-memory snapshot
+    /// Resolve Project/Workspace metadata on an in-memory snapshot
     /// without changing runtime workspace state.
     ///
     /// Read APIs use this for sessions that have never entered the runner
@@ -575,6 +594,9 @@ impl ProjectContextResolver {
         session: &mut Session,
         sync_runtime_workspace: bool,
     ) -> Result<Option<ResolvedProjectContext>, ProjectContextError> {
+        // Legacy prompt text is compatibility input only. Recover a path when
+        // metadata is absent, then remove the marker before normal resolution.
+        crate::runtime::runner::session_setup::migrate_legacy_workspace_prompt(session);
         let resolved = self.resolve(session, None).await?;
         let workspace = if let Some(context) = resolved.as_ref() {
             context.workspace.clone()
@@ -600,50 +622,38 @@ impl ProjectContextResolver {
                 WORKSPACE_SOURCE_METADATA_KEY.to_string(),
                 context.workspace_source.as_str().to_string(),
             );
+            session.metadata.insert(
+                WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+                context.binding_status.as_str().to_string(),
+            );
+        } else if workspace.is_some() {
+            session
+                .metadata
+                .entry(WORKSPACE_SOURCE_METADATA_KEY.to_string())
+                .or_insert_with(|| WorkspaceSource::Session.as_str().to_string());
+            session.metadata.insert(
+                WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+                WorkspaceBindingStatus::Unregistered.as_str().to_string(),
+            );
         } else {
             session.metadata.remove(WORKSPACE_SOURCE_METADATA_KEY);
+            session
+                .metadata
+                .remove(WORKSPACE_BINDING_STATUS_METADATA_KEY);
         }
-        let current = session
-            .messages
-            .iter()
-            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-            .map(|message| message.content.clone())
-            .or_else(|| session.metadata.get("base_system_prompt").cloned())
-            .unwrap_or_default();
-        let mut updated =
-            crate::runtime::context::upsert_project_prompt_context(&current, resolved.as_ref());
 
         if let Some(context) = resolved.as_ref() {
+            session.metadata.insert(
+                PROJECT_CONTEXT_RENDERED_KEY.to_string(),
+                crate::runtime::context::build_project_model_context(context),
+            );
             session.metadata.insert(
                 PROJECT_RESOURCES_RENDERED_KEY.to_string(),
                 context.render_resource_inventory(),
             );
         } else {
+            session.metadata.remove(PROJECT_CONTEXT_RENDERED_KEY);
             session.metadata.remove(PROJECT_RESOURCES_RENDERED_KEY);
-        }
-        let workspace_display = workspace
-            .as_deref()
-            .map(bamboo_config::paths::path_to_display_string);
-        updated = crate::runtime::context::upsert_workspace_prompt_context_with_source(
-            &updated,
-            workspace_display.as_deref(),
-            resolved
-                .as_ref()
-                .map(|context| context.binding_status)
-                .unwrap_or(WorkspaceBindingStatus::Unregistered),
-            resolved.as_ref().map(|context| context.workspace_source),
-        );
-
-        if let Some(system_message) = session
-            .messages
-            .iter_mut()
-            .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        {
-            system_message.content = updated;
-        } else if !updated.trim().is_empty() {
-            session
-                .messages
-                .insert(0, bamboo_agent_core::Message::system(updated));
         }
         crate::runner::refresh_prompt_snapshot(session);
 
@@ -1085,12 +1095,20 @@ mod tests {
             )
         );
         let prompt = &session.messages[0].content;
-        assert_eq!(prompt.matches("Project path:").count(), 1);
-        assert_eq!(prompt.matches("Project home (Bamboo data):").count(), 1);
-        assert_eq!(prompt.matches("Workspace path:").count(), 1);
+        assert_eq!(prompt, "base");
+        let project_context = session
+            .metadata
+            .get(PROJECT_CONTEXT_RENDERED_KEY)
+            .expect("redacted Project context");
+        assert!(project_context.contains("Project ID: project-default"));
+        assert!(!project_context.contains("Project path:"));
+        assert!(!project_context.contains("Project home"));
         assert_eq!(
-            prompt.matches("Workspace source: project_default").count(),
-            1
+            session
+                .metadata
+                .get(WORKSPACE_SOURCE_METADATA_KEY)
+                .map(String::as_str),
+            Some("project_default")
         );
         assert!(!prompt.contains(foreign_default.to_string_lossy().as_ref()));
         assert!(!workspace_root.join(&session.id).exists());
@@ -1365,7 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_refresh_removes_stale_project_and_updates_unassigned_workspace() {
+    async fn metadata_refresh_updates_project_and_unassigned_workspace_without_system_mutation() {
         let directory = tempfile::tempdir().expect("tempdir");
         let workspace = directory.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
@@ -1406,8 +1424,18 @@ mod tests {
             .await
             .expect("assigned refresh");
         let assigned = &session.messages[0].content;
-        assert_eq!(assigned.matches("BAMBOO_PROJECT_CONTEXT_START").count(), 1);
-        assert!(assigned.contains("Binding status: registered"));
+        assert_eq!(assigned, "base");
+        assert!(session
+            .metadata
+            .get(PROJECT_CONTEXT_RENDERED_KEY)
+            .is_some_and(|context| context.contains("Project ID: project-prompt-refresh")));
+        assert_eq!(
+            session
+                .metadata
+                .get(WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some("registered")
+        );
 
         session.clear_project_id_meta();
         resolver
@@ -1415,15 +1443,15 @@ mod tests {
             .await
             .expect("unassigned refresh");
         let unassigned = &session.messages[0].content;
+        assert_eq!(unassigned, "base");
+        assert!(!session.metadata.contains_key(PROJECT_CONTEXT_RENDERED_KEY));
         assert_eq!(
-            unassigned.matches("BAMBOO_PROJECT_CONTEXT_START").count(),
-            0
+            session
+                .metadata
+                .get(WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some("unregistered")
         );
-        assert_eq!(
-            unassigned.matches("BAMBOO_WORKSPACE_CONTEXT_START").count(),
-            1
-        );
-        assert!(unassigned.contains("Binding status: unregistered"));
         assert!(!session
             .metadata
             .contains_key(PROJECT_RESOURCES_RENDERED_KEY));

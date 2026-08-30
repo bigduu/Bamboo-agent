@@ -956,13 +956,16 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
         ..Default::default()
     };
     let mut session = Session::new("session-cp-relocated-env", "test-model");
-    let (stable_frame, _) =
+    let (stable_frame, sections) =
         crate::runtime::runner::session_setup::prompt_setup::build_stable_prompt_frame_with_sections(
             &session,
             &config,
             &[],
             &Default::default(),
         );
+    assert!(!stable_frame
+        .stable_instructions
+        .contains("stable environment inventory"));
     session
         .messages
         .push(Message::system(stable_frame.stable_instructions));
@@ -971,9 +974,22 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
         .push(Message::user("inspect the environment"));
 
     let counter = TiktokenTokenCounter::default();
-    let fitted_system_tokens = counter.count_messages(&session.messages[..1]);
+    let env_context = sections
+        .iter()
+        .find(|section| section.name == "env")
+        .map(|section| section.content.clone())
+        .expect("relocated environment section");
+    let env_message = bamboo_agent_core::ContextBlock::new(
+        ContextBlockType::EnvSnapshot,
+        bamboo_agent_core::ContextBlockPriority::High,
+        bamboo_agent_core::ContextBlockStability::SessionStable,
+        "Environment Snapshot",
+        env_context,
+    )
+    .render_runtime_context_message();
+    let fitted_prefix_tokens = counter.count_messages(&[session.messages[0].clone(), env_message]);
     let max_output_tokens = 256;
-    let request_input_limit = fitted_system_tokens.saturating_add(768);
+    let request_input_limit = fitted_prefix_tokens.saturating_add(768);
     session.token_budget = Some(TokenBudget::with_safety_margin(
         request_input_limit.saturating_add(max_output_tokens),
         max_output_tokens,

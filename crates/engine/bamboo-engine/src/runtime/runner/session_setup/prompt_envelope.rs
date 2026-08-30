@@ -32,6 +32,47 @@ impl StablePromptFrame {
     }
 }
 
+/// Build the single provider-visible Workspace block from authoritative
+/// session metadata. Project identity is included only in its redacted,
+/// path-free form so the active workspace path appears exactly once.
+pub(crate) fn build_workspace_context_block(session: &Session) -> Option<ContextBlock> {
+    let workspace = super::prompt_setup::workspace_context_from_session(session)?;
+    let project = session
+        .metadata
+        .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let content = project
+        .into_iter()
+        .chain(std::iter::once(workspace.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Some(ContextBlock::new(
+        ContextBlockType::Workspace,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Project & Workspace",
+        content,
+    ))
+}
+
+/// Build repository instructions from the authoritative workspace metadata,
+/// never from a marker parsed out of System text.
+pub(crate) fn build_instruction_overlay_context_block(session: &Session) -> Option<ContextBlock> {
+    let workspace = session.workspace_path_meta()?;
+    let content =
+        crate::runtime::context::instruction::build_instruction_prompt_context(workspace.trim())?;
+    Some(ContextBlock::new(
+        ContextBlockType::InstructionOverlay,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::RoundDynamic,
+        "Project Instructions",
+        content,
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn render_context_block_message(block: &ContextBlock) -> Message {
     block.render_runtime_context_message()
@@ -328,6 +369,30 @@ mod tests {
         assert!(envelope.dynamic_context_messages[0]
             .content
             .contains("BAMBOO_CONTEXT_BLOCK_START"));
+    }
+
+    #[test]
+    fn workspace_block_uses_authoritative_path_once_and_path_free_project_metadata() {
+        let workspace = "/private/workspace/current";
+        let mut session = Session::new("session-workspace-block", "model");
+        session.set_workspace_path_meta(workspace);
+        session.metadata.insert(
+            crate::project_context::PROJECT_CONTEXT_RENDERED_KEY.to_string(),
+            format!(
+                "{}\nProject ID: project-1\nProject name: Zenith\n{}",
+                crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+                crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+            ),
+        );
+
+        let block = build_workspace_context_block(&session).expect("workspace block");
+
+        assert_eq!(block.block_type, ContextBlockType::Workspace);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert_eq!(block.content.matches(workspace).count(), 1);
+        assert!(block.content.contains("Project ID: project-1"));
+        assert!(!block.content.contains("Project path:"));
+        assert!(!block.content.contains("Project home"));
     }
 
     #[test]

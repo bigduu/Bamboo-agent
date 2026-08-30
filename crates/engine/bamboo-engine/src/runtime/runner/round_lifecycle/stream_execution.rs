@@ -7,16 +7,14 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
-use crate::runtime::runner::prompt_context::{
-    append_core_agent_directives, strip_existing_core_directives, strip_existing_external_memory,
-    strip_existing_goal, strip_existing_plan_mode_instructions,
-    strip_existing_plan_runtime_context, strip_existing_task_list,
-};
+use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
-    build_goal_context_block, build_plan_mode_context_block, build_plan_runtime_context_block,
+    build_goal_context_block, build_instruction_overlay_context_block,
+    build_plan_mode_context_block, build_plan_runtime_context_block,
     build_project_resources_context_block, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -304,33 +302,23 @@ fn derive_system_remainder_message(
         return None;
     }
 
-    let without_external_memory = strip_existing_external_memory(&message.content);
-    let without_task_list = strip_existing_task_list(&without_external_memory);
-    let without_plan_mode = strip_existing_plan_mode_instructions(&without_task_list);
-    let without_plan_runtime = strip_existing_plan_runtime_context(&without_plan_mode);
-    // Strip a legacy goal block too: the goal now rides the volatile tail (built from
-    // the active goal), so a stale `<!-- BAMBOO_GOAL_START -->` left in an old
-    // persisted System message must not resurface as a duplicate in the remainder.
-    let without_goal = strip_existing_goal(&without_plan_runtime);
-    // Framework directives always live in the assembled system field and are not
-    // part of the persisted base, so strip them from both sides before comparing.
-    // The directives are inserted INTO the `base` section (between the base text
-    // and the skill/tool-guide/workspace/env contexts) — not as a leading prefix
-    // of the whole frame — so stripping them from both the persisted message and
-    // the reference makes the comparison apples-to-apples (base+contexts vs
-    // base+contexts). Without it, the directive-bearing reference no longer equals
-    // the directive-free persisted base, so the dedup falls through and re-emits
-    // the entire base as a redundant system message. Stripping both sides also
-    // discards a STALE directive block in an old persisted message, so the current
-    // directives (already in the system field) win.
-    let without_directives = strip_existing_core_directives(&without_goal);
-    let trimmed = without_directives.trim();
+    // Compare only the normalized user base. Every host-owned section — including
+    // legacy workspace/instruction markers — is either in the canonical system
+    // blocks or the typed model-context ledger and must never leak as a second
+    // System remainder.
+    let normalized = crate::runtime::runner::session_setup::prompt_setup::normalize_base_prompt(
+        &message.content,
+    );
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let stable_without_directives = strip_existing_core_directives(stable_instructions);
-    let stable_trimmed = stable_without_directives.trim();
+    let stable_normalized =
+        crate::runtime::runner::session_setup::prompt_setup::normalize_base_prompt(
+            stable_instructions,
+        );
+    let stable_trimmed = stable_normalized.trim();
     if stable_trimmed.is_empty() {
         return Some(Message::system(trimmed.to_string()));
     }
@@ -648,54 +636,37 @@ fn build_request_envelope_reconciled(
         system_blocks.clear();
     }
 
-    // Session-variable context (workspace path, project instruction overlay,
-    // loaded skills), relocated to ride AFTER the invariant tool guide so it never
-    // shifts the cached head. Each block is session-stable and emitted only when
-    // present; keeping them as separate blocks lets an unchanged block stay inside
-    // the shared prefix even when a sibling changes. The instruction overlay keeps
-    // Critical priority so its authority survives the move out of the system field.
+    // Session-variable context rides AFTER the invariant tool guide so it never
+    // shifts the cached head. Workspace and instructions are added below from
+    // authoritative session metadata, not from these diagnostic sections.
     [
-        (
-            ContextBlockType::Workspace,
-            ContextBlockPriority::High,
-            "Project & Workspace",
-            [section("project"), section("workspace")]
-                .into_iter()
-                .filter(|value| !value.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        ),
-        (
-            ContextBlockType::InstructionOverlay,
-            ContextBlockPriority::Critical,
-            "Project Instructions",
-            section("instruction"),
-        ),
         (
             ContextBlockType::SkillContext,
             ContextBlockPriority::High,
+            ContextBlockStability::RoundDynamic,
             "Loaded Skills",
             section("skill"),
         ),
         (
             ContextBlockType::EnvSnapshot,
             ContextBlockPriority::High,
+            ContextBlockStability::SessionStable,
             "Environment Snapshot",
             section("env"),
         ),
     ]
     .into_iter()
-    .filter(|(_, _, _, content)| !content.trim().is_empty())
-    .map(|(block_type, priority, title, content)| {
-        ContextBlock::new(
-            block_type,
-            priority,
-            ContextBlockStability::SessionStable,
-            title,
-            content,
-        )
+    .filter(|(_, _, _, _, content)| !content.trim().is_empty())
+    .map(|(block_type, priority, stability, title, content)| {
+        ContextBlock::new(block_type, priority, stability, title, content)
     })
     .for_each(|block| context_blocks.push(block));
+    if let Some(block) = build_workspace_context_block(session) {
+        context_blocks.push(block);
+    }
+    if let Some(block) = build_instruction_overlay_context_block(session) {
+        context_blocks.push(block);
+    }
 
     // The Responses-API view (instructions = stable system, guide leading the input
     // array) is no longer pre-baked here: the IR carries the system field + the
@@ -782,6 +753,15 @@ fn build_request_envelope_reconciled(
         cache: cache_plan,
         continuation: None,
     };
+
+    // Prefix-drift diagnostics must observe only bytes that actually participate
+    // in the cacheable head. Keeping dynamic assembly sections here would both
+    // report false cache drift and persist raw workspace paths in diagnostic
+    // snapshots.
+    let stable_prefix_sections = stable_prefix_sections
+        .into_iter()
+        .filter(|section| matches!(section.name, "base" | "core_directives" | "tool_guide"))
+        .collect();
 
     PreparedRequestEnvelope {
         ir,

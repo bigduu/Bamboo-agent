@@ -522,16 +522,18 @@ async fn session_setup_requires_model_issued_load_for_one_explicit_skill() {
     assert!(!session
         .metadata
         .contains_key("skill_runtime_loaded_skill_ids"));
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .expect("system prompt")
-        .content
-        .as_str();
-    assert!(system_prompt.contains("## Required Explicit Workflow Activation"));
-    assert!(system_prompt.contains("first response step MUST be exactly one `load_skill` call"));
-    assert!(system_prompt.contains("review"));
+    let skill_context = session
+        .metadata
+        .get("skill.context")
+        .expect("required activation context");
+    assert!(skill_context.contains("## Required Explicit Workflow Activation"));
+    assert!(skill_context.contains("first response step MUST be exactly one `load_skill` call"));
+    assert!(skill_context.contains("review"));
+    assert!(session.messages.iter().all(|message| {
+        !message
+            .content
+            .contains("## Required Explicit Workflow Activation")
+    }));
 
     let saved = persistence.sessions.lock().expect("recording lock");
     assert!(saved.iter().all(|saved_session| !saved_session
@@ -603,18 +605,20 @@ async fn permission_style_second_prepare_preserves_unchanged_explicit_activation
         Some("[\"review\"]")
     );
     assert!(!super::skill_context::explicit_activation_pending(&session));
-    let system_prompt = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .expect("system prompt")
-        .content
-        .as_str();
-    assert!(!system_prompt.contains("## Required Explicit Workflow Activation"));
-    assert!(system_prompt.contains("## Explicit Workflow Already Activated"));
+    let skill_context = session
+        .metadata
+        .get("skill.context")
+        .expect("restored activation context");
+    assert!(!skill_context.contains("## Required Explicit Workflow Activation"));
+    assert!(skill_context.contains("## Explicit Workflow Already Activated"));
     assert!(
-        system_prompt.contains("Do not call `load_skill` again solely because execution resumed")
+        skill_context.contains("Do not call `load_skill` again solely because execution resumed")
     );
+    assert!(session.messages.iter().all(|message| {
+        !message
+            .content
+            .contains("## Explicit Workflow Already Activated")
+    }));
     assert!(tools.calls.lock().expect("recording tool lock").is_empty());
 }
 
@@ -1392,6 +1396,119 @@ fn apply_system_prompt_contexts_persists_shared_prompt_snapshot() {
 }
 
 #[test]
+fn legacy_workspace_prompt_migration_recovers_metadata_and_strips_derived_sections_once() {
+    let legacy_project = format!(
+        "{}\nProject ID: legacy-project\nProject path: /legacy/workspace\nProject home: /private/project-home\n{}",
+        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+        crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+    );
+    let legacy_workspace =
+        crate::runtime::context::build_workspace_prompt_context("/legacy/workspace")
+            .expect("legacy workspace block");
+    let legacy_instruction = format!(
+        "{}\nlegacy policy\n{}",
+        crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+        crate::runtime::context::instruction::INSTRUCTION_CONTEXT_END_MARKER,
+    );
+    let legacy_env = format!(
+        "{}\nlegacy env /private/env-path\n{}",
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_END_MARKER,
+    );
+    let legacy_skill = "<!-- BAMBOO_SKILL_CONTEXT_START -->\nlegacy skill /private/skill-path\n<!-- BAMBOO_SKILL_CONTEXT_END -->";
+    let legacy_tool_guide = "<!-- BAMBOO_TOOL_GUIDE_START -->\nlegacy guide /private/tool-path\n<!-- BAMBOO_TOOL_GUIDE_END -->";
+    let mut session = Session::new("legacy-workspace-migration", "model");
+    session.add_message(Message::system(format!(
+        "Base prompt\n\n{legacy_project}\n\n{legacy_workspace}\n\n{legacy_instruction}\n\n{legacy_env}\n\n{legacy_skill}\n\n{legacy_tool_guide}"
+    )));
+
+    assert!(super::prompt_setup::migrate_legacy_workspace_prompt(
+        &mut session
+    ));
+    assert_eq!(
+        session.workspace_path_meta().as_deref(),
+        Some("/legacy/workspace")
+    );
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "Base prompt");
+    assert!(!session.messages[0]
+        .content
+        .contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER));
+    for marker in [
+        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+        crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER,
+        crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        "<!-- BAMBOO_SKILL_CONTEXT_START -->",
+        "<!-- BAMBOO_TOOL_GUIDE_START -->",
+    ] {
+        assert!(!session.messages[0].content.contains(marker));
+    }
+    assert!(!session.messages[0]
+        .content
+        .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+    assert!(!session.messages[0].content.contains("/legacy/workspace"));
+    assert!(!session.messages[0]
+        .content
+        .contains("/private/project-home"));
+    assert!(!session.messages[0].content.contains("/private/env-path"));
+    assert!(!session.messages[0].content.contains("/private/skill-path"));
+    assert!(!session.messages[0].content.contains("/private/tool-path"));
+    assert!(!super::prompt_setup::migrate_legacy_workspace_prompt(
+        &mut session
+    ));
+}
+
+#[test]
+fn legacy_workspace_prompt_migration_preserves_authoritative_metadata() {
+    let stale = crate::runtime::context::build_workspace_prompt_context("/stale/workspace")
+        .expect("stale workspace block");
+    let mut session = Session::new("legacy-workspace-authority", "model");
+    session.set_workspace_path_meta("/authoritative/workspace");
+    session.add_message(Message::system(format!("Base prompt\n\n{stale}")));
+
+    assert!(super::prompt_setup::migrate_legacy_workspace_prompt(
+        &mut session
+    ));
+    assert_eq!(
+        session.workspace_path_meta().as_deref(),
+        Some("/authoritative/workspace")
+    );
+    assert_eq!(session.messages[0].content, "Base prompt");
+}
+
+#[test]
+fn normalize_base_prompt_strips_repeated_instruction_and_environment_sections() {
+    let instruction = |path: &str| {
+        format!(
+            "{}\n## AGENTS.md\nSource: {path}\nlegacy policy\n{}",
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_END_MARKER,
+        )
+    };
+    let prompt = format!(
+        "Base prompt\n\n{}\n\n{}\n\n{}\nenv one\n{}\n\n{}\nenv two\n{}",
+        instruction("/private/workspace-one/AGENTS.md"),
+        instruction("/private/workspace-two/AGENTS.md"),
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_END_MARKER,
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_END_MARKER,
+    );
+
+    let normalized = super::prompt_setup::normalize_base_prompt(&prompt);
+
+    assert_eq!(normalized, "Base prompt");
+    assert!(!normalized.contains("/private/workspace-one"));
+    assert!(!normalized.contains("/private/workspace-two"));
+    assert!(!normalized.contains("env one"));
+    assert!(!normalized.contains("env two"));
+    assert!(!normalized
+        .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+    assert!(!normalized.contains(crate::runtime::context::ENV_CONTEXT_START_MARKER));
+}
+
+#[test]
 fn refresh_prompt_snapshot_from_session_preserves_multi_topic_memory_split_fields() {
     let mut session = Session::new("snapshot-memory-topics", "gpt-test");
     session
@@ -1614,6 +1731,27 @@ fn apply_system_prompt_contexts_persists_runtime_prompt_metadata() {
     assert!(session
         .metadata
         .contains_key("runtime_prompt_section_layout"));
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].content, "Base prompt");
+    assert_eq!(
+        session.metadata.get("skill.context").map(String::as_str),
+        Some(skill_context)
+    );
+    for marker in [
+        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+        crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER,
+        crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        "<!-- BAMBOO_SKILL_CONTEXT_START -->",
+        "<!-- BAMBOO_TOOL_GUIDE_START -->",
+    ] {
+        assert!(!session.messages[0].content.contains(marker));
+    }
+    assert!(!session.messages[0]
+        .content
+        .contains(workspace.to_string_lossy().as_ref()));
+    assert!(!session.messages[0].content.contains("Skill details"));
+    assert!(!session.messages[0].content.contains("Guide details"));
 
     let base_prompt = report
         .section("base_prompt")
@@ -1756,7 +1894,7 @@ fn prompt_assembly_report_component_values_match_sections() {
 }
 
 #[test]
-fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
+fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     let _lock = crate::runtime::tests::env_cache_lock_acquire();
     let mut config_with_env = bamboo_llm::Config::default();
     config_with_env.env_vars = vec![bamboo_config::EnvVarEntry {
@@ -1784,6 +1922,7 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
         ..Default::default()
     };
     let mut session = Session::new("session-stable-frame-1", "model");
+    session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
     session.metadata.insert(
         "skill.context".to_string(),
         "## Skill\nUse the skill".to_string(),
@@ -1798,10 +1937,23 @@ fn build_stable_prompt_frame_includes_base_and_stable_contexts() {
     .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
-    assert!(stable.stable_instructions.contains("Workspace path:"));
-    assert!(stable
+    assert!(!stable.stable_instructions.contains("Workspace path:"));
+    assert!(!stable
+        .stable_instructions
+        .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    assert!(!stable
+        .stable_instructions
+        .contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER));
+    assert!(!stable
+        .stable_instructions
+        .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+    assert!(!stable
         .stable_instructions
         .contains("environment variables were explicitly configured by the user inside Bodhi"));
+    assert!(!stable.stable_instructions.contains("## Skill"));
+    assert!(!stable
+        .stable_instructions
+        .contains("BAMBOO_TOOL_GUIDE_START"));
     // Framework-invariant directives ride on top of even a fully custom override
     // base (`config.system_prompt`), so they are present regardless of the user's
     // base prompt.
@@ -1829,6 +1981,7 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
         ..Default::default()
     };
     let mut session = Session::new("session-stable-frame-2", "model");
+    session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
     session.metadata.insert(
         "skill.context".to_string(),
         "## Skill\nUse the skill".to_string(),
@@ -1860,7 +2013,13 @@ fn build_stable_prompt_frame_strips_round_dynamic_prompt_blocks() {
     .0;
 
     assert!(stable.stable_instructions.contains("Base system"));
-    assert!(stable.stable_instructions.contains("Workspace path:"));
+    assert!(!stable.stable_instructions.contains("Workspace path:"));
+    assert!(!stable
+        .stable_instructions
+        .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    assert!(!stable
+        .stable_instructions
+        .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
     assert!(!stable.stable_instructions.contains("Current Task List"));
     assert!(!stable
         .stable_instructions

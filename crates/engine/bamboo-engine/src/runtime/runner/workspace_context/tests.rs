@@ -1,4 +1,3 @@
-use super::prompt::upsert_workspace_context;
 use super::{
     apply_workspace_path_to_session, extract_workspace_path_from_tool_result,
     should_apply_workspace_update,
@@ -122,53 +121,10 @@ fn should_apply_workspace_update_when_target_is_outside_workspace() {
 }
 
 #[test]
-fn upsert_workspace_context_replaces_existing_segment() {
-    let guidance = crate::runtime::context::workspace_prompt_guidance();
-    let old = format!(
-        "Base prompt\n\nWorkspace path: /old/path\n{}\n\n## Tool Usage Guidelines\nX",
-        guidance
-    );
-    let updated = upsert_workspace_context(&old, "/new/path", WorkspaceBindingStatus::Unregistered);
-
-    assert!(updated.contains("Workspace path: /new/path"));
-    assert!(!updated.contains("Workspace path: /old/path"));
-    assert!(updated.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
-    assert!(updated.contains(crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER));
-    assert!(updated.contains("## Tool Usage Guidelines"));
-}
-
-#[test]
-fn workspace_upsert_preserves_stable_project_block() {
-    let project_block = format!(
-        "{}\nProject ID: project-1\nProject name: Zenith\n{}",
-        crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
-        crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
-    );
-    let old_workspace = crate::runtime::context::build_workspace_prompt_context("/old/path")
-        .expect("workspace context");
-    let prompt = format!("Base prompt\n\n{project_block}\n\n{old_workspace}");
-
-    let updated =
-        upsert_workspace_context(&prompt, "/new/path", WorkspaceBindingStatus::Unregistered);
-    assert!(updated.contains(&project_block));
-    assert_eq!(
-        updated
-            .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-            .count(),
-        1
-    );
-    assert_eq!(
-        updated
-            .matches(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
+fn apply_workspace_path_to_session_updates_metadata_without_mutating_system() {
     let mut session = Session::new("session-1", "test-model");
     session.add_message(Message::system("Base prompt".to_string()));
+    let message_id_before = session.messages[0].id.clone();
 
     apply_workspace_path_to_session(
         &mut session,
@@ -187,29 +143,44 @@ fn apply_workspace_path_to_session_updates_metadata_and_prompt() {
             .map(String::as_str),
         Some("explicit")
     );
-    let system_content = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-    assert!(system_content.contains("Workspace path: /tmp/workspace"));
-    assert!(system_content.contains("Workspace source: explicit"));
-    assert!(system_content.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
-    assert!(system_content.contains(crate::runtime::context::WORKSPACE_CONTEXT_END_MARKER));
+    assert_eq!(
+        session
+            .metadata
+            .get(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+            .map(String::as_str),
+        Some("unregistered")
+    );
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].id, message_id_before);
+    assert_eq!(session.messages[0].content, "Base prompt");
     let snapshot = crate::runtime::runner::read_prompt_snapshot(&session)
         .expect("prompt snapshot should exist after workspace update");
     assert!(snapshot
         .workspace_context
         .as_deref()
         .is_some_and(|value| value.contains("/tmp/workspace")));
-    assert!(snapshot
-        .effective_system_prompt
-        .contains("Workspace path: /tmp/workspace"));
+    assert_eq!(snapshot.effective_system_prompt, "Base prompt");
 }
 
 #[test]
-fn registered_workspace_update_preserves_project_block_byte_for_byte() {
+fn apply_workspace_path_to_session_without_system_creates_no_message() {
+    let mut session = Session::new("session-no-system", "test-model");
+
+    apply_workspace_path_to_session(
+        &mut session,
+        "/tmp/workspace",
+        WorkspaceBindingStatus::Unregistered,
+    );
+
+    assert!(session.messages.is_empty());
+    assert_eq!(
+        session.workspace_path_meta().as_deref(),
+        Some("/tmp/workspace")
+    );
+}
+
+#[test]
+fn registered_workspace_update_strips_legacy_project_host_paths_once() {
     let project_block = format!(
         "{}\nProject ID: project-1\nProject name: Zenith\nProject home: /data/projects/project-1\n{}",
         crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
@@ -217,6 +188,7 @@ fn registered_workspace_update_preserves_project_block_byte_for_byte() {
     );
     let mut session = Session::new("session-registered", "test-model");
     session.add_message(Message::system(format!("Base\n\n{project_block}")));
+    let message_id_before = session.messages[0].id.clone();
 
     apply_workspace_path_to_session(
         &mut session,
@@ -224,22 +196,19 @@ fn registered_workspace_update_preserves_project_block_byte_for_byte() {
         WorkspaceBindingStatus::Registered,
     );
 
-    let system = session
-        .messages
-        .iter()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
-        .unwrap();
-    assert!(system.content.contains(&project_block));
-    assert!(system.content.contains("Binding status: registered"));
-    assert_eq!(
-        system
-            .content
-            .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-            .count(),
-        1
-    );
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].id, message_id_before);
+    assert_eq!(session.messages[0].content, "Base");
+    assert!(!session.messages[0].content.contains("/data/projects"));
     assert_eq!(
         session.workspace_path_meta(),
         Some("/tmp/registered".to_string())
+    );
+    assert_eq!(
+        session
+            .metadata
+            .get(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+            .map(String::as_str),
+        Some("registered")
     );
 }

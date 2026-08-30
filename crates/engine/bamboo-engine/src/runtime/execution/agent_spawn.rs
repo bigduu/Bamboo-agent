@@ -788,7 +788,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 Some(&model),
             );
 
-            let system_prompt = system_prompt_for_session(&session);
+            let system_prompt = system_prompt_for_debug_log(&mut session);
             if let Some(prompt) = system_prompt.as_ref() {
                 log_base_system_prompt_snapshot(&session_id, prompt);
             }
@@ -1105,6 +1105,14 @@ fn system_prompt_for_session(session: &Session) -> Option<String> {
         .map(|message| message.content.clone())
 }
 
+/// Normalize legacy host-owned prompt sections before the debug logger can
+/// observe persisted System text. The runner repeats this migration
+/// idempotently before workspace-scoped setup.
+fn system_prompt_for_debug_log(session: &mut Session) -> Option<String> {
+    crate::runtime::runner::session_setup::migrate_legacy_workspace_prompt(session);
+    system_prompt_for_session(session)
+}
+
 fn initial_user_message_for_session(session: &Session) -> String {
     session
         .messages
@@ -1138,6 +1146,46 @@ fn selected_skill_mode_for_session(session: &Session) -> Option<String> {
 mod reservation_tests {
     use super::*;
     use crate::runtime::execution::runner_state::AgentStatus;
+
+    #[test]
+    fn debug_prompt_snapshot_migrates_legacy_host_paths_before_logging() {
+        let legacy_project = format!(
+            "{}\nProject ID: legacy-project\nProject path: /private/legacy-project\nProject home: /private/legacy-home\n{}",
+            crate::runtime::context::PROJECT_CONTEXT_START_MARKER,
+            crate::runtime::context::PROJECT_CONTEXT_END_MARKER,
+        );
+        let legacy_workspace =
+            crate::runtime::context::build_workspace_prompt_context("/private/legacy-workspace")
+                .expect("legacy workspace context");
+        let legacy_instruction = format!(
+            "{}\nSource: /private/legacy-workspace/AGENTS.md\nlegacy policy\n{}",
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER,
+            crate::runtime::context::instruction::INSTRUCTION_CONTEXT_END_MARKER,
+        );
+        let mut session = Session::new("legacy-debug-log", "model");
+        session.add_message(bamboo_agent_core::Message::system(format!(
+            "Base prompt\n\n{legacy_project}\n\n{legacy_workspace}\n\n{legacy_instruction}"
+        )));
+
+        let prompt = system_prompt_for_debug_log(&mut session).expect("normalized System");
+
+        assert_eq!(prompt, "Base prompt");
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some("/private/legacy-workspace")
+        );
+        for private_path in [
+            "/private/legacy-project",
+            "/private/legacy-home",
+            "/private/legacy-workspace",
+        ] {
+            assert!(!prompt.contains(private_path));
+        }
+        assert!(!prompt.contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+        assert!(!prompt
+            .contains(crate::runtime::context::instruction::INSTRUCTION_CONTEXT_START_MARKER));
+    }
 
     #[test]
     fn reservation_target_requires_domain_id_and_exact_runner_registry() {

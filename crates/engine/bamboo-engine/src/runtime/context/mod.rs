@@ -163,6 +163,21 @@ pub fn build_project_prompt_context(context: &ResolvedProjectContext) -> String 
     format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
 }
 
+/// Build provider-visible Project identity without filesystem locations.
+///
+/// The active workspace path is rendered exactly once by the sibling Workspace
+/// context. Project roots and Bamboo-owned data paths are host details and must
+/// not duplicate that path or leak into provider-visible diagnostics.
+pub fn build_project_model_context(context: &ResolvedProjectContext) -> String {
+    let project = &context.project;
+    let body = format!(
+        "{PROJECT_CONTEXT_PREFIX}{}\nProject name: {}\nThis session belongs to this Project.\nWorkspace is mutable execution context; changing it does not change Project membership, sidebar grouping, Project memory, or Project-shared resources.\nProject-shared resource inventory is supplied separately as per-round dynamic context.\nThe host owns workspace selection and reports the active execution context separately.",
+        prompt_safe_scalar(project.id.as_str()),
+        prompt_safe_scalar(&project.name),
+    );
+    format!("{PROJECT_CONTEXT_START_MARKER}\n{body}\n{PROJECT_CONTEXT_END_MARKER}")
+}
+
 /// Replace every existing Project block with exactly one current block.
 ///
 /// Workspace blocks are deliberately outside the removed marker range.
@@ -259,25 +274,22 @@ fn replace_prompt_block(
 /// Assemble a full system prompt from base prompt, optional enhancement, and context segments.
 ///
 /// This is the shared prompt assembly logic used by both the HTTP handler and the schedule
-/// manager. It layers:
-/// 1. Base system prompt (required)
-/// 2. Optional enhancement text
-/// 3. Workspace context (if workspace_path is provided)
-/// 4. Instruction layer context (AGENTS.md / CLAUDE.md from workspace)
-/// 5. Environment variable context
+/// manager. System text contains only the caller-owned base plus optional
+/// enhancement. Project, Workspace, instruction, and environment context are
+/// assembled later as typed model-context blocks.
 pub fn assemble_system_prompt(
     base: &str,
     enhance: Option<&str>,
-    workspace_path: Option<&str>,
+    _workspace_path: Option<&str>,
 ) -> String {
-    assemble_system_prompt_with_project(base, enhance, None, workspace_path)
+    assemble_system_prompt_with_project(base, enhance, None, None)
 }
 
 pub fn assemble_system_prompt_with_project(
     base: &str,
     enhance: Option<&str>,
-    project_context: Option<&ResolvedProjectContext>,
-    workspace_path: Option<&str>,
+    _project_context: Option<&ResolvedProjectContext>,
+    _workspace_path: Option<&str>,
 ) -> String {
     let mut prompt = base.trim().to_string();
     if let Some(extra) = enhance.map(str::trim).filter(|v| !v.is_empty()) {
@@ -285,40 +297,6 @@ pub fn assemble_system_prompt_with_project(
             prompt.push_str("\n\n");
         }
         prompt.push_str(extra);
-    }
-    if let Some(context) = project_context {
-        let segment = build_project_prompt_context(context);
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(&segment);
-    }
-    if let Some(path) = workspace_path.map(str::trim).filter(|v| !v.is_empty()) {
-        let binding_status = project_context
-            .map(|context| context.binding_status)
-            .unwrap_or(WorkspaceBindingStatus::Unregistered);
-        if let Some(segment) = build_workspace_prompt_context_with_binding_and_source(
-            path,
-            binding_status,
-            project_context.map(|context| context.workspace_source),
-        ) {
-            if !prompt.is_empty() {
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str(&segment);
-        }
-        if let Some(instruction_segment) = instruction::build_instruction_prompt_context(path) {
-            if !prompt.is_empty() {
-                prompt.push_str("\n\n");
-            }
-            prompt.push_str(&instruction_segment);
-        }
-    }
-    if let Some(segment) = build_env_prompt_context() {
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(&segment);
     }
     prompt
 }
@@ -383,31 +361,37 @@ mod project_context_tests {
     }
 
     #[test]
-    fn scoped_prompt_contains_exactly_one_project_and_workspace_block() {
-        let context = project_context("/workspace/main");
+    fn system_assembly_ignores_legacy_dynamic_context_arguments() {
+        let context = project_context("/workspace/private");
         let prompt = assemble_system_prompt_with_project(
             "base",
             None,
             Some(&context),
-            Some("/workspace/main"),
+            Some("/workspace/private"),
         );
-        assert_eq!(prompt.matches(PROJECT_CONTEXT_START_MARKER).count(), 1);
-        assert_eq!(prompt.matches(PROJECT_CONTEXT_END_MARKER).count(), 1);
-        assert_eq!(prompt.matches(WORKSPACE_CONTEXT_START_MARKER).count(), 1);
-        assert_eq!(prompt.matches(WORKSPACE_CONTEXT_END_MARKER).count(), 1);
-        assert!(prompt.contains("Binding status: registered"));
+        assert_eq!(prompt, "base");
+        assert!(!prompt.contains("/workspace/private"));
+        assert!(!prompt.contains("/data/projects"));
+        assert!(!prompt.contains(PROJECT_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(WORKSPACE_CONTEXT_START_MARKER));
+        assert!(!prompt.contains(WORKSPACE_CONTEXT_END_MARKER));
+        assert!(!prompt.contains(ENV_CONTEXT_START_MARKER));
+    }
+
+    #[test]
+    fn provider_project_context_contains_no_host_paths() {
+        let context = project_context("/workspace/main");
+        let prompt = build_project_model_context(&context);
+        assert!(prompt.contains("Project ID:"));
+        assert!(!prompt.contains("/workspace/main"));
+        assert!(!prompt.contains("/data/projects"));
     }
 
     #[test]
     fn workspace_upsert_preserves_project_block_byte_for_byte() {
         let context = project_context("/workspace/main");
-        let prompt = assemble_system_prompt_with_project(
-            "base",
-            None,
-            Some(&context),
-            Some("/workspace/main"),
-        );
         let project_block = build_project_prompt_context(&context);
+        let prompt = format!("base\n\n{project_block}");
         let updated = upsert_workspace_prompt_context(
             &prompt,
             Some("/workspace/worktree"),

@@ -197,17 +197,20 @@ fn persist_round_prompt_metadata(session: &mut Session, prompt: &str) {
                 .cloned()
                 .unwrap_or_default(),
             enhancement_prompt: session.enhance_prompt(),
-            project_context: super::session_setup::prompt_setup::extract_project_context(prompt),
-            workspace_context: session.workspace_path_meta().and_then(|workspace_path| {
-                crate::runtime::context::build_workspace_prompt_context(&workspace_path)
-            }),
+            project_context: session
+                .metadata
+                .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+                .cloned(),
+            workspace_context: super::session_setup::prompt_setup::workspace_context_from_session(
+                session,
+            ),
             instruction_context: session.workspace_path_meta().and_then(|workspace_path| {
                 crate::runtime::context::instruction::build_instruction_prompt_context(
                     &workspace_path,
                 )
             }),
-            env_context: None,
-            skill_context: None,
+            env_context: crate::runtime::context::build_env_prompt_context(),
+            skill_context: session.metadata.get("skill.context").cloned(),
             tool_guide_context: None,
             dream_notebook: None,
             session_memory_note: None,
@@ -374,7 +377,7 @@ mod project_prompt_tests {
     }
 
     #[tokio::test]
-    async fn per_round_resolution_injects_project_once_and_refreshes_only_workspace() {
+    async fn per_round_resolution_preserves_system_and_refreshes_workspace_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let first = directory.path().join("main");
         let second = directory.path().join("worktree");
@@ -413,45 +416,60 @@ mod project_prompt_tests {
         session.set_project_id_meta(project_id.to_string());
         session.set_workspace_path_meta(first.to_string_lossy().to_string());
         session.add_message(Message::system("Base"));
+        let system_id = session.messages[0].id.clone();
 
         super::refresh_project_context(&mut session, Some(&resolver))
             .await
             .expect("first Project refresh");
-        let first_prompt = session.messages[0].content.clone();
-        let project_block = first_prompt
-            .split(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-            .nth(1)
-            .and_then(|tail| {
-                tail.split(crate::runtime::context::PROJECT_CONTEXT_END_MARKER)
-                    .next()
-            })
-            .expect("project body")
-            .to_string();
+        assert_eq!(session.messages[0].id, system_id);
+        assert_eq!(session.messages[0].content, "Base");
+        let project_context = session
+            .metadata
+            .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY)
+            .expect("path-free Project model context")
+            .clone();
+        assert!(project_context.contains("Project ID: project-1"));
+        assert!(!project_context.contains(directory.path().to_string_lossy().as_ref()));
 
         session.set_workspace_path_meta(second.to_string_lossy().to_string());
         super::refresh_project_context(&mut session, Some(&resolver))
             .await
             .expect("second Project refresh");
-        let second_prompt = &session.messages[0].content;
-        assert_eq!(
-            second_prompt
-                .matches(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
-                .count(),
-            1
-        );
-        assert_eq!(
-            second_prompt
-                .matches(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
-                .count(),
-            1
-        );
-        assert!(second_prompt.contains(&project_block));
-        let second = bamboo_config::paths::path_to_display_string(
+        let second_workspace = bamboo_config::paths::path_to_display_string(
             &second.canonicalize().expect("canonical second workspace"),
         );
-        assert!(
-            second_prompt.contains(&format!("Workspace path: {second}")),
-            "second workspace was not refreshed in prompt: {second_prompt}"
+        assert_eq!(session.messages[0].id, system_id);
+        assert_eq!(session.messages[0].content, "Base");
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::project_context::PROJECT_CONTEXT_RENDERED_KEY),
+            Some(&project_context)
+        );
+        assert_eq!(
+            session.workspace_path_meta().as_deref(),
+            Some(second_workspace.as_str())
+        );
+        assert!(session
+            .prompt_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.workspace_context.as_deref())
+            .is_some_and(|context| context.contains(&second_workspace)));
+        assert!(session.messages.iter().all(|message| {
+            !message
+                .content
+                .contains(crate::runtime::context::PROJECT_CONTEXT_START_MARKER)
+                && !message
+                    .content
+                    .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
+                && !message.content.contains(&second_workspace)
+        }));
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::project_context::WorkspaceBindingStatus::Unregistered.as_str())
         );
     }
 
