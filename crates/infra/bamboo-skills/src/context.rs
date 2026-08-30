@@ -4,7 +4,7 @@ use crate::{
 };
 
 /// Build system prompt context text from available skills.
-/// Only includes metadata (id, name, description, allowed tools).
+/// Only includes bounded metadata (id, name, summary, source, revision, policy).
 /// The detailed skill content (SKILL.md body) is NOT included to save context space.
 /// When a user's request matches a skill's description, load detailed instructions on demand.
 pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
@@ -96,7 +96,7 @@ pub(crate) fn workflow_catalog_prefix() -> String {
 
     context.push_str("### Mandatory Skill Check\n");
     context.push_str(
-        "1. Evaluate the user's request against ALL available skill descriptions below.\n",
+        "1. Evaluate the user's request against the bounded advertised workflow matches below.\n",
     );
     context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
     context.push_str("3. Do NOT skip this check.\n\n");
@@ -143,7 +143,10 @@ pub(crate) fn render_workflow_catalog_entry(
     // Only metadata - minimal token usage
     context.push_str(&format!("\n**{}** (`{}`)\n", skill.name, skill.id));
     context.push_str(&format!("- skill_id: `{}`\n", skill.id));
-    context.push_str(&format!("- Description: {}\n", skill.description));
+    context.push_str(&format!(
+        "- Summary: {}\n",
+        crate::capability_discovery::bounded_summary(&skill.description)
+    ));
     context.push_str(&format!("- Kind: {:?}\n", entry.kind).to_ascii_lowercase());
     context.push_str(&format!("- Source: {:?}\n", entry.source).to_ascii_lowercase());
     context.push_str(&format!("- Revision: {}\n", entry.revision));
@@ -207,6 +210,8 @@ mod tests {
         assert!(context.contains("Execution Behavior With Injected Context"));
         assert!(context.contains("prefer a minimal execution or verification attempt"));
         assert!(context.contains("Do NOT ask the user to re-send env var values"));
+        assert!(context.contains("bounded advertised workflow matches"));
+        assert!(!context.contains("ALL available skill descriptions"));
 
         // Should contain skill metadata
         assert!(context.contains("Demo Skill"));
@@ -228,7 +233,7 @@ mod tests {
             rendered_labels,
             vec![
                 "skill_id",
-                "Description",
+                "Summary",
                 "kind",
                 "source",
                 "Revision",
@@ -240,5 +245,22 @@ mod tests {
         assert!(!context.contains("This detailed prompt should NOT appear"));
         assert!(!context.contains("references/"));
         assert!(!context.contains("scripts/"));
+    }
+
+    #[test]
+    fn build_skill_context_bounds_description_without_mutating_definition() {
+        let marker = "FULL-DESCRIPTION-TAIL";
+        let skill = SkillDefinition::new(
+            "long-skill",
+            "Long Skill",
+            format!("{} {marker}", "metadata ".repeat(40)),
+            "instructions",
+        );
+
+        let context = build_skill_context(std::slice::from_ref(&skill));
+
+        assert!(context.contains("- Summary:"));
+        assert!(!context.contains(marker));
+        assert!(skill.description.contains(marker));
     }
 }

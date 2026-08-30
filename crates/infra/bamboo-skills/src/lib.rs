@@ -2,6 +2,7 @@
 
 pub mod access_control;
 pub mod activation;
+pub mod capability_discovery;
 pub mod catalog;
 pub mod clone_publication;
 pub mod context;
@@ -29,68 +30,97 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use bamboo_domain::CapabilityInvocationTarget;
+
+use crate::capability_discovery::{
+    capability_source, CapabilityDiscoveryEligibility, CapabilityDiscoveryIndex,
+    InvocationEligibility, ToolCapabilityMetadata, MAX_CAPABILITY_SUMMARY_CHARS,
+};
+
 pub const DEFAULT_WORKFLOW_CATALOG_MAX_CHARS: usize = 10_240;
 pub const DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS: usize = 128_000;
 const ESTIMATED_CHARS_PER_TOKEN: usize = 4;
-const MAX_COMPRESSED_DESCRIPTION_CHARS: usize = 180;
 
-fn tokenize_request_hint(request_hint: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut tokens = Vec::new();
-
-    for token in request_hint
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-        .map(|token| token.trim().to_lowercase())
-        .filter(|token| token.len() >= 3)
-    {
-        if seen.insert(token.clone()) {
-            tokens.push(token);
-        }
-    }
-
-    tokens
-}
-
-fn skill_match_score(skill: &SkillDefinition, tokens: &[String]) -> usize {
-    if tokens.is_empty() {
-        return 0;
-    }
-
-    let searchable = format!(
-        "{} {} {} {}",
-        skill.id.to_lowercase(),
-        skill.name.to_lowercase(),
-        skill.description.to_lowercase(),
-        skill
-            .tool_refs
-            .iter()
-            .map(|tool| tool.to_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-
-    tokens
-        .iter()
-        .map(|token| {
-            if searchable.contains(token) {
-                if skill.id.to_lowercase().contains(token)
-                    || skill.name.to_lowercase().contains(token)
-                {
-                    3
-                } else {
-                    1
-                }
-            } else {
-                0
-            }
-        })
-        .sum()
-}
-
-fn budget_skills_for_context(
+fn select_automatic_skill(
     skills: Vec<SkillDefinition>,
     catalog: &WorkflowCatalogSnapshot,
     request_hint: Option<&str>,
+) -> Vec<SkillDefinition> {
+    let allowed_skill_ids = skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<BTreeSet<_>>();
+    // `skills` may contain a retained last-known-good definition while its live
+    // catalog row reports a newly invalid publication. Preserve that existing
+    // automatic-selection behavior in the search projection without changing
+    // the canonical catalog row or the revision pinned below.
+    let discovery_catalog = WorkflowCatalogSnapshot {
+        revision: catalog.revision,
+        entries: catalog
+            .entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if entry.winner
+                    && entry.status == WorkflowStatus::Invalid
+                    && allowed_skill_ids.contains(&entry.id)
+                {
+                    entry.status = WorkflowStatus::Valid;
+                }
+                entry
+            })
+            .collect(),
+    };
+    let workflow_catalog = WorkflowCatalogSnapshot::default();
+    let index = CapabilityDiscoveryIndex::from_snapshots(
+        std::iter::empty::<ToolCapabilityMetadata>(),
+        &discovery_catalog,
+        &workflow_catalog,
+        &CapabilityDiscoveryEligibility {
+            allowed_skill_ids: Some(allowed_skill_ids),
+            workflow_gateway_available: false,
+            skill_invocation: InvocationEligibility::Automatic,
+            ..Default::default()
+        },
+    );
+    let Some(matched) =
+        index.discover_unambiguous_automatic_skill(request_hint.unwrap_or_default())
+    else {
+        return Vec::new();
+    };
+    let CapabilityInvocationTarget::Skill {
+        skill_id,
+        source,
+        revision,
+        ..
+    } = matched.invocation_target
+    else {
+        return Vec::new();
+    };
+    if matched.source != source || matched.revision != Some(revision) {
+        return Vec::new();
+    }
+    let matches_same_catalog_entry = catalog.entries.iter().any(|entry| {
+        entry.winner
+            && entry.id == skill_id
+            && entry.revision == revision
+            && capability_source(entry.source) == source
+    });
+    if !matches_same_catalog_entry {
+        return Vec::new();
+    }
+
+    skills
+        .into_iter()
+        .find(|skill| skill.id == skill_id)
+        .into_iter()
+        .collect()
+}
+
+fn fit_skills_to_context_budget(
+    skills: Vec<SkillDefinition>,
+    catalog: &WorkflowCatalogSnapshot,
+    candidate_ids: Vec<String>,
     max_context_tokens: usize,
 ) -> (
     Vec<SkillDefinition>,
@@ -103,7 +133,7 @@ fn budget_skills_for_context(
         .filter(|entry| entry.winner)
         .map(|entry| (entry.id.as_str(), entry))
         .collect::<HashMap<_, _>>();
-    let total_candidates = skills.len();
+    let total_candidates = candidate_ids.len();
     let char_budget = DEFAULT_WORKFLOW_CATALOG_MAX_CHARS.min(
         max_context_tokens
             .saturating_mul(2)
@@ -127,7 +157,7 @@ fn budget_skills_for_context(
                 token_budget,
                 compressed_descriptions: false,
                 shortlisted: total_candidates > 0,
-                omitted_ids: skills.into_iter().map(|skill| skill.id).collect(),
+                omitted_ids: candidate_ids,
             },
         );
     }
@@ -146,43 +176,16 @@ fn budget_skills_for_context(
         .sum::<usize>()
         .saturating_add(static_chars)
         .saturating_add(DIAGNOSTIC_RESERVE_CHARS);
-    let compressed_descriptions = initial_chars > char_budget;
-
-    let hint_tokens = request_hint
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(tokenize_request_hint)
-        .unwrap_or_default();
-
-    let mut ranked: Vec<(usize, SkillDefinition)> = skills
-        .into_iter()
-        .map(|skill| (skill_match_score(&skill, &hint_tokens), skill))
-        .collect();
-
-    ranked.sort_by(|(left_score, left_skill), (right_score, right_skill)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_skill.id.cmp(&right_skill.id))
-    });
+    let compressed_descriptions = skills
+        .iter()
+        .any(|skill| skill.description.chars().count() > MAX_CAPABILITY_SUMMARY_CHARS);
 
     let mut selected = Vec::new();
     let mut used = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
-    for (_, mut skill) in ranked {
+    for skill in skills {
         let Some(entry) = entries_by_id.get(skill.id.as_str()).copied() else {
             continue;
         };
-        if compressed_descriptions
-            && skill.description.chars().count() > MAX_COMPRESSED_DESCRIPTION_CHARS
-        {
-            skill.description = format!(
-                "{}…",
-                skill
-                    .description
-                    .chars()
-                    .take(MAX_COMPRESSED_DESCRIPTION_CHARS.saturating_sub(1))
-                    .collect::<String>()
-            );
-        }
         let cost = context::render_workflow_catalog_entry(&skill, entry)
             .chars()
             .count();
@@ -204,11 +207,9 @@ fn budget_skills_for_context(
                 .map(|entry| (*entry).clone())
         })
         .collect::<Vec<_>>();
-    let omitted_ids = catalog
-        .entries
-        .iter()
-        .filter(|entry| entry.winner && !selected_ids.contains(entry.id.as_str()))
-        .map(|entry| entry.id.clone())
+    let omitted_ids = candidate_ids
+        .into_iter()
+        .filter(|id| !selected_ids.contains(id.as_str()))
         .collect::<Vec<_>>();
     let selected_len = selected.len();
     let mut diagnostic = WorkflowCatalogDiagnostic {
@@ -228,6 +229,21 @@ fn budget_skills_for_context(
             .count();
     debug_assert!(diagnostic.final_chars <= diagnostic.char_budget);
     (selected, selected_entries, diagnostic)
+}
+
+fn select_and_fit_automatic_skills(
+    skills: Vec<SkillDefinition>,
+    catalog: &WorkflowCatalogSnapshot,
+    request_hint: Option<&str>,
+    max_context_tokens: usize,
+) -> (
+    Vec<SkillDefinition>,
+    Vec<WorkflowCatalogEntry>,
+    WorkflowCatalogDiagnostic,
+) {
+    let candidate_ids = skills.iter().map(|skill| skill.id.clone()).collect();
+    let selected = select_automatic_skill(skills, catalog, request_hint);
+    fit_skills_to_context_budget(selected, catalog, candidate_ids, max_context_tokens)
 }
 
 fn filter_disabled_skills(
@@ -450,6 +466,55 @@ impl SkillManager {
         Self::filter_skills_for_selection(skills, &catalog, disabled_skill_ids, selected_skill_ids)
     }
 
+    async fn resolve_skills_for_request_from_store(
+        store: &SkillStore,
+        disabled_skill_ids: &BTreeSet<String>,
+        selected_skill_ids: Option<&[String]>,
+        selected_skill_mode: Option<&str>,
+        request_hint: Option<&str>,
+    ) -> Vec<SkillDefinition> {
+        let (skills, catalog) = match store.skills_and_catalog_for_mode(selected_skill_mode).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to resolve skills and workflow policy for mode {:?}: {}",
+                    selected_skill_mode,
+                    error
+                );
+                return Vec::new();
+            }
+        };
+        let selected = Self::filter_skills_for_selection(
+            skills,
+            &catalog,
+            disabled_skill_ids,
+            selected_skill_ids,
+        );
+        if selected_skill_ids.is_some() {
+            return selected;
+        }
+
+        let original_len = selected.len();
+        let selected = select_and_fit_automatic_skills(
+            selected,
+            &catalog,
+            request_hint,
+            DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .0;
+        if selected.len() < original_len {
+            tracing::info!(
+                "Skill context shortlisted from {} to {} entries (request_hint_present={})",
+                original_len,
+                selected.len(),
+                request_hint
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+            );
+        }
+        selected
+    }
+
     async fn resolve_and_pin_activation_from_store(
         store: &SkillStore,
         activation_id: &str,
@@ -472,7 +537,7 @@ impl SkillManager {
             selected_skill_ids,
         );
         let (selected, catalog_entries, catalog_diagnostic) = if selected_skill_ids.is_none() {
-            budget_skills_for_context(selected, &catalog, request_hint, max_context_tokens)
+            select_and_fit_automatic_skills(selected, &catalog, request_hint, max_context_tokens)
         } else {
             let selected_ids = selected
                 .iter()
@@ -576,32 +641,14 @@ impl SkillManager {
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
     ) -> Vec<SkillDefinition> {
-        let mut skills = self
-            .list_skills_for_selection(disabled_skill_ids, selected_skill_ids, selected_skill_mode)
-            .await;
-
-        if selected_skill_ids.is_none() {
-            let original_len = skills.len();
-            skills = budget_skills_for_context(
-                skills,
-                &self.store.skill_catalog_snapshot().await,
-                request_hint,
-                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
-            )
-            .0;
-            if skills.len() < original_len {
-                tracing::info!(
-                    "Skill context shortlisted from {} to {} entries (request_hint_present={})",
-                    original_len,
-                    skills.len(),
-                    request_hint
-                        .map(str::trim)
-                        .is_some_and(|value| !value.is_empty())
-                );
-            }
-        }
-
-        skills
+        Self::resolve_skills_for_request_from_store(
+            self.store.as_ref(),
+            disabled_skill_ids,
+            selected_skill_ids,
+            selected_skill_mode,
+            request_hint,
+        )
+        .await
     }
 
     /// Resolve policy-aware prompt candidates and pin their exact published
@@ -660,24 +707,14 @@ impl SkillManager {
         request_hint: Option<&str>,
     ) -> SkillResult<Vec<SkillDefinition>> {
         let store = self.store.skill_store_for_workspace(workspace).await?;
-        let mut skills = Self::list_skills_for_selection_from_store(
+        let skills = Self::resolve_skills_for_request_from_store(
             store.as_ref(),
             disabled_skill_ids,
             selected_skill_ids,
             selected_skill_mode,
+            request_hint,
         )
         .await;
-
-        if selected_skill_ids.is_none() {
-            let catalog = store.skill_catalog_snapshot().await;
-            skills = budget_skills_for_context(
-                skills,
-                &catalog,
-                request_hint,
-                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
-            )
-            .0;
-        }
         Ok(skills)
     }
 
@@ -1036,9 +1073,10 @@ mod tests {
     use tokio::fs;
 
     use super::{
-        budget_skills_for_context, filter_disabled_skills, tokenize_request_hint, SkillDefinition,
-        SkillManager, SkillStoreConfig, WorkflowCatalogEntry, WorkflowCatalogSnapshot,
-        WorkflowKind, WorkflowSource, WorkflowStatus, DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        filter_disabled_skills, fit_skills_to_context_budget, select_and_fit_automatic_skills,
+        SkillDefinition, SkillManager, SkillStoreConfig, WorkflowCatalogEntry,
+        WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource, WorkflowStatus,
+        DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
     };
 
     fn demo_skill(id: &str, description: &str) -> SkillDefinition {
@@ -1046,19 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_request_hint_dedupes_and_filters_short_tokens() {
-        let tokens = tokenize_request_hint("fix ui ui in app and api");
-        assert!(tokens.contains(&"fix".to_string()));
-        assert!(tokens.contains(&"app".to_string()));
-        assert!(tokens.contains(&"api".to_string()));
-        assert_eq!(
-            tokens.iter().filter(|token| token.as_str() == "ui").count(),
-            0
-        );
-    }
-
-    #[test]
-    fn shortlist_skills_for_context_prefers_request_matches() {
+    fn automatic_shortlist_uses_unified_discovery_match() {
         let mut skills = Vec::new();
         for index in 0..30 {
             skills.push(demo_skill(
@@ -1092,7 +1118,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let (shortlisted, _, diagnostic) = budget_skills_for_context(
+        let (shortlisted, _, diagnostic) = select_and_fit_automatic_skills(
             skills,
             &catalog,
             Some("optimize react vite build"),
@@ -1128,8 +1154,9 @@ mod tests {
                 shadowed_candidates: Vec::new(),
             }],
         };
+        let candidate_ids = vec![skill.id.clone()];
         let (skills, entries, diagnostic) =
-            budget_skills_for_context(vec![skill], &catalog, None, 100);
+            fit_skills_to_context_budget(vec![skill], &catalog, candidate_ids, 100);
         let rendered =
             crate::context::build_workflow_catalog_context(&skills, &entries, &diagnostic);
         assert!(diagnostic.char_budget <= 8);
@@ -1177,6 +1204,12 @@ mod tests {
         assert!(!ids.contains("plan"));
         assert!(ids.contains("review"));
 
+        let disabled = BTreeSet::from(["review".to_string()]);
+        let selected = manager
+            .resolve_skills_for_request_with_mode(&disabled, None, None, Some("review the changes"))
+            .await;
+        assert!(selected.is_empty(), "disabled exact matches must abstain");
+
         let empty_selection = Vec::new();
         let selected = manager
             .resolve_skills_for_request_with_mode(
@@ -1187,6 +1220,84 @@ mod tests {
             )
             .await;
         assert!(!selected.iter().any(|skill| skill.id == "plan"));
+    }
+
+    #[tokio::test]
+    async fn automatic_match_pins_exact_revision_without_truncating_definition() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let skills_dir = directory.path().join("skills");
+        let skill_dir = skills_dir.join("long-review");
+        fs::create_dir_all(skill_dir.join("agents"))
+            .await
+            .expect("skill directory");
+        let description = format!(
+            "Review code changes carefully. {} FULL-DESCRIPTION-TAIL",
+            "bounded metadata ".repeat(32)
+        );
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: long-review\ndescription: {description}\n---\nPinned instructions.\n"
+            ),
+        )
+        .await
+        .expect("skill definition");
+        fs::write(
+            skill_dir.join("agents/bamboo.yaml"),
+            "version: '1'\ninvocation_policy:\n  explicit: true\n  automatic: true\n",
+        )
+        .await
+        .expect("skill metadata");
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        manager.initialize().await.expect("initialize manager");
+
+        let activation = manager
+            .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                "long-review-activation",
+                &BTreeSet::new(),
+                None,
+                None,
+                Some("long-review"),
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .expect("automatic activation");
+
+        assert_eq!(activation.skills.len(), 1);
+        assert_eq!(activation.skills[0].id, "long-review");
+        assert!(activation.skills[0]
+            .description
+            .contains("FULL-DESCRIPTION-TAIL"));
+        let entry = activation
+            .catalog_entries
+            .iter()
+            .find(|entry| entry.id == "long-review")
+            .expect("matched catalog entry");
+        assert_eq!(
+            activation.descriptor.skill_revisions["long-review"],
+            entry.revision
+        );
+        let context = crate::context::build_workflow_catalog_context(
+            &activation.skills,
+            &activation.catalog_entries,
+            &activation.catalog_diagnostic,
+        );
+        assert!(context.contains("long-review"));
+        assert!(!context.contains("FULL-DESCRIPTION-TAIL"));
+
+        let pinned = manager
+            .store()
+            .export_activation_snapshot("long-review-activation")
+            .await
+            .expect("pinned automatic definition");
+        assert_eq!(pinned.skills["long-review"].revision, entry.revision);
+        assert!(pinned.skills["long-review"]
+            .definition
+            .description
+            .contains("FULL-DESCRIPTION-TAIL"));
     }
 
     #[tokio::test]
