@@ -140,6 +140,65 @@ pub fn build_workspace_prompt_context_with_binding_and_source(
     ))
 }
 
+/// Locate a complete unwrapped Workspace block emitted by legacy Bamboo builds.
+///
+/// Some persisted sessions predate the marker wrapper, but an ordinary custom
+/// System prompt is also allowed to discuss a `Workspace path:`. Treat the
+/// prefix as host authority only when it appears at the start of a line and is
+/// followed by the exact generated guidance, with only known generated
+/// metadata lines in between. Otherwise migration must leave the text alone.
+pub(crate) fn legacy_unwrapped_workspace_context_bounds(prompt: &str) -> Option<(usize, usize)> {
+    let guidance = workspace_prompt_guidance();
+
+    for (start_idx, _) in prompt.match_indices(WORKSPACE_CONTEXT_PREFIX) {
+        if start_idx > 0 && prompt.as_bytes()[start_idx - 1] != b'\n' {
+            continue;
+        }
+
+        let path_start = start_idx + WORKSPACE_CONTEXT_PREFIX.len();
+        let Some(path_end_rel) = prompt[path_start..].find('\n') else {
+            continue;
+        };
+        let path_end = path_start + path_end_rel;
+        if prompt[path_start..path_end].trim().is_empty() {
+            continue;
+        }
+
+        let metadata_start = path_end + 1;
+        let Some(guidance_rel) = prompt[metadata_start..].find(&guidance) else {
+            continue;
+        };
+        let guidance_start = metadata_start + guidance_rel;
+        if guidance_start > 0 && prompt.as_bytes()[guidance_start - 1] != b'\n' {
+            continue;
+        }
+
+        let metadata_is_generated = prompt[metadata_start..guidance_start]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .all(|line| {
+                matches!(
+                    line,
+                    "Workspace source: explicit"
+                        | "Workspace source: project_default"
+                        | "Workspace source: session"
+                        | "Binding status: registered"
+                        | "Binding status: unregistered"
+                        | "Workspace-local resources may override Project-shared resources."
+                        | "Changing the workspace changes only the filesystem execution context; it does not change Project membership or Project memory."
+                )
+            });
+        if !metadata_is_generated {
+            continue;
+        }
+
+        return Some((start_idx, guidance_start + guidance.len()));
+    }
+
+    None
+}
+
 /// Build the stable Project identity block.
 ///
 /// Resource counts and revisions are intentionally excluded: they belong to

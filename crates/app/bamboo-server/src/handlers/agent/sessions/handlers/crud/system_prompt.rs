@@ -264,7 +264,6 @@ mod tests {
                 .as_str()
                 .expect("typed Workspace context");
             assert!(workspace_context.contains(workspace.to_string_lossy().as_ref()));
-            assert!(workspace_context.contains("Workspace source: session"));
             assert!(workspace_context.contains("Binding status: registered"));
             assert!(!effective.contains(workspace.to_string_lossy().as_ref()));
 

@@ -24,7 +24,6 @@ use bamboo_domain::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 
 const WORKSPACE_CONTEXT_START_MARKER: &str = crate::context::WORKSPACE_CONTEXT_START_MARKER;
 const WORKSPACE_CONTEXT_END_MARKER: &str = crate::context::WORKSPACE_CONTEXT_END_MARKER;
-const WORKSPACE_CONTEXT_PREFIX: &str = crate::context::WORKSPACE_CONTEXT_PREFIX;
 const PROJECT_CONTEXT_START_MARKER: &str = crate::context::PROJECT_CONTEXT_START_MARKER;
 const PROJECT_CONTEXT_END_MARKER: &str = crate::context::PROJECT_CONTEXT_END_MARKER;
 
@@ -301,14 +300,10 @@ fn split_env_context(prompt: &str) -> (String, Option<String>) {
 }
 
 fn split_legacy_workspace_context(prompt: &str) -> (String, Option<String>) {
-    let Some(start_idx) = prompt.find(WORKSPACE_CONTEXT_PREFIX) else {
+    let Some((start_idx, end_idx)) =
+        crate::runtime::context::legacy_unwrapped_workspace_context_bounds(prompt)
+    else {
         return (prompt.trim().to_string(), None);
-    };
-    let guidance = crate::context::workspace_prompt_guidance();
-    let end_idx = if let Some(guidance_rel_idx) = prompt[start_idx..].find(&guidance) {
-        start_idx + guidance_rel_idx + guidance.len()
-    } else {
-        prompt.len()
     };
 
     let workspace_context = prompt[start_idx..end_idx].trim().to_string();
@@ -505,6 +500,19 @@ mod tests {
             .workspace_context
             .as_deref()
             .is_some_and(|value| value.contains("/tmp/legacy-workspace")));
+    }
+
+    #[test]
+    fn snapshot_preserves_ordinary_workspace_path_text_as_operator_policy() {
+        let original = "Base policy\nWorkspace path: /private/operator-example\nKeep this policy";
+        let mut session = Session::new("session-ordinary-workspace-text", "gpt-5");
+        session.add_message(Message::system(original));
+
+        let snapshot = build_system_prompt_snapshot(&session, TEST_DEFAULT_PROMPT);
+
+        assert_eq!(snapshot.base_system_prompt, original);
+        assert_eq!(snapshot.effective_system_prompt, original);
+        assert!(snapshot.workspace_context.is_none());
     }
 
     #[test]

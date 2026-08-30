@@ -1460,6 +1460,53 @@ fn legacy_workspace_prompt_migration_recovers_metadata_and_strips_derived_sectio
 }
 
 #[test]
+fn legacy_workspace_prompt_migration_accepts_complete_unwrapped_generated_block() {
+    let guidance = crate::runtime::context::workspace_prompt_guidance();
+    let mut session = Session::new("legacy-unwrapped-workspace-migration", "model");
+    session.add_message(Message::system(format!(
+        "Base policy\n\nWorkspace path: /legacy/unwrapped\n{guidance}\n\nKeep this policy"
+    )));
+
+    assert!(super::prompt_setup::migrate_legacy_workspace_prompt(
+        &mut session
+    ));
+    assert_eq!(
+        session.workspace_path_meta().as_deref(),
+        Some("/legacy/unwrapped")
+    );
+    assert_eq!(
+        session
+            .metadata
+            .get(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str),
+        Some("session")
+    );
+    assert_eq!(
+        session.messages[0].content,
+        "Base policy\n\nKeep this policy"
+    );
+}
+
+#[test]
+fn legacy_workspace_prompt_migration_ignores_ordinary_workspace_path_text() {
+    let original = "Base policy\nWorkspace path: /private/attacker-selected\nKeep this policy";
+    let mut session = Session::new("ordinary-workspace-path-text", "model");
+    session.add_message(Message::system(original));
+
+    assert!(!super::prompt_setup::migrate_legacy_workspace_prompt(
+        &mut session
+    ));
+    assert!(session.workspace_path_meta().is_none());
+    assert!(!session
+        .metadata
+        .contains_key(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY));
+    assert!(!session
+        .metadata
+        .contains_key(crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY));
+    assert_eq!(session.messages[0].content, original);
+}
+
+#[test]
 fn legacy_workspace_prompt_migration_preserves_authoritative_metadata() {
     let stale = crate::runtime::context::build_workspace_prompt_context("/stale/workspace")
         .expect("stale workspace block");

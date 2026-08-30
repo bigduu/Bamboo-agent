@@ -813,7 +813,7 @@ fn extract_workspace_context(prompt: &str) -> Option<String> {
 
 fn strip_workspace_context(prompt: &str) -> String {
     let had_generated_workspace = prompt.contains(WORKSPACE_CONTEXT_START_MARKER)
-        || prompt.contains(WORKSPACE_CONTEXT_PREFIX);
+        || crate::runtime::context::legacy_unwrapped_workspace_context_bounds(prompt).is_some();
     let mut current = prompt.trim().to_string();
     while let Some(stripped) = strip_wrapped_section(
         &current,
@@ -951,25 +951,18 @@ fn strip_wrapped_section(prompt: &str, start_marker: &str, end_marker: &str) -> 
 }
 
 fn extract_legacy_workspace_context(prompt: &str) -> Option<String> {
-    let start_idx = prompt.find(WORKSPACE_CONTEXT_PREFIX)?;
-    let guidance = crate::runtime::context::workspace_prompt_guidance();
-    let end_idx = prompt[start_idx..]
-        .find(&guidance)
-        .map(|guidance_rel_idx| start_idx + guidance_rel_idx + guidance.len())
-        .unwrap_or(prompt.len());
+    let (start_idx, end_idx) =
+        crate::runtime::context::legacy_unwrapped_workspace_context_bounds(prompt)?;
     let section = prompt[start_idx..end_idx].trim();
     (!section.is_empty()).then(|| section.to_string())
 }
 
 fn strip_legacy_workspace_context(prompt: &str) -> String {
-    let Some(start_idx) = prompt.find(WORKSPACE_CONTEXT_PREFIX) else {
+    let Some((start_idx, end_idx)) =
+        crate::runtime::context::legacy_unwrapped_workspace_context_bounds(prompt)
+    else {
         return prompt.to_string();
     };
-    let guidance = crate::runtime::context::workspace_prompt_guidance();
-    let end_idx = prompt[start_idx..]
-        .find(&guidance)
-        .map(|guidance_rel_idx| start_idx + guidance_rel_idx + guidance.len())
-        .unwrap_or(prompt.len());
 
     let before = prompt[..start_idx].trim_end();
     let after = prompt[end_idx..].trim_start();
