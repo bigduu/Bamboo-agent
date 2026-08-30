@@ -176,6 +176,14 @@ pub async fn create_provider_from_instance(
             if let Some(tool_search_execution) = tool_search_execution {
                 provider = provider.with_tool_search_execution(tool_search_execution);
             }
+            if instance
+                .extra
+                .get("sticky_tool_loading")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                provider = provider.with_sticky_tool_loading(true);
+            }
 
             provider = provider.with_reasoning_effort(instance.reasoning_effort);
             provider = provider.with_explicit_prompt_cache(
@@ -602,6 +610,72 @@ mod tests {
                 "execution={execution:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn openai_sticky_tool_loading_requires_literal_true_and_preserves_native_precedence() {
+        for (configured, expected) in [
+            (
+                None,
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some(serde_json::json!(false)),
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some(serde_json::json!("true")),
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            (
+                Some(serde_json::json!(true)),
+                bamboo_domain::CapabilityLoadingMode::StickyFallback,
+            ),
+        ] {
+            let mut value = serde_json::json!({
+                "provider_type":"openai",
+                "api_key":"sk-test",
+                "base_url":"https://api.openai.com/v1",
+                "enabled":true
+            });
+            if let Some(configured) = configured {
+                value["sticky_tool_loading"] = configured;
+            }
+            let instance: ProviderInstanceConfig = serde_json::from_value(value).unwrap();
+            let provider =
+                create_provider_from_instance(&Config::default(), &instance, std::env::temp_dir())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                provider.capability_loading_mode("gpt-4o-mini", None).await,
+                expected
+            );
+            assert_eq!(
+                provider
+                    .capability_loading_mode("gpt-4o-mini", Some("load_skill"))
+                    .await,
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog
+            );
+        }
+
+        let instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
+            "provider_type":"openai",
+            "api_key":"sk-test",
+            "base_url":"https://api.openai.com/v1",
+            "responses_only_models":["gpt-5*"],
+            "tool_search_execution":"server",
+            "sticky_tool_loading":true,
+            "enabled":true
+        }))
+        .unwrap();
+        let provider =
+            create_provider_from_instance(&Config::default(), &instance, std::env::temp_dir())
+                .await
+                .unwrap();
+        assert_eq!(
+            provider.capability_loading_mode("gpt-5.6", None).await,
+            bamboo_domain::CapabilityLoadingMode::Progressive
+        );
     }
 
     #[tokio::test]

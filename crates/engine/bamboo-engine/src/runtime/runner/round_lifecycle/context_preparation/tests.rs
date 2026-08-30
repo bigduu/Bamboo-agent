@@ -409,6 +409,28 @@ fn archive_state(session: &Session) -> Vec<(String, bool, Option<String>)> {
 #[tokio::test]
 async fn bounded_host_compression_uses_auxiliary_model_budget_and_exact_candidates() {
     let mut session = bounded_compression_session("bounded-success-763");
+    let mut sticky_call = Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "sticky-compression-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+                arguments: r#"{"query":"archive"}"#.to_string(),
+            },
+        }]),
+    );
+    sticky_call.never_compress = true;
+    let sticky_call_id = sticky_call.id.clone();
+    let mut sticky_result = Message::tool_result_with_status(
+        "sticky-compression-call",
+        r#"<loaded_tools>{"tools":[{"type":"function","function":{"name":"ReadArchive","description":"Read archived files","parameters":{"type":"object"}}}]}</loaded_tools>"#,
+        true,
+    );
+    sticky_result.never_compress = true;
+    let sticky_result_id = sticky_result.id.clone();
+    session.messages.insert(6, sticky_call);
+    session.messages.insert(7, sticky_result);
     let never_compress_id = session
         .messages
         .iter()
@@ -506,6 +528,32 @@ async fn bounded_host_compression_uses_auxiliary_model_budget_and_exact_candidat
         .iter()
         .find(|message| message.id == never_compress_id)
         .is_some_and(|message| !message.compressed));
+    for protected_id in [&sticky_call_id, &sticky_result_id] {
+        assert!(session
+            .messages
+            .iter()
+            .find(|message| message.id == *protected_id)
+            .is_some_and(|message| !message.compressed));
+    }
+    let active = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
+        &session,
+        session
+            .token_budget
+            .as_ref()
+            .expect("bounded session token budget"),
+        &counter,
+        0,
+    )
+    .expect("compressed context should still fit");
+    for protected_id in [&sticky_call_id, &sticky_result_id] {
+        assert!(
+            active
+                .messages
+                .iter()
+                .any(|message| message.id == *protected_id),
+            "sticky discovery call/result must remain together in active context"
+        );
+    }
     for id in latest_user_ids {
         assert!(
             session

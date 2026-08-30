@@ -40,6 +40,7 @@ pub struct OpenAIProvider {
     base_url: String,
     responses_only_models: Vec<String>,
     tool_search_execution: Option<ResponsesToolSearchExecution>,
+    sticky_tool_loading: bool,
     default_reasoning_effort: Option<ReasoningEffort>,
     explicit_prompt_cache: bool,
     request_overrides: Option<RequestOverridesConfig>,
@@ -56,6 +57,7 @@ impl OpenAIProvider {
             base_url: "https://api.openai.com/v1".to_string(),
             responses_only_models: vec![],
             tool_search_execution: None,
+            sticky_tool_loading: false,
             default_reasoning_effort: None,
             explicit_prompt_cache: true,
             request_overrides: None,
@@ -93,6 +95,13 @@ impl OpenAIProvider {
     /// Leaving this unset keeps the provider on the legacy full-catalog path.
     pub fn with_tool_search_execution(mut self, execution: ResponsesToolSearchExecution) -> Self {
         self.tool_search_execution = Some(execution);
+        self
+    }
+
+    /// Enable Bamboo's sticky conversation-history fallback on Chat-compatible
+    /// routes that do not use native Responses tool search.
+    pub fn with_sticky_tool_loading(mut self, enabled: bool) -> Self {
+        self.sticky_tool_loading = enabled;
         self
     }
 
@@ -523,6 +532,11 @@ impl LLMProvider for OpenAIProvider {
             && self.uses_responses_api(model)
         {
             CapabilityLoadingMode::Progressive
+        } else if required_tool.is_none()
+            && self.sticky_tool_loading
+            && !self.uses_responses_api(model)
+        {
+            CapabilityLoadingMode::StickyFallback
         } else {
             CapabilityLoadingMode::LegacyFullCatalog
         }
@@ -959,6 +973,48 @@ mod tests {
         assert_eq!(
             custom.capability_loading_mode("gpt-5.6", None).await,
             CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_loading_is_explicit_chat_only_and_native_responses_search_wins() {
+        let unset = OpenAIProvider::new("k");
+        assert_eq!(
+            unset.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        let disabled = unset.with_sticky_tool_loading(false);
+        assert_eq!(
+            disabled.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+
+        let sticky = disabled.with_sticky_tool_loading(true);
+        assert_eq!(
+            sticky.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        assert_eq!(
+            sticky
+                .capability_loading_mode("gpt-4o-mini", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+
+        let responses_without_native =
+            sticky.with_responses_only_models(vec!["gpt-5*".to_string()]);
+        assert_eq!(
+            responses_without_native
+                .capability_loading_mode("gpt-5.6", None)
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            "sticky fallback must not replace native Responses search"
+        );
+        let native = responses_without_native
+            .with_tool_search_execution(ResponsesToolSearchExecution::Client);
+        assert_eq!(
+            native.capability_loading_mode("gpt-5.6", None).await,
+            CapabilityLoadingMode::Progressive
         );
     }
 

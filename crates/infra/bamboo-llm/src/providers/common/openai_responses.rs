@@ -674,7 +674,9 @@ pub fn build_responses_body_with_capability_loading(
     }
 
     let projected_tools = match capability_loading_mode {
-        CapabilityLoadingMode::LegacyFullCatalog => tools_to_responses_json(tools),
+        CapabilityLoadingMode::LegacyFullCatalog | CapabilityLoadingMode::StickyFallback => {
+            tools_to_responses_json(tools)
+        }
         CapabilityLoadingMode::Progressive => {
             tools_to_progressive_responses_json(tools, tool_search_execution)
         }
@@ -3226,6 +3228,35 @@ mod tests {
         );
         assert!(projected.iter().all(|tool| tool["name"] != "Glob"));
         assert!(projected.iter().all(|tool| tool["name"] != "Workspace"));
+    }
+
+    #[test]
+    fn sticky_fallback_lowers_supplied_core_plus_discovery_without_native_search_flags() {
+        let tools = vec![
+            loading_schema("Read"),
+            bamboo_domain::discovery_control_fallback_schema(),
+        ];
+        let body = build_responses_body_with_capability_loading(
+            "chat-model",
+            &[Message::user("find files")],
+            &tools,
+            None,
+            None,
+            None,
+            None,
+            None,
+            CapabilityLoadingMode::StickyFallback,
+            ResponsesToolSearchExecution::Server,
+        );
+        let projected = body["tools"].as_array().unwrap();
+
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0]["name"], "Read");
+        assert_eq!(projected[1]["name"], "discover_capabilities");
+        assert!(projected.iter().all(|tool| tool["type"] == "function"));
+        assert!(projected
+            .iter()
+            .all(|tool| tool.get("defer_loading").is_none()));
     }
 
     #[test]
