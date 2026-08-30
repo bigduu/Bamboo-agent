@@ -2,6 +2,7 @@
 
 mod external_memory;
 mod goal;
+mod memory_rerank;
 mod plan_mode;
 mod plan_runtime;
 mod system_sections;

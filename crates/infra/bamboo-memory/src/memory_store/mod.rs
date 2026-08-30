@@ -24,7 +24,7 @@ pub use paths::{
 };
 pub use recall::{
     select_relevant_memories, shortlist_relevant_memories, MemoryRecallCandidate,
-    MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallSelection, MemoryRecallStrategy,
+    MemoryRecallOptions, MemoryRecallSelection, MemoryRecallStrategy,
 };
 pub use store::MemoryStore;
 pub use types::{

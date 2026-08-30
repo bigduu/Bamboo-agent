@@ -8,12 +8,13 @@ use bamboo_llm::LLMProvider;
 use bamboo_memory::budget::{segment_by_granularity_budget, GranularityBudgetItem};
 use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
-    render_memory_freshness_note, select_relevant_memories,
-    truncate_chars as memory_truncate_chars, FreshnessKind, MemoryRecallCandidate,
-    MemoryRecallOptions, MemoryRecallRerankContext, MemoryRecallStrategy, MemoryScope, MemoryStore,
-    TemporalGranularity,
+    render_memory_freshness_note, truncate_chars as memory_truncate_chars, FreshnessKind,
+    MemoryRecallCandidate, MemoryRecallOptions, MemoryScope, MemoryStore, TemporalGranularity,
 };
 
+use super::memory_rerank::{
+    select_relevant_memories, MemoryRecallRerankContext, MemoryRecallStrategy,
+};
 use super::system_sections::strip_existing_prompt_block;
 
 const EXTERNAL_MEMORY_START_MARKER: &str = "<!-- BAMBOO_EXTERNAL_MEMORY_START -->";
@@ -448,15 +449,16 @@ fn resolve_prompt_project_scope(session: &Session) -> Option<ProjectMemoryScope>
     ProjectContextResolver::memory_read_identity_for_session(session)
 }
 
-fn latest_user_query_text(session: &Session) -> Option<String> {
-    session
-        .messages
-        .iter()
-        .rev()
-        .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
-        .map(|message| message.content.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+pub(super) fn latest_user_query_text(session: &Session) -> Option<String> {
+    session.messages.iter().rev().find_map(|message| {
+        if !matches!(message.role, bamboo_agent_core::Role::User)
+            || bamboo_domain::is_system_resume_message(message)
+        {
+            return None;
+        }
+        let content = message.content.trim();
+        (!content.is_empty()).then(|| content.to_string())
+    })
 }
 
 async fn load_session_note_snippets(memory: &MemoryStore, session_id: &str) -> Vec<TopicSnippet> {
