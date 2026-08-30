@@ -1,10 +1,17 @@
 use async_trait::async_trait;
 
 use bamboo_agent_core::tools::{
-    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
-    ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
+    ToolOutcome, ToolResult, ToolSchema,
 };
-use bamboo_tools::normalize_tool_ref;
+use bamboo_domain::resolve_tool_reference_name;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OverlayRoute {
+    Overlay,
+    BaseExact(String),
+    BaseFallback,
+}
 
 /// Tool executor that overlays a single tool on top of an existing executor.
 ///
@@ -43,6 +50,36 @@ impl OverlayToolExecutor {
         }
         args
     }
+
+    /// Resolve against the complete overlay + base catalog. Exact base
+    /// identities are considered before any compatibility alias can select the
+    /// overlay; an intentional same-name overlay replacement retains precedence.
+    fn route(&self, reference: &str) -> OverlayRoute {
+        let resolved = resolve_tool_reference_name(reference, |candidate| {
+            candidate == self.overlay.name() || self.base.owns_exact_tool(candidate)
+        });
+        match resolved {
+            Some(execution_name) if execution_name == self.overlay.name() => OverlayRoute::Overlay,
+            Some(execution_name) => OverlayRoute::BaseExact(execution_name),
+            None => OverlayRoute::BaseFallback,
+        }
+    }
+
+    async fn execute_overlay_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let args = self.resolve_args(call, &ctx);
+        if let Some(outcome) = self
+            .base
+            .check_permissions_for_resolved(call, self.overlay.name(), &args, &ctx)
+            .await?
+        {
+            return Ok(outcome);
+        }
+        self.overlay.invoke(args, ctx.to_tool_ctx()).await
+    }
 }
 
 #[async_trait]
@@ -57,36 +94,9 @@ impl ToolExecutor for OverlayToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let name = normalize_tool_name(&call.function.name);
-        let is_overlay_call = name == self.overlay.name()
-            || normalize_tool_ref(name)
-                .as_deref()
-                .is_some_and(|normalized| normalized == self.overlay.name());
-        if is_overlay_call {
-            // Gate the overlay tool through the base executor's real permission
-            // check BEFORE invoking it (issue #341). The permission checker lives
-            // in the base (built-in) executor, so overlay tools (`memory`,
-            // `scheduler`, `SubAgent`, …) used to bypass it entirely. `Some`
-            // is the interactive approval pause; `Err` is deny / fail-closed.
-            if let Some(outcome) = self.base.check_permissions_for(call, &ctx).await? {
-                return Ok(outcome.into_tool_result());
-            }
-            // Reuse the args the dispatching loop already parsed (threaded via the
-            // context) instead of re-parsing the raw JSON string a second time here
-            // (issue #106). The threaded value is the exact output of the same
-            // parser on the same input, so reuse is behavior-preserving — and it
-            // means the malformed-args fallback `warn!` fires at most once per call
-            // (at the dispatch site), never re-emitted here. When absent (`none()`
-            // contexts, tests, synthesized child calls), parse leniently exactly as
-            // before, including the fallback warning.
-            let args = self.resolve_args(call, &ctx);
-            return self
-                .overlay
-                .invoke(args, ctx.to_tool_ctx())
-                .await
-                .map(|outcome| outcome.into_tool_result());
-        }
-        self.base.execute_with_context(call, ctx).await
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
     }
 
     async fn execute_with_context_outcome(
@@ -94,23 +104,35 @@ impl ToolExecutor for OverlayToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolOutcome, ToolError> {
-        let name = normalize_tool_name(&call.function.name);
-        let is_overlay_call = name == self.overlay.name()
-            || normalize_tool_ref(name)
-                .as_deref()
-                .is_some_and(|normalized| normalized == self.overlay.name());
-        if is_overlay_call {
-            // Same permission gate as `execute_with_context` (issue #341): the
-            // overlay tool is checked by the base executor before it runs.
-            if let Some(outcome) = self.base.check_permissions_for(call, &ctx).await? {
-                return Ok(outcome);
+        match self.route(&call.function.name) {
+            OverlayRoute::Overlay => self.execute_overlay_outcome(call, ctx).await,
+            OverlayRoute::BaseExact(execution_name) => {
+                self.base
+                    .execute_exact_with_context_outcome(call, &execution_name, ctx)
+                    .await
             }
-            // Reuse the dispatch-parsed args (parse-once) exactly as in
-            // `execute_with_context` above (issue #106).
-            let args = self.resolve_args(call, &ctx);
-            return self.overlay.invoke(args, ctx.to_tool_ctx()).await;
+            OverlayRoute::BaseFallback => self.base.execute_with_context_outcome(call, ctx).await,
         }
-        self.base.execute_with_context_outcome(call, ctx).await
+    }
+
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        if execution_name == self.overlay.name() {
+            self.execute_overlay_outcome(call, ctx).await
+        } else if self.base.owns_exact_tool(execution_name) {
+            self.base
+                .execute_exact_with_context_outcome(call, execution_name, ctx)
+                .await
+        } else {
+            Err(ToolError::NotFound(format!(
+                "Tool '{}' not found",
+                execution_name
+            )))
+        }
     }
 
     /// Delegate the permission gate to the base executor so stacked overlays
@@ -121,7 +143,32 @@ impl ToolExecutor for OverlayToolExecutor {
         call: &ToolCall,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.base.check_permissions_for(call, ctx).await
+        match self.route(&call.function.name) {
+            OverlayRoute::Overlay => {
+                let args = ctx
+                    .pre_parsed_args
+                    .cloned()
+                    .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+                self.base
+                    .check_permissions_for_resolved(call, self.overlay.name(), &args, ctx)
+                    .await
+            }
+            OverlayRoute::BaseExact(_) | OverlayRoute::BaseFallback => {
+                self.base.check_permissions_for(call, ctx).await
+            }
+        }
+    }
+
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.base
+            .check_permissions_for_resolved(call, execution_name, args, ctx)
+            .await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -136,6 +183,59 @@ impl ToolExecutor for OverlayToolExecutor {
         tools.sort_by_key(|t| t.function.name.clone());
         tools
     }
+
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        tool_name == self.overlay.name() || self.base.owns_exact_tool(tool_name)
+    }
+
+    fn tool_mutability(&self, tool_name: &str) -> bamboo_agent_core::ToolMutability {
+        match self.route(tool_name) {
+            OverlayRoute::Overlay => self.overlay.classify(&serde_json::Value::Null).mutability,
+            OverlayRoute::BaseExact(execution_name) => self.base.tool_mutability(&execution_name),
+            OverlayRoute::BaseFallback => self.base.tool_mutability(tool_name),
+        }
+    }
+
+    fn call_mutability(&self, call: &ToolCall) -> bamboo_agent_core::ToolMutability {
+        self.call_parallel_classification(call).0
+    }
+
+    fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
+        match self.route(tool_name) {
+            OverlayRoute::Overlay => {
+                self.overlay
+                    .classify(&serde_json::Value::Null)
+                    .parallel_safe
+            }
+            OverlayRoute::BaseExact(execution_name) => {
+                self.base.tool_concurrency_safe(&execution_name)
+            }
+            OverlayRoute::BaseFallback => self.base.tool_concurrency_safe(tool_name),
+        }
+    }
+
+    fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
+        self.call_parallel_classification(call).1
+    }
+
+    fn call_parallel_classification(
+        &self,
+        call: &ToolCall,
+    ) -> (bamboo_agent_core::ToolMutability, bool) {
+        match self.route(&call.function.name) {
+            OverlayRoute::Overlay => {
+                let args = parse_tool_args_best_effort(&call.function.arguments).0;
+                let class = self.overlay.classify(&args);
+                (class.mutability, class.parallel_safe)
+            }
+            OverlayRoute::BaseExact(execution_name) => {
+                let mut exact_call = call.clone();
+                exact_call.function.name = execution_name;
+                self.base.call_parallel_classification(&exact_call)
+            }
+            OverlayRoute::BaseFallback => self.base.call_parallel_classification(call),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,7 +244,7 @@ mod tests {
 
     use serde_json::json;
 
-    use bamboo_agent_core::tools::{FunctionCall, ToolCtx};
+    use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCtx};
 
     struct BaseExecutor;
 
@@ -184,6 +284,10 @@ mod tests {
 
         fn parameters_schema(&self) -> serde_json::Value {
             json!({"type":"object","properties":{}})
+        }
+
+        fn classify(&self, _args: &serde_json::Value) -> bamboo_agent_core::ToolClass {
+            bamboo_agent_core::ToolClass::READONLY_PARALLEL
         }
 
         async fn invoke(
@@ -242,6 +346,233 @@ mod tests {
         assert!(
             matches!(err, ToolError::Execution(msg) if msg.contains("base executor called for Read"))
         );
+    }
+
+    struct ExactBaseExecutor {
+        name: &'static str,
+        result: Result<&'static str, ToolError>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ExactBaseExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            if call.function.name != self.name {
+                return Err(ToolError::NotFound(call.function.name.clone()));
+            }
+            let result = self.result.clone()?;
+            Ok(ToolResult {
+                success: true,
+                result: result.to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: self.name.to_string(),
+                    description: "exact base tool".to_string(),
+                    parameters: json!({"type":"object"}),
+                },
+            }]
+        }
+
+        fn owns_exact_tool(&self, tool_name: &str) -> bool {
+            tool_name == self.name
+        }
+
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::ToolMutability, bool) {
+            assert_eq!(call.function.name, self.name);
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        }
+    }
+
+    struct NamedOverlayTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedOverlayTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "named overlay"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object"})
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
+                success: true,
+                result: format!("overlay:{}", self.0),
+                display_preference: None,
+                images: Vec::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_base_spawn_session_beats_overlay_alias_through_stacked_overlays() {
+        let base: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(ExactBaseExecutor {
+            name: "spawn_session",
+            result: Ok("exact-base"),
+        });
+        let subagent: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(
+            OverlayToolExecutor::new(base, std::sync::Arc::new(SubAgentOverlayTool)),
+        );
+        let stacked =
+            OverlayToolExecutor::new(subagent, std::sync::Arc::new(NamedOverlayTool("memory")));
+
+        assert!(stacked.owns_exact_tool("spawn_session"));
+        let exact = stacked
+            .execute(&make_call("spawn_session"))
+            .await
+            .expect("base exact owner must win");
+        assert_eq!(exact.result, "exact-base");
+
+        let alias = stacked
+            .execute(&make_call("sub_task"))
+            .await
+            .expect("unshadowed alias must reach SubAgent overlay");
+        assert_eq!(alias.result, "overlay");
+    }
+
+    #[tokio::test]
+    async fn exact_base_not_found_is_not_reinterpreted_as_overlay_alias() {
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(ExactBaseExecutor {
+                name: "spawn_session",
+                result: Err(ToolError::NotFound("exact owner failed".to_string())),
+            }),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+
+        let error = overlay
+            .execute(&make_call("spawn_session"))
+            .await
+            .expect_err("exact owner error must propagate");
+        assert!(matches!(error, ToolError::NotFound(message) if message == "exact owner failed"));
+    }
+
+    #[tokio::test]
+    async fn namespace_fallback_dispatches_the_resolved_exact_base_identity() {
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(ExactBaseExecutor {
+                name: "custom_tool",
+                result: Ok("base-custom"),
+            }),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+        let call = make_call("default::custom_tool");
+
+        let result = overlay
+            .execute(&call)
+            .await
+            .expect("namespace fallback must execute base exact identity");
+        assert_eq!(result.result, "base-custom");
+        assert_eq!(
+            overlay.call_parallel_classification(&call),
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_name_overlay_replacement_keeps_overlay_precedence() {
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(ExactBaseExecutor {
+                name: "SubAgent",
+                result: Ok("base-subagent"),
+            }),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+
+        let result = overlay
+            .execute(&make_call("SubAgent"))
+            .await
+            .expect("same-name overlay must replace base");
+        assert_eq!(result.result, "overlay");
+        assert_eq!(
+            overlay
+                .list_tools()
+                .iter()
+                .filter(|schema| schema.function.name == "SubAgent")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn alias_classification_uses_the_selected_overlay_identity() {
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(BaseExecutor),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+
+        assert_eq!(
+            overlay.call_parallel_classification(&make_call("sub_task")),
+            (bamboo_agent_core::ToolMutability::ReadOnly, true)
+        );
+    }
+
+    struct ResolvedPermissionBase {
+        seen: std::sync::Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ResolvedPermissionBase {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Err(ToolError::NotFound(call.function.name.clone()))
+        }
+
+        async fn check_permissions_for(
+            &self,
+            _call: &ToolCall,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            panic!("overlay must use the resolved permission seam")
+        }
+
+        async fn check_permissions_for_resolved(
+            &self,
+            _call: &ToolCall,
+            execution_name: &str,
+            args: &serde_json::Value,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            *self.seen.lock().unwrap() = Some((execution_name.to_string(), args.clone()));
+            Ok(None)
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_permission_gate_receives_overlay_identity_and_effective_args() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(ResolvedPermissionBase { seen: seen.clone() }),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+        let call = make_call_with_args("sub_task", r#"{"prompt":"inspect"}"#);
+
+        overlay.execute(&call).await.expect("execute overlay alias");
+
+        let recorded = seen.lock().unwrap().clone().expect("permission record");
+        assert_eq!(recorded.0, "SubAgent");
+        assert_eq!(recorded.1, json!({"prompt": "inspect"}));
     }
 
     // ---- issue #341: overlay tools must hit the base permission gate ---------

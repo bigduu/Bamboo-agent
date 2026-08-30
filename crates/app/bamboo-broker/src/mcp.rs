@@ -772,6 +772,17 @@ impl ToolExecutor for McpProxyExecutor {
     fn list_tools(&self) -> Vec<ToolSchema> {
         self.manifest.read().map(|m| m.clone()).unwrap_or_default()
     }
+
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        self.manifest
+            .read()
+            .map(|manifest| {
+                manifest
+                    .iter()
+                    .any(|schema| schema.function.name == tool_name)
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1107,9 @@ mod tests {
         let tools = proxy.list_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "nova_click");
+        assert!(proxy.owns_exact_tool("nova_click"));
+        assert!(!proxy.owns_exact_tool("NOVA_CLICK"));
+        assert!(!proxy.owns_exact_tool("default::nova_click"));
 
         // A call is forwarded to the orchestrator and the result comes back.
         let call = ToolCall {
