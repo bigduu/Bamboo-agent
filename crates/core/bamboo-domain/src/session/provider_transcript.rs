@@ -2459,6 +2459,32 @@ fn openai_loaded_tool_names(payload: &Value) -> Vec<String> {
     names
 }
 
+/// Extract function identities only from validated OpenAI Responses
+/// `tool_search_output.tools` items. Ordinary function calls do not contribute
+/// loading state.
+pub fn validated_openai_loaded_tool_names<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    family: ProviderFamily,
+) -> Vec<String> {
+    if !matches!(family, ProviderFamily::OpenAi | ProviderFamily::Copilot) {
+        return Vec::new();
+    }
+    let mut names = groups
+        .into_iter()
+        .filter(|group| {
+            group.family() == family
+                && group.protocol() == ProviderProtocol::OpenAiResponsesV1
+                && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+        })
+        .flat_map(ProviderTranscriptGroup::items)
+        .filter(|item| item.kind() == ProviderTranscriptItemKind::OpenAiToolSearchOutput)
+        .flat_map(|item| openai_loaded_tool_names(item.payload()))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn stable_item_id(
     family: ProviderFamily,
     protocol: ProviderProtocol,
@@ -2876,6 +2902,71 @@ mod tests {
         );
         ProviderTranscriptGroup::validate_items(std::slice::from_ref(&client))
             .expect("a client output is a standalone host-owned continuation group");
+    }
+
+    #[test]
+    fn openai_loaded_names_survive_resume_and_come_only_from_search_output() {
+        let mut session = Session::new("client-loaded-resume", "gpt-5.6");
+        activate_openai(&mut session);
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        let call = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_search_call","id":"tsc_resume","execution":"client",
+                "call_id":"search_resume","status":"completed",
+                "arguments":{"query":"files"}
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![call])
+            .unwrap();
+        let output = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client",
+                "call_id":"search_resume","status":"completed","tools":[{
+                    "type":"function","name":"Glob","description":"Find files",
+                    "parameters":{"type":"object"},"strict":false,"defer_loading":true
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+
+        let names =
+            validated_openai_loaded_tool_names(replayable_openai(&session), ProviderFamily::OpenAi);
+        assert_eq!(names, vec!["Glob"]);
+
+        let resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        let resumed_names =
+            validated_openai_loaded_tool_names(replayable_openai(&resumed), ProviderFamily::OpenAi);
+        assert_eq!(resumed_names, vec!["Glob"]);
+
+        let mut hosted = Session::new("hosted-loaded", "gpt-5.6");
+        activate_openai(&mut hosted);
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        hosted.add_message(assistant);
+        hosted
+            .append_provider_transcript_group(&anchor, None, openai_output_items())
+            .unwrap();
+        assert_eq!(
+            validated_openai_loaded_tool_names(replayable_openai(&hosted), ProviderFamily::OpenAi,),
+            vec!["list_open_orders"],
+            "the following ordinary function_call must not add loading state"
+        );
     }
 
     #[test]
