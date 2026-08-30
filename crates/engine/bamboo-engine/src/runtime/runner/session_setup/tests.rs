@@ -10,7 +10,9 @@ use bamboo_agent_core::tools::{
     FunctionSchema, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{Message, Session};
-use bamboo_domain::{CapabilityLoadingClass, RuntimeSessionPersistence};
+use bamboo_domain::{
+    CapabilityLoadingClass, CapabilityLoadingMode, EffectiveCallableSet, RuntimeSessionPersistence,
+};
 use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
     SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
@@ -1023,6 +1025,36 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
         discovery_names, model_names,
         "legacy provider projection and discovery must consume one classified catalog"
     );
+}
+
+#[test]
+fn progressive_effective_set_intersects_final_session_eligible_catalog() {
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: std::collections::BTreeSet::from(["Glob".to_string()]),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: ["Read", "Glob", "custom_tool", "Workspace"]
+            .into_iter()
+            .map(schema)
+            .collect(),
+    };
+    let session = Session::new("progressive-session-eligibility", "model");
+
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let effective = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::Progressive,
+        ["Glob", "custom_tool", "Workspace", "missing_tool"],
+    );
+
+    assert_eq!(
+        effective.execution_names().collect::<Vec<_>>(),
+        vec!["Read", "custom_tool"]
+    );
+    assert!(!effective.contains_execution_name("Glob"));
+    assert!(!effective.contains_execution_name("Workspace"));
+    assert!(!effective.contains_execution_name("missing_tool"));
 }
 
 #[test]
