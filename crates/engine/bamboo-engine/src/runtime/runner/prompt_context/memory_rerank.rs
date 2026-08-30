@@ -261,9 +261,8 @@ fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option
     let stripped = strip_markdown_fence(raw);
     let fragment = extract_json_fragment(&stripped).unwrap_or(stripped.trim());
     let ids = serde_json::from_str::<MemoryRecallRerankEnvelope>(fragment)
-        .map(|value| value.ids)
-        .or_else(|_| serde_json::from_str::<Vec<String>>(fragment))
-        .ok()?;
+        .ok()?
+        .ids;
     let explicit_empty_selection = ids.is_empty();
 
     let allowed = candidates
@@ -430,14 +429,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_reranked_ids_accepts_only_explicit_empty_selections() {
+    fn parse_reranked_ids_accepts_only_explicit_empty_object_selection() {
         let candidates = vec![candidate("mem-a", 10.0)];
 
         assert_eq!(
             parse_reranked_ids("{\"ids\":[]}", &candidates),
             Some(Vec::new())
         );
-        assert_eq!(parse_reranked_ids("[]", &candidates), Some(Vec::new()));
+        assert!(parse_reranked_ids("[]", &candidates).is_none());
+        assert!(parse_reranked_ids("[\"mem-a\"]", &candidates).is_none());
         assert!(parse_reranked_ids("{\"ids\":[\"unknown\",\" \"]}", &candidates).is_none());
         assert!(parse_reranked_ids("[\"unknown\",\"\"]", &candidates).is_none());
     }
@@ -560,6 +560,8 @@ mod tests {
 
         for response in [
             "not valid json",
+            "[]",
+            "[\"mem-a\"]",
             "{}",
             "{\"other\":[]}",
             "{\"ids\":[],\"error\":\"rate limited\"}",
@@ -583,24 +585,22 @@ mod tests {
     #[tokio::test]
     async fn valid_empty_model_selection_surfaces_no_memories() {
         let (_dir, store) = recall_store().await;
-        for response in ["{\"ids\":[]}", "[]"] {
-            let selection = select_relevant_memories(
-                &store,
-                Some("proj-1"),
-                "release freeze for mobile",
-                &MemoryRecallOptions {
-                    shortlist_limit: 2,
-                    include_global_fallback: false,
-                    max_candidates_per_scope: 12,
-                },
-                Some(&rerank_context(response)),
-            )
-            .await
-            .expect("reranked selection");
+        let selection = select_relevant_memories(
+            &store,
+            Some("proj-1"),
+            "release freeze for mobile",
+            &MemoryRecallOptions {
+                shortlist_limit: 2,
+                include_global_fallback: false,
+                max_candidates_per_scope: 12,
+            },
+            Some(&rerank_context("{\"ids\":[]}")),
+        )
+        .await
+        .expect("reranked selection");
 
-            assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
-            assert!(selection.candidates.is_empty());
-        }
+        assert_eq!(selection.strategy, MemoryRecallStrategy::Reranked);
+        assert!(selection.candidates.is_empty());
     }
 
     #[tokio::test]
