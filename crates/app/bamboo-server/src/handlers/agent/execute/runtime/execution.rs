@@ -145,7 +145,10 @@ pub(crate) fn make_disabled_filter_resolver(
     Arc::new(move || {
         let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
         (
-            config_snapshot.disabled_tool_names().into_iter().collect(),
+            config_snapshot
+                .disabled_tool_references()
+                .into_iter()
+                .collect(),
             config_snapshot.disabled_skill_ids().into_iter().collect(),
         )
     })

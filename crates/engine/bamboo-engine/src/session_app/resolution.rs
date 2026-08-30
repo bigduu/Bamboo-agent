@@ -62,7 +62,7 @@ pub fn resolve_resume_config_snapshot(
             .map(|model| model.model_name.clone()),
         summarization_model_ref: areas.summarization_ref.clone(),
         summarization_model_provider: areas.summarization.map(|model| model.provider),
-        disabled_tools: config.disabled_tool_names(),
+        disabled_tools: config.disabled_tool_references(),
         disabled_skill_ids: config.disabled_skill_ids(),
         image_fallback: resolve_image_fallback(config).ok().flatten(),
         gold_config: gold_config_override.or_else(|| {

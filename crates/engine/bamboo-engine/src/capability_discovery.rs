@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bamboo_agent_core::ToolSchema;
 use bamboo_domain::{
-    CapabilityInvocationPolicy, CapabilityInvocationTarget, CapabilityKind, CapabilityMatch,
-    CapabilitySource, CapabilityStatus, DiscoverCapabilitiesRequest, DiscoverCapabilitiesResult,
-    DISCOVER_CAPABILITY_NAME, MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
+    canonical_tool_name as canonical_registry_tool_name, resolve_tool_reference_name,
+    CapabilityInvocationPolicy, CapabilityInvocationTarget, CapabilityKind, CapabilityLoadingClass,
+    CapabilityMatch, CapabilitySource, CapabilityStatus, ClassifiedToolIdentity,
+    ClassifiedToolSchema, DiscoverCapabilitiesRequest, DiscoverCapabilitiesResult,
+    MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
 };
 use bamboo_skills::{
     WorkflowCatalogEntry, WorkflowCatalogSnapshot, WorkflowKind, WorkflowSource, WorkflowStatus,
@@ -20,23 +22,6 @@ use thiserror::Error;
 /// Discovery summaries are bounded independently of the source description so
 /// one verbose registry entry cannot dominate a bounded result.
 pub const MAX_CAPABILITY_SUMMARY_CHARS: usize = 240;
-
-const SERVER_CAPABILITY_NAMES: &[&str] = &[
-    "Project",
-    "ask_agent",
-    "cluster",
-    "compact_context",
-    "deploy_agent",
-    "ledger",
-    "load_skill",
-    "memory",
-    "notify",
-    "read_skill_resource",
-    "scheduler",
-    "session_history",
-    "SubAgent",
-    "workflow_run",
-];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InvocationEligibility {
@@ -66,7 +51,8 @@ impl InvocationEligibility {
 pub struct CapabilityDiscoveryEligibility {
     pub disabled_tool_names: BTreeSet<String>,
     /// `None` means the caller already supplied a surface-scoped registry.
-    /// `Some(empty)` exposes no tools. Names are canonicalized before matching.
+    /// `Some(empty)` exposes no tools. References resolve exact-first against
+    /// the projected catalog, then through legacy/builtin aliases.
     pub allowed_tool_names: Option<BTreeSet<String>>,
     pub disabled_skill_ids: BTreeSet<String>,
     /// `None` means no additional allowlist. `Some(empty)` exposes no Skills.
@@ -108,17 +94,36 @@ pub fn project_tool_capability_metadata(schemas: &[ToolSchema]) -> Vec<ToolCapab
     schemas
         .iter()
         .filter_map(|schema| {
-            let canonical_name = canonical_registry_tool_name(&schema.function.name);
-            if canonical_name.is_empty() {
+            let identity = ClassifiedToolIdentity::from_schema_name(&schema.function.name)?;
+            if identity.loading_class() == CapabilityLoadingClass::HostOnly {
                 return None;
             }
             Some(ToolCapabilityMetadata {
-                source: source_for_tool(&canonical_name),
-                aliases: aliases_for_tool(&canonical_name),
-                canonical_name,
+                source: source_for_tool(identity.execution_name()),
+                aliases: aliases_for_tool(identity.execution_name()),
+                canonical_name: identity.execution_name().to_string(),
                 summary: bounded_summary(&schema.function.description),
                 available: true,
             })
+        })
+        .collect()
+}
+
+/// Project a classified logical catalog into metadata-only discovery entries.
+/// HostOnly schemas never enter the searchable index, while Core and Deferred
+/// share the exact execution identity and policy used by provider projection.
+pub fn project_classified_tool_capability_metadata(
+    catalog: &[ClassifiedToolSchema],
+) -> Vec<ToolCapabilityMetadata> {
+    catalog
+        .iter()
+        .filter(|entry| entry.loading_class() != CapabilityLoadingClass::HostOnly)
+        .map(|entry| ToolCapabilityMetadata {
+            source: source_for_tool(entry.execution_name()),
+            aliases: aliases_for_tool(entry.execution_name()),
+            canonical_name: entry.execution_name().to_string(),
+            summary: bounded_summary(&entry.schema().function.description),
+            available: true,
         })
         .collect()
 }
@@ -138,10 +143,31 @@ pub struct CapabilityDiscoveryIndex {
 }
 
 impl CapabilityDiscoveryIndex {
-    /// Capture both command catalogs under the store's publication read lock and
-    /// build one immutable index. `command_catalog_snapshots` is the atomic
-    /// counterpart of `skill_catalog_snapshot` + `workflow_catalog_snapshot`;
-    /// it returns the same metadata-only entries without opening bundle files.
+    /// Build discovery from the exact classified catalog already resolved for
+    /// the current session/round, while capturing both command catalogs under
+    /// the store's publication read lock. Tool allow/disable references are not
+    /// applied twice; Skill/Workflow eligibility is still resolved here.
+    pub async fn from_resolved_classified_store(
+        tool_catalog: &[ClassifiedToolSchema],
+        store: &bamboo_skills::SkillStore,
+        eligibility: &CapabilityDiscoveryEligibility,
+    ) -> Self {
+        let (skill_catalog, workflow_catalog) = store.command_catalog_snapshots().await;
+        let mut non_tool_eligibility = eligibility.clone();
+        non_tool_eligibility.disabled_tool_names.clear();
+        non_tool_eligibility.allowed_tool_names = None;
+        Self::from_snapshots(
+            project_classified_tool_capability_metadata(tool_catalog),
+            &skill_catalog,
+            &workflow_catalog,
+            &non_tool_eligibility,
+        )
+    }
+
+    /// Legacy compatibility facade for callers that do not yet have a
+    /// session-resolved classified catalog. New agent-loop code must use
+    /// [`Self::from_resolved_classified_store`] so goal/Skill/disabled eligibility
+    /// and provider projection cannot drift from discovery.
     pub async fn from_store(
         tool_schemas: &[ToolSchema],
         store: &bamboo_skills::SkillStore,
@@ -162,37 +188,18 @@ impl CapabilityDiscoveryIndex {
         workflow_catalog: &WorkflowCatalogSnapshot,
         eligibility: &CapabilityDiscoveryEligibility,
     ) -> Self {
-        let disabled_tools = eligibility
-            .disabled_tool_names
-            .iter()
-            .map(|name| canonical_registry_tool_name(name).to_lowercase())
-            .collect::<BTreeSet<_>>();
-        let allowed_tools = eligibility.allowed_tool_names.as_ref().map(|names| {
-            names
-                .iter()
-                .map(|name| canonical_registry_tool_name(name).to_lowercase())
-                .collect::<BTreeSet<_>>()
-        });
         let mut projected_tools = BTreeMap::<String, ToolCapabilityMetadata>::new();
 
         for mut tool in tools {
-            tool.canonical_name = canonical_registry_tool_name(&tool.canonical_name);
-            if tool.canonical_name.is_empty()
-                || tool
-                    .canonical_name
-                    .eq_ignore_ascii_case(DISCOVER_CAPABILITY_NAME)
-                || !tool.available
-            {
+            let Some(identity) = ClassifiedToolIdentity::from_schema_name(&tool.canonical_name)
+            else {
+                continue;
+            };
+            tool.canonical_name = identity.execution_name().to_string();
+            if identity.loading_class() == CapabilityLoadingClass::HostOnly || !tool.available {
                 continue;
             }
-            let key = tool.canonical_name.to_lowercase();
-            if disabled_tools.contains(&key)
-                || allowed_tools
-                    .as_ref()
-                    .is_some_and(|allowed| !allowed.contains(&key))
-            {
-                continue;
-            }
+            let key = tool.canonical_name.clone();
             tool.summary = bounded_summary(&tool.summary);
             tool.aliases.sort();
             tool.aliases.dedup();
@@ -203,6 +210,30 @@ impl CapabilityDiscoveryIndex {
                 }
             }
         }
+
+        let disabled_execution_names = eligibility
+            .disabled_tool_names
+            .iter()
+            .filter_map(|reference| {
+                resolve_tool_reference_name(reference, |name| projected_tools.contains_key(name))
+            })
+            .collect::<BTreeSet<_>>();
+        let allowed_execution_names = eligibility.allowed_tool_names.as_ref().map(|references| {
+            references
+                .iter()
+                .filter_map(|reference| {
+                    resolve_tool_reference_name(reference, |name| {
+                        projected_tools.contains_key(name)
+                    })
+                })
+                .collect::<BTreeSet<_>>()
+        });
+        projected_tools.retain(|name, _| {
+            !disabled_execution_names.contains(name)
+                && allowed_execution_names
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(name))
+        });
 
         let mut candidates = projected_tools
             .into_values()
@@ -288,6 +319,18 @@ impl CapabilityDiscoveryIndex {
         if normalized_query.is_empty() || query_tokens.is_empty() {
             return Ok(empty());
         }
+        let tool_query = query
+            .strip_prefix("tool:")
+            .or_else(|| query.strip_prefix("tool/"))
+            .unwrap_or(&query);
+        let resolved_tool_query = resolve_tool_reference_name(tool_query, |name| {
+            self.candidates.iter().any(|candidate| {
+                matches!(
+                    &candidate.value.invocation_target,
+                    CapabilityInvocationTarget::Tool { name: registered } if registered == name
+                )
+            })
+        });
 
         let mut ranked = self
             .candidates
@@ -298,8 +341,14 @@ impl CapabilityDiscoveryIndex {
                     .is_none_or(|kinds| kinds.contains(&candidate.value.kind))
             })
             .filter_map(|candidate| {
-                rank_candidate(candidate, &query, &normalized_query, &query_tokens)
-                    .map(|rank| (rank, candidate))
+                rank_candidate(
+                    candidate,
+                    &query,
+                    &normalized_query,
+                    &query_tokens,
+                    resolved_tool_query.as_deref(),
+                )
+                .map(|rank| (rank, candidate))
             })
             .collect::<Vec<_>>();
 
@@ -333,6 +382,7 @@ pub enum CapabilityDiscoveryError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SearchRank {
+    exact_registered_identity: bool,
     exact_identity: bool,
     name_phrase: bool,
     name_token_hits: usize,
@@ -346,7 +396,12 @@ fn rank_candidate(
     raw_query: &str,
     normalized_query: &str,
     query_tokens: &BTreeSet<String>,
+    resolved_tool_query: Option<&str>,
 ) -> Option<SearchRank> {
+    let exact_registered_identity = matches!(
+        (&candidate.value.invocation_target, resolved_tool_query),
+        (CapabilityInvocationTarget::Tool { name }, Some(resolved)) if name == resolved
+    );
     let exact_identity = candidate
         .normalized_names
         .iter()
@@ -369,7 +424,8 @@ fn rank_candidate(
     let summary_phrase = candidate.normalized_summary.contains(normalized_query);
     let summary_token_hits = token_hits(&candidate.normalized_summary, query_tokens);
 
-    if !exact_identity
+    if !exact_registered_identity
+        && !exact_identity
         && !name_phrase
         && name_token_hits == 0
         && !summary_phrase
@@ -379,6 +435,7 @@ fn rank_candidate(
     }
 
     Some(SearchRank {
+        exact_registered_identity,
         exact_identity,
         name_phrase,
         name_token_hits,
@@ -399,7 +456,7 @@ fn tool_alias_exact_match(candidate: &IndexedCapability, raw_query: &str) -> boo
     let canonical = canonical_registry_tool_name(query);
     matches!(
         &candidate.value.invocation_target,
-        CapabilityInvocationTarget::Tool { name } if name.eq_ignore_ascii_case(&canonical)
+        CapabilityInvocationTarget::Tool { name } if name == &canonical
     )
 }
 
@@ -577,44 +634,21 @@ fn prefer_tool_projection(
 }
 
 fn source_for_tool(name: &str) -> CapabilitySource {
-    if bamboo_domain::BUILTIN_TOOL_NAMES
-        .iter()
-        .any(|builtin| builtin.eq_ignore_ascii_case(name))
-    {
+    if bamboo_domain::BUILTIN_TOOL_NAMES.contains(&name) {
         CapabilitySource::Builtin
-    } else if SERVER_CAPABILITY_NAMES
-        .iter()
-        .any(|server| server.eq_ignore_ascii_case(name))
-    {
+    } else if bamboo_domain::SERVER_CAPABILITY_NAMES.contains(&name) {
         CapabilitySource::Server
-    } else if name.to_ascii_lowercase().starts_with("mcp__") {
+    } else if name.starts_with("mcp__") {
         CapabilitySource::Mcp
     } else {
         CapabilitySource::Custom
     }
 }
 
-fn canonical_registry_tool_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let unqualified = trimmed.split("::").last().unwrap_or(trimmed);
-    let normalized = bamboo_domain::normalize_builtin_alias(unqualified);
-    let canonical = bamboo_domain::resolve_alias(normalized).unwrap_or(normalized);
-    bamboo_domain::BUILTIN_TOOL_NAMES
-        .iter()
-        .chain(bamboo_domain::SERVER_TOOL_NAMES.iter())
-        .chain(SERVER_CAPABILITY_NAMES.iter())
-        .find(|known| known.eq_ignore_ascii_case(canonical))
-        .map(|known| (*known).to_string())
-        .unwrap_or_else(|| trimmed.to_string())
-}
-
 fn aliases_for_tool(canonical_name: &str) -> Vec<String> {
     bamboo_domain::BUILTIN_TOOL_ALIASES
         .iter()
-        .filter(|(_, canonical)| canonical.eq_ignore_ascii_case(canonical_name))
+        .filter(|(_, canonical)| *canonical == canonical_name)
         .map(|(alias, _)| (*alias).to_string())
         .collect()
 }
@@ -933,6 +967,35 @@ mod tests {
             serde_json::to_string(&first).expect("serialize"),
             serde_json::to_string(&second).expect("serialize")
         );
+    }
+
+    #[test]
+    fn exact_registered_identity_ranks_ahead_of_alias_and_case_fallbacks() {
+        let index = index(
+            &[
+                schema("Edit", "builtin edit", json!({})),
+                schema("apply_patch", "custom exact patch", json!({})),
+                schema("Foo", "upper custom", json!({})),
+                schema("foo", "lower custom", json!({})),
+            ],
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility::default(),
+        );
+
+        let patch = index
+            .discover(&request("apply_patch"))
+            .expect("exact custom alias query");
+        assert_eq!(patch.matches[0].capability_ref, "tool:apply_patch");
+        let legacy_patch = index
+            .discover(&request("applyPatch"))
+            .expect("legacy spelling resolves through exact custom alias");
+        assert_eq!(legacy_patch.matches[0].capability_ref, "tool:apply_patch");
+
+        let lower = index.discover(&request("foo")).expect("exact case query");
+        assert_eq!(lower.matches[0].capability_ref, "tool:foo");
+        let upper = index.discover(&request("Foo")).expect("exact case query");
+        assert_eq!(upper.matches[0].capability_ref, "tool:Foo");
     }
 
     #[test]
@@ -1364,12 +1427,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_projection_deduplicates_canonical_aliases_and_bounds_summaries() {
+    fn tool_projection_keeps_exact_alias_shadow_separate_and_bounds_summaries() {
         let long = "x".repeat(MAX_CAPABILITY_SUMMARY_CHARS + 40);
         let metadata = project_tool_capability_metadata(&[
             schema("Edit", &long, json!({})),
             schema("apply_patch", "short alias", json!({})),
         ]);
+        assert_eq!(metadata.len(), 2);
+        let edit = metadata
+            .iter()
+            .find(|entry| entry.canonical_name == "Edit")
+            .expect("builtin Edit projection");
+        assert_eq!(edit.source, CapabilitySource::Builtin);
+        assert_eq!(edit.aliases, vec!["apply_patch"]);
+        let custom_alias = metadata
+            .iter()
+            .find(|entry| entry.canonical_name == "apply_patch")
+            .expect("exact custom alias projection");
+        assert_eq!(custom_alias.source, CapabilitySource::Custom);
+        assert!(custom_alias.aliases.is_empty());
         let result = CapabilityDiscoveryIndex::from_snapshots(
             metadata,
             &WorkflowCatalogSnapshot::default(),
@@ -1384,15 +1460,313 @@ mod tests {
         assert!(result.matches[0].summary.chars().count() <= MAX_CAPABILITY_SUMMARY_CHARS);
     }
 
+    #[test]
+    fn framework_source_and_alias_metadata_require_exact_registered_identity() {
+        let metadata = project_tool_capability_metadata(&[
+            schema("Bash", "canonical builtin", json!({})),
+            schema("bash", "custom lowercase", json!({})),
+            schema("Project", "canonical server", json!({})),
+            schema("project", "custom lowercase", json!({})),
+            schema("Edit", "canonical edit", json!({})),
+            schema("edit", "custom lowercase", json!({})),
+            schema("mcp__alpha__inspect", "canonical mcp alias", json!({})),
+            schema("MCP__alpha__inspect", "custom uppercase prefix", json!({})),
+        ]);
+        let entry = |name: &str| {
+            metadata
+                .iter()
+                .find(|entry| entry.canonical_name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+
+        assert_eq!(entry("Bash").source, CapabilitySource::Builtin);
+        assert_eq!(entry("bash").source, CapabilitySource::Custom);
+        assert_eq!(entry("Project").source, CapabilitySource::Server);
+        assert_eq!(entry("project").source, CapabilitySource::Custom);
+        assert_eq!(entry("Edit").aliases, vec!["apply_patch"]);
+        assert!(entry("edit").aliases.is_empty());
+        assert_eq!(entry("mcp__alpha__inspect").source, CapabilitySource::Mcp);
+        assert_eq!(
+            entry("MCP__alpha__inspect").source,
+            CapabilitySource::Custom
+        );
+    }
+
+    #[test]
+    fn raw_and_classified_projections_exclude_host_only_and_keep_deferred_tools() {
+        let schemas = [
+            schema("Bash", "inspect core", json!({})),
+            schema("Glob", "inspect deferred", json!({})),
+            schema("custom_tool", "inspect custom", json!({})),
+            schema("mcp__alpha__inspect", "inspect mcp", json!({})),
+            schema("Workspace", "inspect host", json!({})),
+            schema("conclusion_with_options", "inspect host", json!({})),
+            schema("request_permissions", "inspect host", json!({})),
+        ];
+        let raw = project_tool_capability_metadata(&schemas);
+        let classified = schemas
+            .iter()
+            .cloned()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let typed = project_classified_tool_capability_metadata(&classified);
+        let names = |items: &[ToolCapabilityMetadata]| {
+            items
+                .iter()
+                .map(|item| item.canonical_name.clone())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(names(&raw), names(&typed));
+        assert_eq!(
+            names(&raw),
+            BTreeSet::from([
+                "Bash".to_string(),
+                "Glob".to_string(),
+                "custom_tool".to_string(),
+                "mcp__alpha__inspect".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn snapshot_boundary_rejects_forged_host_only_metadata() {
+        let mut metadata = [
+            "Workspace",
+            "conclusion_with_options",
+            "request_permissions",
+            "GetCurrentDir",
+            "SetWorkspace",
+        ]
+        .into_iter()
+        .map(|name| ToolCapabilityMetadata {
+            canonical_name: name.to_string(),
+            summary: "inspect host".to_string(),
+            source: CapabilitySource::Custom,
+            aliases: Vec::new(),
+            available: true,
+        })
+        .collect::<Vec<_>>();
+        metadata.push(ToolCapabilityMetadata {
+            canonical_name: "VisibleTool".to_string(),
+            summary: "inspect visible".to_string(),
+            source: CapabilitySource::Custom,
+            aliases: Vec::new(),
+            available: true,
+        });
+        let result = CapabilityDiscoveryIndex::from_snapshots(
+            metadata,
+            &WorkflowCatalogSnapshot::default(),
+            &WorkflowCatalogSnapshot::default(),
+            &CapabilityDiscoveryEligibility::default(),
+        )
+        .discover(&request("inspect"))
+        .expect("host-only boundary");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].capability_ref, "tool:VisibleTool");
+    }
+
+    #[test]
+    fn disabled_aliases_use_the_same_canonical_identity_as_discovery() {
+        let eligibility = CapabilityDiscoveryEligibility {
+            disabled_tool_names: BTreeSet::from([
+                "apply_patch".to_string(),
+                "FileExists".to_string(),
+                "sub_session_manager".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let result = index(
+            &[
+                schema("Edit", "inspect edit", json!({})),
+                schema("GetFileInfo", "inspect file", json!({})),
+                schema("SubAgent", "inspect agent", json!({})),
+                schema("VisibleTool", "inspect visible", json!({})),
+            ],
+            Vec::new(),
+            Vec::new(),
+            eligibility,
+        )
+        .discover(&request("inspect"))
+        .expect("canonical disabled filter");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].capability_ref, "tool:VisibleTool");
+    }
+
+    #[test]
+    fn eligibility_resolves_exact_shadow_before_alias_fallback() {
+        let schemas = [
+            schema("Edit", "builtin edit", json!({})),
+            schema("apply_patch", "custom exact patch", json!({})),
+        ];
+        let allowed_builtin = index(
+            &schemas,
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility {
+                allowed_tool_names: Some(BTreeSet::from(["Edit".to_string()])),
+                ..Default::default()
+            },
+        )
+        .discover(&request("patch"))
+        .expect("exact allowed builtin");
+        assert_eq!(allowed_builtin.matches.len(), 1);
+        assert_eq!(allowed_builtin.matches[0].capability_ref, "tool:Edit");
+
+        let allowed_shadow = index(
+            &schemas,
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility {
+                allowed_tool_names: Some(BTreeSet::from(["apply_patch".to_string()])),
+                ..Default::default()
+            },
+        )
+        .discover(&request("patch"))
+        .expect("exact allowed custom shadow");
+        assert_eq!(allowed_shadow.matches.len(), 1);
+        assert_eq!(allowed_shadow.matches[0].capability_ref, "tool:apply_patch");
+
+        let alias_fallback = index(
+            &[schema("Edit", "builtin edit", json!({}))],
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility {
+                allowed_tool_names: Some(BTreeSet::from(["apply_patch".to_string()])),
+                ..Default::default()
+            },
+        )
+        .discover(&request("patch"))
+        .expect("unshadowed alias fallback");
+        assert_eq!(alias_fallback.matches.len(), 1);
+        assert_eq!(alias_fallback.matches[0].capability_ref, "tool:Edit");
+
+        let disabled_shadow = index(
+            &schemas,
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility {
+                disabled_tool_names: BTreeSet::from(["apply_patch".to_string()]),
+                ..Default::default()
+            },
+        )
+        .discover(&request("edit"))
+        .expect("exact disabled custom shadow");
+        assert_eq!(disabled_shadow.matches.len(), 1);
+        assert_eq!(disabled_shadow.matches[0].capability_ref, "tool:Edit");
+    }
+
+    #[test]
+    fn case_distinct_dynamic_and_mcp_identities_do_not_collapse() {
+        let metadata = project_tool_capability_metadata(&[
+            schema("Foo", "inspect custom", json!({})),
+            schema("foo", "inspect custom", json!({})),
+            schema("mcp__Alpha__inspect", "inspect mcp", json!({})),
+            schema("mcp__alpha__inspect", "inspect mcp", json!({})),
+        ]);
+        assert_eq!(metadata.len(), 4);
+
+        let eligibility = CapabilityDiscoveryEligibility {
+            disabled_tool_names: BTreeSet::from(["mcp__Alpha__inspect".to_string()]),
+            ..Default::default()
+        };
+        let result = CapabilityDiscoveryIndex::from_snapshots(
+            metadata,
+            &WorkflowCatalogSnapshot::default(),
+            &WorkflowCatalogSnapshot::default(),
+            &eligibility,
+        )
+        .discover(&request("inspect"))
+        .expect("case-preserving discovery");
+        let refs = result
+            .matches
+            .iter()
+            .map(|entry| entry.capability_ref.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(refs.len(), 3);
+        assert!(refs.contains("tool:Foo"));
+        assert!(refs.contains("tool:foo"));
+        assert!(refs.contains("tool:mcp__alpha__inspect"));
+        assert!(!refs.contains("tool:mcp__Alpha__inspect"));
+
+        let allowed = CapabilityDiscoveryIndex::from_snapshots(
+            project_tool_capability_metadata(&[
+                schema("Foo", "inspect custom", json!({})),
+                schema("foo", "inspect custom", json!({})),
+                schema("mcp__Alpha__inspect", "inspect mcp", json!({})),
+                schema("mcp__alpha__inspect", "inspect mcp", json!({})),
+            ]),
+            &WorkflowCatalogSnapshot::default(),
+            &WorkflowCatalogSnapshot::default(),
+            &CapabilityDiscoveryEligibility {
+                allowed_tool_names: Some(BTreeSet::from([
+                    "Foo".to_string(),
+                    "mcp__alpha__inspect".to_string(),
+                ])),
+                ..Default::default()
+            },
+        )
+        .discover(&request("inspect"))
+        .expect("case-preserving allowlist");
+        let allowed_refs = allowed
+            .matches
+            .iter()
+            .map(|entry| entry.capability_ref.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            allowed_refs,
+            BTreeSet::from(["tool:Foo", "tool:mcp__alpha__inspect"])
+        );
+    }
+
+    #[test]
+    fn ordinary_discover_named_function_is_searchable_and_disableable() {
+        let schemas = [schema(
+            "discover",
+            "discover a custom data source",
+            json!({}),
+        )];
+        let visible = index(
+            &schemas,
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility::default(),
+        )
+        .discover(&request("discover custom"))
+        .expect("ordinary discover-named function");
+        assert_eq!(visible.matches.len(), 1);
+        assert_eq!(visible.matches[0].capability_ref, "tool:discover");
+
+        let hidden = index(
+            &schemas,
+            Vec::new(),
+            Vec::new(),
+            CapabilityDiscoveryEligibility {
+                disabled_tool_names: BTreeSet::from(["discover".to_string()]),
+                ..Default::default()
+            },
+        )
+        .discover(&request("discover custom"))
+        .expect("disabled ordinary function");
+        assert!(hidden.matches.is_empty());
+    }
+
     #[tokio::test]
     async fn store_facade_builds_from_atomic_metadata_snapshots() {
         let store = bamboo_skills::SkillStore::default();
-        let index = CapabilityDiscoveryIndex::from_store(
-            &[schema(
-                "SafeTool",
-                "Inspect safely",
-                json!({"private_schema": "must-not-be-read"}),
-            )],
+        let catalog = [schema(
+            "SafeTool",
+            "Inspect safely",
+            json!({"private_schema": "must-not-be-read"}),
+        )]
+        .into_iter()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+        let index = CapabilityDiscoveryIndex::from_resolved_classified_store(
+            &catalog,
             &store,
             &CapabilityDiscoveryEligibility::default(),
         )
@@ -1403,5 +1777,30 @@ mod tests {
             .expect("metadata-only store projection");
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].capability_ref, "tool:SafeTool");
+
+        let edit_schema = schema("Edit", "Edit safely", json!({}));
+        let resolved_catalog = [edit_schema.clone()]
+            .into_iter()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let disabled_alias = CapabilityDiscoveryEligibility {
+            disabled_tool_names: BTreeSet::from(["apply_patch".to_string()]),
+            ..Default::default()
+        };
+        let resolved = CapabilityDiscoveryIndex::from_resolved_classified_store(
+            &resolved_catalog,
+            &store,
+            &disabled_alias,
+        )
+        .await
+        .discover(&request("edit"))
+        .expect("resolved catalogs must not be filtered twice");
+        assert_eq!(resolved.matches[0].capability_ref, "tool:Edit");
+
+        let legacy = CapabilityDiscoveryIndex::from_store(&[edit_schema], &store, &disabled_alias)
+            .await
+            .discover(&request("edit"))
+            .expect("raw schemas still resolve tool eligibility");
+        assert!(legacy.matches.is_empty());
     }
 }

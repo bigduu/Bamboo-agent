@@ -2,13 +2,15 @@ use async_trait::async_trait;
 
 use super::prompt_envelope::StablePromptFrame;
 use super::prompt_setup::build_stable_prompt_frame_with_sections;
-use super::tool_schemas::resolve_available_tool_schemas_for_session;
+use super::tool_schemas::{
+    resolve_available_tool_schemas_for_session, resolve_classified_tool_catalog_for_session,
+};
 use bamboo_agent_core::agent::types::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_agent_core::tools::{
     FunctionSchema, ToolCall, ToolExecutionContext, ToolExecutor, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{Message, Session};
-use bamboo_domain::RuntimeSessionPersistence;
+use bamboo_domain::{CapabilityLoadingClass, RuntimeSessionPersistence};
 use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_ACTIVATION_GENERATION_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
     SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY,
@@ -873,13 +875,22 @@ fn explicit_activation_state_becomes_current_only_after_successful_model_load() 
 #[test]
 fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases() {
     let config = crate::runtime::config::AgentLoopConfig {
-        disabled_tools: ["Bash".to_string(), "Read".to_string()]
-            .into_iter()
-            .collect(),
+        disabled_tools: [
+            "apply_patch".to_string(),
+            "FileExists".to_string(),
+            "sub_session_manager".to_string(),
+        ]
+        .into_iter()
+        .collect(),
         ..Default::default()
     };
     let tools = StaticToolExecutor {
-        schemas: vec![schema("Bash"), schema("Read"), schema("Write")],
+        schemas: vec![
+            schema("Edit"),
+            schema("GetFileInfo"),
+            schema("SubAgent"),
+            schema("Write"),
+        ],
     };
     let session = Session::new("session-1", "model");
 
@@ -893,7 +904,7 @@ fn resolve_available_tool_schemas_excludes_canonicalized_disabled_tool_aliases()
 }
 
 #[test]
-fn resolve_available_tool_schemas_hides_discoverable_tools_by_default() {
+fn legacy_projection_keeps_deferred_tools_with_short_guide_descriptions() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
         schemas: vec![schema("Read"), schema("Sleep"), schema("scheduler")],
@@ -919,6 +930,294 @@ fn resolve_available_tool_schemas_hides_discoverable_tools_by_default() {
         .find(|s| s.function.name == "scheduler")
         .unwrap();
     assert!(scheduler.function.description.contains("Discoverable"));
+}
+
+#[test]
+fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: [
+            "Bash",
+            "Read",
+            "Grep",
+            "Edit",
+            "Write",
+            "Glob",
+            "GetFileInfo",
+            "load_skill",
+            "workflow_run",
+            "custom_tool",
+            "mcp__alpha__inspect",
+            "mcp__beta__inspect",
+            "Workspace",
+            "conclusion_with_options",
+            "request_permissions",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let session = Session::new("classified-catalog", "model");
+
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let classes = catalog
+        .iter()
+        .map(|entry| (entry.execution_name(), entry.loading_class()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    for name in ["Bash", "Read", "Grep", "Edit", "Write"] {
+        assert_eq!(classes[name], CapabilityLoadingClass::Core, "{name}");
+    }
+    for name in [
+        "Glob",
+        "GetFileInfo",
+        "load_skill",
+        "workflow_run",
+        "custom_tool",
+        "mcp__alpha__inspect",
+        "mcp__beta__inspect",
+    ] {
+        assert_eq!(classes[name], CapabilityLoadingClass::Deferred, "{name}");
+    }
+    for name in [
+        "Workspace",
+        "conclusion_with_options",
+        "request_permissions",
+    ] {
+        assert_eq!(classes[name], CapabilityLoadingClass::HostOnly, "{name}");
+    }
+
+    let model_names = resolve_available_tool_schemas_for_session(&config, &tools, &session)
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    for name in [
+        "Glob",
+        "GetFileInfo",
+        "load_skill",
+        "workflow_run",
+        "custom_tool",
+        "mcp__alpha__inspect",
+        "mcp__beta__inspect",
+    ] {
+        assert!(model_names.contains(name), "legacy projection lost {name}");
+    }
+    for name in [
+        "Workspace",
+        "conclusion_with_options",
+        "request_permissions",
+    ] {
+        assert!(!model_names.contains(name), "HostOnly leaked: {name}");
+    }
+
+    let discovery_names =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+            .into_iter()
+            .map(|entry| entry.canonical_name)
+            .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        discovery_names, model_names,
+        "legacy provider projection and discovery must consume one classified catalog"
+    );
+}
+
+#[test]
+fn ordinary_discover_named_function_is_deferred_and_disableable() {
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["discover".to_string()].into_iter().collect(),
+        ..Default::default()
+    };
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("discover")],
+    };
+    let session = Session::new("custom-discover", "model");
+
+    assert!(resolve_classified_tool_catalog_for_session(&config, &tools, &session).is_empty());
+    assert!(resolve_available_tool_schemas_for_session(&config, &tools, &session).is_empty());
+}
+
+#[test]
+fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![
+            schema("Edit"),
+            schema("apply_patch"),
+            schema("read_file"),
+            schema("execute_command"),
+            schema("bash"),
+            schema("a::custom_tool"),
+            schema("custom_tool"),
+        ],
+    };
+    let session = Session::new("reserved-alias-collision", "model");
+
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let entries = catalog
+        .iter()
+        .map(|entry| {
+            (
+                entry.execution_name().to_string(),
+                entry.schema().function.name.clone(),
+                entry.loading_class(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "Edit".to_string(),
+                "Edit".to_string(),
+                CapabilityLoadingClass::Core
+            ),
+            (
+                "a::custom_tool".to_string(),
+                "a::custom_tool".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
+                "apply_patch".to_string(),
+                "apply_patch".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
+                "bash".to_string(),
+                "bash".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
+                "custom_tool".to_string(),
+                "custom_tool".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
+                "execute_command".to_string(),
+                "execute_command".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
+                "read_file".to_string(),
+                "read_file".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+        ]
+    );
+
+    let model_names = resolve_available_tool_schemas_for_session(&config, &tools, &session)
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_names,
+        vec![
+            "Edit",
+            "a::custom_tool",
+            "apply_patch",
+            "bash",
+            "custom_tool",
+            "execute_command",
+            "read_file"
+        ]
+    );
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|entry| entry.execution_name() == "custom_tool")
+            .expect("exact custom execution entry")
+            .schema()
+            .function
+            .description,
+        "custom_tool tool"
+    );
+}
+
+#[test]
+fn session_disabled_filter_resolves_exact_shadow_before_alias_fallback() {
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: std::collections::BTreeSet::from(["default::applyPatch".to_string()]),
+        ..Default::default()
+    };
+    let session = Session::new("disabled-exact-shadow", "model");
+
+    let shadowed = StaticToolExecutor {
+        schemas: vec![schema("Edit"), schema("apply_patch")],
+    };
+    let shadowed_names = resolve_classified_tool_catalog_for_session(&config, &shadowed, &session)
+        .into_iter()
+        .map(|entry| entry.execution_name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(shadowed_names, vec!["Edit"]);
+
+    let unshadowed = StaticToolExecutor {
+        schemas: vec![schema("Edit")],
+    };
+    assert!(
+        resolve_classified_tool_catalog_for_session(&config, &unshadowed, &session).is_empty(),
+        "without an exact custom shadow, applyPatch must fall back to Edit"
+    );
+}
+
+#[test]
+fn session_eligibility_is_shared_by_model_and_discovery_projections() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![
+            schema("update_goal"),
+            schema("load_skill"),
+            schema("default::update_goal"),
+            schema("default::load_skill"),
+            schema("Glob"),
+            schema("Workspace"),
+        ],
+    };
+    let mut session = Session::new("shared-session-eligibility", "model");
+    session.metadata.insert(
+        "skill_runtime_loaded_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selected_skill_ids".to_string(),
+        "[\"review\"]".to_string(),
+    );
+    session.metadata.insert(
+        "skill_runtime_selection_source".to_string(),
+        "explicit".to_string(),
+    );
+
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let catalog_names = catalog
+        .iter()
+        .map(|entry| entry.execution_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        catalog_names,
+        std::collections::BTreeSet::from([
+            "Glob",
+            "Workspace",
+            "default::load_skill",
+            "default::update_goal",
+        ])
+    );
+
+    let model_names = resolve_available_tool_schemas_for_session(&config, &tools, &session)
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    let discovery_names =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+            .into_iter()
+            .map(|entry| entry.canonical_name)
+            .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        model_names,
+        std::collections::BTreeSet::from([
+            "Glob".to_string(),
+            "default::load_skill".to_string(),
+            "default::update_goal".to_string(),
+        ])
+    );
+    assert_eq!(discovery_names, model_names);
 }
 
 #[test]
@@ -983,8 +1282,7 @@ fn resolve_available_tool_schemas_does_not_mutate_session_metadata() {
 }
 
 #[test]
-fn resolve_available_tool_schemas_keeps_conclusion_with_options_description_neutral_when_flag_disabled(
-) {
+fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_disabled() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
         schemas: vec![schema("conclusion_with_options")],
@@ -992,24 +1290,29 @@ fn resolve_available_tool_schemas_keeps_conclusion_with_options_description_neut
     let session = Session::new("session-1", "model");
 
     let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    let conclusion_with_options_schema = resolved
+    assert!(resolved
         .iter()
-        .find(|schema| schema.function.name == "conclusion_with_options")
-        .expect("conclusion_with_options schema should exist");
+        .all(|schema| schema.function.name != "conclusion_with_options"));
 
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let host_entry = catalog
+        .iter()
+        .find(|entry| entry.execution_name() == "conclusion_with_options")
+        .expect("host catalog keeps compatibility entry");
     assert_eq!(
-        conclusion_with_options_schema.function.description,
+        host_entry.schema().function.description,
         "conclusion_with_options tool"
     );
-    assert!(!conclusion_with_options_schema
+    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
+    assert!(!host_entry
+        .schema()
         .function
         .description
         .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
 }
 
 #[test]
-fn resolve_available_tool_schemas_strengthens_conclusion_with_options_description_when_flag_enabled(
-) {
+fn model_catalog_excludes_conclusion_with_options_when_enhancement_flag_is_enabled() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
         schemas: vec![schema("conclusion_with_options")],
@@ -1021,23 +1324,27 @@ fn resolve_available_tool_schemas_strengthens_conclusion_with_options_descriptio
     );
 
     let resolved = resolve_available_tool_schemas_for_session(&config, &tools, &session);
-    let conclusion_with_options_schema = resolved
+    assert!(resolved
         .iter()
-        .find(|schema| schema.function.name == "conclusion_with_options")
-        .expect("conclusion_with_options schema should exist");
+        .all(|schema| schema.function.name != "conclusion_with_options"));
 
-    assert!(conclusion_with_options_schema
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let host_entry = catalog
+        .iter()
+        .find(|entry| entry.execution_name() == "conclusion_with_options")
+        .expect("host catalog keeps compatibility entry");
+    assert_eq!(host_entry.loading_class(), CapabilityLoadingClass::HostOnly);
+    assert!(host_entry
+        .schema()
         .function
         .description
         .contains(ASK_USER_ENHANCED_DESCRIPTION_FRAGMENT));
-    assert!(conclusion_with_options_schema
+    assert!(host_entry
+        .schema()
         .function
         .description
         .contains("conclusion"));
-    assert!(conclusion_with_options_schema
-        .function
-        .description
-        .contains("OK"));
+    assert!(host_entry.schema().function.description.contains("OK"));
 }
 
 #[test]

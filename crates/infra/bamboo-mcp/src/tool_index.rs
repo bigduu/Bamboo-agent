@@ -127,6 +127,7 @@ impl Default for ToolIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bamboo_domain::{canonical_tool_name, CapabilityLoadingClass, ClassifiedToolIdentity};
 
     #[test]
     fn test_generate_alias() {
@@ -140,6 +141,19 @@ mod tests {
         let index = ToolIndex::new();
         let alias = index.generate_alias("my::server", "tool::name");
         assert_eq!(alias, "mcp__my__server__tool__name");
+    }
+
+    #[test]
+    fn generated_alias_is_an_exact_deferred_capability_identity() {
+        let index = ToolIndex::new();
+        let alias = index.generate_alias("filesystem", "read_file");
+        let identity = ClassifiedToolIdentity::from_schema_name(&alias)
+            .expect("generated MCP alias must be a valid registration identity");
+
+        assert_eq!(canonical_tool_name(&alias), alias);
+        assert_eq!(identity.execution_name(), alias);
+        assert_eq!(identity.alias_fallback_name(), alias);
+        assert_eq!(identity.loading_class(), CapabilityLoadingClass::Deferred);
     }
 
     #[test]
