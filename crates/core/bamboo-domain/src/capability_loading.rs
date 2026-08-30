@@ -5,7 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{canonical_tool_name, ToolSchema, DISCOVER_CAPABILITY_NAME};
+use crate::{
+    canonical_tool_name, FunctionSchema, ToolSchema, DISCOVER_CAPABILITY_NAME,
+    MAX_DISCOVERY_QUERY_CHARS, MAX_DISCOVERY_RESULTS,
+};
 
 /// The loading class of a callable function schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,6 +31,11 @@ pub enum CapabilityLoadingMode {
     #[default]
     LegacyFullCatalog,
     Progressive,
+    /// Compatibility path for providers without native deferred-tool search.
+    /// The top-level catalog stays fixed at Core plus Bamboo's synthetic
+    /// discovery function while loaded definitions live in conversation
+    /// history.
+    StickyFallback,
 }
 
 /// The complete and intentionally small always-resident function surface.
@@ -53,6 +61,48 @@ pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 5] = [
 /// fallback adapter. Native provider search items map to the logical gateway
 /// directly and do not use this function identity.
 pub const DISCOVERY_CONTROL_FALLBACK_TOOL_NAME: &str = "discover_capabilities";
+
+/// Complete, bounded function schema used by the compatibility fallback.
+///
+/// This schema is synthesized after ordinary catalog classification because
+/// its reserved name must never be accepted as an executor-backed tool.
+pub fn discovery_control_fallback_schema() -> ToolSchema {
+    ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+            description: "Search Bamboo tools, Skills, and Workflows and load complete callable definitions into conversation history.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Capability name or concise task description.",
+                        "maxLength": MAX_DISCOVERY_QUERY_CHARS
+                    },
+                    "kinds": {
+                        "type": "array",
+                        "description": "Optional capability kinds to search.",
+                        "items": {
+                            "type": "string",
+                            "enum": ["tool", "skill", "workflow"]
+                        },
+                        "maxItems": 3,
+                        "uniqueItems": true
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of relevant matches.",
+                        "minimum": 1,
+                        "maximum": MAX_DISCOVERY_RESULTS
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    }
+}
 
 /// Trusted marker for Bamboo's separate, always-resident discovery gateway.
 ///
@@ -306,12 +356,17 @@ impl EffectiveCallableSet {
             .iter()
             .filter(|entry| match mode {
                 CapabilityLoadingMode::LegacyFullCatalog => entry.is_model_visible(),
-                CapabilityLoadingMode::Progressive => entry.is_initially_visible(),
+                CapabilityLoadingMode::Progressive | CapabilityLoadingMode::StickyFallback => {
+                    entry.is_initially_visible()
+                }
             })
             .map(|entry| entry.execution_name().to_string())
             .collect::<BTreeSet<_>>();
 
-        if mode == CapabilityLoadingMode::Progressive {
+        if matches!(
+            mode,
+            CapabilityLoadingMode::Progressive | CapabilityLoadingMode::StickyFallback
+        ) {
             for loaded_reference in loaded_execution_names {
                 let Some(execution_name) = resolve_tool_reference_name(loaded_reference, |name| {
                     catalog_by_execution_name.contains_key(name)
@@ -413,6 +468,27 @@ mod tests {
         assert!(!ordinary_function.is_initially_visible());
         assert!(ClassifiedToolSchema::new(schema(DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)).is_none());
         assert!(ClassifiedToolSchema::new(schema("default::discover_capabilities")).is_none());
+    }
+
+    #[test]
+    fn fallback_discovery_schema_is_reserved_complete_and_bounded() {
+        let schema = discovery_control_fallback_schema();
+        assert_eq!(schema.schema_type, "function");
+        assert_eq!(schema.function.name, DISCOVERY_CONTROL_FALLBACK_TOOL_NAME);
+        assert_eq!(
+            schema.function.parameters["properties"]["query"]["maxLength"],
+            MAX_DISCOVERY_QUERY_CHARS
+        );
+        assert_eq!(
+            schema.function.parameters["properties"]["limit"]["maximum"],
+            MAX_DISCOVERY_RESULTS
+        );
+        assert_eq!(
+            schema.function.parameters["properties"]["kinds"]["items"]["enum"],
+            serde_json::json!(["tool", "skill", "workflow"])
+        );
+        assert_eq!(schema.function.parameters["additionalProperties"], false);
+        assert!(ClassifiedToolSchema::new(schema).is_none());
     }
 
     #[test]
@@ -690,6 +766,24 @@ mod tests {
         assert!(!effective.contains_execution_name("custom_tool"));
         assert!(!effective.contains_execution_name("Workspace"));
         assert!(!effective.contains_execution_name("unknown_tool"));
+    }
+
+    #[test]
+    fn sticky_fallback_effective_set_matches_progressive_core_plus_loaded_semantics() {
+        let catalog = classified_catalog(&["Read", "Glob", "custom_tool", "Workspace"]);
+        let sticky = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::StickyFallback,
+            ["Glob", "Workspace", "unknown_tool", "Glob"],
+        );
+
+        assert_eq!(
+            sticky.execution_names().collect::<Vec<_>>(),
+            vec!["Glob", "Read"]
+        );
+        assert!(!sticky.contains_execution_name("custom_tool"));
+        assert!(!sticky.contains_execution_name("Workspace"));
+        assert!(!sticky.contains_execution_name("unknown_tool"));
     }
 
     #[test]

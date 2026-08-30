@@ -27,7 +27,7 @@ use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_
 use crate::runtime::stream::handler::StreamHandlingOutput;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::session::runtime_state::{
     AgentRuntimeState, AgentStatusState, ChildWaitPolicy, SuspensionState, WaitingForBashState,
     WaitingForChildrenState,
@@ -54,6 +54,10 @@ use crate::runtime::runner::state_bridge;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
+const STICKY_DISCOVERY_RUNTIME_KIND: &str = "sticky_capability_discovery";
+const STICKY_DISCOVERY_RUNTIME_VERSION: u64 = 1;
+const STICKY_DISCOVERY_RESULT_START: &str = "<loaded_tools>";
+const STICKY_DISCOVERY_RESULT_END: &str = "</loaded_tools>";
 
 #[cfg(test)]
 const TEST_POST_LLM_RETRY_FAILURES_KEY: &str = "test.pipeline.post_llm_retry_failures";
@@ -90,30 +94,35 @@ fn effective_callable_set_for_round(
         return crate::runtime::runner::tool_execution::legacy_effective_callable_set(tool_schemas);
     }
 
-    let transcript = &session.provider_transcript;
-    let family = transcript.active_family();
-    let protocol = transcript.active_protocol();
-    let groups = match (
-        family,
-        protocol,
-        transcript.active_provider_boundary_sha256(),
-    ) {
-        (Some(family), Some(protocol), Some(boundary)) => {
-            transcript.replayable_groups(family, protocol, boundary)
-        }
-        _ => Vec::new(),
-    };
-    let loaded_names = match (family, protocol) {
-        (Some(ProviderFamily::Anthropic), Some(ProviderProtocol::AnthropicMessages2023_06_01)) => {
-            bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
+    let loaded_names = if capability_loading_mode == CapabilityLoadingMode::StickyFallback {
+        validated_sticky_fallback_loaded_tool_names(session)
+    } else {
+        let transcript = &session.provider_transcript;
+        let family = transcript.active_family();
+        let protocol = transcript.active_protocol();
+        let groups = match (
+            family,
+            protocol,
+            transcript.active_provider_boundary_sha256(),
+        ) {
+            (Some(family), Some(protocol), Some(boundary)) => {
+                transcript.replayable_groups(family, protocol, boundary)
+            }
+            _ => Vec::new(),
+        };
+        match (family, protocol) {
+            (
+                Some(ProviderFamily::Anthropic),
+                Some(ProviderProtocol::AnthropicMessages2023_06_01),
+            ) => bamboo_llm::providers::anthropic::validated_anthropic_loaded_tool_names(
                 groups.iter().copied(),
                 tool_schemas,
-            )
+            ),
+            (Some(family @ ProviderFamily::OpenAi), Some(ProviderProtocol::OpenAiResponsesV1)) => {
+                bamboo_domain::validated_openai_loaded_tool_names(groups.iter().copied(), family)
+            }
+            _ => Vec::new(),
         }
-        (Some(family @ ProviderFamily::OpenAi), Some(ProviderProtocol::OpenAiResponsesV1)) => {
-            bamboo_domain::validated_openai_loaded_tool_names(groups.iter().copied(), family)
-        }
-        _ => Vec::new(),
     };
     let catalog = tool_schemas
         .iter()
@@ -122,7 +131,7 @@ fn effective_callable_set_for_round(
         .collect::<Vec<_>>();
     EffectiveCallableSet::from_catalog(
         &catalog,
-        CapabilityLoadingMode::Progressive,
+        capability_loading_mode,
         loaded_names.iter().map(String::as_str),
     )
 }
@@ -173,18 +182,15 @@ fn capability_source_name(source: CapabilitySource) -> &'static str {
 /// argument to this bounded discovery result. Revision/source stay descriptive
 /// metadata because `load_skill` has no revision argument and multiple workflow
 /// IDs can legitimately carry different revisions.
-fn scope_discovered_gateway_definition(
+fn scope_discovered_gateway_schema(
     entry: &ClassifiedToolSchema,
     matches: &[&CapabilityMatch],
-) -> serde_json::Value {
-    let mut definition =
-        bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
-            entry.schema(),
-        );
+) -> bamboo_agent_core::tools::ToolSchema {
+    let mut schema = entry.schema().clone();
     let (catalog_kind, id_property) = match entry.execution_name() {
         "load_skill" => ("skill", "skill_id"),
         "workflow_run" => ("workflow", "workflow_id"),
-        _ => return definition,
+        _ => return schema,
     };
     let mut ids = Vec::new();
     let mut workflow_revisions = Vec::new();
@@ -227,13 +233,17 @@ fn scope_discovered_gateway_definition(
         }
     }
     if ids.is_empty() {
-        return definition;
+        return schema;
     }
 
-    let parameters = definition
-        .get_mut("parameters")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("loaded function definitions always have object parameters");
+    if !schema.function.parameters.is_object() {
+        schema.function.parameters = serde_json::json!({"type": "object"});
+    }
+    let parameters = schema
+        .function
+        .parameters
+        .as_object_mut()
+        .expect("gateway parameters were normalized to an object");
     let properties = parameters
         .entry("properties")
         .or_insert_with(|| serde_json::json!({}));
@@ -264,78 +274,87 @@ fn scope_discovered_gateway_definition(
         revision_schema["enum"] = serde_json::json!(workflow_revisions);
     }
 
-    definition["description"] = serde_json::json!(format!(
+    schema.function.description = format!(
         "{}. Scoped {catalog_kind} matches in discovery relevance order: {}.",
         entry.schema().function.description.trim_end_matches('.'),
         metadata.join("; ")
-    ));
-    definition
+    );
+    schema
 }
 
-async fn build_openai_client_tool_search_outputs(
-    session: &Session,
-    config: &AgentLoopConfig,
-    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-    provider_items: &[ProviderTranscriptItem],
-) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
-    let requests = openai_client_tool_search_requests(provider_items)?;
-    let catalog = tool_schemas
-        .iter()
-        .cloned()
-        .filter_map(ClassifiedToolSchema::new)
-        .collect::<Vec<_>>();
-    let searchable_tool_catalog = catalog
-        .iter()
-        .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred)
-        .cloned()
-        .collect::<Vec<_>>();
-    let (_, disabled_skill_ids) = config.resolve_disabled_filters();
-    let catalog_names = catalog
-        .iter()
-        .map(|entry| entry.execution_name())
-        .collect::<BTreeSet<_>>();
-    let eligibility = crate::capability_discovery::CapabilityDiscoveryEligibility {
-        disabled_skill_ids: disabled_skill_ids.into_owned(),
-        allowed_skill_ids: config
-            .selected_skill_ids
-            .as_ref()
-            .map(|ids| ids.iter().cloned().collect()),
-        skill_gateway_available: catalog_names.contains("load_skill"),
-        workflow_gateway_available: catalog_names.contains("workflow_run"),
-        ..Default::default()
-    };
-    let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
-        config, session,
-    )
-    .await
-    .map_err(AgentError::Tool)?
-    {
-        Some(store) => {
-            crate::capability_discovery::CapabilityDiscoveryIndex::from_resolved_classified_store(
-                &searchable_tool_catalog,
-                store.as_ref(),
-                &eligibility,
-            )
-            .await
-        }
-        None => {
-            let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
-            let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
-            crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
-                crate::capability_discovery::project_classified_tool_capability_metadata(
-                    &searchable_tool_catalog,
-                ),
-                &empty_skills,
-                &empty_workflows,
-                &eligibility,
-            )
-        }
-    };
+struct CompleteCapabilityDiscovery {
+    catalog: Vec<ClassifiedToolSchema>,
+    index: crate::capability_discovery::CapabilityDiscoveryIndex,
+}
 
-    let mut outputs = Vec::with_capacity(requests.len());
-    for (call_id, request) in requests {
-        let result = index
-            .discover(&request)
+impl CompleteCapabilityDiscovery {
+    async fn new(
+        session: &Session,
+        config: &AgentLoopConfig,
+        tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    ) -> Result<Self, AgentError> {
+        let catalog = tool_schemas
+            .iter()
+            .cloned()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let searchable_tool_catalog = catalog
+            .iter()
+            .filter(|entry| entry.loading_class() == CapabilityLoadingClass::Deferred)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (_, disabled_skill_ids) = config.resolve_disabled_filters();
+        let catalog_names = catalog
+            .iter()
+            .map(|entry| entry.execution_name())
+            .collect::<BTreeSet<_>>();
+        let eligibility = crate::capability_discovery::CapabilityDiscoveryEligibility {
+            disabled_skill_ids: disabled_skill_ids.into_owned(),
+            allowed_skill_ids: config
+                .selected_skill_ids
+                .as_ref()
+                .map(|ids| ids.iter().cloned().collect()),
+            skill_gateway_available: catalog_names.contains("load_skill"),
+            workflow_gateway_available: catalog_names.contains("workflow_run"),
+            ..Default::default()
+        };
+        let index = match crate::runtime::runner::session_setup::skill_context::resolve_skill_store_for_session(
+            config, session,
+        )
+        .await
+        .map_err(AgentError::Tool)?
+        {
+            Some(store) => {
+                crate::capability_discovery::CapabilityDiscoveryIndex::from_resolved_classified_store(
+                    &searchable_tool_catalog,
+                    store.as_ref(),
+                    &eligibility,
+                )
+                .await
+            }
+            None => {
+                let empty_skills = bamboo_skills::WorkflowCatalogSnapshot::default();
+                let empty_workflows = bamboo_skills::WorkflowCatalogSnapshot::default();
+                crate::capability_discovery::CapabilityDiscoveryIndex::from_snapshots(
+                    crate::capability_discovery::project_classified_tool_capability_metadata(
+                        &searchable_tool_catalog,
+                    ),
+                    &empty_skills,
+                    &empty_workflows,
+                    &eligibility,
+                )
+            }
+        };
+        Ok(Self { catalog, index })
+    }
+
+    fn discover_complete_schemas(
+        &self,
+        request: &DiscoverCapabilitiesRequest,
+    ) -> Result<Vec<bamboo_agent_core::tools::ToolSchema>, AgentError> {
+        let result = self
+            .index
+            .discover(request)
             .map_err(|error| AgentError::LLM(format!("capability discovery failed: {error}")))?;
         let mut matches_by_function = Vec::<(String, Vec<_>)>::new();
         for matched in &result.matches {
@@ -356,14 +375,266 @@ async fn build_openai_client_tool_search_outputs(
         let tools = matches_by_function
             .into_iter()
             .filter_map(|(name, matches)| {
-                let entry = catalog
+                let entry = self
+                    .catalog
                     .iter()
                     .find(|entry| entry.execution_name() == name)?;
                 if entry.loading_class() != CapabilityLoadingClass::Deferred {
                     return None;
                 }
-                Some(scope_discovered_gateway_definition(entry, &matches))
+                Some(scope_discovered_gateway_schema(entry, &matches))
             })
+            .collect::<Vec<_>>();
+        Ok(tools)
+    }
+}
+
+fn sticky_discovery_call_ids(session: &Session) -> BTreeSet<&str> {
+    session
+        .messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::Assistant))
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME)
+        .map(|call| call.id.as_str())
+        .collect()
+}
+
+fn sticky_result_definition_values(message: &Message) -> Option<Vec<serde_json::Value>> {
+    let body = message
+        .content
+        .strip_prefix(STICKY_DISCOVERY_RESULT_START)?
+        .strip_suffix(STICKY_DISCOVERY_RESULT_END)?;
+    let payload = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    payload["tools"].as_array().cloned()
+}
+
+fn sticky_definition_name(definition: &serde_json::Value) -> Option<&str> {
+    (definition["type"].as_str() == Some("function"))
+        .then(|| definition["function"]["name"].as_str())
+        .flatten()
+}
+
+fn validated_sticky_fallback_results(session: &Session) -> Vec<&Message> {
+    let call_ids = sticky_discovery_call_ids(session);
+    session
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message.role, Role::Tool)
+                && message.tool_success == Some(true)
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|call_id| call_ids.contains(call_id))
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"].as_str() == Some(STICKY_DISCOVERY_RUNTIME_KIND)
+                        && metadata["version"].as_u64() == Some(STICKY_DISCOVERY_RUNTIME_VERSION)
+                        && metadata["canonical_new_names"].is_array()
+                })
+                && sticky_result_definition_values(message).is_some()
+        })
+        .collect()
+}
+
+fn validated_sticky_fallback_loaded_tool_names(session: &Session) -> Vec<String> {
+    let mut loaded = Vec::new();
+    for message in validated_sticky_fallback_results(session) {
+        let definition_names = sticky_result_definition_values(message)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|definition| sticky_definition_name(&definition).map(str::to_string))
+            .collect::<BTreeSet<_>>();
+        let Some(names) = message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata["canonical_new_names"].as_array())
+        else {
+            continue;
+        };
+        for name in names.iter().filter_map(serde_json::Value::as_str) {
+            if definition_names.contains(name) && !loaded.iter().any(|seen| seen == name) {
+                loaded.push(name.to_string());
+            }
+        }
+    }
+    loaded
+}
+
+fn prior_sticky_fallback_definitions(session: &Session) -> Vec<serde_json::Value> {
+    validated_sticky_fallback_results(session)
+        .into_iter()
+        .filter_map(sticky_result_definition_values)
+        .flatten()
+        .collect()
+}
+
+fn sticky_fallback_definition_delta(
+    session: &Session,
+    schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+    let previous = prior_sticky_fallback_definitions(session);
+    let mut definitions = schemas
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    definitions.retain(|definition| !previous.contains(definition));
+    Ok(definitions)
+}
+
+fn sticky_fallback_tool_result(
+    tool_call_id: &str,
+    content: String,
+    success: bool,
+    canonical_new_names: &[String],
+) -> Message {
+    let mut message = Message::tool_result_with_status(tool_call_id, content, success);
+    message.never_compress = true;
+    message.metadata = Some(serde_json::json!({
+        "runtime_kind": STICKY_DISCOVERY_RUNTIME_KIND,
+        "version": STICKY_DISCOVERY_RUNTIME_VERSION,
+        "canonical_new_names": canonical_new_names,
+    }));
+    message
+}
+
+async fn commit_sticky_fallback_discovery_round(
+    stream_output: StreamHandlingOutput,
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+) -> Result<(), AgentError> {
+    let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+        .then_some(stream_output.reasoning_content);
+    let reasoning_signature = reasoning
+        .as_ref()
+        .and_then(|_| stream_output.reasoning_signature.clone());
+    let tool_calls = stream_output.tool_calls;
+    let mut assistant = Message::assistant_with_reasoning(
+        stream_output.content,
+        Some(tool_calls.clone()),
+        reasoning,
+    )
+    .with_reasoning_signature(reasoning_signature);
+    assistant.never_compress = true;
+    assistant.metadata = Some(serde_json::json!({
+        "runtime_kind": STICKY_DISCOVERY_RUNTIME_KIND,
+        "version": STICKY_DISCOVERY_RUNTIME_VERSION,
+    }));
+    let mut native_items = Some(stream_output.provider_transcript_items);
+    commit_assistant_message(session, assistant, &mut native_items)?;
+
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "sticky discovery assistant checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+
+    let discovery_is_alone = tool_calls.len() == 1
+        && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+    if !discovery_is_alone {
+        const ERROR: &str = "discovery must be called alone";
+        for call in &tool_calls {
+            session.add_message(sticky_fallback_tool_result(
+                &call.id,
+                ERROR.to_string(),
+                false,
+                &[],
+            ));
+        }
+    } else {
+        let call = &tool_calls[0];
+        let discovery_result =
+            serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
+                .map_err(|error| format!("invalid discovery arguments: {error}"));
+        let definitions = match discovery_result {
+            Ok(request) => match CompleteCapabilityDiscovery::new(session, config, tool_schemas)
+                .await
+                .and_then(|discovery| discovery.discover_complete_schemas(&request))
+            {
+                Ok(schemas) => {
+                    sticky_fallback_definition_delta(session, &schemas).map_err(|error| {
+                        format!("discovered tool definitions could not be serialized: {error}")
+                    })
+                }
+                Err(error) => Err(error.to_string()),
+            },
+            Err(error) => Err(error),
+        };
+        match definitions {
+            Ok(definitions) => {
+                let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let mut canonical_new_names = Vec::new();
+                for name in definitions.iter().filter_map(sticky_definition_name) {
+                    if !already_loaded.contains(name)
+                        && !canonical_new_names.iter().any(|seen| seen == name)
+                    {
+                        canonical_new_names.push(name.to_string());
+                    }
+                }
+                let payload = serde_json::to_string(&serde_json::json!({
+                    "tools": definitions
+                }))
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "sticky discovery result could not be serialized: {error}"
+                    ))
+                })?;
+                session.add_message(sticky_fallback_tool_result(
+                    &call.id,
+                    format!(
+                        "{STICKY_DISCOVERY_RESULT_START}{payload}{STICKY_DISCOVERY_RESULT_END}"
+                    ),
+                    true,
+                    &canonical_new_names,
+                ));
+            }
+            Err(error) => {
+                session.add_message(sticky_fallback_tool_result(
+                    &call.id,
+                    format!("capability discovery failed: {error}"),
+                    false,
+                    &[],
+                ));
+            }
+        }
+    }
+
+    if let Some(persistence) = config.persistence.as_ref() {
+        persistence
+            .save_runtime_session(session)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "sticky discovery result checkpoint could not be persisted: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+async fn build_openai_client_tool_search_outputs(
+    session: &Session,
+    config: &AgentLoopConfig,
+    tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
+    provider_items: &[ProviderTranscriptItem],
+) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+    let requests = openai_client_tool_search_requests(provider_items)?;
+    let discovery = CompleteCapabilityDiscovery::new(session, config, tool_schemas).await?;
+    let mut outputs = Vec::with_capacity(requests.len());
+    for (call_id, request) in requests {
+        let tools = discovery
+            .discover_complete_schemas(&request)?
+            .iter()
+            .map(bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json)
             .collect::<Vec<_>>();
         let item = ProviderTranscriptItem::try_from_payload(
             ProviderFamily::OpenAi,
@@ -2733,6 +3004,42 @@ async fn run_pipeline_inner(
                 break;
             }
 
+            let required_tool =
+                crate::runtime::runner::round_lifecycle::required_tool_for_session(session);
+            let capability_loading_mode = llm
+                .capability_loading_mode(&state.model_name, required_tool)
+                .await;
+            if capability_loading_mode == CapabilityLoadingMode::StickyFallback
+                && stream_output.tool_calls.iter().any(|call| {
+                    call.function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME
+                })
+            {
+                match commit_sticky_fallback_discovery_round(
+                    stream_output,
+                    session,
+                    config,
+                    &tool_schemas,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        record_no_tool_calls_round_completed(
+                            state.metrics_collector.as_ref(),
+                            &round_id,
+                            &state.session_id,
+                            session,
+                            round_activity.token_usage(),
+                        );
+                        turn_outcome = Some(TurnOutcome {
+                            should_break: false,
+                            sent_complete: false,
+                        });
+                    }
+                    Err(error) => terminal_error = Some(error),
+                }
+                break;
+            }
+
             let frame = crate::runtime::runner::round_frame::RoundFrame {
                 session_id: &state.session_id,
                 round_id: &round_id,
@@ -3308,11 +3615,13 @@ mod tests {
         apply_successful_explicit_activation, build_guardian_review_prompt,
         build_openai_client_tool_search_outputs, check_run_budget_exceeded,
         commit_assistant_message, commit_openai_client_tool_search_round,
-        effective_callable_set_for_round, is_overflow_recoverable, is_subagent_create_call,
-        is_terminal_child_status, map_turn_error_status, maybe_spawn_guardian_review,
-        maybe_suspend_for_orphaned_children, maybe_suspend_for_outstanding_bash,
-        scope_discovered_gateway_definition, should_retry_turn_error, suspend_to_wait_for_bash,
-        validate_explicit_activation_first_step,
+        commit_sticky_fallback_discovery_round, effective_callable_set_for_round,
+        is_overflow_recoverable, is_subagent_create_call, is_terminal_child_status,
+        map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
+        maybe_suspend_for_outstanding_bash, scope_discovered_gateway_schema,
+        should_retry_turn_error, sticky_fallback_definition_delta, sticky_fallback_tool_result,
+        sticky_result_definition_values, suspend_to_wait_for_bash,
+        validate_explicit_activation_first_step, validated_sticky_fallback_loaded_tool_names,
     };
     use crate::project_context::{
         ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
@@ -3470,9 +3779,10 @@ mod tests {
                 revision: 3,
             },
         };
-        let skill = scope_discovered_gateway_definition(
-            &skill_gateway,
-            &[&skill_match, &second_skill_match],
+        let skill_schema =
+            scope_discovered_gateway_schema(&skill_gateway, &[&skill_match, &second_skill_match]);
+        let skill = bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+            &skill_schema,
         );
         assert_eq!(
             skill["parameters"]["properties"]["skill_id"]["enum"],
@@ -3559,10 +3869,14 @@ mod tests {
                 revision: 4,
             },
         };
-        let workflow = scope_discovered_gateway_definition(
+        let workflow_schema = scope_discovered_gateway_schema(
             &workflow_gateway,
             &[&workflow_match, &second_workflow_match],
         );
+        let workflow =
+            bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
+                &workflow_schema,
+            );
         assert_eq!(
             workflow["parameters"]["properties"]["workflow_id"]["enum"],
             serde_json::json!(["review-pipeline", "lint-pipeline"])
@@ -3604,6 +3918,131 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sticky_skill_a_then_b_keeps_each_complete_definition_and_repeats_b_as_empty() {
+        fn scoped_skill(
+            skill_id: &str,
+            display_name: &str,
+            summary: &str,
+            revision: u64,
+            source: bamboo_domain::CapabilitySource,
+        ) -> bamboo_agent_core::tools::ToolSchema {
+            let gateway =
+                bamboo_domain::ClassifiedToolSchema::new(bamboo_agent_core::tools::ToolSchema {
+                    schema_type: "function".to_string(),
+                    function: bamboo_agent_core::tools::FunctionSchema {
+                        name: "load_skill".to_string(),
+                        description: "Load one instruction Skill".to_string(),
+                        parameters: serde_json::json!({
+                            "type":"object",
+                            "properties":{
+                                "skill_id":{"type":"string"},
+                                "detail":{"type":"string"}
+                            },
+                            "required":["skill_id"],
+                            "additionalProperties":false
+                        }),
+                    },
+                })
+                .unwrap();
+            let matched = bamboo_domain::CapabilityMatch {
+                capability_ref: format!("skill:{skill_id}"),
+                kind: bamboo_domain::CapabilityKind::Skill,
+                display_name: display_name.to_string(),
+                summary: summary.to_string(),
+                source,
+                revision: Some(revision),
+                status: bamboo_domain::CapabilityStatus::Valid,
+                invocation_policy: None,
+                invocation_target: bamboo_domain::CapabilityInvocationTarget::Skill {
+                    name: "load_skill".to_string(),
+                    skill_id: skill_id.to_string(),
+                    source,
+                    revision,
+                },
+            };
+            scope_discovered_gateway_schema(&gateway, &[&matched])
+        }
+
+        fn append_sticky_definition(
+            session: &mut Session,
+            call_id: &str,
+            schema: &bamboo_agent_core::tools::ToolSchema,
+            canonical_new_names: &[String],
+        ) {
+            let mut assistant = Message::assistant(
+                "",
+                Some(vec![activation_call(
+                    call_id,
+                    bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                    r#"{"query":"skill"}"#,
+                )]),
+            );
+            assistant.never_compress = true;
+            session.add_message(assistant);
+            let payload = serde_json::to_string(&serde_json::json!({
+                "tools":[serde_json::to_value(schema).unwrap()]
+            }))
+            .unwrap();
+            session.add_message(sticky_fallback_tool_result(
+                call_id,
+                format!("<loaded_tools>{payload}</loaded_tools>"),
+                true,
+                canonical_new_names,
+            ));
+        }
+
+        let skill_a = scoped_skill(
+            "skill-a",
+            "Skill A",
+            "Review alpha changes",
+            3,
+            bamboo_domain::CapabilitySource::Project,
+        );
+        let skill_b = scoped_skill(
+            "skill-b",
+            "Skill B",
+            "Review beta changes",
+            5,
+            bamboo_domain::CapabilitySource::User,
+        );
+        let mut session = Session::new("sticky-skill-delta", "chat-model");
+        append_sticky_definition(
+            &mut session,
+            "skill-search-a",
+            &skill_a,
+            &["load_skill".to_string()],
+        );
+
+        let delta_b =
+            sticky_fallback_definition_delta(&session, std::slice::from_ref(&skill_b)).unwrap();
+        assert_eq!(delta_b, vec![serde_json::to_value(&skill_b).unwrap()]);
+        assert_eq!(
+            delta_b[0]["function"]["parameters"]["properties"]["skill_id"]["enum"],
+            serde_json::json!(["skill-b"])
+        );
+        assert!(delta_b[0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("skill-b — Skill B — Review beta changes [revision=5, source=user]"));
+
+        append_sticky_definition(&mut session, "skill-search-b", &skill_b, &[]);
+        assert!(
+            sticky_fallback_definition_delta(&session, std::slice::from_ref(&skill_b))
+                .unwrap()
+                .is_empty(),
+            "repeating the same scoped Skill B definition emits an empty delta"
+        );
+        assert_eq!(
+            super::prior_sticky_fallback_definitions(&session),
+            vec![
+                serde_json::to_value(&skill_a).unwrap(),
+                serde_json::to_value(&skill_b).unwrap()
+            ],
+            "different scoped definitions sharing load_skill remain independently visible"
+        );
+    }
+
     #[tokio::test]
     async fn client_search_filters_core_before_applying_the_result_limit() {
         let tools = vec![
@@ -3635,6 +4074,133 @@ mod tests {
                 "defer_loading":true
             }]),
             "the initially visible Core candidate must not consume limit=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_discovery_persists_canonical_delta_and_resumes_callable_membership() {
+        let mut deferred =
+            loading_test_schema_with_description("ReadArchive", "Read archived repository files");
+        deferred.function.parameters = serde_json::json!({
+            "type":"object",
+            "properties":{"path":{"type":"string"}},
+            "required":["path"],
+            "additionalProperties":false
+        });
+        let tools = vec![
+            loading_test_schema_with_description("Read", "Read repository files"),
+            deferred,
+            loading_test_schema_with_description("Glob", "Match repository paths"),
+        ];
+        let config = AgentLoopConfig::default();
+        let mut session = Session::new("sticky-discovery", "chat-model");
+        let discovery_arguments = r#"{"query":"read","kinds":["tool"],"limit":1}"#;
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "sticky-search-1",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                discovery_arguments,
+            )),
+            &mut session,
+            &config,
+            &tools,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.messages.len(), 2);
+        let assistant = &session.messages[0];
+        let result = &session.messages[1];
+        assert!(matches!(assistant.role, bamboo_agent_core::Role::Assistant));
+        assert!(matches!(result.role, bamboo_agent_core::Role::Tool));
+        assert_eq!(result.tool_call_id.as_deref(), Some("sticky-search-1"));
+        assert_eq!(result.tool_success, Some(true));
+        assert!(assistant.never_compress && result.never_compress);
+
+        let definitions = sticky_result_definition_values(result).unwrap();
+        assert_eq!(definitions.len(), 1);
+        let definition = &definitions[0];
+        assert_eq!(definition["type"], "function");
+        assert_eq!(definition["function"]["name"], "ReadArchive");
+        assert_eq!(
+            definition["function"]["parameters"],
+            tools[1].function.parameters
+        );
+        assert!(
+            definition.get("defer_loading").is_none(),
+            "fallback history uses the provider-neutral ToolSchema/Chat shape"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["canonical_new_names"],
+            serde_json::json!(["ReadArchive"])
+        );
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&session),
+            vec!["ReadArchive"]
+        );
+
+        let mut resumed: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert!(resumed.messages[0].never_compress && resumed.messages[1].never_compress);
+        let resumed_effective = effective_callable_set_for_round(
+            &resumed,
+            &tools,
+            bamboo_domain::CapabilityLoadingMode::StickyFallback,
+        );
+        assert_eq!(
+            resumed_effective.resolve_callable_reference("ReadArchive"),
+            Some("ReadArchive".to_string())
+        );
+        assert_eq!(resumed_effective.resolve_callable_reference("Glob"), None);
+        assert_eq!(
+            resumed_effective.resolve_callable_reference("invented_tool"),
+            None
+        );
+
+        let forged_definition = serde_json::to_value(&tools[2]).unwrap();
+        resumed.add_message(Message::assistant(
+            "",
+            Some(vec![activation_call("ordinary-glob", "Glob", "{}")]),
+        ));
+        resumed.add_message(Message::tool_result_with_status(
+            "ordinary-glob",
+            format!(
+                "<loaded_tools>{}</loaded_tools>",
+                serde_json::json!({"tools":[forged_definition]})
+            ),
+            true,
+        ));
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&resumed),
+            vec!["ReadArchive"],
+            "an ordinary function call/result cannot manufacture loaded state"
+        );
+
+        commit_sticky_fallback_discovery_round(
+            stream_output_with_tool_call(activation_call(
+                "sticky-search-2",
+                bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                discovery_arguments,
+            )),
+            &mut resumed,
+            &config,
+            &tools,
+        )
+        .await
+        .unwrap();
+        let repeated = resumed.messages.last().unwrap();
+        assert_eq!(repeated.tool_call_id.as_deref(), Some("sticky-search-2"));
+        assert_eq!(repeated.tool_success, Some(true));
+        assert_eq!(
+            sticky_result_definition_values(repeated).unwrap(),
+            Vec::<serde_json::Value>::new(),
+            "repeated discovery closes the call with an empty definition delta"
+        );
+        assert!(resumed.messages[4].never_compress && repeated.never_compress);
+        assert_eq!(
+            validated_sticky_fallback_loaded_tool_names(&resumed),
+            vec!["ReadArchive"]
         );
     }
 
