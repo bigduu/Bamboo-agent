@@ -3,6 +3,8 @@
 //! Provider adapters lower these logical classes to their own wire protocols.
 //! The schema itself deliberately stays free of Anthropic/OpenAI fields.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::{canonical_tool_name, ToolSchema, DISCOVER_CAPABILITY_NAME};
 
 /// The loading class of a callable function schema.
@@ -14,6 +16,18 @@ pub enum CapabilityLoadingClass {
     Deferred,
     /// Retained for host compatibility but never advertised to a model.
     HostOnly,
+}
+
+/// How the current provider surface interprets eligible function schemas.
+///
+/// The default deliberately preserves Bamboo's existing full-catalog behavior.
+/// Provider adapters opt into `Progressive` explicitly; an empty loaded-name
+/// set cannot distinguish a progressive first round from a legacy request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapabilityLoadingMode {
+    #[default]
+    LegacyFullCatalog,
+    Progressive,
 }
 
 /// The complete and intentionally small always-resident function surface.
@@ -249,6 +263,100 @@ impl ClassifiedToolSchema {
 
     pub fn is_initially_visible(&self) -> bool {
         self.loading_class() == CapabilityLoadingClass::Core
+    }
+}
+
+/// Provider-neutral callable membership at one conversation position.
+///
+/// Function identities use exact registered execution names. The complete
+/// catalog name set is retained separately from the callable subset so an
+/// unloaded exact registration still shadows legacy alias fallback. Bamboo's
+/// trusted discovery gateway is intentionally exposed through its typed marker
+/// rather than inserted as a string: an ordinary custom function named
+/// `discover` remains Deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveCallableSet {
+    catalog_execution_names: BTreeSet<String>,
+    callable_execution_names: BTreeSet<String>,
+}
+
+impl EffectiveCallableSet {
+    /// Resolve callable membership from an already eligible classified catalog.
+    ///
+    /// `loaded_execution_names` is the provider-adapter boundary: adapters
+    /// extract names from their validated native/fallback history and this pure
+    /// resolver canonicalizes them against the exact catalog, deduplicates them,
+    /// and ignores unknown or HostOnly references. It neither parses provider
+    /// payloads nor persists a second loaded-state representation.
+    pub fn from_catalog<'a>(
+        catalog: &[ClassifiedToolSchema],
+        mode: CapabilityLoadingMode,
+        loaded_execution_names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let catalog_by_execution_name = catalog
+            .iter()
+            .map(|entry| (entry.execution_name(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let catalog_execution_names = catalog_by_execution_name
+            .keys()
+            .map(|name| (*name).to_string())
+            .collect::<BTreeSet<_>>();
+
+        let mut callable_execution_names = catalog
+            .iter()
+            .filter(|entry| match mode {
+                CapabilityLoadingMode::LegacyFullCatalog => entry.is_model_visible(),
+                CapabilityLoadingMode::Progressive => entry.is_initially_visible(),
+            })
+            .map(|entry| entry.execution_name().to_string())
+            .collect::<BTreeSet<_>>();
+
+        if mode == CapabilityLoadingMode::Progressive {
+            for loaded_reference in loaded_execution_names {
+                let Some(execution_name) = resolve_tool_reference_name(loaded_reference, |name| {
+                    catalog_by_execution_name.contains_key(name)
+                }) else {
+                    continue;
+                };
+                let Some(entry) = catalog_by_execution_name.get(execution_name.as_str()) else {
+                    continue;
+                };
+                if entry.loading_class() == CapabilityLoadingClass::Deferred {
+                    callable_execution_names.insert(execution_name);
+                }
+            }
+        }
+
+        Self {
+            catalog_execution_names,
+            callable_execution_names,
+        }
+    }
+
+    /// Exact execution-name membership for provider projection and admission.
+    pub fn contains_execution_name(&self, execution_name: &str) -> bool {
+        self.callable_execution_names.contains(execution_name)
+    }
+
+    /// Resolve a model reference exact-first against the complete catalog, then
+    /// admit it only when that exact identity belongs to the callable subset.
+    pub fn resolve_callable_reference(&self, reference: &str) -> Option<String> {
+        let execution_name = resolve_tool_reference_name(reference, |name| {
+            self.catalog_execution_names.contains(name)
+        })?;
+        self.callable_execution_names
+            .contains(&execution_name)
+            .then_some(execution_name)
+    }
+
+    /// Callable function execution names in deterministic order.
+    pub fn execution_names(&self) -> impl Iterator<Item = &str> {
+        self.callable_execution_names.iter().map(String::as_str)
+    }
+
+    /// Bamboo's separate trusted discovery control surface.
+    pub const fn discovery_gateway(&self) -> DiscoveryControlGateway {
+        DISCOVERY_CONTROL_GATEWAY
     }
 }
 
@@ -539,5 +647,93 @@ mod tests {
         assert!(!debug.contains(SECRET));
         assert!(debug.contains("custom_tool"));
         assert!(debug.contains("Deferred"));
+    }
+
+    fn classified_catalog(names: &[&str]) -> Vec<ClassifiedToolSchema> {
+        names
+            .iter()
+            .map(|name| schema(name))
+            .filter_map(ClassifiedToolSchema::new)
+            .collect()
+    }
+
+    #[test]
+    fn legacy_effective_set_keeps_core_and_deferred_but_excludes_host_only() {
+        let catalog = classified_catalog(&["Read", "Glob", "custom_tool", "Workspace"]);
+        let effective = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            std::iter::empty::<&str>(),
+        );
+
+        assert_eq!(
+            effective.execution_names().collect::<Vec<_>>(),
+            vec!["Glob", "Read", "custom_tool"]
+        );
+        assert_eq!(effective.discovery_gateway(), DISCOVERY_CONTROL_GATEWAY);
+        assert!(effective.discovery_gateway().is_initially_visible());
+    }
+
+    #[test]
+    fn progressive_effective_set_adds_only_loaded_eligible_deferred() {
+        let catalog = classified_catalog(&["Read", "Glob", "custom_tool", "Workspace"]);
+        let effective = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            ["Glob", "Workspace", "unknown_tool", "Glob"],
+        );
+
+        assert_eq!(
+            effective.execution_names().collect::<Vec<_>>(),
+            vec!["Glob", "Read"]
+        );
+        assert!(!effective.contains_execution_name("custom_tool"));
+        assert!(!effective.contains_execution_name("Workspace"));
+        assert!(!effective.contains_execution_name("unknown_tool"));
+    }
+
+    #[test]
+    fn callable_reference_resolution_preserves_exact_shadow_before_alias_fallback() {
+        let catalog = classified_catalog(&["Edit", "apply_patch"]);
+        let core_only = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            std::iter::empty::<&str>(),
+        );
+
+        assert_eq!(
+            core_only.resolve_callable_reference("Edit"),
+            Some("Edit".to_string())
+        );
+        assert_eq!(core_only.resolve_callable_reference("apply_patch"), None);
+        assert_eq!(core_only.resolve_callable_reference("applyPatch"), None);
+
+        let with_custom = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            ["apply_patch"],
+        );
+        assert_eq!(
+            with_custom.resolve_callable_reference("apply_patch"),
+            Some("apply_patch".to_string())
+        );
+        assert_eq!(
+            with_custom.resolve_callable_reference("applyPatch"),
+            Some("apply_patch".to_string())
+        );
+    }
+
+    #[test]
+    fn trusted_discovery_gateway_is_separate_from_deferred_discover_function() {
+        let catalog = classified_catalog(&["discover"]);
+        let effective = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            std::iter::empty::<&str>(),
+        );
+
+        assert_eq!(effective.resolve_callable_reference("discover"), None);
+        assert_eq!(effective.discovery_gateway().logical_name(), "discover");
+        assert!(effective.discovery_gateway().is_initially_visible());
     }
 }

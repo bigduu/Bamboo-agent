@@ -2,8 +2,8 @@ use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
-    resolve_tool_reference_name, CapabilityLoadingClass, ClassifiedToolIdentity,
-    ClassifiedToolSchema,
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet,
 };
 use bamboo_skills::runtime_metadata::{
     LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
@@ -42,9 +42,15 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     tools: &dyn ToolExecutor,
     session: &Session,
 ) -> Vec<ToolSchema> {
-    resolve_classified_tool_catalog_for_session(config, tools, session)
+    let catalog = resolve_classified_tool_catalog_for_session(config, tools, session);
+    let effective = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        std::iter::empty::<&str>(),
+    );
+    catalog
         .into_iter()
-        .filter(ClassifiedToolSchema::is_model_visible)
+        .filter(|entry| effective.contains_execution_name(entry.execution_name()))
         .map(ClassifiedToolSchema::into_schema)
         .collect()
 }
