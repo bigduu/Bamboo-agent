@@ -44,6 +44,7 @@ pub(crate) async fn refresh_round_prompt_context(
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+    app_data_dir: Option<&std::path::Path>,
 ) -> Result<(), AgentError> {
     refresh_project_context(session, project_context_resolver).await?;
     refresh_external_memory_context(
@@ -51,6 +52,7 @@ pub(crate) async fn refresh_round_prompt_context(
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
+        app_data_dir,
     )
     .await;
     // Task list, goal, plan-mode, and plan-runtime context are NOT injected into
@@ -144,6 +146,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         config.prompt_memory_flags,
         runtime_context,
         config.project_context_resolver.as_deref(),
+        config.app_data_dir.as_deref(),
     )
     .await?;
 
@@ -409,6 +412,7 @@ mod project_prompt_tests {
     use async_trait::async_trait;
     use bamboo_agent_core::{Message, Session};
     use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
+    use bamboo_memory::memory_store::MemoryStore;
 
     use crate::project_context::{
         ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
@@ -492,6 +496,11 @@ mod project_prompt_tests {
         session.add_message(Message::system("Base"));
         let system_id = session.messages[0].id.clone();
 
+        MemoryStore::new(directory.path())
+            .write_session_topic("session-1", "default", "memory refresh marker")
+            .await
+            .expect("write session memory note");
+
         super::refresh_project_context(&mut session, Some(&resolver))
             .await
             .expect("first Project refresh");
@@ -506,14 +515,26 @@ mod project_prompt_tests {
         assert!(!project_context.contains(directory.path().to_string_lossy().as_ref()));
 
         session.set_workspace_path_meta(second.to_string_lossy().to_string());
-        super::refresh_project_context(&mut session, Some(&resolver))
-            .await
-            .expect("second Project refresh");
+        super::refresh_round_prompt_context(
+            &mut session,
+            crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            None,
+            Some(&resolver),
+            Some(directory.path()),
+        )
+        .await
+        .expect("second full prompt refresh");
         let second_workspace = bamboo_config::paths::path_to_display_string(
             &second.canonicalize().expect("canonical second workspace"),
         );
         assert_eq!(session.messages[0].id, system_id);
-        assert_eq!(session.messages[0].content, "Base");
+        assert_eq!(session.messages[0].content.as_bytes(), b"Base");
         assert_eq!(
             session
                 .metadata
@@ -529,6 +550,23 @@ mod project_prompt_tests {
             .as_ref()
             .and_then(|snapshot| snapshot.workspace_context.as_deref())
             .is_some_and(|context| context.contains(&second_workspace)));
+        let snapshot = session
+            .prompt_snapshot
+            .as_ref()
+            .expect("full prompt snapshot after round refresh");
+        assert_eq!(
+            snapshot.project_context.as_deref(),
+            Some(project_context.as_str())
+        );
+        assert!(snapshot
+            .session_memory_note
+            .as_deref()
+            .is_some_and(|note| note.contains("memory refresh marker")));
+        assert!(snapshot
+            .external_memory
+            .as_deref()
+            .is_some_and(|memory| memory.contains("memory refresh marker")));
+        assert_eq!(snapshot.effective_system_prompt.as_bytes(), b"Base");
         assert!(session.messages.iter().all(|message| {
             !message
                 .content
@@ -537,6 +575,8 @@ mod project_prompt_tests {
                     .content
                     .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER)
                 && !message.content.contains(&second_workspace)
+                && !message.content.contains("memory refresh marker")
+                && !message.content.contains("External memory")
         }));
         assert_eq!(
             session

@@ -178,8 +178,11 @@ pub(super) async fn refresh_external_memory_context(
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
+    app_data_dir: Option<&std::path::Path>,
 ) {
-    let memory = MemoryStore::with_defaults();
+    let memory = app_data_dir
+        .map(MemoryStore::new)
+        .unwrap_or_else(MemoryStore::with_defaults);
     refresh_external_memory_context_with_store_and_resolver(
         session,
         &memory,

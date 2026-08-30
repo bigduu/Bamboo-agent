@@ -17,6 +17,7 @@ impl MemoryManager for DefaultMemoryManager {
             config.prompt_memory_flags,
             None,
             config.project_context_resolver.as_deref(),
+            config.app_data_dir.as_deref(),
         )
         .await;
         session.messages.len() > msg_count_before

@@ -33,24 +33,6 @@ impl Default for MemoryRecallOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryRecallStrategy {
-    Lexical,
-}
-
-impl MemoryRecallStrategy {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        "lexical"
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemoryRecallSelection {
-    pub candidates: Vec<MemoryRecallCandidate>,
-    pub strategy: MemoryRecallStrategy,
-}
-
 pub async fn shortlist_relevant_memories(
     store: &MemoryStore,
     project_key: Option<&str>,
@@ -62,18 +44,6 @@ pub async fn shortlist_relevant_memories(
         lexical_shortlist_relevant_memories(store, project_key, query, options).await?;
     candidates.truncate(limit);
     Ok(candidates)
-}
-
-pub async fn select_relevant_memories(
-    store: &MemoryStore,
-    project_key: Option<&str>,
-    query: &str,
-    options: &MemoryRecallOptions,
-) -> io::Result<MemoryRecallSelection> {
-    Ok(MemoryRecallSelection {
-        candidates: shortlist_relevant_memories(store, project_key, query, options).await?,
-        strategy: MemoryRecallStrategy::Lexical,
-    })
 }
 
 async fn lexical_shortlist_relevant_memories(

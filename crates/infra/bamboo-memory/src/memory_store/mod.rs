@@ -22,10 +22,7 @@ pub use paths::{
     LegacyProjectMemoryReadRoot, MemoryPathResolver, ProjectMemoryPathResolver, SESSIONS_DIR,
     TOPICS_DIR,
 };
-pub use recall::{
-    select_relevant_memories, shortlist_relevant_memories, MemoryRecallCandidate,
-    MemoryRecallOptions, MemoryRecallSelection, MemoryRecallStrategy,
-};
+pub use recall::{shortlist_relevant_memories, MemoryRecallCandidate, MemoryRecallOptions};
 pub use store::MemoryStore;
 pub use types::{
     BlobScanItem, BlobScanReport, CreatedBy, DuplicateCluster, DuplicateClusterMember,

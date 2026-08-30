@@ -2012,8 +2012,7 @@ async fn run_pipeline_inner(
         // --- Turn-boundary refresh, cancellation, and prompt context ---
         // Admit durable input before deriving this round's memory query. The
         // shared prelude also checks cancellation before Project/external-memory
-        // work; this pipeline keeps its additional in-flight evaluation cleanup
-        // when that check fires.
+        // work and again before provider dispatch.
         let runtime_context = PromptMemoryRuntimeContext {
             llm: state
                 .auxiliary_models
@@ -2022,22 +2021,15 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let prompt_context_result =
-            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
-                session,
-                &mut state.runtime_state,
-                config,
-                cancel_token,
-                state.metrics_collector.as_ref(),
-                Some(&runtime_context),
-            )
-            .await;
-        if matches!(&prompt_context_result, Err(AgentError::Cancelled)) {
-            // This early exit skips the post-loop drain, so explicitly abort
-            // auxiliary evaluations before returning (issue #347).
-            abort_in_flight_evaluations(state, event_tx, "run_cancelled").await;
-        }
-        prompt_context_result?;
+        crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+            session,
+            &mut state.runtime_state,
+            config,
+            cancel_token,
+            state.metrics_collector.as_ref(),
+            Some(&runtime_context),
+        )
+        .await?;
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -2923,6 +2915,10 @@ mod tests {
         maybe_suspend_for_outstanding_bash, should_retry_turn_error, suspend_to_wait_for_bash,
         validate_explicit_activation_first_step,
     };
+    use crate::project_context::{
+        ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
+        ProjectMemoryReadRoots,
+    };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
         ensure_goal_state, read_goal_state, write_goal_state, GoalDeclaredStatus, GoalRuntimeStatus,
@@ -2936,7 +2932,11 @@ mod tests {
     use bamboo_agent_core::{
         AgentError, AgentEvent, AgentHook, Message, Session, StreamTimeoutError, StreamTimeoutPhase,
     };
-    use bamboo_domain::{AgentHookPoint, AgentRuntimeState, HookPayload, HookResult};
+    use bamboo_domain::{
+        AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, ProjectId,
+        ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort,
+        SessionMessageEnvelope,
+    };
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
         RoundStatus as MetricsRoundStatus, SessionStatus as MetricsSessionStatus,
@@ -2945,6 +2945,7 @@ mod tests {
     use chrono::Utc;
     use futures::stream;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -3352,7 +3353,10 @@ mod tests {
         }
     }
 
-    struct ContextProbeProvider;
+    #[derive(Default)]
+    struct ContextProbeProvider {
+        calls: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl LLMProvider for ContextProbeProvider {
@@ -3363,10 +3367,31 @@ mod tests {
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::pin(stream::iter(vec![
                 Ok(LLMChunk::Token("done".to_string())),
                 Ok(LLMChunk::Done),
             ])))
+        }
+    }
+
+    struct CancelOnSecondProjectLookup {
+        descriptor: ProjectDescriptor,
+        cancel_token: tokio_util::sync::CancellationToken,
+        lookups: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectContextSource for CancelOnSecondProjectLookup {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<Option<ProjectDescriptor>, ProjectContextError> {
+            assert_eq!(project_id, &self.descriptor.id);
+            if self.lookups.fetch_add(1, Ordering::SeqCst) == 1 {
+                self.cancel_token.cancel();
+            }
+            Ok(Some(self.descriptor.clone()))
         }
     }
 
@@ -5925,30 +5950,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_admits_disk_user_input_before_prompt_memory_refresh() {
-        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
-        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
-            Arc::new(TestPersistence(storage.clone()));
-        let mut persisted = Session::new("pipeline-boundary-before-recall", "model");
-        persisted.add_message(Message::system("base prompt"));
-        persisted.metadata.insert(
-            "pending_injected_messages".to_string(),
-            serde_json::json!([{
-                "content": "use the just-admitted user correction",
-                "created_at": chrono::Utc::now(),
-            }])
-            .to_string(),
+    async fn pipeline_typed_inbox_input_drives_current_round_memory_recall() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
         );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            SessionInboxLimits::default(),
+        ));
+
+        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path());
+        memory
+            .write_memory(
+                bamboo_memory::memory_store::MemoryScope::Global,
+                None,
+                bamboo_memory::memory_store::DurableMemoryType::Reference,
+                "Pipeline cobalt orchid rule",
+                "The cobalt orchid request must use the pipeline memory boundary.",
+                &["cobalt".to_string(), "orchid".to_string()],
+                Some("pipeline-typed-inbox-recall"),
+                "model",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut persisted = Session::new("pipeline-typed-inbox-recall", "model");
+        persisted.add_message(Message::system("base prompt"));
+        persisted.add_message(Message::user("unrelated earlier request"));
         storage.save_session(&persisted).await.unwrap();
 
         let mut running = persisted;
-        running.metadata.remove("pending_injected_messages");
+        let query = "what is the pipeline cobalt orchid rule?";
+        let envelope = SessionMessageEnvelope::user_input(&running.id, query);
+        let receipt = inbox.deliver(&envelope).await.unwrap();
+        inbox
+            .mark_activation_eligible(
+                &running.id,
+                receipt.generation,
+                SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+
         let config = AgentLoopConfig {
             storage: Some(storage),
             persistence: Some(persistence),
+            session_inbox: Some(inbox),
+            app_data_dir: Some(directory.path().to_path_buf()),
             prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
-                relevant_recall: false,
+                relevant_recall: true,
                 relevant_recall_rerank: false,
                 project_first_dream: false,
                 ledger_agenda: false,
@@ -5964,7 +6023,7 @@ mod tests {
         super::run_pipeline(
             &mut running,
             &event_tx,
-            Arc::new(ContextProbeProvider),
+            Arc::new(ContextProbeProvider::default()),
             Arc::new(AlwaysOkExecutor),
             &cancel,
             &config,
@@ -5974,17 +6033,102 @@ mod tests {
         .expect("the pipeline should complete after refreshing the boundary");
 
         assert!(running.messages.iter().any(|message| {
-            message.role == bamboo_domain::Role::User
-                && message.content == "use the just-admitted user correction"
+            message.id == envelope.id.as_str()
+                && message.role == bamboo_domain::Role::User
+                && message.content == query
         }));
-        let observability: serde_json::Value = serde_json::from_str(
+        let rendered =
+            crate::runtime::runner::prompt_context::render_external_memory_section(&running)
+                .expect("current-round recall should render external memory");
+        assert!(rendered.contains("Pipeline cobalt orchid rule"));
+        assert!(
+            rendered.contains("The cobalt orchid request must use the pipeline memory boundary.")
+        );
+
+        let observability: bamboo_agent_core::PromptMemoryObservability = serde_json::from_str(
             running
                 .metadata
                 .get(crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY)
                 .expect("prompt memory refresh should persist observability"),
         )
         .unwrap();
-        assert_eq!(observability["latest_user_query_present"], true);
+        assert!(observability.latest_user_query_present);
+        assert_eq!(observability.relevant_memory_status, "lexical");
+        assert_eq!(observability.relevant_memory_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_cancelled_during_context_refresh_skips_primary_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let project_id = ProjectId::parse("pipeline-context-cancel-project").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let source = Arc::new(CancelOnSecondProjectLookup {
+            descriptor: ProjectDescriptor {
+                id: project_id.clone(),
+                name: "Pipeline cancellation fixture".to_string(),
+                project_path: Some(workspace),
+                home: directory
+                    .path()
+                    .join("projects/pipeline-context-cancel-project"),
+                workspace_bindings: Vec::new(),
+                resources: ProjectResourceSummary {
+                    project_id: project_id.clone(),
+                    resource_revision: 1,
+                    resources: Vec::new(),
+                },
+                memory_read_roots: ProjectMemoryReadRoots {
+                    primary: directory
+                        .path()
+                        .join("projects/pipeline-context-cancel-project/memory/v1"),
+                    legacy_aliases: Vec::new(),
+                },
+            },
+            cancel_token: cancel.clone(),
+            lookups: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(ContextProbeProvider::default());
+        let mut session = Session::new("pipeline-context-cancel", "model");
+        session.add_message(Message::system("base prompt"));
+        session.add_message(Message::user("run the cancellation fixture"));
+        session.set_project_id_meta(project_id.to_string());
+        let config = AgentLoopConfig {
+            project_context_resolver: Some(Arc::new(ProjectContextResolver::new(source.clone()))),
+            app_data_dir: Some(directory.path().to_path_buf()),
+            prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            max_rounds: 1,
+            ..AgentLoopConfig::default()
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let mut state = e2e_loop_state(&session.id);
+
+        let error = super::run_pipeline(
+            &mut session,
+            &event_tx,
+            provider.clone(),
+            Arc::new(AlwaysOkExecutor),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect_err("cancellation observed after context refresh must stop the round");
+
+        assert!(matches!(error, AgentError::Cancelled));
+        assert_eq!(source.lookups.load(Ordering::SeqCst), 2);
+        assert!(session
+            .metadata
+            .contains_key(crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
     // --- Tests from rounds.rs ---

@@ -258,9 +258,7 @@ fn reorder_candidates_by_ids(
 }
 
 fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option<Vec<String>> {
-    let stripped = strip_markdown_fence(raw);
-    let fragment = extract_json_fragment(&stripped).unwrap_or(stripped.trim());
-    let ids = serde_json::from_str::<MemoryRecallRerankEnvelope>(fragment)
+    let ids = serde_json::from_str::<MemoryRecallRerankEnvelope>(raw.trim())
         .ok()?
         .ids;
     let explicit_empty_selection = ids.is_empty();
@@ -285,43 +283,6 @@ fn parse_reranked_ids(raw: &str, candidates: &[MemoryRecallCandidate]) -> Option
     }
 
     Some(out)
-}
-
-fn strip_markdown_fence(raw: &str) -> String {
-    let trimmed = raw.trim();
-    for fence in ["````", "```"] {
-        if let Some(after_fence) = trimmed.strip_prefix(fence) {
-            let Some(first_newline) = after_fence.find('\n') else {
-                continue;
-            };
-            let body = &after_fence[first_newline + 1..];
-            if let Some(end_idx) = body.rfind(fence) {
-                return body[..end_idx].trim().to_string();
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-fn extract_json_fragment(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start <= end {
-            return Some(trimmed[start..=end].trim());
-        }
-    }
-
-    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
-        if start <= end {
-            return Some(trimmed[start..=end].trim());
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -405,10 +366,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_reranked_ids_accepts_fenced_json_and_filters_unknown_ids() {
+    fn parse_reranked_ids_filters_unknown_and_duplicate_ids() {
         let candidates = vec![candidate("mem-a", 10.0), candidate("mem-b", 9.0)];
         let parsed = parse_reranked_ids(
-            "```json\n{\"ids\":[\"mem-b\",\"unknown\",\"mem-a\",\"mem-b\"]}\n```",
+            " \n{\"ids\":[\"mem-b\",\"unknown\",\"mem-a\",\"mem-b\"]}\t ",
             &candidates,
         )
         .expect("reranked ids should parse");
@@ -426,6 +387,9 @@ mod tests {
         assert!(
             parse_reranked_ids("{\"ids\":[],\"error\":\"rate limited\"}", &candidates).is_none()
         );
+        assert!(parse_reranked_ids("```json\n{\"ids\":[\"mem-a\"]}\n```", &candidates).is_none());
+        assert!(parse_reranked_ids("result: {\"ids\":[\"mem-a\"]}", &candidates).is_none());
+        assert!(parse_reranked_ids("{\"ids\":[\"mem-a\"]} done", &candidates).is_none());
     }
 
     #[test]
@@ -576,6 +540,30 @@ mod tests {
             )
             .await
             .expect("fallback selection");
+
+            assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
+            assert_eq!(selection.candidates, expected);
+        }
+
+        let known_id = expected
+            .first()
+            .expect("lexical shortlist should contain a known candidate")
+            .id
+            .clone();
+        for response in [
+            format!("```json\n{{\"ids\":[\"{known_id}\"]}}\n```"),
+            format!("result: {{\"ids\":[\"{known_id}\"]}}"),
+            format!("{{\"ids\":[\"{known_id}\"]}} done"),
+        ] {
+            let selection = select_relevant_memories(
+                &store,
+                Some("proj-1"),
+                "release freeze for mobile",
+                &options,
+                Some(&rerank_context(&response)),
+            )
+            .await
+            .expect("wrapped known id should fall back to lexical selection");
 
             assert_eq!(selection.strategy, MemoryRecallStrategy::RerankFallback);
             assert_eq!(selection.candidates, expected);
