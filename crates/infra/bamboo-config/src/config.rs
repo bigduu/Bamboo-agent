@@ -66,7 +66,7 @@ use std::sync::{OnceLock, RwLock};
 
 use crate::keyword_masking::KeywordMaskingConfig;
 use crate::model_mapping::{AnthropicModelMapping, GeminiModelMapping};
-use bamboo_domain::tool_names::normalize_tool_ref;
+use bamboo_domain::normalize_tool_ref;
 use bamboo_domain::ReasoningEffort;
 
 /// Minimum accepted watchdog deadline. Zero would turn scheduling jitter into
@@ -4352,20 +4352,36 @@ impl Config {
         }
     }
 
-    /// Get normalized disabled tool names.
-    pub fn disabled_tool_names(&self) -> BTreeSet<String> {
+    /// Get exact disabled tool references for catalog-aware resolution.
+    ///
+    /// References remain exact here: catalog-aware filtering resolves an exact
+    /// registered name before applying legacy/builtin alias fallback. Eagerly
+    /// rewriting `apply_patch` to `Edit`, for example, would make an exact
+    /// custom `apply_patch` registration indistinguishable from the builtin.
+    pub fn disabled_tool_references(&self) -> BTreeSet<String> {
         self.tools
             .disabled
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
-            .map(|name| normalize_tool_ref(name).unwrap_or_else(|| name.to_string()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Legacy normalized-name facade retained for source compatibility.
+    ///
+    /// New execution/catalog code must use [`Self::disabled_tool_references`]
+    /// so an exact registered alias can be resolved before fallback.
+    pub fn disabled_tool_names(&self) -> BTreeSet<String> {
+        self.disabled_tool_references()
+            .into_iter()
+            .map(|reference| normalize_tool_ref(&reference).unwrap_or(reference))
             .collect()
     }
 
     /// Normalize tool settings (trim / dedupe / sort).
     pub fn normalize_tool_settings(&mut self) {
-        self.tools.disabled = self.disabled_tool_names().into_iter().collect();
+        self.tools.disabled = self.disabled_tool_references().into_iter().collect();
     }
 
     /// Get normalized disabled skill IDs.
@@ -8495,7 +8511,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tool_settings_trims_dedupes_canonicalizes_and_sorts() {
+    fn normalize_tool_settings_trims_dedupes_and_sorts_raw_references() {
         let mut config = Config::default();
         config.tools.disabled = vec![
             "  read_file  ".to_string(),
@@ -8503,15 +8519,28 @@ mod tests {
             "read_file".to_string(),
             "bash".to_string(),
             "default::getCurrentDir".to_string(),
+            "default::applyPatch".to_string(),
+            "default::custom_tool".to_string(),
+            "mcp__alpha__inspect".to_string(),
         ];
 
         config.normalize_tool_settings();
 
-        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
+        assert_eq!(
+            config.tools.disabled,
+            vec![
+                "bash",
+                "default::applyPatch",
+                "default::custom_tool",
+                "default::getCurrentDir",
+                "mcp__alpha__inspect",
+                "read_file"
+            ]
+        );
     }
 
     #[test]
-    fn config_load_reads_disabled_tools_as_canonical_names() {
+    fn config_load_preserves_disabled_references_for_catalog_resolution() {
         let _lock = env_lock_acquire();
         let temp_home = TempHome::new();
         temp_home.set_config_json(
@@ -8523,10 +8552,23 @@ mod tests {
         );
 
         let config = Config::from_data_dir(Some(temp_home.path.clone()));
-        assert_eq!(config.tools.disabled, vec!["Bash", "GetCurrentDir", "Read"]);
-        assert!(config.disabled_tool_names().contains("Bash"));
-        assert!(config.disabled_tool_names().contains("Read"));
-        assert!(config.disabled_tool_names().contains("GetCurrentDir"));
+        assert_eq!(
+            config.tools.disabled,
+            vec!["bash", "default::getCurrentDir", "read_file"]
+        );
+        assert!(config.disabled_tool_references().contains("bash"));
+        assert!(config.disabled_tool_references().contains("read_file"));
+        assert!(config
+            .disabled_tool_references()
+            .contains("default::getCurrentDir"));
+        assert_eq!(
+            config.disabled_tool_names(),
+            BTreeSet::from([
+                "Bash".to_string(),
+                "GetCurrentDir".to_string(),
+                "Read".to_string()
+            ])
+        );
     }
 
     #[test]

@@ -298,7 +298,7 @@ pub struct ExecuteRequest {
     /// Optional per-round live resolver for the disabled tool/skill sets (#136).
     /// When `None`, the snapshotted `disabled_tools`/`disabled_skill_ids` are used.
     pub disabled_filter_resolver: Option<DisabledFilterResolver>,
-    /// When `None`, falls back to `Config::disabled_tool_names()`.
+    /// When `None`, falls back to `Config::disabled_tool_references()`.
     pub disabled_tools: Option<BTreeSet<String>>,
     /// When `None`, falls back to `Config::disabled_skill_ids()`.
     pub disabled_skill_ids: Option<BTreeSet<String>>,
@@ -809,7 +809,7 @@ impl AgentRuntime {
             auxiliary_model_resolver,
             disabled_filter_resolver,
             disabled_tools: {
-                let mut merged = config.disabled_tool_names();
+                let mut merged = config.disabled_tool_references();
                 if let Some(dt) = disabled_tools {
                     merged.extend(dt);
                 }

@@ -242,37 +242,37 @@ async fn root_tools_include_server_overlays_and_session_note() {
 }
 
 #[tokio::test]
-async fn default_first_round_tool_surface_is_smaller_than_full_root_tool_catalog() {
+async fn root_catalog_classifies_exactly_five_callable_core_functions() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
 
     let full = state.get_all_tool_schemas();
-    let visible: Vec<_> = full
+    let core_names = full
         .iter()
-        .filter(|schema| bamboo_tools::exposure::is_core_tool(&schema.function.name))
-        .collect();
-    let visible_names: std::collections::HashSet<&str> = visible
-        .iter()
-        .map(|schema| schema.function.name.as_str())
-        .collect();
-    eprintln!(
-        "tool_surface_metrics: full={}, visible={}, hidden={}",
-        full.len(),
-        visible.len(),
-        full.len().saturating_sub(visible.len())
-    );
+        .filter_map(|schema| {
+            bamboo_domain::ClassifiedToolIdentity::from_schema_name(&schema.function.name)
+        })
+        .filter(|identity| identity.loading_class() == bamboo_domain::CapabilityLoadingClass::Core)
+        .map(|identity| identity.execution_name().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
 
-    assert!(
-        visible.len() < full.len(),
-        "expected reduced first-round surface: visible={}, full={}",
-        visible.len(),
-        full.len()
+    assert_eq!(
+        core_names,
+        std::collections::BTreeSet::from([
+            "Bash".to_string(),
+            "Edit".to_string(),
+            "Grep".to_string(),
+            "Read".to_string(),
+            "Write".to_string(),
+        ])
     );
-    assert!(!visible_names.contains("scheduler"));
-    assert!(!visible_names.contains("sub_session_manager"));
-    assert!(!visible_names.contains("session_history"));
+    assert_eq!(
+        bamboo_domain::DISCOVERY_CONTROL_GATEWAY.logical_name(),
+        "discover"
+    );
+    assert!(bamboo_domain::DISCOVERY_CONTROL_GATEWAY.is_initially_visible());
 }
 
 #[tokio::test]

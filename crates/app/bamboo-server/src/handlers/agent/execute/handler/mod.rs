@@ -101,8 +101,10 @@ pub async fn handle_execute(
         }
     };
 
-    let disabled_tools_vec: Vec<String> =
-        config_snapshot.disabled_tool_names().into_iter().collect();
+    let disabled_tools_vec: Vec<String> = config_snapshot
+        .disabled_tool_references()
+        .into_iter()
+        .collect();
     let disabled_skill_ids_vec: Vec<String> =
         config_snapshot.disabled_skill_ids().into_iter().collect();
     let explicit_provider = req

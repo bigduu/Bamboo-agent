@@ -1,14 +1,15 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
+use bamboo_domain::{
+    canonical_tool_name, resolve_tool_reference_name, CapabilityLoadingClass,
+    ClassifiedToolIdentity, ClassifiedToolSchema,
+};
 use bamboo_skills::runtime_metadata::{
     LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
     SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
-use bamboo_tools::exposure::{
-    activated_discoverable_tools, canonical_tool_name, discoverable_tool_short_description,
-    is_core_tool,
-};
+use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
 
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
@@ -41,6 +42,25 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     tools: &dyn ToolExecutor,
     session: &Session,
 ) -> Vec<ToolSchema> {
+    resolve_classified_tool_catalog_for_session(config, tools, session)
+        .into_iter()
+        .filter(ClassifiedToolSchema::is_model_visible)
+        .map(ClassifiedToolSchema::into_schema)
+        .collect()
+}
+
+/// Resolve the provider-neutral logical catalog for one round.
+///
+/// Legacy providers project every model-visible Deferred entry from this
+/// catalog. Native/fallback progressive-loading adapters later consume the same
+/// classification and may project only initially visible entries. HostOnly
+/// entries remain represented for host compatibility but never cross the model
+/// catalog projection above.
+pub(crate) fn resolve_classified_tool_catalog_for_session(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+) -> Vec<ClassifiedToolSchema> {
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
@@ -54,16 +74,13 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
     // round, because this list is rebuilt unfiltered every round; with no resolver
     // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
     let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
-    if !disabled_tools.is_empty() {
-        tool_schemas.retain(|schema| !disabled_tools.contains(&schema.function.name));
-    }
-
     // The `update_goal` self-report tool is only meaningful while the autonomous
     // goal loop is active; hide it from every ordinary session so it never
     // tempts the model when no goal is set.
     if !config.goal_loop_active() {
         tool_schemas.retain(|schema| {
-            schema.function.name != bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME
+            !canonical_tool_name(&schema.function.name)
+                .eq_ignore_ascii_case(bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME)
         });
     }
 
@@ -95,18 +112,24 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
             .metadata
             .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
     if explicit_activation_is_current || explicit_activation_degraded {
-        tool_schemas.retain(|schema| schema.function.name != "load_skill");
+        tool_schemas.retain(|schema| {
+            !canonical_tool_name(&schema.function.name).eq_ignore_ascii_case("load_skill")
+        });
     }
 
     let activated = activated_discoverable_tools(session);
 
-    // Replace descriptions for inactive discoverable tools with short summaries.
-    // All tools remain available to the LLM; activation only controls the
-    // depth of guidance (short vs full) shown in the tool guide.
+    // Legacy providers keep Deferred schemas visible during migration;
+    // activation only controls the depth of the existing tool-guide summaries.
     for schema in &mut tool_schemas {
-        let canonical = canonical_tool_name(&schema.function.name);
-        if !is_core_tool(&canonical) && !activated.contains(&canonical) {
-            if let Some(short) = discoverable_tool_short_description(&canonical) {
+        let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
+            continue;
+        };
+        let guide_name = identity.alias_fallback_name();
+        if identity.loading_class() == CapabilityLoadingClass::Deferred
+            && !activated.contains(guide_name)
+        {
+            if let Some(short) = expandable_tool_short_description(guide_name) {
                 schema.function.description =
                     format!("[Discoverable — not fully activated] {}", short);
             }
@@ -115,7 +138,36 @@ pub(crate) fn resolve_available_tool_schemas_for_session(
 
     apply_session_tool_schema_overrides(session, &mut tool_schemas);
 
-    tool_schemas
+    let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
+    for entry in tool_schemas
+        .into_iter()
+        .filter_map(ClassifiedToolSchema::new)
+    {
+        let key = entry.execution_name().to_string();
+        match by_execution_name.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let disabled_execution_names = disabled_tools
+        .iter()
+        .filter_map(|reference| {
+            resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
+
+    let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
+    catalog.sort_by(|left, right| {
+        left.schema()
+            .function
+            .name
+            .cmp(&right.schema().function.name)
+    });
+
+    catalog
 }
 
 #[cfg(test)]
