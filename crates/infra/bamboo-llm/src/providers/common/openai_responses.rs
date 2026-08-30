@@ -2320,6 +2320,19 @@ mod tests {
         ])
     }
 
+    fn client_discovery_output_fixture(call_id: Option<Value>) -> Value {
+        let mut output = discovery_output_fixture();
+        output.as_array_mut().unwrap().truncate(3);
+        output[2]["execution"] = json!("client");
+        match call_id {
+            Some(call_id) => output[2]["call_id"] = call_id,
+            None => {
+                output[2].as_object_mut().unwrap().remove("call_id");
+            }
+        }
+        output
+    }
+
     #[test]
     fn discovery_output_is_captured_and_replayed_at_its_message_anchor() {
         let output = discovery_output_fixture();
@@ -2424,7 +2437,36 @@ mod tests {
         assert_eq!(captured, output.as_array().unwrap().clone());
     }
 
+    #[test]
+    fn client_discovery_call_with_matching_id_stops_as_a_replayable_group() {
+        let output = client_discovery_output_fixture(Some(json!("search_client_1")));
+        let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
+        let items = parser
+            .handle_event_multi(
+                "response.completed",
+                &json!({"type":"response.completed","response":{"output":output}}).to_string(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items.last().unwrap().payload()["type"], "tool_search_call");
+        assert_eq!(
+            items.last().unwrap().payload()["call_id"],
+            "search_client_1"
+        );
+        ProviderTranscriptGroup::validate_items(&items).unwrap();
+    }
+
     fn assert_discovery_output_falls_back(output: Value) {
+        let expects_tool_call = output
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call"));
         let mut parser = ResponsesSseParser::new_with_context("OpenAI", "gpt-5.6", None);
         let chunks = parser
             .handle_event_multi(
@@ -2439,10 +2481,27 @@ mod tests {
         assert!(chunks
             .iter()
             .any(|chunk| matches!(chunk, LLMChunk::Token(text) if text == "Searching")));
-        assert!(chunks
-            .iter()
-            .any(|chunk| matches!(chunk, LLMChunk::ToolCalls(calls) if !calls.is_empty())));
+        if expects_tool_call {
+            assert!(chunks
+                .iter()
+                .any(|chunk| matches!(chunk, LLMChunk::ToolCalls(calls) if !calls.is_empty())));
+        }
         assert!(chunks.iter().any(|chunk| matches!(chunk, LLMChunk::Done)));
+    }
+
+    #[test]
+    fn malformed_client_discovery_stops_fail_closed_to_normalized_chunks() {
+        for call_id in [None, Some(Value::Null), Some(json!("")), Some(json!(7))] {
+            assert_discovery_output_falls_back(client_discovery_output_fixture(call_id));
+        }
+
+        let mut premature_function =
+            client_discovery_output_fixture(Some(json!("search_client_1")));
+        premature_function
+            .as_array_mut()
+            .unwrap()
+            .push(discovery_output_fixture()[4].clone());
+        assert_discovery_output_falls_back(premature_function);
     }
 
     #[test]

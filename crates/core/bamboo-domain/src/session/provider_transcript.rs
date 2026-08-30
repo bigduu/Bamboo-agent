@@ -1660,12 +1660,17 @@ fn validate_openai_item(
                 ],
                 "tool search call fields",
             )?;
-            execution()?;
+            let execution = execution()?;
             require_nonempty_string("id")?;
+            let call_id_valid = if execution == "client" {
+                is_nonempty_string(object.get("call_id"))
+            } else {
+                is_optional_nullable_nonempty_string(object.get("call_id"))
+            };
             if author != ProviderTranscriptAuthor::Model
                 || object.get("status").and_then(Value::as_str) != Some("completed")
                 || !object.get("arguments").is_some_and(Value::is_object)
-                || !is_optional_nullable_nonempty_string(object.get("call_id"))
+                || !call_id_valid
                 || !is_optional_nullable_nonempty_string(object.get("created_by"))
             {
                 return Err(ProviderTranscriptError::InvalidItem(
@@ -2213,7 +2218,7 @@ fn validate_group_order(
             let mut pending_provider_calls = HashSet::<&str>::new();
             let mut pending_client_calls = HashSet::<&str>::new();
             let mut pending_unkeyed_provider_calls = 0usize;
-            let mut pending_unkeyed_client_calls = 0usize;
+            let mut saw_client_search_call = false;
             let mut loaded_at = HashMap::<String, usize>::new();
             let mut function_calls = Vec::<(usize, &str)>::new();
             for (index, item) in items.iter().enumerate() {
@@ -2239,8 +2244,7 @@ fn validate_group_order(
                                 pending_unkeyed_provider_calls =
                                     pending_unkeyed_provider_calls.saturating_add(1);
                             } else {
-                                pending_unkeyed_client_calls =
-                                    pending_unkeyed_client_calls.saturating_add(1);
+                                return Err(ProviderTranscriptError::InvalidGroupOrder);
                             }
                         } else {
                             if !seen_search_call_ids.insert(call_id) {
@@ -2252,6 +2256,7 @@ fn validate_group_order(
                                 pending_client_calls.insert(call_id);
                             }
                         }
+                        saw_client_search_call |= execution == "client";
                     }
                     ProviderTranscriptItemKind::OpenAiToolSearchOutput => {
                         let execution = item
@@ -2269,15 +2274,11 @@ fn validate_group_order(
                             return Err(ProviderTranscriptError::InvalidGroupOrder);
                         }
                         let matched_pending = if call_id.is_empty() {
-                            let pending = if execution == "server" {
-                                &mut pending_unkeyed_provider_calls
-                            } else {
-                                &mut pending_unkeyed_client_calls
-                            };
-                            if *pending == 0 {
+                            if execution != "server" || pending_unkeyed_provider_calls == 0 {
                                 false
                             } else {
-                                *pending = pending.saturating_sub(1);
+                                pending_unkeyed_provider_calls =
+                                    pending_unkeyed_provider_calls.saturating_sub(1);
                                 true
                             }
                         } else {
@@ -2288,6 +2289,9 @@ fn validate_group_order(
                             };
                             pending.remove(call_id)
                         };
+                        if execution == "client" && saw_client_search_call {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
                         if !matched_pending
                             && (execution == "server"
                                 || item.origin != ProviderTranscriptOrigin::HostToolSearch)
@@ -2303,6 +2307,9 @@ fn validate_group_order(
                         }
                     }
                     ProviderTranscriptItemKind::OpenAiFunctionCall => {
+                        if saw_client_search_call {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
                         let name = item
                             .payload
                             .get("name")
@@ -2844,6 +2851,8 @@ mod tests {
             additional.kind(),
             ProviderTranscriptItemKind::OpenAiAdditionalTools
         );
+        ProviderTranscriptGroup::validate_items(std::slice::from_ref(&client))
+            .expect("a client output is a standalone host-owned continuation group");
     }
 
     #[test]
@@ -3583,6 +3592,34 @@ mod tests {
         )
         .expect("the official hosted output model permits an omitted call_id");
 
+        for malformed_client in [
+            json!({
+                "type":"tool_search_call","id":"tsc_client_missing","execution":"client",
+                "status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_null","execution":"client",
+                "call_id":null,"status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_empty","execution":"client",
+                "call_id":"","status":"completed","arguments":{}
+            }),
+            json!({
+                "type":"tool_search_call","id":"tsc_client_typed","execution":"client",
+                "call_id":7,"status":"completed","arguments":{}
+            }),
+        ] {
+            assert!(ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                ProviderTranscriptOrigin::Provider,
+                ProviderTranscriptAuthor::Model,
+                malformed_client,
+            )
+            .is_err());
+        }
+
         // Client execution intentionally stops after the call. Its host output
         // is committed in a later input group and may therefore stand alone.
         let client_call = ProviderTranscriptItem::try_from_payload(
@@ -3596,7 +3633,22 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(test_group("client-call", vec![client_call]).is_ok());
+        assert!(test_group("client-call", vec![client_call.clone()]).is_ok());
+        let premature_function_call = hosted_item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"function_call","id":"fc_client_premature","call_id":"function_1",
+                "name":"get_weather","arguments":"{}","status":"completed"
+            }),
+        );
+        assert_eq!(
+            test_group(
+                "client-call-must-stop",
+                vec![client_call, premature_function_call],
+            )
+            .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
 
         let anthropic = anthropic_items();
         let mut reordered = anthropic.clone();
