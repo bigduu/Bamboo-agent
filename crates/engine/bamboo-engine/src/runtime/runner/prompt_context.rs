@@ -2,6 +2,7 @@
 
 mod external_memory;
 mod goal;
+mod memory_rerank;
 mod plan_mode;
 mod plan_runtime;
 mod system_sections;
@@ -18,12 +19,14 @@ pub(crate) async fn refresh_external_memory_context(
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
+    app_data_dir: Option<&std::path::Path>,
 ) {
     external_memory::refresh_external_memory_context(
         session,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
+        app_data_dir,
     )
     .await;
 }

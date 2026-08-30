@@ -44,6 +44,39 @@ impl LLMProvider for StaticResponseProvider {
 }
 
 #[test]
+fn latest_user_query_skips_hidden_and_runtime_resume_messages() {
+    let mut session = bamboo_agent_core::Session::new("recall-real-user", "test-model");
+    session.add_message(bamboo_agent_core::Message::user("real release question"));
+
+    let mut hidden = bamboo_agent_core::Message::user("hidden child completion");
+    hidden.metadata = Some(serde_json::json!({
+        "hidden_from_ui": true,
+        "runtime_kind": "child_completion_resume"
+    }));
+    session.add_message(hidden);
+
+    let mut runtime_kind_only = bamboo_agent_core::Message::user("internal retry notice");
+    runtime_kind_only.metadata = Some(serde_json::json!({"runtime_kind": "retry_resume"}));
+    session.add_message(runtime_kind_only);
+
+    assert_eq!(
+        super::external_memory::latest_user_query_text(&session).as_deref(),
+        Some("real release question")
+    );
+}
+
+#[test]
+fn latest_user_query_returns_none_for_internal_or_blank_user_messages_only() {
+    let mut session = bamboo_agent_core::Session::new("recall-no-real-user", "test-model");
+    session.add_message(bamboo_agent_core::Message::user("   "));
+    let mut hidden = bamboo_agent_core::Message::user("hidden resume");
+    hidden.metadata = Some(serde_json::json!({"hidden_from_ui": true}));
+    session.add_message(hidden);
+
+    assert!(super::external_memory::latest_user_query_text(&session).is_none());
+}
+
+#[test]
 fn merge_system_prompt_with_contexts_appends_both_contexts() {
     let merged = merge_system_prompt_with_contexts(
         "You are a helpful assistant.",

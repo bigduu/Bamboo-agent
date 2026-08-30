@@ -10,14 +10,12 @@ license = "MIT"
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
-bamboo-llm = { path = "../../infra/bamboo-llm" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
-futures = "0.3"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
