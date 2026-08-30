@@ -1633,6 +1633,8 @@ async fn handle_tool_calls_path(
     }
     let tool_schemas =
         resolve_available_tool_schemas_for_session(frame.config, frame.tools.as_ref(), session);
+    let effective_callable_set =
+        crate::runtime::runner::tool_execution::legacy_effective_callable_set(&tool_schemas);
 
     // Tool execution can block for a long time (up to parallel_batch_timeout_secs,
     // default 300s, and per_tool_timeout_secs for single tools). The loop only
@@ -1666,6 +1668,7 @@ async fn handle_tool_calls_path(
                     .as_ref()
                     .or(auxiliary_models.background_model_provider.as_ref()),
                 tool_schemas: &tool_schemas,
+                effective_callable_set: &effective_callable_set,
             },
         ) => result?,
     };
@@ -6980,6 +6983,8 @@ mod tests {
             tools: &tools,
         };
         let tool_schemas = tools.list_tools();
+        let effective_callable_set =
+            crate::runtime::runner::tool_execution::legacy_effective_callable_set(&tool_schemas);
         let mut runtime_state = AgentRuntimeState::new("s-normal");
         let mut task_context: Option<TaskLoopContext> = None;
 
@@ -6996,6 +7001,7 @@ mod tests {
                 compression_model_name: None,
                 compression_model_provider: None,
                 tool_schemas: &tool_schemas,
+                effective_callable_set: &effective_callable_set,
             }),
         )
         .await
