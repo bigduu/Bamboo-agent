@@ -1,8 +1,11 @@
 use crate::error::ToolRegistrationError;
+use crate::manager::generation::GenerationAuthority;
+#[cfg(test)]
+use crate::manager::generation::McpRuntimeGeneration;
 use crate::types::{McpTool, ToolAlias};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 /// OpenAI and Anthropic function names are bounded to 64 provider-safe bytes.
 pub const MAX_MCP_TOOL_ALIAS_BYTES: usize = 64;
@@ -71,6 +74,10 @@ pub(crate) struct ServerToolCatalog {
 }
 
 impl ServerToolCatalog {
+    pub(crate) fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
     pub(crate) fn aliases(&self) -> Vec<ToolAlias> {
         self.entries
             .iter()
@@ -85,10 +92,19 @@ impl ServerToolCatalog {
             .expect("test catalog must contain one tool")
             .canonical_alias = alias;
     }
+
+    #[cfg(test)]
+    pub(crate) fn replace_first_original_name_for_test(&mut self, original_name: String) {
+        self.entries
+            .first_mut()
+            .expect("test catalog must contain one tool")
+            .owner
+            .original_name = original_name;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
-struct IndexState {
+pub(crate) struct IndexState {
     /// Monotonic publication generation. Every committed replacement advances
     /// this value exactly once while holding the state write lock.
     revision: u64,
@@ -112,6 +128,25 @@ struct IndexState {
 }
 
 impl IndexState {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn plan_catalog_update(
+        &self,
+        replacements: &[ServerToolCatalog],
+        removals: &[String],
+        ledger_relationship_limit: usize,
+    ) -> Result<Self, ToolRegistrationError> {
+        let mut next = self.clone();
+        next.apply_catalog_update(replacements, removals, ledger_relationship_limit)?;
+        next.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(ToolRegistrationError::PublicationRevisionExhausted)?;
+        Ok(next)
+    }
+
     fn apply_catalog_update(
         &mut self,
         replacements: &[ServerToolCatalog],
@@ -210,16 +245,83 @@ impl IndexState {
                 total.saturating_add(owners.len())
             })
     }
+
+    pub(crate) fn lookup(&self, alias: &str) -> Option<ToolAlias> {
+        let resolved = self.resolve(alias)?;
+        Some(ToolAlias {
+            alias: alias.to_string(),
+            server_id: resolved.server_id,
+            original_name: resolved.original_name,
+        })
+    }
+
+    pub(crate) fn resolve(&self, alias: &str) -> Option<ResolvedIndexAlias> {
+        if let Some(owner) = self.aliases.get(alias) {
+            return Some(ResolvedIndexAlias {
+                canonical_alias: alias.to_string(),
+                server_id: owner.server_id.clone(),
+                original_name: owner.original_name.clone(),
+            });
+        }
+        let active_owners = self.legacy_candidates.get(alias)?;
+        if active_owners.len() != 1 {
+            return None;
+        }
+        let active_owner = active_owners.iter().next()?;
+        let historical_owners = self.legacy_owners.get(&legacy_alias_fingerprint(alias))?;
+        if historical_owners.len() != 1 || !historical_owners.contains(&active_owner.fingerprint())
+        {
+            return None;
+        }
+        let canonical_alias = self.aliases.iter().find_map(|(canonical_alias, owner)| {
+            (owner == active_owner).then(|| canonical_alias.clone())
+        })?;
+        Some(ResolvedIndexAlias {
+            canonical_alias,
+            server_id: active_owner.server_id.clone(),
+            original_name: active_owner.original_name.clone(),
+        })
+    }
+
+    pub(crate) fn all_aliases(&self) -> Vec<ToolAlias> {
+        self.aliases
+            .iter()
+            .map(|(alias, owner)| owner.as_alias(alias.clone()))
+            .collect()
+    }
+
+    pub(crate) fn get_server_tools(&self, server_id: &str) -> Option<Vec<String>> {
+        self.server_catalogs.get(server_id).map(|catalog| {
+            catalog
+                .entries
+                .iter()
+                .map(|entry| entry.owner.original_name.clone())
+                .collect()
+        })
+    }
+
+    pub(crate) fn contains_exact(&self, alias: &str) -> bool {
+        self.aliases.contains_key(alias)
+    }
+}
+
+pub(crate) struct ResolvedIndexAlias {
+    pub(crate) canonical_alias: String,
+    pub(crate) server_id: String,
+    pub(crate) original_name: String,
 }
 
 /// A whole-index update that has already validated every replacement/removal.
 /// The manager holds its reconciliation lock between preflight and commit.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ToolIndexTransaction {
+    base_generation: Arc<McpRuntimeGeneration>,
     base_revision: u64,
     next: IndexState,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum ToolIndexCommitError {
     #[error(
@@ -229,9 +331,6 @@ enum ToolIndexCommitError {
         base_revision: u64,
         current_revision: u64,
     },
-
-    #[error("MCP tool-index publication revision exhausted at {current_revision}")]
-    RevisionExhausted { current_revision: u64 },
 }
 
 /// Atomic owner index for MCP tool identities.
@@ -240,36 +339,47 @@ enum ToolIndexCommitError {
 /// published behind one lock so readers never observe a partially installed
 /// catalog.
 pub struct ToolIndex {
-    state: RwLock<IndexState>,
-    ledger_relationship_limit: usize,
+    authority: Arc<GenerationAuthority>,
 }
 
 impl ToolIndex {
     pub fn new() -> Self {
         Self {
-            state: RwLock::new(IndexState::default()),
-            ledger_relationship_limit: MAX_MCP_OWNERSHIP_LEDGER_RELATIONSHIPS,
+            authority: GenerationAuthority::new(MAX_MCP_OWNERSHIP_LEDGER_RELATIONSHIPS),
         }
+    }
+
+    pub(crate) fn from_authority(authority: Arc<GenerationAuthority>) -> Self {
+        Self { authority }
+    }
+
+    pub(crate) fn authority(&self) -> &Arc<GenerationAuthority> {
+        &self.authority
+    }
+
+    pub fn same_authority(&self, other: &Self) -> bool {
+        GenerationAuthority::same_authority(&self.authority, &other.authority)
     }
 
     #[cfg(test)]
     fn with_ledger_relationship_limit_for_test(ledger_relationship_limit: usize) -> Self {
         Self {
-            state: RwLock::new(IndexState::default()),
-            ledger_relationship_limit,
+            authority: GenerationAuthority::new(ledger_relationship_limit),
         }
     }
 
-    fn read_state(&self) -> RwLockReadGuard<'_, IndexState> {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    #[cfg(test)]
+    pub(crate) fn set_revision_for_test(&self, revision: u64) {
+        let base = self.authority.generation();
+        let mut index = (*base.index).clone();
+        index.revision = revision;
+        let next = McpRuntimeGeneration::with_index(&base, &[], &[], index, false)
+            .expect("test revision must preserve the generation shape");
+        self.authority.replace_prevalidated(&base, next);
     }
 
-    fn write_state(&self) -> RwLockWriteGuard<'_, IndexState> {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn read_state(&self) -> Arc<IndexState> {
+        self.authority.generation().index.clone()
     }
 
     /// Generate the stable provider-visible identity for one exact owner tuple.
@@ -348,17 +458,21 @@ impl ToolIndex {
 
     /// Preflight a complete set of catalog changes against one cloned snapshot.
     /// No live map is touched if any plan is invalid or collides.
+    #[cfg(test)]
     pub(crate) fn preflight_catalog_update(
         &self,
         replacements: &[ServerToolCatalog],
         removals: &[String],
     ) -> Result<ToolIndexTransaction, ToolRegistrationError> {
-        let state = self.read_state();
-        let base_revision = state.revision;
-        let mut next = state.clone();
-        drop(state);
-        next.apply_catalog_update(replacements, removals, self.ledger_relationship_limit)?;
+        let base_generation = self.authority.generation();
+        let base_revision = base_generation.index.revision;
+        let next = base_generation.index.plan_catalog_update(
+            replacements,
+            removals,
+            self.authority.ledger_relationship_limit,
+        )?;
         Ok(ToolIndexTransaction {
+            base_generation,
             base_revision,
             next,
         })
@@ -369,29 +483,44 @@ impl ToolIndex {
     /// a recoverable post-durable CAS outcome: production has exactly one writer
     /// behind that lock. Fail-stop before swapping in every build so a stale
     /// snapshot can never erase a newer catalog or ownership history.
+    #[cfg(test)]
     pub(crate) fn commit_catalog_update(&self, transaction: ToolIndexTransaction) {
         self.try_commit_catalog_update(transaction)
             .unwrap_or_else(|error| panic!("MCP tool-index writer invariant violated: {error}"));
     }
 
+    #[cfg(test)]
     fn try_commit_catalog_update(
         &self,
-        mut transaction: ToolIndexTransaction,
+        transaction: ToolIndexTransaction,
     ) -> Result<(), ToolIndexCommitError> {
-        let mut state = self.write_state();
-        let current_revision = state.revision;
-        if transaction.base_revision != current_revision {
+        let current = self.authority.generation();
+        let current_revision = current.index.revision;
+        if !Arc::ptr_eq(&current, &transaction.base_generation) {
             return Err(ToolIndexCommitError::StaleTransaction {
                 base_revision: transaction.base_revision,
                 current_revision,
             });
         }
-        let next_revision = current_revision
-            .checked_add(1)
-            .ok_or(ToolIndexCommitError::RevisionExhausted { current_revision })?;
-        transaction.next.revision = next_revision;
-        *state = transaction.next;
-        Ok(())
+        let next = McpRuntimeGeneration::with_index(
+            &transaction.base_generation,
+            &[],
+            &[],
+            transaction.next,
+            false,
+        )
+        .expect("test-only catalog state must construct a detached generation");
+        if self
+            .authority
+            .try_replace(&transaction.base_generation, next)
+        {
+            Ok(())
+        } else {
+            Err(ToolIndexCommitError::StaleTransaction {
+                base_revision: transaction.base_revision,
+                current_revision: self.authority.generation().revision,
+            })
+        }
     }
 
     /// Test-only direct registration seam. Production writes are owned by
@@ -426,45 +555,18 @@ impl ToolIndex {
     /// Lookup either an exact canonical alias or an unambiguous legacy alias.
     /// Canonical identities always win. Ambiguous legacy identities fail closed.
     pub fn lookup(&self, alias: &str) -> Option<ToolAlias> {
-        let state = self.read_state();
-        if let Some(owner) = state.aliases.get(alias) {
-            return Some(owner.as_alias(alias.to_string()));
-        }
-        let active_owners = state.legacy_candidates.get(alias)?;
-        if active_owners.len() != 1 {
-            return None;
-        }
-        let active_owner = active_owners.iter().next()?;
-        let historical_owners = state.legacy_owners.get(&legacy_alias_fingerprint(alias))?;
-        if historical_owners.len() != 1 || !historical_owners.contains(&active_owner.fingerprint())
-        {
-            return None;
-        }
-        Some(active_owner.as_alias(alias.to_string()))
+        self.read_state().lookup(alias)
     }
 
     /// Get every canonical provider-visible alias in stable lexical order.
     /// Legacy compatibility names are deliberately not advertised.
     pub fn all_aliases(&self) -> Vec<ToolAlias> {
-        self.read_state()
-            .aliases
-            .iter()
-            .map(|(alias, owner)| owner.as_alias(alias.clone()))
-            .collect()
+        self.read_state().all_aliases()
     }
 
     /// Get exact original tool names for one server in canonical alias order.
     pub fn get_server_tools(&self, server_id: &str) -> Option<Vec<String>> {
-        self.read_state()
-            .server_catalogs
-            .get(server_id)
-            .map(|catalog| {
-                catalog
-                    .entries
-                    .iter()
-                    .map(|entry| entry.owner.original_name.clone())
-                    .collect()
-            })
+        self.read_state().get_server_tools(server_id)
     }
 
     /// Test-only clear seam. Process-lifetime owner ledgers remain so removed
@@ -489,7 +591,7 @@ impl ToolIndex {
     /// Execution surfaces that promise exact tool membership must use this
     /// method rather than the legacy-aware [`Self::contains`] seam.
     pub fn contains_exact_alias(&self, alias: &str) -> bool {
-        self.read_state().aliases.contains_key(alias)
+        self.read_state().contains_exact(alias)
     }
 
     /// Check whether a canonical or unambiguous compatibility alias resolves.

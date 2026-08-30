@@ -271,13 +271,13 @@ pub(super) fn legacy_workflow_catalog_entry_to_command(
 pub(super) async fn list_mcp_tools_as_commands(
     state: &AppState,
 ) -> Result<Vec<CommandItem>, AppError> {
-    let aliases = state.mcp_manager.tool_index().all_aliases();
+    let snapshot = state.mcp_manager.snapshot();
+    let aliases = snapshot.aliases();
     let commands = aliases
         .into_iter()
         .filter_map(|alias| {
-            state
-                .mcp_manager
-                .get_tool_info(&alias.server_id, &alias.original_name)
+            snapshot
+                .tool(&alias.server_id, &alias.original_name)
                 .map(|tool| CommandItem {
                     id: format!("mcp-{}-{}", alias.server_id, alias.original_name),
                     name: alias.alias.clone(),

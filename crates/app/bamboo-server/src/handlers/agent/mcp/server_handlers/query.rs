@@ -10,15 +10,13 @@ use super::super::api_types::{to_api_config, McpServerApiRecord, ServerListRespo
 /// `GET /mcp/servers`
 pub async fn list_servers(state: web::Data<AppState>) -> impl Responder {
     let config = state.config.read().await.clone();
+    let snapshot = state.mcp_manager.snapshot();
     let servers: Vec<McpServerApiRecord> = config
         .mcp
         .servers
         .iter()
         .map(|server_cfg| {
-            let runtime = state
-                .mcp_manager
-                .get_server_info(&server_cfg.id)
-                .unwrap_or_default();
+            let runtime = snapshot.server_info(&server_cfg.id).unwrap_or_default();
             McpServerApiRecord {
                 id: server_cfg.id.clone(),
                 name: server_cfg.name.clone(),
@@ -55,10 +53,8 @@ pub async fn get_server(state: web::Data<AppState>, path: web::Path<String>) -> 
         }));
     };
 
-    let runtime = state
-        .mcp_manager
-        .get_server_info(&server_id)
-        .unwrap_or_default();
+    let snapshot = state.mcp_manager.snapshot();
+    let runtime = snapshot.server_info(&server_id).unwrap_or_default();
     let server_info = McpServerApiRecord {
         id: server_cfg.id.clone(),
         name: server_cfg.name.clone(),

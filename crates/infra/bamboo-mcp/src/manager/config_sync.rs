@@ -1,35 +1,28 @@
 use super::fingerprint::{effective_server_config, manager_proxy_fingerprint};
+use super::lifecycle::RetiredRuntimeCleanup;
 use super::*;
 use std::collections::HashSet;
 
 impl McpServerManager {
     /// Reconcile running MCP servers with the desired configuration.
     ///
-    /// This is best-effort and will:
-    /// - Stop servers that are running but removed/disabled in config.
-    /// - Start enabled servers that are not running.
-    /// - Restart servers whose effective runtime config changed.
-    ///
-    /// Secrets are compared by their hydrated plaintext (env/header values), not by the
-    /// encrypted-at-rest blobs (which can change on every save due to random nonces).
+    /// New and changed runtimes are fully staged before one immutable
+    /// generation replaces the complete live catalog/runtime view.
     pub async fn reconcile_from_config(&self, config: &McpConfig) {
         if let Err(error) = self.reconcile_from_config_transactional(config).await {
             error!("Failed to reconcile MCP configuration transactionally: {error}");
         }
     }
 
-    /// Reconcile configuration without evicting any working runtime until all
-    /// new and changed servers have completed transport connection, protocol
-    /// initialization, and tool discovery.
+    /// Reconcile without evicting any working publication until every new or
+    /// changed server has connected, initialized, and published its tool schema.
     pub async fn reconcile_from_config_transactional(&self, config: &McpConfig) -> Result<()> {
         self.reconcile_from_config_transactional_after(config, || async { Ok(()) })
             .await
     }
 
-    /// Stage every new/changed runtime, then run `before_publish`, and only
-    /// publish the prepared runtimes when that durable boundary succeeds.
-    /// This lets a section store place its CAS commit exactly between runtime
-    /// validation and runtime/tool-index publication.
+    /// Stage the next generation, run `before_publish` as the durable boundary,
+    /// then complete the already-prevalidated publication in the same poll.
     pub async fn reconcile_from_config_transactional_after<F, Fut>(
         &self,
         config: &McpConfig,
@@ -47,10 +40,8 @@ impl McpServerManager {
         .await
     }
 
-    /// Transactional reconcile with explicit runtime replacements even when
-    /// their effective configuration is unchanged. Legacy reconnect/update
-    /// endpoints use this to preserve their restart contract without doing an
-    /// out-of-transaction stop/start after the durable boundary.
+    /// Transactional reconcile with explicit replacements even when effective
+    /// runtime configuration is unchanged.
     pub async fn reconcile_from_config_transactional_after_forcing<F, Fut>(
         &self,
         config: &McpConfig,
@@ -61,7 +52,8 @@ impl McpServerManager {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let _reconcile = self.reconcile_lock.lock().await;
+        let sequence = self.event_sequence_lock.clone().lock_owned().await;
+        let reconcile = self.reconcile_lock.lock().await;
         let mut seen = HashSet::new();
         for server in &config.servers {
             if server.id.trim().is_empty() {
@@ -77,14 +69,16 @@ impl McpServerManager {
             }
         }
 
+        let base = self.authority.generation();
         let desired_proxy_fingerprint = manager_proxy_fingerprint(self.config.as_ref()).await;
-        let mut replacements = Vec::new();
+        let mut prepared = Vec::new();
         for desired in config.servers.iter().filter(|server| server.enabled) {
             let needs_replacement = force_replacements.contains(&desired.id)
-                || self
-                    .runtimes
+                || base
+                    .servers
                     .get(&desired.id)
-                    .map(|runtime| {
+                    .map(|publication| {
+                        let runtime = &publication.runtime.runtime;
                         effective_server_config(&runtime.config) != effective_server_config(desired)
                             || matches!(
                                 runtime.config.transport,
@@ -92,22 +86,11 @@ impl McpServerManager {
                             ) && runtime.proxy_fingerprint != desired_proxy_fingerprint
                     })
                     .unwrap_or(true);
-            if !needs_replacement {
-                continue;
-            }
-
-            match self
-                .prepare_server_runtime(desired.clone(), "config reload")
-                .await
-            {
-                Ok(prepared) => replacements.push(prepared),
-                Err(error) => {
-                    for prepared in replacements {
-                        let id = prepared.runtime.config.id.clone();
-                        self.shutdown_detached_runtime(&id, prepared.runtime).await;
-                    }
-                    return Err(error);
-                }
+            if needs_replacement {
+                prepared.push(
+                    self.prepare_server_runtime(desired.clone(), "config reload")
+                        .await?,
+                );
             }
         }
 
@@ -117,104 +100,100 @@ impl McpServerManager {
             .filter(|server| server.enabled)
             .map(|server| server.id.as_str())
             .collect();
-        let removals: Vec<String> = self
-            .list_servers()
-            .into_iter()
-            .filter(|id| !desired_enabled.contains(id.as_str()))
-            .collect();
-
-        // Validate the complete resulting catalog before crossing the durable
-        // configuration boundary. This catches cross-server alias conflicts as
-        // one unit and leaves every currently published runtime/index entry
-        // untouched on failure.
-        let replacement_catalogs: Vec<_> = replacements
+        let removals = base
+            .servers
+            .keys()
+            .filter(|server_id| !desired_enabled.contains(server_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let replacements = prepared
             .iter()
-            .map(|prepared| prepared.catalog.clone())
+            .map(|prepared| prepared.publication().clone())
+            .collect::<Vec<_>>();
+
+        // Collision/history/capacity/schema/revision validation and full next
+        // generation allocation all precede the durable callback.
+        let next = McpRuntimeGeneration::plan(
+            &base,
+            &replacements,
+            &removals,
+            self.authority.ledger_relationship_limit,
+            true,
+        )?;
+        let retirements = base
+            .servers
+            .values()
+            .filter_map(|publication| {
+                let replaced = replacements
+                    .iter()
+                    .any(|replacement| replacement.server_id == publication.server_id);
+                let removed = removals.contains(&publication.server_id);
+                (replaced || removed).then(|| (publication.clone(), removed))
+            })
+            .collect::<Vec<_>>();
+        if !self.authority.is_current(&base) {
+            return Err(McpError::Connection(
+                "stale MCP reconcile base generation".to_string(),
+            ));
+        }
+
+        let mut events = Vec::new();
+        for publication in &replacements {
+            events.extend(self.runtime_ready_events(publication));
+        }
+        for (publication, removed) in &retirements {
+            if *removed {
+                events.push(McpEvent::ServerStatusChanged {
+                    server_id: publication.server_id.clone(),
+                    status: ServerStatus::Stopped,
+                    error: None,
+                });
+            }
+        }
+        let retired = retirements
+            .iter()
+            .map(|(publication, _)| RetiredRuntimeCleanup {
+                runtime: publication.runtime.clone(),
+            })
             .collect();
-        let catalog_update = match self
-            .index
-            .preflight_catalog_update(&replacement_catalogs, &removals)
-        {
-            Ok(update) => update,
-            Err(error) => {
-                for prepared in replacements {
-                    let id = prepared.runtime.config.id.clone();
-                    self.shutdown_detached_runtime(&id, prepared.runtime).await;
-                }
-                return Err(error.into());
-            }
-        };
+        let event_batch = self.prepare_event_batch(sequence, events, retired);
+        let mut commits = prepared
+            .into_iter()
+            .map(PreparedServerRuntime::into_commit)
+            .collect::<Vec<_>>();
 
-        if let Err(error) = before_publish().await {
-            for prepared in replacements {
-                let id = prepared.runtime.config.id.clone();
-                self.shutdown_detached_runtime(&id, prepared.runtime).await;
-            }
-            return Err(error);
-        }
+        before_publish().await?;
 
-        // From the durable boundary through the end of these loops there must
-        // be no suspension point: cancellation must observe either the old
-        // section or every committed runtime/tool-index publication.
-        let mut published = Vec::new();
-        let mut replaced = Vec::new();
-        for prepared in replacements {
-            let (id, tool_names, old) = self.publish_prepared_runtime(prepared);
-            if let Some(old) = old {
-                // publish_prepared_runtime sets shutdown synchronously before
-                // returning, but keep the old generation for deferred cleanup.
-                replaced.push((id.clone(), old));
+        // No await or fallible operation is permitted after the durable
+        // boundary. The reconcile lock proves the prevalidated base is current.
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::BeforeFenceAndSwap);
+        self.authority.replace_prevalidated_with(&base, next, || {
+            for (publication, _) in &retirements {
+                publication.retire_with_runtime();
             }
-            published.push((id, tool_names));
-        }
-        let mut removed = Vec::new();
-        for id in removals {
-            match self.detach_runtime_without_index(&id) {
-                Ok(runtime) => removed.push((id, runtime)),
-                Err(error) => {
-                    // The reconcile lock makes this unreachable for ordinary
-                    // manager callers, but a commit must remain best-effort and
-                    // infallible once replacements are published.
-                    warn!("Failed to detach removed MCP server '{}': {}", id, error);
-                }
-            }
-        }
-        self.index.commit_catalog_update(catalog_update);
+            #[cfg(test)]
+            self.observe_publish(PublishProbePhase::AfterFencesBeforeSwap);
+        });
 
-        // Event channel backpressure and transport shutdown are post-commit
-        // cleanup. They must never delay section health publication by the
-        // caller or make a committed reconcile cancellable halfway through.
-        for (id, tool_names) in published {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                manager.emit_runtime_ready_events(id, tool_names).await;
-            });
+        for commit in &mut commits {
+            commit.mark_published();
         }
-        for (id, runtime) in removed {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                manager.finish_detached_stop(id, runtime, true).await;
-            });
+        for commit in &mut commits {
+            commit.activate();
         }
-        for (id, old) in replaced {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                manager.finish_detached_stop(id, old, false).await;
-            });
-        }
+        #[cfg(test)]
+        self.observe_publish(PublishProbePhase::AfterTransferAndSwapBeforeUnlock);
+        drop(reconcile);
+        event_batch.activate();
         Ok(())
     }
 
-    /// Initialize from configuration.
+    /// Initialize the enabled configuration as one generation instead of
+    /// exposing a partial server-by-server prefix.
     pub async fn initialize_from_config(&self, config: &McpConfig) {
-        for server_config in &config.servers {
-            if !server_config.enabled {
-                continue;
-            }
-
-            if let Err(e) = self.start_server(server_config.clone()).await {
-                error!("Failed to start MCP server '{}': {}", server_config.id, e);
-            }
+        if let Err(error) = self.reconcile_from_config_transactional(config).await {
+            error!("Failed to initialize MCP configuration: {error}");
         }
     }
 }

@@ -34,6 +34,12 @@ pub enum ToolRegistrationError {
         "MCP ownership ledger capacity exceeded: attempted {attempted} relationships with limit {limit}"
     )]
     OwnershipLedgerCapacityExceeded { limit: usize, attempted: usize },
+
+    #[error("MCP publication revision exhausted")]
+    PublicationRevisionExhausted,
+
+    #[error("MCP provider schema is unavailable for a published catalog entry")]
+    ProviderSchemaUnavailable,
 }
 
 #[derive(Error, Debug, Clone)]
@@ -94,6 +100,21 @@ pub enum McpError {
 
     #[error("Server not running: {0}")]
     NotRunning(String),
+
+    #[error("MCP publication is stale (publication_id={publication_id}, runtime_id={runtime_id})")]
+    StalePublication {
+        publication_id: u64,
+        runtime_id: u64,
+    },
+
+    #[error("MCP resolved call belongs to a different runtime authority")]
+    ForeignRuntimeAuthority,
+
+    #[error("MCP publication identity space exhausted")]
+    PublicationIdentityExhausted,
+
+    #[error("MCP runtime identity space exhausted")]
+    RuntimeIdentityExhausted,
 }
 
 impl From<serde_json::Error> for McpError {

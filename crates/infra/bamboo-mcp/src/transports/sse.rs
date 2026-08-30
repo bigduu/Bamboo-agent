@@ -423,6 +423,18 @@ impl McpTransport for SseTransport {
     }
 }
 
+impl Drop for SseTransport {
+    /// A staged SSE candidate may be cancelled after connect but before
+    /// publication. Abort the stream reader synchronously so dropping that
+    /// candidate cannot leak a background connection.
+    fn drop(&mut self) {
+        self.connected.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.sse_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +458,20 @@ mod tests {
         let transport = SseTransport::new(config);
         assert!(!transport.is_connected());
         assert!(transport.sse_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_staged_sse_aborts_reader() {
+        let mut transport = SseTransport::new(create_test_config());
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let abort = reader.abort_handle();
+        transport.sse_handle = Some(reader);
+        transport.connected.store(true, Ordering::SeqCst);
+
+        drop(transport);
+        tokio::task::yield_now().await;
+
+        assert!(abort.is_finished());
     }
 
     #[test]
