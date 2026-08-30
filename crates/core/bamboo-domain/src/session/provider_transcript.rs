@@ -2342,14 +2342,25 @@ fn validate_group_order(
         }
         ProviderProtocol::AnthropicMessages2023_06_01 => {
             let mut server_ids = HashSet::new();
+            let mut all_tool_use_ids = HashSet::new();
             let mut completed_server_ids = HashSet::new();
             let mut referenced_at = HashMap::<String, usize>::new();
             let mut tool_uses = Vec::<(usize, &str)>::new();
+            let mut thinking_blocks = 0usize;
             for (index, item) in items.iter().enumerate() {
                 match item.kind {
+                    ProviderTranscriptItemKind::AnthropicThinking
+                    | ProviderTranscriptItemKind::AnthropicRedactedThinking => {
+                        thinking_blocks = thinking_blocks.saturating_add(1);
+                        if index != 0 || thinking_blocks != 1 {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
+                    }
                     ProviderTranscriptItemKind::AnthropicServerToolUse => {
                         if let Some(id) = item.payload.get("id").and_then(Value::as_str) {
-                            if !server_ids.insert(id.to_string()) {
+                            if !server_ids.insert(id.to_string())
+                                || !all_tool_use_ids.insert(id.to_string())
+                            {
                                 return Err(ProviderTranscriptError::InvalidGroupOrder);
                             }
                         }
@@ -2381,6 +2392,14 @@ fn validate_group_order(
                         }
                     }
                     ProviderTranscriptItemKind::AnthropicToolUse => {
+                        let id = item
+                            .payload
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if !all_tool_use_ids.insert(id.to_string()) {
+                            return Err(ProviderTranscriptError::InvalidGroupOrder);
+                        }
                         let name = item
                             .payload
                             .get("name")
@@ -3716,6 +3735,139 @@ mod tests {
                 vec![anthropic[1].clone(), anthropic[2].clone(), mismatched_use],
             )
             .unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+    }
+
+    #[test]
+    fn anthropic_groups_require_one_leading_thinking_block_and_unique_tool_use_ids() {
+        let item = |author, payload| {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let thinking = item(
+            ProviderTranscriptAuthor::Model,
+            json!({"type":"thinking","thinking":"private","signature":"signed"}),
+        );
+        let redacted = item(
+            ProviderTranscriptAuthor::Model,
+            json!({"type":"redacted_thinking","data":"opaque"}),
+        );
+        let base = anthropic_items();
+
+        let mut leading = vec![thinking.clone()];
+        leading.extend(base.clone());
+        assert!(test_group("anthropic-leading-thinking", leading).is_ok());
+
+        let mut interior = base.clone();
+        interior.insert(1, thinking.clone());
+        assert_eq!(
+            test_group("anthropic-interior-thinking", interior).unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let mut multiple = vec![thinking, redacted];
+        multiple.extend(base.clone());
+        assert_eq!(
+            test_group("anthropic-multiple-thinking", multiple).unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let duplicate_id = item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_use","id":"toolu_01XYZ789",
+                "name":"get_weather","input":{}
+            }),
+        );
+        let mut duplicate = base.clone();
+        duplicate.push(duplicate_id);
+        assert_eq!(
+            test_group("anthropic-duplicate-tool-id", duplicate).unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+
+        let server_id_collision = item(
+            ProviderTranscriptAuthor::Model,
+            json!({
+                "type":"tool_use","id":"srvtoolu_01ABC123",
+                "name":"get_weather","input":{}
+            }),
+        );
+        let mut collision = base;
+        collision.push(server_id_collision);
+        assert_eq!(
+            test_group("anthropic-cross-type-tool-id", collision).unwrap_err(),
+            ProviderTranscriptError::InvalidGroupOrder
+        );
+    }
+
+    #[test]
+    fn anthropic_parallel_search_results_pair_by_server_id() {
+        let item = |author, payload| {
+            ProviderTranscriptItem::try_from_payload(
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let parallel = vec![
+            item(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"pattern":"weather"}
+                }),
+            ),
+            item(
+                ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_2",
+                    "name":"tool_search_tool_bm25","input":{"query":"calendar"}
+                }),
+            ),
+            item(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_2",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_calendar"}
+                    ]}
+                }),
+            ),
+            item(
+                ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_weather"}
+                    ]}
+                }),
+            ),
+            item(
+                ProviderTranscriptAuthor::Model,
+                json!({"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}),
+            ),
+            item(
+                ProviderTranscriptAuthor::Model,
+                json!({"type":"tool_use","id":"tool_2","name":"get_calendar","input":{}}),
+            ),
+        ];
+        assert!(test_group("anthropic-parallel", parallel.clone()).is_ok());
+
+        let mut result_before_call = parallel;
+        result_before_call.swap(1, 2);
+        assert_eq!(
+            test_group("anthropic-result-before-call", result_before_call).unwrap_err(),
             ProviderTranscriptError::InvalidGroupOrder
         );
     }
