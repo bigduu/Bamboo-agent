@@ -2009,7 +2009,11 @@ async fn run_pipeline_inner(
             hook_result?;
         }
 
-        // --- Prompt context refresh ---
+        // --- Turn-boundary refresh, cancellation, and prompt context ---
+        // Admit durable input before deriving this round's memory query. The
+        // shared prelude also checks cancellation before Project/external-memory
+        // work; this pipeline keeps its additional in-flight evaluation cleanup
+        // when that check fires.
         let runtime_context = PromptMemoryRuntimeContext {
             llm: state
                 .auxiliary_models
@@ -2018,13 +2022,22 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        crate::runtime::runner::round_prelude::refresh_round_prompt_context(
-            session,
-            config.prompt_memory_flags,
-            Some(&runtime_context),
-            config.project_context_resolver.as_deref(),
-        )
-        .await?;
+        let prompt_context_result =
+            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+                session,
+                &mut state.runtime_state,
+                config,
+                cancel_token,
+                state.metrics_collector.as_ref(),
+                Some(&runtime_context),
+            )
+            .await;
+        if matches!(&prompt_context_result, Err(AgentError::Cancelled)) {
+            // This early exit skips the post-loop drain, so explicitly abort
+            // auxiliary evaluations before returning (issue #347).
+            abort_in_flight_evaluations(state, event_tx, "run_cancelled").await;
+        }
+        prompt_context_result?;
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -2052,62 +2065,6 @@ async fn run_pipeline_inner(
                 round_count: turn_counter,
             })
             .await;
-
-        // --- Turn-boundary refresh from disk: messages + live permission mode ---
-        // A single load also picks up a mid-run `PATCH /sessions
-        // {permission_mode|bypass_permissions}`: the run owns a Session taken at
-        // spawn and never otherwise re-reads storage, so without this a mode
-        // transition would not take effect until the next run. Adopt the disk
-        // value onto BOTH the live runtime state and the owned session so this
-        // round's per-tool-call flags see it. #540/#770.
-        if let Some(notifications) = config.session_activation_notifications.as_ref() {
-            let mut receiver = notifications.lock();
-            if receiver.has_changed().unwrap_or(false) {
-                let generation = *receiver.borrow_and_update();
-                tracing::debug!(
-                    session_id = %session.id,
-                    generation,
-                    "active loop consumed SessionInbox wake notification at safe boundary"
-                );
-            }
-        }
-        let turn_refresh = state_bridge::refresh_turn_boundary_with_inbox(
-            session,
-            config.storage.as_ref(),
-            config.persistence.as_ref(),
-            config.session_inbox.as_ref(),
-        )
-        .await;
-        if turn_refresh.merged > 0 {
-            tracing::debug!(
-                session_id = %session.id,
-                admitted_messages = turn_refresh.merged,
-                "turn boundary admitted durable SessionInbox work"
-            );
-        }
-        if let Some(disk_mode) = turn_refresh.disk_permission_mode {
-            state.runtime_state.set_permission_mode(disk_mode);
-            session
-                .agent_runtime_state
-                .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-                .set_permission_mode(disk_mode);
-        }
-
-        // --- Cancellation check ---
-        if cancel_token.is_cancelled() {
-            crate::runtime::runner::metrics_lifecycle::record_session_cancelled(
-                state.metrics_collector.as_ref(),
-                &state.session_id,
-                session.messages.len() as u32,
-            );
-            // Abort any in-flight Gold/Task eval before returning: this early exit
-            // skips the post-loop drain, so without this the handle would be
-            // dropped (detached, not aborted) and the eval would keep running its
-            // LLM request to completion — wasted spend + a late event onto the
-            // already-ended stream (issue #347).
-            abort_in_flight_evaluations(state, event_tx, "run_cancelled").await;
-            return Err(AgentError::Cancelled);
-        }
 
         // --- Metrics: round started ---
         crate::runtime::runner::metrics_lifecycle::record_round_started(
@@ -3392,6 +3349,24 @@ mod tests {
             _model: &str,
         ) -> Result<LLMStream, LLMError> {
             Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    struct ContextProbeProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for ContextProbeProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("done".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
         }
     }
 
@@ -5947,6 +5922,69 @@ mod tests {
         )
         .await;
         assert_eq!(running.messages.len(), count_after_first_merge);
+    }
+
+    #[tokio::test]
+    async fn pipeline_admits_disk_user_input_before_prompt_memory_refresh() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+            Arc::new(TestPersistence(storage.clone()));
+        let mut persisted = Session::new("pipeline-boundary-before-recall", "model");
+        persisted.add_message(Message::system("base prompt"));
+        persisted.metadata.insert(
+            "pending_injected_messages".to_string(),
+            serde_json::json!([{
+                "content": "use the just-admitted user correction",
+                "created_at": chrono::Utc::now(),
+            }])
+            .to_string(),
+        );
+        storage.save_session(&persisted).await.unwrap();
+
+        let mut running = persisted;
+        running.metadata.remove("pending_injected_messages");
+        let config = AgentLoopConfig {
+            storage: Some(storage),
+            persistence: Some(persistence),
+            prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            model_name: Some("model".to_string()),
+            max_rounds: 1,
+            ..AgentLoopConfig::default()
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let mut state = e2e_loop_state(&running.id);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        super::run_pipeline(
+            &mut running,
+            &event_tx,
+            Arc::new(ContextProbeProvider),
+            Arc::new(AlwaysOkExecutor),
+            &cancel,
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("the pipeline should complete after refreshing the boundary");
+
+        assert!(running.messages.iter().any(|message| {
+            message.role == bamboo_domain::Role::User
+                && message.content == "use the just-admitted user correction"
+        }));
+        let observability: serde_json::Value = serde_json::from_str(
+            running
+                .metadata
+                .get(crate::runtime::runner::prompt_context::PROMPT_MEMORY_OBSERVABILITY_KEY)
+                .expect("prompt memory refresh should persist observability"),
+        )
+        .unwrap();
+        assert_eq!(observability["latest_user_query_present"], true);
     }
 
     // --- Tests from rounds.rs ---

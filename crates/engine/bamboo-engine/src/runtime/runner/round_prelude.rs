@@ -9,6 +9,7 @@ use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, Role, Session};
+use bamboo_domain::AgentRuntimeState;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
@@ -82,6 +83,80 @@ async fn refresh_project_context(
         .await
         .map(|_| ())
         .map_err(|error| AgentError::ProjectContext(error.to_string()))
+}
+
+/// Refresh the durable turn boundary before deriving any prompt context.
+///
+/// Both the main pipeline and the lifecycle adapter use this exact sequence so
+/// external-memory recall always sees messages admitted for the current round,
+/// while a cancelled run never starts Project or memory context work.
+pub(crate) async fn refresh_round_boundary_and_prompt_context(
+    session: &mut Session,
+    runtime_state: &mut AgentRuntimeState,
+    config: &AgentLoopConfig,
+    cancel_token: &CancellationToken,
+    metrics_collector: Option<&MetricsCollector>,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) -> Result<(), AgentError> {
+    if let Some(notifications) = config.session_activation_notifications.as_ref() {
+        let mut receiver = notifications.lock();
+        if receiver.has_changed().unwrap_or(false) {
+            let generation = *receiver.borrow_and_update();
+            tracing::debug!(
+                session_id = %session.id,
+                generation,
+                "active loop consumed SessionInbox wake notification at safe boundary"
+            );
+        }
+    }
+
+    let turn_refresh = super::state_bridge::refresh_turn_boundary_with_inbox(
+        session,
+        config.storage.as_ref(),
+        config.persistence.as_ref(),
+        config.session_inbox.as_ref(),
+    )
+    .await;
+    if turn_refresh.merged > 0 {
+        tracing::debug!(
+            session_id = %session.id,
+            admitted_messages = turn_refresh.merged,
+            "turn boundary admitted durable SessionInbox work"
+        );
+    }
+    if let Some(disk_mode) = turn_refresh.disk_permission_mode {
+        runtime_state.set_permission_mode(disk_mode);
+        session
+            .agent_runtime_state
+            .get_or_insert_with(AgentRuntimeState::default)
+            .set_permission_mode(disk_mode);
+    }
+
+    ensure_not_cancelled(
+        cancel_token,
+        metrics_collector,
+        &session.id,
+        session.messages.len(),
+    )?;
+
+    refresh_round_prompt_context(
+        session,
+        config.prompt_memory_flags,
+        runtime_context,
+        config.project_context_resolver.as_deref(),
+    )
+    .await?;
+
+    // Preserve the existing post-refresh observation point as well: a cancel
+    // that arrives while context I/O is in flight must still stop before the
+    // provider request. The check above is what prevents already-cancelled runs
+    // from starting context work in the first place.
+    ensure_not_cancelled(
+        cancel_token,
+        metrics_collector,
+        &session.id,
+        session.messages.len(),
+    )
 }
 
 // ---- round_state functions ----
@@ -280,6 +355,7 @@ fn log_round_prompt_refresh_summary(session_id: &str, prompt: &str) {
 pub(crate) async fn prepare_round(
     session: &mut Session,
     task_context: &mut Option<TaskLoopContext>,
+    runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
     llm: Arc<dyn LLMProvider>,
     _tools: &dyn ToolExecutor,
@@ -298,11 +374,13 @@ pub(crate) async fn prepare_round(
         llm: config.background_model_provider.clone().unwrap_or(llm),
         background_model_name: config.background_model_name.clone(),
     };
-    refresh_round_prompt_context(
+    refresh_round_boundary_and_prompt_context(
         session,
-        config.prompt_memory_flags,
+        runtime_state,
+        config,
+        cancel_token,
+        metrics_collector,
         Some(&runtime_context),
-        config.project_context_resolver.as_deref(),
     )
     .await?;
     update_task_round_state(task_context, round, max_rounds);
@@ -315,12 +393,6 @@ pub(crate) async fn prepare_round(
         max_rounds,
         session.messages.len(),
     );
-    ensure_not_cancelled(
-        cancel_token,
-        metrics_collector,
-        session_id,
-        session.messages.len(),
-    )?;
 
     super::metrics_lifecycle::record_round_started(
         metrics_collector,
