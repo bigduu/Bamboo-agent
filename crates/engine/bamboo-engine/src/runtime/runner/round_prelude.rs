@@ -1,5 +1,5 @@
-//! Minimal round prelude — provides `prepare_round` for lifecycle adapter
-//! and `refresh_round_prompt_context` for the pipeline.
+//! Shared round prelude for the lifecycle adapter and main pipeline.
+//! Durable input admission and cancellation checks happen before prompt context.
 
 use std::sync::Arc;
 
