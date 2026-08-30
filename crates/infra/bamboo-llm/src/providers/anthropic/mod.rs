@@ -14,15 +14,19 @@ pub use stream::{
     format_sse_data, format_sse_event, map_completion_stream_chunk, AnthropicStreamAdapter,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
-use bamboo_domain::ToolSchema;
+use bamboo_domain::{
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ToolSchema,
+};
 use bamboo_domain::{
     Message, MessagePart, PromptBlock, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
-    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptOrigin, Role,
+    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    ProviderTranscriptOrigin, Role,
 };
 use reqwest::{header::HeaderMap, Client};
 use serde_json::{json, Value};
@@ -39,6 +43,39 @@ use bamboo_domain::ReasoningEffort;
 
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
+
+const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
+const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+const ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES: [&str; 10] = [
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+];
+
+fn is_official_anthropic_base_url(base_url: &str) -> bool {
+    let normalized = base_url.trim_end_matches('/');
+    normalized.eq_ignore_ascii_case("https://api.anthropic.com")
+        || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
+}
+
+fn supports_anthropic_tool_search(model: &str) -> bool {
+    let model = model.trim();
+    ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES.iter().any(|prefix| {
+        model == *prefix
+            || model.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 9
+                    && suffix.starts_with('-')
+                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
 
 pub(crate) fn reasoning_effort_for_required_tool(
     configured: Option<ReasoningEffort>,
@@ -234,6 +271,21 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LLMProvider for AnthropicProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_none()
+            && is_official_anthropic_base_url(&self.base_url)
+            && supports_anthropic_tool_search(model)
+        {
+            CapabilityLoadingMode::Progressive
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        }
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -253,8 +305,17 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        self.stream_messages_inner(messages, &[], &[], tools, max_output_tokens, model, options)
-            .await
+        self.stream_messages_inner(
+            messages,
+            &[],
+            &[],
+            tools,
+            max_output_tokens,
+            model,
+            options,
+            CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .await
     }
 
     /// Render the canonical [`PromptIR`] into the Anthropic wire: the structured
@@ -272,6 +333,11 @@ impl LLMProvider for AnthropicProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
+        let required_tool = options
+            .and_then(|options| options.required_tool.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let capability_loading_mode = self.capability_loading_mode(model, required_tool).await;
         if ir.system_blocks.is_empty() {
             return self
                 .stream_messages_inner(
@@ -282,6 +348,7 @@ impl LLMProvider for AnthropicProvider {
                     max_output_tokens,
                     model,
                     options,
+                    capability_loading_mode,
                 )
                 .await;
         }
@@ -294,6 +361,7 @@ impl LLMProvider for AnthropicProvider {
             max_output_tokens,
             model,
             options,
+            capability_loading_mode,
         )
         .await
     }
@@ -319,6 +387,7 @@ impl AnthropicProvider {
         max_output_tokens: Option<u32>,
         model: &str,
         options: Option<&LLMRequestOptions>,
+        capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
         let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
@@ -365,7 +434,7 @@ impl AnthropicProvider {
 
         tracing::debug!("Anthropic provider using model: {}", model);
 
-        let mut body = build_anthropic_request_with_cache_blocks_and_native(
+        let mut body = build_anthropic_request_with_cache_blocks_native_mode(
             messages,
             system_blocks,
             tools,
@@ -377,6 +446,7 @@ impl AnthropicProvider {
             cache_plan,
             self.thinking_replay_always,
             native_groups,
+            capability_loading_mode,
         );
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -478,7 +548,7 @@ impl AnthropicProvider {
                     session_log_id,
                     model
                 );
-                let mut fallback_body = build_anthropic_request_with_cache_blocks_and_native(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
                     messages,
                     system_blocks,
                     tools,
@@ -490,6 +560,7 @@ impl AnthropicProvider {
                     cache_plan,
                     false,
                     native_groups,
+                    capability_loading_mode,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -531,7 +602,7 @@ impl AnthropicProvider {
                     model
                 );
 
-                let mut fallback_body = build_anthropic_request_with_cache_blocks_and_native(
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
                     messages,
                     system_blocks,
                     tools,
@@ -543,6 +614,7 @@ impl AnthropicProvider {
                     cache_plan,
                     self.thinking_replay_always,
                     native_groups,
+                    capability_loading_mode,
                 );
                 request_overrides::apply_overrides_to_body(
                     &mut fallback_body,
@@ -748,6 +820,37 @@ fn build_anthropic_request_with_cache_blocks_and_native(
     thinking_replay_always: bool,
     native_groups: &[ProviderTranscriptGroup],
 ) -> Value {
+    build_anthropic_request_with_cache_blocks_native_mode(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        native_groups,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_native_mode(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Value {
     let default_plan = PromptCachePlan {
         cache_tools: true,
         cache_system: true,
@@ -807,9 +910,16 @@ fn build_anthropic_request_with_cache_blocks_and_native(
     // (tools, then system), then on conversation breakpoints nearest the end.
     let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
 
-    let mut tools_json = tools_to_anthropic_json(tools);
+    let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
     if plan.cache_tools && budget > 0 {
-        if let Some(last_tool) = tools_json.last_mut().and_then(|t| t.as_object_mut()) {
+        if let Some(last_tool) = tools_json.iter_mut().rev().find_map(|tool| {
+            let object = tool.as_object_mut()?;
+            (!object
+                .get("defer_loading")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+            .then_some(object)
+        }) {
             last_tool.insert("cache_control".to_string(), cache_control_value(ttl));
             budget -= 1;
         }
@@ -857,6 +967,8 @@ fn build_anthropic_request_with_cache_blocks_and_native(
         &source_spans,
         native_groups,
         thinking_enabled,
+        tools,
+        capability_loading_mode,
     );
 
     let mut body = json!({
@@ -897,6 +1009,8 @@ fn apply_anthropic_native_groups(
     source_spans: &[Vec<SourceSpan>],
     groups: &[ProviderTranscriptGroup],
     thinking_enabled: bool,
+    eligible_tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
 ) {
     struct Replacement {
         message_index: usize,
@@ -905,6 +1019,19 @@ fn apply_anthropic_native_groups(
         end: usize,
         items: Vec<Value>,
     }
+
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return;
+    }
+
+    let eligible_execution_names = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
 
     let mut groups_by_anchor: HashMap<&str, Vec<&ProviderTranscriptGroup>> = HashMap::new();
     for group in groups.iter().filter(|group| {
@@ -934,9 +1061,6 @@ fn apply_anthropic_native_groups(
         };
         let spans = &source_spans[message_index];
         let span = &spans[span_index];
-        if !span.is_assistant {
-            continue;
-        }
         let start = span.start_block;
         let end = span.end_block;
 
@@ -946,6 +1070,27 @@ fn apply_anthropic_native_groups(
             .flat_map(|group| group.items().iter().cloned())
             .collect::<Vec<_>>();
         if ProviderTranscriptGroup::validate_items(&items).is_err() {
+            continue;
+        }
+        let custom_host_result = items.iter().all(|item| {
+            item.origin() == ProviderTranscriptOrigin::HostToolSearch
+                && item.kind() == ProviderTranscriptItemKind::AnthropicToolResult
+        });
+        if custom_host_result {
+            if !span.is_tool_result {
+                continue;
+            }
+        } else if !span.is_assistant {
+            continue;
+        }
+        if items
+            .iter()
+            .flat_map(anthropic_reference_names)
+            .any(|reference| !eligible_execution_names.contains(reference))
+        {
+            // Anthropic resolves the literal reference against this request's
+            // top-level catalog. Keep the normalized anchor instead of sending
+            // a native group that the provider would reject with a 400.
             continue;
         }
         let thinking_positions = items
@@ -1196,6 +1341,7 @@ fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Val
 struct SourceSpan {
     id: String,
     is_assistant: bool,
+    is_tool_result: bool,
     start_block: usize,
     end_block: usize,
 }
@@ -1286,6 +1432,7 @@ fn messages_to_anthropic_json(
                                 last_spans.push(SourceSpan {
                                     id: m.id.clone(),
                                     is_assistant: matches!(m.role, Role::Assistant),
+                                    is_tool_result: matches!(m.role, Role::Tool),
                                     start_block,
                                     end_block: last_content.len(),
                                 });
@@ -1303,6 +1450,7 @@ fn messages_to_anthropic_json(
                 out_spans.push(vec![SourceSpan {
                     id: m.id.clone(),
                     is_assistant: matches!(m.role, Role::Assistant),
+                    is_tool_result: matches!(m.role, Role::Tool),
                     start_block: 0,
                     end_block,
                 }]);
@@ -1635,17 +1783,113 @@ fn tool_call_to_tool_use_block(tool_call: &bamboo_domain::ToolCall) -> Value {
     })
 }
 
-fn tools_to_anthropic_json(tools: &[ToolSchema]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|t| {
-            json!({
-                "name": t.function.name,
-                "description": t.function.description,
-                "input_schema": t.function.parameters,
+fn tools_to_anthropic_json(
+    tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Vec<Value> {
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "input_schema": tool.function.parameters,
+                })
             })
+            .collect();
+    }
+
+    let mut rendered = tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            if identity.loading_class() == CapabilityLoadingClass::HostOnly {
+                return None;
+            }
+            let mut value = json!({
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "input_schema": tool.function.parameters,
+            });
+            if identity.loading_class() == CapabilityLoadingClass::Deferred {
+                value["defer_loading"] = Value::Bool(true);
+            }
+            Some(value)
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    rendered.push(json!({
+        "type": ANTHROPIC_TOOL_SEARCH_TYPE,
+        "name": ANTHROPIC_TOOL_SEARCH_NAME,
+    }));
+    rendered
+}
+
+fn anthropic_reference_names(item: &ProviderTranscriptItem) -> Vec<&str> {
+    match item.kind() {
+        ProviderTranscriptItemKind::AnthropicToolSearchToolResult => item
+            .payload()
+            .get("content")
+            .and_then(|content| content.get("tool_references"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        ProviderTranscriptItemKind::AnthropicToolResult => item
+            .payload()
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract provider-loaded tool identities from already typed Anthropic history.
+///
+/// Only references that name an exact definition in this request's eligible
+/// catalog are returned. This keeps the top-level `tools` array authoritative:
+/// an unknown, removed, disabled, HostOnly, or alias-only reference cannot make
+/// a function callable or produce an upstream missing-definition error.
+pub fn validated_anthropic_loaded_tool_names<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Vec<String> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut loaded = BTreeSet::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let Some(execution_name) =
+                resolve_tool_reference_name(reference, |name| catalog.contains(name))
+            else {
+                continue;
+            };
+            // Anthropic expands the literal `tool_name` by looking it up in the
+            // top-level array. Keep only exact request identities; aliases must
+            // be canonicalized before a custom typed result is persisted.
+            if execution_name == reference {
+                loaded.insert(execution_name);
+            }
+        }
+    }
+
+    loaded.into_iter().collect()
 }
 
 /// Stateful parser for Anthropic SSE streaming events.
@@ -2382,6 +2626,17 @@ mod anthropic_request_building {
     const TEST_PROVIDER_BOUNDARY: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} description"),
+                parameters: json!({"type":"object"}),
+            },
+        }
+    }
+
     fn native_item(
         author: super::ProviderTranscriptAuthor,
         payload: Value,
@@ -2593,6 +2848,8 @@ mod anthropic_request_building {
         session
             .append_provider_transcript_group(&anchor, None, items)
             .unwrap();
+        let session: bamboo_domain::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
         let groups = session
             .provider_transcript
             .replayable_groups(
@@ -2603,10 +2860,11 @@ mod anthropic_request_building {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
-        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
             &session.messages,
             &[],
-            &[],
+            &tools,
             "claude-sonnet-4-6",
             4096,
             true,
@@ -2615,8 +2873,224 @@ mod anthropic_request_building {
             None,
             false,
             &groups,
+            super::CapabilityLoadingMode::Progressive,
         );
         assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
+        let tools = [
+            "Bash",
+            "Read",
+            "Glob",
+            "bash",
+            "Workspace",
+            "discover_capabilities",
+        ]
+        .into_iter()
+        .map(tool_schema)
+        .collect::<Vec<_>>();
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(
+            rendered.len(),
+            5,
+            "HostOnly is replaced by one search entry"
+        );
+        assert_eq!(rendered[0]["name"], "Bash");
+        assert_eq!(rendered[1]["name"], "Read");
+        assert_eq!(rendered[2]["name"], "Glob");
+        assert_eq!(rendered[2]["defer_loading"], true);
+        assert_eq!(rendered[3]["name"], "bash");
+        assert_eq!(
+            rendered[3]["defer_loading"], true,
+            "a custom exact lowercase alias must not inherit Core policy"
+        );
+        assert!(rendered[0].get("defer_loading").is_none());
+        assert!(rendered[1].get("defer_loading").is_none());
+        assert!(rendered[2].get("cache_control").is_none());
+        assert!(rendered[3].get("cache_control").is_none());
+        assert_eq!(rendered[4]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert_eq!(rendered[4]["name"], super::ANTHROPIC_TOOL_SEARCH_NAME);
+        assert!(rendered[4].get("defer_loading").is_none());
+        assert_eq!(rendered[4]["cache_control"]["type"], "ephemeral");
+
+        let legacy = super::build_anthropic_request(
+            &[Message::user("inspect")],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(legacy["tools"].as_array().unwrap().len(), tools.len());
+        assert_eq!(legacy["tools"][5]["name"], "discover_capabilities");
+        assert!(legacy.to_string().find("defer_loading").is_none());
+        assert!(legacy
+            .to_string()
+            .find(super::ANTHROPIC_TOOL_SEARCH_TYPE)
+            .is_none());
+    }
+
+    #[test]
+    fn progressive_cache_can_be_disabled_without_changing_deferred_catalog() {
+        let tools = vec![tool_schema("Bash"), tool_schema("Glob")];
+        let plan = crate::cache::PromptCachePlan {
+            cache_tools: false,
+            ..Default::default()
+        };
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            Some(&plan),
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(rendered[1]["defer_loading"], true);
+        assert!(rendered
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn custom_tool_reference_replays_at_tool_result_anchor_and_loads_exact_name() {
+        let tools = vec![tool_schema("custom_search"), tool_schema("get_weather")];
+        let mut session = bamboo_domain::Session::new("custom-search", "claude");
+        session.add_message(Message::user("weather"));
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized search result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search","is_error":false,
+                "content":[{"type":"tool_reference","tool_name":"get_weather"}]
+            }),
+        )
+        .unwrap();
+        let expected = item.payload().clone();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        assert_eq!(
+            super::validated_anthropic_loaded_tool_names(groups.iter(), &tools),
+            vec!["get_weather"]
+        );
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][2]["content"], json!([expected]));
+        assert!(!body.to_string().contains("normalized search result"));
+    }
+
+    #[test]
+    fn missing_custom_reference_is_not_loaded_or_replayed() {
+        let tools = vec![tool_schema("custom_search")];
+        let mut session = bamboo_domain::Session::new("missing-custom-search", "claude");
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized missing result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search",
+                "content":[{"type":"tool_reference","tool_name":"missing_tool"}]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+        assert!(super::validated_anthropic_loaded_tool_names(groups.iter(), &tools).is_empty());
+
+        for mode in [
+            super::CapabilityLoadingMode::Progressive,
+            super::CapabilityLoadingMode::LegacyFullCatalog,
+        ] {
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                mode,
+            );
+            assert!(body.to_string().contains("normalized missing result"));
+            assert!(!body.to_string().contains("missing_tool"));
+        }
     }
 
     #[test]
@@ -2725,10 +3199,11 @@ mod anthropic_request_building {
             .cloned()
             .collect::<Vec<_>>();
 
-        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+        let tools = vec![tool_schema("get_first"), tool_schema("get_second")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
             &session.messages,
             &[],
-            &[],
+            &tools,
             "claude-sonnet-4-6",
             4096,
             true,
@@ -2737,6 +3212,7 @@ mod anthropic_request_building {
             None,
             false,
             &groups,
+            super::CapabilityLoadingMode::Progressive,
         );
         assert_eq!(body["messages"][1]["content"], json!(expected));
     }
@@ -3056,7 +3532,7 @@ mod anthropic_request_building {
                 .append_provider_transcript_group(&anchor, None, discovery_items())
                 .unwrap();
             let groups = replayable_native_groups(&session);
-            let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
                 &session.messages,
                 &[],
                 &[],
@@ -3068,6 +3544,7 @@ mod anthropic_request_building {
                 None,
                 false,
                 &groups,
+                super::CapabilityLoadingMode::Progressive,
             );
             let serialized = body.to_string();
             assert!(!serialized.contains("server_tool_use"));
@@ -3091,10 +3568,11 @@ mod anthropic_request_building {
             .append_provider_transcript_group(&anchor, None, items)
             .unwrap();
         let groups = replayable_native_groups(&session);
-        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
             &session.messages,
             &[],
-            &[],
+            &tools,
             "claude-sonnet-4-6",
             4096,
             true,
@@ -3103,6 +3581,7 @@ mod anthropic_request_building {
             None,
             false,
             &groups,
+            super::CapabilityLoadingMode::Progressive,
         );
         assert_eq!(body["messages"][1]["content"], json!(expected));
     }
@@ -3154,7 +3633,7 @@ mod anthropic_request_building {
                 .append_provider_transcript_group(&second_anchor, None, second_items)
                 .unwrap();
             let groups = replayable_native_groups(&session);
-            let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
                 &session.messages,
                 &[],
                 &[],
@@ -3166,6 +3645,7 @@ mod anthropic_request_building {
                 None,
                 false,
                 &groups,
+                super::CapabilityLoadingMode::Progressive,
             );
 
             assert_eq!(body["messages"][1]["content"], json!(expected));
@@ -3202,10 +3682,11 @@ mod anthropic_request_building {
             .unwrap();
         let groups = replayable_native_groups(&session);
 
-        let enabled = super::build_anthropic_request_with_cache_blocks_and_native(
+        let tools = vec![tool_schema("get_weather")];
+        let enabled = super::build_anthropic_request_with_cache_blocks_native_mode(
             &session.messages,
             &[],
-            &[],
+            &tools,
             "claude-sonnet-4-6",
             4096,
             true,
@@ -3214,6 +3695,7 @@ mod anthropic_request_building {
             None,
             false,
             &groups,
+            super::CapabilityLoadingMode::Progressive,
         );
         assert!(enabled.get("thinking").is_some());
         assert_eq!(enabled["messages"][1]["content"][0]["type"], "thinking");
@@ -5739,6 +6221,117 @@ mod anthropic_provider_tests {
                 description: "Load one skill".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_loading_requires_official_endpoint_supported_model_and_no_required_tool() {
+        let provider = AnthropicProvider::new("test-key");
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5-20260830",
+            "claude-opus-5",
+            "claude-opus-4-8-20260830",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::Progressive,
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-opus-4-1",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4-50",
+            "unknown-model",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        assert_eq!(
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_selected_mode_controls_deferred_catalog_shape() {
+        let provider = AnthropicProvider::new("test-key");
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "Read".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                },
+            },
+            load_skill_tool(),
+        ];
+        let render = |mode| {
+            build_anthropic_request_with_cache_blocks_native_mode(
+                &[Message::user("inspect")],
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &[],
+                mode,
+            )
+        };
+
+        let progressive = render(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        );
+        assert_eq!(progressive["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(progressive["tools"][0]["name"], "Read");
+        assert_eq!(progressive["tools"][1]["defer_loading"], true);
+        assert_eq!(progressive["tools"][2]["type"], ANTHROPIC_TOOL_SEARCH_TYPE);
+
+        for mode in [
+            provider
+                .capability_loading_mode("claude-opus-4-1", None)
+                .await,
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        ] {
+            let legacy = render(mode);
+            assert_eq!(legacy["tools"].as_array().unwrap().len(), 2);
+            assert!(legacy.to_string().find("defer_loading").is_none());
+            assert!(legacy
+                .to_string()
+                .find(ANTHROPIC_TOOL_SEARCH_TYPE)
+                .is_none());
         }
     }
 

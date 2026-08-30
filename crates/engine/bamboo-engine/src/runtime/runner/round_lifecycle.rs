@@ -23,6 +23,9 @@ mod token_estimation;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;
 pub(crate) use stream_execution::discard_latest_interrupted_assistant_output;
+pub(in crate::runtime::runner) use stream_execution::{
+    effective_tool_schemas, required_tool_for_session,
+};
 
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,

@@ -412,12 +412,14 @@ fn measure_request_usage(
     }
 }
 
-fn required_tool_for_session(session: &Session) -> Option<&'static str> {
+pub(in crate::runtime::runner) fn required_tool_for_session(
+    session: &Session,
+) -> Option<&'static str> {
     crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session)
         .then_some("load_skill")
 }
 
-fn effective_tool_schemas<'a>(
+pub(in crate::runtime::runner) fn effective_tool_schemas<'a>(
     session: &Session,
     tool_schemas: &'a [ToolSchema],
 ) -> Cow<'a, [ToolSchema]> {
