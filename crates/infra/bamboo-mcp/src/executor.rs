@@ -3,6 +3,8 @@ use bamboo_agent_core::{
     parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
     ToolOutcome, ToolResult, ToolResultImage, ToolSchema,
 };
+use bamboo_domain::resolve_tool_reference_name;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
@@ -231,6 +233,10 @@ impl ToolExecutor for McpToolExecutor {
             .collect()
     }
 
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        self.index.contains_exact_alias(tool_name)
+    }
+
     /// Each connected MCP server's `instructions`, rendered as a labeled block.
     /// Only ready servers contribute, so this guidance is automatically scoped to
     /// whatever is loaded for the run.
@@ -258,26 +264,70 @@ pub struct CompositeToolExecutor {
     mcp: Arc<dyn ToolExecutor>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompositeRoute {
+    Builtin { execution_name: String },
+    Secondary { execution_name: String },
+    LegacyFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompositeOwner {
+    Builtin,
+    Secondary,
+    None,
+}
+
 impl CompositeToolExecutor {
     pub fn new(builtin: Arc<dyn ToolExecutor>, mcp: Arc<dyn ToolExecutor>) -> Self {
         Self { builtin, mcp }
+    }
+
+    /// Resolve once against both children. Builtin wins duplicate exact names;
+    /// the secondary wins an exact shadow before builtin alias fallback.
+    fn route(&self, reference: &str) -> CompositeRoute {
+        let mut owners = HashMap::<String, CompositeOwner>::new();
+        let mut selected_owner = CompositeOwner::None;
+        let resolved = resolve_tool_reference_name(reference, |candidate| {
+            let owner = *owners.entry(candidate.to_string()).or_insert_with(|| {
+                if self.builtin.owns_exact_tool(candidate) {
+                    CompositeOwner::Builtin
+                } else if self.mcp.owns_exact_tool(candidate) {
+                    CompositeOwner::Secondary
+                } else {
+                    CompositeOwner::None
+                }
+            });
+            if owner != CompositeOwner::None {
+                selected_owner = owner;
+                true
+            } else {
+                false
+            }
+        });
+        let Some(execution_name) = resolved else {
+            return CompositeRoute::LegacyFallback;
+        };
+        match selected_owner {
+            CompositeOwner::Builtin => CompositeRoute::Builtin { execution_name },
+            CompositeOwner::Secondary => CompositeRoute::Secondary { execution_name },
+            CompositeOwner::None => CompositeRoute::LegacyFallback,
+        }
+    }
+
+    fn call_with_execution_name(call: &ToolCall, execution_name: &str) -> ToolCall {
+        let mut resolved_call = call.clone();
+        resolved_call.function.name = execution_name.to_string();
+        resolved_call
     }
 }
 
 #[async_trait]
 impl ToolExecutor for CompositeToolExecutor {
     async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
-        // Try built-in first
-        match self.builtin.execute(call).await {
-            Ok(result) => return Ok(result),
-            Err(ToolError::NotFound(_)) => {
-                // Fall through to MCP
-            }
-            Err(e) => return Err(e),
-        }
-
-        // Try MCP
-        self.mcp.execute(call).await
+        self.execute_with_context_outcome(call, ToolExecutionContext::none(&call.id))
+            .await
+            .map(ToolOutcome::into_tool_result)
     }
 
     async fn execute_with_context(
@@ -285,17 +335,9 @@ impl ToolExecutor for CompositeToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> std::result::Result<ToolResult, ToolError> {
-        // Try built-in first (preserve context for streaming tools).
-        match self.builtin.execute_with_context(call, ctx).await {
-            Ok(result) => return Ok(result),
-            Err(ToolError::NotFound(_)) => {
-                // Fall through to MCP
-            }
-            Err(e) => return Err(e),
-        }
-
-        // Try MCP (context ignored by default).
-        self.mcp.execute_with_context(call, ctx).await
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
     }
 
     /// Outcome-aware dispatch. MUST be overridden here (not left to the trait
@@ -312,15 +354,48 @@ impl ToolExecutor for CompositeToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> std::result::Result<ToolOutcome, ToolError> {
-        match self.builtin.execute_with_context_outcome(call, ctx).await {
-            Ok(outcome) => return Ok(outcome),
-            Err(ToolError::NotFound(_)) => {
-                // Fall through to MCP.
+        match self.route(&call.function.name) {
+            CompositeRoute::Builtin { execution_name } => {
+                self.builtin
+                    .execute_exact_with_context_outcome(call, &execution_name, ctx)
+                    .await
             }
-            Err(e) => return Err(e),
+            CompositeRoute::Secondary { execution_name } => {
+                self.mcp
+                    .execute_exact_with_context_outcome(call, &execution_name, ctx)
+                    .await
+            }
+            CompositeRoute::LegacyFallback => {
+                match self.builtin.execute_with_context_outcome(call, ctx).await {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(ToolError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+                self.mcp.execute_with_context_outcome(call, ctx).await
+            }
         }
+    }
 
-        self.mcp.execute_with_context_outcome(call, ctx).await
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> std::result::Result<ToolOutcome, ToolError> {
+        if self.builtin.owns_exact_tool(execution_name) {
+            self.builtin
+                .execute_exact_with_context_outcome(call, execution_name, ctx)
+                .await
+        } else if self.mcp.owns_exact_tool(execution_name) {
+            self.mcp
+                .execute_exact_with_context_outcome(call, execution_name, ctx)
+                .await
+        } else {
+            Err(ToolError::NotFound(format!(
+                "Tool '{}' not found",
+                execution_name
+            )))
+        }
     }
 
     /// Delegate the permission gate to the built-in executor, which is where the
@@ -338,13 +413,147 @@ impl ToolExecutor for CompositeToolExecutor {
         call: &ToolCall,
         ctx: &ToolExecutionContext<'_>,
     ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
-        self.builtin.check_permissions_for(call, ctx).await
+        match self.route(&call.function.name) {
+            CompositeRoute::Builtin { execution_name } => {
+                self.builtin
+                    .check_permissions_for_exact(call, &execution_name, ctx)
+                    .await
+            }
+            CompositeRoute::Secondary { execution_name } => {
+                let args = ctx
+                    .pre_parsed_args
+                    .cloned()
+                    .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+                self.builtin
+                    .check_permissions_for_resolved(call, &execution_name, &args, ctx)
+                    .await
+            }
+            CompositeRoute::LegacyFallback => self.builtin.check_permissions_for(call, ctx).await,
+        }
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+        if self.builtin.owns_exact_tool(execution_name) {
+            self.builtin
+                .check_permissions_for_exact(call, execution_name, ctx)
+                .await
+        } else if self.mcp.owns_exact_tool(execution_name) {
+            let args = ctx
+                .pre_parsed_args
+                .cloned()
+                .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+            self.builtin
+                .check_permissions_for_resolved(call, execution_name, &args, ctx)
+                .await
+        } else {
+            Err(ToolError::NotFound(format!(
+                "Tool '{}' not found",
+                execution_name
+            )))
+        }
+    }
+
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+        // The builtin executor hosts the real permission policy for every live
+        // surface, including MCP and the server overlays stacked above this
+        // composite. Preserve that architecture while forwarding the exact
+        // identity and effective arguments selected by the routing layer.
+        self.builtin
+            .check_permissions_for_resolved(call, execution_name, args, ctx)
+            .await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.builtin.list_tools();
-        tools.extend(self.mcp.list_tools());
+        let mut names: HashSet<String> = tools
+            .iter()
+            .map(|schema| schema.function.name.clone())
+            .collect();
+        tools.extend(
+            self.mcp
+                .list_tools()
+                .into_iter()
+                .filter(|schema| names.insert(schema.function.name.clone())),
+        );
         tools
+    }
+
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        self.builtin.owns_exact_tool(tool_name) || self.mcp.owns_exact_tool(tool_name)
+    }
+
+    fn tool_mutability(&self, tool_name: &str) -> bamboo_agent_core::ToolMutability {
+        match self.route(tool_name) {
+            CompositeRoute::Builtin { execution_name } => {
+                self.builtin.tool_mutability(&execution_name)
+            }
+            CompositeRoute::Secondary { execution_name } => {
+                self.mcp.tool_mutability(&execution_name)
+            }
+            CompositeRoute::LegacyFallback => bamboo_agent_core::classify_tool(tool_name),
+        }
+    }
+
+    fn call_mutability(&self, call: &ToolCall) -> bamboo_agent_core::ToolMutability {
+        self.call_parallel_classification(call).0
+    }
+
+    fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
+        match self.route(tool_name) {
+            CompositeRoute::Builtin { execution_name } => {
+                self.builtin.tool_concurrency_safe(&execution_name)
+            }
+            CompositeRoute::Secondary { execution_name } => {
+                self.mcp.tool_concurrency_safe(&execution_name)
+            }
+            CompositeRoute::LegacyFallback => {
+                bamboo_agent_core::classify_tool(tool_name)
+                    == bamboo_agent_core::ToolMutability::ReadOnly
+            }
+        }
+    }
+
+    fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
+        self.call_parallel_classification(call).1
+    }
+
+    fn call_parallel_classification(
+        &self,
+        call: &ToolCall,
+    ) -> (bamboo_agent_core::ToolMutability, bool) {
+        match self.route(&call.function.name) {
+            CompositeRoute::Builtin { execution_name } => self
+                .builtin
+                .call_parallel_classification(&Self::call_with_execution_name(
+                    call,
+                    &execution_name,
+                )),
+            CompositeRoute::Secondary { execution_name } => {
+                self.mcp
+                    .call_parallel_classification(&Self::call_with_execution_name(
+                        call,
+                        &execution_name,
+                    ))
+            }
+            CompositeRoute::LegacyFallback => {
+                let mutability = bamboo_agent_core::classify_tool(&call.function.name);
+                (
+                    mutability,
+                    mutability == bamboo_agent_core::ToolMutability::ReadOnly,
+                )
+            }
+        }
     }
 
     fn tool_guidance(&self) -> Option<String> {
@@ -393,6 +602,295 @@ mod tests {
         fn tool_guidance(&self) -> Option<String> {
             self.0.map(str::to_string)
         }
+    }
+
+    struct RoutingStub {
+        exact_names: Vec<&'static str>,
+        label: &'static str,
+        apply_patch_alias: bool,
+        error: Option<ToolError>,
+        classification: (bamboo_agent_core::ToolMutability, bool),
+        executed: Arc<std::sync::Mutex<Vec<String>>>,
+        permission_checked: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        permission_reresolution: Option<(&'static str, &'static str)>,
+        classified: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RoutingStub {
+        fn new(exact_names: Vec<&'static str>, label: &'static str) -> Self {
+            Self {
+                exact_names,
+                label,
+                apply_patch_alias: false,
+                error: None,
+                classification: (bamboo_agent_core::ToolMutability::Mutating, false),
+                executed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                permission_checked: Arc::new(std::sync::Mutex::new(Vec::new())),
+                permission_reresolution: None,
+                classified: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn schema(name: &str) -> ToolSchema {
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: name.to_string(),
+                    description: "routing stub".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for RoutingStub {
+        async fn execute(&self, call: &ToolCall) -> std::result::Result<ToolResult, ToolError> {
+            let exact = self.owns_exact_tool(&call.function.name);
+            let accepted_alias = self.apply_patch_alias
+                && call.function.name == "apply_patch"
+                && self.owns_exact_tool("Edit");
+            if !exact && !accepted_alias {
+                return Err(ToolError::NotFound(call.function.name.clone()));
+            }
+            self.executed
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(ToolResult {
+                success: true,
+                result: self.label.to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        async fn check_permissions_for(
+            &self,
+            call: &ToolCall,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+            let args = parse_tool_args_best_effort(&call.function.arguments).0;
+            let permission_name = self
+                .permission_reresolution
+                .filter(|(reference, _)| *reference == call.function.name)
+                .map(|(_, alias)| alias)
+                .unwrap_or(&call.function.name);
+            self.permission_checked
+                .lock()
+                .unwrap()
+                .push((permission_name.to_string(), args));
+            Ok(None)
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.exact_names
+                .iter()
+                .map(|name| Self::schema(name))
+                .collect()
+        }
+
+        fn owns_exact_tool(&self, tool_name: &str) -> bool {
+            self.exact_names.contains(&tool_name)
+        }
+
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::ToolMutability, bool) {
+            self.classified
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            self.classification
+        }
+    }
+
+    #[tokio::test]
+    async fn secondary_exact_apply_patch_beats_builtin_alias_across_all_routes() {
+        let mut builtin = RoutingStub::new(vec!["Edit"], "builtin-edit");
+        builtin.apply_patch_alias = true;
+        let builtin_executed = builtin.executed.clone();
+        let builtin_permissions = builtin.permission_checked.clone();
+
+        let mut secondary = RoutingStub::new(vec!["apply_patch"], "secondary-exact");
+        secondary.classification = (bamboo_agent_core::ToolMutability::ReadOnly, true);
+        let secondary_executed = secondary.executed.clone();
+        let secondary_permissions = secondary.permission_checked.clone();
+
+        let composite = CompositeToolExecutor::new(Arc::new(builtin), Arc::new(secondary));
+        let call = create_test_tool_call("apply_patch", r#"{"path":"custom"}"#);
+
+        let result = composite
+            .execute(&call)
+            .await
+            .expect("secondary exact owner must execute");
+        assert_eq!(result.result, "secondary-exact");
+        assert!(builtin_executed.lock().unwrap().is_empty());
+        assert_eq!(
+            secondary_executed.lock().unwrap().as_slice(),
+            ["apply_patch"]
+        );
+        assert_eq!(
+            composite.call_parallel_classification(&call),
+            (bamboo_agent_core::ToolMutability::ReadOnly, true)
+        );
+
+        composite
+            .check_permissions_for(&call, &ToolExecutionContext::none(&call.id))
+            .await
+            .expect("secondary permission check");
+        assert_eq!(
+            builtin_permissions.lock().unwrap().as_slice(),
+            [(
+                "apply_patch".to_string(),
+                serde_json::json!({"path": "custom"})
+            )]
+        );
+        assert!(secondary_permissions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stacked_composites_keep_the_selected_builtin_exact_identity() {
+        let mut builtin = RoutingStub::new(vec!["custom_tool"], "builtin-custom");
+        builtin.permission_reresolution = Some(("default::custom_tool", "legacy_alias_owner"));
+        let builtin = Arc::new(builtin);
+        let builtin_executed = builtin.executed.clone();
+        let builtin_permissions = builtin.permission_checked.clone();
+        let builtin_classified = builtin.classified.clone();
+
+        let mut secondary = RoutingStub::new(vec!["legacy_alias_owner"], "secondary-alias");
+        secondary.classification = (bamboo_agent_core::ToolMutability::ReadOnly, true);
+        let secondary_executed = secondary.executed.clone();
+        let secondary_permissions = secondary.permission_checked.clone();
+        let secondary_classified = secondary.classified.clone();
+        let call = create_test_tool_call("default::custom_tool", r#"{"path":"selected-owner"}"#);
+        let ctx = ToolExecutionContext::none(&call.id);
+
+        builtin
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("raw permission repro");
+        assert_eq!(
+            builtin_permissions.lock().unwrap().as_slice(),
+            [(
+                "legacy_alias_owner".to_string(),
+                serde_json::json!({"path": "selected-owner"})
+            )],
+            "the generic raw gate demonstrates the re-resolution mismatch"
+        );
+        builtin_permissions.lock().unwrap().clear();
+
+        let inner = Arc::new(CompositeToolExecutor::new(builtin, Arc::new(secondary)));
+        let composite = CompositeToolExecutor::new(inner, Arc::new(GuidanceStub(None)));
+        let result = composite
+            .execute(&call)
+            .await
+            .expect("selected builtin exact owner executes");
+        assert_eq!(result.result, "builtin-custom");
+        composite
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("selected builtin exact owner permission check");
+        assert_eq!(
+            composite.call_parallel_classification(&call),
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        );
+
+        assert_eq!(builtin_executed.lock().unwrap().as_slice(), ["custom_tool"]);
+        assert_eq!(
+            builtin_permissions.lock().unwrap().as_slice(),
+            [(
+                "custom_tool".to_string(),
+                serde_json::json!({"path": "selected-owner"})
+            )]
+        );
+        assert_eq!(
+            builtin_classified.lock().unwrap().as_slice(),
+            ["custom_tool"]
+        );
+        assert!(secondary_executed.lock().unwrap().is_empty());
+        assert!(secondary_permissions.lock().unwrap().is_empty());
+        assert!(secondary_classified.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unshadowed_apply_patch_preserves_builtin_alias_fallback() {
+        let mut builtin = RoutingStub::new(vec!["Edit"], "builtin-edit");
+        builtin.apply_patch_alias = true;
+        let composite = CompositeToolExecutor::new(
+            Arc::new(builtin),
+            Arc::new(RoutingStub::new(Vec::new(), "secondary")),
+        );
+
+        let result = composite
+            .execute(&create_test_tool_call("apply_patch", "{}"))
+            .await
+            .expect("unshadowed alias must retain builtin behavior");
+        assert_eq!(result.result, "builtin-edit");
+    }
+
+    #[tokio::test]
+    async fn namespace_fallback_executes_the_selected_secondary_exact_identity() {
+        let secondary = RoutingStub::new(vec!["custom_tool"], "secondary-custom");
+        let composite = CompositeToolExecutor::new(
+            Arc::new(RoutingStub::new(Vec::new(), "builtin")),
+            Arc::new(secondary),
+        );
+
+        let result = composite
+            .execute(&create_test_tool_call("default::custom_tool", "{}"))
+            .await
+            .expect("namespace fallback must execute secondary exact identity");
+        assert_eq!(result.result, "secondary-custom");
+    }
+
+    #[tokio::test]
+    async fn selected_exact_owner_errors_never_fall_through() {
+        for error in [
+            ToolError::NotFound("secondary exact missing".to_string()),
+            ToolError::Execution("secondary exact denied".to_string()),
+        ] {
+            let mut builtin = RoutingStub::new(vec!["Edit"], "builtin-fallback");
+            builtin.apply_patch_alias = true;
+            let builtin_executed = builtin.executed.clone();
+            let mut secondary = RoutingStub::new(vec!["apply_patch"], "secondary");
+            secondary.error = Some(error.clone());
+            let composite = CompositeToolExecutor::new(Arc::new(builtin), Arc::new(secondary));
+
+            let actual = composite
+                .execute(&create_test_tool_call("apply_patch", "{}"))
+                .await
+                .expect_err("selected exact owner error must propagate");
+            assert_eq!(actual.to_string(), error.to_string());
+            assert!(builtin_executed.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_exact_names_are_builtin_first_and_listed_once() {
+        let builtin = RoutingStub::new(vec!["duplicate"], "builtin");
+        let secondary = RoutingStub::new(vec!["duplicate"], "secondary");
+        let secondary_executed = secondary.executed.clone();
+        let composite = CompositeToolExecutor::new(Arc::new(builtin), Arc::new(secondary));
+
+        let result = composite
+            .execute(&create_test_tool_call("duplicate", "{}"))
+            .await
+            .expect("builtin duplicate owner must win");
+        assert_eq!(result.result, "builtin");
+        assert!(secondary_executed.lock().unwrap().is_empty());
+        assert_eq!(
+            composite
+                .list_tools()
+                .iter()
+                .filter(|schema| schema.function.name == "duplicate")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -739,7 +1237,7 @@ mod tests {
     #[tokio::test]
     async fn test_composite_executor_builtin_success() {
         let mut mock_builtin = MockToolExecutor::new();
-        let mock_mcp = MockToolExecutor::new();
+        let mut mock_mcp = MockToolExecutor::new();
 
         // Built-in succeeds, MCP should not be called
         mock_builtin.expect_execute().returning(|_| {
@@ -761,6 +1259,7 @@ mod tests {
                 },
             }]
         });
+        mock_mcp.expect_list_tools().returning(Vec::new);
 
         let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 
@@ -773,7 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn test_composite_executor_builtin_error() {
         let mut mock_builtin = MockToolExecutor::new();
-        let mock_mcp = MockToolExecutor::new();
+        let mut mock_mcp = MockToolExecutor::new();
 
         // Built-in returns error (not NotFound), should propagate
         mock_builtin
@@ -790,6 +1289,7 @@ mod tests {
                 },
             }]
         });
+        mock_mcp.expect_list_tools().returning(Vec::new);
 
         let composite = CompositeToolExecutor::new(Arc::new(mock_builtin), Arc::new(mock_mcp));
 

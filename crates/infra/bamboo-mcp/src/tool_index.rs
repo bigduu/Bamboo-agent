@@ -116,6 +116,15 @@ impl ToolIndex {
     pub fn contains(&self, alias: &str) -> bool {
         self.aliases.contains_key(alias)
     }
+
+    /// Check ownership of a complete, exact alias identity.
+    ///
+    /// Keep this separate from compatibility lookup/containment APIs: executor
+    /// routing must never treat a canonicalized or unambiguous legacy reference
+    /// as an exact owner.
+    pub fn contains_exact_alias(&self, alias: &str) -> bool {
+        self.aliases.contains_key(alias)
+    }
 }
 
 impl Default for ToolIndex {
@@ -245,5 +254,21 @@ mod tests {
 
         index.remove_server_tools("fs");
         assert!(!index.contains("mcp__fs__read_file"));
+    }
+
+    #[test]
+    fn exact_alias_membership_is_case_sensitive_and_does_not_canonicalize() {
+        let index = ToolIndex::new();
+        let tools = vec![McpTool {
+            name: "read_file".to_string(),
+            description: "Read".to_string(),
+            parameters: serde_json::json!({}),
+            output_schema: None,
+        }];
+        index.register_server_tools("fs", &tools, &[], &[]);
+
+        assert!(index.contains_exact_alias("mcp__fs__read_file"));
+        assert!(!index.contains_exact_alias("MCP__fs__read_file"));
+        assert!(!index.contains_exact_alias("read_file"));
     }
 }

@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_agent_core::{
-    normalize_tool_name, parse_tool_args_best_effort, Tool, ToolCall, ToolError,
-    ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
+    ToolOutcome, ToolResult, ToolSchema,
 };
-use bamboo_domain::tool_names::{normalize_builtin_alias, resolve_alias};
+use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
@@ -83,26 +83,41 @@ fn normalize_legacy_builtin_args(
     }
 }
 
-fn resolve_registered_tool_name(registry: &ToolRegistry, raw_tool_name: &str) -> String {
-    if registry.get(raw_tool_name).is_some() {
-        return raw_tool_name.to_string();
-    }
+fn resolve_registered_tool_name(registry: &ToolRegistry, reference: &str) -> Option<String> {
+    resolve_tool_reference_name(reference, |candidate| registry.contains(candidate))
+}
 
-    let aliased = normalize_builtin_alias(raw_tool_name);
-    if registry.get(aliased).is_some() {
-        return aliased.to_string();
+/// Apply compatibility argument aliases only after the registry identity and
+/// its framework-owned implementation provenance are resolved. Exact custom
+/// tools whose names merely resemble a builtin or alias (for example an exact
+/// `Read` or `apply_patch`) must receive their original arguments.
+fn normalize_resolved_builtin_args(
+    reference: &str,
+    execution_name: &str,
+    args: &mut serde_json::Value,
+) {
+    if !matches!(execution_name, "Read" | "Write" | "Edit" | "Bash" | "Glob") {
+        return;
     }
-
-    resolve_alias(aliased).unwrap_or(aliased).to_string()
+    let unqualified = reference
+        .trim()
+        .rsplit("::")
+        .next()
+        .unwrap_or(reference)
+        .trim();
+    if let Some(args_obj) = args.as_object_mut() {
+        normalize_legacy_builtin_args(unqualified, args_obj);
+    }
 }
 
 /// Built-in tool executor that uses ToolRegistry for dynamic dispatch
 pub struct BuiltinToolExecutor {
     registry: ToolRegistry,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
-    /// Framework-owned mutation tool instances keyed by canonical name. Arc
-    /// identity prevents a registry replacement from inheriting provenance.
-    builtin_mutation_tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Framework-owned tool instances whose identity affects compatibility
+    /// argument handling or file-change events. Arc identity prevents a custom
+    /// same-name registry replacement from inheriting builtin provenance.
+    framework_builtin_tools: BTreeMap<String, Arc<dyn Tool>>,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
 }
 
@@ -114,11 +129,11 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with all built-in tools registered
     pub fn new() -> Self {
         let registry = ToolRegistry::new();
-        let builtin_mutation_tools = Self::register_builtin_tools(&registry, None);
+        let framework_builtin_tools = Self::register_builtin_tools(&registry, None);
         Self {
             registry,
             permission_checker: None,
-            builtin_mutation_tools,
+            framework_builtin_tools,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -126,11 +141,11 @@ impl BuiltinToolExecutor {
     /// Creates a new executor with a permission checker
     pub fn new_with_permissions(permission_checker: Arc<dyn PermissionChecker>) -> Self {
         let registry = ToolRegistry::new();
-        let builtin_mutation_tools = Self::register_builtin_tools(&registry, None);
+        let framework_builtin_tools = Self::register_builtin_tools(&registry, None);
         Self {
             registry,
             permission_checker: Some(permission_checker),
-            builtin_mutation_tools,
+            framework_builtin_tools,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -141,11 +156,11 @@ impl BuiltinToolExecutor {
     /// `http_request`) honor proxy settings from `config.json`.
     pub fn new_with_config(config: Arc<RwLock<Config>>) -> Self {
         let registry = ToolRegistry::new();
-        let builtin_mutation_tools = Self::register_builtin_tools(&registry, Some(config));
+        let framework_builtin_tools = Self::register_builtin_tools(&registry, Some(config));
         Self {
             registry,
             permission_checker: None,
-            builtin_mutation_tools,
+            framework_builtin_tools,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -156,11 +171,11 @@ impl BuiltinToolExecutor {
         permission_checker: Arc<dyn PermissionChecker>,
     ) -> Self {
         let registry = ToolRegistry::new();
-        let builtin_mutation_tools = Self::register_builtin_tools(&registry, Some(config));
+        let framework_builtin_tools = Self::register_builtin_tools(&registry, Some(config));
         Self {
             registry,
             permission_checker: Some(permission_checker),
-            builtin_mutation_tools,
+            framework_builtin_tools,
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -170,7 +185,7 @@ impl BuiltinToolExecutor {
         Self {
             registry,
             permission_checker: None,
-            builtin_mutation_tools: BTreeMap::new(),
+            framework_builtin_tools: BTreeMap::new(),
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -188,7 +203,7 @@ impl BuiltinToolExecutor {
         Self {
             registry,
             permission_checker: Some(permission_checker),
-            builtin_mutation_tools: BTreeMap::new(),
+            framework_builtin_tools: BTreeMap::new(),
             tool_event_publisher: Self::default_tool_event_publisher(),
         }
     }
@@ -210,7 +225,7 @@ impl BuiltinToolExecutor {
         tool: &Arc<dyn Tool>,
         args: &serde_json::Value,
     ) -> Option<FileChangedV1> {
-        let builtin = self.builtin_mutation_tools.get(tool_name)?;
+        let builtin = self.framework_builtin_tools.get(tool_name)?;
         if !Arc::ptr_eq(builtin, tool) {
             return None;
         }
@@ -258,31 +273,37 @@ impl BuiltinToolExecutor {
         registry: &ToolRegistry,
         config: Option<Arc<RwLock<Config>>>,
     ) -> BTreeMap<String, Arc<dyn Tool>> {
-        let mut mutation_tools = BTreeMap::new();
+        let mut framework_tools = BTreeMap::new();
         let _ = config;
         // NOTE: apply_patch is now an alias for Edit – no separate registration.
         let _ = registry.register(ConclusionWithOptionsTool::new());
-        let _ = registry.register(BashTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
-        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, EditTool::new()) {
-            mutation_tools.insert(name, tool);
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
+            framework_tools.insert(name, tool);
         }
         let _ = registry.register(EnterPlanModeTool::new());
         let _ = registry.register(ExitPlanModeTool::new());
         // NOTE: FileExists is now an alias for GetFileInfo – no separate registration.
         let _ = registry.register(GetFileInfoTool::new());
-        let _ = registry.register(GlobTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, GlobTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(JsReplTool::new());
         let _ = registry.register(KillShellTool::new());
         let _ = registry.register(SessionNoteTool::new());
-        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, NotebookEditTool::new())
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, NotebookEditTool::new())
         {
-            mutation_tools.insert(name, tool);
+            framework_tools.insert(name, tool);
         }
-        let _ = registry.register(ReadTool::new());
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(RequestPermissionsTool::new());
         let _ = registry.register(SleepTool::new());
         let _ = registry.register(TaskTool::new());
@@ -290,13 +311,13 @@ impl BuiltinToolExecutor {
         let _ = registry.register(WebSearchTool::new());
         // NOTE: GetCurrentDir + SetWorkspace are now aliases for Workspace.
         let _ = registry.register(WorkspaceTool::new());
-        if let Ok((name, tool)) = Self::register_builtin_mutation(registry, WriteTool::new()) {
-            mutation_tools.insert(name, tool);
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteTool::new()) {
+            framework_tools.insert(name, tool);
         }
-        mutation_tools
+        framework_tools
     }
 
-    fn register_builtin_mutation<T: Tool + 'static>(
+    fn register_tracked_builtin<T: Tool + 'static>(
         registry: &ToolRegistry,
         tool: T,
     ) -> Result<(String, Arc<dyn Tool>), ToolError> {
@@ -306,6 +327,24 @@ impl BuiltinToolExecutor {
             .register_shared(tool.clone())
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         Ok((name, tool))
+    }
+
+    fn is_framework_builtin_instance(&self, execution_name: &str, tool: &Arc<dyn Tool>) -> bool {
+        self.framework_builtin_tools
+            .get(execution_name)
+            .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
+    }
+
+    fn normalize_registered_builtin_args(
+        &self,
+        reference: &str,
+        execution_name: &str,
+        tool: &Arc<dyn Tool>,
+        args: &mut serde_json::Value,
+    ) {
+        if self.is_framework_builtin_instance(execution_name, tool) {
+            normalize_resolved_builtin_args(reference, execution_name, args);
+        }
     }
 
     /// Returns all built-in tool schemas
@@ -336,6 +375,74 @@ impl BuiltinToolExecutor {
     /// Get guide for a tool
     pub fn get_guide(&self, tool_name: &str) -> Option<Arc<dyn ToolGuide>> {
         self.registry.get_guide(tool_name)
+    }
+
+    fn parse_execution_args(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> serde_json::Value {
+        if let Some(pre_parsed) = ctx.pre_parsed_args {
+            return pre_parsed.clone();
+        }
+        let args_raw = call.function.arguments.trim();
+        let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+        if let Some(warning) = parse_warning {
+            tracing::warn!(
+                "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
+                ctx.session_id,
+                call.id,
+                call.function.name,
+                args_raw.len(),
+                preview_for_log(args_raw, 180),
+                warning
+            );
+        }
+        parsed
+    }
+
+    async fn execute_registered_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let tool = self
+            .registry
+            .get(execution_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        let mut args = self.parse_execution_args(call, &ctx);
+        self.normalize_registered_builtin_args(
+            &call.function.name,
+            execution_name,
+            &tool,
+            &mut args,
+        );
+
+        if let Some(outcome) = self
+            .check_permissions_for_resolved(call, execution_name, &args, &ctx)
+            .await?
+        {
+            return Ok(outcome);
+        }
+
+        let publisher_enabled =
+            catch_unwind(AssertUnwindSafe(|| self.tool_event_publisher.is_enabled()))
+                .unwrap_or(false);
+        let pending_file_changed = publisher_enabled
+            .then(|| self.pending_file_changed(execution_name, &tool, &args))
+            .flatten();
+
+        let outcome = tool.invoke(args, ctx.to_tool_ctx()).await?;
+        if matches!(
+            &outcome,
+            ToolOutcome::Completed(result) if result.success
+        ) {
+            if let Some(data) = pending_file_changed {
+                self.publish_successful_file_change(&ctx, execution_name, data);
+            }
+        }
+        Ok(outcome)
     }
 
     /// Build enhanced prompt for all registered tools
@@ -379,85 +486,23 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolOutcome, ToolError> {
-        // Reuse the args the dispatching agent loop already parsed (for the
-        // `ToolStart` event) when it threaded them through the context, instead
-        // of re-parsing the raw JSON string here (issue #106, deferred B1 from
-        // #17). The pre-parsed value is the exact output of
-        // `parse_tool_args_best_effort` on the same input, and that loop already
-        // logged any fallback warning at parse time, so skipping the re-parse is
-        // behavior-preserving. When absent (the `execute` entry point, tests, or
-        // a loop that parsed with a different/stricter parser), fall back to
-        // parsing here exactly as before — including the fallback-warning log.
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            let args_raw = call.function.arguments.trim();
-            let (parsed, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
-            if let Some(warning) = parse_warning {
-                tracing::warn!(
-                    "Builtin tool argument parsing fallback applied: session_id={:?}, tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", warning={}",
-                    ctx.session_id,
-                    call.id,
-                    call.function.name,
-                    args_raw.len(),
-                    preview_for_log(args_raw, 180),
-                    warning
-                );
-            }
-            parsed
-        };
+        let reference = call.function.name.trim();
+        let tool_name =
+            resolve_registered_tool_name(&self.registry, reference).ok_or_else(|| {
+                ToolError::NotFound(format!("Tool '{}' not found", call.function.name))
+            })?;
+        self.execute_registered_with_context_outcome(call, &tool_name, ctx)
+            .await
+    }
 
-        let raw_tool_name = normalize_tool_name(&call.function.name);
-        if let Some(args_obj) = args.as_object_mut() {
-            normalize_legacy_builtin_args(raw_tool_name, args_obj);
-        }
-
-        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
-
-        // Look up the tool in the registry
-        let tool = self
-            .registry
-            .get(&tool_name)
-            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", tool_name)))?;
-
-        // Permission gate. Factored onto the `ToolExecutor` trait
-        // (`check_permissions_for`) so overlay/wrapping executors can run the
-        // exact same check before invoking their own tools (issue #341). Kept
-        // AFTER the registry lookup so a `NotFound` still takes precedence,
-        // exactly as before. `Some(outcome)` is the interactive approval pause
-        // synthesized for a human sink; `Err` is deny / fail-closed.
-        if let Some(outcome) = self.check_permissions_for(call, &ctx).await? {
-            return Ok(outcome);
-        }
-
-        // Only framework-owned mutation tool instances are eligible. The hint
-        // itself is bounded before allocation and is inert until the real tool
-        // returns a successful terminal result.
-        let publisher_enabled =
-            catch_unwind(AssertUnwindSafe(|| self.tool_event_publisher.is_enabled()))
-                .unwrap_or(false);
-        let pending_file_changed = publisher_enabled
-            .then(|| self.pending_file_changed(&tool_name, &tool, &args))
-            .flatten();
-
-        // Rewritten dispatch: build the owned `ToolCtx` at this concrete seam and
-        // call the tool's single `invoke`. Unwrap the `ToolOutcome` back to a
-        // `ToolResult` so the surrounding dispatch/loop is unchanged for now:
-        // `Completed` is the result; `Running`'s synthetic ack IS a `ToolResult`
-        // (preserving background Bash's current behavior); `NeedsHuman` cannot yet
-        // be produced (no tool returns it in this phase). Phase B makes the outcome
-        // authoritative and removes this unwrap.
-        let tool_ctx = ctx.to_tool_ctx();
-        let outcome = tool.invoke(args, tool_ctx).await?;
-        if matches!(
-            &outcome,
-            ToolOutcome::Completed(result) if result.success
-        ) {
-            if let Some(data) = pending_file_changed {
-                self.publish_successful_file_change(&ctx, &tool_name, data);
-            }
-        }
-        Ok(outcome)
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.execute_registered_with_context_outcome(call, execution_name, ctx)
+            .await
     }
 
     /// The real permission gate for built-in tools, extracted from the execute
@@ -488,8 +533,55 @@ impl ToolExecutor for BuiltinToolExecutor {
         call: &ToolCall,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        let raw_tool_name = normalize_tool_name(&call.function.name);
-        let tool_name = resolve_registered_tool_name(&self.registry, raw_tool_name);
+        let reference = call.function.name.trim();
+        let tool_name = resolve_registered_tool_name(&self.registry, reference)
+            .unwrap_or_else(|| canonical_tool_name(reference));
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        if let Some(tool) = self.registry.get(&tool_name) {
+            self.normalize_registered_builtin_args(reference, &tool_name, &tool, &mut args);
+        }
+        self.check_permissions_for_resolved(call, &tool_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let tool = self
+            .registry
+            .get(execution_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        self.normalize_registered_builtin_args(
+            call.function.name.trim(),
+            execution_name,
+            &tool,
+            &mut args,
+        );
+        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        resolved_args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let tool_name = execution_name.to_string();
+        let args = resolved_args.clone();
         if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
             return Err(ToolError::Execution(
                 "Auto mode cannot request expanded permissions; operate within existing hard boundaries"
@@ -505,19 +597,6 @@ impl ToolExecutor for BuiltinToolExecutor {
             return Ok(None);
         };
         let hook_permission_override = crate::current_hook_permission_override(&call.id);
-
-        // Mirror the head of `execute_with_context_outcome`: reuse the pre-parsed
-        // args when threaded, apply the legacy-arg normalization, then resolve the
-        // registered/alias tool name. This is what makes the gate see the exact
-        // `tool_name`/`args` the tool will actually run with.
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            parse_tool_args_best_effort(&call.function.arguments).0
-        };
-        if let Some(args_obj) = args.as_object_mut() {
-            normalize_legacy_builtin_args(raw_tool_name, args_obj);
-        }
 
         if let Some(contexts) =
             check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
@@ -741,53 +820,56 @@ impl ToolExecutor for BuiltinToolExecutor {
         self.registry.list_tools()
     }
 
+    fn owns_exact_tool(&self, tool_name: &str) -> bool {
+        self.registry.contains(tool_name)
+    }
+
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
-        self.registry
-            .get(tool_name)
+        let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        resolved
+            .as_deref()
+            .and_then(|name| self.registry.get(name))
             .map(|tool| tool.classify(&serde_json::Value::Null).mutability)
-            .unwrap_or_else(|| crate::classify_tool(tool_name))
+            .unwrap_or_else(|| crate::classify_tool(&canonical_tool_name(tool_name)))
     }
 
     fn call_mutability(&self, call: &ToolCall) -> crate::ToolMutability {
-        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
-        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
-        self.registry
-            .get(&canonical)
-            .map(|tool| tool.classify(&args).mutability)
-            .unwrap_or_else(|| self.tool_mutability(&canonical))
+        self.call_parallel_classification(call).0
     }
 
     fn tool_concurrency_safe(&self, tool_name: &str) -> bool {
-        let canonical = resolve_registered_tool_name(&self.registry, tool_name);
-        self.registry
-            .get(&canonical)
+        let resolved = resolve_registered_tool_name(&self.registry, tool_name);
+        resolved
+            .as_deref()
+            .and_then(|name| self.registry.get(name))
             .map(|tool| tool.classify(&serde_json::Value::Null).parallel_safe)
-            .unwrap_or_else(|| self.tool_mutability(&canonical) == crate::ToolMutability::ReadOnly)
+            .unwrap_or_else(|| self.tool_mutability(tool_name) == crate::ToolMutability::ReadOnly)
     }
 
     fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
-        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
-        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
-        self.registry
-            .get(&canonical)
-            .map(|tool| tool.classify(&args).parallel_safe)
-            .unwrap_or_else(|| self.tool_concurrency_safe(&canonical))
+        self.call_parallel_classification(call).1
     }
 
     fn call_parallel_classification(&self, call: &ToolCall) -> (crate::ToolMutability, bool) {
         // One args-aware `classify` returns the (mutability, parallel_safe) pair
         // with a single arg parse — the collapse of the former
         // `call_mutability`/`call_concurrency_safe` pair.
-        let canonical = resolve_registered_tool_name(&self.registry, call.function.name.trim());
-        let args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
-        match self.registry.get(&canonical) {
-            Some(tool) => {
+        let reference = call.function.name.trim();
+        let resolved = resolve_registered_tool_name(&self.registry, reference);
+        let mut args = bamboo_agent_core::parse_tool_args_best_effort(&call.function.arguments).0;
+        match resolved.as_deref().and_then(|execution_name| {
+            self.registry
+                .get(execution_name)
+                .map(|tool| (execution_name, tool))
+        }) {
+            Some((execution_name, tool)) => {
+                self.normalize_registered_builtin_args(reference, execution_name, &tool, &mut args);
                 let class = tool.classify(&args);
                 (class.mutability, class.parallel_safe)
             }
             None => (
-                self.tool_mutability(&canonical),
-                self.tool_concurrency_safe(&canonical),
+                self.tool_mutability(reference),
+                self.tool_concurrency_safe(reference),
             ),
         }
     }
@@ -797,7 +879,7 @@ impl ToolExecutor for BuiltinToolExecutor {
 pub struct BuiltinToolExecutorBuilder {
     registry: ToolRegistry,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
-    builtin_mutation_tools: BTreeMap<String, Arc<dyn Tool>>,
+    framework_builtin_tools: BTreeMap<String, Arc<dyn Tool>>,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
 }
 
@@ -807,14 +889,14 @@ impl BuiltinToolExecutorBuilder {
         Self {
             registry: ToolRegistry::new(),
             permission_checker: None,
-            builtin_mutation_tools: BTreeMap::new(),
+            framework_builtin_tools: BTreeMap::new(),
             tool_event_publisher: BuiltinToolExecutor::default_tool_event_publisher(),
         }
     }
 
     /// Registers all default built-in tools
     pub fn with_default_tools(mut self) -> Self {
-        self.builtin_mutation_tools
+        self.framework_builtin_tools
             .extend(BuiltinToolExecutor::register_builtin_tools(
                 &self.registry,
                 None,
@@ -824,38 +906,36 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific filesystem tool by name
     pub fn with_filesystem_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        let marker = match name {
+        let (name, tool) = match name {
             "Read" => {
-                self.registry
-                    .register(ReadTool::new())
-                    .map_err(|error| ToolError::Execution(error.to_string()))?;
-                None
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, ReadTool::new())?
             }
-            "Write" => Some(BuiltinToolExecutor::register_builtin_mutation(
-                &self.registry,
-                WriteTool::new(),
-            )?),
+            "Write" => {
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, WriteTool::new())?
+            }
             // apply_patch is now an alias for Edit
-            "Edit" | "apply_patch" => Some(BuiltinToolExecutor::register_builtin_mutation(
-                &self.registry,
-                EditTool::new(),
-            )?),
-            "NotebookEdit" => Some(BuiltinToolExecutor::register_builtin_mutation(
+            "Edit" | "apply_patch" => {
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, EditTool::new())?
+            }
+            "NotebookEdit" => BuiltinToolExecutor::register_tracked_builtin(
                 &self.registry,
                 NotebookEditTool::new(),
-            )?),
+            )?,
             _ => return Err(ToolError::NotFound(format!("Unknown tool: {}", name))),
         };
-        if let Some((name, tool)) = marker {
-            self.builtin_mutation_tools.insert(name, tool);
-        }
+        self.framework_builtin_tools.insert(name, tool);
         Ok(self)
     }
 
     /// Registers a specific command tool by name
-    pub fn with_command_tool(self, name: &str) -> Result<Self, ToolError> {
+    pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
+        if name == "Bash" {
+            let (name, tool) =
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?;
+            self.framework_builtin_tools.insert(name, tool);
+            return Ok(self);
+        }
         match name {
-            "Bash" => self.registry.register(BashTool::new()),
             "BashOutput" => self.registry.register(BashOutputTool::new()),
             "KillShell" => self.registry.register(KillShellTool::new()),
             "Task" => self.registry.register(TaskTool::new()),
@@ -890,7 +970,7 @@ impl BuiltinToolExecutorBuilder {
         BuiltinToolExecutor {
             registry: self.registry,
             permission_checker: self.permission_checker,
-            builtin_mutation_tools: self.builtin_mutation_tools,
+            framework_builtin_tools: self.framework_builtin_tools,
             tool_event_publisher: self.tool_event_publisher,
         }
     }
@@ -1078,7 +1158,7 @@ mod tests {
         BuiltinToolExecutor {
             registry,
             permission_checker: None,
-            builtin_mutation_tools: BTreeMap::from([("Write".to_string(), tool)]),
+            framework_builtin_tools: BTreeMap::from([("Write".to_string(), tool)]),
             tool_event_publisher: publisher,
         }
     }
@@ -1308,6 +1388,11 @@ mod tests {
         let call = make_tool_call("Read", json!({"path": file_path}));
 
         let result = executor.execute(&call).await.unwrap();
+        assert!(result.success);
+        assert!(result.result.contains("canonical read content"));
+
+        let namespaced = make_tool_call("default::Read", json!({"path": file_path}));
+        let result = executor.execute(&namespaced).await.unwrap();
         assert!(result.success);
         assert!(result.result.contains("canonical read content"));
     }
@@ -2649,6 +2734,292 @@ mod tests {
         let result = executor.execute(&call).await.expect("execute custom tool");
         assert!(result.success);
         assert_eq!(result.result, "custom-spawn-session");
+    }
+
+    struct ExactRoutingTool {
+        name: &'static str,
+        label: &'static str,
+        args_sensitive: bool,
+    }
+
+    #[async_trait]
+    impl Tool for ExactRoutingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "exact routing regression tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type":"object","properties":{}})
+        }
+
+        fn classify(&self, args: &serde_json::Value) -> bamboo_agent_core::ToolClass {
+            let has_builtin_normalized_arg = ["file_path", "command", "pattern"]
+                .iter()
+                .any(|key| args.get(key).is_some());
+            if self.args_sensitive && !has_builtin_normalized_arg {
+                bamboo_agent_core::ToolClass::READONLY_PARALLEL
+            } else {
+                bamboo_agent_core::ToolClass::MUTATING_SERIAL
+            }
+        }
+
+        async fn invoke(
+            &self,
+            args: serde_json::Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, ToolError> {
+            Ok(ToolOutcome::Completed(ToolResult {
+                success: true,
+                result: json!({"label": self.label, "args": args}).to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_preserves_namespaced_exact_identity_and_unqualified_collision() {
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "a::custom_tool",
+                label: "namespaced",
+                args_sensitive: false,
+            })
+            .expect("register namespaced tool")
+            .with_tool(ExactRoutingTool {
+                name: "custom_tool",
+                label: "unqualified",
+                args_sensitive: false,
+            })
+            .expect("register unqualified tool")
+            .build();
+
+        assert!(executor.owns_exact_tool("a::custom_tool"));
+        assert!(executor.owns_exact_tool("custom_tool"));
+        assert!(!executor.owns_exact_tool("A::custom_tool"));
+        let names: Vec<String> = executor
+            .list_tools()
+            .into_iter()
+            .map(|schema| schema.function.name)
+            .collect();
+        assert!(names.contains(&"a::custom_tool".to_string()));
+        assert!(names.contains(&"custom_tool".to_string()));
+
+        let namespaced = executor
+            .execute(&make_tool_call("a::custom_tool", json!({})))
+            .await
+            .expect("execute namespaced exact tool");
+        let unqualified = executor
+            .execute(&make_tool_call("custom_tool", json!({})))
+            .await
+            .expect("execute unqualified exact tool");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&namespaced.result).unwrap()["label"],
+            "namespaced"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unqualified.result).unwrap()["label"],
+            "unqualified"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_canonical_shadows_do_not_inherit_builtin_argument_provenance() {
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "Read",
+                label: "exact-read",
+                args_sensitive: true,
+            })
+            .expect("register exact Read shadow")
+            .with_tool(ExactRoutingTool {
+                name: "Write",
+                label: "exact-write",
+                args_sensitive: true,
+            })
+            .expect("register exact Write shadow")
+            .with_tool(ExactRoutingTool {
+                name: "Edit",
+                label: "exact-edit",
+                args_sensitive: true,
+            })
+            .expect("register exact Edit shadow")
+            .with_tool(ExactRoutingTool {
+                name: "Bash",
+                label: "exact-bash",
+                args_sensitive: true,
+            })
+            .expect("register exact Bash shadow")
+            .with_tool(ExactRoutingTool {
+                name: "Glob",
+                label: "exact-glob",
+                args_sensitive: true,
+            })
+            .expect("register exact Glob shadow")
+            .with_default_tools()
+            .build();
+
+        let cases = [
+            ("Read", json!({"path": "/tmp/custom-read"}), "file_path"),
+            ("Write", json!({"path": "/tmp/custom-write"}), "file_path"),
+            ("Edit", json!({"path": "/tmp/custom-edit"}), "file_path"),
+            ("Bash", json!({"cmd": "custom-command"}), "command"),
+            (
+                "Glob",
+                json!({"path": "/tmp/custom-glob", "recursive": true}),
+                "pattern",
+            ),
+        ];
+
+        for (name, args, normalized_key) in cases {
+            let call = make_tool_call(name, args.clone());
+            assert_eq!(
+                executor.call_mutability(&call),
+                crate::ToolMutability::ReadOnly,
+                "custom {name} classification must see the original args"
+            );
+            assert!(
+                executor.call_concurrency_safe(&call),
+                "custom {name} classification must remain parallel-safe"
+            );
+
+            let result = executor
+                .execute(&call)
+                .await
+                .unwrap_or_else(|error| panic!("execute custom {name}: {error}"));
+            let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(result["args"], args, "custom {name} args changed");
+            assert!(result["args"].get(normalized_key).is_none());
+        }
+
+        // Exercise the permission entry point with exact canonical shadows for
+        // which the central policy has no name-based write/execute rule. The
+        // same raw args must reach classification and invocation even when a
+        // checker is installed.
+        let permission_executor = BuiltinToolExecutorBuilder::new()
+            .with_tool(ExactRoutingTool {
+                name: "Read",
+                label: "permission-read",
+                args_sensitive: true,
+            })
+            .expect("register permission-aware Read shadow")
+            .with_tool(ExactRoutingTool {
+                name: "Glob",
+                label: "permission-glob",
+                args_sensitive: true,
+            })
+            .expect("register permission-aware Glob shadow")
+            .with_default_tools()
+            .with_permission_checker(Arc::new(crate::permission::AllowAllPermissionChecker))
+            .build();
+        for (name, args) in [
+            ("Read", json!({"path": "/tmp/permission-read"})),
+            (
+                "Glob",
+                json!({"path": "/tmp/permission-glob", "recursive": true}),
+            ),
+        ] {
+            let call = make_tool_call(name, args.clone());
+            let ctx = ToolExecutionContext::none(&call.id);
+            assert!(permission_executor
+                .check_permissions_for(&call, &ctx)
+                .await
+                .expect("permission check")
+                .is_none());
+            assert_eq!(
+                permission_executor.call_mutability(&call),
+                crate::ToolMutability::ReadOnly
+            );
+            assert!(permission_executor.call_concurrency_safe(&call));
+            let result = permission_executor.execute(&call).await.unwrap();
+            let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(result["args"], args);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_apply_patch_keeps_original_args_and_classification() {
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Edit")
+            .expect("register builtin Edit")
+            .with_tool(ExactRoutingTool {
+                name: "apply_patch",
+                label: "exact-apply-patch",
+                args_sensitive: true,
+            })
+            .expect("register exact apply_patch shadow")
+            .build();
+        let call = make_tool_call("apply_patch", json!({"path": "/tmp/exact-shadow"}));
+
+        let (mutability, parallel_safe) = executor.call_parallel_classification(&call);
+        assert_eq!(mutability, crate::ToolMutability::ReadOnly);
+        assert!(parallel_safe);
+
+        let result = executor.execute(&call).await.expect("execute exact shadow");
+        let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(result["label"], "exact-apply-patch");
+        assert_eq!(result["args"]["path"], "/tmp/exact-shadow");
+        assert!(result["args"].get("file_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_permission_seam_preserves_default_apply_patch_builtin_provenance() {
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Edit")
+            .expect("register builtin Edit")
+            .with_permission_checker(Arc::new(crate::permission::AllowAllPermissionChecker))
+            .build();
+        let raw_args = json!({
+            "path": "/tmp/exact-permission-apply-patch.txt",
+            "old_string": "before",
+            "new_string": "after"
+        });
+        let call = make_tool_call("default::apply_patch", raw_args.clone());
+        let ctx = ToolExecutionContext {
+            pre_parsed_args: Some(&raw_args),
+            ..ToolExecutionContext::none(&call.id)
+        };
+
+        assert!(executor
+            .check_permissions_for_exact(&call, "Edit", &ctx)
+            .await
+            .expect("normalized builtin permission check")
+            .is_none());
+        assert_eq!(call.function.name, "default::apply_patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap(),
+            raw_args
+        );
+    }
+
+    #[tokio::test]
+    async fn unshadowed_alias_and_namespace_keep_legacy_argument_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-alias.txt");
+        fs::write(&path, "before").await.unwrap();
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Edit")
+            .expect("register builtin Edit")
+            .with_permission_checker(Arc::new(crate::permission::AllowAllPermissionChecker))
+            .build();
+
+        let result = executor
+            .execute(&make_tool_call(
+                "default::apply_patch",
+                json!({
+                    "path": path,
+                    "old_string": "before",
+                    "new_string": "after"
+                }),
+            ))
+            .await
+            .expect("execute unshadowed alias");
+        assert!(result.success);
+        assert_eq!(fs::read_to_string(path).await.unwrap(), "after");
     }
 
     // ---- issue #106: parse tool args once on the execute path -------------
