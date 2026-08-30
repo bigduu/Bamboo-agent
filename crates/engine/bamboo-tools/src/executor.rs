@@ -548,6 +548,31 @@ impl ToolExecutor for BuiltinToolExecutor {
             .await
     }
 
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let tool = self
+            .registry
+            .get(execution_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        self.normalize_registered_builtin_args(
+            call.function.name.trim(),
+            execution_name,
+            &tool,
+            &mut args,
+        );
+        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
+            .await
+    }
+
     async fn check_permissions_for_resolved(
         &self,
         call: &ToolCall,
@@ -2939,6 +2964,36 @@ mod tests {
         assert_eq!(result["label"], "exact-apply-patch");
         assert_eq!(result["args"]["path"], "/tmp/exact-shadow");
         assert!(result["args"].get("file_path").is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_permission_seam_preserves_default_apply_patch_builtin_provenance() {
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_filesystem_tool("Edit")
+            .expect("register builtin Edit")
+            .with_permission_checker(Arc::new(crate::permission::AllowAllPermissionChecker))
+            .build();
+        let raw_args = json!({
+            "path": "/tmp/exact-permission-apply-patch.txt",
+            "old_string": "before",
+            "new_string": "after"
+        });
+        let call = make_tool_call("default::apply_patch", raw_args.clone());
+        let ctx = ToolExecutionContext {
+            pre_parsed_args: Some(&raw_args),
+            ..ToolExecutionContext::none(&call.id)
+        };
+
+        assert!(executor
+            .check_permissions_for_exact(&call, "Edit", &ctx)
+            .await
+            .expect("normalized builtin permission check")
+            .is_none());
+        assert_eq!(call.function.name, "default::apply_patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap(),
+            raw_args
+        );
     }
 
     #[tokio::test]

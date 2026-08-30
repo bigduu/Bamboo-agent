@@ -414,7 +414,11 @@ impl ToolExecutor for CompositeToolExecutor {
         ctx: &ToolExecutionContext<'_>,
     ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
         match self.route(&call.function.name) {
-            CompositeRoute::Builtin { .. } => self.builtin.check_permissions_for(call, ctx).await,
+            CompositeRoute::Builtin { execution_name } => {
+                self.builtin
+                    .check_permissions_for_exact(call, &execution_name, ctx)
+                    .await
+            }
             CompositeRoute::Secondary { execution_name } => {
                 let args = ctx
                     .pre_parsed_args
@@ -425,6 +429,32 @@ impl ToolExecutor for CompositeToolExecutor {
                     .await
             }
             CompositeRoute::LegacyFallback => self.builtin.check_permissions_for(call, ctx).await,
+        }
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
+        if self.builtin.owns_exact_tool(execution_name) {
+            self.builtin
+                .check_permissions_for_exact(call, execution_name, ctx)
+                .await
+        } else if self.mcp.owns_exact_tool(execution_name) {
+            let args = ctx
+                .pre_parsed_args
+                .cloned()
+                .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+            self.builtin
+                .check_permissions_for_resolved(call, execution_name, &args, ctx)
+                .await
+        } else {
+            Err(ToolError::NotFound(format!(
+                "Tool '{}' not found",
+                execution_name
+            )))
         }
     }
 
@@ -503,7 +533,12 @@ impl ToolExecutor for CompositeToolExecutor {
         call: &ToolCall,
     ) -> (bamboo_agent_core::ToolMutability, bool) {
         match self.route(&call.function.name) {
-            CompositeRoute::Builtin { .. } => self.builtin.call_parallel_classification(call),
+            CompositeRoute::Builtin { execution_name } => self
+                .builtin
+                .call_parallel_classification(&Self::call_with_execution_name(
+                    call,
+                    &execution_name,
+                )),
             CompositeRoute::Secondary { execution_name } => {
                 self.mcp
                     .call_parallel_classification(&Self::call_with_execution_name(
@@ -577,6 +612,8 @@ mod tests {
         classification: (bamboo_agent_core::ToolMutability, bool),
         executed: Arc<std::sync::Mutex<Vec<String>>>,
         permission_checked: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        permission_reresolution: Option<(&'static str, &'static str)>,
+        classified: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl RoutingStub {
@@ -589,6 +626,8 @@ mod tests {
                 classification: (bamboo_agent_core::ToolMutability::Mutating, false),
                 executed: Arc::new(std::sync::Mutex::new(Vec::new())),
                 permission_checked: Arc::new(std::sync::Mutex::new(Vec::new())),
+                permission_reresolution: None,
+                classified: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -635,10 +674,15 @@ mod tests {
             _ctx: &ToolExecutionContext<'_>,
         ) -> std::result::Result<Option<ToolOutcome>, ToolError> {
             let args = parse_tool_args_best_effort(&call.function.arguments).0;
+            let permission_name = self
+                .permission_reresolution
+                .filter(|(reference, _)| *reference == call.function.name)
+                .map(|(_, alias)| alias)
+                .unwrap_or(&call.function.name);
             self.permission_checked
                 .lock()
                 .unwrap()
-                .push((call.function.name.clone(), args));
+                .push((permission_name.to_string(), args));
             Ok(None)
         }
 
@@ -655,8 +699,12 @@ mod tests {
 
         fn call_parallel_classification(
             &self,
-            _call: &ToolCall,
+            call: &ToolCall,
         ) -> (bamboo_agent_core::ToolMutability, bool) {
+            self.classified
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
             self.classification
         }
     }
@@ -703,6 +751,70 @@ mod tests {
             )]
         );
         assert!(secondary_permissions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stacked_composites_keep_the_selected_builtin_exact_identity() {
+        let mut builtin = RoutingStub::new(vec!["custom_tool"], "builtin-custom");
+        builtin.permission_reresolution = Some(("default::custom_tool", "legacy_alias_owner"));
+        let builtin = Arc::new(builtin);
+        let builtin_executed = builtin.executed.clone();
+        let builtin_permissions = builtin.permission_checked.clone();
+        let builtin_classified = builtin.classified.clone();
+
+        let mut secondary = RoutingStub::new(vec!["legacy_alias_owner"], "secondary-alias");
+        secondary.classification = (bamboo_agent_core::ToolMutability::ReadOnly, true);
+        let secondary_executed = secondary.executed.clone();
+        let secondary_permissions = secondary.permission_checked.clone();
+        let secondary_classified = secondary.classified.clone();
+        let call = create_test_tool_call("default::custom_tool", r#"{"path":"selected-owner"}"#);
+        let ctx = ToolExecutionContext::none(&call.id);
+
+        builtin
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("raw permission repro");
+        assert_eq!(
+            builtin_permissions.lock().unwrap().as_slice(),
+            [(
+                "legacy_alias_owner".to_string(),
+                serde_json::json!({"path": "selected-owner"})
+            )],
+            "the generic raw gate demonstrates the re-resolution mismatch"
+        );
+        builtin_permissions.lock().unwrap().clear();
+
+        let inner = Arc::new(CompositeToolExecutor::new(builtin, Arc::new(secondary)));
+        let composite = CompositeToolExecutor::new(inner, Arc::new(GuidanceStub(None)));
+        let result = composite
+            .execute(&call)
+            .await
+            .expect("selected builtin exact owner executes");
+        assert_eq!(result.result, "builtin-custom");
+        composite
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("selected builtin exact owner permission check");
+        assert_eq!(
+            composite.call_parallel_classification(&call),
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        );
+
+        assert_eq!(builtin_executed.lock().unwrap().as_slice(), ["custom_tool"]);
+        assert_eq!(
+            builtin_permissions.lock().unwrap().as_slice(),
+            [(
+                "custom_tool".to_string(),
+                serde_json::json!({"path": "selected-owner"})
+            )]
+        );
+        assert_eq!(
+            builtin_classified.lock().unwrap().as_slice(),
+            ["custom_tool"]
+        );
+        assert!(secondary_executed.lock().unwrap().is_empty());
+        assert!(secondary_permissions.lock().unwrap().is_empty());
+        assert!(secondary_classified.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

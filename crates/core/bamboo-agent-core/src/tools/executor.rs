@@ -155,6 +155,25 @@ pub trait ToolExecutor: Send + Sync {
         Ok(None)
     }
 
+    /// Permission gate for an already-selected exact owner identity.
+    ///
+    /// Routing wrappers must use this seam after ownership resolution instead
+    /// of handing the original reference back to
+    /// [`check_permissions_for`](Self::check_permissions_for), where a concrete
+    /// executor may resolve it differently. The default preserves compatibility
+    /// by pinning only the function name and delegating to the existing gate;
+    /// argument bytes and the caller's pre-parsed context remain unchanged.
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>> {
+        let mut exact_call = call.clone();
+        exact_call.function.name = execution_name.to_string();
+        self.check_permissions_for(&exact_call, ctx).await
+    }
+
     /// Permission gate for a call whose exact execution identity and effective
     /// arguments have already been resolved by a wrapping executor.
     ///
@@ -545,5 +564,34 @@ mod tests {
         assert_eq!(recorded.2, effective_args);
         assert_eq!(call.function.name, "default::apply_patch");
         assert_eq!(call.function.arguments, original_args.to_string());
+    }
+
+    #[tokio::test]
+    async fn default_exact_permission_seam_pins_only_the_selected_identity() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let executor: Arc<dyn ToolExecutor> =
+            Arc::new(PermissionArgsExecutor { seen: seen.clone() });
+        let mut call = make_tool_call("default::custom_tool");
+        call.function.arguments = json!({"path": "original"}).to_string();
+        let original_args = json!({"path": "from-context"});
+        let ctx = ToolExecutionContext {
+            pre_parsed_args: Some(&original_args),
+            ..ToolExecutionContext::none(&call.id)
+        };
+
+        executor
+            .check_permissions_for_exact(&call, "custom_tool", &ctx)
+            .await
+            .expect("exact permission check");
+
+        let recorded = seen.lock().unwrap().clone().expect("permission record");
+        assert_eq!(recorded.0, "custom_tool");
+        assert_eq!(recorded.1, json!({"path": "original"}));
+        assert_eq!(recorded.2, original_args);
+        assert_eq!(call.function.name, "default::custom_tool");
+        assert_eq!(
+            call.function.arguments,
+            json!({"path": "original"}).to_string()
+        );
     }
 }

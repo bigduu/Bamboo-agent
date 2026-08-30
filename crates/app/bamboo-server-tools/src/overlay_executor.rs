@@ -153,9 +153,38 @@ impl ToolExecutor for OverlayToolExecutor {
                     .check_permissions_for_resolved(call, self.overlay.name(), &args, ctx)
                     .await
             }
-            OverlayRoute::BaseExact(_) | OverlayRoute::BaseFallback => {
-                self.base.check_permissions_for(call, ctx).await
+            OverlayRoute::BaseExact(execution_name) => {
+                self.base
+                    .check_permissions_for_exact(call, &execution_name, ctx)
+                    .await
             }
+            OverlayRoute::BaseFallback => self.base.check_permissions_for(call, ctx).await,
+        }
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        if execution_name == self.overlay.name() {
+            let args = ctx
+                .pre_parsed_args
+                .cloned()
+                .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+            self.base
+                .check_permissions_for_resolved(call, execution_name, &args, ctx)
+                .await
+        } else if self.base.owns_exact_tool(execution_name) {
+            self.base
+                .check_permissions_for_exact(call, execution_name, ctx)
+                .await
+        } else {
+            Err(ToolError::NotFound(format!(
+                "Tool '{}' not found",
+                execution_name
+            )))
         }
     }
 
@@ -446,6 +475,121 @@ mod tests {
             .await
             .expect("unshadowed alias must reach SubAgent overlay");
         assert_eq!(alias.result, "overlay");
+    }
+
+    struct ReResolvingPermissionBase {
+        executed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        permission_checked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        classified: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for ReResolvingPermissionBase {
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            if call.function.name != "spawn_session" {
+                return Err(ToolError::NotFound(call.function.name.clone()));
+            }
+            self.executed
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            Ok(ToolResult {
+                success: true,
+                result: "exact-base".to_string(),
+                display_preference: None,
+                images: Vec::new(),
+            })
+        }
+
+        async fn check_permissions_for(
+            &self,
+            call: &ToolCall,
+            _ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            let permission_name = if call.function.name == "default::spawn_session" {
+                "SubAgent"
+            } else {
+                &call.function.name
+            };
+            self.permission_checked
+                .lock()
+                .unwrap()
+                .push(permission_name.to_string());
+            Ok(None)
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "spawn_session".to_string(),
+                    description: "exact base tool".to_string(),
+                    parameters: json!({"type":"object"}),
+                },
+            }]
+        }
+
+        fn owns_exact_tool(&self, tool_name: &str) -> bool {
+            tool_name == "spawn_session"
+        }
+
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::ToolMutability, bool) {
+            self.classified
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        }
+    }
+
+    #[tokio::test]
+    async fn stacked_overlays_keep_base_exact_owner_for_permission_and_classification() {
+        let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let permission_checked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let classified = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = std::sync::Arc::new(ReResolvingPermissionBase {
+            executed: executed.clone(),
+            permission_checked: permission_checked.clone(),
+            classified: classified.clone(),
+        });
+        let call = make_call("default::spawn_session");
+        let ctx = ToolExecutionContext::none(&call.id);
+
+        base.check_permissions_for(&call, &ctx)
+            .await
+            .expect("raw permission mismatch repro");
+        assert_eq!(permission_checked.lock().unwrap().as_slice(), ["SubAgent"]);
+        permission_checked.lock().unwrap().clear();
+
+        let subagent: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(
+            OverlayToolExecutor::new(base, std::sync::Arc::new(SubAgentOverlayTool)),
+        );
+        let stacked =
+            OverlayToolExecutor::new(subagent, std::sync::Arc::new(NamedOverlayTool("memory")));
+
+        let result = stacked
+            .execute(&call)
+            .await
+            .expect("stacked exact base owner executes");
+        assert_eq!(result.result, "exact-base");
+        stacked
+            .check_permissions_for(&call, &ctx)
+            .await
+            .expect("stacked exact base owner permission check");
+        assert_eq!(
+            stacked.call_parallel_classification(&call),
+            (bamboo_agent_core::ToolMutability::Mutating, false)
+        );
+
+        assert_eq!(executed.lock().unwrap().as_slice(), ["spawn_session"]);
+        assert_eq!(
+            permission_checked.lock().unwrap().as_slice(),
+            ["spawn_session"]
+        );
+        assert_eq!(classified.lock().unwrap().as_slice(), ["spawn_session"]);
     }
 
     #[tokio::test]
