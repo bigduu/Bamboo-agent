@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use crate::prompt_ir::PromptIR;
 use crate::provider::{
     required_tool_from_options, LLMError, LLMProvider, LLMRequestOptions, LLMStream,
+    ProviderVisibleToolFootprint, ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
     ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
@@ -22,12 +23,13 @@ use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema}
 use super::common::model_fetcher;
 use super::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_strict_multi,
+    parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
 };
 use super::common::openai_responses::{
     build_responses_body_with_capability_loading, retain_provider_transcript_family,
-    select_responses_input_messages, ResponsesInputSource, ResponsesSseParser,
-    ResponsesToolSearchExecution, ResponsesWirePrefixTracker,
+    select_responses_input_messages, tools_to_progressive_responses_deferred_descriptors_json,
+    tools_to_progressive_responses_footprint_json, tools_to_responses_json, ResponsesInputSource,
+    ResponsesSseParser, ResponsesToolSearchExecution, ResponsesWirePrefixTracker,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -542,6 +544,55 @@ impl LLMProvider for OpenAIProvider {
         }
     }
 
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let mode = self.capability_loading_mode(model, required_tool).await;
+        let (projected, deferred_descriptors, late_bound) = if self.uses_responses_api(model) {
+            match mode {
+                CapabilityLoadingMode::Progressive => {
+                    let execution = self
+                        .tool_search_execution
+                        .unwrap_or(ResponsesToolSearchExecution::Client);
+                    (
+                        tools_to_progressive_responses_footprint_json(tools, execution),
+                        tools_to_progressive_responses_deferred_descriptors_json(tools, execution),
+                        true,
+                    )
+                }
+                CapabilityLoadingMode::LegacyFullCatalog
+                | CapabilityLoadingMode::StickyFallback => {
+                    (tools_to_responses_json(tools), Vec::new(), false)
+                }
+            }
+        } else {
+            (tools_to_openai_compat_json(tools), Vec::new(), false)
+        };
+        if projected.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        let mut segments = vec![ProviderVisibleToolSegment::from_serializable(
+            ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            &projected,
+        )?];
+        if !deferred_descriptors.is_empty() {
+            segments.push(ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialDeferredDescriptor,
+                &deferred_descriptors,
+            )?);
+        }
+        if late_bound {
+            segments.push(ProviderVisibleToolSegment::empty_marker(
+                ProviderVisibleToolSegmentKind::ProviderLateBound,
+            ));
+        }
+        Ok(ProviderVisibleToolFootprint { segments })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -885,12 +936,16 @@ impl LLMProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_ir::{Segment, SegmentRole};
     use crate::providers::common::openai_compat::parse_openai_compat_sse_data_strict;
     use bamboo_config::{
         BodyPatch, BodyPatchOp, PatchValue, RequestOverridesConfig, RequestScopeOverride,
     };
     use bamboo_domain::Message;
-    use bamboo_domain::{FunctionSchema, ToolSchema};
+    use bamboo_domain::{
+        FunctionSchema, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+        ProviderTranscriptItem, ProviderTranscriptOrigin, ToolSchema,
+    };
 
     // ===== Basic Tests (5 tests) =====
 
@@ -934,6 +989,262 @@ mod tests {
         assert!(provider.uses_responses_api("gpt-5.3-codex"));
         assert!(provider.uses_responses_api("gpt-5.0-any"));
         assert!(!provider.uses_responses_api("gpt-4o-mini"));
+    }
+
+    fn footprint_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("Use {name}"),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+            },
+        }
+    }
+
+    fn ir_with_openai_loaded_history() -> PromptIR {
+        let mut session = bamboo_domain::Session::new("footprint-history", "gpt-5.6");
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant.clone());
+        let boundary = bamboo_domain::provider_transcript_boundary_sha256(
+            Some("openai-footprint"),
+            Some("openai"),
+        )
+        .unwrap();
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &boundary,
+            )
+            .unwrap();
+        let output = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::HostToolSearch,
+            ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_search_output","execution":"client","call_id":"search_1",
+                "status":"completed","tools":[{
+                    "type":"function","name":"Glob","description":"Find files",
+                    "parameters":{"type":"object"},"strict":false,"defer_loading":true
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![output])
+            .unwrap();
+        let additional = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::DeveloperContext,
+            ProviderTranscriptAuthor::Host,
+            json!({
+                "type":"additional_tools","role":"developer","tools":[{
+                    "type":"function","name":"extra_tool","description":"Extra",
+                    "parameters":{"type":"object"},"strict":false
+                }]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![additional])
+            .unwrap();
+
+        PromptIR {
+            segments: vec![Segment::new(SegmentRole::Conversation, vec![assistant])],
+            provider_transcript_groups: session.provider_transcript.groups().to_vec(),
+            ..PromptIR::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_progressive_footprint_is_core_plus_search_for_client_and_server() {
+        let tools = vec![
+            footprint_schema("Read"),
+            footprint_schema("Glob"),
+            footprint_schema("Workspace"),
+        ];
+        let ir = ir_with_openai_loaded_history();
+        for execution in [
+            ResponsesToolSearchExecution::Client,
+            ResponsesToolSearchExecution::Server,
+        ] {
+            let expected_execution = match execution {
+                ResponsesToolSearchExecution::Client => "client",
+                ResponsesToolSearchExecution::Server => "server",
+            };
+            let provider = OpenAIProvider::new("k")
+                .with_responses_only_models(vec!["gpt-5*".to_string()])
+                .with_tool_search_execution(execution);
+            let footprint = provider
+                .provider_visible_tool_footprint(&ir, &tools, "gpt-5.6", None)
+                .await
+                .unwrap();
+
+            let marker_index = match execution {
+                ResponsesToolSearchExecution::Client => {
+                    assert_eq!(footprint.segments.len(), 2);
+                    1
+                }
+                ResponsesToolSearchExecution::Server => {
+                    assert_eq!(footprint.segments.len(), 3);
+                    assert_eq!(
+                        footprint.segments[1].kind,
+                        ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+                    );
+                    let descriptors: Value =
+                        serde_json::from_str(&footprint.segments[1].serialized).unwrap();
+                    assert_eq!(descriptors.as_array().unwrap().len(), 1);
+                    assert_eq!(descriptors[0]["type"], "function");
+                    assert_eq!(descriptors[0]["name"], "Glob");
+                    assert_eq!(descriptors[0]["description"], "Use Glob");
+                    assert_eq!(descriptors[0]["defer_loading"], true);
+                    assert_eq!(descriptors[0]["strict"], false);
+                    assert!(descriptors[0].get("parameters").is_none());
+                    assert!(!footprint.segments[1].serialized.contains("extra_tool"));
+                    2
+                }
+            };
+            assert_eq!(
+                footprint.segments[0].kind,
+                ProviderVisibleToolSegmentKind::InitialFullDefinition
+            );
+            assert_eq!(
+                footprint.segments[marker_index],
+                ProviderVisibleToolSegment::empty_marker(
+                    ProviderVisibleToolSegmentKind::ProviderLateBound
+                )
+            );
+            let projected: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+            let projected = projected.as_array().unwrap();
+            assert_eq!(projected.len(), 2, "Core definition plus search");
+            assert_eq!(projected[0]["name"], "Read");
+            assert_eq!(projected[1]["type"], "tool_search");
+            assert_eq!(projected[1]["execution"], expected_execution);
+            assert!(projected.iter().all(|tool| tool["name"] != "Glob"));
+            assert!(projected.iter().all(|tool| tool["name"] != "Workspace"));
+            assert!(projected.iter().all(|tool| tool["name"] != "extra_tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_deferred_descriptor_ignores_hidden_parameters_but_tracks_description() {
+        let provider = OpenAIProvider::new("k")
+            .with_responses_only_models(vec!["gpt-5*".to_string()])
+            .with_tool_search_execution(ResponsesToolSearchExecution::Server);
+        let mut tools = vec![footprint_schema("Read"), footprint_schema("Glob")];
+
+        let baseline = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let baseline_descriptor = baseline
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap()
+            .serialized
+            .clone();
+
+        tools[1].function.parameters = json!({
+            "type": "object",
+            "description": "hidden".repeat(50_000),
+        });
+        let huge_hidden_schema = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let huge_descriptor = huge_hidden_schema
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap();
+        assert_eq!(huge_descriptor.serialized, baseline_descriptor);
+        assert!(!huge_descriptor.serialized.contains("hidden"));
+
+        tools[1].function.description = "A different visible description".to_string();
+        let changed_description = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "gpt-5.6", None)
+            .await
+            .unwrap();
+        let changed_descriptor = changed_description
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.kind == ProviderVisibleToolSegmentKind::InitialDeferredDescriptor
+            })
+            .unwrap();
+        assert_ne!(changed_descriptor.serialized, baseline_descriptor);
+        assert!(changed_descriptor
+            .serialized
+            .contains("A different visible description"));
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_and_chat_sticky_footprints_match_their_top_level_lowering() {
+        let full = vec![footprint_schema("Read"), footprint_schema("Glob")];
+        let responses =
+            OpenAIProvider::new("k").with_responses_only_models(vec!["gpt-5*".to_string()]);
+        let legacy = responses
+            .provider_visible_tool_footprint(&PromptIR::default(), &full, "gpt-5.6", None)
+            .await
+            .unwrap();
+        assert_eq!(legacy.segments.len(), 1);
+        assert_eq!(
+            legacy.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            legacy.segments[0].serialized,
+            serde_json::to_string(&tools_to_responses_json(&full)).unwrap()
+        );
+
+        let sticky_tools = vec![
+            footprint_schema("Read"),
+            bamboo_domain::discovery_control_fallback_schema(),
+        ];
+        let sticky = OpenAIProvider::new("k").with_sticky_tool_loading(true);
+        assert_eq!(
+            sticky.capability_loading_mode("gpt-4o-mini", None).await,
+            CapabilityLoadingMode::StickyFallback
+        );
+        let sticky_footprint = sticky
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &sticky_tools,
+                "gpt-4o-mini",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sticky_footprint.segments[0].serialized,
+            serde_json::to_string(&tools_to_openai_compat_json(&sticky_tools)).unwrap()
+        );
+
+        let forced = responses
+            .with_tool_search_execution(ResponsesToolSearchExecution::Server)
+            .provider_visible_tool_footprint(&PromptIR::default(), &full, "gpt-5.6", Some("Glob"))
+            .await
+            .unwrap();
+        assert_eq!(
+            forced.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            forced.segments[0].serialized,
+            serde_json::to_string(&tools_to_responses_json(&full)).unwrap()
+        );
     }
 
     #[tokio::test]

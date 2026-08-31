@@ -11,9 +11,13 @@ use tokio_util::sync::CancellationToken;
 use super::execute_llm_stream;
 use super::LlmStreamFrame;
 use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
+use bamboo_agent_core::tools::{FunctionSchema, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_compression::{BudgetStrategy, PreparedContext, TokenBudget, TokenUsageBreakdown};
-use bamboo_llm::{Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream};
+use bamboo_llm::{
+    Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
+};
 use chrono::Utc;
 
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
@@ -168,6 +172,21 @@ fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
         ir_invoked: Mutex::new(false),
         ir_call_count: std::sync::atomic::AtomicUsize::new(0),
     })
+}
+
+fn provider_visible_schema(
+    name: &str,
+    description: impl Into<String>,
+    parameters: serde_json::Value,
+) -> ToolSchema {
+    ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: name.to_string(),
+            description: description.into(),
+            parameters,
+        },
+    }
 }
 
 fn test_config(system_prompt: &str) -> crate::runtime::config::AgentLoopConfig {
@@ -771,8 +790,8 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         .all(|event| matches!(event, AgentEvent::TokenBudgetUpdated { .. })));
 }
 
-#[test]
-fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
+#[tokio::test]
+async fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-explicit-projection", "test-model");
     session.metadata.insert(
@@ -808,6 +827,7 @@ fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
     let effective = super::effective_tool_schemas(&session, &tool_schemas);
     assert_eq!(effective.len(), 1);
     assert_eq!(effective[0].function.name, "load_skill");
+    let llm: Arc<dyn LLMProvider> = mock_llm(Vec::new());
 
     let projected_from_full = super::project_request_usage(
         &session,
@@ -815,14 +835,20 @@ fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
         &config,
         &tool_schemas,
         "test-model",
-    );
+        &llm,
+    )
+    .await
+    .expect("full projection");
     let projected_from_live_slice = super::project_request_usage(
         &session,
         &prepared_context,
         &config,
         &tool_schemas[..1],
         "test-model",
-    );
+        &llm,
+    )
+    .await
+    .expect("live-slice projection");
     assert_eq!(
         projected_from_full.input_tokens,
         projected_from_live_slice.input_tokens
@@ -831,6 +857,241 @@ fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
         projected_from_full.ledger_rendered_bytes,
         projected_from_live_slice.ledger_rendered_bytes
     );
+    assert!(projected_from_full.tool_schema_input_tokens > 0);
+    assert_eq!(
+        projected_from_full.tool_schema_input_tokens,
+        projected_from_live_slice.tool_schema_input_tokens
+    );
+    assert_eq!(projected_from_full.tool_schema_segment_count, 1);
+}
+
+#[tokio::test]
+async fn projected_usage_adds_the_provider_visible_schema_lane_once() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-provider-visible-budget", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm: Arc<dyn LLMProvider> = mock_llm(Vec::new());
+
+    let empty = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("empty provider-visible projection");
+    assert_eq!(empty.tool_schema_input_tokens, 0);
+    assert_eq!(empty.tool_schema_serialized_bytes, 0);
+    assert_eq!(empty.tool_schema_serialized_chars, 0);
+    assert_eq!(empty.tool_schema_segment_count, 0);
+    assert_eq!(empty.input_tokens, empty.message_input_tokens);
+
+    let tools = vec![provider_visible_schema(
+        "large_lookup",
+        "provider-visible lookup",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "large provider-visible parameter ".repeat(256)
+                }
+            }
+        }),
+    )];
+    let projected = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("schema provider-visible projection");
+    let repeated = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("deterministic provider-visible projection");
+
+    assert!(projected.tool_schema_input_tokens > 0);
+    assert!(projected.tool_schema_serialized_bytes > 0);
+    assert!(projected.tool_schema_serialized_chars > 0);
+    assert_eq!(projected.tool_schema_segment_count, 1);
+    assert_eq!(projected.input_tokens, repeated.input_tokens);
+    assert_eq!(
+        projected.input_tokens,
+        projected
+            .message_input_tokens
+            .saturating_add(projected.tool_schema_input_tokens)
+    );
+}
+
+#[test]
+fn openai_loaded_tool_items_increase_only_the_message_lane() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-openai-loaded-budget", "test-model");
+    let assistant = Message::assistant("normalized search result", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let mut config = test_config("system");
+    config.provider_name = Some("openai-footprint".to_string());
+    config.provider_type = Some("openai".to_string());
+    let prepared_context = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let footprint = ProviderVisibleToolFootprint {
+        segments: vec![ProviderVisibleToolSegment {
+            kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            serialized: r#"[{"type":"function","name":"Read"}]"#.to_string(),
+        }],
+    };
+    let baseline_envelope =
+        super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let baseline = super::measure_request_usage(&session, &baseline_envelope, &footprint);
+
+    let boundary = bamboo_domain::provider_transcript_boundary_sha256(
+        config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
+    )
+    .unwrap();
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &boundary,
+        )
+        .unwrap();
+    let search_output = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::HostToolSearch,
+        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+        serde_json::json!({
+            "type":"tool_search_output",
+            "execution":"client",
+            "call_id":"search_loaded_budget",
+            "status":"completed",
+            "tools":[{
+                "type":"function",
+                "name":"loaded_tool",
+                "description":"loaded message payload ".repeat(128),
+                "parameters":{"type":"object"},
+                "strict":false,
+                "defer_loading":true
+            }]
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![search_output])
+        .unwrap();
+    let additional_tools = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::DeveloperContext,
+        bamboo_domain::ProviderTranscriptAuthor::Host,
+        serde_json::json!({
+            "type":"additional_tools",
+            "role":"developer",
+            "tools":[{
+                "type":"function",
+                "name":"additional_tool",
+                "description":"additional message payload ".repeat(128),
+                "parameters":{"type":"object"},
+                "strict":false
+            }]
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![additional_tools])
+        .unwrap();
+
+    let loaded_envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let loaded = super::measure_request_usage(&session, &loaded_envelope, &footprint);
+
+    assert!(loaded.message_input_tokens > baseline.message_input_tokens);
+    assert_eq!(
+        loaded.tool_schema_input_tokens,
+        baseline.tool_schema_input_tokens
+    );
+    assert_eq!(
+        loaded.tool_schema_serialized_bytes,
+        baseline.tool_schema_serialized_bytes
+    );
+    assert_eq!(
+        loaded.input_tokens - baseline.input_tokens,
+        loaded.message_input_tokens - baseline.message_input_tokens
+    );
+}
+
+#[test]
+fn late_bound_marker_is_explicit_but_not_claimed_as_known_input() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-late-bound-budget", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let known = ProviderVisibleToolSegment {
+        kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+        serialized: r#"[{"type":"tool_search"}]"#.to_string(),
+    };
+    let known_only = super::measure_request_usage(
+        &session,
+        &envelope,
+        &ProviderVisibleToolFootprint {
+            segments: vec![known.clone()],
+        },
+    );
+    let with_late_bound = super::measure_request_usage(
+        &session,
+        &envelope,
+        &ProviderVisibleToolFootprint {
+            segments: vec![
+                known,
+                ProviderVisibleToolSegment {
+                    kind: ProviderVisibleToolSegmentKind::ProviderLateBound,
+                    serialized: String::new(),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(with_late_bound.input_tokens, known_only.input_tokens);
+    assert_eq!(with_late_bound.tool_schema_segment_count, 1);
+    assert_eq!(with_late_bound.tool_schema_late_bound_segment_count, 1);
 }
 
 #[tokio::test]
@@ -1094,6 +1355,79 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
 }
 
 #[tokio::test]
+async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-schema-final-budget", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let secret_sentinel = "SCHEMA_SENTINEL_MUST_NOT_APPEAR_IN_DIAGNOSTICS";
+    let tools = vec![provider_visible_schema(
+        "oversized_lookup",
+        "oversized provider-visible schema",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": format!("{} {}", secret_sentinel, "large parameter ".repeat(2_000))
+                }
+            }
+        }),
+    )];
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &tools,
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-schema-final-budget",
+            model: "test-model",
+            provider_name: Some("test"),
+            provider_type: Some("test"),
+            reasoning_effort: None,
+            max_context_tokens: 1_000,
+            max_output_tokens: 200,
+        },
+    )
+    .await;
+
+    let message = match result {
+        Err(AgentError::Budget(message)) => message,
+        Err(error) => panic!("oversized schema must fail with a budget error, got {error}"),
+        Ok(_) => panic!("oversized schema must be rejected"),
+    };
+    assert!(message.contains("message_input_tokens="));
+    assert!(message.contains("tool_schema_input_tokens="));
+    assert!(message.contains("input_limit=800"));
+    assert!(!message.contains(secret_sentinel));
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the final schema budget guard must run before chat_stream_ir"
+    );
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
     struct CountingCheckpointPersistence(std::sync::atomic::AtomicUsize);
 
@@ -1161,16 +1495,18 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         0,
     )
     .expect("the legacy zero-reservation fit should succeed");
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
     let naive_projection =
-        super::project_request_usage(&session, &naive, &config, &[], "test-model");
+        super::project_request_usage(&session, &naive, &config, &[], "test-model", &llm_dyn)
+            .await
+            .expect("naive provider-visible projection");
     assert!(
         naive_projection.input_tokens > budget.max_request_input_tokens(),
         "without projected snapshots the prepared transcript must reproduce the old overflow"
     );
     let naive_message_count = naive.messages.len();
 
-    let llm = mock_llm(vec![LLMChunk::Done]);
-    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
     let prepared = super::super::context_preparation::prepare_round_context(
         &mut session,
         &config,
@@ -1190,7 +1526,10 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         &config,
         &[],
         "test-model",
-    );
+        &llm_dyn,
+    )
+    .await
+    .expect("provider-visible projection");
     assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
 
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -1257,7 +1596,10 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         &config,
         &[],
         "test-model",
-    );
+        &llm_dyn,
+    )
+    .await
+    .expect("retry provider-visible projection");
     assert!(retry_projection.input_tokens <= retry_prepared.budget.max_request_input_tokens());
 
     execute_llm_stream(
@@ -2334,7 +2676,17 @@ fn plan_llm_request_model_transcript_path_records_observability() {
     };
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
 
-    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None);
+    let usage = super::ProjectedRequestUsage {
+        message_input_tokens: 120,
+        tool_schema_input_tokens: 30,
+        input_tokens: 150,
+        tool_schema_serialized_bytes: 512,
+        tool_schema_serialized_chars: 500,
+        tool_schema_segment_count: 2,
+        tool_schema_late_bound_segment_count: 1,
+        ledger_rendered_bytes: 64,
+    };
+    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None, usage);
 
     // No continuation set on the IR → the canonical model-transcript wire.
     assert!(envelope.ir.continuation.is_none());
@@ -2343,6 +2695,13 @@ fn plan_llm_request_model_transcript_path_records_observability() {
     // System rendered as structured blocks (tool guide present → relocation on).
     assert!(planned.render.system_block_count >= 1);
     assert_eq!(planned.render.tool_count, 3);
+    assert_eq!(planned.render.message_input_tokens, 120);
+    assert_eq!(planned.render.tool_schema_input_tokens, 30);
+    assert_eq!(planned.render.total_input_tokens, 150);
+    assert_eq!(planned.render.tool_schema_segment_count, 2);
+    assert_eq!(planned.render.tool_schema_late_bound_segment_count, 1);
+    assert_eq!(planned.render.tool_schema_serialized_bytes, 512);
+    assert_eq!(planned.render.tool_schema_serialized_chars, 500);
     // Cache plan surfaced into the observability + carried in the request options.
     assert!(planned.render.cache_system);
     assert_eq!(planned.render.cache_ttl, "1h");
@@ -2386,7 +2745,14 @@ fn plan_llm_request_continuation_path_builds_delta() {
         "resp_prev",
     );
 
-    let planned = super::plan_llm_request(&envelope, "session-plan-cont", None, 0, None);
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-plan-cont",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
 
     assert_eq!(planned.render.wire, "responses_continuation");
     // Delta is the tool result after the last assistant turn — NOT the full convo.
@@ -2592,7 +2958,14 @@ fn responses_continuation_uses_full_input_not_the_delta() {
         super::build_request_envelope(&session, &prepared_context, &config, &[]),
         "resp_prev",
     );
-    let planned = super::plan_llm_request(&envelope, "session-resp-cont", None, 0, None);
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-resp-cont",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
 
     // The adapter derives the Responses wire view from the IR + the engine's request
     // POLICY (planned.request_options.responses).
@@ -2635,7 +3008,14 @@ fn ir_cache_matches_request_options_cache() {
     };
 
     let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
-    let planned = super::plan_llm_request(&envelope, "session-cache-dup", None, 0, None);
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-cache-dup",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
     let options_cache = planned
         .request_options
         .cache

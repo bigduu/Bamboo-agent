@@ -10,6 +10,7 @@ use bamboo_domain::ToolSchema;
 use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
 use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
+use serde::Serialize;
 use std::pin::Pin;
 use thiserror::Error;
 
@@ -46,6 +47,64 @@ pub type Result<T> = std::result::Result<T, LLMError>;
 
 /// Type alias for boxed streaming LLM responses
 pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMChunk>> + Send>>;
+
+/// Why one compact tool-schema segment is visible at its model position.
+///
+/// The footprint deliberately describes already-lowered JSON rather than
+/// estimating tokens in the provider crate. Adjacent top-level definitions are
+/// one segment; provider-inlined definitions later in history are separate
+/// segments because prompt text lies between those positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderVisibleToolSegmentKind {
+    /// Complete definitions visible in the request's initial tools position.
+    InitialFullDefinition,
+    /// Name and description retained for one or more OpenAI hosted-search
+    /// functions while their parameter schemas remain deferred.
+    InitialDeferredDescriptor,
+    /// A complete Anthropic definition expanded at a validated tool reference.
+    AnthropicToolReferenceExpansion,
+    /// Empty marker following an initial search-enabled definition array. Later
+    /// definitions are bound by the provider or by transcript items rather than
+    /// duplicated at the initial position.
+    ProviderLateBound,
+}
+
+/// One compact serialized provider-visible schema position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderVisibleToolSegment {
+    pub kind: ProviderVisibleToolSegmentKind,
+    pub serialized: String,
+}
+
+impl ProviderVisibleToolSegment {
+    pub(crate) fn from_serializable<T: Serialize + ?Sized>(
+        kind: ProviderVisibleToolSegmentKind,
+        value: &T,
+    ) -> Result<Self> {
+        Ok(Self {
+            kind,
+            serialized: serde_json::to_string(value)?,
+        })
+    }
+
+    pub(crate) fn empty_marker(kind: ProviderVisibleToolSegmentKind) -> Self {
+        Self {
+            kind,
+            serialized: String::new(),
+        }
+    }
+}
+
+/// Ordered tool-schema material visible to a provider model for one request.
+///
+/// [`ProviderVisibleToolSegmentKind::ProviderLateBound`] explicitly marks
+/// provider-selected schema material that cannot be known before dispatch. It
+/// is not included in the known local token estimate; provider-reported usage
+/// remains authoritative after the response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderVisibleToolFootprint {
+    pub segments: Vec<ProviderVisibleToolSegment>,
+}
 
 /// Metadata for a provider model returned by `list_model_info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +279,30 @@ pub trait LLMProvider: Send + Sync {
         _required_tool: Option<&str>,
     ) -> CapabilityLoadingMode {
         CapabilityLoadingMode::LegacyFullCatalog
+    }
+
+    /// Lower the tool definitions visible to the model at this request.
+    ///
+    /// The default matches Bamboo's OpenAI-compatible Chat wire, which is also
+    /// the legacy surface used by generic providers. Native adapters override
+    /// this when their schema shape or deferred-loading protocol differs.
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &PromptIR,
+        tools: &[ToolSchema],
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        if tools.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        let projected = crate::providers::common::openai_compat::tools_to_openai_compat_json(tools);
+        Ok(ProviderVisibleToolFootprint {
+            segments: vec![ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                &projected,
+            )?],
+        })
     }
 
     /// Stream chat completion from the LLM
@@ -432,6 +515,50 @@ mod tests {
     struct RecordingProvider {
         requested_models: Arc<Mutex<Vec<String>>>,
         requested_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[tokio::test]
+    async fn default_tool_footprint_is_one_compact_openai_compat_position() {
+        let provider = RecordingProvider::default();
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_domain::FunctionSchema {
+                name: "lookup".to_string(),
+                description: "Look up a value".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "oneOf": [{"required": ["key"]}]
+                }),
+            },
+        }];
+
+        let footprint = provider
+            .provider_visible_tool_footprint(&PromptIR::default(), &tools, "model", None)
+            .await
+            .expect("footprint");
+
+        assert_eq!(footprint.segments.len(), 1);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        let rendered: serde_json::Value =
+            serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+        assert_eq!(
+            footprint.segments[0].serialized,
+            serde_json::to_string(&rendered).unwrap()
+        );
+        assert_eq!(rendered[0]["function"]["name"], "lookup");
+        assert!(rendered[0]["function"]["parameters"].get("oneOf").is_none());
+
+        assert_eq!(
+            provider
+                .provider_visible_tool_footprint(&PromptIR::default(), &[], "model", None)
+                .await
+                .unwrap(),
+            ProviderVisibleToolFootprint::default()
+        );
     }
 
     #[async_trait]

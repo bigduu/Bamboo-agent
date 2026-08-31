@@ -7,7 +7,7 @@ use super::{
     prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
-use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
@@ -1072,7 +1072,10 @@ async fn projected_relocation_does_not_double_reserve_large_system_env_context()
         &config,
         &[],
         "test-model",
-    );
+        &llm,
+    )
+    .await
+    .expect("provider-visible projection");
 
     assert!(projected.input_tokens <= request_input_limit);
     assert!(
@@ -1148,7 +1151,10 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
         &config,
         &[],
         "test-model",
-    );
+        &llm,
+    )
+    .await
+    .expect("provider-visible projection");
 
     assert!(projected.input_tokens <= request_input_limit);
     assert_eq!(
@@ -1250,13 +1256,17 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         counter.count_messages(&expanded_candidate_messages) > request_input_limit,
         "fixture must make the transformed candidate itself exceed the input limit"
     );
+    let projection_llm = noop_llm();
     let naive_projection = super::super::stream_execution::project_request_usage(
         &session,
         &naive,
         &config,
         &[],
         "test-model",
-    );
+        &projection_llm,
+    )
+    .await
+    .expect("provider-visible naive projection");
     assert!(
         naive_projection.input_tokens
             > session
@@ -1297,12 +1307,109 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         &config,
         &[],
         "test-model",
-    );
+        &llm,
+    )
+    .await
+    .expect("provider-visible projection");
     assert!(
         counter.count_messages(&prepared.prepared_context.messages) <= request_input_limit,
         "refit must bring the transformed message vector itself back under the limit"
     );
     assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn prepare_round_context_refits_for_provider_visible_tool_schemas() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut base = Session::new("session-schema-refit", "test-model");
+    base.messages.push(Message::system("system"));
+    for index in 0..36 {
+        base.messages.push(Message::user(format!(
+            "history-{index} {}",
+            "bounded user transcript ".repeat(18)
+        )));
+        base.messages.push(Message::assistant(
+            format!(
+                "answer-{index} {}",
+                "bounded assistant transcript ".repeat(18)
+            ),
+            None,
+        ));
+    }
+    base.messages.push(Message::user("continue"));
+    base.token_budget = Some(TokenBudget::with_safety_margin(
+        5_000,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("system".to_string()),
+        ..Default::default()
+    };
+    let tool = ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "large_lookup".to_string(),
+            description: "Large lookup".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "provider-visible parameter ".repeat(320)
+                    }
+                }
+            }),
+        },
+    };
+    let llm = noop_llm();
+
+    let mut without_tools = base.clone();
+    let without_tools_prepared = prepare_round_context(
+        &mut without_tools,
+        &config,
+        "test-model",
+        "session-schema-refit-empty",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("message-only context preparation");
+
+    let mut with_tools = base;
+    let with_tools_prepared = prepare_round_context(
+        &mut with_tools,
+        &config,
+        "test-model",
+        "session-schema-refit-tools",
+        std::slice::from_ref(&tool),
+        &llm,
+        None,
+    )
+    .await
+    .expect("schema-aware context preparation");
+
+    assert!(
+        with_tools_prepared.prepared_context.messages.len()
+            < without_tools_prepared.prepared_context.messages.len(),
+        "the fixed schema footprint must reserve room before fitting history"
+    );
+    let projected = super::super::stream_execution::project_request_usage(
+        &with_tools,
+        &with_tools_prepared.prepared_context,
+        &config,
+        std::slice::from_ref(&tool),
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("schema-aware final projection");
+    assert!(projected.tool_schema_input_tokens > 0);
+    assert!(projected.input_tokens <= with_tools_prepared.budget.max_request_input_tokens());
 }
 
 #[tokio::test]

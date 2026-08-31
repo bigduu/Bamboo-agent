@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 pub mod auth;
 use crate::provider::{
     LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo,
+    ProviderVisibleToolFootprint, ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
     ResponsesRequestOptions, Result,
 };
 use crate::types::LLMChunk;
@@ -25,7 +26,7 @@ use super::common::openai_compat::{
 };
 use super::common::openai_responses::{
     build_responses_body, retain_provider_transcript_family, select_responses_input_messages,
-    ResponsesInputSource, ResponsesSseParser,
+    tools_to_responses_json, ResponsesInputSource, ResponsesSseParser,
 };
 use super::common::request_overrides;
 use super::common::responses_debug::append_responses_sse_record;
@@ -1107,6 +1108,29 @@ impl CopilotProvider {
 
 #[async_trait]
 impl LLMProvider for CopilotProvider {
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &crate::prompt_ir::PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        _required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        if tools.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        let projected = if self.uses_responses_api(model) {
+            tools_to_responses_json(tools)
+        } else {
+            tools_to_openai_compat_json(tools)
+        };
+        Ok(ProviderVisibleToolFootprint {
+            segments: vec![ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                &projected,
+            )?],
+        })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -1705,6 +1729,52 @@ mod tests {
         assert!(provider.uses_responses_api("gpt-5.3-codex"));
         assert!(provider.uses_responses_api("gpt-5.4-whatever"));
         assert!(!provider.uses_responses_api("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn tool_footprint_matches_copilot_chat_and_responses_routes() {
+        let tools = vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "lookup".to_string(),
+                description: "Lookup".to_string(),
+                parameters: json!({"type":"object"}),
+            },
+        }];
+        let provider =
+            CopilotProvider::new().with_responses_only_models(vec!["gpt-5*".to_string()]);
+
+        let chat = provider
+            .provider_visible_tool_footprint(
+                &crate::prompt_ir::PromptIR::default(),
+                &tools,
+                "gpt-4o",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            chat.segments[0].serialized,
+            serde_json::to_string(&tools_to_openai_compat_json(&tools)).unwrap()
+        );
+
+        let responses = provider
+            .provider_visible_tool_footprint(
+                &crate::prompt_ir::PromptIR::default(),
+                &tools,
+                "gpt-5.6",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            responses.segments[0].serialized,
+            serde_json::to_string(&tools_to_responses_json(&tools)).unwrap()
+        );
+        assert_ne!(
+            responses.segments[0].serialized,
+            chat.segments[0].serialized
+        );
     }
 
     // ============================================

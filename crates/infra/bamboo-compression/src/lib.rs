@@ -32,7 +32,9 @@ pub use compression_tooling::{
     CompressionCandidatePlan, CompressionPlan, CompressionPlanError, ContextCompressionExposure,
     DEFAULT_SUMMARY_TARGET_RATIO,
 };
-pub use counter::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
+pub use counter::{
+    HeuristicTokenCounter, ProviderVisibleToolEstimate, TiktokenTokenCounter, TokenCounter,
+};
 pub use limits::{create_budget_for_model, ModelLimitsRegistry};
 pub use preparation::{
     estimate_prompt_cache_savings, estimate_prompt_cache_savings_with_fixed_tokens,

@@ -510,6 +510,45 @@ pub fn tools_to_progressive_responses_json(
     projected
 }
 
+/// Return the complete progressive Responses definitions inserted into the
+/// model's initial prefix. Hosted deferred functions retain a separate visible
+/// name/description descriptor, returned by
+/// [`tools_to_progressive_responses_deferred_descriptors_json`].
+pub fn tools_to_progressive_responses_footprint_json(
+    tools: &[ToolSchema],
+    execution: ResponsesToolSearchExecution,
+) -> Vec<Value> {
+    tools_to_progressive_responses_json(tools, execution)
+        .into_iter()
+        .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+        .collect()
+}
+
+/// Return the descriptor-only surface retained for server-hosted deferred
+/// functions. OpenAI keeps function names and descriptions visible while the
+/// potentially large parameter schemas stay deferred. Client search receives
+/// no deferred functions in the initial request and therefore has no matching
+/// descriptor segment.
+pub fn tools_to_progressive_responses_deferred_descriptors_json(
+    tools: &[ToolSchema],
+    execution: ResponsesToolSearchExecution,
+) -> Vec<Value> {
+    if execution == ResponsesToolSearchExecution::Client {
+        return Vec::new();
+    }
+    tools_to_progressive_responses_json(tools, execution)
+        .into_iter()
+        .filter_map(|mut tool| {
+            (tool.get("defer_loading").and_then(Value::as_bool) == Some(true)).then(|| {
+                if let Some(object) = tool.as_object_mut() {
+                    object.remove("parameters");
+                }
+                tool
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesInputSource {
     Explicit,
@@ -3182,6 +3221,9 @@ mod tests {
         assert_eq!(out[0]["name"], "Read");
         assert!(out[0].get("defer_loading").is_none());
         assert_eq!(out[1]["name"], "Glob");
+        assert_eq!(out[1]["description"], "Use Glob");
+        assert!(out[1]["parameters"].is_object());
+        assert_eq!(out[1]["strict"], false);
         assert_eq!(out[1]["defer_loading"], true);
         assert_eq!(out[2]["type"], "tool_search");
         assert_eq!(out[2]["execution"], "server");
@@ -3189,6 +3231,57 @@ mod tests {
         assert!(out[2].get("parameters").is_none());
         assert!(out[2].get("defer_loading").is_none());
         assert!(out.iter().all(|tool| tool["name"] != "Workspace"));
+
+        let footprint = tools_to_progressive_responses_footprint_json(
+            &tools,
+            ResponsesToolSearchExecution::Server,
+        );
+        assert_eq!(footprint.len(), 2, "Read + hosted search only");
+        assert_eq!(footprint[0]["name"], "Read");
+        assert_eq!(footprint[1]["type"], "tool_search");
+        assert!(footprint.iter().all(|tool| tool["name"] != "Glob"));
+    }
+
+    #[test]
+    fn hosted_deferred_descriptor_counts_names_but_not_hidden_parameter_size() {
+        let small = loading_schema("Glob");
+        let mut huge = small.clone();
+        huge.function.parameters = json!({
+            "type":"object",
+            "properties":{
+                "payload":{
+                    "type":"string",
+                    "description":"x".repeat(32_000)
+                }
+            }
+        });
+        let small_descriptor = tools_to_progressive_responses_deferred_descriptors_json(
+            std::slice::from_ref(&small),
+            ResponsesToolSearchExecution::Server,
+        );
+        let huge_descriptor = tools_to_progressive_responses_deferred_descriptors_json(
+            std::slice::from_ref(&huge),
+            ResponsesToolSearchExecution::Server,
+        );
+        assert_eq!(small_descriptor, huge_descriptor);
+        assert!(!serde_json::to_string(&huge_descriptor)
+            .unwrap()
+            .contains(&"x".repeat(128)));
+
+        let named = loading_schema("much_longer_deferred_function_name");
+        let named_descriptor = tools_to_progressive_responses_deferred_descriptors_json(
+            &[named],
+            ResponsesToolSearchExecution::Server,
+        );
+        assert!(
+            serde_json::to_string(&named_descriptor).unwrap().len()
+                > serde_json::to_string(&small_descriptor).unwrap().len()
+        );
+        assert!(tools_to_progressive_responses_deferred_descriptors_json(
+            &[small],
+            ResponsesToolSearchExecution::Client,
+        )
+        .is_empty());
     }
 
     #[test]
