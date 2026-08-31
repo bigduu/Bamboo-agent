@@ -9,13 +9,17 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
     Client,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, Result};
+use crate::protocol::ToProvider;
+use crate::provider::{
+    LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
+};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_strict_multi,
+    parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
 };
 use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::KeywordMaskingConfig;
@@ -93,6 +97,44 @@ impl BodhiProvider {
 
 #[async_trait]
 impl LLMProvider for BodhiProvider {
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &crate::prompt_ir::PromptIR,
+        tools: &[ToolSchema],
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let projected: Vec<Value> = match self.target_provider.as_str() {
+            "openai" => tools_to_openai_compat_json(tools),
+            "anthropic" => crate::providers::anthropic::tools_to_anthropic_json(
+                tools,
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ),
+            "gemini" => {
+                let tools: Vec<crate::protocol::gemini::GeminiTool> =
+                    tools.to_vec().to_provider()?;
+                tools
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<std::result::Result<_, _>>()?
+            }
+            other => {
+                return Err(LLMError::Auth(format!(
+                    "Unknown bodhi target provider: {other}"
+                )))
+            }
+        };
+        if projected.is_empty() {
+            return Ok(ProviderVisibleToolFootprint::default());
+        }
+        Ok(ProviderVisibleToolFootprint {
+            segments: vec![ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                &projected,
+            )?],
+        })
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -495,6 +537,53 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn tool_footprint_matches_each_bodhi_target_lowering() {
+        let tools = vec![load_skill_tool()];
+        let ir = crate::prompt_ir::PromptIR::default();
+
+        let openai = BodhiProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &tools, "model", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            openai.segments[0].serialized,
+            serde_json::to_string(&tools_to_openai_compat_json(&tools)).unwrap()
+        );
+
+        let anthropic = BodhiProvider::new("k")
+            .with_target_provider("anthropic")
+            .provider_visible_tool_footprint(&ir, &tools, "model", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            anthropic.segments[0].serialized,
+            serde_json::to_string(&crate::providers::anthropic::tools_to_anthropic_json(
+                &tools,
+                bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+            ))
+            .unwrap()
+        );
+
+        let gemini = BodhiProvider::new("k")
+            .with_target_provider("gemini")
+            .provider_visible_tool_footprint(&ir, &tools, "model", None)
+            .await
+            .unwrap();
+        let gemini: Value = serde_json::from_str(&gemini.segments[0].serialized).unwrap();
+        assert_eq!(gemini[0]["functionDeclarations"][0]["name"], "load_skill");
+        assert!(gemini[0]["functionDeclarations"][0]
+            .get("parametersJsonSchema")
+            .is_some());
+
+        let error = BodhiProvider::new("k")
+            .with_target_provider("unknown")
+            .provider_visible_tool_footprint(&ir, &tools, "model", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Unknown bodhi target provider"));
     }
 
     fn unsigned_tool_loop_messages() -> Vec<Message> {

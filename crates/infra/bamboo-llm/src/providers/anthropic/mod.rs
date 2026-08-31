@@ -34,7 +34,10 @@ use serde_json::{json, Value};
 use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
 use crate::prompt_ir::PromptIR;
 use crate::provider::LLMRequestOptions;
-use crate::provider::{required_tool_from_options, LLMError, LLMProvider, LLMStream, Result};
+use crate::provider::{
+    required_tool_from_options, LLMError, LLMProvider, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
+};
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
 use crate::types::LLMChunk;
@@ -284,6 +287,52 @@ impl LLMProvider for AnthropicProvider {
         } else {
             CapabilityLoadingMode::LegacyFullCatalog
         }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let mode = self.capability_loading_mode(model, required_tool).await;
+        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+            let projected = tools_to_anthropic_json(tools, mode);
+            if projected.is_empty() {
+                return Ok(ProviderVisibleToolFootprint::default());
+            }
+            return Ok(ProviderVisibleToolFootprint {
+                segments: vec![ProviderVisibleToolSegment::from_serializable(
+                    ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                    &projected,
+                )?],
+            });
+        }
+
+        let initial = tools_to_anthropic_json(tools, mode)
+            .into_iter()
+            .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+            .collect::<Vec<_>>();
+        let mut segments = vec![ProviderVisibleToolSegment::from_serializable(
+            ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            &initial,
+        )?];
+        segments.push(ProviderVisibleToolSegment::empty_marker(
+            ProviderVisibleToolSegmentKind::ProviderLateBound,
+        ));
+
+        for definition in validated_anthropic_reference_definitions_in_order(
+            ir.provider_transcript_groups.iter(),
+            tools,
+        )? {
+            segments.push(ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion,
+                &definition,
+            )?);
+        }
+
+        Ok(ProviderVisibleToolFootprint { segments })
     }
 
     async fn chat_stream(
@@ -1783,21 +1832,20 @@ fn tool_call_to_tool_use_block(tool_call: &bamboo_domain::ToolCall) -> Value {
     })
 }
 
-fn tools_to_anthropic_json(
+fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
+    json!({
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "input_schema": tool.function.parameters,
+    })
+}
+
+pub(crate) fn tools_to_anthropic_json(
     tools: &[ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
 ) -> Vec<Value> {
     if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
-        return tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "name": tool.function.name,
-                    "description": tool.function.description,
-                    "input_schema": tool.function.parameters,
-                })
-            })
-            .collect();
+        return tools.iter().map(tool_to_anthropic_json).collect();
     }
 
     let mut rendered = tools
@@ -1807,11 +1855,7 @@ fn tools_to_anthropic_json(
             if identity.loading_class() == CapabilityLoadingClass::HostOnly {
                 return None;
             }
-            let mut value = json!({
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "input_schema": tool.function.parameters,
-            });
+            let mut value = tool_to_anthropic_json(tool);
             if identity.loading_class() == CapabilityLoadingClass::Deferred {
                 value["defer_loading"] = Value::Bool(true);
             }
@@ -1890,6 +1934,42 @@ pub fn validated_anthropic_loaded_tool_names<'a>(
     }
 
     loaded.into_iter().collect()
+}
+
+/// Resolve every model-visible Anthropic reference occurrence, in transcript
+/// order, to the exact complete definition from this request's frozen catalog.
+/// Repeated references remain repeated because each one is expanded at a
+/// distinct history position by the provider.
+fn validated_anthropic_reference_definitions_in_order<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Result<Vec<Value>> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then_some((identity.execution_name().to_string(), tool))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut definitions = Vec::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let tool = catalog.get(reference).ok_or_else(|| {
+                LLMError::Api(format!(
+                    "Anthropic tool reference '{reference}' was not offered in the eligible catalog"
+                ))
+            })?;
+            definitions.push(tool_to_anthropic_json(tool));
+        }
+    }
+
+    Ok(definitions)
 }
 
 /// Stateful parser for Anthropic SSE streaming events.
@@ -2618,6 +2698,8 @@ pub fn parse_anthropic_sse_event(
 #[cfg(test)]
 mod anthropic_request_building {
     use crate::models::{ContentPart, ImageUrl};
+    use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
+    use crate::provider::{LLMProvider, ProviderVisibleToolSegmentKind};
     use bamboo_domain::Message;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
@@ -2676,6 +2758,199 @@ mod anthropic_request_building {
                 }),
             ),
         ]
+    }
+
+    fn host_reference_item(
+        tool_use_id: &str,
+        references: &[&str],
+    ) -> super::ProviderTranscriptItem {
+        super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result",
+                "tool_use_id":tool_use_id,
+                "is_error":false,
+                "content":references.iter().map(|name| {
+                    json!({"type":"tool_reference","tool_name":name})
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap()
+    }
+
+    fn anthropic_ir_with_reference_groups(groups: &[(&str, &[&str])]) -> PromptIR {
+        let mut session = bamboo_domain::Session::new("footprint-references", "claude");
+        activate_native_route(&mut session);
+        for (tool_use_id, references) in groups {
+            let result = Message::tool_result(*tool_use_id, "normalized reference result");
+            let anchor = result.id.clone();
+            session.add_message(result);
+            session
+                .append_provider_transcript_group(
+                    &anchor,
+                    None,
+                    vec![host_reference_item(tool_use_id, references)],
+                )
+                .unwrap();
+        }
+        PromptIR {
+            segments: vec![Segment::new(
+                SegmentRole::Conversation,
+                session.messages.clone(),
+            )],
+            provider_transcript_groups: session.provider_transcript.groups().to_vec(),
+            ..PromptIR::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_keeps_initial_array_and_each_reference_occurrence_ordered() {
+        let tools = vec![
+            tool_schema("Read"),
+            tool_schema("alpha_tool"),
+            tool_schema("beta_tool"),
+            tool_schema("Workspace"),
+        ];
+        let ir = anthropic_ir_with_reference_groups(&[
+            ("search_1", &["beta_tool", "Read", "alpha_tool"]),
+            ("search_2", &["beta_tool"]),
+        ]);
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &tools, "claude-sonnet-4-6", None)
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 6);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        let initial: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+        assert_eq!(initial.as_array().unwrap().len(), 2, "Read + search");
+        assert_eq!(initial[0]["name"], "Read");
+        assert_eq!(initial[1]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert!(initial.as_array().unwrap().iter().all(|tool| {
+            tool["name"] != "alpha_tool"
+                && tool["name"] != "beta_tool"
+                && tool["name"] != "Workspace"
+        }));
+        assert_eq!(
+            footprint.segments[1].kind,
+            ProviderVisibleToolSegmentKind::ProviderLateBound
+        );
+        assert!(footprint.segments[1].serialized.is_empty());
+
+        let expanded = footprint.segments[2..]
+            .iter()
+            .map(|segment| {
+                assert_eq!(
+                    segment.kind,
+                    ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion
+                );
+                serde_json::from_str::<Value>(&segment.serialized).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded,
+            vec!["beta_tool", "Read", "alpha_tool", "beta_tool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_rejects_a_reference_missing_from_the_frozen_catalog() {
+        let ir = anthropic_ir_with_reference_groups(&[("search_missing", &["missing_tool"])]);
+        let error = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &[tool_schema("Read")], "claude-sonnet-4-6", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing_tool"));
+        assert!(error.to_string().contains("eligible catalog"));
+    }
+
+    #[tokio::test]
+    async fn unreferenced_deferred_tools_do_not_change_the_initial_footprint() {
+        let provider = super::AnthropicProvider::new("k");
+        let baseline_tools = vec![tool_schema("Read")];
+        let baseline = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &baseline_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut expanded_tools = baseline_tools.clone();
+        expanded_tools.extend((0..100).map(|index| {
+            let mut tool = tool_schema(&format!("deferred_tool_{index}"));
+            tool.function.parameters = json!({
+                "type": "object",
+                "description": "hidden".repeat(1_000),
+            });
+            tool
+        }));
+        let expanded = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &expanded_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expanded.segments, baseline.segments);
+        let baseline_transport = super::tools_to_anthropic_json(
+            &baseline_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let expanded_transport = super::tools_to_anthropic_json(
+            &expanded_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(expanded_transport.len(), baseline_transport.len() + 100);
+        assert_eq!(
+            expanded_transport
+                .iter()
+                .filter(|tool| tool["defer_loading"] == true)
+                .count(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_footprint_matches_the_complete_anthropic_tools_lowering() {
+        let tools = vec![tool_schema("Read"), tool_schema("Glob")];
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &tools,
+                "claude-sonnet-4-6",
+                Some("Read"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 1);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            footprint.segments[0].serialized,
+            serde_json::to_string(&super::tools_to_anthropic_json(
+                &tools,
+                super::CapabilityLoadingMode::LegacyFullCatalog,
+            ))
+            .unwrap()
+        );
     }
 
     fn activate_native_route(session: &mut bamboo_domain::Session) {

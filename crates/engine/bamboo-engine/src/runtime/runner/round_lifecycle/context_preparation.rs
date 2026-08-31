@@ -883,7 +883,9 @@ pub(super) async fn prepare_round_context(
             config,
             tool_schemas,
             model_name,
-        );
+            llm,
+        )
+        .await?;
         if projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
             return Err(AgentError::Budget(format!(
                 "projected model-context ledger exceeds byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
@@ -902,8 +904,11 @@ pub(super) async fn prepare_round_context(
         }
         if refit_pass >= MAX_PROJECTED_REQUEST_REFIT_PASSES {
             return Err(AgentError::Budget(format!(
-                "projected model-context request remains over budget after {refit_pass} refit passes: input_tokens={}, input_limit={request_input_limit}",
+                "projected known provider-visible request remains over budget after {refit_pass} refit passes: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_late_bound_segments={}",
+                projected.message_input_tokens,
+                projected.tool_schema_input_tokens,
                 projected.input_tokens,
+                projected.tool_schema_late_bound_segment_count,
             )));
         }
 
@@ -922,6 +927,9 @@ pub(super) async fn prepare_round_context(
             session_id = %session.id,
             refit_pass,
             projected_input_tokens = projected.input_tokens,
+            message_input_tokens = projected.message_input_tokens,
+            tool_schema_input_tokens = projected.tool_schema_input_tokens,
+            tool_schema_late_bound_segments = projected.tool_schema_late_bound_segment_count,
             request_input_limit,
             deficit_tokens,
             prepared_message_tokens,
@@ -934,7 +942,16 @@ pub(super) async fn prepare_round_context(
             &budget,
             &counter,
             refit_fixed_tokens,
-        )?;
+        )
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "known provider-visible request cannot be refitted: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_late_bound_segments={}, cause={error}",
+                projected.message_input_tokens,
+                projected.tool_schema_input_tokens,
+                projected.input_tokens,
+                projected.tool_schema_late_bound_segment_count,
+            ))
+        })?;
     }
 
     logging::log_context_truncation(session_id, &prepared_context);
