@@ -91,10 +91,10 @@ pub(super) fn build_base_tools(
         project_tool,
     ));
 
-    let memory_tool = Arc::new(
-        crate::tools::MemoryTool::new(session_repo.clone(), app_data_dir.clone())
-            .with_project_store(project_store.clone()),
-    );
+    let memory_tool = Arc::new(crate::tools::MemoryTool::new(
+        session_repo.clone(),
+        app_data_dir.clone(),
+    ));
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,
         memory_tool,

@@ -6,9 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_domain::ProjectId;
 use bamboo_engine::project_context::{
-    ProjectContextError, ProjectContextSource, ProjectDescriptor, ProjectMemoryReadRoots,
+    ProjectContextError, ProjectContextSource, ProjectDescriptor,
 };
-use bamboo_memory::memory_store::LegacyProjectMemoryReadRoot;
 use bamboo_projects::{ProjectStore, ProjectStoreError};
 
 #[derive(Debug, thiserror::Error)]
@@ -550,10 +549,6 @@ impl ProjectContextSource for ProjectStoreContextSource {
             .store
             .resource_summary(project_id)
             .map_err(|error| ProjectContextError::Source(error.to_string()))?;
-        let memory_read_roots = self
-            .store
-            .project_memory_read_roots(project_id)
-            .map_err(|error| ProjectContextError::Source(error.to_string()))?;
         Ok(Some(ProjectDescriptor {
             id: manifest.id.clone(),
             name: manifest.name,
@@ -561,17 +556,6 @@ impl ProjectContextSource for ProjectStoreContextSource {
             home: self.store.paths().project_home(project_id),
             workspace_bindings: manifest.workspace_bindings,
             resources,
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: memory_read_roots.primary,
-                legacy_aliases: memory_read_roots
-                    .legacy_aliases
-                    .into_iter()
-                    .map(|legacy| LegacyProjectMemoryReadRoot {
-                        project_key: legacy.legacy_project_key,
-                        root: legacy.root,
-                    })
-                    .collect(),
-            },
         }))
     }
 

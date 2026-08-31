@@ -2171,10 +2171,6 @@ async fn runtime_skill_context_rejects_another_projects_workspace_overlay() {
             resource_revision: 1,
             resources: Vec::new(),
         },
-        memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-            primary: project_home.join("memory/v1"),
-            legacy_aliases: Vec::new(),
-        },
     };
     let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: directory.path().join("global-skills"),

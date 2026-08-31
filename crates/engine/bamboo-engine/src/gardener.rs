@@ -169,13 +169,13 @@ async fn gardener_targets(
 ) -> Vec<(MemoryScope, Option<String>, MemoryStore)> {
     let mut targets = vec![(MemoryScope::Global, None, memory.clone())];
     if let Some(resolver) = project_context_resolver {
-        match resolver.list_memory_read_scopes().await {
-            Ok(scopes) => {
-                targets.extend(scopes.into_iter().map(|scope| {
+        match resolver.list_project_ids().await {
+            Ok(project_ids) => {
+                targets.extend(project_ids.into_iter().map(|project_id| {
                     (
                         MemoryScope::Project,
-                        Some(scope.key().to_string()),
-                        scope.scoped_store(memory),
+                        Some(project_id.to_string()),
+                        memory.for_project(&project_id),
                     )
                 }));
             }
@@ -184,15 +184,6 @@ async fn gardener_targets(
                 "failed to resolve first-class Project gardener scopes: {error}"
             ),
         }
-    } else {
-        targets.extend(
-            memory
-                .list_project_keys()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|key| (MemoryScope::Project, Some(key), memory.clone())),
-        );
     }
     targets
 }
@@ -283,10 +274,6 @@ async fn run_gardener_once_with_store_and_resolver(
         else {
             continue;
         };
-        if target_store.is_read_only_project_memory_path(&doc.path) {
-            continue;
-        }
-
         let prompt = build_blob_split_prompt(&doc.frontmatter.title, &doc.body);
         let raw = match collect_model_json(
             provider.clone(),
@@ -433,10 +420,6 @@ async fn run_dedup_gardener_once_with_store_and_resolver(
                 .await
                 .map_err(|error| format!("dedup get failed: {error}"))?
             {
-                if target_store.is_read_only_project_memory_path(&doc.path) {
-                    members.clear();
-                    break;
-                }
                 if doc.frontmatter.status == DurableMemoryStatus::Active {
                     members.push((
                         doc.frontmatter.id.clone(),

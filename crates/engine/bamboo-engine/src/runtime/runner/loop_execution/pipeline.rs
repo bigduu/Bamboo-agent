@@ -3625,7 +3625,6 @@ mod tests {
     };
     use crate::project_context::{
         ProjectContextError, ProjectContextResolver, ProjectContextSource, ProjectDescriptor,
-        ProjectMemoryReadRoots,
     };
     use crate::runtime::config::{AgentLoopConfig, GuardianConfig, GuardianSpawner};
     use crate::runtime::goal_state::{
@@ -7675,12 +7674,6 @@ mod tests {
                     project_id: project_id.clone(),
                     resource_revision: 1,
                     resources: Vec::new(),
-                },
-                memory_read_roots: ProjectMemoryReadRoots {
-                    primary: directory
-                        .path()
-                        .join("projects/pipeline-context-cancel-project/memory/v1"),
-                    legacy_aliases: Vec::new(),
                 },
             },
             cancel_token: cancel.clone(),

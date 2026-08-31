@@ -18,10 +18,7 @@ pub use freshness::{
     memory_age_days, memory_age_label, memory_freshness_text, render_memory_freshness_note,
     FreshnessKind,
 };
-pub use paths::{
-    LegacyProjectMemoryReadRoot, MemoryPathResolver, ProjectMemoryPathResolver, SESSIONS_DIR,
-    TOPICS_DIR,
-};
+pub use paths::{MemoryPathResolver, ProjectMemoryPathResolver, SESSIONS_DIR, TOPICS_DIR};
 pub use recall::{shortlist_relevant_memories, MemoryRecallCandidate, MemoryRecallOptions};
 pub use store::MemoryStore;
 pub use types::{

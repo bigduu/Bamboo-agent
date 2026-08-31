@@ -484,10 +484,6 @@ mod project_prompt_tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/project-1/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("session-1", "model");
@@ -604,10 +600,6 @@ mod project_prompt_tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/round-project/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver =
             ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor.clone())));
@@ -669,12 +661,6 @@ mod project_prompt_tests {
                 project_id,
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/unrelated-project/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(std::sync::Arc::new(StaticSource(descriptor)));

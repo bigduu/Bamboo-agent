@@ -253,11 +253,13 @@ async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
 async fn external_memory_includes_project_memory_index_and_omits_global_dream_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-index").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-alpha");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -278,6 +280,7 @@ async fn external_memory_includes_project_memory_index_and_omits_global_dream_fa
         .expect("save dream notebook");
 
     let mut session = bamboo_agent_core::Session::new("session-project-memory", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -306,14 +309,18 @@ async fn external_memory_includes_project_memory_index_and_omits_global_dream_fa
 async fn external_memory_excludes_other_project_memory_index_content() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id_a = bamboo_domain::ProjectId::parse("project-prompt-a").expect("project id");
+    let project_id_b = bamboo_domain::ProjectId::parse("project-prompt-b").expect("project id");
+    let project_memory_a = store.for_project(&project_id_a);
+    let project_memory_b = store.for_project(&project_id_b);
     let workspace_a = temp_dir.path().join("workspace-project-a");
     let workspace_b = temp_dir.path().join("workspace-project-b");
     std::fs::create_dir_all(&workspace_a).expect("workspace a dir");
     std::fs::create_dir_all(&workspace_b).expect("workspace b dir");
-    let project_key_a = bamboo_memory::memory_store::project_key_from_path(&workspace_a);
-    let project_key_b = bamboo_memory::memory_store::project_key_from_path(&workspace_b);
+    let project_key_a = project_id_a.to_string();
+    let project_key_b = project_id_b.to_string();
 
-    store
+    project_memory_a
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key_a.as_str()),
@@ -328,7 +335,7 @@ async fn external_memory_excludes_other_project_memory_index_content() {
         )
         .await
         .expect("save project A memory");
-    store
+    project_memory_b
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key_b.as_str()),
@@ -345,6 +352,7 @@ async fn external_memory_excludes_other_project_memory_index_content() {
         .expect("save project B memory");
 
     let mut session = bamboo_agent_core::Session::new("session-project-a", "test-model");
+    session.set_project_id_meta(project_id_a.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -370,7 +378,7 @@ async fn external_memory_excludes_other_project_memory_index_content() {
 }
 
 #[tokio::test]
-async fn external_memory_malformed_project_id_does_not_read_path_derived_legacy_scope() {
+async fn external_memory_malformed_project_id_does_not_read_canonical_project_memory() {
     struct EmptyProjectSource;
 
     #[async_trait]
@@ -388,13 +396,14 @@ async fn external_memory_malformed_project_id_does_not_read_path_derived_legacy_
 
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    let workspace = temp_dir.path().join("legacy-workspace");
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-secret").expect("project id");
+    let project_memory = store.for_project(&project_id);
+    let workspace = temp_dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
-    let legacy_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
-            Some(&legacy_key),
+            Some(project_id.as_str()),
             bamboo_memory::memory_store::DurableMemoryType::Project,
             "Legacy secret",
             "MUST NOT ENTER PROMPT THROUGH MALFORMED PROJECT ID",
@@ -405,7 +414,7 @@ async fn external_memory_malformed_project_id_does_not_read_path_derived_legacy_
             None,
         )
         .await
-        .expect("seed legacy memory");
+        .expect("seed canonical Project memory");
     let mut session = bamboo_agent_core::Session::new("malformed-prompt-memory", "test-model");
     session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
     session.set_project_id_meta("../malformed".to_string());
@@ -431,10 +440,13 @@ async fn external_memory_malformed_project_id_does_not_read_path_derived_legacy_
 async fn external_memory_truncates_project_memory_index_and_adds_freshness_note() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-prompt-truncated").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-beta");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
-    let views_dir = store.resolver().views_dir(
+    let project_key = project_id.to_string();
+    let views_dir = project_memory.resolver().views_dir(
         bamboo_memory::memory_store::MemoryScope::Project,
         Some(project_key.as_str()),
     );
@@ -452,6 +464,7 @@ async fn external_memory_truncates_project_memory_index_and_adds_freshness_note(
 
     let mut session =
         bamboo_agent_core::Session::new("session-project-memory-truncated", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -527,11 +540,13 @@ async fn external_memory_truncates_multi_topic_content_and_is_idempotent() {
 async fn external_memory_renders_relevant_memory_section_for_project_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-recall").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-recall-project");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -548,6 +563,7 @@ async fn external_memory_renders_relevant_memory_section_for_project_hits() {
         .expect("save relevant project memory");
 
     let mut session = bamboo_agent_core::Session::new("session-recall-project", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -578,11 +594,13 @@ async fn external_memory_renders_relevant_memory_section_for_project_hits() {
 async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-stale").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-recall-stale");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    let doc = store
+    let doc = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -604,7 +622,7 @@ async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
         .replace(&doc.frontmatter.updated_at, old_timestamp)
         .replace(&doc.frontmatter.created_at, old_timestamp);
     std::fs::write(&doc.path, rewritten).expect("rewrite timestamps");
-    store
+    project_memory
         .rebuild_scope(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -613,6 +631,7 @@ async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
         .expect("rebuild scope after timestamp rewrite");
 
     let mut session = bamboo_agent_core::Session::new("session-recall-stale", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -675,12 +694,14 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
 async fn external_memory_limits_relevant_memories_to_top_k() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-topk").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-recall-topk");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
     for idx in 0..4 {
-        store
+        project_memory
             .write_memory(
                 bamboo_memory::memory_store::MemoryScope::Project,
                 Some(project_key.as_str()),
@@ -699,6 +720,7 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
     }
 
     let mut session = bamboo_agent_core::Session::new("session-recall-topk", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -725,11 +747,14 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
 async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_has_no_hits() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-prompt-fallback").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-recall-fallback");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -761,6 +786,7 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
         .expect("save global fallback memory");
 
     let mut session = bamboo_agent_core::Session::new("session-recall-fallback", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -789,11 +815,13 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
 async fn external_memory_prefers_project_dream_over_global_fallback() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-dream").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-project-dream");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_project_dream_view(
             project_key.as_str(),
             "# Bamboo Dream Notebook\n\nProject dream context",
@@ -806,6 +834,7 @@ async fn external_memory_prefers_project_dream_over_global_fallback() {
         .expect("write global dream");
 
     let mut session = bamboo_agent_core::Session::new("session-project-dream", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -869,11 +898,14 @@ async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index
 async fn external_memory_omits_project_index_when_project_prompt_injection_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-prompt-disabled").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-no-project-index");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -890,6 +922,7 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
         .expect("save project memory");
 
     let mut session = bamboo_agent_core::Session::new("session-no-project-index", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -935,11 +968,14 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
 async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_project_first_disabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-prompt-global-mode").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-global-dream-mode");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    store
+    project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -954,7 +990,7 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
         )
         .await
         .expect("save relevant project memory");
-    store
+    project_memory
         .write_project_dream_view(
             project_key.as_str(),
             "# Bamboo Dream Notebook\n\nProject dream context",
@@ -967,6 +1003,7 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
         .expect("write global dream");
 
     let mut session = bamboo_agent_core::Session::new("session-global-dream-mode", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -1014,11 +1051,13 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
 async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id = bamboo_domain::ProjectId::parse("project-prompt-rerank").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-rerank-recall");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    let lexical_first = store
+    let lexical_first = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -1033,7 +1072,7 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
         )
         .await
         .expect("save lexical-first memory");
-    let reranked_first = store
+    let reranked_first = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -1060,6 +1099,7 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
     };
 
     let mut session = bamboo_agent_core::Session::new("session-rerank-recall", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
@@ -1111,11 +1151,14 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
 async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-prompt-rerank-reload").expect("project id");
+    let project_memory = store.for_project(&project_id);
     let workspace = temp_dir.path().join("workspace-rerank-reload");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
-    let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+    let project_key = project_id.to_string();
 
-    let lexical_first = store
+    let lexical_first = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -1130,7 +1173,7 @@ async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
         )
         .await
         .expect("save lexical-first memory");
-    let reranked_first = store
+    let reranked_first = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -1153,6 +1196,7 @@ async fn external_memory_uses_latest_background_model_on_repeated_refresh() {
     let requested_models = provider.requested_models.clone();
 
     let mut session = bamboo_agent_core::Session::new("session-rerank-reload", "test-model");
+    session.set_project_id_meta(project_id.to_string());
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
     session.metadata.insert(
         "workspace_path".to_string(),
