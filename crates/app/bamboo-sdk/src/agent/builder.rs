@@ -77,12 +77,6 @@ impl bamboo_engine::project_context::ProjectContextSource for SdkProjectContextS
         let resources = self.store.resource_summary(project_id).map_err(|error| {
             bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
         })?;
-        let roots = self
-            .store
-            .project_memory_read_roots(project_id)
-            .map_err(|error| {
-                bamboo_engine::project_context::ProjectContextError::Source(error.to_string())
-            })?;
         Ok(Some(bamboo_engine::project_context::ProjectDescriptor {
             id: manifest.id.clone(),
             name: manifest.name,
@@ -90,19 +84,6 @@ impl bamboo_engine::project_context::ProjectContextSource for SdkProjectContextS
             home: self.store.paths().project_home(project_id),
             workspace_bindings: manifest.workspace_bindings,
             resources,
-            memory_read_roots: bamboo_engine::project_context::ProjectMemoryReadRoots {
-                primary: roots.primary,
-                legacy_aliases: roots
-                    .legacy_aliases
-                    .into_iter()
-                    .map(
-                        |root| bamboo_memory::memory_store::LegacyProjectMemoryReadRoot {
-                            project_key: root.legacy_project_key,
-                            root: root.root,
-                        },
-                    )
-                    .collect(),
-            },
         }))
     }
 

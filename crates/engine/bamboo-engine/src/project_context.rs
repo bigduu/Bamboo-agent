@@ -52,13 +52,6 @@ pub struct ProjectDescriptor {
     pub home: PathBuf,
     pub workspace_bindings: Vec<WorkspaceBinding>,
     pub resources: ProjectResourceSummary,
-    pub memory_read_roots: ProjectMemoryReadRoots,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectMemoryReadRoots {
-    pub primary: PathBuf,
-    pub legacy_aliases: Vec<bamboo_memory::memory_store::LegacyProjectMemoryReadRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,37 +201,6 @@ pub enum SessionProjectIdentity {
     Invalid { raw: String, message: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectMemoryScope {
-    Assigned {
-        project_id: ProjectId,
-        legacy_aliases: Vec<bamboo_memory::memory_store::LegacyProjectMemoryReadRoot>,
-    },
-    LegacyReadOnly(String),
-}
-
-impl ProjectMemoryScope {
-    pub fn key(&self) -> &str {
-        match self {
-            Self::Assigned { project_id, .. } => project_id.as_str(),
-            Self::LegacyReadOnly(project_key) => project_key,
-        }
-    }
-
-    pub fn scoped_store(
-        &self,
-        store: &bamboo_memory::memory_store::MemoryStore,
-    ) -> bamboo_memory::memory_store::MemoryStore {
-        match self {
-            Self::Assigned {
-                project_id,
-                legacy_aliases,
-            } => store.for_project_with_legacy_read_roots(project_id, legacy_aliases.clone()),
-            Self::LegacyReadOnly(_) => store.clone(),
-        }
-    }
-}
-
 impl ProjectContextResolver {
     pub fn new(source: Arc<dyn ProjectContextSource>) -> Self {
         Self {
@@ -300,33 +262,10 @@ impl ProjectContextResolver {
         }
     }
 
-    /// Resolve the Project id used for memory reads.
-    ///
-    /// Assigned sessions always use their stable Project id. The path-derived
-    /// fallback is read-compatibility for unassigned legacy sessions only; new
-    /// sessions and writes must use [`Self::project_id_from_session`].
-    pub fn memory_read_scope_for_session(session: &Session) -> Option<String> {
-        Self::memory_read_identity_for_session(session).map(|scope| scope.key().to_string())
-    }
-
-    pub fn memory_read_identity_for_session(session: &Session) -> Option<ProjectMemoryScope> {
+    pub fn memory_read_identity_for_session(session: &Session) -> Option<ProjectId> {
         match Self::session_project_identity(session) {
-            SessionProjectIdentity::Assigned(project_id) => Some(ProjectMemoryScope::Assigned {
-                project_id,
-                legacy_aliases: Vec::new(),
-            }),
-            SessionProjectIdentity::Unassigned => session
-                .workspace_path_meta()
-                .map(PathBuf::from)
-                .or_else(|| {
-                    bamboo_tools::tools::workspace_state::get_workspace(session.id.as_str())
-                })
-                .map(|path| {
-                    ProjectMemoryScope::LegacyReadOnly(
-                        bamboo_memory::memory_store::project_key_from_path(&path),
-                    )
-                }),
-            SessionProjectIdentity::Invalid { .. } => None,
+            SessionProjectIdentity::Assigned(project_id) => Some(project_id),
+            SessionProjectIdentity::Unassigned | SessionProjectIdentity::Invalid { .. } => None,
         }
     }
 
@@ -334,10 +273,10 @@ impl ProjectContextResolver {
         &self,
         session: &Session,
         workspace: Option<&Path>,
-    ) -> Result<Option<ProjectMemoryScope>, ProjectContextError> {
+    ) -> Result<Option<ProjectId>, ProjectContextError> {
         match Self::session_project_identity(session) {
             SessionProjectIdentity::Unassigned => {
-                return Ok(Self::memory_read_identity_for_session(session));
+                return Ok(None);
             }
             SessionProjectIdentity::Invalid { raw, message } => {
                 return Err(ProjectContextError::InvalidProjectIdentity { raw, message });
@@ -347,37 +286,17 @@ impl ProjectContextResolver {
         Ok(self
             .resolve(session, workspace)
             .await?
-            .map(|context| ProjectMemoryScope::Assigned {
-                project_id: context.project.id,
-                legacy_aliases: context.project.memory_read_roots.legacy_aliases,
-            }))
+            .map(|context| context.project.id))
     }
 
-    pub async fn list_memory_read_scopes(
-        &self,
-    ) -> Result<Vec<ProjectMemoryScope>, ProjectContextError> {
+    pub async fn list_project_ids(&self) -> Result<Vec<ProjectId>, ProjectContextError> {
         Ok(self
             .source
             .list_projects()
             .await?
             .into_iter()
-            .map(|project| ProjectMemoryScope::Assigned {
-                project_id: project.id,
-                legacy_aliases: project.memory_read_roots.legacy_aliases,
-            })
+            .map(|project| project.id)
             .collect())
-    }
-
-    /// Resolve the only valid Project write scope.
-    ///
-    /// Unassigned legacy sessions intentionally return `None`: their
-    /// path-derived scopes are read/migration aliases and must never receive
-    /// new Project memory or Dream writes.
-    pub fn memory_write_scope_for_session(session: &Session) -> Option<String> {
-        match Self::session_project_identity(session) {
-            SessionProjectIdentity::Assigned(project_id) => Some(project_id.into_string()),
-            SessionProjectIdentity::Unassigned | SessionProjectIdentity::Invalid { .. } => None,
-        }
     }
 
     pub async fn resolve(
@@ -1003,12 +922,6 @@ mod tests {
                 resource_revision: 7,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/01JPROJECT00000000000000000/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("session-1", "test");
@@ -1049,10 +962,6 @@ mod tests {
                 project_id: project_id.clone(),
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/project-default/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new_with_workspace_resolver(
@@ -1126,10 +1035,6 @@ mod tests {
                 resource_revision: 2,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/project-default/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let moved_resolver = ProjectContextResolver::new(Arc::new(StaticSource(moved_descriptor)));
         let moved = moved_resolver
@@ -1168,12 +1073,6 @@ mod tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/legacy-persisted-workspace/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("legacy-persisted-workspace", "test");
@@ -1206,12 +1105,6 @@ mod tests {
                 project_id,
                 resource_revision: 2,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/legacy-persisted-workspace/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let moved_resolver = ProjectContextResolver::new(Arc::new(StaticSource(moved_descriptor)));
@@ -1246,12 +1139,6 @@ mod tests {
                 project_id: project_id.clone(),
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/symlink-replaced-project/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
@@ -1292,12 +1179,6 @@ mod tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/symlink-explicit-project/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("symlink-explicit-project", "test");
@@ -1337,12 +1218,6 @@ mod tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/unconfigured-project/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("unconfigured", "test");
@@ -1363,12 +1238,6 @@ mod tests {
                 project_id: project_id.clone(),
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/unconfigured-project/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
@@ -1403,12 +1272,6 @@ mod tests {
                 project_id: project_id.clone(),
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory
-                    .path()
-                    .join("projects/project-prompt-refresh/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
@@ -1479,10 +1342,6 @@ mod tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/project-a/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(OwnedWorkspaceSource {
             descriptor,
@@ -1541,10 +1400,6 @@ mod tests {
                 resource_revision: 1,
                 resources: Vec::new(),
             },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/descriptor/memory/v1"),
-                legacy_aliases: Vec::new(),
-            },
         };
         let resolver = ProjectContextResolver::new(Arc::new(StaticSource(descriptor)));
         let mut session = Session::new("malformed", "test");
@@ -1581,10 +1436,6 @@ mod tests {
                 project_id: descriptor_id,
                 resource_revision: 1,
                 resources: Vec::new(),
-            },
-            memory_read_roots: ProjectMemoryReadRoots {
-                primary: directory.path().join("projects/descriptor/memory/v1"),
-                legacy_aliases: Vec::new(),
             },
         };
         let resolver = ProjectContextResolver::new(Arc::new(OwnedWorkspaceSource {
@@ -1655,10 +1506,9 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_legacy_scope_is_read_only() {
-        let mut session = Session::new("legacy-session", "legacy");
-        session.set_workspace_path_meta("/tmp/legacy-workspace");
-        assert!(ProjectContextResolver::memory_read_scope_for_session(&session).is_some());
-        assert!(ProjectContextResolver::memory_write_scope_for_session(&session).is_none());
+    fn unassigned_session_with_workspace_has_no_project_memory_scope() {
+        let mut session = Session::new("unassigned-session", "unassigned");
+        session.set_workspace_path_meta("/tmp/unassigned-workspace");
+        assert!(ProjectContextResolver::memory_read_identity_for_session(&session).is_none());
     }
 }

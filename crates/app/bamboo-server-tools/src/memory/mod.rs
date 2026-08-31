@@ -4,8 +4,8 @@ use serde_json::json;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
-    DurableMemoryStatus, LegacyProjectMemoryReadRoot, MemoryQueryOptions, MemoryScope, MemoryStore,
-    MAX_MAX_CHARS, MAX_QUERY_LIMIT,
+    DurableMemoryStatus, MemoryQueryOptions, MemoryScope, MemoryStore, MAX_MAX_CHARS,
+    MAX_QUERY_LIMIT,
 };
 use bamboo_tools::tools::session_memory::{
     execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
@@ -23,13 +23,11 @@ use args::MemoryArgs;
 pub struct MemoryTool {
     session_repo: bamboo_engine::SessionRepository,
     memory_store: MemoryStore,
-    project_store: Option<std::sync::Arc<bamboo_projects::ProjectStore>>,
 }
 
-struct ResolvedProjectMemoryAccess {
+struct ResolvedMemoryAccess {
     store: MemoryStore,
     project_key: Option<String>,
-    writable: bool,
 }
 
 impl MemoryTool {
@@ -40,27 +38,19 @@ impl MemoryTool {
         Self {
             session_repo,
             memory_store: MemoryStore::new(data_dir),
-            project_store: None,
         }
-    }
-
-    pub fn with_project_store(
-        mut self,
-        project_store: std::sync::Arc<bamboo_projects::ProjectStore>,
-    ) -> Self {
-        self.project_store = Some(project_store);
-        self
     }
 
     async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
         self.session_repo.load(session_id?).await
     }
 
-    async fn resolve_project_memory_access(
+    async fn resolve_memory_access(
         &self,
         explicit: Option<&str>,
         session_id: Option<&str>,
-    ) -> Result<ResolvedProjectMemoryAccess, ToolError> {
+        requested_scope: Option<MemoryScope>,
+    ) -> Result<ResolvedMemoryAccess, ToolError> {
         let explicit = explicit
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -89,78 +79,26 @@ impl MemoryTool {
                     "project_key cannot override the session's assigned Project".to_string(),
                 ));
             }
-            let project_store = self.project_store.as_ref().ok_or_else(|| {
-                ToolError::Execution(
-                    "Project memory resolver is unavailable for this assigned session".to_string(),
-                )
-            })?;
-            let roots = project_store
-                .project_memory_read_roots(&project_id)
-                .map_err(|error| {
-                    ToolError::Execution(format!("Failed to resolve Project memory roots: {error}"))
-                })?;
-            let aliases = roots
-                .legacy_aliases
-                .into_iter()
-                .map(|legacy| LegacyProjectMemoryReadRoot {
-                    project_key: legacy.legacy_project_key,
-                    root: legacy.root,
-                })
-                .collect();
-            return Ok(ResolvedProjectMemoryAccess {
-                store: self
-                    .memory_store
-                    .for_project_with_legacy_read_roots(&project_id, aliases),
+            return Ok(ResolvedMemoryAccess {
+                store: self.memory_store.for_project(&project_id),
                 project_key: Some(project_id.to_string()),
-                writable: true,
             });
         }
 
-        let derived_legacy_key = session.as_ref().and_then(|session| {
-            bamboo_engine::project_context::ProjectContextResolver::memory_read_scope_for_session(
-                session,
-            )
-        });
-        if explicit.as_deref() != derived_legacy_key.as_deref() && explicit.is_some() {
+        if explicit.is_some() {
             return Err(ToolError::InvalidArguments(
-                "project_key cannot override the session's legacy Project read scope".to_string(),
+                "project_key requires the session to be assigned to that Project".to_string(),
             ));
         }
-        Ok(ResolvedProjectMemoryAccess {
+        if requested_scope == Some(MemoryScope::Project) {
+            return Err(ToolError::InvalidArguments(
+                "Project memory requires an assigned Project".to_string(),
+            ));
+        }
+        Ok(ResolvedMemoryAccess {
             store: self.memory_store.clone(),
-            project_key: derived_legacy_key,
-            writable: false,
+            project_key: None,
         })
-    }
-
-    async fn ensure_memory_mutation_allowed(
-        &self,
-        access: &ResolvedProjectMemoryAccess,
-        id: &str,
-    ) -> Result<(), ToolError> {
-        let Some(doc) = access
-            .store
-            .get_memory(id, access.project_key.as_deref())
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("Failed to resolve memory mutation scope: {error}"))
-            })?
-        else {
-            return Ok(());
-        };
-        if doc.frontmatter.scope == MemoryScope::Project && !access.writable {
-            return Err(ToolError::Execution(
-                "Unassigned sessions may read legacy Project memory but cannot mutate it"
-                    .to_string(),
-            ));
-        }
-        if access.store.is_read_only_project_memory_path(&doc.path) {
-            return Err(ToolError::Execution(
-                "Legacy Project memory aliases are read-only; migrate the memory before mutating it"
-                    .to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -358,7 +296,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
                 let options = MemoryQueryOptions {
                     limit: options
@@ -411,7 +349,7 @@ impl Tool for MemoryTool {
                 options,
             } => {
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
                     .await?;
                 let max_chars = options
                     .and_then(|value| value.max_chars)
@@ -469,14 +407,8 @@ impl Tool for MemoryTool {
                 }
                 let granularity = Self::parse_granularity(granularity.as_deref())?;
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
-                if scope == MemoryScope::Project && !memory_access.writable {
-                    return Err(ToolError::Execution(
-                        "Unassigned sessions may read legacy Project memory but cannot write it"
-                            .to_string(),
-                    ));
-                }
                 let doc = memory_access
                     .store
                     .write_memory(
@@ -526,9 +458,7 @@ impl Tool for MemoryTool {
                 reason,
             } => {
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
-                    .await?;
-                self.ensure_memory_mutation_allowed(&memory_access, id.trim())
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
                     .await?;
                 let mode = Self::parse_merge_mode(mode.as_deref())?;
                 if matches!(mode.as_deref(), Some("contradict")) {
@@ -618,7 +548,7 @@ impl Tool for MemoryTool {
                     None => None,
                 };
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
                 let limit = options
                     .and_then(|value| value.limit)
@@ -661,9 +591,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
-                    .await?;
-                self.ensure_memory_mutation_allowed(&memory_access, id.trim())
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
                     .await?;
                 let mut split_pieces = Vec::with_capacity(pieces.len());
                 for piece in pieces {
@@ -721,7 +649,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
                 let min_sections = min_sections.unwrap_or(3);
                 let limit = options
@@ -764,7 +692,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
                 let min_score = min_score.unwrap_or(0.6);
                 let limit = options
@@ -813,7 +741,7 @@ impl Tool for MemoryTool {
                     None => None,
                 };
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
                     .await?;
                 let merged = bamboo_memory::memory_store::MemorySplitPiece {
                     title,
@@ -822,10 +750,6 @@ impl Tool for MemoryTool {
                     tags,
                 };
                 let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
-                for id in &ids {
-                    self.ensure_memory_mutation_allowed(&memory_access, id)
-                        .await?;
-                }
                 let Some(result) = memory_access
                     .store
                     .consolidate_memories(
@@ -871,17 +795,31 @@ impl Tool for MemoryTool {
                     Some(value) => Self::parse_status(value)?,
                     None => DurableMemoryStatus::Archived,
                 };
-                let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
-                    .await?;
-
-                if let Some(id) = id
+                let id = id
                     .as_deref()
                     .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    self.ensure_memory_mutation_allowed(&memory_access, id)
-                        .await?;
+                    .filter(|value| !value.is_empty());
+                let requested_scope = match id {
+                    Some(_) => None,
+                    None => {
+                        let scope = Self::parse_scope(scope.as_deref())?;
+                        if scope == MemoryScope::Session {
+                            return Err(ToolError::InvalidArguments(
+                                "purge supports durable scopes only in v1".to_string(),
+                            ));
+                        }
+                        Some(scope)
+                    }
+                };
+                let memory_access = self
+                    .resolve_memory_access(
+                        project_key.as_deref(),
+                        Some(session_id),
+                        requested_scope,
+                    )
+                    .await?;
+
+                if let Some(id) = id {
                     let Some(doc) = memory_access
                         .store
                         .archive_memory(
@@ -909,41 +847,7 @@ impl Tool for MemoryTool {
                         images: Vec::new(),
                     })
                 } else {
-                    let scope = Self::parse_scope(scope.as_deref())?;
-                    if scope == MemoryScope::Session {
-                        return Err(ToolError::InvalidArguments(
-                            "purge supports durable scopes only in v1".to_string(),
-                        ));
-                    }
-                    if scope == MemoryScope::Project && !memory_access.writable {
-                        return Err(ToolError::Execution(
-                            "Unassigned sessions may read legacy Project memory but cannot purge it"
-                                .to_string(),
-                        ));
-                    }
-                    if scope == MemoryScope::Project {
-                        let contains_alias = memory_access
-                            .store
-                            .list_memory_documents(scope, memory_access.project_key.as_deref())
-                            .await
-                            .map_err(|error| {
-                                ToolError::Execution(format!(
-                                    "Failed to inspect Project memory aliases: {error}"
-                                ))
-                            })?
-                            .iter()
-                            .any(|doc| {
-                                memory_access
-                                    .store
-                                    .is_read_only_project_memory_path(&doc.path)
-                            });
-                        if contains_alias {
-                            return Err(ToolError::Execution(
-                                "Batch purge is unavailable while read-only legacy Project memory aliases are present; migrate them first"
-                                    .to_string(),
-                            ));
-                        }
-                    }
+                    let scope = requested_scope.expect("batch purge scope was parsed");
                     let (filter_types, filter_statuses, filter_granularity) =
                         Self::parse_query_filters(filters.as_ref())?;
                     let result = memory_access
@@ -981,7 +885,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
                 let result = memory_access
                     .store
@@ -1009,14 +913,8 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_project_memory_access(project_key.as_deref(), Some(session_id))
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
                     .await?;
-                if scope == MemoryScope::Project && !memory_access.writable {
-                    return Err(ToolError::Execution(
-                        "Unassigned sessions may read legacy Project memory but cannot rebuild it"
-                            .to_string(),
-                    ));
-                }
                 memory_access
                     .store
                     .rebuild_scope(scope, memory_access.project_key.as_deref())

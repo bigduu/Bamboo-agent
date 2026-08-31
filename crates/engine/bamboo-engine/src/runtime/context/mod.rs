@@ -408,10 +408,6 @@ mod project_context_tests {
                         },
                     ],
                 },
-                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                    primary: PathBuf::from("/data/projects/01JPROJECT00000000000000000/memory/v1"),
-                    legacy_aliases: Vec::new(),
-                },
             },
             workspace: Some(PathBuf::from(workspace)),
             workspace_source: WorkspaceSource::Session,

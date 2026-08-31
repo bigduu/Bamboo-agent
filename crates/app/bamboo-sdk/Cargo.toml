@@ -22,7 +22,6 @@ bamboo-skills = { path = "../../infra/bamboo-skills" }
 bamboo-storage = { path = "../../infra/bamboo-storage" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 bamboo-mcp = { path = "../../infra/bamboo-mcp" }
-bamboo-memory = { path = "../../infra/bamboo-memory" }
 bamboo-projects = { path = "../../infra/bamboo-projects" }
 bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
 bamboo-server-tools = { path = "../bamboo-server-tools" }

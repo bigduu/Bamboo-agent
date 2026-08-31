@@ -2,11 +2,8 @@ use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use bamboo_agent_core::{Session, Storage};
-use bamboo_engine::auto_dream::{
-    run_project_auto_dream_once_for_project_with_read_roots, AutoDreamContext,
-};
+use bamboo_engine::auto_dream::{run_project_auto_dream_once_for_project, AutoDreamContext};
 use bamboo_engine::project_context::ProjectContextResolver;
-use bamboo_memory::memory_store::LegacyProjectMemoryReadRoot;
 use bamboo_storage::{CleanupMode, CleanupResult};
 
 use super::super::types::CleanupRequest;
@@ -135,34 +132,13 @@ pub async fn run_project_dream(
         config: state.config.clone(),
         provider_registry: state.provider_registry.clone(),
     };
-    let memory_roots = state
-        .project_store
-        .project_memory_read_roots(&project_id)
+    let result = run_project_auto_dream_once_for_project(&ctx, &project_id)
+        .await
         .map_err(|error| {
             crate::error::json_internal_server_error(format!(
-                "Failed to resolve Project memory roots: {error}"
+                "Failed to run project Dream generation: {error}"
             ))
         })?;
-    let legacy_read_roots = memory_roots
-        .legacy_aliases
-        .into_iter()
-        .map(|legacy| LegacyProjectMemoryReadRoot {
-            project_key: legacy.legacy_project_key,
-            root: legacy.root,
-        })
-        .collect();
-
-    let result = run_project_auto_dream_once_for_project_with_read_roots(
-        &ctx,
-        &project_id,
-        legacy_read_roots,
-    )
-    .await
-    .map_err(|error| {
-        crate::error::json_internal_server_error(format!(
-            "Failed to run project Dream generation: {error}"
-        ))
-    })?;
 
     let response = match result {
         Some(result) => serde_json::json!({

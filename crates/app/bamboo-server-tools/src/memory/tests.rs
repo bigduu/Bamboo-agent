@@ -322,17 +322,196 @@ async fn query_action_filters_by_granularity() {
 }
 
 #[tokio::test]
-async fn malformed_project_identity_cannot_read_path_derived_legacy_memory() {
+async fn assigned_project_memory_uses_only_the_canonical_project_store() {
     let dir = tempfile::tempdir().expect("memory dir");
-    let workspace = tempfile::tempdir().expect("legacy workspace");
-    let legacy_key = bamboo_memory::memory_store::project_key_from_path(workspace.path());
-    let store = MemoryStore::new(dir.path());
-    store
+    let workspace = tempfile::tempdir().expect("workspace");
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-memory-tool").expect("valid Project identity");
+    let mut session = Session::new("assigned-project-memory-tool", "model");
+    session.set_project_id_meta(project_id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let out = tool
+        .invoke(
+            json!({
+                "action": "write",
+                "scope": "project",
+                "project_key": project_id.as_str(),
+                "type": "project",
+                "title": "Canonical Project memory",
+                "content": "Project memory is keyed only by the assigned ProjectId."
+            }),
+            test_context("assigned-project-memory-tool"),
+        )
+        .await
+        .expect("assigned Project write should succeed");
+    let ToolOutcome::Completed(result) = out else {
+        panic!("expected Completed")
+    };
+    let value: serde_json::Value = serde_json::from_str(&result.result).expect("valid json");
+    let path = value["memory"]["path"]
+        .as_str()
+        .expect("memory path in response");
+    assert!(std::path::Path::new(path).starts_with(
+        dir.path()
+            .join("projects")
+            .join(project_id.as_str())
+            .join("memory")
+            .join("v1")
+    ));
+
+    let docs = MemoryStore::new(dir.path())
+        .for_project(&project_id)
+        .list_memory_documents(MemoryScope::Project, Some(project_id.as_str()))
+        .await
+        .expect("read canonical Project memory");
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].frontmatter.title, "Canonical Project memory");
+
+    let error = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "project",
+                "project_key": "project-other"
+            }),
+            test_context("assigned-project-memory-tool"),
+        )
+        .await
+        .expect_err("an explicit key must not override the assigned Project");
+    assert!(matches!(
+        error,
+        ToolError::InvalidArguments(ref message)
+            if message.contains("cannot override the session's assigned Project")
+    ));
+}
+
+#[tokio::test]
+async fn unassigned_workspace_cannot_select_or_discover_project_memory() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-private").expect("valid Project identity");
+    let seeded = MemoryStore::new(dir.path())
+        .for_project(&project_id)
         .write_memory(
             MemoryScope::Project,
-            Some(&legacy_key),
+            Some(project_id.as_str()),
             bamboo_memory::memory_store::DurableMemoryType::Project,
-            "Legacy secret",
+            "Private Project memory",
+            "MUST NOT LEAK TO AN UNASSIGNED WORKSPACE SESSION",
+            &[],
+            Some("seed-session"),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("seed canonical Project memory");
+    let mut session = Session::new("unassigned-workspace-memory-tool", "model");
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let query_error = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "project",
+                "query": "Private Project memory"
+            }),
+            test_context("unassigned-workspace-memory-tool"),
+        )
+        .await
+        .expect_err("workspace metadata must not create Project memory scope");
+    assert!(matches!(
+        query_error,
+        ToolError::InvalidArguments(ref message)
+            if message.contains("requires an assigned Project")
+    ));
+
+    let explicit_error = tool
+        .invoke(
+            json!({
+                "action": "query",
+                "scope": "global",
+                "project_key": project_id.as_str(),
+                "query": "Private Project memory"
+            }),
+            test_context("unassigned-workspace-memory-tool"),
+        )
+        .await
+        .expect_err("explicit project_key must not create Project memory scope");
+    assert!(matches!(
+        explicit_error,
+        ToolError::InvalidArguments(ref message)
+            if message.contains("requires the session to be assigned")
+    ));
+
+    let get_error = tool
+        .invoke(
+            json!({"action": "get", "id": seeded.frontmatter.id}),
+            test_context("unassigned-workspace-memory-tool"),
+        )
+        .await
+        .expect_err("unscoped get must not enumerate Project directories");
+    assert!(get_error.to_string().contains("memory not found"));
+    assert!(!get_error
+        .to_string()
+        .contains("MUST NOT LEAK TO AN UNASSIGNED WORKSPACE SESSION"));
+}
+
+#[tokio::test]
+async fn assigned_project_cannot_get_memory_from_an_unrelated_project() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let assigned_id =
+        bamboo_domain::ProjectId::parse("project-assigned").expect("valid assigned Project");
+    let unrelated_id =
+        bamboo_domain::ProjectId::parse("project-unrelated").expect("valid unrelated Project");
+    let unrelated = MemoryStore::new(dir.path())
+        .for_project(&unrelated_id)
+        .write_memory(
+            MemoryScope::Project,
+            Some(unrelated_id.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Unrelated Project memory",
+            "MUST NOT LEAK ACROSS PROJECTS",
+            &[],
+            Some("seed-session"),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("seed unrelated Project memory");
+    let mut session = Session::new("assigned-isolation-memory-tool", "model");
+    session.set_project_id_meta(assigned_id.to_string());
+    let tool = build_memory_tool_with_session(dir.path(), session).await;
+
+    let error = tool
+        .invoke(
+            json!({"action": "get", "id": unrelated.frontmatter.id}),
+            test_context("assigned-isolation-memory-tool"),
+        )
+        .await
+        .expect_err("unscoped get must stay within the assigned Project and Global");
+    assert!(error.to_string().contains("memory not found"));
+    assert!(!error.to_string().contains("MUST NOT LEAK ACROSS PROJECTS"));
+}
+
+#[tokio::test]
+async fn malformed_project_identity_cannot_read_canonical_project_memory() {
+    let dir = tempfile::tempdir().expect("memory dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let project_id =
+        bamboo_domain::ProjectId::parse("project-secret").expect("valid Project identity");
+    MemoryStore::new(dir.path())
+        .for_project(&project_id)
+        .write_memory(
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Project secret",
             "MUST NOT LEAK THROUGH MALFORMED PROJECT ID",
             &[],
             Some("seed-session"),
@@ -341,7 +520,7 @@ async fn malformed_project_identity_cannot_read_path_derived_legacy_memory() {
             None,
         )
         .await
-        .expect("seed legacy memory");
+        .expect("seed canonical Project memory");
     let mut session = Session::new("malformed-project-memory-tool", "model");
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     session.set_project_id_meta("../malformed".to_string());
@@ -352,13 +531,13 @@ async fn malformed_project_identity_cannot_read_path_derived_legacy_memory() {
             json!({
                 "action": "query",
                 "scope": "project",
-                "project_key": legacy_key,
-                "query": "Legacy secret"
+                "project_key": project_id.as_str(),
+                "query": "Project secret"
             }),
             test_context("malformed-project-memory-tool"),
         )
         .await
-        .expect_err("malformed Project identity must fail before legacy lookup");
+        .expect_err("malformed Project identity must fail before Project lookup");
     assert!(
         matches!(error, ToolError::InvalidArguments(ref message) if message.contains("invalid Project identity"))
     );

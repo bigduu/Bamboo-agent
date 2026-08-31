@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::project_context::{ProjectContextResolver, ProjectMemoryScope};
+use crate::project_context::ProjectContextResolver;
 use crate::runtime::config::PromptMemoryFlags;
 use bamboo_agent_core::{PromptMemoryObservability, Session};
 use bamboo_domain::ledger::LedgerScope;
@@ -232,22 +232,20 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
             Err(error) => {
                 tracing::warn!(
                     session_id = %session.id,
-                    "failed to resolve Project memory read roots: {error}"
+                    "failed to resolve Project memory identity: {error}"
                 );
                 None
             }
         }
     } else {
-        resolve_prompt_project_scope(session)
+        ProjectContextResolver::memory_read_identity_for_session(session)
     };
     let scoped_memory = resolved_project_scope
         .as_ref()
-        .map(|scope| scope.scoped_store(memory))
+        .map(|project_id| memory.for_project(project_id))
         .unwrap_or_else(|| memory.clone());
     let memory = &scoped_memory;
-    let resolved_project_key = resolved_project_scope
-        .as_ref()
-        .map(|scope| scope.key().to_string());
+    let resolved_project_key = resolved_project_scope.as_ref().map(ToString::to_string);
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
     let ledger_agenda = if prompt_memory_flags.ledger_agenda {
         load_ledger_agenda_snippet(memory, resolved_project_key.as_deref()).await
@@ -446,10 +444,6 @@ fn render_ledger_agenda_section(snippet: &LedgerAgendaSnippet) -> String {
     }
     section.push('\n');
     section
-}
-
-fn resolve_prompt_project_scope(session: &Session) -> Option<ProjectMemoryScope> {
-    ProjectContextResolver::memory_read_identity_for_session(session)
 }
 
 pub(super) fn latest_user_query_text(session: &Session) -> Option<String> {

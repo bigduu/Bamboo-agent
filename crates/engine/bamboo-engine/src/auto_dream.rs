@@ -25,7 +25,7 @@ use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LE
 use bamboo_memory::memory_store::{MemoryScope, MemoryStore};
 use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
-use crate::project_context::{ProjectContextResolver, ProjectMemoryScope};
+use crate::project_context::ProjectContextResolver;
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
 const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
@@ -134,32 +134,29 @@ async fn collect_candidate_sessions(
     out
 }
 
-async fn resolve_session_project_key(
+async fn resolve_session_project_id(
     ctx: &AutoDreamContext,
-    _memory: &MemoryStore,
     session_id: &str,
-) -> Option<String> {
+) -> Option<bamboo_domain::ProjectId> {
     ctx.storage
         .load_session(session_id)
         .await
         .ok()
         .flatten()
-        .and_then(|session| ProjectContextResolver::memory_write_scope_for_session(&session))
+        .and_then(|session| ProjectContextResolver::memory_read_identity_for_session(&session))
 }
 
 async fn collect_candidate_sessions_for_project(
     ctx: &AutoDreamContext,
-    memory: &MemoryStore,
     project_key: &str,
     since: DateTime<Utc>,
 ) -> Vec<(SessionIndexEntry, Option<String>)> {
     let mut out = Vec::new();
     for (entry, summary) in collect_candidate_sessions(ctx, since).await {
-        if resolve_session_project_key(ctx, memory, &entry.id)
-            .await
-            .as_deref()
-            != Some(project_key)
-        {
+        let Some(project_id) = resolve_session_project_id(ctx, &entry.id).await else {
+            continue;
+        };
+        if project_id.as_str() != project_key {
             continue;
         }
         out.push((entry, summary));
@@ -177,7 +174,9 @@ async fn collect_candidate_session_contexts_from_sessions(
 ) -> Vec<CandidateSessionContext> {
     let mut out = Vec::new();
     for (entry, summary) in sessions {
-        let project_key = resolve_session_project_key(ctx, memory, &entry.id).await;
+        let project_key = resolve_session_project_id(ctx, &entry.id)
+            .await
+            .map(bamboo_domain::ProjectId::into_string);
         let topics = memory
             .read_session_topics_with_content(&entry.id)
             .await
@@ -228,7 +227,7 @@ async fn collect_candidate_session_contexts_for_project(
     collect_candidate_session_contexts_from_sessions(
         ctx,
         memory,
-        collect_candidate_sessions_for_project(ctx, memory, project_key, since).await,
+        collect_candidate_sessions_for_project(ctx, project_key, since).await,
     )
     .await
 }
@@ -379,11 +378,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         "failed to resolve Project memory scope for session '{session_id}': {error}"
                     )
                 })?;
-            let Some(ProjectMemoryScope::Assigned {
-                project_id,
-                legacy_aliases,
-            }) = resolved
-            else {
+            let Some(project_id) = resolved else {
                 tracing::warn!(
                     target: DREAM_TRACING_TARGET,
                     event = "project_candidate_skipped",
@@ -394,7 +389,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 continue;
             };
             write_project_key = Some(project_id.to_string());
-            write_memory = memory.for_project_with_legacy_read_roots(&project_id, legacy_aliases);
+            write_memory = memory.for_project(&project_id);
         }
         let tags = candidate.tags;
         let _ = &candidate.confidence;
@@ -761,7 +756,7 @@ async fn run_auto_dream_once_for_scope(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
-            collect_candidate_sessions_for_project(ctx, memory, project_key, since).await
+            collect_candidate_sessions_for_project(ctx, project_key, since).await
         }
         MemoryScope::Session => {
             return Err("session-scoped Dream generation is not supported".to_string())
@@ -976,34 +971,12 @@ pub async fn run_auto_dream_once_with_project_resolver(
     .await
 }
 
-pub async fn run_project_auto_dream_once(
-    ctx: &AutoDreamContext,
-    project_key: &str,
-) -> Result<Option<AutoDreamRunResult>, String> {
-    let memory = memory_store_for_context(ctx);
-    run_project_auto_dream_once_with_store(ctx, &memory, project_key).await
-}
-
 /// Run Project Dream against the first-class Project-home memory layout.
-///
-/// The legacy string-key entrypoint above remains for migration-only callers;
-/// assigned sessions must call this typed entrypoint so new Dream writes cannot
-/// land in a path-hash scope.
 pub async fn run_project_auto_dream_once_for_project(
     ctx: &AutoDreamContext,
     project_id: &bamboo_domain::ProjectId,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let memory = memory_store_for_context(ctx).for_project(project_id);
-    run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
-}
-
-pub async fn run_project_auto_dream_once_for_project_with_read_roots(
-    ctx: &AutoDreamContext,
-    project_id: &bamboo_domain::ProjectId,
-    legacy_read_roots: Vec<bamboo_memory::memory_store::LegacyProjectMemoryReadRoot>,
-) -> Result<Option<AutoDreamRunResult>, String> {
-    let memory = memory_store_for_context(ctx)
-        .for_project_with_legacy_read_roots(project_id, legacy_read_roots);
     run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
 }
 
@@ -1315,14 +1288,6 @@ mod tests {
             .expect("query should succeed");
         assert_eq!(results.matched_count, 1);
         assert_eq!(results.items[0].title, "User prefers terse responses");
-        let legacy_project_key = bamboo_memory::memory_store::project_key_from_path(
-            &temp_dir.path().join("workspace-a"),
-        );
-        assert!(!temp_dir
-            .path()
-            .join("memory/v1/scopes/projects")
-            .join(legacy_project_key)
-            .exists());
 
         let state = memory
             .read_session_state("session-auto")
@@ -1350,10 +1315,6 @@ mod tests {
                     project_id: project_id.clone(),
                     resource_revision: 1,
                     resources: Vec::new(),
-                },
-                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                    primary: project_home.join("memory/v1"),
-                    legacy_aliases: Vec::new(),
                 },
             },
         )));
@@ -1424,12 +1385,20 @@ mod tests {
             .await
             .expect("query global");
         assert_eq!(global.matched_count, 0);
-        let legacy_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
-        assert!(!temp_dir
-            .path()
-            .join("memory/v1/scopes/projects")
-            .join(legacy_key)
-            .exists());
+        let project = memory
+            .for_project(&project_id)
+            .query_scope(
+                MemoryScope::Project,
+                Some(project_id.as_str()),
+                Some("Must not persist"),
+                None,
+                None,
+                None,
+                &bamboo_memory::memory_store::MemoryQueryOptions::default(),
+            )
+            .await
+            .expect("query Project memory");
+        assert_eq!(project.matched_count, 0);
     }
 
     #[tokio::test]
@@ -1465,10 +1434,6 @@ mod tests {
                     project_id: project_id.clone(),
                     resource_revision: 1,
                     resources: Vec::new(),
-                },
-                memory_read_roots: crate::project_context::ProjectMemoryReadRoots {
-                    primary: memory_root.clone(),
-                    legacy_aliases: Vec::new(),
                 },
             },
         )));
@@ -1554,19 +1519,6 @@ mod tests {
             .expect("query Project memory");
         assert_eq!(results.matched_count, 2);
         assert!(memory_root.join("topics").is_dir());
-        assert!(!temp_dir
-            .path()
-            .join("memory/v1/scopes/projects")
-            .join(project_id.as_str())
-            .exists());
-        for workspace in [&workspace_one, &workspace_two] {
-            let legacy_key = bamboo_memory::memory_store::project_key_from_path(workspace);
-            assert!(!temp_dir
-                .path()
-                .join("memory/v1/scopes/projects")
-                .join(legacy_key)
-                .exists());
-        }
     }
 
     #[tokio::test]
@@ -1949,7 +1901,8 @@ mod tests {
         let workspace_b = temp_dir.path().join("workspace-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a");
         std::fs::create_dir_all(&workspace_b).expect("workspace b");
-        let project_key_a = bamboo_memory::memory_store::project_key_from_path(&workspace_a);
+        let project_id_a = ProjectId::parse("project-auto-dream-a").expect("project id");
+        let project_key_a = project_id_a.to_string();
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -1971,7 +1924,7 @@ mod tests {
 
         let mut session_a = bamboo_agent_core::Session::new("session-project-a", "model");
         session_a.title = "Project A session".to_string();
-        session_a.set_project_id_meta(project_key_a.clone());
+        session_a.set_project_id_meta(project_id_a.to_string());
         session_a.metadata.insert(
             "workspace_path".to_string(),
             workspace_a.to_string_lossy().to_string(),
@@ -2004,8 +1957,8 @@ mod tests {
             .await
             .expect("save session b");
 
-        let memory = MemoryStore::new(temp_dir.path());
-        memory
+        let base_memory = MemoryStore::new(temp_dir.path());
+        base_memory
             .write_session_topic(
                 "session-project-a",
                 "default",
@@ -2013,7 +1966,7 @@ mod tests {
             )
             .await
             .expect("write session topic a");
-        memory
+        base_memory
             .write_session_topic(
                 "session-project-b",
                 "default",
@@ -2021,6 +1974,7 @@ mod tests {
             )
             .await
             .expect("write session topic b");
+        let memory = base_memory.for_project(&project_id_a);
 
         let context = AutoDreamContext {
             session_store,
@@ -2029,7 +1983,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key_a)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id_a)
             .await
             .expect("project auto dream should succeed")
             .expect("project auto dream should produce output");
@@ -2081,8 +2035,8 @@ mod tests {
         let workspace_target = temp_dir.path().join("workspace-target");
         std::fs::create_dir_all(&workspace_other).expect("workspace other");
         std::fs::create_dir_all(&workspace_target).expect("workspace target");
-        let target_project_key =
-            bamboo_memory::memory_store::project_key_from_path(&workspace_target);
+        let target_project_id = ProjectId::parse("project-auto-dream-target").expect("project id");
+        let target_project_key = target_project_id.to_string();
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -2116,7 +2070,7 @@ mod tests {
             .await
             .expect("save other session");
 
-        let memory = MemoryStore::new(temp_dir.path());
+        let memory = MemoryStore::new(temp_dir.path()).for_project(&target_project_id);
         memory
             .write_project_dream_view(
                 &target_project_key,
@@ -2132,7 +2086,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_with_store(&context, &memory, &target_project_key)
+        let result = run_project_auto_dream_once_for_project(&context, &target_project_id)
             .await
             .expect("project auto dream without sessions should not error");
         assert!(result.is_none());
@@ -2152,7 +2106,8 @@ mod tests {
 
         let workspace = temp_dir.path().join("workspace-manual-project-dream");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+        let project_id = ProjectId::parse("project-manual-dream").expect("project id");
+        let project_key = project_id.to_string();
 
         let session_store = Arc::new(
             SessionStoreV2::new(temp_dir.path().to_path_buf())
@@ -2173,7 +2128,7 @@ mod tests {
 
         let mut session = bamboo_agent_core::Session::new("session-manual-project-dream", "model");
         session.title = "Manual project dream session".to_string();
-        session.set_project_id_meta(project_key.clone());
+        session.set_project_id_meta(project_id.to_string());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
@@ -2186,8 +2141,8 @@ mod tests {
         session.add_message(Message::user("Generate a project-scoped dream manually."));
         storage.save_session(&session).await.expect("save session");
 
-        let memory = MemoryStore::new(temp_dir.path());
-        memory
+        let base_memory = MemoryStore::new(temp_dir.path());
+        base_memory
             .write_session_topic(
                 "session-manual-project-dream",
                 "default",
@@ -2195,6 +2150,7 @@ mod tests {
             )
             .await
             .expect("write session topic");
+        let memory = base_memory.for_project(&project_id);
 
         let context = AutoDreamContext {
             session_store,
@@ -2203,7 +2159,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id)
             .await
             .expect(
                 "manual project dream should succeed even when auto background dream is disabled",
@@ -2249,11 +2205,12 @@ mod tests {
 
         let workspace = temp_dir.path().join("workspace-grounded-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+        let project_id = ProjectId::parse("project-grounded-dream").expect("project id");
+        let project_key = project_id.to_string();
 
         let mut session = bamboo_agent_core::Session::new("session-grounded-mode", "model");
         session.title = "Grounded mode test".to_string();
-        session.set_project_id_meta(project_key.clone());
+        session.set_project_id_meta(project_id.to_string());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
@@ -2266,7 +2223,7 @@ mod tests {
         session.add_message(Message::user("Update the dream from durable memory."));
         storage.save_session(&session).await.expect("save session");
 
-        let memory = MemoryStore::new(temp_dir.path());
+        let memory = MemoryStore::new(temp_dir.path()).for_project(&project_id);
         // Existing notebook with only a "Last consolidated at" line (NO "Last full
         // rebuild at") → force_full_rebuild is false, so this is a NON-forced pass.
         memory
@@ -2300,7 +2257,7 @@ mod tests {
             provider_registry: test_registry(),
         };
 
-        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id)
             .await
             .expect("grounded auto dream should succeed")
             .expect("dream output should be produced");
@@ -2359,11 +2316,12 @@ mod tests {
 
         let workspace = temp_dir.path().join("workspace-rebuild-mode");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let project_key = bamboo_memory::memory_store::project_key_from_path(&workspace);
+        let project_id = ProjectId::parse("project-rebuild-dream").expect("project id");
+        let project_key = project_id.to_string();
 
         let mut session = bamboo_agent_core::Session::new("session-rebuild-mode", "model");
         session.title = "Rebuild mode test".to_string();
-        session.set_project_id_meta(project_key.clone());
+        session.set_project_id_meta(project_id.to_string());
         session.metadata.insert(
             "workspace_path".to_string(),
             workspace.to_string_lossy().to_string(),
@@ -2378,7 +2336,7 @@ mod tests {
         ));
         storage.save_session(&session).await.expect("save session");
 
-        let memory = MemoryStore::new(temp_dir.path());
+        let memory = MemoryStore::new(temp_dir.path()).for_project(&project_id);
         memory
             .write_project_dream_view(
                 &project_key,
@@ -2410,7 +2368,7 @@ mod tests {
             provider_registry: test_registry(),
         };
 
-        let result = run_project_auto_dream_once_with_store(&context, &memory, &project_key)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id)
             .await
             .expect("rebuild auto dream should succeed")
             .expect("rebuild dream output should be produced");

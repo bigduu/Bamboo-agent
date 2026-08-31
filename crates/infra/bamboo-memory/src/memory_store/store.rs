@@ -7,8 +7,6 @@ use dashmap::DashMap;
 use tokio::fs;
 use tokio::sync::Mutex;
 
-use bamboo_agent_core::workspace_state;
-
 use super::access_log::{
     self, AccessLogEntry, AccessStats, ACCESS_LOG_COMPACT_TRIGGER_BYTES, ACCESS_LOG_FILE,
 };
@@ -18,18 +16,17 @@ use super::{
     build_dream_view, build_memory_markdown_view, build_recent_markdown_view,
     build_stale_markdown_view, derive_summary, detect_entities, extract_keywords,
     make_query_cursor, match_memory_query, normalize_tags, now_rfc3339, parse_markdown_document,
-    parse_query_cursor, parse_rfc3339, project_key_from_path, render_markdown_document,
-    short_stable_hash, sort_memories_desc, validate_memory_title, validate_session_id,
-    validate_session_topic, AuditLogEntry, GraphIndex, GraphIndexItem, LegacyProjectMemoryReadRoot,
-    LexicalIndex, LexicalIndexItem, MemoryContradictionResult, MemoryDuplicateCandidate,
-    MemoryInspectResult, MemoryMergeResult, MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem,
-    MemoryQueryOptions, MemoryQueryResult, MemorySplitPiece, MemorySplitResult, RecentIndex,
-    RecentIndexItem, StaleCandidateItem, StaleCandidatesIndex, TaxonomyIndex,
-    CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS, DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC,
-    DREAM_VIEW_FILE, GRAPH_INDEX_FILE, LEXICAL_INDEX_FILE, MAX_MAX_CHARS, MAX_QUERY_LIMIT,
-    MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE, MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE,
-    RECENT_VIEW_FILE, STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, TAXONOMY_INDEX_FILE,
-    WRITE_AUDIT_LOG,
+    parse_query_cursor, parse_rfc3339, render_markdown_document, short_stable_hash,
+    sort_memories_desc, validate_memory_title, validate_session_id, validate_session_topic,
+    AuditLogEntry, GraphIndex, GraphIndexItem, LexicalIndex, LexicalIndexItem,
+    MemoryContradictionResult, MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult,
+    MemoryPathResolver, MemoryPurgeResult, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult,
+    MemorySplitPiece, MemorySplitResult, RecentIndex, RecentIndexItem, StaleCandidateItem,
+    StaleCandidatesIndex, TaxonomyIndex, CONTRADICTION_AUDIT_LOG, DEFAULT_MAX_CHARS,
+    DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC, DREAM_VIEW_FILE, GRAPH_INDEX_FILE,
+    LEXICAL_INDEX_FILE, MAX_MAX_CHARS, MAX_QUERY_LIMIT, MEMORY_SCHEMA_VERSION, MEMORY_VIEW_FILE,
+    MERGE_AUDIT_LOG, PURGE_AUDIT_LOG, RECENT_INDEX_FILE, RECENT_VIEW_FILE,
+    STALE_CANDIDATES_INDEX_FILE, STALE_VIEW_FILE, TAXONOMY_INDEX_FILE, WRITE_AUDIT_LOG,
 };
 use super::{
     BlobScanItem, BlobScanReport, DuplicateCluster, DuplicateClusterMember, DuplicateScanReport,
@@ -202,22 +199,6 @@ impl MemoryStore {
         }
     }
 
-    pub fn for_project_with_legacy_read_roots(
-        &self,
-        project_id: &bamboo_domain::ProjectId,
-        legacy_project_read_roots: Vec<LegacyProjectMemoryReadRoot>,
-    ) -> Self {
-        Self {
-            resolver: self
-                .resolver
-                .for_project_with_legacy_read_roots(project_id, legacy_project_read_roots),
-        }
-    }
-
-    pub fn is_read_only_project_memory_path(&self, path: &Path) -> bool {
-        self.resolver.is_legacy_project_read_path(path)
-    }
-
     /// Return the process-global write lock guarding the given scope's on-disk
     /// state. Callers acquire it for the full duration of a read-modify-write +
     /// `refresh_scope_artifacts` critical section so concurrent writers to the same
@@ -267,17 +248,6 @@ impl MemoryStore {
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    pub fn derive_project_key_from_workspace(workspace: Option<&Path>) -> Option<String> {
-        workspace.map(project_key_from_path)
-    }
-
-    pub fn project_key_for_session(&self, session_id: Option<&str>) -> Option<String> {
-        let workspace = session_id
-            .and_then(workspace_state::get_workspace)
-            .or_else(workspace_state::get_configured_default_workspace);
-        workspace.map(|path| project_key_from_path(&path))
     }
 
     pub async fn read_session_topic(
@@ -446,12 +416,6 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<Option<String>> {
         let project_key = self.require_project_key(scope, project_key)?;
-        if scope == MemoryScope::Project && self.resolver.has_legacy_project_read_roots() {
-            let docs = self.list_memory_documents(scope, project_key).await?;
-            return Ok(
-                (!docs.is_empty()).then(|| build_memory_markdown_view(scope, project_key, &docs))
-            );
-        }
         let path = self
             .resolver
             .views_dir(scope, project_key)
@@ -491,40 +455,6 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<Option<LexicalIndex>> {
         let project_key = self.require_project_key(scope, project_key)?;
-        if scope == MemoryScope::Project && self.resolver.has_legacy_project_read_roots() {
-            let docs = self.list_memory_documents(scope, project_key).await?;
-            if docs.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(LexicalIndex {
-                generated_at: now_rfc3339(),
-                items: docs
-                    .iter()
-                    .filter(|doc| {
-                        matches!(
-                            doc.frontmatter.status,
-                            DurableMemoryStatus::Active | DurableMemoryStatus::Stale
-                        )
-                    })
-                    .map(|doc| LexicalIndexItem {
-                        id: doc.frontmatter.id.clone(),
-                        title: doc.frontmatter.title.clone(),
-                        scope: doc.frontmatter.scope,
-                        project_key: doc.frontmatter.project_key.clone(),
-                        r#type: doc.frontmatter.r#type,
-                        status: doc.frontmatter.status,
-                        tags: doc.frontmatter.tags.clone(),
-                        keywords: doc.frontmatter.retrieval.keywords.clone(),
-                        entities: doc.frontmatter.retrieval.entities.clone(),
-                        updated_at: doc.frontmatter.updated_at.clone(),
-                        created_at: doc.frontmatter.created_at.clone(),
-                        summary: derive_summary(&doc.body, 240),
-                        granularity: doc.frontmatter.granularity,
-                        embedding: None,
-                    })
-                    .collect(),
-            }));
-        }
         let path = self
             .resolver
             .indexes_dir(scope, project_key)
@@ -791,18 +721,6 @@ impl MemoryStore {
             return Ok(Some(doc));
         }
 
-        for project_key in self.list_project_keys().await? {
-            if Some(project_key.as_str()) == preferred_project_key {
-                continue;
-            }
-            if let Some(doc) = self
-                .get_memory_in_scope(MemoryScope::Project, Some(project_key.as_str()), id)
-                .await?
-            {
-                return Ok(Some(doc));
-            }
-        }
-
         Ok(None)
     }
 
@@ -849,77 +767,69 @@ impl MemoryStore {
             {
                 WriteSimilarity::Merge(existing) => {
                     let mut existing = *existing;
-                    if self.resolver.is_legacy_project_read_path(&existing.path) {
-                        // Legacy aliases participate in recall and duplicate
-                        // detection, but never become mutation targets. Treat a
-                        // strong match as a related source and create a new
-                        // primary Project-home record below.
-                        related_ids = vec![existing.frontmatter.id.clone()];
-                    } else {
-                        // Structural guard: never grow a memory into a blob. If appending
-                        // would exceed the body cap, don't merge — fall through to a new
-                        // atomic memory and instead LINK it to the dup, rather than
-                        // silently orphaning it.
-                        let already_present = existing.body.contains(content);
-                        if already_present
-                            || projected_merged_body_chars(&existing.body, content)
-                                <= MAX_DURABLE_MEMORY_BODY_CHARS
-                        {
-                            if !already_present {
-                                existing.body = format!(
-                                    "{}{}{}",
-                                    existing.body.trim_end(),
-                                    MEMORY_SECTION_SEPARATOR,
-                                    content
-                                );
-                            }
-                            existing.frontmatter.updated_at = now_rfc3339();
-                            existing.frontmatter.updated_by = CreatedBy {
-                                kind: "memory_write".to_string(),
-                                id: None,
-                                actor: Some(actor.to_string()),
-                            };
-                            let mut merged_tags = existing.frontmatter.tags.clone();
-                            merged_tags.extend(tags.clone());
-                            existing.frontmatter.tags =
-                                normalize_tags(merged_tags.iter().map(String::as_str));
-                            existing.frontmatter.retrieval.keywords = extract_keywords(
-                                &existing.frontmatter.title,
-                                &existing.body,
-                                &existing.frontmatter.tags,
+                    // Structural guard: never grow a memory into a blob. If appending
+                    // would exceed the body cap, don't merge — fall through to a new
+                    // atomic memory and instead LINK it to the dup, rather than
+                    // silently orphaning it.
+                    let already_present = existing.body.contains(content);
+                    if already_present
+                        || projected_merged_body_chars(&existing.body, content)
+                            <= MAX_DURABLE_MEMORY_BODY_CHARS
+                    {
+                        if !already_present {
+                            existing.body = format!(
+                                "{}{}{}",
+                                existing.body.trim_end(),
+                                MEMORY_SECTION_SEPARATOR,
+                                content
                             );
-                            existing.frontmatter.retrieval.entities =
-                                detect_entities(&existing.frontmatter.title, &existing.body);
-                            self.write_document(&existing).await?;
-                            self.append_audit(
-                                scope,
-                                project_key,
-                                MERGE_AUDIT_LOG,
-                                AuditLogEntry {
-                                    timestamp: now_rfc3339(),
-                                    action: "merge".to_string(),
-                                    scope,
-                                    memory_id: Some(existing.frontmatter.id.clone()),
-                                    session_id: session_id.map(|value| value.to_string()),
-                                    topic: None,
-                                    summary: format!(
-                                        "Merged new content into existing memory '{}'.",
-                                        existing.frontmatter.title
-                                    ),
-                                    metadata: Some(serde_json::json!({
-                                        "type": existing.frontmatter.r#type.as_str(),
-                                        "project_key": project_key,
-                                        "allow_merge_if_similar": true,
-                                    })),
-                                },
-                            )
-                            .await?;
-                            self.refresh_scope_artifacts(scope, project_key).await?;
-                            return Ok(existing);
                         }
-                        // Too big to merge without blobbing → link instead.
-                        related_ids = vec![existing.frontmatter.id.clone()];
+                        existing.frontmatter.updated_at = now_rfc3339();
+                        existing.frontmatter.updated_by = CreatedBy {
+                            kind: "memory_write".to_string(),
+                            id: None,
+                            actor: Some(actor.to_string()),
+                        };
+                        let mut merged_tags = existing.frontmatter.tags.clone();
+                        merged_tags.extend(tags.clone());
+                        existing.frontmatter.tags =
+                            normalize_tags(merged_tags.iter().map(String::as_str));
+                        existing.frontmatter.retrieval.keywords = extract_keywords(
+                            &existing.frontmatter.title,
+                            &existing.body,
+                            &existing.frontmatter.tags,
+                        );
+                        existing.frontmatter.retrieval.entities =
+                            detect_entities(&existing.frontmatter.title, &existing.body);
+                        self.write_document(&existing).await?;
+                        self.append_audit(
+                            scope,
+                            project_key,
+                            MERGE_AUDIT_LOG,
+                            AuditLogEntry {
+                                timestamp: now_rfc3339(),
+                                action: "merge".to_string(),
+                                scope,
+                                memory_id: Some(existing.frontmatter.id.clone()),
+                                session_id: session_id.map(|value| value.to_string()),
+                                topic: None,
+                                summary: format!(
+                                    "Merged new content into existing memory '{}'.",
+                                    existing.frontmatter.title
+                                ),
+                                metadata: Some(serde_json::json!({
+                                    "type": existing.frontmatter.r#type.as_str(),
+                                    "project_key": project_key,
+                                    "allow_merge_if_similar": true,
+                                })),
+                            },
+                        )
+                        .await?;
+                        self.refresh_scope_artifacts(scope, project_key).await?;
+                        return Ok(existing);
                     }
+                    // Too big to merge without blobbing → link instead.
+                    related_ids = vec![existing.frontmatter.id.clone()];
                 }
                 WriteSimilarity::Relate(ids) => related_ids = ids,
                 WriteSimilarity::None => {}
@@ -2038,45 +1948,28 @@ impl MemoryStore {
     ) -> io::Result<Vec<DurableMemoryDocument>> {
         let project_key = self.require_project_key(scope, project_key)?;
         let mut docs = Vec::new();
-        let mut seen = HashSet::new();
-        for root in self.resolver.scope_read_roots(scope, project_key) {
-            let topic_dir = root.join(super::TOPICS_DIR);
-            if !topic_dir.exists() {
+        let topic_dir = self.resolver.topic_dir(scope, project_key);
+        if !topic_dir.exists() {
+            return Ok(docs);
+        }
+        let mut entries = fs::read_dir(topic_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "md") {
                 continue;
             }
-            let is_legacy_alias = self.resolver.is_legacy_project_read_path(&topic_dir);
-            let mut entries = fs::read_dir(topic_dir).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                if !path.extension().is_some_and(|ext| ext == "md") {
-                    continue;
+            let raw = fs::read_to_string(&path).await?;
+            let (mut frontmatter, body) = parse_markdown_document(&raw)?;
+            if scope == MemoryScope::Project {
+                if let Some(project_id) = self.resolver.project_id() {
+                    frontmatter.project_key = Some(project_id.to_string());
                 }
-                let raw = fs::read_to_string(&path).await?;
-                let (mut frontmatter, body) = match parse_markdown_document(&raw) {
-                    Ok(parsed) => parsed,
-                    Err(error) if is_legacy_alias => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            "skipping invalid legacy Project memory during read union: {error}"
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                if !seen.insert(frontmatter.id.clone()) {
-                    continue;
-                }
-                if scope == MemoryScope::Project {
-                    if let Some(project_id) = self.resolver.project_id() {
-                        frontmatter.project_key = Some(project_id.to_string());
-                    }
-                }
-                docs.push(DurableMemoryDocument {
-                    frontmatter,
-                    body,
-                    path,
-                });
             }
+            docs.push(DurableMemoryDocument {
+                frontmatter,
+                body,
+                path,
+            });
         }
         sort_memories_desc(&mut docs);
         Ok(docs)
@@ -2091,9 +1984,6 @@ impl MemoryStore {
         project_key: Option<&str>,
     ) -> io::Result<usize> {
         let project_key = self.require_project_key(scope, project_key)?;
-        if scope == MemoryScope::Project && self.resolver.has_legacy_project_read_roots() {
-            return Ok(self.list_memory_documents(scope, project_key).await?.len());
-        }
         let topic_dir = self.resolver.topic_dir(scope, project_key);
         if !topic_dir.exists() {
             return Ok(0);
@@ -2174,7 +2064,6 @@ impl MemoryStore {
             .filter(|doc| {
                 is_scorable(doc.frontmatter.status)
                     && doc.frontmatter.r#type == DurableMemoryType::Project
-                    && !self.resolver.is_legacy_project_read_path(&doc.path)
             })
             .collect();
 
@@ -2293,7 +2182,6 @@ impl MemoryStore {
         for doc in docs
             .iter_mut()
             .filter(|doc| doc.frontmatter.status == DurableMemoryStatus::Active)
-            .filter(|doc| !self.resolver.is_legacy_project_read_path(&doc.path))
             .filter(|doc| {
                 freshness::granularity_expired(
                     doc.frontmatter.granularity,
@@ -2478,34 +2366,25 @@ impl MemoryStore {
         id: &str,
     ) -> io::Result<Option<DurableMemoryDocument>> {
         let project_key = self.require_project_key(scope, project_key)?;
-        for root in self.resolver.scope_read_roots(scope, project_key) {
-            let path = root.join(super::TOPICS_DIR).join(format!("{id}.md"));
-            if !path.exists() {
-                continue;
-            }
-            let raw = fs::read_to_string(&path).await?;
-            let (mut frontmatter, body) = parse_markdown_document(&raw)?;
-            if scope == MemoryScope::Project {
-                if let Some(project_id) = self.resolver.project_id() {
-                    frontmatter.project_key = Some(project_id.to_string());
-                }
-            }
-            return Ok(Some(DurableMemoryDocument {
-                frontmatter,
-                body,
-                path,
-            }));
+        let path = self.resolver.topic_path(scope, project_key, id);
+        if !path.exists() {
+            return Ok(None);
         }
-        Ok(None)
+        let raw = fs::read_to_string(&path).await?;
+        let (mut frontmatter, body) = parse_markdown_document(&raw)?;
+        if scope == MemoryScope::Project {
+            if let Some(project_id) = self.resolver.project_id() {
+                frontmatter.project_key = Some(project_id.to_string());
+            }
+        }
+        Ok(Some(DurableMemoryDocument {
+            frontmatter,
+            body,
+            path,
+        }))
     }
 
     async fn write_document(&self, doc: &DurableMemoryDocument) -> io::Result<()> {
-        if self.resolver.is_legacy_project_read_path(&doc.path) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "legacy Project memory aliases are read-only; migrate or write a new primary memory",
-            ));
-        }
         if let Some(parent) = doc.path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -3113,13 +2992,11 @@ impl MemoryStore {
         if scope == MemoryScope::Global {
             self.maybe_migrate_legacy_dream().await?;
         }
-        for root in self.resolver.scope_read_roots(scope, project_key) {
-            let path = root.join(super::paths::VIEWS_DIR).join(DREAM_VIEW_FILE);
-            if let Some(content) = self.read_optional_trimmed_text_file(path).await? {
-                return Ok(Some(content));
-            }
-        }
-        Ok(None)
+        let path = self
+            .resolver
+            .views_dir(scope, project_key)
+            .join(DREAM_VIEW_FILE);
+        self.read_optional_trimmed_text_file(path).await
     }
 
     async fn write_scope_dream_view(
@@ -3760,6 +3637,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_memory_isolated_to_preferred_project_or_global_scope() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::new(dir.path());
+        let project_a = store
+            .write_memory(
+                MemoryScope::Project,
+                Some("project-a"),
+                DurableMemoryType::Project,
+                "Project A only",
+                "This durable memory belongs only to Project A.",
+                &[],
+                Some("session-a"),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let global = store
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Global reference",
+                "This durable memory is available globally.",
+                &[],
+                None,
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_memory(&project_a.frontmatter.id, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_memory(&project_a.frontmatter.id, Some("project-b"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_memory(&project_a.frontmatter.id, Some("project-a"))
+                .await
+                .unwrap()
+                .expect("preferred Project can read its own memory")
+                .frontmatter
+                .id,
+            project_a.frontmatter.id
+        );
+        assert_eq!(
+            store
+                .get_memory(&global.frontmatter.id, None)
+                .await
+                .unwrap()
+                .expect("Global memory remains readable without a Project")
+                .frontmatter
+                .id,
+            global.frontmatter.id
+        );
+    }
+
+    #[tokio::test]
     async fn assigned_project_writes_use_project_home_memory_root() {
         let dir = tempdir().unwrap();
         let project_id = bamboo_domain::ProjectId::parse("01JPROJECT00000000000000000").unwrap();
@@ -3820,160 +3764,6 @@ mod tests {
             )
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn assigned_project_reads_legacy_alias_with_primary_precedence_and_isolation() {
-        let dir = tempdir().unwrap();
-        let legacy_store = MemoryStore::new(dir.path());
-        let legacy = legacy_store
-            .write_memory(
-                MemoryScope::Project,
-                Some("legacy-workspace-key"),
-                DurableMemoryType::Project,
-                "Shared legacy fact",
-                "legacy-only content",
-                &[],
-                Some("legacy-session"),
-                "test",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        let project_id = bamboo_domain::ProjectId::parse("project-a").unwrap();
-        let alias_root = dir
-            .path()
-            .join("memory/v1/scopes/projects/legacy-workspace-key");
-        let store = MemoryStore::new(dir.path()).for_project_with_legacy_read_roots(
-            &project_id,
-            vec![LegacyProjectMemoryReadRoot {
-                project_key: "legacy-workspace-key".to_string(),
-                root: alias_root.clone(),
-            }],
-        );
-
-        let before_migration = store
-            .query_scope(
-                MemoryScope::Project,
-                Some(project_id.as_str()),
-                Some("legacy-only"),
-                None,
-                None,
-                None,
-                &MemoryQueryOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(before_migration.matched_count, 1);
-        assert_eq!(
-            before_migration.items[0].project_key.as_deref(),
-            Some(project_id.as_str())
-        );
-
-        let mut primary = legacy.clone();
-        primary.frontmatter.project_key = Some(project_id.to_string());
-        primary.body = "primary content wins".to_string();
-        primary.path = store.resolver.topic_path(
-            MemoryScope::Project,
-            Some(project_id.as_str()),
-            &primary.frontmatter.id,
-        );
-        store.write_document(&primary).await.unwrap();
-
-        let union = store
-            .list_memory_documents(MemoryScope::Project, Some(project_id.as_str()))
-            .await
-            .unwrap();
-        assert_eq!(union.len(), 1, "same id must be deduplicated");
-        assert_eq!(union[0].body, "primary content wins");
-        assert!(store
-            .write_document(&DurableMemoryDocument {
-                path: legacy.path.clone(),
-                ..legacy
-            })
-            .await
-            .is_err());
-
-        let other_project = bamboo_domain::ProjectId::parse("project-b").unwrap();
-        let other = MemoryStore::new(dir.path()).for_project(&other_project);
-        assert_eq!(
-            other
-                .query_scope(
-                    MemoryScope::Project,
-                    Some(other_project.as_str()),
-                    Some("legacy-only"),
-                    None,
-                    None,
-                    None,
-                    &MemoryQueryOptions::default(),
-                )
-                .await
-                .unwrap()
-                .matched_count,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn assigned_project_write_never_merges_into_a_legacy_read_alias() {
-        let dir = tempdir().unwrap();
-        let legacy_store = MemoryStore::new(dir.path());
-        let legacy = legacy_store
-            .write_memory(
-                MemoryScope::Project,
-                Some("legacy-workspace-key"),
-                DurableMemoryType::Project,
-                "Shared durable fact",
-                "identical durable content",
-                &[],
-                Some("legacy-session"),
-                "test",
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        let legacy_bytes = std::fs::read(&legacy.path).unwrap();
-        let project_id = bamboo_domain::ProjectId::parse("project-primary-write").unwrap();
-        let store = MemoryStore::new(dir.path()).for_project_with_legacy_read_roots(
-            &project_id,
-            vec![LegacyProjectMemoryReadRoot {
-                project_key: "legacy-workspace-key".to_string(),
-                root: dir
-                    .path()
-                    .join("memory/v1/scopes/projects/legacy-workspace-key"),
-            }],
-        );
-
-        let written = store
-            .write_memory(
-                MemoryScope::Project,
-                Some(project_id.as_str()),
-                DurableMemoryType::Project,
-                "Shared durable fact",
-                "identical durable content",
-                &[],
-                Some("assigned-session"),
-                "test",
-                true,
-                None,
-            )
-            .await
-            .expect("strong legacy match must copy on write into Project primary");
-
-        assert!(written.path.starts_with(
-            dir.path()
-                .join("projects")
-                .join(project_id.as_str())
-                .join("memory/v1/topics")
-        ));
-        assert!(written
-            .frontmatter
-            .relations
-            .related
-            .contains(&legacy.frontmatter.id));
-        assert_eq!(std::fs::read(&legacy.path).unwrap(), legacy_bytes);
     }
 
     /// L2: a near-identical RESTATEMENT (different title wording, ~same body)
