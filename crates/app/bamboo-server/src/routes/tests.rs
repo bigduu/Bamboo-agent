@@ -11,6 +11,7 @@ async fn configure_routes_registers_expected_api_prefixes() {
     let app = test::init_service(App::new().configure(configure_routes)).await;
 
     let requests = vec![
+        ("GET", "/api/v1/bootstrap"),
         ("GET", "/api/v1/health"),
         ("GET", "/api/v1/metrics/persistence"),
         // Unversioned liveness/readiness probes (#251 finding 6).
@@ -51,6 +52,7 @@ async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
     let app = test::init_service(App::new().configure(configure_routes_with_rate_limiting)).await;
 
     let requests = vec![
+        ("GET", "/api/v1/bootstrap"),
         ("GET", "/api/v1/health"),
         ("GET", "/api/v1/metrics/persistence"),
         // Unversioned liveness/readiness probes (#251 finding 6).
@@ -369,6 +371,166 @@ async fn access_bootstrap_endpoints_remain_public() {
         let resp = test::call_service(&app, req).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+}
+
+#[actix_web::test]
+async fn frontend_bootstrap_is_public_canonical_request_aware_and_secret_free() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let (device, device_token) =
+        crate::handlers::settings::issue_device_token("SECRET_BOOTSTRAP_DEVICE_LABEL");
+    let device_id = device.device_id.clone();
+    let device_hash = device.token_hash.clone();
+    let device_salt = device.token_salt.clone();
+    {
+        let mut config = app_state.config.write().await;
+        let mut access = password_access_control();
+        access.password_credential_ref =
+            Some(bamboo_config::CredentialRef::parse("access.bootstrap.secret").unwrap());
+        access.devices.push(device);
+        config.access_control = Some(access);
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // The canonical bootstrap stays public even though ordinary agent routes
+    // are credential-gated. Its response reports policy separately from the
+    // current request's lack of credentials.
+    let remote = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let remote_response = test::call_service(&app, remote).await;
+    assert_eq!(remote_response.status(), StatusCode::OK);
+    assert_eq!(
+        remote_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap(),
+        "no-store"
+    );
+    let vary = remote_response
+        .headers()
+        .get(header::VARY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    for field in ["Cookie", "Authorization", "X-Device-Id"] {
+        assert!(vary.split(',').any(|value| value.trim() == field));
+    }
+    assert!(remote_response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+    let remote_body = test::read_body(remote_response).await;
+    let remote_json: serde_json::Value = serde_json::from_slice(&remote_body).unwrap();
+    assert_eq!(remote_json["auth"]["policy"], "credential_required");
+    assert_eq!(remote_json["auth"]["request_state"], "unauthenticated");
+    assert_eq!(remote_json["auth"]["password_enabled"], true);
+    assert_eq!(remote_json["auth"]["device_auth_enabled"], true);
+
+    let serialized = String::from_utf8(remote_body.to_vec()).unwrap();
+    for secret in [
+        SECRET_HASH,
+        SECRET_SALT,
+        "SECRET_BOOTSTRAP_DEVICE_LABEL",
+        "access.bootstrap.secret",
+        device_id.as_str(),
+        device_token.as_str(),
+        device_hash.as_str(),
+        device_salt.as_str(),
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "bootstrap leaked secret material"
+        );
+    }
+
+    // Locality is evaluated from the real request rather than inferred from the
+    // configured policy.
+    let local = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let local_json: serde_json::Value = test::call_and_read_body_json(&app, local).await;
+    assert_eq!(local_json["auth"]["policy"], "credential_required");
+    assert_eq!(local_json["auth"]["request_state"], "local_bypass");
+
+    // A password-cookie authenticated request is reflected only after the
+    // server has verified the credential and issued its HttpOnly cookie.
+    let verify = test::TestRequest::post()
+        .uri("/api/v1/bamboo/access/verify")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    let verify_response = test::call_service(&app, verify).await;
+    assert_eq!(verify_response.status(), StatusCode::OK);
+    let cookie = verify_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let cookie_bootstrap = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::COOKIE, cookie))
+        .to_request();
+    let cookie_json: serde_json::Value =
+        test::call_and_read_body_json(&app, cookie_bootstrap).await;
+    assert_eq!(cookie_json["auth"]["request_state"], "authenticated");
+
+    let device_bootstrap = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    let device_json: serde_json::Value =
+        test::call_and_read_body_json(&app, device_bootstrap).await;
+    assert_eq!(device_json["auth"]["request_state"], "authenticated");
+
+    // Public matching is exact and canonical-only. A remote sibling remains
+    // gated; the legacy prefix is observably absent when local bypass allows
+    // the request through routing; non-GET methods cannot invoke the handler.
+    let sibling = test::TestRequest::get()
+        .uri("/api/v1/bootstrap/extra")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, sibling).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let legacy = test::TestRequest::get()
+        .uri("/v1/bootstrap")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, legacy).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let post = test::TestRequest::post()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert!(!test::call_service(&app, post).await.status().is_success());
+
+    let protected = test::TestRequest::get()
+        .uri("/api/v1/sessions")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, protected).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[actix_web::test]
