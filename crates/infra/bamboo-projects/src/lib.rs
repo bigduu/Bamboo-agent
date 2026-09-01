@@ -2002,6 +2002,10 @@ mod tests {
         }
     }
 
+    fn retired_memory_key_field() -> String {
+        ["legacy", "project", "keys"].join("_")
+    }
+
     #[test]
     fn paths_never_use_name_and_reject_traversal_components() {
         let paths = ProjectPaths::new("/tmp/bamboo-data");
@@ -2034,6 +2038,35 @@ mod tests {
                 actual: 2
             })
         ));
+    }
+
+    #[test]
+    fn current_manifest_ignores_retired_memory_key_without_rewrite() {
+        let (temp, store) = store();
+        let project = store.create("Legacy v2", None).unwrap();
+        let manifest_path = store.paths().manifest_path(&project.id);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            retired_memory_key_field(),
+            serde_json::json!(["legacy-project-alias"]),
+        );
+        let original_bytes = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&manifest_path, &original_bytes).unwrap();
+        drop(store);
+
+        let reopened = ProjectStore::open(temp.path()).unwrap();
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+
+        let listed = reopened.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, project.id);
+        assert_eq!(listed[0].revision, project.revision);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+
+        let loaded = reopened.get(&project.id).unwrap();
+        assert_eq!(loaded.revision, project.revision);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
     }
 
     #[test]
@@ -2229,6 +2262,10 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             value["schema_version"] = serde_json::json!(1);
             value.as_object_mut().unwrap().remove("project_path");
+            value.as_object_mut().unwrap().insert(
+                retired_memory_key_field(),
+                serde_json::json!(["legacy-project-alias"]),
+            );
             std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         }
 
@@ -2264,6 +2301,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(backup["schema_version"], 1);
+        assert!(backup.get(retired_memory_key_field().as_str()).is_some());
 
         let zero = store.create("zero", None).unwrap();
         rewrite_as_v1(&store, &zero);
