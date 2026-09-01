@@ -6,7 +6,10 @@ const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
 const ROOT = path.resolve(__dirname, "..");
-const OUTPUT_DIR = path.join(ROOT, "frontend_package");
+// bamboo-server owns the package it embeds. Keeping the bytes inside the crate
+// makes the source checkout, `cargo package`, and downstream installs use the
+// same platform-safe path instead of relying on workspace-relative symlinks.
+const OUTPUT_DIR = path.join(ROOT, "crates", "app", "bamboo-server", "frontend_package");
 const OUTPUT_ZIP = path.join(OUTPUT_DIR, "lotus-frontend.zip");
 const OUTPUT_MANIFEST = path.join(OUTPUT_DIR, "frontend-manifest.json");
 const SOURCE_MODE = (process.env.LOTUS_SOURCE || "auto").toLowerCase();
@@ -283,6 +286,7 @@ function printInfo() {
   const localAvailable = localLotusExists();
   const packageRoot = resolvePackageRoot();
   console.log(`LOTUS_SOURCE=${SOURCE_MODE}`);
+  console.log(`FRONTEND_PACKAGE_DIR=${OUTPUT_DIR}`);
   console.log(`LOTUS_LOCAL_PATH=${LOCAL_PATH} (${localAvailable ? "found" : "missing"})`);
   console.log(
     `LOTUS_PACKAGE_NAME=${PACKAGE_NAME} (${packageRoot ? `found at ${packageRoot}` : "missing"})`,

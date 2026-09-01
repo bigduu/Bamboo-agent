@@ -13,10 +13,9 @@ name: Publish Docker image (GHCR)
 # larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
 # job with docker/setup-qemu-action.)
 #
-# The lotus frontend is embedded via frontend_package/ (which
-# crates/app/bamboo-server/frontend_package symlinks to, picked up by the
-# in-image `cargo build` through include_bytes!). Each build job re-stages that
-# directory from the published @bigduu/lotus npm package first, so the image
+# The Lotus frontend is embedded from bamboo-server's crate-owned
+# frontend_package/ directory. Each build job re-stages that directory from
+# the published @bigduu/lotus npm package first, so the image
 # ships the requested (default: newest) frontend instead of whatever zip was
 # last committed — the committed copy goes stale between Lotus releases.
 
@@ -65,19 +64,20 @@ jobs:
           node-version: lts/*
 
       - name: Stage frontend package from npm
-        # Overwrites the committed frontend_package/ in the build context with a
-        # bundle staged from the published npm package (tag pushes carry no
-        # inputs and stage 'latest'). LOTUS_SOURCE=package hard-fails when the
-        # package is missing — never silently falls back to the stale zip.
+        # Overwrites the committed crate-owned frontend package in the build
+        # context with a bundle staged from the published npm package. Tag
+        # pushes carry no inputs and stage 'latest'. LOTUS_SOURCE=package
+        # hard-fails when the package is missing instead of falling back.
         env:
           LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
         run: |
           set -euo pipefail
           npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
           LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
-          EMBEDDED="$(node -p "require('./frontend_package/frontend-manifest.json').frontend_version")"
+          FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
+          test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
+          test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
+          EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
           echo "Embedded lotus frontend version: ${EMBEDDED}"
           if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
             echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"
@@ -108,6 +108,50 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
           outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Smoke-test API and embedded frontend
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          CONTAINER_NAME="bamboo-frontend-smoke-${{ strategy.job-index }}"
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if [ "${status}" -ne 0 ]; then
+              docker logs "${CONTAINER_NAME}" || true
+            fi
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            exit "${status}"
+          }
+          trap cleanup EXIT
+
+          docker pull "${IMAGE_REF}"
+          docker run --detach --name "${CONTAINER_NAME}" \
+            --publish 127.0.0.1::9562 "${IMAGE_REF}"
+          HOST_PORT="$(docker port "${CONTAINER_NAME}" 9562/tcp | tail -1 | awk -F: '{print $NF}')"
+          ROOT_RESPONSE="$(mktemp)"
+          ROOT_HEADERS="$(mktemp)"
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/v1/health" >/dev/null \
+              && curl -fsS "http://127.0.0.1:${HOST_PORT}/" \
+                --dump-header "${ROOT_HEADERS}" --output "${ROOT_RESPONSE}" \
+              && test -s "${ROOT_RESPONSE}" \
+              && grep -Eiq '^content-type: *text/html' "${ROOT_HEADERS}"; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "::error::Built image did not serve both the Bamboo API and embedded frontend"
+            exit 1
+          fi
+          docker exec "${CONTAINER_NAME}" \
+            test -s /data/frontend/.frontend-manifest.json
 
       - name: Export digest
         run: |
