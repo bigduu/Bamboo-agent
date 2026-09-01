@@ -1306,18 +1306,13 @@ name = "bamboo-projects"
 version = "0.0.0"
 dependencies = [
  "bamboo-domain",
- "bamboo-memory",
  "chrono",
  "fs2",
- "hex",
  "libc",
  "serde",
  "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
- "tokio",
  "tracing",
  "uuid",
  "windows-sys 0.61.2",

@@ -73,8 +73,7 @@ never modifies the source, and records the relative `original_source` plus the
 
 Project memory and Dream data are stored in
 `projects/<id>/memory/v1`. Assigned sessions never derive a write scope from a
-workspace path. Legacy unassigned sessions may read old path-derived memory
-during migration, but cannot create new Project-scoped writes.
+workspace path.
 
 ## API and propagation
 
@@ -86,8 +85,8 @@ restores only an archived Project, returns its canonical manifest and new ETag,
 and publishes `ProjectUpdated`. Missing or stale `If-Match` values return `428`
 or `412`; restoring an already-active Project returns structured
 `project_not_archived` (`409`). Restore preserves Project identity, paths,
-bindings, legacy aliases, shared resources, and session ownership. The current
-primary path cannot be unbound—select a replacement with Project CAS first.
+bindings, shared resources, and session ownership. The current primary path
+cannot be unbound—select a replacement with Project CAS first.
 Session create/list/detail and chat contracts expose `project_id`; explicit
 session reassignment also requires `If-Match` and is rejected while the session
 is running.
@@ -123,21 +122,17 @@ revisions are dynamic per-round context, not part of the cacheable identity
 prefix. Prompt and resource APIs expose only redacted names, status, counts,
 and revisions—never MCP headers, environment values, or credential secrets.
 
-## Legacy migration
+## Legacy Project assignment
 
 Migration dry-runs match only exact canonical bindings or a safely resolved
 common Git directory. Ambiguous names, missing paths, remote URLs, and path
 hashes remain Unassigned. When a dry-run session supplies only `workspace_path`,
 the server reads that existing Workspace to derive its canonical path, Git
-common directory, and the exact legacy memory key used by Bamboo Memory.
-Caller-supplied evidence remains authoritative and is never rewritten. Missing,
-unreadable, or nonexistent Workspaces produce diagnostics and no derived
-evidence instead of failing the request. This enrichment is read-only and never
-updates a session, Project manifest, index, or memory record.
+common directory. Caller-supplied evidence remains authoritative and is never
+rewritten. Missing, unreadable, or nonexistent Workspaces produce diagnostics
+and no derived evidence instead of failing the request. This enrichment is
+read-only and never updates a session, Project manifest, or index.
 
-Memory migration is copy/verify/commit, resumable and idempotent; it does not
-overwrite Project-home documents or delete the legacy source. A Project can
-retain read-only `legacy_project_keys` aliases during the migration window.
 Manifest v1 migration promotes an old binding only when exactly one exists.
 Zero bindings remain `needs_configuration`; multiple bindings remain
 `needs_selection` and are never resolved by vector order or a `main` label.
