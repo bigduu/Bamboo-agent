@@ -31,7 +31,7 @@ If Bodhi is the AI product you see, **Bamboo is the engine running underneath it
 
 | Capability | What it does |
 |---|---|
-| 🧠 **Memory system** | Session notes, Dream notebook, cross-session durable memory, with auto-dream and background gardener |
+| 🧠 **Memory system** | Session notes, Jiandu-owned derived Dream snapshots, and cross-session durable memory, with auto-dream and background gardener |
 | 🗜️ **Context compression** | Hybrid compression with rolling summary + recent-window retention, automatic trimming of oversized tool output, executed against the model's context-window budget |
 | 🛠️ **Built-in tools** | 22 built-in tools: files, search, Shell, Web, plan mode, tasks, permission requests, and more |
 | 🎯 **Skills** | Optional/discoverable skills with lightweight selection based on request hints, including built-in docx / pdf / pptx / xlsx / skill-creator |
@@ -85,9 +85,11 @@ graph TD
 
 Bamboo does not maintain a second memory implementation. Its narrow `bamboo-memory` facade delegates canonical storage, deterministic lexical retrieval, session notes, and Dream snapshots to the exact `jiandu-memory` release.
 
+Jiandu owns canonical persistence, derived indexes, lexical recall, and the persisted Dream snapshot bytes. Bamboo owns prompt selection and budget, may optionally rerank a recalled shortlist, and chooses the model and cadence used to refresh Dream; it does not duplicate Jiandu's memory engine.
+
 - **Session notes** — the `session_note` tool (`read` / `append` / `replace` / `clear` / `list_topics`) keeps compression-resistant context for one session.
 - **Durable memory** — atomic Global or first-class Project facts with type, status, source, relations, and lexical retrieval metadata. Jiandu is the source of truth; there is no embedding pipeline.
-- **Dream** — a derived Global or Project orientation snapshot, never a canonical memory record. Bamboo extracts facts and Ledger candidates first, captures the Jiandu generation, reads canonical `MEMORY.md`, synthesizes once, then publishes with compare-and-swap so a stale run cannot overwrite newer facts.
+- **Dream** — a Jiandu-owned derived Global or Project orientation snapshot, never a canonical memory record. Bamboo extracts facts and Ledger candidates first, captures the Jiandu generation, reads canonical `MEMORY.md`, synthesizes once, then asks Jiandu to publish with compare-and-swap so a stale run cannot overwrite newer facts.
 
 Jiandu defaults to the independent `~/.jiandu` data root. Bamboo configuration, sessions, and the prospective-record Ledger remain under `~/.bamboo`; the two stores are not mixed.
 

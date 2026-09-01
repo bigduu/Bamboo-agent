@@ -69,6 +69,25 @@ async fn build_memory_tool_with_session(
     MemoryTool::new(session_repo, data_dir)
 }
 
+fn completed_json(outcome: ToolOutcome) -> serde_json::Value {
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("expected Completed")
+    };
+    serde_json::from_str(&result.result).expect("valid tool JSON")
+}
+
+async fn invoke_json(
+    tool: &MemoryTool,
+    args: serde_json::Value,
+    session_id: &str,
+) -> serde_json::Value {
+    completed_json(
+        tool.invoke(args, test_context(session_id))
+            .await
+            .expect("memory action should succeed"),
+    )
+}
+
 #[tokio::test]
 async fn memory_session_actions_share_read_shape_and_limits() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -544,4 +563,485 @@ async fn malformed_project_identity_cannot_read_canonical_project_memory() {
     assert!(!error
         .to_string()
         .contains("MUST NOT LEAK THROUGH MALFORMED PROJECT ID"));
+}
+
+#[test]
+fn memory_schema_teaches_the_llm_native_recall_and_authority_contract() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+    let description = tool.description().to_ascii_lowercase();
+
+    assert!(description.contains("short lexical query"));
+    assert!(description.contains("compact top-3"));
+    assert!(description.contains("no bodies"));
+    assert!(description.contains("get only selected ids"));
+    assert!(description.contains("query before write/merge"));
+    assert!(description.contains("one atomic confirmed fact"));
+    assert!(description.contains("trusted scope authority"));
+    assert!(description.contains("verify live state"));
+    assert!(description.contains("embedding-free"));
+
+    let schema = tool.parameters_schema();
+    let properties = &schema["properties"];
+    assert_eq!(
+        properties["query"]["maxLength"],
+        json!(MAX_MEMORY_QUERY_CHARS)
+    );
+    assert_eq!(properties["id"]["minLength"], 1);
+    assert_eq!(
+        properties["options"]["properties"]["limit"]["default"],
+        json!(DEFAULT_QUERY_LIMIT)
+    );
+    assert_eq!(
+        properties["options"]["properties"]["limit"]["maximum"],
+        json!(MAX_QUERY_LIMIT)
+    );
+    assert_eq!(properties["tags"]["maxItems"], json!(MAX_MEMORY_TAGS));
+    assert_eq!(
+        properties["keywords"]["maxItems"],
+        json!(MAX_EXPLICIT_MEMORY_KEYWORDS)
+    );
+    assert_eq!(
+        properties["entities"]["maxItems"],
+        json!(MAX_EXPLICIT_MEMORY_ENTITIES)
+    );
+    assert_eq!(
+        properties["pieces"]["items"]["properties"]["keywords"]["maxItems"],
+        json!(MAX_EXPLICIT_MEMORY_KEYWORDS)
+    );
+    assert!(properties["project_key"]["description"]
+        .as_str()
+        .expect("project authority description")
+        .contains("cannot grant access or switch projects"));
+}
+
+#[tokio::test]
+async fn lexical_query_defaults_to_compact_top_three_without_bodies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+    let session_id = "compact-query-session";
+
+    for index in 0..4 {
+        invoke_json(
+            &tool,
+            json!({
+                "action": "write",
+                "scope": "global",
+                "type": "project",
+                "title": format!("Release freeze fact {index}"),
+                "content": format!("Confirmed release freeze detail number {index}."),
+                "keywords": ["release-freeze-alias"]
+            }),
+            session_id,
+        )
+        .await;
+    }
+
+    let value = invoke_json(
+        &tool,
+        json!({
+            "action": "query",
+            "scope": "global",
+            "query": "release-freeze-alias"
+        }),
+        session_id,
+    )
+    .await;
+    let items = value["data"]["items"].as_array().expect("query items");
+    assert_eq!(value["data"]["matched_count"], 4);
+    assert_eq!(value["data"]["returned_count"], DEFAULT_QUERY_LIMIT);
+    assert_eq!(items.len(), DEFAULT_QUERY_LIMIT);
+    for item in items {
+        let item = item.as_object().expect("compact query item");
+        assert!(item.get("id").and_then(|value| value.as_str()).is_some());
+        assert!(item
+            .get("summary")
+            .and_then(|value| value.as_str())
+            .is_some());
+        assert!(!item.contains_key("body"));
+        assert!(!item.contains_key("path"));
+        assert!(!item.contains_key("frontmatter"));
+        assert!(!item.contains_key("keywords"));
+        assert!(!item.contains_key("entities"));
+    }
+
+    let listing = invoke_json(
+        &tool,
+        json!({
+            "action": "query",
+            "scope": "global",
+            "query": "  ",
+            "options": {"limit": 4}
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(listing["data"]["matched_count"], 4);
+    assert_eq!(
+        listing["data"]["items"]
+            .as_array()
+            .expect("management listing")
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn multilingual_retrieval_metadata_round_trips_through_query_and_get() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+    let session_id = "multilingual-memory-session";
+
+    let written = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Suzaku transport alias",
+            "content": "The confirmed transport alias for 朱雀 is Suzaku.",
+            "tags": ["MCP 认证", "Transport"],
+            "keywords": ["transport-alias", "朱雀别名", "MCP-朱雀"],
+            "entities": ["ＡＰＩ 网关", "Project Suzaku"]
+        }),
+        session_id,
+    )
+    .await;
+    let id = written["memory"]["id"]
+        .as_str()
+        .expect("written memory id")
+        .to_string();
+
+    let queried = invoke_json(
+        &tool,
+        json!({
+            "action": "query",
+            "scope": "global",
+            "query": "朱雀别名"
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(queried["data"]["items"][0]["id"], id);
+    assert!(queried["data"]["items"][0].get("body").is_none());
+
+    let fetched = invoke_json(&tool, json!({"action": "get", "id": id}), session_id).await;
+    let frontmatter = &fetched["memory"]["frontmatter"];
+    let tags = frontmatter["tags"].as_array().expect("tags");
+    let keywords = frontmatter["retrieval"]["keywords"]
+        .as_array()
+        .expect("keywords");
+    let entities = frontmatter["retrieval"]["entities"]
+        .as_array()
+        .expect("entities");
+    assert!(tags.contains(&json!("mcp-认证")));
+    assert!(tags.contains(&json!("transport")));
+    assert!(keywords.contains(&json!("transport-alias")));
+    assert!(keywords.contains(&json!("朱雀别名")));
+    assert!(keywords.contains(&json!("MCP-朱雀")));
+    assert!(entities.contains(&json!("API 网关")));
+    assert!(entities.contains(&json!("Project Suzaku")));
+    assert_eq!(fetched["memory"]["body_truncated"], false);
+    assert_eq!(fetched["memory"]["retrieval_metadata_truncated"], false);
+}
+
+#[tokio::test]
+async fn get_bounds_body_and_retrieval_metadata_independently_without_rewriting_canonical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = MemoryStore::new(dir.path());
+    let tool = build_memory_tool(dir.path());
+    let session_id = "bounded-get-session";
+
+    let body_doc = store
+        .write_memory_with_retrieval(
+            MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Reference,
+            "Long body",
+            &"body".repeat(32),
+            &["bounded".to_string()],
+            &MemoryRetrievalInput {
+                keywords: vec!["body-bound".to_string()],
+                entities: vec!["Body Entity".to_string()],
+            },
+            Some(session_id),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("write long body");
+    let body_result = invoke_json(
+        &tool,
+        json!({
+            "action": "get",
+            "id": body_doc.frontmatter.id,
+            "options": {"max_chars": 8}
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(body_result["memory"]["body_truncated"], true);
+    assert_eq!(body_result["memory"]["retrieval_metadata_truncated"], false);
+    assert_eq!(
+        body_result["memory"]["body"]
+            .as_str()
+            .expect("bounded body")
+            .chars()
+            .count(),
+        8
+    );
+
+    let mut metadata_doc = store
+        .write_memory(
+            MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Reference,
+            "Oversized legacy metadata",
+            "short body",
+            &[],
+            Some(session_id),
+            "test",
+            false,
+            None,
+        )
+        .await
+        .expect("write metadata fixture");
+    metadata_doc.frontmatter.tags = (0..MAX_MEMORY_TAGS + 4)
+        .map(|index| format!("legacy tag {index}"))
+        .collect();
+    metadata_doc.frontmatter.retrieval.keywords = (0..MAX_MEMORY_KEYWORDS + 4)
+        .map(|index| format!("legacy keyword {index} {}", "x".repeat(120)))
+        .collect();
+    metadata_doc.frontmatter.retrieval.entities = (0..MAX_MEMORY_ENTITIES + 4)
+        .map(|index| format!("legacy entity {index} {}", "y".repeat(120)))
+        .collect();
+    let canonical = format!(
+        "---\n{}\n---\n{}\n",
+        serde_json::to_string_pretty(&metadata_doc.frontmatter).expect("serialize fixture"),
+        metadata_doc.body
+    );
+    std::fs::write(&metadata_doc.path, &canonical).expect("write oversized canonical fixture");
+
+    let metadata_result = invoke_json(
+        &tool,
+        json!({"action": "get", "id": metadata_doc.frontmatter.id}),
+        session_id,
+    )
+    .await;
+    assert_eq!(metadata_result["memory"]["body_truncated"], false);
+    assert_eq!(
+        metadata_result["memory"]["retrieval_metadata_truncated"],
+        true
+    );
+    let bounded = &metadata_result["memory"]["frontmatter"];
+    assert_eq!(
+        bounded["tags"].as_array().expect("bounded tags").len(),
+        MAX_MEMORY_TAGS
+    );
+    assert_eq!(
+        bounded["retrieval"]["keywords"]
+            .as_array()
+            .expect("bounded keywords")
+            .len(),
+        MAX_MEMORY_KEYWORDS
+    );
+    assert_eq!(
+        bounded["retrieval"]["entities"]
+            .as_array()
+            .expect("bounded entities")
+            .len(),
+        MAX_MEMORY_ENTITIES
+    );
+    assert!(bounded["retrieval"]["keywords"]
+        .as_array()
+        .expect("bounded keywords")
+        .iter()
+        .all(|value| value.as_str().expect("keyword").chars().count() <= MAX_RETRIEVAL_TERM_CHARS));
+    assert_eq!(
+        std::fs::read_to_string(&metadata_doc.path).expect("read canonical after get"),
+        canonical,
+        "response bounding must not rewrite canonical memory"
+    );
+}
+
+#[tokio::test]
+async fn retrieval_metadata_is_forwarded_through_all_model_driven_mutations() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+    let session_id = "retrieval-mutation-session";
+
+    let written = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Canonical release channel",
+            "content": "The confirmed release channel is stable.",
+            "keywords": ["write-forward-alias"],
+            "entities": ["Release Channel"]
+        }),
+        session_id,
+    )
+    .await;
+    let target_id = written["memory"]["id"]
+        .as_str()
+        .expect("write id")
+        .to_string();
+
+    let duplicates = invoke_json(
+        &tool,
+        json!({
+            "action": "find_duplicates",
+            "scope": "global",
+            "title": "Candidate with different prose",
+            "content": "A separate wording supplied for duplicate review.",
+            "keywords": ["write-forward-alias"],
+            "entities": ["Release Channel"]
+        }),
+        session_id,
+    )
+    .await;
+    assert!(duplicates["candidates"]
+        .as_array()
+        .expect("duplicate candidates")
+        .iter()
+        .any(|candidate| candidate["id"] == target_id));
+
+    invoke_json(
+        &tool,
+        json!({
+            "action": "merge",
+            "id": target_id,
+            "content": "The stable channel also carries signed artifacts.",
+            "keywords": ["merge-forward-alias"],
+            "entities": ["Signed Artifact"]
+        }),
+        session_id,
+    )
+    .await;
+    let merged = invoke_json(&tool, json!({"action": "get", "id": target_id}), session_id).await;
+    assert!(merged["memory"]["frontmatter"]["retrieval"]["keywords"]
+        .as_array()
+        .expect("merged keywords")
+        .contains(&json!("merge-forward-alias")));
+    assert!(merged["memory"]["frontmatter"]["retrieval"]["entities"]
+        .as_array()
+        .expect("merged entities")
+        .contains(&json!("Signed Artifact")));
+
+    let source = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Two independent transport facts",
+            "content": "Transport alpha is local. Transport beta is remote."
+        }),
+        session_id,
+    )
+    .await;
+    let source_id = source["memory"]["id"]
+        .as_str()
+        .expect("split source id")
+        .to_string();
+    let split = invoke_json(
+        &tool,
+        json!({
+            "action": "split",
+            "id": source_id,
+            "pieces": [
+                {
+                    "title": "Local transport",
+                    "content": "Transport alpha is local.",
+                    "keywords": ["split-alpha-alias"],
+                    "entities": ["Transport Alpha"]
+                },
+                {
+                    "title": "Remote transport",
+                    "content": "Transport beta is remote.",
+                    "keywords": ["split-beta-alias"],
+                    "entities": ["Transport Beta"]
+                }
+            ]
+        }),
+        session_id,
+    )
+    .await;
+    let split_ids = split["data"]["new_ids"].as_array().expect("split ids");
+    assert_eq!(split_ids.len(), 2);
+    for (index, expected_keyword) in ["split-alpha-alias", "split-beta-alias"]
+        .into_iter()
+        .enumerate()
+    {
+        let split_doc = invoke_json(
+            &tool,
+            json!({"action": "get", "id": split_ids[index]}),
+            session_id,
+        )
+        .await;
+        assert!(split_doc["memory"]["frontmatter"]["retrieval"]["keywords"]
+            .as_array()
+            .expect("split keywords")
+            .contains(&json!(expected_keyword)));
+    }
+
+    let first = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Legacy endpoint name",
+            "content": "The endpoint was called relay-v1."
+        }),
+        session_id,
+    )
+    .await;
+    let second = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Current endpoint name",
+            "content": "The endpoint is called relay-v2."
+        }),
+        session_id,
+    )
+    .await;
+    let consolidated = invoke_json(
+        &tool,
+        json!({
+            "action": "consolidate",
+            "ids": [first["memory"]["id"], second["memory"]["id"]],
+            "title": "Canonical endpoint name",
+            "content": "The confirmed endpoint name is relay-v2.",
+            "type": "reference",
+            "keywords": ["consolidate-forward-alias"],
+            "entities": ["Relay Endpoint"]
+        }),
+        session_id,
+    )
+    .await;
+    let consolidated_doc = invoke_json(
+        &tool,
+        json!({"action": "get", "id": consolidated["data"]["new_id"]}),
+        session_id,
+    )
+    .await;
+    assert!(
+        consolidated_doc["memory"]["frontmatter"]["retrieval"]["keywords"]
+            .as_array()
+            .expect("consolidated keywords")
+            .contains(&json!("consolidate-forward-alias"))
+    );
+    assert!(
+        consolidated_doc["memory"]["frontmatter"]["retrieval"]["entities"]
+            .as_array()
+            .expect("consolidated entities")
+            .contains(&json!("Relay Endpoint"))
+    );
 }

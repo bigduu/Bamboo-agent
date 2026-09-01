@@ -4,8 +4,11 @@ use serde_json::json;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::Session;
 use bamboo_memory::memory_store::{
-    DurableMemoryStatus, MemoryQueryOptions, MemoryScope, MemoryStore, MAX_MAX_CHARS,
-    MAX_QUERY_LIMIT,
+    normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
+    MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
+    MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES,
+    MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS,
+    MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
 };
 use bamboo_tools::tools::session_memory::{
     execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
@@ -28,6 +31,26 @@ pub struct MemoryTool {
 struct ResolvedMemoryAccess {
     store: MemoryStore,
     project_key: Option<String>,
+}
+
+fn bound_retrieval_metadata(doc: &mut DurableMemoryDocument) -> bool {
+    let original_tags = doc.frontmatter.tags.clone();
+    let original_keywords = doc.frontmatter.retrieval.keywords.clone();
+    let original_entities = doc.frontmatter.retrieval.entities.clone();
+
+    doc.frontmatter.tags = normalize_tags(original_tags.iter().map(String::as_str));
+    doc.frontmatter.retrieval.keywords = normalize_retrieval_terms(
+        original_keywords.iter().map(String::as_str),
+        MAX_MEMORY_KEYWORDS,
+    );
+    doc.frontmatter.retrieval.entities = normalize_retrieval_terms(
+        original_entities.iter().map(String::as_str),
+        MAX_MEMORY_ENTITIES,
+    );
+
+    original_tags != doc.frontmatter.tags
+        || original_keywords != doc.frontmatter.retrieval.keywords
+        || original_entities != doc.frontmatter.retrieval.entities
 }
 
 impl MemoryTool {
@@ -123,7 +146,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Unified memory management tool for Bamboo. Use session_* actions for session continuity notes, and query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project/global memory backed by canonical topic files and derived indexes."
+        "Bamboo's unified memory tool. Use session_* for continuity notes. For durable memory, start with a short lexical query: omitting limit returns a compact top-3 shortlist with actionable ids and no bodies; then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. The Session's assigned Project is trusted scope authority: project_key cannot grant or switch access. Verify live state when a fact may have changed. Retrieval is embedding-free; no embeddings are used. A blank query remains a management listing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -132,6 +155,7 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
+                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates.",
                     "enum": [
                         "session_read",
                         "session_append",
@@ -152,22 +176,94 @@ impl Tool for MemoryTool {
                         "scan_duplicates"
                     ]
                 },
-                "scope": {"type": "string", "enum": ["session", "project", "global"]},
+                "scope": {
+                    "type": "string",
+                    "enum": ["session", "project", "global"],
+                    "description": "Durable actions use project or global. Use session_* actions, not durable actions, for session continuity notes."
+                },
                 "granularity": {
                     "type": "string",
                     "enum": ["day", "week", "month", "quarter", "year"],
                     "description": "Optional temporal granularity for `write`, orthogonal to scope: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). Omit if the memory has no time horizon. Coarser granularities are prefix-cache friendly and recalled ahead of finer ones at equal relevance."
                 },
-                "project_key": {"type": "string"},
+                "project_key": {
+                    "type": "string",
+                    "description": "Optional assertion only. The trusted Session Project selects and authorizes Project memory; this value cannot grant access or switch projects."
+                },
                 "topic": {"type": "string"},
-                "id": {"type": "string"},
-                "query": {"type": "string"},
+                "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_MEMORY_ID_LEN,
+                    "description": "Actionable memory id returned by query; use get only for selected ids."
+                },
+                "query": {
+                    "type": "string",
+                    "maxLength": MAX_MEMORY_QUERY_CHARS,
+                    "description": "Short, discriminative lexical keywords or entities. Omit/blank only for a bounded management listing; no embedding search is used."
+                },
                 "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
-                "title": {"type": "string"},
-                "content": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "pieces": {"type": "array", "items": {"type": "object"}},
-                "ids": {"type": "array", "items": {"type": "string"}},
+                "title": {
+                    "type": "string",
+                    "maxLength": MAX_MEMORY_TITLE_LEN,
+                    "description": "Concise title for one atomic confirmed fact."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "One atomic confirmed fact, not a transcript or speculative note. Verify live state instead of trusting stale memory."
+                },
+                "tags": {
+                    "type": "array",
+                    "maxItems": MAX_MEMORY_TAGS,
+                    "items": {"type": "string", "maxLength": MAX_MEMORY_TAG_CHARS},
+                    "description": "Bounded categorical labels."
+                },
+                "keywords": {
+                    "type": "array",
+                    "maxItems": MAX_EXPLICIT_MEMORY_KEYWORDS,
+                    "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS},
+                    "description": "Bounded multilingual lexical aliases supplied by the model; embeddings are neither accepted nor computed."
+                },
+                "entities": {
+                    "type": "array",
+                    "maxItems": MAX_EXPLICIT_MEMORY_ENTITIES,
+                    "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS},
+                    "description": "Bounded canonical names, products, projects, people, or other entities useful for lexical recall."
+                },
+                "pieces": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "maxLength": MAX_MEMORY_TITLE_LEN},
+                            "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                            "content": {"type": "string"},
+                            "tags": {
+                                "type": "array",
+                                "maxItems": MAX_MEMORY_TAGS,
+                                "items": {"type": "string", "maxLength": MAX_MEMORY_TAG_CHARS}
+                            },
+                            "keywords": {
+                                "type": "array",
+                                "maxItems": MAX_EXPLICIT_MEMORY_KEYWORDS,
+                                "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS}
+                            },
+                            "entities": {
+                                "type": "array",
+                                "maxItems": MAX_EXPLICIT_MEMORY_ENTITIES,
+                                "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS}
+                            }
+                        },
+                        "required": ["title", "content"]
+                    },
+                    "description": "Atomic replacement facts for split; each piece carries its own retrieval metadata."
+                },
+                "ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {"type": "string", "maxLength": MAX_MEMORY_ID_LEN}
+                },
                 "min_score": {"type": "number"},
                 "filters": {
                     "type": "object",
@@ -193,7 +289,25 @@ impl Tool for MemoryTool {
                         }
                     }
                 },
-                "options": {"type": "object"},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_QUERY_LIMIT,
+                            "default": DEFAULT_QUERY_LIMIT,
+                            "description": "Omit for the compact default top-3 query result."
+                        },
+                        "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_MAX_CHARS},
+                        "cursor": {"type": "string"},
+                        "include_related": {"type": "boolean"},
+                        "allow_merge_if_similar": {
+                            "type": "boolean",
+                            "description": "Write-only opt-in after query confirms an existing memory should absorb the fact."
+                        }
+                    }
+                },
                 "reason": {"type": "string"}
             },
             "required": ["action"]
@@ -385,6 +499,7 @@ impl Tool for MemoryTool {
                 let (body, truncated) =
                     bamboo_memory::memory_store::truncate_chars(&doc.body, max_chars);
                 doc.body = body;
+                let retrieval_metadata_truncated = bound_retrieval_metadata(&mut doc);
                 Ok(ToolResult {
                     success: true,
                     result: json!({
@@ -395,6 +510,7 @@ impl Tool for MemoryTool {
                             "body": doc.body,
                             "path": doc.path,
                             "body_truncated": truncated,
+                            "retrieval_metadata_truncated": retrieval_metadata_truncated,
                         }
                     })
                     .to_string(),
@@ -408,6 +524,8 @@ impl Tool for MemoryTool {
                 title,
                 content,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 granularity,
                 options,
@@ -425,13 +543,14 @@ impl Tool for MemoryTool {
                     .await?;
                 let doc = memory_access
                     .store
-                    .write_memory(
+                    .write_memory_with_retrieval(
                         scope,
                         memory_access.project_key.as_deref(),
                         Self::parse_type(&r#type)?,
                         &title,
                         &content,
                         &tags,
+                        &MemoryRetrievalInput { keywords, entities },
                         Some(session_id),
                         "main-model",
                         options
@@ -466,6 +585,8 @@ impl Tool for MemoryTool {
                 id,
                 content,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 source_memory_ids,
                 mode,
@@ -510,11 +631,12 @@ impl Tool for MemoryTool {
                 } else {
                     let Some(result) = memory_access
                         .store
-                        .merge_memory(
+                        .merge_memory_with_retrieval(
                             id.trim(),
                             memory_access.project_key.as_deref(),
                             &content,
                             &tags,
+                            &MemoryRetrievalInput { keywords, entities },
                             Some(session_id),
                             "main-model",
                             &source_memory_ids,
@@ -548,6 +670,8 @@ impl Tool for MemoryTool {
                 content,
                 r#type,
                 tags,
+                keywords,
+                entities,
                 project_key,
                 options,
             } => {
@@ -570,13 +694,14 @@ impl Tool for MemoryTool {
                     .clamp(1, MAX_QUERY_LIMIT);
                 let candidates = memory_access
                     .store
-                    .find_duplicate_candidates(
+                    .find_duplicate_candidates_with_retrieval(
                         scope,
                         memory_access.project_key.as_deref(),
                         r#type,
                         &title,
                         content.as_deref().unwrap_or(""),
                         &tags,
+                        &MemoryRetrievalInput { keywords, entities },
                         limit,
                     )
                     .await
@@ -608,6 +733,7 @@ impl Tool for MemoryTool {
                     .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
                     .await?;
                 let mut split_pieces = Vec::with_capacity(pieces.len());
+                let mut retrieval = Vec::with_capacity(pieces.len());
                 for piece in pieces {
                     let r#type = match piece.r#type.as_deref() {
                         Some(value) => Some(Self::parse_type(value)?),
@@ -619,13 +745,18 @@ impl Tool for MemoryTool {
                         content: piece.content,
                         tags: piece.tags,
                     });
+                    retrieval.push(MemoryRetrievalInput {
+                        keywords: piece.keywords,
+                        entities: piece.entities,
+                    });
                 }
                 let Some(result) = memory_access
                     .store
-                    .split_memory(
+                    .split_memory_with_retrieval(
                         id.trim(),
                         memory_access.project_key.as_deref(),
                         &split_pieces,
+                        &retrieval,
                         Some(session_id),
                         "main-model",
                     )
@@ -743,6 +874,8 @@ impl Tool for MemoryTool {
                 content,
                 r#type,
                 tags,
+                keywords,
+                entities,
                 project_key,
             } => {
                 if ids.len() < 2 {
@@ -766,10 +899,11 @@ impl Tool for MemoryTool {
                 let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
                 let Some(result) = memory_access
                     .store
-                    .consolidate_memories(
+                    .consolidate_memories_with_retrieval(
                         &ids,
                         memory_access.project_key.as_deref(),
                         &merged,
+                        &MemoryRetrievalInput { keywords, entities },
                         Some(session_id),
                         "main-model",
                     )
