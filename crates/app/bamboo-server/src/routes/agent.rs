@@ -84,6 +84,7 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .wrap(actix_web::middleware::from_fn(
             settings::enforce_access_password_middleware,
         ))
+        .route("/bootstrap", web::get().to(agent::bootstrap::handler))
         .route("/chat", web::post().to(agent::chat::handler))
         .route(
             "/prompt-presets",

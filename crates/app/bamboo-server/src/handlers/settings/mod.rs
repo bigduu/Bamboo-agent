@@ -19,12 +19,14 @@ mod workflows;
 
 #[cfg(test)]
 pub(crate) use access_control::issue_device_token;
+pub(crate) use access_control::{
+    bootstrap_access_snapshot, request_is_authorized, verify_device_token, BootstrapAccessSnapshot,
+};
 pub use access_control::{
     create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
     pair_device, revoke_device, rotate_device, update_access_password, verify_access_password,
     PairingCodeEntry, PairingCodeGuard, RootPasswordGuard,
 };
-pub(crate) use access_control::{request_is_authorized, verify_device_token};
 pub use bamboo_config::{
     clear_credential, confirm_config_recovery, detect_codex_cli, get_bamboo_config,
     get_bamboo_tools, get_config_recovery_status, get_connect_config, get_credential_status,

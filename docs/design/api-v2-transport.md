@@ -277,8 +277,7 @@ bd1_<32 hex>          // 例如 bd1_4f8a...e2c9
 
 2. 正常连接(WSS 握手首帧):
    Client → { "type": "hello", "device_id": "...", "token": "bd1_..." }
-   Server → { "type": "welcome", "server_version": "...", "capabilities": [...] }
-   校验 token hash → 绑定连接身份 = device_id
+   Server 校验 token hash → 在服务端绑定连接身份 = device_id
 
 3. 后续设备配对(已有已认证设备在场):
    已认证设备生成一次性 6 位配对码:
@@ -290,6 +289,12 @@ bd1_<32 hex>          // 例如 bd1_4f8a...e2c9
 ```
 
 **loopback 桌面端**:`local_bypass` 语义保留——本地连接免 token(桌面开发零摩擦),仅公网连接强制 device token。
+
+> **当前实现边界:** 成功的 `hello` 只更新服务端连接的授权状态，尚不返回
+> `welcome` / `hello_ack`。客户端也不能以 socket open、首个业务事件或 pong
+> 推断认证成功。显式 acknowledgement 与订阅前等待 ACK 属于独立后续切片；在它
+> 落地前，`GET /api/v1/bootstrap` 只广告已经实现的
+> `auth.ws_device_hello.v1`，不会虚假广告 welcome/ACK 能力。
 
 ### 4.4 管理
 
@@ -471,17 +476,42 @@ WS 标准 RFC 7692 扩展,握手自动协商。对 JSON 文本通常 −60~80%�
 ### 8.1 双轨并存
 
 ```
-/v1  (SSE ×2 + REST)   ── 保留,桌面 loopback 默认,标记 deprecated
-/v2  (单 WSS)           ── 新增,公网/移动端默认
+/v1      (SSE ×2 + REST) ── 仅供遗留 Lotus 过渡,标记 deprecated
+/api/v1  (REST)          ── Lotus Next 全 surface 的 canonical HTTP API
+/v2      (单 WSS)        ── Lotus Next 全 surface 的 realtime transport
 ```
 
-- **桌面 lotus**:`server.tls` 缺省(loopback)→ 继续走 `/v1`,**零行为回退**;`server.tls` 存在 → 可选切 `/v2`。
-- **移动端**:只实现 `/v2` WS 客户端,不碰 SSE。
+- **Lotus Next**:浏览器、嵌入式 WebView、桌面与移动端共享同一套
+  `/api/v1` + `/v2/stream` contract；surface 不再决定协议或 feature tree。
+- **遗留 Lotus**:迁移期间可继续使用 `/v1`/SSE，但 Lotus Next 不对它做运行时
+  fallback；旧路径的最终退休另行跟踪。
 - **broker/worker**:本地继续 loopback;远程启用 `bind_tls`(remote-actor P1)。
 
 ### 8.2 客户端发现
 
-`lotus/src/shared/utils/backendBaseUrl.ts` 的健康探测改为探测 `/v2` 握手能力;发现到 `server.tls` 存在的实例自动选 `wss://`。
+Lotus Next 的所有 surface（浏览器、嵌入式 WebView、桌面和移动端）使用同一个
+canonical public `GET /api/v1/bootstrap` 作为 Bamboo 身份、REST/realtime
+版本范围、编码能力与当前认证状态的唯一兼容性 authority。客户端不得通过
+`/healthz`、`/api/v1/health`、`/v1` 路由存在性或试连 WebSocket 来猜测能力；
+旧服务器的 404、非法响应、产品不匹配、版本范围无交集或必要 capability 缺失
+都应显示为可诊断的不兼容状态，不得回退旧 Lotus 或另一套 endpoint。
+
+响应 schema v1 固定为：
+
+- `server.product = "bamboo"`，`server.version` 仅用于诊断，不用于推导能力；
+- `api.name = "bamboo.agent"`，canonical base 仅为 `/api/v1`，范围 `1..=1`；
+- realtime 为 `/v2/stream`、范围 `2..=2`，显式列出 JSON/MessagePack
+  subprotocol；
+- `capabilities` 是已实现能力的稳定、可扩展 ID 列表；
+- `auth.policy` 与 `auth.request_state` 分离，后者由当前请求 cookie/header、
+  locality 和同一个配置快照计算；
+- 响应不含 verifier、token、device metadata、credential reference 或配置路径，
+  并带 `Cache-Control: no-store` 与
+  `Vary: Cookie, Authorization, X-Device-Id`。
+
+Bootstrap 只证明 HTTP 发现契约；它不等价于 WebSocket hello acknowledgement。
+Lotus Next 在后续独立切片中增加显式 WSS ACK 后，才可在 ACK 前禁止 subscribe
+并将 negotiated connection state 作为 realtime authority。
 
 ### 8.3 认证迁移
 
@@ -491,7 +521,9 @@ WS 标准 RFC 7692 扩展,握手自动协商。对 JSON 文本通常 −60~80%�
 
 ### 8.4 灰度开关
 
-`features` 段新增 `api_v2_ws: bool`(默认桌面 false / 公网 true),允许按实例开关 `/v2` 入口,降低风险。
+当前 `/v2/stream` 是 Bamboo 的固定能力，没有按 desktop/mobile 分叉的
+`api_v2_ws` 配置。迁移灰度由制品发布与 Lotus Next capability admission 控制；
+不得在同一个 Lotus Next 构建里根据 host kind 静默切回 `/v1`/SSE。
 
 ---
 
@@ -551,8 +583,8 @@ WS 标准 RFC 7692 扩展,握手自动协商。对 JSON 文本通常 −60~80%�
 | feed channel | `handlers/agent/stream/response.rs`(`plan_replay`/journal 逐帧复用) |
 | agent channel | `handlers/agent/events/stream.rs`(`AgentEvent` 序列化复用) |
 | token 合帧 | `handlers/agent/events/stream.rs` 帧出口 |
-| 桌面客户端切换 | `lotus/src/services/chat/accountFeed.ts` + `agentSubscriptionRunner.ts` |
-| 客户端发现 | `lotus/src/shared/utils/backendBaseUrl.ts`(探测 `/v2`) |
+| Lotus Next 全 surface realtime consumer | `bigduu/lotus-next` 的 `src/services/chat/v2Stream.ts` + `accountFeed.ts` |
+| canonical 客户端发现 contract | `handlers/agent/bootstrap.rs` + `routes/agent.rs` 的 `GET /api/v1/bootstrap`；Lotus Next typed consumer 由独立 Issue 接入 |
 
 ---
 

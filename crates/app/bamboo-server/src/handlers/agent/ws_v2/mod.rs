@@ -56,6 +56,8 @@
 mod envelope;
 mod forwarders;
 
+pub(crate) use self::envelope::{SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK};
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -70,7 +72,7 @@ use serde::Deserialize;
 
 use self::envelope::{
     decode_client_frame, pong_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding,
-    OutFrame, SUBPROTOCOL_JSON, SUBPROTOCOL_MSGPACK,
+    OutFrame,
 };
 use self::forwarders::{
     spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,

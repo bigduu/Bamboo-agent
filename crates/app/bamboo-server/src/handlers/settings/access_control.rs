@@ -41,6 +41,59 @@ pub(crate) struct AccessStatusResponse {
     pub requires_password: bool,
 }
 
+/// The configured access-control posture advertised by the frontend bootstrap
+/// contract.
+///
+/// This describes configuration policy only. Whether the current request used
+/// a local bypass or presented a valid credential is reported separately by
+/// [`BootstrapRequestState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BootstrapAuthPolicy {
+    /// No root password, active device credential, or repair quarantine gates
+    /// remote requests.
+    Open,
+    /// A root password or at least one non-revoked device credential gates
+    /// remote requests.
+    CredentialRequired,
+    /// The access-control document is quarantined and remote credentials fail
+    /// closed until an explicit repair/reset clears the flag.
+    RepairRequired,
+}
+
+/// How the current bootstrap request relates to the configured auth policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BootstrapRequestState {
+    /// The real request locality qualifies for the existing desktop bypass.
+    LocalBypass,
+    /// A non-local request presented a currently valid cookie or device bearer.
+    Authenticated,
+    /// A non-local request did not present a currently valid credential.
+    /// Under [`BootstrapAuthPolicy::Open`] this is still an allowed request; the
+    /// state deliberately reports credential presence rather than duplicating
+    /// the policy decision.
+    Unauthenticated,
+}
+
+/// Access-control facts embedded in the public frontend bootstrap response.
+///
+/// All fields are derived from one caller-owned [`Config`] snapshot plus the
+/// current request. No device metadata, verifier material, or credential value
+/// is exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct BootstrapAccessSnapshot {
+    pub(crate) policy: BootstrapAuthPolicy,
+    pub(crate) request_state: BootstrapRequestState,
+    /// Durable root-password intent. A missing/degraded verifier does not
+    /// silently turn this off.
+    pub(crate) password_enabled: bool,
+    /// At least one non-revoked device is configured. In repair quarantine this
+    /// remains a configuration fact; [`BootstrapAuthPolicy::RepairRequired`]
+    /// communicates that remote credentials are not currently accepted.
+    pub(crate) device_auth_enabled: bool,
+}
+
 #[derive(Serialize)]
 pub(crate) struct AccessStatusEnvelope {
     #[serde(flatten)]
@@ -259,12 +312,11 @@ fn is_local_request(req: &HttpRequest) -> bool {
         return host_local && peer_local != Some(false);
     }
 
-    // No Host header: decide purely from the real socket peer.
-    if let Some(local) = peer_local {
-        return local;
-    }
-    let conn = req.connection_info();
-    conn.peer_addr().map(is_local_host).unwrap_or(false)
+    // No Host header: decide purely from the real socket peer. Actix derives
+    // `ConnectionInfo::peer_addr()` from this same request-head field, so a
+    // second fallback through `connection_info()` cannot recover an address.
+    // Avoid constructing that header-derived object for an untrusted request.
+    peer_local.unwrap_or(false)
 }
 
 /// Best-effort client-IP key for per-IP throttling (#190).
@@ -544,6 +596,13 @@ const PUBLIC_VERSIONED_SUFFIXES: &[&str] =
     &["/health", "/bamboo/access/status", "/bamboo/access/verify"];
 
 fn is_public_access_route(path: &str) -> bool {
+    // Frontend bootstrap is canonical-only. Do not add `/bootstrap` to
+    // `PUBLIC_VERSIONED_SUFFIXES`: that would also make an unregistered legacy
+    // `/v1/bootstrap` path public and silently invent a compatibility alias.
+    if path == "/api/v1/bootstrap" {
+        return true;
+    }
+
     for prefix in ["/api/v1", "/v1"] {
         if let Some(suffix) = path.strip_prefix(prefix) {
             if PUBLIC_VERSIONED_SUFFIXES.contains(&suffix) {
@@ -596,6 +655,56 @@ pub(crate) fn request_is_authorized(req: &HttpRequest, config: &Config) -> bool 
     !build_access_status(config, req).requires_password
         || request_has_verified_access_cookie(req, config)
         || request_has_valid_device_token(req, config)
+}
+
+/// Derive the access-control portion of the frontend bootstrap contract from a
+/// single configuration snapshot and the current request.
+///
+/// Policy and request state intentionally remain orthogonal: an open instance
+/// can receive an unauthenticated remote request, while a locally bypassed
+/// request retains `CredentialRequired` or `RepairRequired` as its configured
+/// policy. Repair quarantine is evaluated before remote credentials so a cookie
+/// or device bearer minted from stale verifier material always fails closed.
+pub(crate) fn bootstrap_access_snapshot(
+    config: &Config,
+    req: &HttpRequest,
+) -> BootstrapAccessSnapshot {
+    let password_enabled = config
+        .access_control
+        .as_ref()
+        .is_some_and(|access| access.password_enabled);
+    let device_auth_enabled = has_active_devices(config);
+    let repair_required = access_repair_required(config);
+
+    let policy = if repair_required {
+        BootstrapAuthPolicy::RepairRequired
+    } else if password_enabled || device_auth_enabled {
+        BootstrapAuthPolicy::CredentialRequired
+    } else {
+        BootstrapAuthPolicy::Open
+    };
+
+    let request_state = if is_local_request(req) {
+        BootstrapRequestState::LocalBypass
+    } else if repair_required {
+        // Keep the quarantine fail-closed boundary explicit here rather than
+        // allowing a future credential-helper change to make stale material
+        // appear authenticated in the public bootstrap snapshot.
+        BootstrapRequestState::Unauthenticated
+    } else if request_has_verified_access_cookie(req, config)
+        || request_has_valid_device_token(req, config)
+    {
+        BootstrapRequestState::Authenticated
+    } else {
+        BootstrapRequestState::Unauthenticated
+    };
+
+    BootstrapAccessSnapshot {
+        policy,
+        request_state,
+        password_enabled,
+        device_auth_enabled,
+    }
 }
 
 pub async fn enforce_access_password_middleware<B: MessageBody + 'static>(
@@ -2208,6 +2317,12 @@ mod tests {
     }
 
     #[test]
+    fn request_without_host_or_peer_is_not_local() {
+        let req = TestRequest::default().to_http_request();
+        assert!(!is_local_request(&req));
+    }
+
+    #[test]
     fn password_hash_roundtrip_verifies() {
         let salt_hex = hex::encode([1_u8; 16]);
         let hash = compute_password_hash("secret", &salt_hex).unwrap();
@@ -2513,6 +2628,221 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_access_snapshot_reports_policy_and_request_state_matrix() {
+        fn assert_snapshot(
+            config: &Config,
+            request: &HttpRequest,
+            policy: BootstrapAuthPolicy,
+            request_state: BootstrapRequestState,
+            password_enabled: bool,
+            device_auth_enabled: bool,
+        ) {
+            assert_eq!(
+                bootstrap_access_snapshot(config, request),
+                BootstrapAccessSnapshot {
+                    policy,
+                    request_state,
+                    password_enabled,
+                    device_auth_enabled,
+                }
+            );
+        }
+
+        // Open policy is independent from the request's credential state. A
+        // remote request is allowed by policy but still truthfully reports that
+        // it did not authenticate; locality remains visible when the same open
+        // instance is reached over the desktop bypass.
+        let open = Config::default();
+        assert_snapshot(
+            &open,
+            &remote_req(),
+            BootstrapAuthPolicy::Open,
+            BootstrapRequestState::Unauthenticated,
+            false,
+            false,
+        );
+        assert_snapshot(
+            &open,
+            &local_req(),
+            BootstrapAuthPolicy::Open,
+            BootstrapRequestState::LocalBypass,
+            false,
+            false,
+        );
+
+        // Password-only policy, both without and with a valid verification
+        // cookie derived from this exact Config snapshot.
+        let password_only = config_with_password();
+        assert_snapshot(
+            &password_only,
+            &remote_req(),
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Unauthenticated,
+            true,
+            false,
+        );
+        let cookie_value = access_verification_cookie_value(&password_only)
+            .expect("healthy password config yields a cookie");
+        let valid_cookie = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, cookie_value))
+            .to_http_request();
+        assert_snapshot(
+            &password_only,
+            &valid_cookie,
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Authenticated,
+            true,
+            false,
+        );
+        assert_snapshot(
+            &password_only,
+            &local_req(),
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::LocalBypass,
+            true,
+            false,
+        );
+
+        // Device-only policy and a valid bearer + companion device id.
+        let (device, device_token) = issue_device_token("bootstrap-device");
+        let device_id = device.device_id.clone();
+        let device_only = test_config! {
+            access_control: Some(AccessControlConfig {
+                devices: vec![device.clone()],
+                ..Default::default()
+            }),
+        };
+        assert_snapshot(
+            &device_only,
+            &remote_req(),
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Unauthenticated,
+            false,
+            true,
+        );
+        let valid_device = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+            .insert_header((DEVICE_ID_HEADER, device_id.clone()))
+            .to_http_request();
+        assert_snapshot(
+            &device_only,
+            &valid_device,
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Authenticated,
+            false,
+            true,
+        );
+
+        // Both mechanisms configured still form one credential-required policy.
+        let mut both = config_with_password();
+        both.access_control
+            .as_mut()
+            .unwrap()
+            .devices
+            .push(device.clone());
+        assert_snapshot(
+            &both,
+            &remote_req(),
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Unauthenticated,
+            true,
+            true,
+        );
+
+        // An active device keeps the policy gated, but an invalid bearer cannot
+        // claim authentication.
+        let invalid_device = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .insert_header((header::AUTHORIZATION, "Bearer bd1_invalid"))
+            .insert_header((DEVICE_ID_HEADER, device_id.clone()))
+            .to_http_request();
+        assert_snapshot(
+            &device_only,
+            &invalid_device,
+            BootstrapAuthPolicy::CredentialRequired,
+            BootstrapRequestState::Unauthenticated,
+            false,
+            true,
+        );
+
+        // A revoked-only device is not an enabled auth mechanism and cannot
+        // authenticate even with the token that preceded its revocation.
+        let (mut revoked_device, revoked_token) = issue_device_token("revoked-device");
+        let revoked_device_id = revoked_device.device_id.clone();
+        revoked_device.revoked = true;
+        let revoked_only = test_config! {
+            access_control: Some(AccessControlConfig {
+                devices: vec![revoked_device],
+                ..Default::default()
+            }),
+        };
+        let revoked_request = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {revoked_token}")))
+            .insert_header((DEVICE_ID_HEADER, revoked_device_id))
+            .to_http_request();
+        assert_snapshot(
+            &revoked_only,
+            &revoked_request,
+            BootstrapAuthPolicy::Open,
+            BootstrapRequestState::Unauthenticated,
+            false,
+            false,
+        );
+
+        // Repair quarantine dominates previously valid cookie and device
+        // material for remote requests. The same configured mechanisms remain
+        // visible as configuration facts, while a local request reports its
+        // existing bypass without weakening the repair-required policy.
+        let stale_cookie = access_verification_cookie_value(&both)
+            .expect("healthy pre-repair config yields a cookie");
+        both.access_control.as_mut().unwrap().repair_required = true;
+        let repair_remote = TestRequest::default()
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .cookie(Cookie::new(
+                ACCESS_VERIFIED_COOKIE_NAME,
+                stale_cookie.clone(),
+            ))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+            .insert_header((DEVICE_ID_HEADER, device_id.clone()))
+            .to_http_request();
+        assert_snapshot(
+            &both,
+            &repair_remote,
+            BootstrapAuthPolicy::RepairRequired,
+            BootstrapRequestState::Unauthenticated,
+            true,
+            true,
+        );
+        let repair_local = TestRequest::default()
+            .insert_header((header::HOST, "localhost:9562"))
+            .cookie(Cookie::new(ACCESS_VERIFIED_COOKIE_NAME, stale_cookie))
+            .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+            .insert_header((DEVICE_ID_HEADER, device_id))
+            .to_http_request();
+        assert_snapshot(
+            &both,
+            &repair_local,
+            BootstrapAuthPolicy::RepairRequired,
+            BootstrapRequestState::LocalBypass,
+            true,
+            true,
+        );
+
+        // The serialized values are part of the public bootstrap vocabulary.
+        assert_eq!(
+            serde_json::to_value(BootstrapAuthPolicy::CredentialRequired).unwrap(),
+            serde_json::json!("credential_required")
+        );
+        assert_eq!(
+            serde_json::to_value(BootstrapRequestState::LocalBypass).unwrap(),
+            serde_json::json!("local_bypass")
+        );
+    }
+
+    #[test]
     fn stream_is_public_but_sibling_routes_are_not() {
         // #189: the upgrade is whitelisted; the gated siblings are NOT.
         assert!(is_public_access_route("/v2/stream"));
@@ -2529,6 +2859,13 @@ mod tests {
         assert!(is_public_access_route("/healthz"));
         assert!(is_public_access_route("/readyz"));
         assert!(is_public_access_route("/api/v1/health"));
+    }
+
+    #[test]
+    fn bootstrap_is_public_only_at_the_exact_canonical_path() {
+        assert!(is_public_access_route("/api/v1/bootstrap"));
+        assert!(!is_public_access_route("/v1/bootstrap"));
+        assert!(!is_public_access_route("/api/v1/bootstrap/extra"));
     }
 
     #[test]
