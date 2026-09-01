@@ -38,8 +38,9 @@ jobs:
 
       - name: Stage frontend package from npm
         # Embed the published @bigduu/lotus package instead of the committed
-        # frontend_package/ zip — the committed copy goes stale between Lotus
-        # releases (the release train passes the exact same-day version).
+        # crate-owned frontend_package/ zip — the committed copy goes stale
+        # between Lotus releases (the release train passes the exact same-day
+        # version).
         # LOTUS_SOURCE=package hard-fails when the npm package is missing, so a
         # fetch failure can never silently fall back to the stale zip.
         env:
@@ -48,9 +49,10 @@ jobs:
           set -euo pipefail
           npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
           LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
-          EMBEDDED="$(node -p "require('./frontend_package/frontend-manifest.json').frontend_version")"
+          FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
+          test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
+          test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
+          EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
           echo "Embedded lotus frontend version: ${EMBEDDED}"
           if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
             echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"

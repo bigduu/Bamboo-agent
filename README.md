@@ -163,6 +163,45 @@ bamboo serve
 Arguments supported by `bamboo serve` (all override the config file):
 `--port`, `--bind`, `--data-dir`, `--static-dir`, `--workers` (plus `--parent-pid`, a sidecar orphan-guard: the process exits when that PID goes away).
 
+### Frontend build contract
+
+Normal Bamboo builds require the staged frontend package owned by
+`crates/app/bamboo-server/frontend_package`. The build validates the sidecar
+manifest, the matching manifest inside the zip, portable archive paths and
+payload integrity, the `index.html` entry, and the manifest hash shape. Missing
+or invalid assets stop the build with an actionable staging instruction instead
+of silently producing an API-only server. Refresh the committed package
+explicitly with:
+
+```bash
+node scripts/frontend-package.cjs stage
+```
+
+Cargo never runs that staging command implicitly. This removes the previous
+ignored child-process status: explicit local and GitHub Actions callers receive
+the stager's nonzero exit status before `build.rs` validates the resulting
+crate-owned bytes.
+
+An intentionally frontend-free binary remains available for infrastructure
+that supplies only Bamboo APIs. Select it at build time (never as an implicit
+fallback):
+
+```bash
+BAMBOO_FRONTEND_BUILD_MODE=api-only cargo build --bin bamboo
+```
+
+PowerShell:
+
+```powershell
+$env:BAMBOO_FRONTEND_BUILD_MODE = "api-only"
+cargo build --bin bamboo
+```
+
+That setting disables only the compiled-in package. Existing runtime frontend
+discovery remains unchanged: `--static-dir`, `BAMBOO_FRONTEND_PACKAGE`, or a
+legacy package candidate beside the working directory/executable can still
+provide a frontend.
+
 **Other subcommands** (`bamboo --help` / `bamboo <cmd> --help` for the full list):
 
 | Command | What it does |

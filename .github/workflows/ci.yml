@@ -44,10 +44,11 @@ jobs:
           node-version: lts/*
 
       - name: Stage frontend package
+        shell: bash
         run: |
+          set -euo pipefail
           node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
+          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,6 +58,22 @@ jobs:
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
           cache-on-failure: true
+
+      - name: Verify published server crate owns the frontend package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_FILES="$(cargo package --locked -p bamboo-server --allow-dirty --list)"
+          for required in \
+            build.rs \
+            frontend_build.rs \
+            frontend_package/frontend-manifest.json \
+            frontend_package/lotus-frontend.zip; do
+            if ! grep -Fxq "${required}" <<< "${PACKAGE_FILES}"; then
+              echo "::error::bamboo-server package is missing ${required}"
+              exit 1
+            fi
+          done
 
       - name: Run tests
         run: cargo test --all-features --lib --tests
@@ -231,10 +248,11 @@ jobs:
           node-version: lts/*
 
       - name: Stage frontend package
+        shell: bash
         run: |
+          set -euo pipefail
           node scripts/frontend-package.cjs stage
-          test -f frontend_package/lotus-frontend.zip
-          test -f frontend_package/frontend-manifest.json
+          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -247,6 +265,9 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+      - name: Verify portable frontend package contract
+        run: cargo test --locked -p bamboo-server --test frontend_build_contract
 
   docs:
     name: Documentation
