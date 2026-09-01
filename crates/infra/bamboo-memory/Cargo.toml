@@ -9,9 +9,9 @@ license = "MIT"
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }
-bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
+jiandu-memory = "=0.2.0"
 serde = { workspace = true }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -20,11 +20,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
-anyhow = "1"
-regex = "1"
-rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 dashmap = "6"
 seahash = "4"
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3"

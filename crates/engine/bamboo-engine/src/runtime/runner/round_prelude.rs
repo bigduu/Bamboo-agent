@@ -41,6 +41,7 @@ const RUNTIME_PROMPT_SECTION_LAYOUT_KEY: &str = "runtime_prompt_section_layout";
 
 pub(crate) async fn refresh_round_prompt_context(
     session: &mut Session,
+    memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
@@ -49,6 +50,7 @@ pub(crate) async fn refresh_round_prompt_context(
     refresh_project_context(session, project_context_resolver).await?;
     refresh_external_memory_context(
         session,
+        memory,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
@@ -143,6 +145,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
 
     refresh_round_prompt_context(
         session,
+        &config.memory_store,
         config.prompt_memory_flags,
         runtime_context,
         config.project_context_resolver.as_deref(),
@@ -492,7 +495,8 @@ mod project_prompt_tests {
         session.add_message(Message::system("Base"));
         let system_id = session.messages[0].id.clone();
 
-        MemoryStore::new(directory.path())
+        let memory = MemoryStore::new(directory.path().join("jiandu"));
+        memory
             .write_session_topic("session-1", "default", "memory refresh marker")
             .await
             .expect("write session memory note");
@@ -513,6 +517,7 @@ mod project_prompt_tests {
         session.set_workspace_path_meta(second.to_string_lossy().to_string());
         super::refresh_round_prompt_context(
             &mut session,
+            &memory,
             crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: false,

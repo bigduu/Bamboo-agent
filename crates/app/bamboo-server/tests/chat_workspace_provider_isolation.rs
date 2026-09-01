@@ -22,9 +22,14 @@ async fn repeated_chat_materializes_request_states_own_session_fallback() {
         .expect("persist provider owner config");
     bamboo_config::paths::init_bamboo_dir(provider_owner_home.path().to_path_buf());
     let provider_owner = web::Data::new(
-        AppState::new(provider_owner_home.path().to_path_buf())
-            .await
-            .expect("provider owner state"),
+        AppState::new_with_memory_store(
+            provider_owner_home.path().to_path_buf(),
+            bamboo_memory::memory_store::MemoryStore::new(
+                provider_owner_home.path().join("jiandu"),
+            ),
+        )
+        .await
+        .expect("provider owner state"),
     );
     assert_eq!(
         provider_owner
@@ -39,9 +44,12 @@ async fn repeated_chat_materializes_request_states_own_session_fallback() {
 
     let request_home = tempfile::tempdir().expect("request state home");
     let request_state = web::Data::new(
-        AppState::new(request_home.path().to_path_buf())
-            .await
-            .expect("request state"),
+        AppState::new_with_memory_store(
+            request_home.path().to_path_buf(),
+            bamboo_memory::memory_store::MemoryStore::new(request_home.path().join("jiandu")),
+        )
+        .await
+        .expect("request state"),
     );
     assert!(
         request_state

@@ -90,6 +90,8 @@ use bamboo_skills::SkillManager;
 use bamboo_storage::LockedSessionStore;
 use bamboo_storage::SessionStoreV2;
 
+pub use bamboo_memory::memory_store::MemoryStore;
+
 // Context functions moved to bamboo-agent-runtime::context
 pub use bamboo_engine::context::{
     build_env_prompt_context, build_workspace_prompt_context, workspace_prompt_guidance,
@@ -159,6 +161,9 @@ pub use bamboo_engine::execution::runner_state::{AgentRunner, AgentStatus};
 pub struct AppState {
     /// Application data directory (configured via `BAMBOO_DATA_DIR`; default `${HOME}/.bamboo`)
     pub app_data_dir: PathBuf,
+
+    /// Independent Jiandu store shared by every memory surface in this state.
+    pub memory_store: bamboo_memory::memory_store::MemoryStore,
 
     /// Instance-local, best-effort tool-event boundary. Production publication
     /// fans into `tool_event_router`; the additional publisher preserves the

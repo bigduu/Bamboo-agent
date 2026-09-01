@@ -90,7 +90,14 @@ impl TestServer {
     async fn start(configure: impl FnOnce(&mut bamboo_config::Config)) -> Self {
         init_short_auth_deadline();
         let tmp = tempfile::tempdir().unwrap();
-        let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+        let state = web::Data::new(
+            AppState::new_with_memory_store(
+                tmp.path().to_path_buf(),
+                bamboo_memory::memory_store::MemoryStore::new(tmp.path().join("jiandu")),
+            )
+            .await
+            .unwrap(),
+        );
         {
             let mut config = state.config.write().await;
             configure(&mut config);

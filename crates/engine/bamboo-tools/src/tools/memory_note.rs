@@ -33,8 +33,7 @@ impl SessionNoteTool {
         }
     }
 
-    #[cfg(test)]
-    fn with_memory_store(memory_store: MemoryStore) -> Self {
+    pub fn with_memory_store(memory_store: MemoryStore) -> Self {
         Self { memory_store }
     }
 }

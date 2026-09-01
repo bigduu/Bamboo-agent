@@ -159,7 +159,7 @@ pub(crate) fn resolve_background_model(
 pub async fn run_gardener_once(
     ctx: &AutoDreamContext,
 ) -> Result<Option<GardenerRunResult>, String> {
-    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    let memory = ctx.memory.clone();
     run_gardener_once_with_store(ctx, &memory).await
 }
 
@@ -337,7 +337,7 @@ async fn run_gardener_once_with_store_and_resolver(
 pub async fn run_dedup_gardener_once(
     ctx: &AutoDreamContext,
 ) -> Result<Option<DedupGardenerRunResult>, String> {
-    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    let memory = ctx.memory.clone();
     run_dedup_gardener_once_with_store(ctx, &memory).await
 }
 
@@ -509,7 +509,7 @@ async fn run_dedup_gardener_once_with_store_and_resolver(
 pub async fn run_capacity_gardener_once(
     ctx: &AutoDreamContext,
 ) -> Result<Option<CapacityGardenerRunResult>, String> {
-    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    let memory = ctx.memory.clone();
     run_capacity_gardener_once_with_store(ctx, &memory).await
 }
 
@@ -560,7 +560,7 @@ async fn run_capacity_gardener_once_with_store_and_resolver(
 /// Temporal-granularity freshness gardener (issue #61 phase 2, follow-up to the
 /// L5/#263 capacity gardener above): conservatively demotes Active day/week
 /// granularity memories to Stale once they cross the documented staleness window
-/// (`bamboo_memory::memory_store::freshness::granularity_expired`). Deterministic
+/// (applied by `MemoryStore::expire_stale_granularity`). Deterministic
 /// — no LLM, no cost — and non-destructive: it only ever moves Active → Stale,
 /// never archives or deletes. Off when `granularity_freshness_gardener_enabled`
 /// is false; on by default (like the blob/dedup passes). `Ok(None)` when the
@@ -568,7 +568,7 @@ async fn run_capacity_gardener_once_with_store_and_resolver(
 pub async fn run_freshness_gardener_once(
     ctx: &AutoDreamContext,
 ) -> Result<Option<FreshnessGardenerRunResult>, String> {
-    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    let memory = ctx.memory.clone();
     run_freshness_gardener_once_with_store(ctx, &memory).await
 }
 
@@ -643,7 +643,7 @@ async fn run_gardener_passes(
     ctx: &AutoDreamContext,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
 ) {
-    let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+    let memory = ctx.memory.clone();
     if let Err(error) =
         run_gardener_once_with_store_and_resolver(ctx, &memory, project_context_resolver).await
     {
@@ -735,7 +735,7 @@ fn spawn_gardener_task_inner(
         // time interval itself.
         let poll_secs = GARDENER_VOLUME_POLL_SECS.min(interval_secs.max(1));
 
-        let memory = MemoryStore::new(ctx.session_store.bamboo_home_dir());
+        let memory = ctx.memory.clone();
         let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs));
         let mut last_run = Instant::now();
         let mut last_run_count =
@@ -877,13 +877,14 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store: session_store.clone(),
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,
         };
 
         // Seed a blob with 3 `---` accretions in the same bamboo home the gardener reads.
-        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
         let blob = memory
             .write_memory(
                 MemoryScope::Global,
@@ -906,7 +907,10 @@ mod tests {
                 .unwrap();
         }
 
-        let result = run_gardener_once(&ctx).await.unwrap().unwrap();
+        let result = run_gardener_once_with_store(&ctx, &memory)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.split, 1);
 
         let source = memory
@@ -943,11 +947,16 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store,
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,
         };
-        assert_eq!(run_gardener_once(&ctx).await.unwrap(), None);
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        assert_eq!(
+            run_gardener_once_with_store(&ctx, &memory).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -978,13 +987,14 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store: session_store.clone(),
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,
         };
 
         // Seed two near-duplicate memories in the same bamboo home the gardener reads.
-        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
         let mut ids = Vec::new();
         for (title, content) in [
             (
@@ -1014,7 +1024,10 @@ mod tests {
             ids.push(doc.frontmatter.id);
         }
 
-        let result = run_dedup_gardener_once(&ctx).await.unwrap().unwrap();
+        let result = run_dedup_gardener_once_with_store(&ctx, &memory)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.consolidated, 1);
         assert_eq!(result.superseded, 2);
 
@@ -1050,11 +1063,18 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store,
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,
         };
-        assert_eq!(run_dedup_gardener_once(&ctx).await.unwrap(), None);
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        assert_eq!(
+            run_dedup_gardener_once_with_store(&ctx, &memory)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// L5: the capacity gardener is off (Ok(None)) unless `memory_active_capacity`
@@ -1071,7 +1091,7 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
 
-        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
         for title in [
             "Global fact a",
             "Global fact b",
@@ -1101,6 +1121,7 @@ mod tests {
         let ctx_off = AutoDreamContext {
             session_store: session_store.clone(),
             storage: storage.clone(),
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider: provider.clone(),
             config: off_config,
             provider_registry: provider_registry.clone(),
@@ -1122,6 +1143,7 @@ mod tests {
         let ctx_on = AutoDreamContext {
             session_store,
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config: on_config,
             provider_registry,
@@ -1166,11 +1188,18 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store,
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,
         };
-        assert_eq!(run_freshness_gardener_once(&ctx).await.unwrap(), None);
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        assert_eq!(
+            run_freshness_gardener_once_with_store(&ctx, &memory)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// When enabled (the default), the freshness gardener scans every scope
@@ -1192,7 +1221,7 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(CannedProvider::new(vec![]));
 
-        let memory = MemoryStore::new(session_store.bamboo_home_dir());
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
         memory
             .write_memory(
                 MemoryScope::Global,
@@ -1215,6 +1244,7 @@ mod tests {
         let ctx = AutoDreamContext {
             session_store,
             storage,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
             provider,
             config,
             provider_registry,

@@ -426,8 +426,8 @@ pub struct MemoryConfig {
     pub capacity_max_archivals_per_run: usize,
     /// Whether the background freshness gardener may conservatively demote Active
     /// day/week-granularity memories to Stale once they cross their documented
-    /// staleness window (issue #61 phase 2; see
-    /// `bamboo_memory::memory_store::freshness::granularity_expired`). Default ON,
+    /// staleness window (issue #61 phase 2; applied by Jiandu's
+    /// `MemoryStore::expire_stale_granularity`). Default ON,
     /// matching the other gardener passes: deterministic (no LLM, no cost), and
     /// non-destructive — it only ever moves Active → Stale, never archives or
     /// deletes. Set false to opt out.

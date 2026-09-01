@@ -142,12 +142,14 @@ pub async fn run_ledger_gardener_once(
     ctx: &LedgerGardenerContext,
 ) -> Result<Option<LedgerGardenerRunResult>, String> {
     let ledger = LedgerStore::new(ctx.dream.session_store.bamboo_home_dir());
-    run_ledger_gardener_once_with_store(ctx, &ledger).await
+    let memory = ctx.dream.memory.clone();
+    run_ledger_gardener_once_with_stores(ctx, &ledger, &memory).await
 }
 
-async fn run_ledger_gardener_once_with_store(
+async fn run_ledger_gardener_once_with_stores(
     ctx: &LedgerGardenerContext,
     ledger: &LedgerStore,
+    memory: &MemoryStore,
 ) -> Result<Option<LedgerGardenerRunResult>, String> {
     let config_snapshot = ctx.dream.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
@@ -285,7 +287,7 @@ async fn run_ledger_gardener_once_with_store(
 
     // Pass 3: distillation (the only LLM arm; free when nothing completed).
     if memory_cfg.ledger_distillation_enabled {
-        if let Err(error) = run_distillation_pass(ctx, ledger, &scopes, &mut result).await {
+        if let Err(error) = run_distillation_pass(ctx, ledger, memory, &scopes, &mut result).await {
             result.failed += 1;
             tracing::warn!(
                 target: LEDGER_GARDENER_TRACING_TARGET,
@@ -312,6 +314,7 @@ async fn run_ledger_gardener_once_with_store(
 async fn run_distillation_pass(
     ctx: &LedgerGardenerContext,
     ledger: &LedgerStore,
+    memory: &MemoryStore,
     scopes: &[(LedgerScope, Option<String>)],
     result: &mut LedgerGardenerRunResult,
 ) -> Result<(), String> {
@@ -376,7 +379,6 @@ async fn run_distillation_pass(
     .await?;
     let candidates = parse_distilled_candidates(&raw);
 
-    let memory = MemoryStore::new(ctx.dream.session_store.bamboo_home_dir());
     for candidate in &candidates {
         let r#type = match candidate.r#type.as_deref() {
             Some("reference") => DurableMemoryType::Reference,
@@ -629,6 +631,8 @@ mod tests {
                 .unwrap(),
         );
         let ledger = LedgerStore::new(session_store.bamboo_home_dir());
+        let jiandu_root = temp.path().join("jiandu");
+        let memory = MemoryStore::new(&jiandu_root);
         let now = Utc::now();
 
         // 1) A long-past event holding a schedule: must expire + release.
@@ -665,6 +669,7 @@ mod tests {
             dream: AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: session_store.clone(),
+                memory: memory.clone(),
                 provider,
                 config,
                 provider_registry: Arc::new(ProviderRegistry::new(
@@ -675,7 +680,7 @@ mod tests {
             schedule_bridge: Some(bridge.clone()),
         };
 
-        let result = run_ledger_gardener_once_with_store(&ctx, &ledger)
+        let result = run_ledger_gardener_once_with_stores(&ctx, &ledger, &memory)
             .await
             .unwrap()
             .expect("gardener enabled by default");
@@ -715,12 +720,16 @@ mod tests {
         assert!(done.record.tags.iter().any(|tag| tag == DISTILLED_TAG));
 
         // A second run finds nothing new to do.
-        let second = run_ledger_gardener_once_with_store(&ctx, &ledger)
+        let second = run_ledger_gardener_once_with_stores(&ctx, &ledger, &memory)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(second.expired, 0);
         assert_eq!(second.distilled_records, 0);
         assert_eq!(second.memories_written, 0);
+        assert!(
+            !jiandu_root.join("ledger").exists(),
+            "Jiandu memory root must never host Bamboo Ledger data"
+        );
     }
 }

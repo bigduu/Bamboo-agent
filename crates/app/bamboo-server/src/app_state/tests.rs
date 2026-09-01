@@ -843,6 +843,52 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
 }
 
 #[tokio::test]
+async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+    let state = AppState::new(temp_dir.path().to_path_buf())
+        .await
+        .expect("app state should initialize");
+
+    state
+        .tools_for(ToolSurface::Root)
+        .execute_with_context(
+            &make_tool_call(
+                "session_note",
+                json!({
+                    "action": "replace",
+                    "content": "Shared AppState Jiandu note"
+                }),
+            ),
+            bamboo_agent_core::tools::ToolExecutionContext {
+                session_id: Some("session-note-injected-store"),
+                root_session_id: None,
+                tool_call_id: "tool-call-session-note-injected-store",
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            },
+        )
+        .await
+        .expect("session_note replace should succeed");
+
+    assert_eq!(
+        state
+            .memory_store
+            .read_session_topic("session-note-injected-store", "default")
+            .await
+            .expect("read note from AppState store")
+            .as_deref(),
+        Some("Shared AppState Jiandu note")
+    );
+}
+
+#[tokio::test]
 async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     let temp_dir = tempfile::tempdir().unwrap();
     bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
@@ -918,7 +964,10 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     assert!(inspect_json["data"]["state_files"].is_array());
     assert!(inspect_json["data"]["stale_candidate_count"].is_number());
     assert!(inspect_json["data"]["last_reindex_at"].is_string());
-    assert!(inspect_json["data"]["last_dream_at"].is_string());
+    assert!(
+        inspect_json["data"]["last_dream_at"].is_null(),
+        "a cold Jiandu scope has no Dream snapshot until one is explicitly published"
+    );
 
     let rebuild_result = state
         .tools_for(ToolSurface::Root)
@@ -952,7 +1001,10 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
     assert!(rebuild_json["data"]["state_files"].is_array());
     assert!(rebuild_json["data"]["stale_candidate_count"].is_number());
     assert!(rebuild_json["data"]["last_reindex_at"].is_string());
-    assert!(rebuild_json["data"]["last_dream_at"].is_string());
+    assert!(
+        rebuild_json["data"]["last_dream_at"].is_null(),
+        "rebuilding canonical indexes must not synthesize a Dream snapshot"
+    );
 }
 
 #[tokio::test]

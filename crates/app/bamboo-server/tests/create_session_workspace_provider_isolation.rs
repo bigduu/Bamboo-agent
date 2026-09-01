@@ -16,9 +16,14 @@ async fn create_fallback_is_isolated_from_foreign_first_registered_provider() {
     let provider_owner_home = tempfile::tempdir().expect("provider owner home");
     bamboo_config::paths::init_bamboo_dir(provider_owner_home.path().to_path_buf());
     let provider_owner = web::Data::new(
-        AppState::new(provider_owner_home.path().to_path_buf())
-            .await
-            .expect("provider owner state"),
+        AppState::new_with_memory_store(
+            provider_owner_home.path().to_path_buf(),
+            bamboo_memory::memory_store::MemoryStore::new(
+                provider_owner_home.path().join("jiandu"),
+            ),
+        )
+        .await
+        .expect("provider owner state"),
     );
     let foreign_default = tempfile::tempdir().expect("foreign default workspace");
     provider_owner.config.write().await.default_work_area =
@@ -28,9 +33,12 @@ async fn create_fallback_is_isolated_from_foreign_first_registered_provider() {
 
     let request_home = tempfile::tempdir().expect("request state home");
     let request_state = web::Data::new(
-        AppState::new(request_home.path().to_path_buf())
-            .await
-            .expect("request state"),
+        AppState::new_with_memory_store(
+            request_home.path().to_path_buf(),
+            bamboo_memory::memory_store::MemoryStore::new(request_home.path().join("jiandu")),
+        )
+        .await
+        .expect("request state"),
     );
     let request_root = bamboo_config::paths::resolve_workspace_root_in(request_home.path());
     let provider_owner_root =

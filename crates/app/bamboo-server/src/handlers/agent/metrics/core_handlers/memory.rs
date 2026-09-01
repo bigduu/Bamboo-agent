@@ -17,6 +17,7 @@ use bamboo_agent_core::PromptMemoryObservability;
 use bamboo_memory::memory_store::{
     DurableMemoryDocument, MemoryInspectResult, MemoryScope, MemoryStore,
 };
+use bamboo_projects::ProjectStore;
 use bamboo_storage::SessionStoreV2;
 
 fn merge_breakdown(target: &mut BTreeMap<String, u64>, source: &BTreeMap<String, usize>) {
@@ -184,8 +185,17 @@ fn summarize_memory_results(
     }
 }
 
+fn project_scope_contributes(result: &MemoryInspectResult) -> bool {
+    result.total_memories > 0
+        || !result.view_files.is_empty()
+        || !result.index_files.is_empty()
+        || !result.state_files.is_empty()
+        || result.last_dream_at.is_some()
+}
+
 pub(crate) async fn build_memory_summary(
     store: &MemoryStore,
+    project_store: &ProjectStore,
     session_store: &SessionStoreV2,
     storage: &dyn Storage,
     query: &MemoryMetricsQuery,
@@ -197,7 +207,6 @@ pub(crate) async fn build_memory_summary(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let project_keys = store.list_project_keys().await?;
 
     match query.scope {
         Some(MemoryScope::Session) => Err(io::Error::new(
@@ -215,15 +224,25 @@ pub(crate) async fn build_memory_summary(
             ))
         }
         Some(MemoryScope::Project) => {
+            let projects = project_store.list().map_err(io::Error::other)?;
             if let Some(project_key) = normalized_project_key {
-                let result = store
-                    .inspect_scope(MemoryScope::Project, Some(project_key.as_str()))
-                    .await?;
-                let project_count = if project_keys.iter().any(|value| value == &project_key) {
-                    1
-                } else {
-                    0
+                let Some(project) = projects
+                    .iter()
+                    .find(|project| project.id.as_str() == project_key)
+                else {
+                    return Ok(summarize_memory_results(
+                        &[],
+                        Some(MemoryScope::Project),
+                        Some(project_key),
+                        0,
+                        prompt_memory,
+                    ));
                 };
+                let project_memory = store.for_project(&project.id);
+                let result = project_memory
+                    .inspect_scope(MemoryScope::Project, Some(project.id.as_str()))
+                    .await?;
+                let project_count = u64::from(project_scope_contributes(&result));
                 Ok(summarize_memory_results(
                     &[result],
                     Some(MemoryScope::Project),
@@ -233,37 +252,42 @@ pub(crate) async fn build_memory_summary(
                 ))
             } else {
                 let mut results = Vec::new();
-                for project_key in &project_keys {
-                    results.push(
-                        store
-                            .inspect_scope(MemoryScope::Project, Some(project_key.as_str()))
-                            .await?,
-                    );
+                let mut project_count = 0_u64;
+                for project in projects {
+                    let project_memory = store.for_project(&project.id);
+                    let result = project_memory
+                        .inspect_scope(MemoryScope::Project, Some(project.id.as_str()))
+                        .await?;
+                    project_count += u64::from(project_scope_contributes(&result));
+                    results.push(result);
                 }
                 Ok(summarize_memory_results(
                     &results,
                     Some(MemoryScope::Project),
                     None,
-                    project_keys.len() as u64,
+                    project_count,
                     prompt_memory,
                 ))
             }
         }
         None => {
-            let mut results = Vec::with_capacity(project_keys.len() + 1);
+            let projects = project_store.list().map_err(io::Error::other)?;
+            let mut results = Vec::with_capacity(projects.len() + 1);
             results.push(store.inspect_scope(MemoryScope::Global, None).await?);
-            for project_key in &project_keys {
-                results.push(
-                    store
-                        .inspect_scope(MemoryScope::Project, Some(project_key.as_str()))
-                        .await?,
-                );
+            let mut project_count = 0_u64;
+            for project in projects {
+                let project_memory = store.for_project(&project.id);
+                let result = project_memory
+                    .inspect_scope(MemoryScope::Project, Some(project.id.as_str()))
+                    .await?;
+                project_count += u64::from(project_scope_contributes(&result));
+                results.push(result);
             }
             Ok(summarize_memory_results(
                 &results,
                 None,
                 None,
-                project_keys.len() as u64,
+                project_count,
                 prompt_memory,
             ))
         }
@@ -278,6 +302,7 @@ fn parse_memory_date(value: &str) -> Option<NaiveDate> {
 
 async fn collect_memory_documents(
     store: &MemoryStore,
+    project_store: &ProjectStore,
     query: &MemoryMetricsQuery,
 ) -> io::Result<Vec<DurableMemoryDocument>> {
     let normalized_project_key = query
@@ -286,8 +311,6 @@ async fn collect_memory_documents(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let project_keys = store.list_project_keys().await?;
-
     match query.scope {
         Some(MemoryScope::Session) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -295,16 +318,25 @@ async fn collect_memory_documents(
         )),
         Some(MemoryScope::Global) => store.list_memory_documents(MemoryScope::Global, None).await,
         Some(MemoryScope::Project) => {
+            let projects = project_store.list().map_err(io::Error::other)?;
             if let Some(project_key) = normalized_project_key {
+                let Some(project) = projects
+                    .iter()
+                    .find(|project| project.id.as_str() == project_key)
+                else {
+                    return Ok(Vec::new());
+                };
                 store
-                    .list_memory_documents(MemoryScope::Project, Some(project_key.as_str()))
+                    .for_project(&project.id)
+                    .list_memory_documents(MemoryScope::Project, Some(project.id.as_str()))
                     .await
             } else {
                 let mut docs = Vec::new();
-                for project_key in &project_keys {
+                for project in projects {
                     docs.extend(
                         store
-                            .list_memory_documents(MemoryScope::Project, Some(project_key.as_str()))
+                            .for_project(&project.id)
+                            .list_memory_documents(MemoryScope::Project, Some(project.id.as_str()))
                             .await?,
                     );
                 }
@@ -315,10 +347,11 @@ async fn collect_memory_documents(
             let mut docs = store
                 .list_memory_documents(MemoryScope::Global, None)
                 .await?;
-            for project_key in &project_keys {
+            for project in project_store.list().map_err(io::Error::other)? {
                 docs.extend(
                     store
-                        .list_memory_documents(MemoryScope::Project, Some(project_key.as_str()))
+                        .for_project(&project.id)
+                        .list_memory_documents(MemoryScope::Project, Some(project.id.as_str()))
                         .await?,
                 );
             }
@@ -359,9 +392,10 @@ fn period_label(start: NaiveDate, end: NaiveDate) -> String {
 
 pub(crate) async fn build_memory_timeline(
     store: &MemoryStore,
+    project_store: &ProjectStore,
     query: &MemoryMetricsQuery,
 ) -> io::Result<Vec<MemoryTimelinePoint>> {
-    let docs = collect_memory_documents(store, query).await?;
+    let docs = collect_memory_documents(store, project_store, query).await?;
     let days = normalize_days(query.days);
     let end_date = query
         .end_date
@@ -446,9 +480,9 @@ pub async fn memory_summary(
         }));
     }
 
-    let store = MemoryStore::new(state.app_data_dir.clone());
     match build_memory_summary(
-        &store,
+        &state.memory_store,
+        state.project_store.as_ref(),
         &state.session_store,
         state.storage.as_ref(),
         &query.into_inner(),
@@ -476,8 +510,13 @@ pub async fn memory_timeline(
         }));
     }
 
-    let store = MemoryStore::new(state.app_data_dir.clone());
-    match build_memory_timeline(&store, &query.into_inner()).await {
+    match build_memory_timeline(
+        &state.memory_store,
+        state.project_store.as_ref(),
+        &query.into_inner(),
+    )
+    .await
+    {
         Ok(timeline) => HttpResponse::Ok().json(timeline),
         Err(error) => internal_error(error),
     }
@@ -491,8 +530,25 @@ mod tests {
     use tempfile::tempdir;
 
     use bamboo_agent_core::storage::Storage;
+    use bamboo_domain::ProjectId;
     use bamboo_memory::memory_store::DurableMemoryType;
+    use bamboo_projects::ProjectStore;
     use bamboo_storage::SessionStoreV2;
+
+    fn create_project_store(dir: &std::path::Path) -> ProjectStore {
+        ProjectStore::open(dir.join("bamboo")).expect("project store")
+    }
+
+    fn register_project(project_store: &ProjectStore, project_id: &str) -> ProjectId {
+        project_store
+            .create_with_id(
+                ProjectId::parse(project_id).expect("project id"),
+                project_id,
+                None,
+            )
+            .expect("create project")
+            .id
+    }
 
     async fn create_session_storage(
         dir: &std::path::Path,
@@ -509,8 +565,11 @@ mod tests {
     #[tokio::test]
     async fn build_memory_summary_aggregates_global_and_project_scopes() {
         let dir = tempdir().expect("temp dir");
-        let store = MemoryStore::new(dir.path());
-        let (session_store, storage) = create_session_storage(dir.path()).await;
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let project_id = register_project(&project_store, "proj-1");
+        let project_memory = store.for_project(&project_id);
+        let (session_store, storage) = create_session_storage(&dir.path().join("sessions")).await;
 
         store
             .write_memory(
@@ -527,10 +586,10 @@ mod tests {
             )
             .await
             .expect("write global memory");
-        store
+        project_memory
             .write_memory(
                 MemoryScope::Project,
-                Some("proj-1"),
+                Some(project_id.as_str()),
                 DurableMemoryType::Project,
                 "Project note",
                 "Project memory content",
@@ -542,13 +601,14 @@ mod tests {
             )
             .await
             .expect("write project memory");
-        store
-            .rebuild_scope(MemoryScope::Project, Some("proj-1"))
+        project_memory
+            .rebuild_scope(MemoryScope::Project, Some(project_id.as_str()))
             .await
             .expect("rebuild scope");
 
         let summary = build_memory_summary(
             &store,
+            &project_store,
             &session_store,
             storage.as_ref(),
             &MemoryMetricsQuery {
@@ -572,16 +632,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_memory_summary_aggregates_all_projects_for_project_scope() {
+    async fn build_memory_summary_uses_only_registered_contributing_projects() {
         let dir = tempdir().expect("temp dir");
-        let store = MemoryStore::new(dir.path());
-        let (session_store, storage) = create_session_storage(dir.path()).await;
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let (session_store, storage) = create_session_storage(&dir.path().join("sessions")).await;
 
         for project_key in ["proj-a", "proj-b"] {
+            let project_id = register_project(&project_store, project_key);
             store
+                .for_project(&project_id)
                 .write_memory(
                     MemoryScope::Project,
-                    Some(project_key),
+                    Some(project_id.as_str()),
                     DurableMemoryType::Project,
                     &format!("Note for {project_key}"),
                     "Project-specific memory",
@@ -594,9 +657,29 @@ mod tests {
                 .await
                 .expect("write project memory");
         }
+        register_project(&project_store, "proj-empty");
+
+        let unregistered_id = ProjectId::parse("proj-unregistered").expect("project id");
+        store
+            .for_project(&unregistered_id)
+            .write_memory(
+                MemoryScope::Project,
+                Some(unregistered_id.as_str()),
+                DurableMemoryType::Project,
+                "Unregistered note",
+                "Must not be discovered by metrics",
+                &[],
+                Some("session-1"),
+                "tester",
+                false,
+                None,
+            )
+            .await
+            .expect("write unregistered project memory");
 
         let summary = build_memory_summary(
             &store,
+            &project_store,
             &session_store,
             storage.as_ref(),
             &MemoryMetricsQuery {
@@ -619,11 +702,13 @@ mod tests {
     #[tokio::test]
     async fn build_memory_summary_rejects_session_scope() {
         let dir = tempdir().expect("temp dir");
-        let store = MemoryStore::new(dir.path());
-        let (session_store, storage) = create_session_storage(dir.path()).await;
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let (session_store, storage) = create_session_storage(&dir.path().join("sessions")).await;
 
         let error = build_memory_summary(
             &store,
+            &project_store,
             &session_store,
             storage.as_ref(),
             &MemoryMetricsQuery {
@@ -644,13 +729,16 @@ mod tests {
     #[tokio::test]
     async fn build_memory_summary_includes_prompt_memory_observability_aggregates() {
         let dir = tempdir().expect("temp dir");
-        let store = MemoryStore::new(dir.path());
-        let (session_store, storage) = create_session_storage(dir.path()).await;
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let project_id = register_project(&project_store, "proj-1");
+        let (session_store, storage) = create_session_storage(&dir.path().join("sessions")).await;
 
         store
+            .for_project(&project_id)
             .write_memory(
                 MemoryScope::Project,
-                Some("proj-1"),
+                Some(project_id.as_str()),
                 DurableMemoryType::Project,
                 "Project note",
                 "Project memory content",
@@ -733,6 +821,7 @@ mod tests {
 
         let summary = build_memory_summary(
             &store,
+            &project_store,
             &session_store,
             storage.as_ref(),
             &MemoryMetricsQuery {
@@ -797,7 +886,9 @@ mod tests {
     #[tokio::test]
     async fn build_memory_timeline_tracks_created_and_running_total() {
         let dir = tempdir().expect("temp dir");
-        let store = MemoryStore::new(dir.path());
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let project_id = register_project(&project_store, "proj-1");
 
         let first = store
             .write_memory(
@@ -815,9 +906,10 @@ mod tests {
             .await
             .expect("write first memory");
         let second = store
+            .for_project(&project_id)
             .write_memory(
                 MemoryScope::Project,
-                Some("proj-1"),
+                Some(project_id.as_str()),
                 DurableMemoryType::Project,
                 "Later note",
                 "Created later",
@@ -857,6 +949,7 @@ mod tests {
 
         let timeline = build_memory_timeline(
             &store,
+            &project_store,
             &MemoryMetricsQuery {
                 scope: None,
                 project_key: None,
@@ -876,6 +969,78 @@ mod tests {
         assert_eq!(timeline[1].created_memories, 1);
         assert_eq!(timeline[1].updated_memories, 1);
         assert_eq!(timeline[1].total_memories, 2);
+    }
+
+    #[tokio::test]
+    async fn collect_memory_documents_does_not_scan_unregistered_projects() {
+        let dir = tempdir().expect("temp dir");
+        let store = MemoryStore::new(dir.path().join("jiandu"));
+        let project_store = create_project_store(dir.path());
+        let unregistered_id = ProjectId::parse("proj-unregistered").expect("project id");
+        store
+            .for_project(&unregistered_id)
+            .write_memory(
+                MemoryScope::Project,
+                Some(unregistered_id.as_str()),
+                DurableMemoryType::Project,
+                "Unregistered note",
+                "Must not be discovered by the timeline",
+                &[],
+                Some("session-1"),
+                "tester",
+                false,
+                None,
+            )
+            .await
+            .expect("write unregistered project memory");
+
+        let docs = collect_memory_documents(
+            &store,
+            &project_store,
+            &MemoryMetricsQuery {
+                scope: Some(MemoryScope::Project),
+                project_key: None,
+                days: None,
+                end_date: None,
+                granularity: None,
+            },
+        )
+        .await
+        .expect("collect registered project documents");
+
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn project_scope_contribution_requires_durable_data_artifacts_or_dream() {
+        let empty = MemoryInspectResult {
+            scope: MemoryScope::Project,
+            project_key: Some("proj-empty".to_string()),
+            total_memories: 0,
+            by_type: BTreeMap::new(),
+            by_status: BTreeMap::new(),
+            recent_ids: vec![],
+            view_files: vec![],
+            index_files: vec![],
+            state_files: vec![],
+            stale_candidate_count: 0,
+            last_reindex_at: None,
+            last_dream_at: None,
+            topic_paths: vec![],
+        };
+        assert!(!project_scope_contributes(&empty));
+
+        let dream_only = MemoryInspectResult {
+            last_dream_at: Some("2026-09-01T00:00:00Z".to_string()),
+            ..empty.clone()
+        };
+        assert!(project_scope_contributes(&dream_only));
+
+        let artifact_only = MemoryInspectResult {
+            view_files: vec!["MEMORY.md".to_string()],
+            ..empty
+        };
+        assert!(project_scope_contributes(&artifact_only));
     }
 
     #[test]

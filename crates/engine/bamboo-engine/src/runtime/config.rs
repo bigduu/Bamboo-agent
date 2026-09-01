@@ -451,6 +451,9 @@ pub struct AgentLoopConfig {
     /// Used by runtime features that persist auxiliary artifacts outside the
     /// session store, such as durable plan mode files under `~/.bamboo/plan`.
     pub(crate) app_data_dir: Option<PathBuf>,
+    /// Jiandu memory handle for this run. The default is the independent
+    /// `~/.jiandu` store; explicit construction is used by isolated tests.
+    pub(crate) memory_store: bamboo_memory::memory_store::MemoryStore,
     /// Tool names that should be excluded from schemas sent to the LLM.
     pub(crate) disabled_tools: BTreeSet<String>,
     /// Token budget for context management (optional, defaults to model's limits)
@@ -583,6 +586,7 @@ impl Default for AgentLoopConfig {
             provider_type: None,
             reasoning_effort: None,
             app_data_dir: None,
+            memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             disabled_tools: BTreeSet::new(),
             token_budget: None,
             legacy_model_limits: None,

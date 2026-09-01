@@ -42,6 +42,7 @@ pub(super) fn build_base_tools(
     account_sink: Arc<bamboo_engine::events::AccountEventSink>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
+    memory_store: bamboo_memory::memory_store::MemoryStore,
 ) -> Arc<dyn ToolExecutor> {
     // Initialize built-in tools with permission checks.
     // If no permission config has been persisted yet, keep checks disabled for backward
@@ -64,6 +65,16 @@ pub(super) fn build_base_tools(
     let base: Arc<dyn ToolExecutor> = Arc::new(bamboo_mcp::executor::CompositeToolExecutor::new(
         builtin_tools,
         mcp_tools,
+    ));
+
+    // Replace the built-in default-root session_note instance so note writes
+    // and next-round prompt reads share this AppState's one concrete store.
+    let session_note_tool = Arc::new(bamboo_tools::tools::SessionNoteTool::with_memory_store(
+        memory_store.clone(),
+    ));
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        base,
+        session_note_tool,
     ));
 
     // Replace the framework Workspace tool with the Project-aware server
@@ -91,9 +102,9 @@ pub(super) fn build_base_tools(
         project_tool,
     ));
 
-    let memory_tool = Arc::new(crate::tools::MemoryTool::new(
+    let memory_tool = Arc::new(crate::tools::MemoryTool::with_store(
         session_repo.clone(),
-        app_data_dir.clone(),
+        memory_store,
     ));
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,

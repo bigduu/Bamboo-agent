@@ -13,7 +13,7 @@ use bamboo_plugin_protocol::{
     FileChangedV1, ProjectedToolEventV1, ToolEventContextV1, ToolEventPublisher, ToolEventV1,
     TOOL_EVENT_PATH_REDACTION_PERMISSION_NOT_GRANTED, TOOL_EVENT_PATH_REDACTION_SENSITIVE,
 };
-use bamboo_server::app_state::AppState;
+use bamboo_server::app_state::{AppState, MemoryStore};
 use bamboo_server::plugin_installer::ServerPluginInstaller;
 use bamboo_server::plugin_source::{
     install_server_plugin_from_source_with_event_sink_grants, PluginSourceInput,
@@ -27,6 +27,12 @@ const PLUGIN_ID: &str = "tool-event-recorder";
 const SERVICE_ID: &str = "tool-event-recorder-service";
 const SINK_ID: &str = "tool-event-recorder-events";
 const WAIT: Duration = Duration::from_secs(15);
+
+async fn test_app_state(data_dir: PathBuf) -> AppState {
+    AppState::new_with_memory_store(data_dir.clone(), MemoryStore::new(data_dir.join("jiandu")))
+        .await
+        .expect("test AppState should initialize")
+}
 
 struct RecorderFiles {
     output: PathBuf,
@@ -318,7 +324,7 @@ async fn native_recorder_lifecycle_is_bounded_and_generation_safe() {
     let files = RecorderFiles::under(fixture.path());
     write_recorder_config(&data_dir, &files, 0, true).await;
 
-    let state = web::Data::new(AppState::new(data_dir.clone()).await.unwrap());
+    let state = web::Data::new(test_app_state(data_dir.clone()).await);
     state.wait_for_boot_reconcile_services().await;
     let installer = ServerPluginInstaller::new(state.clone());
     let plugins_root = data_dir.join("plugins");
@@ -539,7 +545,7 @@ async fn boot_reconcile_restarts_the_installed_native_recorder() {
     write_recorder_config(&data_dir, &files, 0, false).await;
     let mutation_dir = mutation_root();
 
-    let first = web::Data::new(AppState::new(data_dir.clone()).await.unwrap());
+    let first = web::Data::new(test_app_state(data_dir.clone()).await);
     first.wait_for_boot_reconcile_services().await;
     let first_installer = ServerPluginInstaller::new(first.clone());
     let plugins_root = data_dir.join("plugins");
@@ -575,7 +581,7 @@ async fn boot_reconcile_restarts_the_installed_native_recorder() {
     drop(first_installer);
     drop(first);
 
-    let second = web::Data::new(AppState::new(data_dir.clone()).await.unwrap());
+    let second = web::Data::new(test_app_state(data_dir.clone()).await);
     second.wait_for_boot_reconcile_services().await;
     let reconciled = wait_for_live_sink(second.get_ref(), None).await;
     assert_eq!(reconciled.state, ToolEventSinkState::Live);

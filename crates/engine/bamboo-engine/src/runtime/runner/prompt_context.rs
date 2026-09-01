@@ -16,6 +16,7 @@ pub(crate) use external_memory::EXTERNAL_MEMORY_RENDERED_KEY;
 
 pub(crate) async fn refresh_external_memory_context(
     session: &mut bamboo_agent_core::Session,
+    memory: &bamboo_memory::memory_store::MemoryStore,
     prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
@@ -23,6 +24,7 @@ pub(crate) async fn refresh_external_memory_context(
 ) {
     external_memory::refresh_external_memory_context(
         session,
+        memory,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
@@ -41,6 +43,24 @@ pub(super) async fn refresh_external_memory_context_with_store(
     external_memory::refresh_external_memory_context_with_store(
         session,
         memory,
+        prompt_memory_flags,
+        runtime_context,
+    )
+    .await;
+}
+
+#[cfg(test)]
+pub(super) async fn refresh_external_memory_context_with_stores(
+    session: &mut bamboo_agent_core::Session,
+    memory: &bamboo_memory::memory_store::MemoryStore,
+    ledger_data_dir: &std::path::Path,
+    prompt_memory_flags: crate::runtime::config::PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) {
+    external_memory::refresh_external_memory_context_with_stores(
+        session,
+        memory,
+        ledger_data_dir,
         prompt_memory_flags,
         runtime_context,
     )
