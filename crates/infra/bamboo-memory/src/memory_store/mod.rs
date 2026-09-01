@@ -7,14 +7,17 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub use jiandu_memory::memory_store::{
-    count_chars, normalize_tags, render_memory_freshness_note, summary_json, truncate_chars,
-    BlobScanItem, BlobScanReport, DreamReadResult, DreamSnapshot, DuplicateCluster,
-    DuplicateScanReport, DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType,
-    FreshnessKind, MemoryConsolidateResult, MemoryContradictionResult, MemoryDuplicateCandidate,
-    MemoryMergeResult, MemoryPurgeResult, MemoryQueryOptions, MemoryQueryResult,
-    MemoryRecallCandidate, MemoryRecallOptions, MemoryScope, MemorySplitPiece, MemorySplitResult,
-    SessionState, TemporalGranularity, DEFAULT_SESSION_TOPIC, MAX_MAX_CHARS, MAX_MEMORY_TITLE_LEN,
-    MAX_QUERY_LIMIT,
+    count_chars, normalize_retrieval_terms, normalize_tags, render_memory_freshness_note,
+    summary_json, truncate_chars, BlobScanItem, BlobScanReport, DreamReadResult, DreamSnapshot,
+    DuplicateCluster, DuplicateScanReport, DurableMemoryDocument, DurableMemoryStatus,
+    DurableMemoryType, FreshnessKind, MemoryConsolidateResult, MemoryContradictionResult,
+    MemoryDuplicateCandidate, MemoryMergeResult, MemoryPurgeResult, MemoryQueryOptions,
+    MemoryQueryResult, MemoryRecallCandidate, MemoryRecallOptions, MemoryRetrievalInput,
+    MemoryScope, MemorySplitPiece, MemorySplitResult, SessionState, TemporalGranularity,
+    DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC, MAX_EXPLICIT_MEMORY_ENTITIES,
+    MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN,
+    MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS,
+    MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
 };
 
 /// Jiandu's inspection result plus Bamboo's flattened Dream timestamp.
@@ -234,6 +237,38 @@ impl MemoryStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_memory_with_retrieval(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: DurableMemoryType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
+    ) -> io::Result<DurableMemoryDocument> {
+        self.store
+            .write_memory_with_retrieval(
+                scope,
+                project_key,
+                r#type,
+                title,
+                content,
+                tags,
+                retrieval,
+                session_id,
+                actor,
+                allow_merge_if_similar,
+                granularity,
+            )
+            .await
+    }
+
     pub async fn archive_memory(
         &self,
         id: &str,
@@ -259,6 +294,27 @@ impl MemoryStore {
             .await
     }
 
+    pub async fn split_memory_with_retrieval(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        pieces: &[MemorySplitPiece],
+        retrieval: &[MemoryRetrievalInput],
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemorySplitResult>> {
+        self.store
+            .split_memory_with_retrieval(
+                id,
+                preferred_project_key,
+                pieces,
+                retrieval,
+                session_id,
+                actor,
+            )
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn find_duplicate_candidates(
         &self,
@@ -272,6 +328,32 @@ impl MemoryStore {
     ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
         self.store
             .find_duplicate_candidates(scope, project_key, r#type, title, content, tags, limit)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_duplicate_candidates_with_retrieval(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: Option<DurableMemoryType>,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        limit: usize,
+    ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
+        self.store
+            .find_duplicate_candidates_with_retrieval(
+                scope,
+                project_key,
+                r#type,
+                title,
+                content,
+                tags,
+                retrieval,
+                limit,
+            )
             .await
     }
 
@@ -316,6 +398,27 @@ impl MemoryStore {
     ) -> io::Result<Option<MemoryConsolidateResult>> {
         self.store
             .consolidate_memories(ids, preferred_project_key, merged, session_id, actor)
+            .await
+    }
+
+    pub async fn consolidate_memories_with_retrieval(
+        &self,
+        ids: &[String],
+        preferred_project_key: Option<&str>,
+        merged: &MemorySplitPiece,
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemoryConsolidateResult>> {
+        self.store
+            .consolidate_memories_with_retrieval(
+                ids,
+                preferred_project_key,
+                merged,
+                retrieval,
+                session_id,
+                actor,
+            )
             .await
     }
 
@@ -382,6 +485,32 @@ impl MemoryStore {
                 preferred_project_key,
                 content,
                 tags,
+                session_id,
+                actor,
+                source_memory_ids,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_memory_with_retrieval(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        content: &str,
+        tags: &[String],
+        retrieval: &MemoryRetrievalInput,
+        session_id: Option<&str>,
+        actor: &str,
+        source_memory_ids: &[String],
+    ) -> io::Result<Option<MemoryMergeResult>> {
+        self.store
+            .merge_memory_with_retrieval(
+                id,
+                preferred_project_key,
+                content,
+                tags,
+                retrieval,
                 session_id,
                 actor,
                 source_memory_ids,

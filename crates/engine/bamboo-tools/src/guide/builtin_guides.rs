@@ -385,8 +385,8 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory" => Some(guide(
             "memory",
             ToolCategory::TaskManagement,
-            "Manage Bamboo's unified memory system. Use session_* actions only for current-session continuity notes, and use query/get/write/merge/split/consolidate/purge/inspect/rebuild for durable project or global memories backed by canonical topic files. Proactively query before answering when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — recall first instead of replying that you don't know.",
-            "Do not use session actions for long-term project knowledge, and do not dump large bodies through query when query -> get(id) or inspect is more appropriate. Prefer query first, then get the specific durable item you need before writing or merging. One memory = one atomic fact: do not bundle unrelated facts into a single memory. Only merge/append content that is the SAME fact as the target — if it's a different topic, write a new memory instead of appending.",
+            "Use Session memory for current-session continuity, Project memory for durable project facts and decisions, and Global memory for cross-project user context. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing; store one confirmed atomic fact with a few useful keywords, entities, and tags.",
+            "Do not store secrets, unverified claims, live state that you can inspect directly, embeddings, or unrelated facts in one memory. Treat canonical Project memory as trusted durable project authority but verify live state before acting; treat Dream as a low-trust derived orientation snapshot. Do not increase the query limit or get every hit by default, and merge or consolidate only the same confirmed fact.",
             &["session_note", "session_history", "Task"],
             vec![
                 example(
@@ -396,47 +396,47 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 ),
                 example(
                     "Shortlist durable memories before reading full content",
-                    json!({"action":"query","scope":"project","query":"release freeze mobile","options":{"limit":5,"max_chars":3000}}),
-                    "Prefer query first so the model gets a shortlist summary under budget; call get(id) only for the durable item that needs full context.",
+                    json!({"action":"query","scope":"project","query":"mobile release freeze"}),
+                    "Use Jiandu's compact default top three ID/summary results, then select only the item that needs full context.",
                 ),
                 example(
-                    "Read one durable memory in full after query",
+                    "Get the selected durable memory",
                     json!({"action":"get","id":"mem_20260403_001","options":{"max_chars":5000}}),
-                    "Use after query when you need the full body/frontmatter of a single durable memory item.",
+                    "Use after query for the one selected ID whose full body or frontmatter is needed.",
                 ),
                 example(
                     "Recall before answering about the user's own context",
-                    json!({"action":"query","scope":"global","query":"preferred testing framework","options":{"limit":5}}),
+                    json!({"action":"query","scope":"global","query":"preferred testing framework"}),
                     "When the user refers to their own preferences, opinions, or past decisions you don't already know — especially first-person questions ('what do I...', 'did I...', '我...?') — query memory BEFORE answering; do not say you don't know without checking.",
                 ),
                 example(
                     "Recall a past project decision before acting",
-                    json!({"action":"query","scope":"project","query":"why we chose HTTP over Tauri IPC","options":{"limit":5}}),
-                    "When continuing prior work, query project memory for past decisions and constraints before re-deciding or claiming none exist.",
+                    json!({"action":"query","scope":"project","query":"HTTP Tauri IPC decision"}),
+                    "Treat a matching canonical Project memory as trusted durable project authority, then verify any live implementation state before acting.",
                 ),
                 example(
-                    "Check for an existing duplicate before writing",
-                    json!({"action":"find_duplicates","scope":"project","type":"project","title":"Release freeze begins next week","content":"Mobile release freeze begins Tuesday."}),
-                    "Before write, check whether the same fact already exists; if a high-scoring candidate is the same fact, merge into it instead of creating a near-duplicate.",
+                    "Query before writing a durable fact",
+                    json!({"action":"query","scope":"project","query":"mobile release freeze Tuesday"}),
+                    "Check whether the same fact already exists before write; merge only when the selected existing item is the same confirmed fact.",
                 ),
                 example(
                     "Write a durable project memory",
-                    json!({"action":"write","scope":"project","type":"project","title":"Release freeze begins next week","content":"Merge freeze begins on Tuesday for the mobile release cut.","tags":["release","freeze"]}),
-                    "Use when the fact should persist across sessions as canonical project memory. Give it a specific title that summarizes this fact — recall is keyword-based, so a vague or mismatched title makes it unfindable.",
+                    json!({"action":"write","scope":"project","type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["mobile","release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
+                    "Write one confirmed atomic fact with a specific title and only a few lexical retrieval hints.",
                 ),
                 example(
                     "Merge follow-up details into an existing durable memory",
-                    json!({"action":"merge","id":"mem_20260403_001","content":"Additional confirmation from a later session.","tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
+                    json!({"action":"merge","id":"mem_20260403_001","content":"The release manager confirmed the Tuesday freeze.","keywords":["release freeze","Tuesday"],"entities":["release manager"],"tags":["confirmed"],"source_memory_ids":["mem_20260403_002"]}),
                     "Use ONLY when the new evidence is the same fact as the target memory and older overlapping items should be superseded. Do not merge unrelated facts together — create a separate memory instead.",
                 ),
                 example(
                     "Split a multi-topic memory into atomic memories",
-                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm and strict TypeScript.","tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","tags":["release"]}]}),
+                    json!({"action":"split","id":"mem_20260403_001","pieces":[{"title":"User prefers pnpm","type":"user","content":"User prefers pnpm.","keywords":["pnpm","package manager"],"entities":["pnpm"],"tags":["preference"]},{"title":"Mobile release freeze is Tuesday","type":"project","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}]}),
                     "Use when one memory has accreted several unrelated facts (a 'blob'): split archives the original and creates one atomic memory per fact, preserving lineage via supersedes.",
                 ),
                 example(
                     "Consolidate near-duplicate memories into one",
-                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday for the release cut.","tags":["release","freeze"]}),
+                    json!({"action":"consolidate","ids":["mem_20260403_001","mem_20260403_007"],"type":"project","title":"Mobile release freeze is Tuesday","content":"Mobile release freeze begins Tuesday.","keywords":["release freeze","Tuesday"],"entities":["Mobile"],"tags":["release"]}),
                     "Use ONLY when two or more memories are the SAME fact: consolidate archives them all and creates one canonical atomic memory, preserving lineage via supersedes. Confirm sameness (e.g. via scan_duplicates / find_duplicates) before consolidating — never merge distinct facts.",
                 ),
             ],
@@ -742,6 +742,55 @@ mod tests {
                 .and_then(|value| value.as_str())
                 == Some("merge")
         }));
+    }
+
+    #[test]
+    fn memory_guide_teaches_compact_recall_and_small_lexical_hints() {
+        let guide = builtin_guide_spec("memory").expect("memory guide should exist");
+        let examples_for = |action: &str| {
+            guide
+                .examples
+                .iter()
+                .filter(|example| {
+                    example
+                        .parameters
+                        .get("action")
+                        .and_then(|value| value.as_str())
+                        == Some(action)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let queries = examples_for("query");
+        assert!(!queries.is_empty());
+        assert!(queries
+            .iter()
+            .all(|example| example.parameters.pointer("/options/limit").is_none()));
+        assert_eq!(examples_for("get").len(), 1);
+
+        for action in ["write", "merge", "consolidate"] {
+            let examples = examples_for(action);
+            assert_eq!(examples.len(), 1, "missing {action} example");
+            for field in ["keywords", "entities", "tags"] {
+                let hints = examples[0].parameters[field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{action} example is missing {field}"));
+                assert!(!hints.is_empty() && hints.len() <= 3);
+            }
+        }
+
+        let split = examples_for("split");
+        let pieces = split[0].parameters["pieces"]
+            .as_array()
+            .expect("split example should contain pieces");
+        for piece in pieces {
+            for field in ["keywords", "entities", "tags"] {
+                let hints = piece[field]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("split piece is missing {field}"));
+                assert!(!hints.is_empty() && hints.len() <= 3);
+            }
+        }
     }
 
     #[test]

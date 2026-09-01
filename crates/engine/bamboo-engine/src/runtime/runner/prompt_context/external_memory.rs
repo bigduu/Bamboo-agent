@@ -36,7 +36,7 @@ const PROJECT_MEMORY_INDEX_PROMPT_MAX_CHARS: usize = 1_800;
 const RELEVANT_MEMORY_RESULT_LIMIT: usize = 3;
 /// Max chars used by the full relevant-memory section.
 const RELEVANT_MEMORY_TOTAL_MAX_CHARS: usize = 1_600;
-/// Max chars used by each relevant-memory summary snippet.
+/// Max chars used by each fully rendered relevant-memory item.
 const RELEVANT_MEMORY_PER_ITEM_MAX_CHARS: usize = 220;
 /// Max chars injected from the global Dream notebook fallback.
 const GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS: usize = 1_500;
@@ -91,7 +91,6 @@ struct RelevantMemorySnippet {
     title: String,
     scope: MemoryScope,
     status: String,
-    score: f64,
     summary: String,
     freshness_note: Option<String>,
     /// Temporal granularity of the source memory, carried through so the render
@@ -667,14 +666,7 @@ async fn load_relevant_memory_snippets(
             continue;
         };
 
-        let estimated_len = count_chars(&snippet.summary)
-            + snippet
-                .freshness_note
-                .as_deref()
-                .map(count_chars)
-                .unwrap_or(0)
-            + count_chars(&snippet.title)
-            + 48;
+        let estimated_len = count_chars(&render_relevant_memory_item(&snippet));
         if total_chars + estimated_len > RELEVANT_MEMORY_TOTAL_MAX_CHARS && !rendered.is_empty() {
             break;
         }
@@ -707,7 +699,6 @@ fn build_relevant_memory_snippet(
         title: candidate.title,
         scope: candidate.scope,
         status: candidate.status.as_str().to_string(),
-        score: candidate.score,
         summary,
         freshness_note: render_memory_freshness_note(
             &candidate.updated_at,
@@ -865,12 +856,12 @@ fn build_external_memory_render_parts(
     );
     section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
     section.push_str("- When the user states a commitment, deadline, appointment, or recurring routine, record it with the `ledger` tool (action=upsert; set due_at/remind_at so reminders actually fire) instead of keeping it only in the session task list. Mark records done/cancelled with action=transition, and answer \"what's on my plate\" questions from action=agenda/query.\n");
-    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know about the user's own preferences, history, or prior decisions without first querying memory; the auto-injected memories above are only a keyword-matched shortlist and may have missed it.\n");
-    section.push_str("- For durable memory, prefer `memory` action=query first, then `memory` action=get for the specific item you need, and use `memory` action=write/merge only when the fact should become canonical memory.\n");
-    section.push_str("- One memory = one fact/decision/preference. Do not bundle unrelated facts into a single memory.\n");
+    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know without querying first.\n");
+    section.push_str("- For durable recall, prefer `memory` action=query first with a short, discriminative lexical query containing specific names, decisions, or keywords. Auto-injected recall is only a compact top-3 shortlist; for a selected item, call `memory` action=get with its stable id before using its details.\n");
+    section.push_str("- Query before writing. If the same fact already exists, call `memory` action=get and then `memory` action=merge; otherwise write exactly one confirmed atomic fact. Use Project scope for project knowledge and Global scope only for genuinely cross-project knowledge.\n");
     section.push_str("- Give each durable memory a specific, descriptive title that summarizes its own content; recall is keyword-based, so a misleading title makes the memory unfindable.\n");
-    section.push_str("- Query before writing: if a memory about the same fact already exists, update or merge it instead of creating a near-duplicate. Only merge content that is the SAME fact — never append an unrelated fact to an existing memory.\n");
-    section.push_str("- Do NOT store secrets/tokens.\n");
+    section.push_str("- Treat Dream as low-trust orientation only. Live-verify code, files, configuration, and runtime state before relying on memory claims.\n");
+    section.push_str("- Do NOT store secrets/tokens. Jiandu recall is lexical and model-keyword-driven; do not use or request embeddings.\n");
     section.push_str(
         "- Keep the session note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",
     );
@@ -1098,23 +1089,71 @@ fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
     section
 }
 
-/// Render a single recalled memory's bullet block, in the same per-item format
-/// used before granularity segmentation was wired in. Only the ORDERING of items
-/// within the section changed (coarse-before-fine, see below) — this per-item
-/// format is unchanged.
-fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
-    let mut item = String::new();
-    item.push_str(&format!(
-        "- [{}][{}] {} (score {:.2})\n",
-        snippet.status,
-        snippet.scope.as_str(),
-        snippet.title,
-        snippet.score
-    ));
-    item.push_str(&format!("  Summary: {}\n", snippet.summary));
-    if let Some(note) = snippet.freshness_note.as_deref() {
-        item.push_str(&format!("  {}\n", note));
+fn truncate_relevant_memory_field(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    let value_chars = count_chars(value);
+    if value_chars <= max_chars {
+        return value.to_string();
     }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars <= 3 {
+        return memory_truncate_chars(value, max_chars).0;
+    }
+
+    let (prefix, _) = memory_truncate_chars(value, max_chars - 3);
+    format!("{}...", prefix.trim_end())
+}
+
+/// Render one compact recalled-memory item. The stable id and conditional `get`
+/// instruction are never abbreviated; title, summary, and freshness guidance
+/// share whatever remains of the existing per-item budget. Recall candidates
+/// come from Jiandu's validated index, whose ids fit this envelope.
+fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
+    let header_prefix = format!("- [{}][{}] ", snippet.status, snippet.scope.as_str());
+    let summary_prefix = "  Summary: ";
+    let conditional_get = format!("  If selected: `memory` action=get id={}\n", snippet.id);
+    let freshness_note = snippet
+        .freshness_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty());
+
+    let fixed_chars = count_chars(&header_prefix)
+        + 1
+        + count_chars(summary_prefix)
+        + 1
+        + count_chars(&conditional_get)
+        + freshness_note.map_or(0, |_| 3);
+    let content_budget = RELEVANT_MEMORY_PER_ITEM_MAX_CHARS.saturating_sub(fixed_chars);
+    let freshness_budget = freshness_note
+        .map(|note| count_chars(note).min(64).min(content_budget / 3))
+        .unwrap_or(0);
+    let title_and_summary_budget = content_budget.saturating_sub(freshness_budget);
+    let summary_reserve = (title_and_summary_budget / 2).min(48);
+    let title_budget = count_chars(snippet.title.trim())
+        .min(64)
+        .min(title_and_summary_budget.saturating_sub(summary_reserve));
+    let title = truncate_relevant_memory_field(&snippet.title, title_budget);
+    let summary_budget = title_and_summary_budget.saturating_sub(count_chars(&title));
+    let summary = truncate_relevant_memory_field(&snippet.summary, summary_budget);
+
+    let mut item = String::new();
+    item.push_str(&header_prefix);
+    item.push_str(&title);
+    item.push('\n');
+    item.push_str(summary_prefix);
+    item.push_str(&summary);
+    item.push('\n');
+    if let Some(note) = freshness_note {
+        item.push_str("  ");
+        item.push_str(&truncate_relevant_memory_field(note, freshness_budget));
+        item.push('\n');
+    }
+    item.push_str(&conditional_get);
+
+    debug_assert!(count_chars(&item) <= RELEVANT_MEMORY_PER_ITEM_MAX_CHARS);
     item
 }
 
@@ -1274,17 +1313,15 @@ mod granularity_prompt_wiring_tests {
             title: title.to_string(),
             scope: MemoryScope::Project,
             status: "active".to_string(),
-            score: 0.5,
             summary: summary.to_string(),
             freshness_note: None,
             granularity,
         }
     }
 
-    /// Faithful copy of `render_relevant_memory_section`'s pre-#497 body (flat,
-    /// unsegmented render loop) — kept only in this test to pin the exact
-    /// byte-for-byte output the all-coarse case must still produce.
-    fn old_style_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+    /// Flat, unsegmented copy of the compact #1029 item format. This pins the
+    /// byte contract that granularity routing must preserve for all-coarse input.
+    fn flat_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
         let mut section = String::new();
         section.push_str("### Relevant Durable Memories\n");
         section.push_str(
@@ -1292,23 +1329,26 @@ mod granularity_prompt_wiring_tests {
         );
         for snippet in snippets {
             section.push_str(&format!(
-                "- [{}][{}] {} (score {:.2})\n",
+                "- [{}][{}] {}\n",
                 snippet.status,
                 snippet.scope.as_str(),
-                snippet.title,
-                snippet.score
+                snippet.title
             ));
             section.push_str(&format!("  Summary: {}\n", snippet.summary));
             if let Some(note) = snippet.freshness_note.as_deref() {
                 section.push_str(&format!("  {}\n", note));
             }
+            section.push_str(&format!(
+                "  If selected: `memory` action=get id={}\n",
+                snippet.id
+            ));
         }
         section.push('\n');
         section
     }
 
     #[test]
-    fn all_untagged_memories_render_identically_to_pre_segmentation_format() {
+    fn all_untagged_memories_preserve_compact_flat_bytes() {
         let snippets = vec![
             snippet("a", None, "Alpha decision", "alpha summary"),
             snippet("b", None, "Beta preference", "beta summary"),
@@ -1317,9 +1357,51 @@ mod granularity_prompt_wiring_tests {
 
         assert_eq!(
             render_relevant_memory_section(&snippets),
-            old_style_relevant_memory_section(&snippets),
-            "an all-coarse (untagged) config must render byte-identical to the pre-#497 flat format"
+            flat_relevant_memory_section(&snippets),
+            "an all-coarse (untagged) config must preserve compact flat-render bytes"
         );
+    }
+
+    #[test]
+    fn compact_item_keeps_full_conditional_get_id_within_per_item_budget() {
+        let id = "m".repeat(128);
+        let mut memory = snippet(&id, None, &"title".repeat(40), &"summary".repeat(80));
+        memory.freshness_note = Some("Historical memory; verify against current state.".repeat(4));
+
+        let rendered = render_relevant_memory_item(&memory);
+
+        assert!(rendered.contains(&format!("If selected: `memory` action=get id={id}")));
+        assert!(rendered.contains("Summary:"));
+        assert!(count_chars(&rendered) <= RELEVANT_MEMORY_PER_ITEM_MAX_CHARS);
+    }
+
+    #[test]
+    fn compact_items_remain_within_existing_total_budget() {
+        let snippets = (0..20)
+            .map(|index| {
+                snippet(
+                    &format!("mem_{index:038}"),
+                    None,
+                    &"title".repeat(40),
+                    &"summary".repeat(80),
+                )
+            })
+            .collect::<Vec<_>>();
+        let items = snippets
+            .iter()
+            .map(|snippet| {
+                GranularityBudgetItem::new(
+                    snippet.id.clone(),
+                    snippet.granularity,
+                    render_relevant_memory_item(snippet),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let rendered =
+            segment_by_granularity_budget(&items, RELEVANT_MEMORY_TOTAL_MAX_CHARS).combined();
+
+        assert!(count_chars(&rendered) <= RELEVANT_MEMORY_TOTAL_MAX_CHARS);
     }
 
     #[test]

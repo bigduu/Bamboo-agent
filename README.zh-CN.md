@@ -31,7 +31,7 @@ Bamboo 是一个能在你自己电脑上运行的 AI 助理"大脑"。它不只�
 
 | 能力 | 说明 |
 |---|---|
-| 🧠 **记忆系统** | 会话便签、Dream 笔记本、跨会话的持久记忆，可自动梦境化（auto-dream）与后台整理（gardener） |
+| 🧠 **记忆系统** | 会话便签、由 Jiandu 持有的派生 Dream 快照和跨会话持久记忆，支持自动生成 Dream 与后台整理（gardener） |
 | 🗜️ **上下文压缩** | 滚动摘要 + 近窗保留的混合压缩，超大工具输出自动裁剪，按模型上下文窗口预算执行 |
 | 🛠️ **内置工具** | 22 个内置工具：文件、搜索、Shell、Web、计划模式、任务、权限请求等 |
 | 🎯 **技能系统** | 可选/可发现的技能，按请求提示做轻量选择，含内置 docx / pdf / pptx / xlsx / skill-creator |
@@ -83,9 +83,11 @@ graph TD
 
 Bamboo 不再维护第二套记忆实现。窄 `bamboo-memory` facade 通过精确版本依赖，把规范存储、确定性词法检索、会话便签和 Dream 快照交给 Jiandu。
 
+Jiandu 持有规范持久化、派生索引、词法召回和落盘的 Dream 快照字节。Bamboo 负责 prompt 选择与预算，可对召回短名单做可选 rerank，并选择刷新 Dream 所用的模型与节奏；它不会复制 Jiandu 的记忆引擎。
+
 - **会话便签** — `session_note` 工具（`read` / `append` / `replace` / `clear` / `list_topics`）保存单个会话内抗压缩的上下文。
 - **持久记忆** — 原子化的 Global 或一等 Project 事实，包含类型、状态、来源、关系和词法检索元数据。Jiandu 是唯一事实源，不存在 embedding 流水线。
-- **Dream** — Global 或 Project 的派生方向快照，不是规范记忆记录。Bamboo 先抽取事实和 Ledger 候选，再捕获 Jiandu generation、读取规范 `MEMORY.md`、只合成一次，最后通过 compare-and-swap 发布，避免过时任务覆盖新事实。
+- **Dream** — 由 Jiandu 持有的 Global 或 Project 派生方向快照，不是规范记忆记录。Bamboo 先抽取事实和 Ledger 候选，再捕获 Jiandu generation、读取规范 `MEMORY.md`、只合成一次，最后请求 Jiandu 通过 compare-and-swap 发布，避免过时任务覆盖新事实。
 
 Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会话和面向未来事项的 Ledger 仍留在 `~/.bamboo`，两套存储不会混在一起。
 

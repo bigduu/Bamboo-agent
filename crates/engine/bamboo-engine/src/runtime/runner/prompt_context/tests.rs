@@ -206,7 +206,17 @@ async fn external_memory_includes_global_dream_fallback_and_session_note_when_pr
     assert!(system_prompt.contains("Session durable note"));
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("the `memory` tool only for durable project/global knowledge"));
-    assert!(system_prompt.contains("prefer `memory` action=query first"));
+    assert!(system_prompt.contains("short, discriminative lexical query"));
+    assert!(system_prompt.contains("compact top-3 shortlist"));
+    assert!(system_prompt.contains("Query before writing"));
+    assert!(system_prompt.contains("`memory` action=merge"));
+    assert!(system_prompt.contains("one confirmed atomic fact"));
+    assert!(system_prompt.contains("Project scope"));
+    assert!(system_prompt.contains("Global scope"));
+    assert!(system_prompt.contains("Dream as low-trust orientation only"));
+    assert!(system_prompt.contains("Live-verify code"));
+    assert!(system_prompt.contains("Do NOT store secrets/tokens"));
+    assert!(system_prompt.contains("do not use or request embeddings"));
 }
 
 #[tokio::test]
@@ -612,13 +622,17 @@ async fn external_memory_renders_relevant_memory_section_for_project_hits() {
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     let project_key = project_id.to_string();
 
-    project_memory
+    let body = format!(
+        "Keep responses concise and avoid unnecessary recap. {}FULL_BODY_SENTINEL_DO_NOT_INJECT",
+        "x".repeat(240)
+    );
+    let written = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
             bamboo_memory::memory_store::DurableMemoryType::Feedback,
             "User prefers concise answers",
-            "Keep responses concise and avoid unnecessary recap.",
+            &body,
             &["concise".to_string(), "style".to_string()],
             Some("session-recall-project"),
             "main-model",
@@ -654,6 +668,12 @@ async fn external_memory_renders_relevant_memory_section_for_project_hits() {
     assert!(system_prompt.contains("User prefers concise answers"));
     assert!(system_prompt.contains("Summary: Keep responses concise"));
     assert!(system_prompt.contains("[active][project]"));
+    assert!(system_prompt.contains(&written.frontmatter.id));
+    assert!(system_prompt.contains(&format!(
+        "If selected: `memory` action=get id={}",
+        written.frontmatter.id
+    )));
+    assert!(!system_prompt.contains("FULL_BODY_SENTINEL_DO_NOT_INJECT"));
 }
 
 #[tokio::test]
@@ -807,6 +827,12 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
 
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert_eq!(system_prompt.matches("Summary:").count(), 3);
+    assert_eq!(
+        system_prompt
+            .matches("If selected: `memory` action=get id=")
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -820,7 +846,7 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     let project_key = project_id.to_string();
 
-    project_memory
+    let unrelated = project_memory
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Project,
             Some(project_key.as_str()),
@@ -835,7 +861,7 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
         )
         .await
         .expect("save unrelated project memory");
-    store
+    let global = store
         .write_memory(
             bamboo_memory::memory_store::MemoryScope::Global,
             None,
@@ -874,7 +900,14 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
     assert!(system_prompt.contains("### Relevant Durable Memories"));
     assert!(system_prompt.contains("Global release guidance"));
     assert!(system_prompt.contains("[active][global]"));
-    assert!(!system_prompt.contains("Unrelated project note (score"));
+    assert!(system_prompt.contains(&format!(
+        "If selected: `memory` action=get id={}",
+        global.frontmatter.id
+    )));
+    assert!(!system_prompt.contains(&format!(
+        "If selected: `memory` action=get id={}",
+        unrelated.frontmatter.id
+    )));
 }
 
 #[tokio::test]
