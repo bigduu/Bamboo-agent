@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -285,50 +284,6 @@ pub fn sanitize_component(input: &str) -> String {
     } else {
         out
     }
-}
-
-pub fn project_key_from_path(path: &Path) -> String {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-    if let Some(root) = find_git_root(&canonical) {
-        if let Some(name) = root.file_name().and_then(|value| value.to_str()) {
-            let mut key = sanitize_component(name);
-            if let Some(hash) =
-                short_stable_hash(&bamboo_config::paths::path_to_display_string(&root))
-            {
-                key.push('-');
-                key.push_str(&hash);
-            }
-            return key;
-        }
-    }
-
-    if let Some(name) = canonical.file_name().and_then(|value| value.to_str()) {
-        let mut key = sanitize_component(name);
-        if let Some(hash) =
-            short_stable_hash(&bamboo_config::paths::path_to_display_string(&canonical))
-        {
-            key.push('-');
-            key.push_str(&hash);
-        }
-        return key;
-    }
-
-    let raw = bamboo_config::paths::path_to_display_string(&canonical);
-    format!(
-        "path-{}",
-        short_stable_hash(&raw).unwrap_or_else(|| "unknown".to_string())
-    )
-}
-
-pub fn find_git_root(start: &Path) -> Option<PathBuf> {
-    for ancestor in start.ancestors() {
-        let git_dir = ancestor.join(".git");
-        if git_dir.is_dir() || git_dir.is_file() {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
 }
 
 pub fn short_stable_hash(input: &str) -> Option<String> {
@@ -705,12 +660,6 @@ mod tests {
     fn normalize_tags_dedupes_and_sanitizes() {
         let tags = normalize_tags(["User Preference", "user-preference", "release/freeze"]);
         assert_eq!(tags, vec!["release-freeze", "user-preference"]);
-    }
-
-    #[test]
-    fn project_key_from_path_is_stable() {
-        let key = project_key_from_path(Path::new("/tmp/My Project"));
-        assert!(key.starts_with("my-project-"));
     }
 
     #[test]

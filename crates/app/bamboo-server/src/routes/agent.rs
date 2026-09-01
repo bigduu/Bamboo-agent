@@ -122,14 +122,6 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/projects/migrations/legacy/dry-run",
             web::post().to(agent::projects::legacy_dry_run),
         )
-        .route(
-            "/projects/{project_id}/migrations/legacy-memory",
-            web::post().to(agent::projects::migrate_legacy_memory),
-        )
-        .route(
-            "/projects/{project_id}/migrations/legacy-memory",
-            web::get().to(agent::projects::legacy_memory_migration_status),
-        )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
         .route(
