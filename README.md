@@ -81,17 +81,17 @@ graph TD
 
 ## Signature Deep-Dives
 
-### Memory System · `crates/infra/bamboo-memory`
+### Memory System · Jiandu through `crates/infra/bamboo-memory`
 
-Memory has three layers:
+Bamboo does not maintain a second memory implementation. Its narrow `bamboo-memory` facade delegates canonical storage, deterministic lexical retrieval, session notes, and Dream snapshots to the exact `jiandu-memory` release.
 
-- **Session notes** — written by the `session_note` tool (actions: `session_read` / `session_append` / `session_replace` / `session_clear` / `session_list_topics`); these are temporary drafts/facts within the current session.
-- **Dream notebook** — a background process "dreams" over a stretch of conversation, distilling it into structured candidate memories and consolidating them into the notebook (`auto_dream.rs`).
-- **Durable memory** — survives across sessions, with frontmatter (type, status, source, relations, retrieval metadata), scoped as `session` / `project` / `global` (`memory_store/types.rs`).
+- **Session notes** — the `session_note` tool (`read` / `append` / `replace` / `clear` / `list_topics`) keeps compression-resistant context for one session.
+- **Durable memory** — atomic Global or first-class Project facts with type, status, source, relations, and lexical retrieval metadata. Jiandu is the source of truth; there is no embedding pipeline.
+- **Dream** — a derived Global or Project orientation snapshot, never a canonical memory record. Bamboo extracts facts and Ledger candidates first, captures the Jiandu generation, reads canonical `MEMORY.md`, synthesizes once, then publishes with compare-and-swap so a stale run cannot overwrite newer facts.
 
-**Auto-dream** (`MemoryConfig.auto_dream_enabled`, **off by default** because it consumes model tokens) performs extraction, consolidation, and Dream generation as the conversation evolves; it supports three modes: `Incremental`, `Refine`, `Rebuild`.
+Jiandu defaults to the independent `~/.jiandu` data root. Bamboo configuration, sessions, and the prospective-record Ledger remain under `~/.bamboo`; the two stores are not mixed.
 
-**Gardener** (`bamboo-engine/src/gardener.rs`, `gardener_enabled` off by default) specializes in splitting "multi-topic blob memories." It has cost guardrails: a hard per-run split cap, a slow cadence (daily by default), and **it calls no LLM when the deterministic pre-screen finds no candidates** — an idle gardener costs nothing. The split "work list" is produced for free by `MemoryStore::scan_blob_candidates`; only the split "decision" uses the model.
+**Gardener** (`bamboo-engine/src/gardener.rs`) specializes in splitting multi-topic blobs and consolidating duplicates. It has a hard per-run cap and **calls no LLM when the deterministic pre-screen finds no candidates**; only the model-reviewed maintenance decision has model cost.
 
 > Why it matters: the memory system lets the assistant understand your project better over long-term use, while keeping cost controlled and data local.
 

@@ -278,7 +278,7 @@ mod tests {
             SessionInboxLimits::default(),
         ));
 
-        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path());
+        let memory = bamboo_memory::memory_store::MemoryStore::new(directory.path().join("jiandu"));
         memory
             .write_memory(
                 bamboo_memory::memory_store::MemoryScope::Global,
@@ -316,7 +316,8 @@ mod tests {
             storage: Some(storage),
             persistence: Some(persistence),
             session_inbox: Some(inbox),
-            app_data_dir: Some(directory.path().to_path_buf()),
+            app_data_dir: Some(directory.path().join("bamboo")),
+            memory_store: memory,
             prompt_memory_flags: crate::runtime::config::PromptMemoryFlags {
                 project_prompt_injection: false,
                 relevant_recall: true,

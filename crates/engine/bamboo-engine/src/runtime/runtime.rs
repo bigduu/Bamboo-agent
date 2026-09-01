@@ -63,6 +63,9 @@ pub struct AgentRuntime {
     /// Reloadable LLM provider handle (delegates to the latest provider).
     pub provider: Arc<dyn LLMProvider>,
 
+    /// Concrete Jiandu store shared by every run from this runtime.
+    pub memory_store: bamboo_memory::memory_store::MemoryStore,
+
     /// Default tool executor (root tools with full surface).
     /// Call sites that need a reduced tool set (child / schedule) pass their
     /// own via `ExecuteRequest::tools`.
@@ -101,6 +104,7 @@ pub struct AgentRuntimeBuilder {
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     permission_mode: PermissionMode,
     provider: Option<Arc<dyn LLMProvider>>,
+    memory_store: bamboo_memory::memory_store::MemoryStore,
     default_tools: Option<Arc<dyn ToolExecutor>>,
     hook_runner: Arc<HookRunner>,
 }
@@ -121,6 +125,7 @@ impl AgentRuntimeBuilder {
             permission_config: None,
             permission_mode: PermissionMode::Default,
             provider: None,
+            memory_store: bamboo_memory::memory_store::MemoryStore::with_defaults(),
             default_tools: None,
             hook_runner: Arc::new(HookRunner::new()),
         }
@@ -194,6 +199,11 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    pub fn memory_store(mut self, v: bamboo_memory::memory_store::MemoryStore) -> Self {
+        self.memory_store = v;
+        self
+    }
+
     pub fn default_tools(mut self, v: Arc<dyn ToolExecutor>) -> Self {
         self.default_tools = Some(v);
         self
@@ -231,6 +241,7 @@ impl AgentRuntimeBuilder {
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
             provider: self.provider.ok_or_else(|| format_missing("provider"))?,
+            memory_store: self.memory_store,
             default_tools: self
                 .default_tools
                 .ok_or_else(|| format_missing("default_tools"))?,
@@ -832,6 +843,7 @@ impl AgentRuntime {
             },
             image_fallback,
             app_data_dir,
+            memory_store: self.memory_store.clone(),
             prompt_memory_flags: config
                 .memory()
                 .as_ref()

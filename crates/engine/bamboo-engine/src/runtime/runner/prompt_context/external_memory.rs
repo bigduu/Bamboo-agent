@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::project_context::ProjectContextResolver;
@@ -175,20 +176,19 @@ fn count_chars(value: &str) -> usize {
 
 pub(super) async fn refresh_external_memory_context(
     session: &mut Session,
+    memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
-    app_data_dir: Option<&std::path::Path>,
+    app_data_dir: Option<&Path>,
 ) {
-    let memory = app_data_dir
-        .map(MemoryStore::new)
-        .unwrap_or_else(MemoryStore::with_defaults);
-    refresh_external_memory_context_with_store_and_resolver(
+    refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
-        &memory,
+        memory,
         prompt_memory_flags,
         runtime_context,
         project_context_resolver,
+        app_data_dir,
     )
     .await;
 }
@@ -200,22 +200,62 @@ pub(super) async fn refresh_external_memory_context_with_store(
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
 ) {
-    refresh_external_memory_context_with_store_and_resolver(
+    refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
         prompt_memory_flags,
         runtime_context,
         None,
+        None,
     )
     .await;
 }
 
+#[cfg(test)]
+pub(super) async fn refresh_external_memory_context_with_stores(
+    session: &mut Session,
+    memory: &MemoryStore,
+    ledger_data_dir: &Path,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+) {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        None,
+        Some(ledger_data_dir),
+    )
+    .await;
+}
+
+#[cfg(test)]
 pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
     session: &mut Session,
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
+) {
+    refresh_external_memory_context_with_store_resolver_and_ledger(
+        session,
+        memory,
+        prompt_memory_flags,
+        runtime_context,
+        project_context_resolver,
+        None,
+    )
+    .await;
+}
+
+async fn refresh_external_memory_context_with_store_resolver_and_ledger(
+    session: &mut Session,
+    memory: &MemoryStore,
+    prompt_memory_flags: PromptMemoryFlags,
+    runtime_context: Option<&PromptMemoryRuntimeContext>,
+    project_context_resolver: Option<&ProjectContextResolver>,
+    ledger_data_dir: Option<&Path>,
 ) {
     // Computed each round and cached in a session field (NOT injected into the
     // system message), so a per-round memory change never invalidates the cached
@@ -248,7 +288,8 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
     let resolved_project_key = resolved_project_scope.as_ref().map(ToString::to_string);
     let session_note_snippets = load_session_note_snippets(memory, session_id.as_str()).await;
     let ledger_agenda = if prompt_memory_flags.ledger_agenda {
-        load_ledger_agenda_snippet(memory, resolved_project_key.as_deref()).await
+        let data_dir = resolve_ledger_data_dir(ledger_data_dir);
+        load_ledger_agenda_snippet(&data_dir, resolved_project_key.as_deref()).await
     } else {
         None
     };
@@ -371,14 +412,19 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
     );
 }
 
-/// Load the agenda from the ledger store colocated with the memory store's
-/// data dir (global scope + the resolved project scope). Pure index/file
-/// reads — no LLM cost. `None` when the ledger has nothing open.
+/// Load the agenda from Bamboo's ledger store. Jiandu memory owns a separate
+/// data root and is deliberately not used to locate prospective records.
+fn resolve_ledger_data_dir(explicit: Option<&Path>) -> PathBuf {
+    explicit
+        .map(Path::to_path_buf)
+        .unwrap_or_else(bamboo_config::paths::bamboo_dir)
+}
+
 async fn load_ledger_agenda_snippet(
-    memory: &MemoryStore,
+    ledger_data_dir: &Path,
     project_key: Option<&str>,
 ) -> Option<LedgerAgendaSnippet> {
-    let store = LedgerStore::new(memory.resolver().data_dir());
+    let store = LedgerStore::new(ledger_data_dir);
     let mut scopes: Vec<(LedgerScope, Option<String>)> = vec![(LedgerScope::Global, None)];
     if let Some(project_key) = project_key {
         scopes.push((LedgerScope::Project, Some(project_key.to_string())));
@@ -681,9 +727,11 @@ async fn load_project_dream_snippet(
         return None;
     }
 
-    let content = match memory.read_project_dream_view(project_key).await {
-        Ok(Some(content)) => content,
-        Ok(None) => return None,
+    let read = match memory
+        .read_dream_snapshot(MemoryScope::Project, Some(project_key))
+        .await
+    {
+        Ok(read) => read,
         Err(error) => {
             tracing::warn!(
                 "[{}] Failed to read project Dream notebook for '{}': {}",
@@ -694,6 +742,14 @@ async fn load_project_dream_snippet(
             return None;
         }
     };
+    if read.stale {
+        tracing::debug!(
+            "[{}] Using stale project Dream snapshot for orientation; project='{}'",
+            session_id,
+            project_key
+        );
+    }
+    let content = read.snapshot?.content;
 
     let full_len = count_chars(&content);
     let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
@@ -709,14 +765,20 @@ async fn load_global_dream_fallback_snippet(
     memory: &MemoryStore,
     session_id: &str,
 ) -> Option<LoadedSnippet> {
-    let content = match memory.read_dream_view().await {
-        Ok(Some(content)) => content,
-        Ok(None) => return None,
+    let read = match memory.read_dream_snapshot(MemoryScope::Global, None).await {
+        Ok(read) => read,
         Err(error) => {
             tracing::warn!("[{}] Failed to read Dream notebook: {}", session_id, error);
             return None;
         }
     };
+    if read.stale {
+        tracing::debug!(
+            "[{}] Using stale global Dream snapshot for orientation",
+            session_id
+        );
+    }
+    let content = read.snapshot?.content;
 
     let full_len = count_chars(&content);
     let (snippet, truncated) = truncate_chars(&content, GLOBAL_DREAM_NOTEBOOK_PROMPT_MAX_CHARS);
@@ -1190,6 +1252,16 @@ fn render_context_pressure_warning(session: &Session) -> Option<String> {
 #[cfg(test)]
 mod granularity_prompt_wiring_tests {
     use super::*;
+
+    #[test]
+    fn ledger_root_defaults_to_bamboo_and_preserves_explicit_override() {
+        let explicit = PathBuf::from("explicit-bamboo-root");
+        assert_eq!(resolve_ledger_data_dir(Some(explicit.as_path())), explicit);
+        assert_eq!(
+            resolve_ledger_data_dir(None),
+            bamboo_config::paths::bamboo_dir()
+        );
+    }
 
     fn snippet(
         id: &str,

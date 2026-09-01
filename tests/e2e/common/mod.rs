@@ -1,5 +1,6 @@
 //! Common utilities and helpers for e2e tests
 
+use bamboo_agent::server::app_state::MemoryStore;
 use bamboo_agent::server::AppState;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -45,8 +46,11 @@ pub async fn create_test_app() -> actix_web::web::Data<AppState> {
         .keep();
 
     actix_web::web::Data::new(
-        AppState::new(temp_dir.clone())
-            .await
-            .expect("Failed to create AppState for e2e test"),
+        AppState::new_with_memory_store(
+            temp_dir.clone(),
+            MemoryStore::new(temp_dir.join("jiandu")),
+        )
+        .await
+        .expect("Failed to create AppState for e2e test"),
     )
 }

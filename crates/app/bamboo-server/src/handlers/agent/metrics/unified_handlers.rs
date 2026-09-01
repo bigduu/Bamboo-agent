@@ -12,7 +12,6 @@ use super::{
     UnifiedSummary, UnifiedTimelinePoint,
 };
 use crate::app_state::AppState;
-use bamboo_memory::memory_store::MemoryStore;
 
 use super::core_handlers::memory::build_memory_summary;
 
@@ -63,9 +62,9 @@ pub async fn v2_unified_summary(
 
     let forward_result = state.metrics_service.forward_summary(forward_filter).await;
 
-    let memory_store = MemoryStore::new(state.app_data_dir.clone());
     let memory_result = build_memory_summary(
-        &memory_store,
+        &state.memory_store,
+        state.project_store.as_ref(),
         &state.session_store,
         state.storage.as_ref(),
         &MemoryMetricsQuery {

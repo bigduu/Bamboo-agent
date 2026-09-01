@@ -372,6 +372,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn memory_store(mut self, v: bamboo_memory::memory_store::MemoryStore) -> Self {
+        self.inner = self.inner.memory_store(v);
+        self
+    }
+
     pub fn default_tools(mut self, v: Arc<dyn bamboo_agent_core::tools::ToolExecutor>) -> Self {
         self.inner = self.inner.default_tools(v);
         self

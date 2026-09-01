@@ -10,6 +10,20 @@ use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 
+fn default_app_state_memory_store(
+    bamboo_home_dir: &std::path::Path,
+) -> bamboo_memory::memory_store::MemoryStore {
+    #[cfg(test)]
+    {
+        return bamboo_memory::memory_store::MemoryStore::new(bamboo_home_dir.join("jiandu"));
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bamboo_home_dir;
+        bamboo_memory::memory_store::MemoryStore::with_defaults()
+    }
+}
+
 impl AppState {
     /// Create unified app state with direct provider access
     ///
@@ -53,6 +67,16 @@ impl AppState {
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
+        Self::new_with_memory_store(bamboo_home_dir, memory_store).await
+    }
+
+    /// Create a server state with one explicit Jiandu store shared by the tool,
+    /// prompt, Dream, gardener, metrics, and maintenance paths.
+    pub async fn new_with_memory_store(
+        bamboo_home_dir: PathBuf,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Result<Self, AppError> {
         // Ensure all helpers that rely on `core::paths::bamboo_dir()` see the same
         // directory as the server runtime.
         bamboo_config::paths::init_bamboo_dir(bamboo_home_dir.clone());
@@ -146,6 +170,7 @@ impl AppState {
             provider,
             config_facade,
             Arc::new(NoopToolEventPublisher),
+            memory_store,
         )
         .await
     }
@@ -169,12 +194,14 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
             provider,
             None,
             Arc::new(NoopToolEventPublisher),
+            memory_store,
         )
         .await
     }
@@ -187,12 +214,14 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
     ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
             provider,
             None,
             tool_event_publisher,
+            memory_store,
         )
         .await
     }
@@ -203,6 +232,7 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
     ) -> Result<Self, AppError> {
         // Wire the configured-default-workspace resolver into agent-core. This keeps
         let data_dir = bamboo_home_dir.clone();
@@ -476,6 +506,7 @@ impl AppState {
             account_sink.clone(),
             workspace_resolver.clone(),
             tool_event_publisher.clone(),
+            memory_store.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -581,6 +612,7 @@ impl AppState {
             .metrics_collector(metrics_service.collector())
             .config(config.clone())
             .provider(provider_handle.clone())
+            .memory_store(memory_store.clone())
             .default_tools(base_tools.clone())
             .project_context_resolver(project_context_resolver.clone());
         if let Some(permission_config) = permission_checker.permission_config() {
@@ -772,6 +804,7 @@ impl AppState {
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
+                memory: memory_store.clone(),
                 provider: provider_handle.clone(),
                 config: config.clone(),
                 provider_registry: provider_registry.clone(),
@@ -786,6 +819,7 @@ impl AppState {
             bamboo_engine::auto_dream::AutoDreamContext {
                 session_store: session_store.clone(),
                 storage: storage.clone(),
+                memory: memory_store.clone(),
                 provider: provider_handle.clone(),
                 config: config.clone(),
                 provider_registry: provider_registry.clone(),
@@ -801,6 +835,7 @@ impl AppState {
                 dream: bamboo_engine::auto_dream::AutoDreamContext {
                     session_store: session_store.clone(),
                     storage: storage.clone(),
+                    memory: memory_store.clone(),
                     provider: provider_handle.clone(),
                     config: config.clone(),
                     provider_registry: provider_registry.clone(),
@@ -1056,6 +1091,7 @@ impl AppState {
             );
         Ok(Self {
             app_data_dir: bamboo_home_dir,
+            memory_store,
             tool_event_publisher,
             tool_event_router,
             config,

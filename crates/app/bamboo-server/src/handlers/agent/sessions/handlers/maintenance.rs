@@ -4,6 +4,7 @@ use crate::app_state::AppState;
 use bamboo_agent_core::{Session, Storage};
 use bamboo_engine::auto_dream::{run_project_auto_dream_once_for_project, AutoDreamContext};
 use bamboo_engine::project_context::ProjectContextResolver;
+use bamboo_memory::memory_store::MemoryStore;
 use bamboo_storage::{CleanupMode, CleanupResult};
 
 use super::super::types::CleanupRequest;
@@ -92,6 +93,10 @@ async fn load_session_from_state_or_storage(
         })
 }
 
+fn dream_memory_store(state: &AppState) -> MemoryStore {
+    state.memory_store.clone()
+}
+
 /// `POST /api/v1/sessions/{session_id}/project-dream/run`
 pub async fn run_project_dream(
     state: web::Data<AppState>,
@@ -128,6 +133,7 @@ pub async fn run_project_dream(
     let ctx = AutoDreamContext {
         session_store: state.session_store.clone(),
         storage: state.storage.clone(),
+        memory: dream_memory_store(&state),
         provider: state.get_provider().await,
         config: state.config.clone(),
         provider_registry: state.provider_registry.clone(),
@@ -148,7 +154,8 @@ pub async fn run_project_dream(
             "dream_generated": true,
             "used_model": result.used_model,
             "session_count": result.session_count,
-            "note_path": result.note_path.to_string_lossy().to_string(),
+            "generated_at": result.generated_at,
+            "source_generation": result.source_generation,
             "notebook_chars": result.notebook_chars,
         }),
         None => serde_json::json!({
@@ -313,8 +320,8 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace dir");
 
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "## Current durable context\n- HTTP project dream generated\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
             "{\"candidates\":[]}".to_string(),
+            "## Current durable context\n- HTTP project dream generated\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
         ]));
         let app_state = build_test_app_state(temp_dir.path().to_path_buf(), provider).await;
         let project = app_state
@@ -375,15 +382,28 @@ mod tests {
             body.get("used_model").and_then(Value::as_str),
             Some("fast-model")
         );
+        assert!(body.get("generated_at").and_then(Value::as_str).is_some());
+        assert_eq!(
+            body.get("source_generation")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+        assert!(body.get("note_path").is_none());
 
-        let memory =
-            bamboo_memory::memory_store::MemoryStore::new(temp_dir.path()).for_project(&project.id);
+        let memory = app_state.memory_store.for_project(&project.id);
         let project_dream = memory
-            .read_project_dream_view(project.id.as_str())
+            .read_dream_snapshot(
+                bamboo_memory::memory_store::MemoryScope::Project,
+                Some(project.id.as_str()),
+            )
             .await
-            .expect("read project dream")
+            .expect("read project Dream snapshot")
+            .snapshot
             .expect("project dream should exist");
-        assert!(project_dream.contains("HTTP project dream generated"));
+        assert!(project_dream
+            .content
+            .contains("HTTP project dream generated"));
     }
 
     #[actix_web::test]

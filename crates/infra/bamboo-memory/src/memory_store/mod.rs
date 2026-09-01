@@ -1,768 +1,782 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io;
+//! Bamboo's narrow native facade over the Jiandu memory store.
 
-use chrono::{DateTime, Utc};
+use std::collections::{BTreeMap, HashSet};
+use std::io;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-mod access_log;
-pub mod embedding;
-pub mod freshness;
-mod lexical_bm25;
-pub mod paths;
-pub mod recall;
-pub mod store;
-pub mod types;
-
-pub use freshness::{
-    memory_age_days, memory_age_label, memory_freshness_text, render_memory_freshness_note,
-    FreshnessKind,
-};
-pub use paths::{MemoryPathResolver, ProjectMemoryPathResolver, SESSIONS_DIR, TOPICS_DIR};
-pub use recall::{shortlist_relevant_memories, MemoryRecallCandidate, MemoryRecallOptions};
-pub use store::MemoryStore;
-pub use types::{
-    BlobScanItem, BlobScanReport, CreatedBy, DuplicateCluster, DuplicateClusterMember,
-    DuplicateScanReport, DurableContentLocation, DurableMemoryDocument, DurableMemoryFrontmatter,
-    DurableMemoryRef, DurableMemoryRelations, DurableMemoryRetrieval, DurableMemorySource,
-    DurableMemoryStatus, DurableMemoryType, MemoryConsolidateResult, MemoryContradictionResult,
-    MemoryDuplicateCandidate, MemoryInspectResult, MemoryMergeResult, MemoryPurgeResult,
-    MemoryQueryCursor, MemoryQueryItem, MemoryQueryOptions, MemoryQueryResult, MemoryScope,
-    MemorySplitPiece, MemorySplitResult, SessionState, TemporalGranularity,
+pub use jiandu_memory::memory_store::{
+    count_chars, normalize_tags, render_memory_freshness_note, summary_json, truncate_chars,
+    BlobScanItem, BlobScanReport, DreamReadResult, DreamSnapshot, DuplicateCluster,
+    DuplicateScanReport, DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType,
+    FreshnessKind, MemoryConsolidateResult, MemoryContradictionResult, MemoryDuplicateCandidate,
+    MemoryMergeResult, MemoryPurgeResult, MemoryQueryOptions, MemoryQueryResult,
+    MemoryRecallCandidate, MemoryRecallOptions, MemoryScope, MemorySplitPiece, MemorySplitResult,
+    SessionState, TemporalGranularity, DEFAULT_SESSION_TOPIC, MAX_MAX_CHARS, MAX_MEMORY_TITLE_LEN,
+    MAX_QUERY_LIMIT,
 };
 
-pub const MEMORY_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_SESSION_TOPIC: &str = "default";
-pub const MAX_SESSION_TOPIC_LEN: usize = 50;
-pub const MAX_MEMORY_TITLE_LEN: usize = 160;
-pub const MAX_MEMORY_TAGS: usize = 32;
-pub const DEFAULT_QUERY_LIMIT: usize = 5;
-pub const MAX_QUERY_LIMIT: usize = 20;
-pub const DEFAULT_MAX_CHARS: usize = 3_000;
-pub const MAX_MAX_CHARS: usize = 6_000;
-pub const WRITE_AUDIT_LOG: &str = "write_audit.jsonl";
-pub const MERGE_AUDIT_LOG: &str = "merge_audit.jsonl";
-pub const PURGE_AUDIT_LOG: &str = "purge_audit.jsonl";
-pub const CONTRADICTION_AUDIT_LOG: &str = "contradiction_audit.jsonl";
-pub const DREAM_VIEW_FILE: &str = "DREAM_NOTEBOOK.md";
-pub const MEMORY_VIEW_FILE: &str = "MEMORY.md";
-pub const RECENT_VIEW_FILE: &str = "RECENT.md";
-pub const STALE_VIEW_FILE: &str = "STALE.md";
-pub const LEXICAL_INDEX_FILE: &str = "lexical.json";
-pub const GRAPH_INDEX_FILE: &str = "graph.json";
-pub const RECENT_INDEX_FILE: &str = "recent.json";
-pub const STALE_CANDIDATES_INDEX_FILE: &str = "stale_candidates.json";
-pub const TAXONOMY_INDEX_FILE: &str = "taxonomy.json";
-
-pub fn validate_session_id(session_id: &str) -> io::Result<&str> {
-    let trimmed = session_id.trim();
-    if trimmed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session_id cannot be empty",
-        ));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session_id contains invalid path characters",
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session_id contains unsupported characters",
-        ));
-    }
-    Ok(trimmed)
-}
-
-pub fn validate_session_topic(topic: &str) -> io::Result<&str> {
-    let trimmed = topic.trim();
-    if trimmed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "topic cannot be empty",
-        ));
-    }
-    if trimmed.len() > MAX_SESSION_TOPIC_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "topic name too long (max {} chars, got {})",
-                MAX_SESSION_TOPIC_LEN,
-                trimmed.len()
-            ),
-        ));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "topic contains invalid path characters",
-        ));
-    }
-    if !trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "topic must contain only alphanumeric, dash, or underscore characters",
-        ));
-    }
-    Ok(trimmed)
-}
-
-pub fn validate_memory_title(title: &str) -> io::Result<&str> {
-    let trimmed = title.trim();
-    if trimmed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "title cannot be empty",
-        ));
-    }
-    if trimmed.chars().count() > MAX_MEMORY_TITLE_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("title too long (max {} chars)", MAX_MEMORY_TITLE_LEN),
-        ));
-    }
-    Ok(trimmed)
-}
-
-pub fn normalize_tag(tag: &str) -> Option<String> {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(trimmed.len());
-    let mut prev_dash = false;
-    for ch in trimmed.chars() {
-        let normalized = match ch {
-            'A'..='Z' => ch.to_ascii_lowercase(),
-            'a'..='z' | '0'..='9' => ch,
-            '-' | '_' | ' ' | '.' | '/' => '-',
-            _ => continue,
-        };
-        if normalized == '-' {
-            if prev_dash {
-                continue;
-            }
-            prev_dash = true;
-            out.push(normalized);
-        } else {
-            prev_dash = false;
-            out.push(normalized);
-        }
-    }
-    let normalized = out.trim_matches('-').to_string();
-    (!normalized.is_empty()).then_some(normalized)
-}
-
-pub fn normalize_tags<I, S>(tags: I) -> Vec<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut seen = BTreeSet::new();
-    for tag in tags {
-        if let Some(tag) = normalize_tag(tag.as_ref()) {
-            seen.insert(tag);
-            if seen.len() >= MAX_MEMORY_TAGS {
-                break;
-            }
-        }
-    }
-    seen.into_iter().collect()
-}
-
-pub fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
-    let mut out = String::new();
-    for (count, ch) in value.chars().enumerate() {
-        if count >= max_chars {
-            return (out, true);
-        }
-        out.push(ch);
-    }
-    (out, false)
-}
-
-pub fn count_chars(value: &str) -> usize {
-    value.chars().count()
-}
-
-pub fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
-}
-
-pub fn derive_summary(content: &str, max_chars: usize) -> String {
-    let collapsed = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let (summary, truncated) = truncate_chars(&collapsed, max_chars);
-    if truncated {
-        format!("{}...", summary.trim_end())
-    } else {
-        summary
-    }
-}
-
-pub fn extract_keywords(title: &str, content: &str, tags: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    for tag in tags {
-        if let Some(tag) = normalize_tag(tag) {
-            seen.insert(tag);
-        }
-    }
-
-    // CJK-aware tokenization (shared with recall's `lexical_bm25::tokenize`) so a
-    // bilingual (中文 + English) library stores Chinese keywords too. The old pass
-    // keyed on `is_ascii_alphanumeric`, dropping ALL CJK — Chinese docs got no
-    // keyword-boost and (since keywords feed the recall index) full-body Chinese
-    // content was never indexed beyond the 240-char summary. English tokens keep
-    // their prior lowercased form; each Chinese run contributes char bigrams. (#242)
-    let combined = format!("{}\n{}", title, content);
-    for token in lexical_bm25::tokenize(&combined) {
-        seen.insert(token);
-    }
-
-    seen.into_iter().take(128).collect()
-}
-
-pub fn detect_entities(title: &str, content: &str) -> Vec<String> {
-    let mut entities = BTreeSet::new();
-    for token in format!("{}\n{}", title, content)
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '/'))
-    {
-        let trimmed = token.trim();
-        if trimmed.len() < 3 {
-            continue;
-        }
-        let has_upper = trimmed.chars().any(|ch| ch.is_ascii_uppercase());
-        let has_separator = trimmed.contains('-') || trimmed.contains('_') || trimmed.contains('/');
-        if has_upper || has_separator {
-            entities.insert(trimmed.to_string());
-        }
-    }
-    entities.into_iter().take(64).collect()
-}
-
-pub fn sanitize_component(input: &str) -> String {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return "unknown".to_string();
-    }
-
-    let mut out = String::with_capacity(trimmed.len());
-    let mut prev_dash = false;
-    for ch in trimmed.chars() {
-        let normalized = match ch {
-            'A'..='Z' => ch.to_ascii_lowercase(),
-            'a'..='z' | '0'..='9' => ch,
-            _ => '-',
-        };
-        if normalized == '-' {
-            if prev_dash {
-                continue;
-            }
-            prev_dash = true;
-            out.push('-');
-        } else {
-            prev_dash = false;
-            out.push(normalized);
-        }
-    }
-
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "unknown".to_string()
-    } else {
-        out
-    }
-}
-
-pub fn short_stable_hash(input: &str) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    trimmed.hash(&mut hasher);
-    Some(format!("{:08x}", (hasher.finish() & 0xffff_ffff) as u32))
-}
-
-pub fn build_yaml_frontmatter(frontmatter: &DurableMemoryFrontmatter) -> io::Result<String> {
-    serde_yaml::to_string(frontmatter).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to serialize memory frontmatter: {error}"),
-        )
-    })
-}
-
-pub fn parse_markdown_document(content: &str) -> io::Result<(DurableMemoryFrontmatter, String)> {
-    let trimmed = content.trim_start_matches('\u{feff}');
-    let Some(rest) = trimmed.strip_prefix("---\n") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing frontmatter start marker",
-        ));
-    };
-    let Some(end_idx) = rest.find("\n---\n") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing frontmatter end marker",
-        ));
-    };
-    let yaml = &rest[..end_idx];
-    let body = &rest[end_idx + "\n---\n".len()..];
-    let frontmatter: DurableMemoryFrontmatter = serde_yaml::from_str(yaml).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to parse memory frontmatter: {error}"),
-        )
-    })?;
-    Ok((frontmatter, body.trim().to_string()))
-}
-
-pub fn render_markdown_document(
-    frontmatter: &DurableMemoryFrontmatter,
-    body: &str,
-) -> io::Result<String> {
-    let yaml = build_yaml_frontmatter(frontmatter)?;
-    Ok(format!("---\n{}---\n\n{}\n", yaml, body.trim()))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LexicalIndex {
-    pub generated_at: String,
-    pub items: Vec<LexicalIndexItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LexicalIndexItem {
-    pub id: String,
-    pub title: String,
+/// Jiandu's inspection result plus Bamboo's flattened Dream timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryInspectResult {
     pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
-    pub r#type: DurableMemoryType,
-    pub status: DurableMemoryStatus,
-    pub tags: Vec<String>,
-    pub keywords: Vec<String>,
-    pub entities: Vec<String>,
-    pub updated_at: String,
-    pub created_at: String,
-    pub summary: String,
-    /// Optional temporal granularity carried from the source frontmatter so recall
-    /// can rank by cache-stability without re-reading every document. Back-compat:
-    /// older `lexical.json` index files predate this field and deserialize to `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub granularity: Option<TemporalGranularity>,
-    /// Optional dense embedding (title+keywords+summary), populated at index-build
-    /// time WHEN a [`embedding::MemoryEmbedder`] backend is configured. Reserved by
-    /// L1: absent today (recall is pure BM25) so this seam is inert; when present,
-    /// recall adds a β·cosine term. Back-compat: older index files → `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<Vec<f32>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RecentIndex {
-    pub generated_at: String,
-    pub items: Vec<RecentIndexItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentIndexItem {
-    pub id: String,
-    pub title: String,
-    pub updated_at: String,
-    pub last_accessed_at: Option<String>,
-    pub status: DurableMemoryStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GraphIndex {
-    pub generated_at: String,
-    pub items: Vec<GraphIndexItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphIndexItem {
-    pub id: String,
-    pub related: Vec<String>,
-    pub supersedes: Vec<String>,
-    pub contradicted_by: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StaleCandidatesIndex {
-    pub generated_at: String,
-    pub items: Vec<StaleCandidateItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaleCandidateItem {
-    pub id: String,
-    pub title: String,
-    pub status: DurableMemoryStatus,
-    pub updated_at: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TaxonomyIndex {
-    pub generated_at: String,
+    pub total_memories: usize,
+    #[serde(default)]
     pub by_type: BTreeMap<String, usize>,
+    #[serde(default)]
     pub by_status: BTreeMap<String, usize>,
-    pub by_scope: BTreeMap<String, usize>,
-    pub total: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditLogEntry {
-    pub timestamp: String,
-    pub action: String,
-    pub scope: MemoryScope,
-    pub memory_id: Option<String>,
-    pub session_id: Option<String>,
-    pub topic: Option<String>,
-    pub summary: String,
+    #[serde(default)]
+    pub recent_ids: Vec<String>,
+    #[serde(default)]
+    pub view_files: Vec<String>,
+    #[serde(default)]
+    pub index_files: Vec<String>,
+    #[serde(default)]
+    pub state_files: Vec<String>,
+    #[serde(default)]
+    pub stale_candidate_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
+    pub last_reindex_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dream_at: Option<String>,
+    #[serde(default)]
+    pub topic_paths: Vec<String>,
 }
 
-pub fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+/// Bamboo-facing memory handle. Jiandu remains private so Bamboo callers cannot
+/// bypass the facade's Project identity and inspection extensions.
+#[derive(Debug, Clone)]
+pub struct MemoryStore {
+    store: jiandu_memory::memory_store::MemoryStore,
 }
 
-pub fn sort_memories_desc(memories: &mut [DurableMemoryDocument]) {
-    memories.sort_by(|left, right| {
-        let left_dt =
-            parse_rfc3339(&left.frontmatter.updated_at).unwrap_or(DateTime::<Utc>::MIN_UTC);
-        let right_dt =
-            parse_rfc3339(&right.frontmatter.updated_at).unwrap_or(DateTime::<Utc>::MIN_UTC);
-        right_dt
-            .cmp(&left_dt)
-            .then_with(|| left.frontmatter.id.cmp(&right.frontmatter.id))
-    });
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::with_defaults()
+    }
 }
 
-pub fn match_memory_query(
-    doc: &DurableMemoryDocument,
-    query: Option<&str>,
-    filter_types: Option<&HashSet<DurableMemoryType>>,
-    filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
-    filter_granularity: Option<&HashSet<TemporalGranularity>>,
-) -> Option<f64> {
-    if let Some(types) = filter_types {
-        if !types.contains(&doc.frontmatter.r#type) {
-            return None;
-        }
-    }
-    if let Some(statuses) = filter_statuses {
-        if !statuses.contains(&doc.frontmatter.status) {
-            return None;
-        }
-    }
-    // Absent filter (`None`) = no filtering, matching every existing memory
-    // regardless of whether it carries a granularity — back-compat with pre-#61
-    // callers and with memories written before the dimension existed. An ACTIVE
-    // filter (issue #61 phase 2, "只看本周的 memory") only matches memories that
-    // carry one of the requested granularities; an untagged memory (`None`) never
-    // matches an active granularity filter, since the caller asked for a specific
-    // time horizon and an untagged memory doesn't claim one.
-    if let Some(granularities) = filter_granularity {
-        match doc.frontmatter.granularity {
-            Some(granularity) if granularities.contains(&granularity) => {}
-            _ => return None,
+impl MemoryStore {
+    /// Construct a Jiandu store rooted at an explicit data directory.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            store: jiandu_memory::memory_store::MemoryStore::new(data_dir),
         }
     }
 
-    let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Some(1.0);
-    };
-
-    // CJK-aware tokenization (shared with recall) so a Chinese `search`/`query_scope`
-    // query matches (bigrams substring-match the Chinese-preserving title/body).
-    // The old ASCII-only pass yielded zero tokens for Chinese → matched everything
-    // unranked. (#242)
-    let query_tokens = lexical_bm25::tokenize(query);
-    if query_tokens.is_empty() {
-        return Some(1.0);
+    /// Construct the production store at the independent `~/.jiandu` root.
+    pub fn with_defaults() -> Self {
+        Self::new(default_jiandu_data_dir())
     }
 
-    let title = doc.frontmatter.title.to_ascii_lowercase();
-    let body = doc.body.to_ascii_lowercase();
-    let keywords: HashSet<String> = doc
-        .frontmatter
-        .retrieval
-        .keywords
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect();
-    let tags: HashSet<String> = doc
-        .frontmatter
-        .tags
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect();
-    let entities: HashSet<String> = doc
-        .frontmatter
-        .retrieval
-        .entities
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect();
-
-    let mut score = 0.0;
-    let mut matched_any = false;
-    for token in &query_tokens {
-        let mut token_score = 0.0;
-        if title.contains(token) {
-            token_score += 3.0;
-        }
-        if keywords.contains(token) {
-            token_score += 2.5;
-        }
-        if tags.contains(token) {
-            token_score += 2.0;
-        }
-        if entities.contains(token) {
-            token_score += 1.5;
-        }
-        if body.contains(token) {
-            token_score += 1.0;
-        }
-        if token_score > 0.0 {
-            matched_any = true;
-            score += token_score;
+    /// Bind Project memory to Bamboo's first-class Project identity.
+    pub fn for_project(&self, project_id: &bamboo_domain::ProjectId) -> Self {
+        let project_id = jiandu_memory::ProjectId::parse(project_id.as_str().to_owned())
+            .expect("Bamboo ProjectId must satisfy Jiandu's identical path-safe contract");
+        Self {
+            store: self.store.for_project(&project_id),
         }
     }
 
-    matched_any.then_some(score / query_tokens.len() as f64)
+    pub async fn read_session_topic(
+        &self,
+        session_id: &str,
+        topic: &str,
+    ) -> io::Result<Option<String>> {
+        self.store.read_session_topic(session_id, topic).await
+    }
+
+    pub async fn write_session_topic(
+        &self,
+        session_id: &str,
+        topic: &str,
+        content: &str,
+    ) -> io::Result<PathBuf> {
+        self.store
+            .write_session_topic(session_id, topic, content)
+            .await
+    }
+
+    pub async fn delete_session_topic(&self, session_id: &str, topic: &str) -> io::Result<bool> {
+        self.store.delete_session_topic(session_id, topic).await
+    }
+
+    pub async fn list_session_topics(&self, session_id: &str) -> io::Result<Vec<String>> {
+        self.store.list_session_topics(session_id).await
+    }
+
+    pub async fn read_session_topics_with_content(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Vec<(String, String)>> {
+        self.store
+            .read_session_topics_with_content(session_id)
+            .await
+    }
+
+    pub async fn read_session_state(&self, session_id: &str) -> io::Result<SessionState> {
+        self.store.read_session_state(session_id).await
+    }
+
+    pub async fn mark_session_extracted(
+        &self,
+        session_id: &str,
+        extracted_at: &str,
+    ) -> io::Result<()> {
+        self.store
+            .mark_session_extracted(session_id, extracted_at)
+            .await
+    }
+
+    pub async fn read_memory_view(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        self.store.read_memory_view(scope, project_key).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_scope(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        query: Option<&str>,
+        filter_types: Option<&HashSet<DurableMemoryType>>,
+        filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
+        options: &MemoryQueryOptions,
+    ) -> io::Result<MemoryQueryResult> {
+        self.store
+            .query_scope(
+                scope,
+                project_key,
+                query,
+                filter_types,
+                filter_statuses,
+                filter_granularity,
+                options,
+            )
+            .await
+    }
+
+    pub async fn inspect_scope(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<MemoryInspectResult> {
+        let result = self.store.inspect_scope(scope, project_key).await?;
+        let last_dream_at = if scope == MemoryScope::Session {
+            None
+        } else {
+            self.store
+                .read_dream_snapshot(scope, project_key)
+                .await?
+                .snapshot
+                .map(|snapshot| snapshot.generated_at)
+        };
+
+        Ok(MemoryInspectResult {
+            scope: result.scope,
+            project_key: result.project_key,
+            total_memories: result.total_memories,
+            by_type: result.by_type,
+            by_status: result.by_status,
+            recent_ids: result.recent_ids,
+            view_files: result.view_files,
+            index_files: result.index_files,
+            state_files: result.state_files,
+            stale_candidate_count: result.stale_candidate_count,
+            last_reindex_at: result.last_reindex_at,
+            last_dream_at,
+            topic_paths: result.topic_paths,
+        })
+    }
+
+    pub async fn get_memory(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+    ) -> io::Result<Option<DurableMemoryDocument>> {
+        self.store.get_memory(id, preferred_project_key).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_memory(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: DurableMemoryType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        session_id: Option<&str>,
+        actor: &str,
+        allow_merge_if_similar: bool,
+        granularity: Option<TemporalGranularity>,
+    ) -> io::Result<DurableMemoryDocument> {
+        self.store
+            .write_memory(
+                scope,
+                project_key,
+                r#type,
+                title,
+                content,
+                tags,
+                session_id,
+                actor,
+                allow_merge_if_similar,
+                granularity,
+            )
+            .await
+    }
+
+    pub async fn archive_memory(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        mode: DurableMemoryStatus,
+        reason: Option<&str>,
+    ) -> io::Result<Option<DurableMemoryDocument>> {
+        self.store
+            .archive_memory(id, preferred_project_key, mode, reason)
+            .await
+    }
+
+    pub async fn split_memory(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        pieces: &[MemorySplitPiece],
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemorySplitResult>> {
+        self.store
+            .split_memory(id, preferred_project_key, pieces, session_id, actor)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_duplicate_candidates(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        r#type: Option<DurableMemoryType>,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        limit: usize,
+    ) -> io::Result<Vec<MemoryDuplicateCandidate>> {
+        self.store
+            .find_duplicate_candidates(scope, project_key, r#type, title, content, tags, limit)
+            .await
+    }
+
+    pub async fn scan_blob_candidates(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        min_appended_sections: usize,
+        limit: usize,
+    ) -> io::Result<BlobScanReport> {
+        self.store
+            .scan_blob_candidates(scope, project_key, min_appended_sections, limit)
+            .await
+    }
+
+    pub async fn scan_duplicate_clusters(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        min_score: f64,
+        max_members_per_cluster: usize,
+        limit: usize,
+    ) -> io::Result<DuplicateScanReport> {
+        self.store
+            .scan_duplicate_clusters(
+                scope,
+                project_key,
+                min_score,
+                max_members_per_cluster,
+                limit,
+            )
+            .await
+    }
+
+    pub async fn consolidate_memories(
+        &self,
+        ids: &[String],
+        preferred_project_key: Option<&str>,
+        merged: &MemorySplitPiece,
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemoryConsolidateResult>> {
+        self.store
+            .consolidate_memories(ids, preferred_project_key, merged, session_id, actor)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn purge_memories(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        filter_types: Option<&HashSet<DurableMemoryType>>,
+        filter_statuses: Option<&HashSet<DurableMemoryStatus>>,
+        filter_granularity: Option<&HashSet<TemporalGranularity>>,
+        mode: DurableMemoryStatus,
+        reason: Option<&str>,
+    ) -> io::Result<MemoryPurgeResult> {
+        self.store
+            .purge_memories(
+                scope,
+                project_key,
+                filter_types,
+                filter_statuses,
+                filter_granularity,
+                mode,
+                reason,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_memory_contradicted(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        contradicted_by_ids: &[String],
+        reason: Option<&str>,
+        session_id: Option<&str>,
+        actor: &str,
+    ) -> io::Result<Option<MemoryContradictionResult>> {
+        self.store
+            .mark_memory_contradicted(
+                id,
+                preferred_project_key,
+                contradicted_by_ids,
+                reason,
+                session_id,
+                actor,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_memory(
+        &self,
+        id: &str,
+        preferred_project_key: Option<&str>,
+        content: &str,
+        tags: &[String],
+        session_id: Option<&str>,
+        actor: &str,
+        source_memory_ids: &[String],
+    ) -> io::Result<Option<MemoryMergeResult>> {
+        self.store
+            .merge_memory(
+                id,
+                preferred_project_key,
+                content,
+                tags,
+                session_id,
+                actor,
+                source_memory_ids,
+            )
+            .await
+    }
+
+    pub async fn rebuild_scope(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<()> {
+        self.store.rebuild_scope(scope, project_key).await
+    }
+
+    pub async fn current_scope_generation(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<String> {
+        self.store
+            .current_scope_generation(scope, project_key)
+            .await
+    }
+
+    pub async fn read_dream_snapshot(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<DreamReadResult> {
+        self.store.read_dream_snapshot(scope, project_key).await
+    }
+
+    pub async fn publish_dream_snapshot(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        source_generation: &str,
+        content: &str,
+    ) -> io::Result<DreamSnapshot> {
+        self.store
+            .publish_dream_snapshot(scope, project_key, source_generation, content)
+            .await
+    }
+
+    pub async fn list_memory_documents(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Vec<DurableMemoryDocument>> {
+        self.store.list_memory_documents(scope, project_key).await
+    }
+
+    pub async fn count_scope_memories(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<usize> {
+        self.store.count_scope_memories(scope, project_key).await
+    }
+
+    pub async fn enforce_scope_capacity(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        capacity: usize,
+        max_archivals: usize,
+    ) -> io::Result<Vec<String>> {
+        self.store
+            .enforce_scope_capacity(scope, project_key, capacity, max_archivals)
+            .await
+    }
+
+    pub async fn expire_stale_granularity(
+        &self,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+    ) -> io::Result<Vec<String>> {
+        self.store
+            .expire_stale_granularity(scope, project_key)
+            .await
+    }
 }
 
-pub fn build_memory_markdown_view(
-    scope: MemoryScope,
+/// Run Jiandu's deterministic lexical shortlist without exposing the composed
+/// store to Bamboo callers.
+pub async fn shortlist_relevant_memories(
+    store: &MemoryStore,
     project_key: Option<&str>,
-    docs: &[DurableMemoryDocument],
-) -> String {
-    let title = match scope {
-        MemoryScope::Global => "# Bamboo Memory Index (Global)".to_string(),
-        MemoryScope::Project => format!(
-            "# Bamboo Memory Index (Project: {})",
-            project_key.unwrap_or("unknown")
-        ),
-        MemoryScope::Session => "# Bamboo Memory Index (Session)".to_string(),
-    };
-    let mut out = String::new();
-    out.push_str(&title);
-    out.push_str("\n\n");
-    if docs.is_empty() {
-        out.push_str("_(empty)_\n");
-        return out;
-    }
-
-    for doc in docs {
-        out.push_str(&format!(
-            "- `{}` {} [{} / {}] updated {}\n",
-            doc.frontmatter.id,
-            doc.frontmatter.title,
-            doc.frontmatter.r#type.as_str(),
-            doc.frontmatter.status.as_str(),
-            doc.frontmatter.updated_at,
-        ));
-        let summary = derive_summary(&doc.body, 160);
-        if !summary.is_empty() {
-            out.push_str(&format!("  - {}\n", summary));
-        }
-    }
-    out
+    query: &str,
+    options: &MemoryRecallOptions,
+) -> io::Result<Vec<MemoryRecallCandidate>> {
+    jiandu_memory::memory_store::shortlist_relevant_memories(
+        &store.store,
+        project_key,
+        query,
+        options,
+    )
+    .await
 }
 
-pub fn build_recent_markdown_view(docs: &[DurableMemoryDocument]) -> String {
-    let mut out = String::from("# Recent Memory Updates\n\n");
-    if docs.is_empty() {
-        out.push_str("_(empty)_\n");
-        return out;
-    }
-    for doc in docs.iter().take(20) {
-        out.push_str(&format!(
-            "- `{}` {} — {}\n",
-            doc.frontmatter.id, doc.frontmatter.title, doc.frontmatter.updated_at
-        ));
-    }
-    out
-}
-
-pub fn build_stale_markdown_view(docs: &[DurableMemoryDocument]) -> String {
-    let mut out = String::from("# Stale Memory Candidates\n\n");
-    let stale: Vec<_> = docs
-        .iter()
-        .filter(|doc| doc.frontmatter.status != DurableMemoryStatus::Active)
-        .collect();
-    if stale.is_empty() {
-        out.push_str("_(no stale items)_\n");
-        return out;
-    }
-    for doc in stale {
-        out.push_str(&format!(
-            "- `{}` {} [{}]\n",
-            doc.frontmatter.id,
-            doc.frontmatter.title,
-            doc.frontmatter.status.as_str()
-        ));
-    }
-    out
-}
-
-pub fn build_dream_view(existing: Option<&str>) -> String {
-    match existing.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => value.to_string(),
-        None => "# Bamboo Dream Notebook\n\n_(empty)_\n".to_string(),
-    }
-}
-
-pub fn parse_query_cursor(cursor: Option<&str>) -> usize {
-    cursor
-        .and_then(|raw| raw.rsplit(':').next())
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
-pub fn make_query_cursor(scope: MemoryScope, offset: usize) -> String {
-    format!("{}:{}", scope.as_str(), offset)
-}
-
-pub fn summary_json(items: usize, total: usize) -> String {
-    if total == 0 {
-        "No matching memories found.".to_string()
-    } else {
-        format!("Returned top {} of {} matching memories.", items, total)
-    }
+fn default_jiandu_data_dir() -> PathBuf {
+    dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
-    #[test]
-    fn normalize_tags_dedupes_and_sanitizes() {
-        let tags = normalize_tags(["User Preference", "user-preference", "release/freeze"]);
-        assert_eq!(tags, vec!["release-freeze", "user-preference"]);
+    async fn write_durable(
+        store: &MemoryStore,
+        scope: MemoryScope,
+        project_key: Option<&str>,
+        title: &str,
+        body: &str,
+    ) -> DurableMemoryDocument {
+        store
+            .write_memory(
+                scope,
+                project_key,
+                if scope == MemoryScope::Project {
+                    DurableMemoryType::Project
+                } else {
+                    DurableMemoryType::Reference
+                },
+                title,
+                body,
+                &["facade-test".to_string()],
+                Some("session-test"),
+                "facade-test",
+                false,
+                None,
+            )
+            .await
+            .expect("write durable memory")
     }
 
     #[test]
-    fn parse_markdown_document_requires_frontmatter() {
-        let result = parse_markdown_document("plain body");
-        assert!(result.is_err());
+    fn default_root_is_dot_jiandu_under_home() {
+        let expected =
+            dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"));
+        assert_eq!(default_jiandu_data_dir(), expected);
     }
 
-    /// Back-compat: a memory document written before the temporal-granularity
-    /// dimension existed (its frontmatter has no `granularity` key) must still
-    /// parse, with `granularity` defaulting to `None`.
-    #[test]
-    fn legacy_frontmatter_without_granularity_parses_to_none() {
-        let legacy = "---\n\
-id: mem-legacy\n\
-title: Legacy memory\n\
-type: project\n\
-scope: project\n\
-project_key: proj-1\n\
-status: active\n\
-created_at: 2026-01-01T00:00:00Z\n\
-updated_at: 2026-01-01T00:00:00Z\n\
-created_by:\n  kind: session\n\
-updated_by:\n  kind: memory_write\n\
----\n\
-Legacy body content.\n";
-        let (frontmatter, body) =
-            parse_markdown_document(legacy).expect("legacy document should parse");
-        assert_eq!(frontmatter.id, "mem-legacy");
-        assert_eq!(frontmatter.granularity, None);
-        assert_eq!(body, "Legacy body content.");
-    }
+    #[tokio::test]
+    async fn session_global_and_typed_project_round_trip_with_scope_isolation() {
+        let directory = tempdir().expect("tempdir");
+        let store = MemoryStore::new(directory.path());
 
-    /// A granularity set on the frontmatter round-trips through render + parse.
-    #[test]
-    fn granularity_round_trips_through_render_and_parse() {
-        let legacy = "---\n\
-id: mem-legacy\n\
-title: Legacy memory\n\
-type: project\n\
-scope: project\n\
-project_key: proj-1\n\
-status: active\n\
-created_at: 2026-01-01T00:00:00Z\n\
-updated_at: 2026-01-01T00:00:00Z\n\
-created_by:\n  kind: session\n\
-updated_by:\n  kind: memory_write\n\
----\n\
-Body.\n";
-        let (mut frontmatter, body) = parse_markdown_document(legacy).unwrap();
-        frontmatter.granularity = Some(TemporalGranularity::Quarter);
-
-        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
-        assert!(rendered.contains("granularity: quarter"));
-
-        let (reparsed, _) = parse_markdown_document(&rendered).unwrap();
-        assert_eq!(reparsed.granularity, Some(TemporalGranularity::Quarter));
-    }
-
-    /// `None` granularity must not emit a `granularity:` key (skip_serializing_if),
-    /// so existing documents re-rendered after a load keep their on-disk shape.
-    #[test]
-    fn none_granularity_is_omitted_on_render() {
-        let legacy = "---\n\
-id: mem-legacy\n\
-title: Legacy memory\n\
-type: project\n\
-scope: project\n\
-project_key: proj-1\n\
-status: active\n\
-created_at: 2026-01-01T00:00:00Z\n\
-updated_at: 2026-01-01T00:00:00Z\n\
-created_by:\n  kind: session\n\
-updated_by:\n  kind: memory_write\n\
----\n\
-Body.\n";
-        let (frontmatter, body) = parse_markdown_document(legacy).unwrap();
-        let rendered = render_markdown_document(&frontmatter, &body).unwrap();
-        assert!(!rendered.contains("granularity"));
-    }
-
-    #[test]
-    fn temporal_granularity_parse_is_case_insensitive_and_rejects_unknown() {
+        store
+            .write_session_topic("session_1", DEFAULT_SESSION_TOPIC, "session note")
+            .await
+            .expect("write session note");
         assert_eq!(
-            TemporalGranularity::parse("Week"),
-            Some(TemporalGranularity::Week)
+            store
+                .read_session_topic("session_1", DEFAULT_SESSION_TOPIC)
+                .await
+                .expect("read session note")
+                .as_deref(),
+            Some("session note")
+        );
+
+        let global = write_durable(
+            &store,
+            MemoryScope::Global,
+            None,
+            "Global decision",
+            "Prefer deterministic lexical memory.",
+        )
+        .await;
+
+        let project_id =
+            bamboo_domain::ProjectId::parse("project_alpha").expect("valid Bamboo ProjectId");
+        let project_store = store.for_project(&project_id);
+        let project = write_durable(
+            &project_store,
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            "Project decision",
+            "Project alpha uses the Jiandu facade.",
+        )
+        .await;
+
+        assert!(project
+            .path
+            .starts_with(directory.path().join("projects/project_alpha/memory/v1")));
+        assert_eq!(
+            store
+                .get_memory(&global.frontmatter.id, None)
+                .await
+                .expect("read global")
+                .expect("global exists")
+                .body,
+            global.body
+        );
+        assert!(
+            store
+                .get_memory(&project.frontmatter.id, None)
+                .await
+                .expect("unscoped lookup")
+                .is_none(),
+            "unscoped lookup must not scan Projects"
+        );
+        assert!(project_store
+            .get_memory(&project.frontmatter.id, Some(project_id.as_str()))
+            .await
+            .expect("typed Project lookup")
+            .is_some());
+
+        let other_id =
+            bamboo_domain::ProjectId::parse("project_beta").expect("valid Bamboo ProjectId");
+        assert!(store
+            .for_project(&other_id)
+            .get_memory(&project.frontmatter.id, Some(other_id.as_str()))
+            .await
+            .expect("unrelated Project lookup")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn inspect_reads_dream_timestamp_from_the_same_scope() {
+        let directory = tempdir().expect("tempdir");
+        let store = MemoryStore::new(directory.path());
+        write_durable(
+            &store,
+            MemoryScope::Global,
+            None,
+            "Global fact",
+            "Global memory remains separate.",
+        )
+        .await;
+
+        let global_generation = store
+            .current_scope_generation(MemoryScope::Global, None)
+            .await
+            .expect("global generation");
+        let global_dream = store
+            .publish_dream_snapshot(
+                MemoryScope::Global,
+                None,
+                &global_generation,
+                "Global orientation",
+            )
+            .await
+            .expect("publish global Dream");
+
+        let project_id =
+            bamboo_domain::ProjectId::parse("project_dream").expect("valid Bamboo ProjectId");
+        let project_store = store.for_project(&project_id);
+        write_durable(
+            &project_store,
+            MemoryScope::Project,
+            Some(project_id.as_str()),
+            "Project fact",
+            "Project memory remains separate.",
+        )
+        .await;
+
+        let before_project_dream = project_store
+            .inspect_scope(MemoryScope::Project, Some(project_id.as_str()))
+            .await
+            .expect("inspect Project before Dream");
+        assert_eq!(before_project_dream.last_dream_at, None);
+
+        let project_generation = project_store
+            .current_scope_generation(MemoryScope::Project, Some(project_id.as_str()))
+            .await
+            .expect("Project generation");
+        let project_dream = project_store
+            .publish_dream_snapshot(
+                MemoryScope::Project,
+                Some(project_id.as_str()),
+                &project_generation,
+                "Project orientation",
+            )
+            .await
+            .expect("publish Project Dream");
+
+        assert_eq!(
+            store
+                .inspect_scope(MemoryScope::Global, None)
+                .await
+                .expect("inspect Global")
+                .last_dream_at,
+            Some(global_dream.generated_at)
         );
         assert_eq!(
-            TemporalGranularity::parse("  YEAR "),
-            Some(TemporalGranularity::Year)
+            project_store
+                .inspect_scope(MemoryScope::Project, Some(project_id.as_str()))
+                .await
+                .expect("inspect Project")
+                .last_dream_at,
+            Some(project_dream.generated_at)
         );
-        assert_eq!(TemporalGranularity::parse("decade"), None);
     }
 
-    #[test]
-    fn cache_stability_rank_orders_coarse_before_fine_and_none_first() {
-        use TemporalGranularity::*;
-        let rank = TemporalGranularity::cache_stability_rank;
-        // None is treated as most stable, then coarsest → finest.
-        assert!(rank(None) < rank(Some(Year)));
-        assert!(rank(Some(Year)) < rank(Some(Quarter)));
-        assert!(rank(Some(Quarter)) < rank(Some(Month)));
-        assert!(rank(Some(Month)) < rank(Some(Week)));
-        assert!(rank(Some(Week)) < rank(Some(Day)));
+    #[tokio::test]
+    async fn dream_cold_success_stale_and_failed_cas_preserve_prior_snapshot() {
+        let directory = tempdir().expect("tempdir");
+        let store = MemoryStore::new(directory.path());
+
+        let cold = store
+            .read_dream_snapshot(MemoryScope::Global, None)
+            .await
+            .expect("read cold Dream");
+        assert!(cold.snapshot.is_none());
+        assert!(!cold.stale);
+
+        let initial = store
+            .publish_dream_snapshot(
+                MemoryScope::Global,
+                None,
+                &cold.current_generation,
+                "Initial complete orientation",
+            )
+            .await
+            .expect("publish initial Dream");
+        let fresh = store
+            .read_dream_snapshot(MemoryScope::Global, None)
+            .await
+            .expect("read fresh Dream");
+        assert_eq!(fresh.snapshot.as_ref(), Some(&initial));
+        assert!(!fresh.stale);
+
+        write_durable(
+            &store,
+            MemoryScope::Global,
+            None,
+            "Concurrent fact",
+            "Canonical memory changed after synthesis began.",
+        )
+        .await;
+        let stale = store
+            .read_dream_snapshot(MemoryScope::Global, None)
+            .await
+            .expect("read stale Dream");
+        assert!(stale.stale);
+        assert_eq!(stale.snapshot.as_ref(), Some(&initial));
+
+        let error = store
+            .publish_dream_snapshot(
+                MemoryScope::Global,
+                None,
+                &cold.current_generation,
+                "Must not replace the complete snapshot",
+            )
+            .await
+            .expect_err("stale generation must fail CAS");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            store
+                .read_dream_snapshot(MemoryScope::Global, None)
+                .await
+                .expect("read preserved Dream")
+                .snapshot,
+            Some(initial)
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_preserves_a_complete_dream_snapshot() {
+        let directory = tempdir().expect("tempdir");
+        let store = MemoryStore::new(directory.path());
+        write_durable(
+            &store,
+            MemoryScope::Global,
+            None,
+            "Rebuild fact",
+            "Derived indexes can rebuild without replacing Dream.",
+        )
+        .await;
+        let generation = store
+            .current_scope_generation(MemoryScope::Global, None)
+            .await
+            .expect("generation");
+        let dream = store
+            .publish_dream_snapshot(
+                MemoryScope::Global,
+                None,
+                &generation,
+                "Stable complete orientation",
+            )
+            .await
+            .expect("publish Dream");
+
+        store
+            .rebuild_scope(MemoryScope::Global, None)
+            .await
+            .expect("rebuild scope");
+        let after = store
+            .read_dream_snapshot(MemoryScope::Global, None)
+            .await
+            .expect("read Dream after rebuild");
+        assert!(!after.stale);
+        assert_eq!(after.snapshot, Some(dream));
     }
 }

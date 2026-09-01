@@ -14,6 +14,7 @@ impl MemoryManager for DefaultMemoryManager {
         let msg_count_before = session.messages.len();
         crate::runtime::runner::prompt_context::refresh_external_memory_context(
             session,
+            &config.memory_store,
             config.prompt_memory_flags,
             None,
             config.project_context_resolver.as_deref(),

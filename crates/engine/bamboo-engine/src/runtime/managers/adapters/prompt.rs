@@ -84,6 +84,7 @@ impl PromptManager for DefaultPromptManager {
     async fn refresh_external_memory(&self, session: &mut Session, config: &AgentLoopConfig) {
         crate::runtime::runner::prompt_context::refresh_external_memory_context(
             session,
+            &config.memory_store,
             config.prompt_memory_flags,
             None,
             config.project_context_resolver.as_deref(),

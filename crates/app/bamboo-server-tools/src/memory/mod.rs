@@ -31,13 +31,27 @@ struct ResolvedMemoryAccess {
 }
 
 impl MemoryTool {
+    pub fn with_defaults(session_repo: bamboo_engine::SessionRepository) -> Self {
+        Self {
+            session_repo,
+            memory_store: MemoryStore::with_defaults(),
+        }
+    }
+
     pub fn new(
         session_repo: bamboo_engine::SessionRepository,
         data_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        Self::with_store(session_repo, MemoryStore::new(data_dir))
+    }
+
+    pub fn with_store(
+        session_repo: bamboo_engine::SessionRepository,
+        memory_store: MemoryStore,
+    ) -> Self {
         Self {
             session_repo,
-            memory_store: MemoryStore::new(data_dir),
+            memory_store,
         }
     }
 

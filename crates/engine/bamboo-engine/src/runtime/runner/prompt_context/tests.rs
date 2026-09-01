@@ -43,6 +43,45 @@ impl LLMProvider for StaticResponseProvider {
     }
 }
 
+async fn publish_global_dream(store: &bamboo_memory::memory_store::MemoryStore, content: &str) {
+    let generation = store
+        .current_scope_generation(bamboo_memory::memory_store::MemoryScope::Global, None)
+        .await
+        .expect("read global generation");
+    store
+        .publish_dream_snapshot(
+            bamboo_memory::memory_store::MemoryScope::Global,
+            None,
+            &generation,
+            content,
+        )
+        .await
+        .expect("publish global dream");
+}
+
+async fn publish_project_dream(
+    store: &bamboo_memory::memory_store::MemoryStore,
+    project_key: &str,
+    content: &str,
+) {
+    let generation = store
+        .current_scope_generation(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_key),
+        )
+        .await
+        .expect("read project generation");
+    store
+        .publish_dream_snapshot(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_key),
+            &generation,
+            content,
+        )
+        .await
+        .expect("publish project dream");
+}
+
 #[test]
 fn latest_user_query_skips_hidden_and_runtime_resume_messages() {
     let mut session = bamboo_agent_core::Session::new("recall-real-user", "test-model");
@@ -137,10 +176,11 @@ fn strip_existing_tool_guide_context_does_not_remove_user_heading_without_marker
 async fn external_memory_includes_global_dream_fallback_and_session_note_when_project_unknown() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
-    store
-        .write_dream_view("# Bamboo Dream Notebook\n\nDurable cross-session insight")
-        .await
-        .expect("save dream notebook");
+    publish_global_dream(
+        &store,
+        "# Bamboo Dream Notebook\n\nDurable cross-session insight",
+    )
+    .await;
     store
         .write_session_topic("session-dream-test", "default", "Session durable note")
         .await
@@ -172,10 +212,12 @@ async fn external_memory_includes_global_dream_fallback_and_session_note_when_pr
 #[tokio::test]
 async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let jiandu_root = temp_dir.path().join("jiandu");
+    let bamboo_root = temp_dir.path().join("bamboo");
+    let store = bamboo_memory::memory_store::MemoryStore::new(&jiandu_root);
 
-    // A colocated ledger with one overdue record and one undated open todo.
-    let ledger = bamboo_memory::ledger_store::LedgerStore::new(temp_dir.path());
+    // Bamboo's Ledger remains separate from Jiandu memory.
+    let ledger = bamboo_memory::ledger_store::LedgerStore::new(&bamboo_root);
     let mut overdue = bamboo_domain::ledger::LedgerRecord::new(
         "rec_overdue",
         bamboo_domain::ledger::RecordKind::Todo,
@@ -199,9 +241,10 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     let mut session = bamboo_agent_core::Session::new("session-ledger-test", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
 
-    super::refresh_external_memory_context_with_store(
+    super::refresh_external_memory_context_with_stores(
         &mut session,
         &store,
+        &bamboo_root,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
@@ -218,16 +261,26 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     // Flag off → the section disappears even with open records.
     let mut flags = crate::runtime::config::PromptMemoryFlags::default();
     flags.ledger_agenda = false;
-    super::refresh_external_memory_context_with_store(&mut session, &store, flags, None).await;
+    super::refresh_external_memory_context_with_stores(
+        &mut session,
+        &store,
+        &bamboo_root,
+        flags,
+        None,
+    )
+    .await;
     let without = super::render_external_memory_section(&session)
         .expect("external memory section should still render");
     assert!(!without.contains("### Ledger Agenda"));
+    assert!(!jiandu_root.join("ledger").exists());
 }
 
 #[tokio::test]
 async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let jiandu_root = temp_dir.path().join("jiandu");
+    let bamboo_root = temp_dir.path().join("bamboo");
+    let store = bamboo_memory::memory_store::MemoryStore::new(&jiandu_root);
     store
         .write_session_topic("session-empty-ledger", "default", "note")
         .await
@@ -236,9 +289,10 @@ async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
     let mut session = bamboo_agent_core::Session::new("session-empty-ledger", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
 
-    super::refresh_external_memory_context_with_store(
+    super::refresh_external_memory_context_with_stores(
         &mut session,
         &store,
+        &bamboo_root,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
@@ -247,6 +301,7 @@ async fn external_memory_omits_ledger_agenda_when_ledger_is_empty() {
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
     assert!(!system_prompt.contains("### Ledger Agenda"));
+    assert!(!jiandu_root.join("ledger").exists());
 }
 
 #[tokio::test]
@@ -274,10 +329,11 @@ async fn external_memory_includes_project_memory_index_and_omits_global_dream_fa
         )
         .await
         .expect("save project memory");
-    store
-        .write_dream_view("# Bamboo Dream Notebook\n\nGlobal fallback that should not appear")
-        .await
-        .expect("save dream notebook");
+    publish_global_dream(
+        &store,
+        "# Bamboo Dream Notebook\n\nGlobal fallback that should not appear",
+    )
+    .await;
 
     let mut session = bamboo_agent_core::Session::new("session-project-memory", "test-model");
     session.set_project_id_meta(project_id.to_string());
@@ -437,7 +493,7 @@ async fn external_memory_malformed_project_id_does_not_read_canonical_project_me
 }
 
 #[tokio::test]
-async fn external_memory_truncates_project_memory_index_and_adds_freshness_note() {
+async fn external_memory_truncates_project_memory_index_without_path_access() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
     let project_id =
@@ -446,21 +502,23 @@ async fn external_memory_truncates_project_memory_index_and_adds_freshness_note(
     let workspace = temp_dir.path().join("workspace-beta");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     let project_key = project_id.to_string();
-    let views_dir = project_memory.resolver().views_dir(
-        bamboo_memory::memory_store::MemoryScope::Project,
-        Some(project_key.as_str()),
-    );
-    std::fs::create_dir_all(&views_dir).expect("views dir");
-    let large_view = format!(
-        "# Bamboo Memory Index (Project: {project_key})\n\n- `mem_old` Architectural note [project / active] updated 2026-03-01T00:00:00Z\n  - {}\n{}",
-        "Older repo-state observation that needs verification.",
-        "x".repeat(4_000)
-    );
-    std::fs::write(
-        views_dir.join(bamboo_memory::memory_store::MEMORY_VIEW_FILE),
-        large_view,
-    )
-    .expect("write memory view");
+    for index in 0..12 {
+        project_memory
+            .write_memory(
+                bamboo_memory::memory_store::MemoryScope::Project,
+                Some(project_key.as_str()),
+                bamboo_memory::memory_store::DurableMemoryType::Project,
+                &format!("Architectural note {index}"),
+                &format!("Durable project context {index}: {}", "x".repeat(320)),
+                &["architecture".to_string()],
+                Some("session-project-memory-truncated"),
+                "test-model",
+                false,
+                None,
+            )
+            .await
+            .expect("write project memory");
+    }
 
     let mut session =
         bamboo_agent_core::Session::new("session-project-memory-truncated", "test-model");
@@ -484,10 +542,18 @@ async fn external_memory_truncates_project_memory_index_and_adds_freshness_note(
 
     assert!(system_prompt.contains("### Project Durable Memory Index"));
     assert!(system_prompt.contains("showing "));
-    assert!(
-        system_prompt.contains("Historical memory index entry")
-            || system_prompt.contains("Older memory index entry")
-    );
+    assert!(system_prompt.contains("Architectural note"));
+}
+
+#[test]
+fn memory_freshness_note_marks_old_index_entries() {
+    let note = bamboo_memory::memory_store::render_memory_freshness_note(
+        "2026-03-01T00:00:00Z",
+        bamboo_memory::memory_store::FreshnessKind::Index,
+    )
+    .expect("old memory index should carry a freshness warning");
+    assert!(note.contains("memory index entry"));
+    assert!(note.contains("verify"));
 }
 
 #[tokio::test]
@@ -821,17 +887,13 @@ async fn external_memory_prefers_project_dream_over_global_fallback() {
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     let project_key = project_id.to_string();
 
-    project_memory
-        .write_project_dream_view(
-            project_key.as_str(),
-            "# Bamboo Dream Notebook\n\nProject dream context",
-        )
-        .await
-        .expect("write project dream");
-    store
-        .write_dream_view("# Bamboo Dream Notebook\n\nGlobal dream fallback")
-        .await
-        .expect("write global dream");
+    publish_project_dream(
+        &project_memory,
+        project_key.as_str(),
+        "# Bamboo Dream Notebook\n\nProject dream context",
+    )
+    .await;
+    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal dream fallback").await;
 
     let mut session = bamboo_agent_core::Session::new("session-project-dream", "test-model");
     session.set_project_id_meta(project_id.to_string());
@@ -865,10 +927,7 @@ async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index
     let workspace = temp_dir.path().join("workspace-global-dream-fallback");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
 
-    store
-        .write_dream_view("# Bamboo Dream Notebook\n\nGlobal fallback dream")
-        .await
-        .expect("write global dream");
+    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal fallback dream").await;
 
     let mut session =
         bamboo_agent_core::Session::new("session-global-dream-fallback", "test-model");
@@ -920,6 +979,12 @@ async fn external_memory_omits_project_index_when_project_prompt_injection_disab
         )
         .await
         .expect("save project memory");
+    publish_project_dream(
+        &project_memory,
+        project_key.as_str(),
+        "# Bamboo Dream Notebook\n\nProject dream remains available",
+    )
+    .await;
 
     let mut session = bamboo_agent_core::Session::new("session-no-project-index", "test-model");
     session.set_project_id_meta(project_id.to_string());
@@ -990,17 +1055,13 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
         )
         .await
         .expect("save relevant project memory");
-    project_memory
-        .write_project_dream_view(
-            project_key.as_str(),
-            "# Bamboo Dream Notebook\n\nProject dream context",
-        )
-        .await
-        .expect("write project dream");
-    store
-        .write_dream_view("# Bamboo Dream Notebook\n\nGlobal dream fallback")
-        .await
-        .expect("write global dream");
+    publish_project_dream(
+        &project_memory,
+        project_key.as_str(),
+        "# Bamboo Dream Notebook\n\nProject dream context",
+    )
+    .await;
+    publish_global_dream(&store, "# Bamboo Dream Notebook\n\nGlobal dream fallback").await;
 
     let mut session = bamboo_agent_core::Session::new("session-global-dream-mode", "test-model");
     session.set_project_id_meta(project_id.to_string());

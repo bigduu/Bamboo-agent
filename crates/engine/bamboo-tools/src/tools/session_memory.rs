@@ -4,8 +4,9 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 use bamboo_agent_core::{ToolError, ToolResult};
-use bamboo_memory::memory::DEFAULT_TOPIC;
-use bamboo_memory::memory_store::{count_chars, truncate_chars, MemoryStore};
+use bamboo_memory::memory_store::{
+    count_chars, truncate_chars, MemoryStore, DEFAULT_SESSION_TOPIC,
+};
 
 pub const MAX_SESSION_NOTE_CHARS: usize = 12_000;
 
@@ -83,7 +84,7 @@ pub async fn execute_session_memory_action(
     let topic = topic
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_TOPIC);
+        .unwrap_or(DEFAULT_SESSION_TOPIC);
     let session_guard = session_memory_lock(session_id);
     let _guard = session_guard.lock().await;
 

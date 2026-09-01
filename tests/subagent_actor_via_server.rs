@@ -19,7 +19,7 @@ use bamboo_agent_core::storage::Storage as _;
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{Role, Session};
 use bamboo_domain::session::tool_types::{FunctionCall, ToolCall};
-use bamboo_server::app_state::AppState;
+use bamboo_server::app_state::{AppState, MemoryStore};
 use bamboo_server::tools::ToolSurface;
 use tempfile::TempDir;
 
@@ -49,9 +49,12 @@ async fn subagent_create_runs_actor_process_through_the_server() {
     )
     .unwrap();
 
-    let state = AppState::new(home.path().to_path_buf())
-        .await
-        .expect("app state boots");
+    let state = AppState::new_with_memory_store(
+        home.path().to_path_buf(),
+        MemoryStore::new(home.path().join("jiandu")),
+    )
+    .await
+    .expect("app state boots");
 
     // A root session for the parent (workspace = the temp dir).
     let parent_id = "parent-actor-e2e";
@@ -193,9 +196,12 @@ async fn cancel_running_actor_child_through_the_server() {
     )
     .unwrap();
 
-    let state = AppState::new(home.path().to_path_buf())
-        .await
-        .expect("app state boots");
+    let state = AppState::new_with_memory_store(
+        home.path().to_path_buf(),
+        MemoryStore::new(home.path().join("jiandu")),
+    )
+    .await
+    .expect("app state boots");
 
     let parent_id = "parent-cancel-e2e";
     let mut parent = Session::new(parent_id, "claude-test");

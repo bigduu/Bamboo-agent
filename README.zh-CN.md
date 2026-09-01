@@ -79,17 +79,17 @@ graph TD
 
 ## 旗舰能力深读
 
-### 记忆系统 · `crates/infra/bamboo-memory`
+### 记忆系统 · Jiandu + `crates/infra/bamboo-memory`
 
-记忆分三层：
+Bamboo 不再维护第二套记忆实现。窄 `bamboo-memory` facade 通过精确版本依赖，把规范存储、确定性词法检索、会话便签和 Dream 快照交给 Jiandu。
 
-- **会话便签** — 由 `session_note` 工具写入（动作：`session_read` / `session_append` / `session_replace` / `session_clear` / `session_list_topics`），是当前会话内的临时草稿/事实。
-- **Dream 笔记本** — 后台把一段会话"梦境化"，提炼成结构化的候选记忆并整合进笔记本（`auto_dream.rs`）。
-- **持久记忆** — 跨会话存活，带 frontmatter（类型、状态、来源、关系、检索元数据），作用域分为 `session` / `project` / `global`（`memory_store/types.rs`）。
+- **会话便签** — `session_note` 工具（`read` / `append` / `replace` / `clear` / `list_topics`）保存单个会话内抗压缩的上下文。
+- **持久记忆** — 原子化的 Global 或一等 Project 事实，包含类型、状态、来源、关系和词法检索元数据。Jiandu 是唯一事实源，不存在 embedding 流水线。
+- **Dream** — Global 或 Project 的派生方向快照，不是规范记忆记录。Bamboo 先抽取事实和 Ledger 候选，再捕获 Jiandu generation、读取规范 `MEMORY.md`、只合成一次，最后通过 compare-and-swap 发布，避免过时任务覆盖新事实。
 
-**自动梦境**（`MemoryConfig.auto_dream_enabled`，**默认关闭**，因为会消耗模型 token）在会话演进时抽取（extraction）、整合（consolidation）并生成 Dream；支持三种模式：`Incremental`、`Refine`、`Rebuild`。
+Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会话和面向未来事项的 Ledger 仍留在 `~/.bamboo`，两套存储不会混在一起。
 
-**Gardener（后台园丁）**（`bamboo-engine/src/gardener.rs`，`gardener_enabled` 默认关闭）专门拆分"多主题的 blob 记忆"。它有成本护栏：单次运行硬性拆分上限、缓慢节奏（默认按天），且**当确定性预筛找不到候选时不调用任何 LLM**——空闲的 gardener 零成本。拆分的"工作清单"由 `MemoryStore::scan_blob_candidates` 免费产出，只有拆分"决策"才用模型。
+**Gardener（后台园丁）**（`bamboo-engine/src/gardener.rs`）负责拆分多主题 blob 并整合重复项。它有单次运行硬上限，且**当确定性预筛找不到候选时不调用任何 LLM**；只有经过模型审阅的维护决策会产生模型成本。
 
 > 为什么重要：记忆系统让助理在长期使用中越来越懂你的项目，而成本可控、数据本地。
 
