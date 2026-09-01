@@ -329,7 +329,7 @@ in-process runtime toggle.
 
 | Field | Purpose |
 |---|---|
-| `max_concurrent` | Cap on simultaneously running sub-agents. |
+| `max_concurrent` | Cap on simultaneously running sub-agents (default: 200). |
 | `worker_bin` / `worker_args` | Override the sub-agent worker binary/args (defaults to the current `bamboo` binary's `subagent-worker` mode). |
 | `fabric_dir` | Where the actor fabric's mailbox/state files live. |
 | `executor` | Which executor spawns a child: `"echo"` (test stub) \| `"bamboo_runtime"` (default — a full nested Bamboo agent loop) \| `"claude_code"` \| `"codex"`. |

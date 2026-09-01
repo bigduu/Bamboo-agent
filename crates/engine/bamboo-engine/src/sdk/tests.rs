@@ -814,6 +814,12 @@ async fn distinct_router_collision_is_a_terminal_setup_error_not_a_phantom_run()
 #[tokio::test]
 async fn s_t2_1_run_child_spawn_emits_started_event_completed_in_order() {
     let mut harness = build_harness(Arc::new(CompletedProvider), Vec::new(), &[]).await;
+    let child_tx = crate::runtime::execution::session_events::get_or_create_event_sender(
+        &harness.ctx.session_event_senders,
+        &harness.child_session_id,
+    )
+    .await;
+    let mut child_rx = child_tx.subscribe();
 
     // The adapter emits SubAgentStarted before enqueue; simulate that here so the
     // full ordering can be asserted.
@@ -848,24 +854,30 @@ async fn s_t2_1_run_child_spawn_emits_started_event_completed_in_order() {
         .iter()
         .position(|e| matches!(e, AgentEvent::SubAgentCompleted { .. }))
         .expect("SubAgentCompleted present");
-    let event_idx = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::SubAgentEvent { .. }));
-
     assert!(
         started_idx < completed_idx,
         "Started must precede Completed: {events:?}"
     );
-    if let Some(event_idx) = event_idx {
-        assert!(
-            started_idx < event_idx,
-            "Started must precede SubAgentEvent"
-        );
-        assert!(
-            event_idx < completed_idx,
-            "SubAgentEvent must precede Completed"
-        );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::SubAgentEvent { .. })),
+        "raw child events belong only to the child's independently subscribable channel"
+    );
+    let mut child_events = Vec::new();
+    while let Ok(event) = child_rx.try_recv() {
+        child_events.push(event);
     }
+    assert!(
+        !child_events.is_empty(),
+        "the child session must retain its independently subscribable event stream"
+    );
+    assert!(
+        child_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Token { .. })),
+        "the child channel must retain full-fidelity token events"
+    );
 
     match events.last().unwrap() {
         AgentEvent::SubAgentCompleted { status, .. } => {

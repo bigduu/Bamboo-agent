@@ -1928,6 +1928,7 @@ mod tests {
                 serde_json::to_value(Message::user("base task")).unwrap(),
             ],
             activation_run_id: Some(activation_run_id.to_string()),
+            execution_epoch: 1,
             initial_session_messages: deliveries,
             secrets: RunSecrets::default(),
         }

@@ -495,6 +495,123 @@ async fn subscribe_event_unsubscribe_roundtrip() {
     server.stop().await;
 }
 
+/// A frontend may keep the parent session open while independently opening a
+/// child session. Full-fidelity child tokens must stay on `agent.{child}`; the
+/// parent receives only lifecycle projection events. This is the network half
+/// of the child-session isolation contract (the engine SDK test covers the
+/// producer half by asserting it publishes raw tokens only to the child sender).
+#[actix_web::test]
+async fn parent_and_child_agent_channels_are_independently_subscribable() {
+    let server = TestServer::start(|_| {}).await;
+    let parent_id = "sess_isolated_parent";
+    let child_id = "sess_isolated_child";
+
+    let mut parent = bamboo_agent_core::Session::new(parent_id, "test-model");
+    register_session(&server.state, &mut parent).await;
+    let mut child =
+        bamboo_agent_core::Session::new_child(child_id, parent_id, "test-model", "isolated child");
+    register_session(&server.state, &mut child).await;
+
+    let mut parent_conn = connect_local(&server).await;
+    let mut child_conn = connect_local(&server).await;
+    let parent_ch = format!("agent.{parent_id}");
+    let child_ch = format!("agent.{child_id}");
+    send_json(
+        &mut parent_conn,
+        json!({"type": "subscribe", "ch": parent_ch}),
+    )
+    .await;
+    send_json(
+        &mut child_conn,
+        json!({"type": "subscribe", "ch": child_ch}),
+    )
+    .await;
+
+    // Bounded retries synchronize with the asynchronous channel-forwarder
+    // installation without relying on a fixed sleep.
+    let parent_event = {
+        let mut got = None;
+        let overall = tokio::time::Instant::now() + RECV_TIMEOUT;
+        while tokio::time::Instant::now() < overall {
+            server
+                .state
+                .get_session_event_sender(parent_id)
+                .await
+                .send(AgentEvent::SubAgentStarted {
+                    parent_session_id: parent_id.into(),
+                    child_session_id: child_id.into(),
+                    title: Some("isolated child".into()),
+                })
+                .ok();
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(150), next_envelope(&mut parent_conn))
+                    .await
+            {
+                got = Some(event);
+                break;
+            }
+        }
+        got.expect("parent lifecycle event reaches the parent channel")
+    };
+    assert_eq!(parent_event["ch"], parent_ch);
+    assert_eq!(parent_event["event"]["type"], "sub_agent_started");
+
+    let child_event = {
+        let mut got = None;
+        let overall = tokio::time::Instant::now() + RECV_TIMEOUT;
+        while tokio::time::Instant::now() < overall {
+            server
+                .state
+                .get_session_event_sender(child_id)
+                .await
+                .send(AgentEvent::Token {
+                    content: "child-full-fidelity".into(),
+                })
+                .ok();
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(150), next_envelope(&mut child_conn))
+                    .await
+            {
+                got = Some(event);
+                break;
+            }
+        }
+        got.expect("child token reaches an independently opened child channel")
+    };
+    assert_eq!(child_event["ch"], child_ch);
+    assert_eq!(child_event["event"]["type"], "token");
+    assert_eq!(child_event["event"]["content"], "child-full-fidelity");
+
+    // Retry synchronization can leave duplicate lifecycle frames queued on the
+    // parent socket. Drain them, then publish a distinct child-only marker and
+    // prove it cannot leak onto the parent's session channel.
+    while let Ok(Some(_)) =
+        tokio::time::timeout(Duration::from_millis(100), next_envelope(&mut parent_conn)).await
+    {
+    }
+    server
+        .state
+        .get_session_event_sender(child_id)
+        .await
+        .send(AgentEvent::Token {
+            content: "child-only-marker".into(),
+        })
+        .expect("child subscriber remains attached");
+    let marker = next_envelope(&mut child_conn)
+        .await
+        .expect("child-only marker reaches child frontend");
+    assert_eq!(marker["ch"], child_ch);
+    assert_eq!(marker["event"]["content"], "child-only-marker");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), next_envelope(&mut parent_conn))
+            .await
+            .is_err(),
+        "a child token must never be projected onto the parent agent channel"
+    );
+
+    server.stop().await;
+}
+
 // ── Scenario 2: feed cursor resume ──────────────────────────────────────────
 
 /// Publish a couple of ChangeEvents to the account feed, then connect and

@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -395,36 +394,16 @@ async fn run_child_spawn_inner(
         .save_runtime_session(&mut session)
         .await;
 
-    // Forward ALL child events to parent.
+    // Parent projection is intentionally lifecycle-only. The child's complete
+    // event stream already lives on `agent.{child_session_id}` and can be
+    // opened independently by the frontend. Recursively wrapping every token
+    // in `SubAgentEvent` multiplies one busy child stream into every ancestor
+    // channel (O(depth × tokens)) and makes 200-way fan-out untenable.
+    //
+    // Keep only the low-rate Started/Heartbeat/Completed projection on the
+    // parent. `SubAgentStarted` is published by the spawn admission path and
+    // `SubAgentCompleted` by the durable completion path below.
     let forwarder_done = CancellationToken::new();
-    {
-        let mut rx = child_tx.subscribe();
-        let parent_tx = parent_tx.clone();
-        let job_clone = job.clone();
-        let done = forwarder_done.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = done.cancelled() => break,
-                    evt = rx.recv() => {
-                        match evt {
-                            Ok(event) => {
-                                let _ = parent_tx.send(AgentEvent::SubAgentEvent {
-                                    parent_session_id: job_clone.parent_session_id.clone(),
-                                    child_session_id: job_clone.child_session_id.clone(),
-                                    event: Box::new(event),
-                                });
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                continue;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        });
-    }
     {
         let parent_tx = parent_tx.clone();
         let job_clone = job.clone();

@@ -81,7 +81,8 @@ fn default_title_generated() -> bool {
 ///
 /// ## Sub-agents (Async Spawn)
 /// - `SubAgentStarted` - A child session is created and scheduled to run
-/// - `SubAgentEvent` - Forwarded raw child event (full fidelity)
+/// - `SubAgentEvent` - Legacy parent projection of a raw child event; current
+///   runtimes publish full fidelity on the child's own session channel
 /// - `SubAgentHeartbeat` - Periodic heartbeat while the child is running
 /// - `SubAgentCompleted` - Child session finished (completed/cancelled/error)
 ///
@@ -390,9 +391,9 @@ pub enum AgentEvent {
         title: Option<String>,
     },
 
-    /// Forwarded raw child event to the parent session stream.
-    ///
-    /// Child sessions are not allowed to spawn further sessions, so this should not nest.
+    /// Legacy raw child projection on the parent session stream. Retained for
+    /// wire compatibility; current runtimes publish raw events only on the
+    /// child's own independently subscribable session channel.
     SubAgentEvent {
         parent_session_id: String,
         child_session_id: String,
