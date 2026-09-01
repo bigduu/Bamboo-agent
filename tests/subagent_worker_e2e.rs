@@ -86,6 +86,7 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 1,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -98,6 +99,14 @@ async fn real_bamboo_binary_serves_a_subagent_run() {
         match frame {
             ChildFrame::Event { event } => {
                 if event["type"] == "token" {
+                    saw_token = true;
+                }
+            }
+            ChildFrame::EventBatch { batch } => {
+                batch
+                    .validate()
+                    .expect("worker emitted a valid event batch");
+                if batch.events.iter().any(|event| event["type"] == "token") {
                     saw_token = true;
                 }
             }

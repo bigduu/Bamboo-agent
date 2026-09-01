@@ -1585,6 +1585,7 @@ while IFS= read -r ignored; do :; done
                     ),
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: RunSecrets::default(),
                 },
@@ -1888,6 +1889,7 @@ exit 2
                     }),
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: RunSecrets::default(),
                 },
@@ -1965,6 +1967,7 @@ exit 2
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: RunSecrets {
                 codex_provider_token: Some(SecretValue::new("bcx1_app_server_secret")),

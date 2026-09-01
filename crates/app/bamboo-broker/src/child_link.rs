@@ -14,7 +14,7 @@ use bamboo_subagent::{
 };
 use chrono::Utc;
 
-use crate::client::BrokerClient;
+use crate::client::{BrokerClient, BrokerStreamEvent};
 use crate::error::{BrokerError, BrokerResult};
 
 /// A parent→child link over the broker, addressing the child by its mailbox id.
@@ -39,7 +39,7 @@ impl BrokerChildLink {
         token: &str,
         child: impl Into<String>,
     ) -> BrokerResult<Self> {
-        let mut client = BrokerClient::connect(endpoint, parent.clone(), token).await?;
+        let mut client = BrokerClient::connect_actor(endpoint, parent.clone(), token).await?;
         client.subscribe().await?;
         Ok(Self {
             client,
@@ -121,8 +121,21 @@ impl BrokerChildLink {
             return Ok(None);
         }
         loop {
-            let Some(msg) = self.client.next_message().await else {
-                return Ok(None);
+            let msg = match self.client.next_message_or_event_batch().await {
+                BrokerStreamEvent::EventBatch(Some(delivery)) => {
+                    if self.run_id.as_ref() != Some(&delivery.correlation_id) {
+                        continue;
+                    }
+                    delivery.batch.validate().map_err(|error| {
+                        BrokerError::Transport(format!("invalid actor event batch: {error}"))
+                    })?;
+                    return Ok(Some(ChildFrame::EventBatch {
+                        batch: delivery.batch,
+                    }));
+                }
+                BrokerStreamEvent::EventBatch(None) => continue,
+                BrokerStreamEvent::Message(Some(message)) => message,
+                BrokerStreamEvent::Message(None) => return Ok(None),
             };
             let id = msg.id.clone();
             // Only this run's frames; ack + skip anything else so the mailbox drains.
@@ -131,7 +144,14 @@ impl BrokerChildLink {
                 continue;
             }
             let frame = match msg.kind {
-                InboxKind::Event => Some(ChildFrame::Event { event: msg.body }),
+                InboxKind::Event => {
+                    match serde_json::from_value::<bamboo_subagent::ActorEventBatch>(
+                        msg.body.clone(),
+                    ) {
+                        Ok(batch) => Some(ChildFrame::EventBatch { batch }),
+                        Err(_) => Some(ChildFrame::Event { event: msg.body }),
+                    }
+                }
                 InboxKind::SessionMessageAdmitted => {
                     let confirmation = serde_json::from_value(msg.body).map_err(|e| {
                         BrokerError::Transport(format!(
@@ -253,6 +273,7 @@ mod tests {
             permission_policy: None,
             messages: vec![],
             activation_run_id: None,
+            execution_epoch: 1,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -260,6 +281,7 @@ mod tests {
         .unwrap();
 
         let mut events = 0usize;
+        let mut saw_batch = false;
         let mut terminal = None;
         loop {
             match tokio::time::timeout(Duration::from_secs(5), link.next_frame())
@@ -268,6 +290,10 @@ mod tests {
                 .expect("link ok")
             {
                 Some(ChildFrame::Event { .. }) => events += 1,
+                Some(ChildFrame::EventBatch { batch }) => {
+                    saw_batch = true;
+                    events += batch.events.len();
+                }
                 Some(ChildFrame::Terminal { status, result, .. }) => {
                     terminal = Some((status, result));
                     break;
@@ -278,6 +304,10 @@ mod tests {
         }
 
         assert!(events >= 1, "expected streamed events, got {events}");
+        assert!(
+            saw_batch,
+            "a non-zero execution epoch must select event batches"
+        );
         let (status, result) = terminal.expect("a terminal frame");
         assert_eq!(status, bamboo_subagent::TerminalStatus::Completed);
         assert_eq!(result.as_deref(), Some("echo: hello world"));
@@ -427,6 +457,7 @@ mod tests {
             permission_policy: None,
             messages: vec![],
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -441,7 +472,7 @@ mod tests {
             .expect("a frame")
             .expect("ok")
         {
-            Some(ChildFrame::Event { .. }) => {}
+            Some(ChildFrame::Event { .. } | ChildFrame::EventBatch { .. }) => {}
             other => panic!("expected ready event first, got {other:?}"),
         }
         link.send(ParentFrame::Message {
@@ -480,6 +511,7 @@ mod tests {
             permission_policy: None,
             messages: vec![],
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -490,7 +522,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            Some(ChildFrame::Event { .. })
+            Some(ChildFrame::Event { .. } | ChildFrame::EventBatch { .. })
         ));
         let mut envelope =
             bamboo_domain::SessionMessageEnvelope::user_input("logical-child", "typed");
@@ -536,6 +568,7 @@ mod tests {
             permission_policy: None,
             messages: vec![],
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))

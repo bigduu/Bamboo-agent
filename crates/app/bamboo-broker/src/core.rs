@@ -15,27 +15,37 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_subagent::{InboxMessage, Mailbox, MsgId};
-use tokio::sync::{mpsc, Mutex};
+use bamboo_subagent::{ActorEventBatch, ActorEventQos, InboxMessage, Mailbox, MsgId};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::error::{BrokerError, BrokerResult};
 
+fn is_ordered_actor_message(message: &InboxMessage) -> bool {
+    matches!(
+        message.kind,
+        bamboo_subagent::InboxKind::Event | bamboo_subagent::InboxKind::Outcome
+    )
+}
+
 /// Default cap on a single mailbox's pending (undelivered-or-unacked) message
-/// count (#53). Generous: a live streaming Run can legitimately push
-/// hundreds of `Event`s while its subscriber briefly lags, and this only
-/// bites when nobody is draining at all (offline/never-subscribed session) —
-/// so it exists to bound worst-case disk use from a flood, not to throttle
-/// normal traffic. Override via [`BrokerCore::with_max_pending_per_mailbox`].
+/// count (#53). Generous enough for durable actor boundaries and ordinary
+/// mailbox bursts; live token/snapshot batches no longer touch Maildir. This
+/// bounds worst-case disk use for offline sessions rather than throttling live
+/// streams. Override via [`BrokerCore::with_max_pending_per_mailbox`].
 pub const DEFAULT_MAX_PENDING_PER_MAILBOX: usize = 50_000;
 
-/// An item pushed to a live subscriber's sink: either a durable mailbox message
-/// or an ephemeral out-of-band control signal. Both ride the same subscriber
-/// channel (so the server's single push arm handles them in arrival order), but
-/// a `Cancel` never touches the mailbox — it is not persisted, claimed, or
-/// acked. #50.
+/// Maximum live actor-event batches buffered for one subscriber. With the
+/// protocol's 64-event batch cap this bounds each actor link independently;
+/// overload drops a batch and is detected through its sequence range.
+pub const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 64;
+
+/// An item pushed to a live subscriber's control sink. Both variants bypass the
+/// bounded actor-data lane, so cancellation and ordinary mailbox traffic cannot
+/// be starved by token streams. A `Cancel` never touches the mailbox. #50.
 #[derive(Debug)]
 pub enum PushItem {
     /// A durable message claimed from the subscriber's mailbox.
@@ -44,11 +54,37 @@ pub enum PushItem {
     Cancel(MsgId),
 }
 
+/// One ordered actor event item. Durable mailbox Events and lossy live batches
+/// share this queue so a later durable boundary cannot overtake earlier tokens.
+/// Only `Live` holds a semaphore permit, bounding high-volume data without
+/// weakening durable delivery.
+#[derive(Debug)]
+pub(crate) enum EventPush {
+    Durable(InboxMessage),
+    Live {
+        correlation_id: MsgId,
+        batch: ActorEventBatch,
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+/// Result of publishing onto the bounded live event lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPublishOutcome {
+    Published,
+    Offline,
+    Dropped,
+    Rejected,
+}
+
 /// A live subscriber: its push sink plus the role it announced at handshake.
 /// The subscriber table doubles as the live-actor registry — presence here is
 /// connection-truth (subscribed == reachable now), fresher than any lease.
 struct Subscriber {
-    sink: mpsc::UnboundedSender<PushItem>,
+    control_sink: mpsc::UnboundedSender<PushItem>,
+    event_sink: mpsc::UnboundedSender<EventPush>,
+    live_event_capacity: Arc<Semaphore>,
+    ordered_actor_events: bool,
     /// Role announced in the `Hello` (`subagent_type`), if any — lets the bus
     /// answer "which connected actors serve role X" without a separate registry.
     role: Option<String>,
@@ -58,14 +94,19 @@ struct Subscriber {
 /// Cleanup compares the underlying channel identity so an older connection
 /// cannot unregister a newer replacement for the same session. #788.
 pub(crate) struct SubscriptionLease {
-    sink: mpsc::UnboundedSender<PushItem>,
+    control_sink: mpsc::UnboundedSender<PushItem>,
+}
+
+pub(crate) struct SubscriptionStreams {
+    pub control: mpsc::UnboundedReceiver<PushItem>,
+    pub events: mpsc::UnboundedReceiver<EventPush>,
 }
 
 /// In-process routing engine: owns the mailbox root and the live subscriber table.
 pub struct BrokerCore {
     root: PathBuf,
     /// session_id -> live subscriber. Present only while a client is subscribed.
-    subscribers: Mutex<HashMap<String, Subscriber>>,
+    subscribers: RwLock<HashMap<String, Subscriber>>,
     /// Per-mailbox pending-message cap (#53); see
     /// [`DEFAULT_MAX_PENDING_PER_MAILBOX`].
     max_pending_per_mailbox: usize,
@@ -79,15 +120,19 @@ pub struct BrokerCore {
     /// lagging subscriber paid ~O(backlog²) total directory-scan work
     /// climbing toward the cap (review finding #2 on #491/#53).
     pending_counts: Mutex<HashMap<String, usize>>,
+    event_queue_capacity: usize,
+    dropped_event_batches: AtomicU64,
 }
 
 impl BrokerCore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            subscribers: Mutex::new(HashMap::new()),
+            subscribers: RwLock::new(HashMap::new()),
             max_pending_per_mailbox: DEFAULT_MAX_PENDING_PER_MAILBOX,
             pending_counts: Mutex::new(HashMap::new()),
+            event_queue_capacity: DEFAULT_EVENT_QUEUE_CAPACITY,
+            dropped_event_batches: AtomicU64::new(0),
         }
     }
 
@@ -96,6 +141,11 @@ impl BrokerCore {
     /// [`Self::new`] before wrapping in `Arc`.
     pub fn with_max_pending_per_mailbox(mut self, max: usize) -> Self {
         self.max_pending_per_mailbox = max;
+        self
+    }
+
+    pub fn with_event_queue_capacity(mut self, capacity: usize) -> Self {
+        self.event_queue_capacity = capacity.max(1);
         self
     }
 
@@ -163,9 +213,9 @@ impl BrokerCore {
         session_id: &str,
         role: Option<&str>,
     ) -> BrokerResult<mpsc::UnboundedReceiver<PushItem>> {
-        self.subscribe_with_lease(session_id, role)
+        self.subscribe_streams(session_id, role, false)
             .await
-            .map(|(rx, _lease)| rx)
+            .map(|(streams, _lease)| streams.control)
     }
 
     /// Server-facing subscription API that returns connection-scoped
@@ -175,13 +225,29 @@ impl BrokerCore {
         &self,
         session_id: &str,
         role: Option<&str>,
-    ) -> BrokerResult<(mpsc::UnboundedReceiver<PushItem>, SubscriptionLease)> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let lease = SubscriptionLease { sink: tx.clone() };
-        self.subscribers.lock().await.insert(
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        self.subscribe_streams(session_id, role, true).await
+    }
+
+    async fn subscribe_streams(
+        &self,
+        session_id: &str,
+        role: Option<&str>,
+        ordered_actor_events: bool,
+    ) -> BrokerResult<(SubscriptionStreams, SubscriptionLease)> {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let live_event_capacity = Arc::new(Semaphore::new(self.event_queue_capacity));
+        let lease = SubscriptionLease {
+            control_sink: control_tx.clone(),
+        };
+        self.subscribers.write().await.insert(
             session_id.to_string(),
             Subscriber {
-                sink: tx.clone(),
+                control_sink: control_tx.clone(),
+                event_sink: event_tx.clone(),
+                live_event_capacity,
+                ordered_actor_events,
                 role: role.map(str::to_string),
             },
         );
@@ -191,10 +257,18 @@ impl BrokerCore {
         // then newly delivered, all in time order.
         let preload: BrokerResult<()> = async {
             for d in mb.recover().await? {
-                let _ = tx.send(PushItem::Message(d.msg));
+                if ordered_actor_events && is_ordered_actor_message(&d.msg) {
+                    let _ = event_tx.send(EventPush::Durable(d.msg));
+                } else {
+                    let _ = control_tx.send(PushItem::Message(d.msg));
+                }
             }
             for d in mb.drain().await? {
-                let _ = tx.send(PushItem::Message(d.msg));
+                if ordered_actor_events && is_ordered_actor_message(&d.msg) {
+                    let _ = event_tx.send(EventPush::Durable(d.msg));
+                } else {
+                    let _ = control_tx.send(PushItem::Message(d.msg));
+                }
             }
             Ok(())
         }
@@ -203,7 +277,57 @@ impl BrokerCore {
             self.unsubscribe_if_owner(session_id, &lease).await;
             return Err(error);
         }
-        Ok((rx, lease))
+        Ok((
+            SubscriptionStreams {
+                control: control_rx,
+                events: event_rx,
+            },
+            lease,
+        ))
+    }
+
+    /// Publish a non-durable actor event batch to the target's bounded live
+    /// lane. No filesystem operation occurs here. Full queues drop the current
+    /// batch and increment a metric; the next delivered `first_seq` exposes the
+    /// gap so the host/UI can reload authoritative state.
+    pub async fn publish_event_batch(
+        &self,
+        to: &str,
+        correlation_id: &MsgId,
+        batch: ActorEventBatch,
+    ) -> EventPublishOutcome {
+        if batch.validate().is_err() || batch.qos == ActorEventQos::Durable {
+            return EventPublishOutcome::Rejected;
+        }
+        let (sink, capacity) = {
+            let subscribers = self.subscribers.read().await;
+            let Some(subscriber) = subscribers.get(to) else {
+                return EventPublishOutcome::Offline;
+            };
+            (
+                subscriber.event_sink.clone(),
+                Arc::clone(&subscriber.live_event_capacity),
+            )
+        };
+        let permit = match capacity.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.dropped_event_batches.fetch_add(1, Ordering::Relaxed);
+                return EventPublishOutcome::Dropped;
+            }
+        };
+        match sink.send(EventPush::Live {
+            correlation_id: correlation_id.clone(),
+            batch,
+            _permit: permit,
+        }) {
+            Ok(()) => EventPublishOutcome::Published,
+            Err(_) => EventPublishOutcome::Offline,
+        }
+    }
+
+    pub fn dropped_event_batches(&self) -> u64 {
+        self.dropped_event_batches.load(Ordering::Relaxed)
     }
 
     /// Out-of-band cancel: if `to` is currently subscribed, push an ephemeral
@@ -213,10 +337,10 @@ impl BrokerCore {
     /// received it (a cancel for an offline session is a meaningless no-op — the
     /// run isn't happening). #50.
     pub async fn cancel(&self, to: &str, correlation_id: &MsgId) -> bool {
-        let subs = self.subscribers.lock().await;
+        let subs = self.subscribers.read().await;
         match subs.get(to) {
             Some(sub) => sub
-                .sink
+                .control_sink
                 .send(PushItem::Cancel(correlation_id.clone()))
                 .is_ok(),
             None => false,
@@ -226,7 +350,7 @@ impl BrokerCore {
     /// Drop the subscriber for `session_id` (connection closed). Unacked messages
     /// remain in `cur/` for redelivery on the next subscribe.
     pub async fn unsubscribe(&self, session_id: &str) {
-        self.subscribers.lock().await.remove(session_id);
+        self.subscribers.write().await.remove(session_id);
     }
 
     /// Remove `session_id` only if `lease` still owns its subscriber entry.
@@ -237,10 +361,10 @@ impl BrokerCore {
         session_id: &str,
         lease: &SubscriptionLease,
     ) -> bool {
-        let mut subscribers = self.subscribers.lock().await;
+        let mut subscribers = self.subscribers.write().await;
         let owns_current = subscribers
             .get(session_id)
-            .is_some_and(|subscriber| subscriber.sink.same_channel(&lease.sink));
+            .is_some_and(|subscriber| subscriber.control_sink.same_channel(&lease.control_sink));
         if owns_current {
             subscribers.remove(session_id);
         }
@@ -268,7 +392,7 @@ impl BrokerCore {
 
     /// True if a client is currently subscribed to `session_id`.
     pub async fn is_subscribed(&self, session_id: &str) -> bool {
-        self.subscribers.lock().await.contains_key(session_id)
+        self.subscribers.read().await.contains_key(session_id)
     }
 
     /// Reclaim orphan mailbox dirs: delete every mailbox that is EMPTY and has NO
@@ -289,7 +413,7 @@ impl BrokerCore {
 
         // Snapshot the currently-subscribed ids under a brief lock, then release.
         let subscribed: std::collections::HashSet<String> =
-            self.subscribers.lock().await.keys().cloned().collect();
+            self.subscribers.read().await.keys().cloned().collect();
 
         // Phase 1 (off-lock, off-worker): find empty, unsubscribed candidate dirs.
         let scan_root = root.clone();
@@ -325,7 +449,7 @@ impl BrokerCore {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if self.subscribers.lock().await.contains_key(&id) {
+            if self.subscribers.read().await.contains_key(&id) {
                 continue; // subscribed since the snapshot — keep.
             }
             // Re-check emptiness and remove back-to-back in one blocking call (no
@@ -374,7 +498,7 @@ impl BrokerCore {
     /// "list workers" reads against the file/HTTP registries.
     pub async fn connected(&self) -> Vec<(String, Option<String>)> {
         self.subscribers
-            .lock()
+            .read()
             .await
             .iter()
             .map(|(id, sub)| (id.clone(), sub.role.clone()))
@@ -386,7 +510,7 @@ impl BrokerCore {
     /// lease-liveness + connect-fail-failover dance for schedulable selection).
     pub async fn connected_by_role(&self, role: &str) -> Vec<String> {
         self.subscribers
-            .lock()
+            .read()
             .await
             .iter()
             .filter(|(_, sub)| sub.role.as_deref() == Some(role))
@@ -400,15 +524,23 @@ impl BrokerCore {
     /// messages are only re-pushed on a fresh `subscribe`, so a live subscriber
     /// is not spammed with not-yet-acked duplicates.
     async fn push_new(&self, session_id: &str) -> BrokerResult<()> {
-        let tx = {
-            let subs = self.subscribers.lock().await;
+        let (control_tx, event_tx, ordered_actor_events) = {
+            let subs = self.subscribers.read().await;
             match subs.get(session_id) {
-                Some(sub) => sub.sink.clone(),
+                Some(sub) => (
+                    sub.control_sink.clone(),
+                    sub.event_sink.clone(),
+                    sub.ordered_actor_events,
+                ),
                 None => return Ok(()),
             }
         };
         for d in self.mailbox(session_id).drain().await? {
-            let _ = tx.send(PushItem::Message(d.msg));
+            if ordered_actor_events && is_ordered_actor_message(&d.msg) {
+                let _ = event_tx.send(EventPush::Durable(d.msg));
+            } else {
+                let _ = control_tx.send(PushItem::Message(d.msg));
+            }
         }
         Ok(())
     }
@@ -441,6 +573,31 @@ mod tests {
         (d, c)
     }
 
+    fn event_batch(seq: u64, qos: ActorEventQos) -> ActorEventBatch {
+        let event = match qos {
+            ActorEventQos::Ephemeral => {
+                serde_json::json!({"type":"token","content":seq.to_string()})
+            }
+            ActorEventQos::Snapshot => {
+                serde_json::json!({"type":"runner_progress","session_id":"child","round_count":seq})
+            }
+            ActorEventQos::Durable => {
+                serde_json::json!({"type":"tool_start","tool_call_id":"t"})
+            }
+        };
+        ActorEventBatch {
+            logical_session: None,
+            activation_id: Some("activation".into()),
+            execution_epoch: 1,
+            source_node_id: None,
+            source_actor_id: Some("worker".into()),
+            first_seq: seq,
+            last_seq: seq,
+            qos,
+            events: vec![event],
+        }
+    }
+
     fn expect_message(item: PushItem) -> InboxMessage {
         match item {
             PushItem::Message(m) => m,
@@ -471,6 +628,114 @@ mod tests {
         c.deliver("child", &m).await.unwrap();
         let got = expect_message(rx.recv().await.expect("live push"));
         assert_eq!(got.id, m.id);
+    }
+
+    #[tokio::test]
+    async fn live_event_batch_bypasses_mailbox() {
+        let (_d, c) = core();
+        let (mut streams, _lease) = c.subscribe_with_lease("parent", None).await.unwrap();
+        let correlation_id = MsgId::new();
+        assert_eq!(
+            c.publish_event_batch(
+                "parent",
+                &correlation_id,
+                event_batch(1, ActorEventQos::Ephemeral),
+            )
+            .await,
+            EventPublishOutcome::Published
+        );
+        let pushed = streams.events.recv().await.expect("live event batch");
+        let EventPush::Live {
+            correlation_id: pushed_correlation,
+            batch,
+            ..
+        } = pushed
+        else {
+            panic!("expected live event batch");
+        };
+        assert_eq!(pushed_correlation, correlation_id);
+        assert_eq!(batch.first_seq, 1);
+        assert_eq!(c.mailbox("parent").pending_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_and_durable_actor_events_keep_source_order() {
+        let (_d, c) = core();
+        let (mut streams, _lease) = c.subscribe_with_lease("parent", None).await.unwrap();
+        let correlation_id = MsgId::new();
+        assert_eq!(
+            c.publish_event_batch(
+                "parent",
+                &correlation_id,
+                event_batch(1, ActorEventQos::Ephemeral),
+            )
+            .await,
+            EventPublishOutcome::Published
+        );
+        let durable_batch = event_batch(2, ActorEventQos::Durable);
+        let durable_message = InboxMessage {
+            id: MsgId::new(),
+            from: AgentRef {
+                session_id: "worker".into(),
+                role: None,
+            },
+            kind: InboxKind::Event,
+            body: serde_json::to_value(durable_batch).unwrap(),
+            created_at: Utc::now(),
+            correlation_id: Some(correlation_id),
+        };
+        c.deliver("parent", &durable_message).await.unwrap();
+
+        assert!(matches!(
+            streams.events.recv().await,
+            Some(EventPush::Live { batch, .. }) if batch.first_seq == 1
+        ));
+        assert!(matches!(
+            streams.events.recv().await,
+            Some(EventPush::Durable(message)) if message.id == durable_message.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_event_lane_drops_data_but_not_control() {
+        let dir = TempDir::new().unwrap();
+        let c = BrokerCore::new(dir.path()).with_event_queue_capacity(1);
+        let (mut streams, _lease) = c.subscribe_with_lease("parent", None).await.unwrap();
+        let correlation_id = MsgId::new();
+        assert_eq!(
+            c.publish_event_batch(
+                "parent",
+                &correlation_id,
+                event_batch(1, ActorEventQos::Ephemeral),
+            )
+            .await,
+            EventPublishOutcome::Published
+        );
+        assert_eq!(
+            c.publish_event_batch(
+                "parent",
+                &correlation_id,
+                event_batch(2, ActorEventQos::Ephemeral),
+            )
+            .await,
+            EventPublishOutcome::Dropped
+        );
+        assert_eq!(c.dropped_event_batches(), 1);
+
+        assert!(c.cancel("parent", &correlation_id).await);
+        assert!(matches!(
+            streams.control.recv().await,
+            Some(PushItem::Cancel(id)) if id == correlation_id
+        ));
+        assert_eq!(
+            c.publish_event_batch(
+                "parent",
+                &correlation_id,
+                event_batch(3, ActorEventQos::Durable),
+            )
+            .await,
+            EventPublishOutcome::Rejected
+        );
     }
 
     #[tokio::test]

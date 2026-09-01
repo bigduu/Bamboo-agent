@@ -22,11 +22,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bamboo_subagent::{AgentRef, InboxMessage, MsgId};
+use bamboo_subagent::{ActorEventBatch, AgentRef, InboxKind, InboxMessage, MsgId};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
@@ -55,6 +55,10 @@ pub(crate) type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, M
 /// arrive promptly; 30s is a generous cap that still guarantees a caller can
 /// never hang indefinitely if the broker dies after receiving `Deliver`.
 const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The reader never lets live event traffic block durable/control frames on
+/// the same WebSocket. Overflow is dropped and exposed by the batch sequence.
+const CLIENT_EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// Each phase of explicit client shutdown is bounded independently. Sending a
 /// Close frame can stall behind a wedged transport, and a reader can fail to
@@ -168,6 +172,28 @@ pub enum ServeEvent {
     Cancel(Option<MsgId>),
 }
 
+#[derive(Debug)]
+pub struct ActorEventDelivery {
+    pub correlation_id: MsgId,
+    pub batch: ActorEventBatch,
+}
+
+#[derive(Debug)]
+enum ActorStreamItem {
+    Message(InboxMessage),
+    EventBatch {
+        delivery: ActorEventDelivery,
+        _permit: OwnedSemaphorePermit,
+    },
+}
+
+/// Combined receive result used by an actor parent link. Actor-mode clients
+/// preserve wire order across live batches, durable Events, and Outcome.
+pub enum BrokerStreamEvent {
+    Message(Option<InboxMessage>),
+    EventBatch(Option<ActorEventDelivery>),
+}
+
 /// A connected broker client bound to one session mailbox.
 pub struct BrokerClient {
     /// Declared first so Drop cancels the reader before the transport sink and
@@ -175,6 +201,9 @@ pub struct BrokerClient {
     reader: ReaderLifecycle,
     sink: WsSink,
     messages: mpsc::UnboundedReceiver<InboxMessage>,
+    messages_open: bool,
+    actor_stream: mpsc::UnboundedReceiver<ActorStreamItem>,
+    actor_stream_open: bool,
     delivered: mpsc::UnboundedReceiver<MsgId>,
     /// Correlated rejections for an in-flight `Deliver` (e.g. `MailboxFull`),
     /// demuxed independently of `delivered` so `deliver()` can distinguish
@@ -215,6 +244,17 @@ impl BrokerClient {
         Self::connect_with_tls(endpoint, agent, token, None).await
     }
 
+    /// Connect a parent-side actor link. Unlike the general mailbox client,
+    /// durable Event/Outcome messages stay on the same ordered receive lane as
+    /// live event batches.
+    pub(crate) async fn connect_actor(
+        endpoint: &str,
+        agent: AgentRef,
+        token: &str,
+    ) -> BrokerResult<Self> {
+        Self::connect_with_tls_mode(endpoint, agent, token, None, true).await
+    }
+
     /// Like [`connect`](Self::connect), but for `wss://` lets the caller
     /// supply a custom rustls [`rustls::ClientConfig`] — e.g. one built by
     /// [`client_config_trusting_cert`] that trusts exactly a self-signed
@@ -226,6 +266,16 @@ impl BrokerClient {
         agent: AgentRef,
         token: &str,
         tls_config: Option<rustls::ClientConfig>,
+    ) -> BrokerResult<Self> {
+        Self::connect_with_tls_mode(endpoint, agent, token, tls_config, false).await
+    }
+
+    async fn connect_with_tls_mode(
+        endpoint: &str,
+        agent: AgentRef,
+        token: &str,
+        tls_config: Option<rustls::ClientConfig>,
+        actor_stream_mode: bool,
     ) -> BrokerResult<Self> {
         let request = endpoint
             .into_client_request()
@@ -262,6 +312,8 @@ impl BrokerClient {
         }
 
         let (msg_tx, messages) = mpsc::unbounded_channel();
+        let (actor_tx, actor_stream) = mpsc::unbounded_channel();
+        let actor_capacity = Arc::new(Semaphore::new(CLIENT_EVENT_QUEUE_CAPACITY));
         let (del_tx, delivered) = mpsc::unbounded_channel();
         let (err_tx, errors) = mpsc::unbounded_channel();
         let (cancel_tx, cancels) = mpsc::unbounded_channel();
@@ -284,7 +336,40 @@ impl BrokerClient {
                 match frame {
                     Some(Ok(Message::Text(t))) => match BrokerFrame::from_text(&t) {
                         Ok(BrokerFrame::Message { message }) => {
-                            let _ = msg_tx.send(message);
+                            if actor_stream_mode
+                                && matches!(message.kind, InboxKind::Event | InboxKind::Outcome)
+                            {
+                                let _ = actor_tx.send(ActorStreamItem::Message(message));
+                            } else {
+                                let _ = msg_tx.send(message);
+                            }
+                        }
+                        Ok(BrokerFrame::EventBatch {
+                            correlation_id,
+                            batch,
+                        }) => {
+                            // Never wait here: a saturated data consumer must
+                            // not stop this reader from receiving an Outcome,
+                            // Cancel, approval, or delivery receipt.
+                            match Arc::clone(&actor_capacity).try_acquire_owned() {
+                                Ok(permit) => {
+                                    let _ = actor_tx.send(ActorStreamItem::EventBatch {
+                                        delivery: ActorEventDelivery {
+                                            correlation_id,
+                                            batch,
+                                        },
+                                        _permit: permit,
+                                    });
+                                }
+                                Err(_) => {
+                                    tracing::debug!(
+                                        correlation_id = %correlation_id.as_str(),
+                                        first_seq = batch.first_seq,
+                                        last_seq = batch.last_seq,
+                                        "dropping actor live batch at saturated client event lane"
+                                    );
+                                }
+                            }
                         }
                         Ok(BrokerFrame::Delivered { id }) => {
                             let _ = del_tx.send(id);
@@ -347,6 +432,9 @@ impl BrokerClient {
             reader,
             sink,
             messages,
+            messages_open: true,
+            actor_stream,
+            actor_stream_open: true,
             delivered,
             errors,
             cancels,
@@ -495,6 +583,38 @@ impl BrokerClient {
         msg
     }
 
+    /// Await the next ordinary control message or ordered actor-stream item.
+    /// Once the actor lane closes, queued controls are still drained.
+    pub async fn next_message_or_event_batch(&mut self) -> BrokerStreamEvent {
+        loop {
+            if !self.messages_open && !self.actor_stream_open {
+                return BrokerStreamEvent::Message(None);
+            }
+            tokio::select! {
+                biased;
+                message = self.messages.recv(), if self.messages_open => {
+                    match message {
+                        Some(message) => {
+                            return BrokerStreamEvent::Message(Some(message));
+                        }
+                        None => self.messages_open = false,
+                    }
+                }
+                item = self.actor_stream.recv(), if self.actor_stream_open => {
+                    match item {
+                        Some(ActorStreamItem::Message(message)) => {
+                            return BrokerStreamEvent::Message(Some(message));
+                        }
+                        Some(ActorStreamItem::EventBatch { delivery, .. }) => {
+                            return BrokerStreamEvent::EventBatch(Some(delivery));
+                        }
+                        None => self.actor_stream_open = false,
+                    }
+                }
+            }
+        }
+    }
+
     /// Await the next out-of-band cancel (the correlation id of the run to
     /// abort), demuxed independently of `next_message` so it can be received
     /// while the work loop is busy. `None` when the reader has exited. #50.
@@ -577,6 +697,23 @@ impl BrokerClient {
         self.send(ClientFrame::Cancel {
             to: to.into(),
             correlation_id: correlation_id.clone(),
+        })
+        .await
+    }
+
+    /// Publish a snapshot/ephemeral actor batch on the broker's live lane. The
+    /// send has no durability receipt by design; consumers detect loss through
+    /// sequence gaps and reconcile from the logical session snapshot.
+    pub async fn publish_event_batch(
+        &mut self,
+        to: &str,
+        correlation_id: &MsgId,
+        batch: ActorEventBatch,
+    ) -> BrokerResult<()> {
+        self.send(ClientFrame::PublishEventBatch {
+            to: to.into(),
+            correlation_id: correlation_id.clone(),
+            batch,
         })
         .await
     }
@@ -679,7 +816,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_subagent::{AskBody, AskMode, InboxKind};
+    use bamboo_subagent::{ActorEventQos, AskBody, AskMode, InboxKind};
     use chrono::Utc;
     use tokio_tungstenite::accept_async;
 
@@ -703,6 +840,86 @@ mod tests {
             created_at: Utc::now(),
             correlation_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn actor_mode_preserves_live_event_and_outcome_wire_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let run_id = MsgId::new();
+        let server_run_id = run_id.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("ws upgrade");
+            let _hello = ws.next().await.expect("hello").expect("hello frame");
+            ws.send(Message::text(BrokerFrame::Welcome.to_text()))
+                .await
+                .unwrap();
+            let _subscribe = ws
+                .next()
+                .await
+                .expect("subscribe")
+                .expect("subscribe frame");
+            let live = ActorEventBatch {
+                logical_session: None,
+                activation_id: None,
+                execution_epoch: 0,
+                source_node_id: None,
+                source_actor_id: Some("worker".into()),
+                first_seq: 1,
+                last_seq: 1,
+                qos: ActorEventQos::Ephemeral,
+                events: vec![serde_json::json!({"type":"token","content":"a"})],
+            };
+            ws.send(Message::text(
+                BrokerFrame::EventBatch {
+                    correlation_id: server_run_id.clone(),
+                    batch: live,
+                }
+                .to_text(),
+            ))
+            .await
+            .unwrap();
+            for kind in [InboxKind::Event, InboxKind::Outcome] {
+                let message = InboxMessage {
+                    id: MsgId::new(),
+                    from: test_agent("worker"),
+                    kind,
+                    body: serde_json::json!({}),
+                    created_at: Utc::now(),
+                    correlation_id: Some(server_run_id.clone()),
+                };
+                ws.send(Message::text(BrokerFrame::Message { message }.to_text()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut client = BrokerClient::connect_actor(&endpoint, test_agent("parent"), "ignored")
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        assert!(matches!(
+            client.next_message_or_event_batch().await,
+            BrokerStreamEvent::EventBatch(Some(ActorEventDelivery { batch, .. }))
+                if batch.first_seq == 1
+        ));
+        assert!(matches!(
+            client.next_message_or_event_batch().await,
+            BrokerStreamEvent::Message(Some(InboxMessage {
+                kind: InboxKind::Event,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            client.next_message_or_event_batch().await,
+            BrokerStreamEvent::Message(Some(InboxMessage {
+                kind: InboxKind::Outcome,
+                ..
+            }))
+        ));
     }
 
     /// Spawn a raw WS server that completes the client's `Hello`→`Welcome`

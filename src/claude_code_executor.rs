@@ -1312,6 +1312,7 @@ mod tests {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }
@@ -1326,6 +1327,7 @@ mod tests {
             permission_policy: None,
             messages,
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }

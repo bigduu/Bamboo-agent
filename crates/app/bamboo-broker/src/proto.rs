@@ -4,7 +4,7 @@
 //! [`AgentRef`] verbatim — the broker is a transport for those, it does not
 //! reinterpret them.
 
-use bamboo_subagent::{AgentRef, InboxMessage, MsgId};
+use bamboo_subagent::{ActorEventBatch, AgentRef, InboxMessage, MsgId};
 use serde::{Deserialize, Serialize};
 
 /// Client → broker.
@@ -16,6 +16,14 @@ pub enum ClientFrame {
     Hello { agent: AgentRef, token: String },
     /// Durably enqueue `message` into the mailbox of session `to`.
     Deliver { to: String, message: InboxMessage },
+    /// Publish a sequenced snapshot/ephemeral actor event batch to a live
+    /// subscriber without touching Maildir. This lane is deliberately lossy
+    /// and bounded; durable event batches must use [`ClientFrame::Deliver`].
+    PublishEventBatch {
+        to: String,
+        correlation_id: MsgId,
+        batch: ActorEventBatch,
+    },
     /// Start receiving this client's own mailbox (push). Backlog (incl. crash
     /// leftovers) is delivered first, then new messages as they arrive.
     Subscribe,
@@ -58,6 +66,12 @@ pub enum BrokerFrame {
     },
     /// A message pushed from the subscriber's mailbox.
     Message { message: InboxMessage },
+    /// A live actor event batch. No ack is required: sequence gaps trigger
+    /// snapshot reconciliation at the consumer.
+    EventBatch {
+        correlation_id: MsgId,
+        batch: ActorEventBatch,
+    },
     /// Receipt that a [`ClientFrame::Deliver`] was durably enqueued.
     Delivered { id: MsgId },
     /// Out-of-band cancel pushed to a live subscriber: abort the in-flight run
@@ -124,6 +138,11 @@ mod tests {
                 to: "child".into(),
                 message: ask_msg(),
             },
+            ClientFrame::PublishEventBatch {
+                to: "parent".into(),
+                correlation_id: MsgId::new(),
+                batch: event_batch(),
+            },
             ClientFrame::Subscribe,
             ClientFrame::Ack { id: MsgId::new() },
             ClientFrame::Cancel {
@@ -164,6 +183,10 @@ mod tests {
                 id: Some(MsgId::new()),
             },
             BrokerFrame::Message { message: ask_msg() },
+            BrokerFrame::EventBatch {
+                correlation_id: MsgId::new(),
+                batch: event_batch(),
+            },
             BrokerFrame::Delivered { id: MsgId::new() },
             BrokerFrame::Cancel {
                 correlation_id: MsgId::new(),
@@ -192,5 +215,19 @@ mod tests {
                 id: None,
             }
         );
+    }
+
+    fn event_batch() -> ActorEventBatch {
+        ActorEventBatch {
+            logical_session: None,
+            activation_id: Some("run-1".into()),
+            execution_epoch: 1,
+            source_node_id: Some("node-a".into()),
+            source_actor_id: Some("worker-a".into()),
+            first_seq: 1,
+            last_seq: 1,
+            qos: bamboo_subagent::ActorEventQos::Ephemeral,
+            events: vec![serde_json::json!({"type":"token","content":"x"})],
+        }
     }
 }

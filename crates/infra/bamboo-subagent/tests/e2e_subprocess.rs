@@ -49,6 +49,7 @@ async fn spawn_discover_run_stream_terminal() {
             permission_policy: None,
             messages: Vec::new(),
             activation_run_id: None,
+            execution_epoch: 0,
             initial_session_messages: Vec::new(),
             secrets: Default::default(),
         }))
@@ -61,6 +62,7 @@ async fn spawn_discover_run_stream_terminal() {
     while let Some(frame) = client.next_frame().await.unwrap() {
         match frame {
             ChildFrame::Event { event } => events.push(event),
+            ChildFrame::EventBatch { batch } => events.extend(batch.events),
             ChildFrame::ApprovalRequest { .. } => {}
             ChildFrame::SessionMessageAdmitted { confirmation } => {
                 panic!("echo run emitted unexpected SessionInbox confirmation: {confirmation:?}")
@@ -126,6 +128,7 @@ async fn reusable_worker_serves_two_sequential_assignments_same_process() {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))

@@ -38,6 +38,7 @@ fn spec(assignment: &str, messages: Vec<serde_json::Value>) -> RunSpec {
         permission_policy: None,
         messages,
         activation_run_id: None,
+        execution_epoch: 0,
         initial_session_messages: Vec::new(),
         secrets: Default::default(),
     }

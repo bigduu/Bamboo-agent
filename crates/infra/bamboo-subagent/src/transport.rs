@@ -1,7 +1,7 @@
 //! WebSocket transport (design §6): full-duplex parent↔child link.
 //!
 //! - Child side: [`WsServer`] accepts a connection and drives a [`ChildExecutor`] — `Run` starts a
-//!   task whose events stream out as `ChildFrame::Event`, then a `ChildFrame::Terminal`; `Cancel`
+//!   task whose events stream out as `ChildFrame::EventBatch`, then a `ChildFrame::Terminal`; `Cancel`
 //!   trips the run's token (out-of-band, never queued behind events).
 //! - Parent side: [`ChildClient`] sends [`ParentFrame`]s and reads [`ChildFrame`]s.
 
@@ -30,7 +30,16 @@ use crate::executor::{
     SteerMessage,
 };
 use crate::poison::PoisonRecover;
-use crate::proto::{ChildFrame, ParentFrame, RunSpec};
+use crate::proto::{
+    ActorEventBatch, ActorEventBatcher, ActorEventQos, ChildFrame, ParentFrame, RunSpec,
+};
+
+/// Direct actor links use separate bounded data/control queues. A slow parent
+/// can lose lossy batches (visible as a sequence gap), but it cannot grow the
+/// worker heap without bound or strand approvals behind token traffic.
+const DIRECT_EVENT_QUEUE_CAPACITY: usize = 64;
+const DIRECT_CONTROL_QUEUE_CAPACITY: usize = 32;
+const ACTOR_EVENT_BATCH_LATENCY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Pending host-callback replies, keyed by request id, shared between the
 /// per-run pump (which inserts) and the connection read loop (which resolves
@@ -457,9 +466,12 @@ where
     E: ChildExecutor + ?Sized,
 {
     let (ws_tx, mut ws_rx) = ws.split();
-    // One writer task owns the sink; runs push frames through this channel (decouples read/write).
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<ChildFrame>();
-    let writer = tokio::spawn(writer_task(ws_tx, out_rx));
+    // One writer task owns the sink. Event traffic is bounded and independent
+    // from control traffic, so 200 active actors cannot create an unbounded
+    // per-connection token queue or starve an approval/cancellation response.
+    let (control_tx, control_rx) = mpsc::channel::<ChildFrame>(DIRECT_CONTROL_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel::<ChildFrame>(DIRECT_EVENT_QUEUE_CAPACITY);
+    let writer = tokio::spawn(writer_task(ws_tx, control_rx, event_rx));
 
     // Host-callback replies for gated-tool approvals the active run proxies back
     // to the host over this WS. Shared with each run's pump.
@@ -498,7 +510,8 @@ where
                         spec,
                         steer_rx,
                         cancel,
-                        out_tx.clone(),
+                        control_tx.clone(),
+                        event_tx.clone(),
                         pending.clone(),
                     );
                 }
@@ -532,18 +545,42 @@ where
     if let Some(c) = active_cancel {
         c.cancel();
     }
-    drop(out_tx);
+    drop(control_tx);
+    drop(event_tx);
     let _ = writer.await;
     Ok(())
 }
 
 async fn writer_task<S>(
     mut ws_tx: SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
-    mut out_rx: mpsc::UnboundedReceiver<ChildFrame>,
+    mut control_rx: mpsc::Receiver<ChildFrame>,
+    mut event_rx: mpsc::Receiver<ChildFrame>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    while let Some(frame) = out_rx.recv().await {
+    let mut control_open = true;
+    let mut events_open = true;
+    while control_open || events_open {
+        let frame = tokio::select! {
+            biased;
+            frame = control_rx.recv(), if control_open => match frame {
+                Some(frame) => Some(frame),
+                None => {
+                    control_open = false;
+                    None
+                }
+            },
+            frame = event_rx.recv(), if events_open => match frame {
+                Some(frame) => Some(frame),
+                None => {
+                    events_open = false;
+                    None
+                }
+            },
+        };
+        let Some(frame) = frame else {
+            continue;
+        };
         if ws_tx.send(Message::text(frame.to_text())).await.is_err() {
             break;
         }
@@ -556,20 +593,56 @@ fn start_run<E: ChildExecutor + ?Sized>(
     spec: RunSpec,
     steer: SteerInbox,
     cancel: CancellationToken,
-    out_tx: mpsc::UnboundedSender<ChildFrame>,
+    control_tx: mpsc::Sender<ChildFrame>,
+    event_tx: mpsc::Sender<ChildFrame>,
     pending: PendingReplies,
 ) {
     let (sink, mut ev_rx, mut control_rx) = EventSink::channel_with_control();
-    let out_fwd = out_tx.clone();
-    // forward executor events -> wire, ends when the executor drops the sink
+    let legacy_event_wire = spec.execution_epoch == 0;
+    let mut batcher = ActorEventBatcher::for_run(&spec, None, None);
+    let event_fwd = event_tx.clone();
+    // All event batches share one ordered data lane. Durable batches wait for
+    // capacity; lossy data uses `try_send`, making overload observable as a
+    // sequence gap. Approval/admission controls remain independent.
     let fwd = tokio::spawn(async move {
-        while let Some(e) = ev_rx.recv().await {
-            if out_fwd.send(ChildFrame::Event { event: e }).is_err() {
-                break;
+        let mut flush = tokio::time::interval(ACTOR_EVENT_BATCH_LATENCY);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        flush.tick().await;
+        let mut open = true;
+        while open {
+            tokio::select! {
+                event = ev_rx.recv() => match event {
+                    Some(event) => {
+                        if legacy_event_wire {
+                            if event_fwd.send(ChildFrame::Event { event }).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        for batch in batcher.push(event) {
+                            if !send_direct_event_batch(&event_fwd, batch).await {
+                                return;
+                            }
+                        }
+                    }
+                    None => open = false,
+                },
+                _ = flush.tick(), if !legacy_event_wire && batcher.has_pending() => {
+                    if let Some(batch) = batcher.flush() {
+                        if !send_direct_event_batch(&event_fwd, batch).await {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if !legacy_event_wire {
+            if let Some(batch) = batcher.flush() {
+                let _ = send_direct_event_batch(&event_fwd, batch).await;
             }
         }
     });
-    let out_control = out_tx.clone();
+    let out_control = control_tx.clone();
     let control = tokio::spawn(async move {
         while let Some(control) = control_rx.recv().await {
             let frame = match control {
@@ -577,7 +650,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
                     ChildFrame::SessionMessageAdmitted { confirmation }
                 }
             };
-            if out_control.send(frame).is_err() {
+            if out_control.send(frame).await.is_err() {
                 break;
             }
         }
@@ -589,7 +662,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
     // `pending`.
     let (bridge, mut req_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(bridge);
-    let out_req = out_tx.clone();
+    let out_req = control_tx.clone();
     let pending_for_pump = pending.clone();
     let pump = tokio::spawn(async move {
         while let Some(req) = req_rx.recv().await {
@@ -605,7 +678,7 @@ fn start_run<E: ChildExecutor + ?Sized>(
             let frame = match req.kind {
                 HostRequestKind::Approval => ChildFrame::ApprovalRequest { id, body: req.body },
             };
-            if out_req.send(frame).is_err() {
+            if out_req.send(frame).await.is_err() {
                 break;
             }
         }
@@ -616,13 +689,39 @@ fn start_run<E: ChildExecutor + ?Sized>(
         let _ = fwd.await; // flush all events before the terminal frame
         let _ = control.await; // flush durable-admission confirmations first
         pump.abort(); // no more host callbacks after the run ends
-        let _ = out_tx.send(ChildFrame::Terminal {
-            status: outcome.status,
-            result: outcome.result,
-            error: outcome.error,
-            transcript: outcome.transcript,
-        });
+                      // Terminal follows every accepted event batch on the bounded event
+                      // lane. Approval/admission control remains independently prioritized.
+        let _ = event_tx
+            .send(ChildFrame::Terminal {
+                status: outcome.status,
+                result: outcome.result,
+                error: outcome.error,
+                transcript: outcome.transcript,
+            })
+            .await;
     });
+}
+
+async fn send_direct_event_batch(
+    event_tx: &mpsc::Sender<ChildFrame>,
+    batch: ActorEventBatch,
+) -> bool {
+    let frame = ChildFrame::EventBatch { batch };
+    if matches!(
+        &frame,
+        ChildFrame::EventBatch {
+            batch: ActorEventBatch {
+                qos: ActorEventQos::Durable,
+                ..
+            }
+        }
+    ) {
+        return event_tx.send(frame).await.is_ok();
+    }
+    match event_tx.try_send(frame) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 // ---- parent side -------------------------------------------------------------
@@ -820,6 +919,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 1,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -827,10 +927,15 @@ mod tests {
             .unwrap();
 
         let mut events = Vec::new();
+        let mut saw_batch = false;
         let mut terminal = None;
         while let Some(frame) = client.next_frame().await.unwrap() {
             match frame {
                 ChildFrame::Event { event } => events.push(event),
+                ChildFrame::EventBatch { batch } => {
+                    saw_batch = true;
+                    events.extend(batch.events);
+                }
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
                     panic!(
@@ -848,6 +953,10 @@ mod tests {
         assert_eq!(status, TerminalStatus::Completed);
         assert_eq!(result.as_deref(), Some("echo: one two"));
         assert!(events.iter().any(|e| e["content"] == "one "));
+        assert!(
+            saw_batch,
+            "a non-zero execution epoch must select event batches"
+        );
 
         let _ = client.close().await;
         let _ = srv.await;
@@ -881,6 +990,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -946,6 +1056,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1069,6 +1180,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1153,6 +1265,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1245,6 +1358,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1302,6 +1416,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
@@ -1323,6 +1438,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 }))
@@ -1359,6 +1475,14 @@ mod tests {
                     if let Some(t) = event["content"].as_str() {
                         tokens.push(t.to_string());
                     }
+                }
+                ChildFrame::EventBatch { batch } => {
+                    tokens.extend(
+                        batch
+                            .events
+                            .into_iter()
+                            .filter_map(|event| event["content"].as_str().map(ToString::to_string)),
+                    );
                 }
                 ChildFrame::ApprovalRequest { .. } => {}
                 ChildFrame::SessionMessageAdmitted { confirmation } => {
@@ -1435,6 +1559,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))
@@ -1443,6 +1568,11 @@ mod tests {
         loop {
             match client.next_frame().await.unwrap() {
                 Some(ChildFrame::Event { event }) if event["content"] == "go" => break,
+                Some(ChildFrame::EventBatch { batch })
+                    if batch.events.iter().any(|event| event["content"] == "go") =>
+                {
+                    break;
+                }
                 Some(_) => continue,
                 None => panic!("connection closed before first token"),
             }
@@ -1458,6 +1588,7 @@ mod tests {
                 permission_policy: None,
                 messages: Vec::new(),
                 activation_run_id: None,
+                execution_epoch: 0,
                 initial_session_messages: Vec::new(),
                 secrets: Default::default(),
             }))

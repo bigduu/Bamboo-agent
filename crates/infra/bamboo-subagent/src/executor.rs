@@ -139,8 +139,12 @@ pub struct ChildOutcome {
     pub status: TerminalStatus,
     pub result: Option<String>,
     pub error: Option<String>,
-    /// Full worker transcript, shipped only on suspend so the host can persist
-    /// it onto the child session and rehydrate the worker on resume.
+    /// Rolling-wire compatibility field. The current actor host never consumes
+    /// it: canonical session checkpoints are the transcript authority and
+    /// suspend/resume dispatch is not implemented. Keep serializing the empty
+    /// field until the protocol is versioned; do not build new state transfer on
+    /// this payload.
+    #[serde(default)]
     pub transcript: Vec<serde_json::Value>,
 }
 
@@ -169,8 +173,8 @@ impl ChildOutcome {
             transcript: Vec::new(),
         }
     }
-    /// The worker suspended to wait on its own sub-agents; ship the full
-    /// transcript so the host can resume it later.
+    /// Compatibility constructor for the unimplemented suspend wire path.
+    /// Current hosts reject `Suspended` and do not persist this transcript.
     pub fn suspended(transcript: Vec<serde_json::Value>) -> Self {
         Self {
             status: TerminalStatus::Suspended,
@@ -243,6 +247,15 @@ impl SteerInbox {
 /// What runs inside an actor. Implemented by the worker with the real runtime.
 #[async_trait]
 pub trait ChildExecutor: Send + Sync + 'static {
+    /// Maximum number of independent Run/Ask/Task executions this instance may
+    /// execute at once. The safe default is one: production executors often
+    /// own mutable permission/provider/child-runner state that must not cross
+    /// session boundaries. An implementation may opt into more slots only when
+    /// all per-run state is isolated.
+    fn max_parallel_executions(&self) -> usize {
+        1
+    }
+
     async fn run(
         &self,
         spec: RunSpec,
@@ -265,6 +278,12 @@ pub const ECHO_SLEEP_PREFIX: &str = "__sleep_ms:";
 
 #[async_trait]
 impl ChildExecutor for EchoExecutor {
+    fn max_parallel_executions(&self) -> usize {
+        // Echo has no mutable execution state; keep the high-concurrency fabric
+        // E2E honest without weakening the safe default for real runtimes.
+        256
+    }
+
     async fn run(
         &self,
         spec: RunSpec,
@@ -310,6 +329,11 @@ impl ChildExecutor for EchoExecutor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn echo_explicitly_opts_into_high_parallelism() {
+        assert!(EchoExecutor.max_parallel_executions() >= 200);
+    }
+
     #[tokio::test]
     async fn echo_streams_then_completes() {
         let (sink, mut rx) = EventSink::channel();
@@ -323,6 +347,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 },
@@ -358,6 +383,7 @@ mod tests {
                     permission_policy: None,
                     messages: Vec::new(),
                     activation_run_id: None,
+                    execution_epoch: 0,
                     initial_session_messages: Vec::new(),
                     secrets: Default::default(),
                 },

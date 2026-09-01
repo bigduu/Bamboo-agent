@@ -30,7 +30,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 
-use crate::core::{BrokerCore, PushItem};
+use crate::core::{BrokerCore, EventPublishOutcome, EventPush, PushItem};
 use crate::error::{BrokerError, BrokerResult};
 use crate::proto::{BrokerFrame, ClientFrame};
 
@@ -47,12 +47,10 @@ type DeliverLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 ///   sidecar (loopback-only, see `is_loopback_bind`), there is no "trusted
 ///   local caller" to exempt here. Loopback and remote connections share the
 ///   one limit.
-/// - A single connection relaying a live Run's LLM token stream
-///   (`serve::handle_run`) can legitimately emit 100+ `Deliver`s/sec — so
-///   `messages_per_second`/`message_burst` are sized well above that, and
-///   exceeding them backpressures (delays) the connection rather than
-///   dropping it, so a brief legitimate burst is absorbed instead of
-///   punished.
+/// - Live token batches now use a separate bounded, non-Maildir frame and do
+///   not consume this disk-write bucket. The generous Deliver allowance covers
+///   durable actor boundaries and ordinary mailbox bursts; exceeding it
+///   backpressures rather than drops.
 #[derive(Debug, Clone, Copy)]
 pub struct BrokerLimits {
     /// Max concurrent accepted WebSocket connections. Beyond this, new
@@ -74,7 +72,14 @@ pub struct BrokerLimits {
 impl Default for BrokerLimits {
     fn default() -> Self {
         Self {
-            max_connections: 1000,
+            // A fully loaded 200-actor fabric can use roughly five sockets per
+            // activation (parent link, worker inbound/control/event, optional
+            // MCP proxy). Keep meaningful headroom for UI/orchestrator clients
+            // while retaining a finite connection-DoS ceiling. This protocol
+            // limit does not raise the process RLIMIT_NOFILE; deployments near
+            // 200 local actors still need an FD budget check until parent links
+            // are multiplexed.
+            max_connections: 4096,
             // SAFETY-of-intent: literals are non-zero; `NonZeroU32::new(..).unwrap()`
             // in a const fn context is not stable here, so this is a plain runtime
             // unwrap of a value we control.
@@ -231,9 +236,8 @@ impl BrokerServer {
             .await
             .map_err(|e| BrokerError::Transport(format!("ws accept: {e}")))?;
         let (mut sink, mut source) = ws.split();
-        // One token bucket per connection for `Deliver` frames (#53) — sized
-        // per `limits`, generous enough for a single live event stream (see
-        // [`BrokerLimits`]'s doc comment).
+        // One token bucket per connection for durable `Deliver` frames (#53).
+        // Snapshot/ephemeral actor batches use the separate bounded live lane.
         let deliver_limiter: DeliverLimiter = RateLimiter::direct(
             Quota::per_second(self.limits.messages_per_second)
                 .allow_burst(self.limits.message_burst),
@@ -273,7 +277,8 @@ impl BrokerServer {
         send(&mut sink, BrokerFrame::Welcome).await?;
 
         // 2. Serve: client frames in, subscription stream out.
-        let mut sub_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
+        let mut control_rx: Option<mpsc::UnboundedReceiver<PushItem>> = None;
+        let mut event_rx: Option<mpsc::UnboundedReceiver<EventPush>> = None;
         // Multiple connections may authenticate as the same agent: the
         // long-lived worker subscribes while short-lived per-run connections
         // only deliver. Disconnecting a delivery-only connection must never
@@ -327,10 +332,32 @@ impl BrokerServer {
                                 }
                             }
                         }
+                        Ok(Some(ClientFrame::PublishEventBatch {
+                            to,
+                            correlation_id,
+                            batch,
+                        })) => {
+                            if self
+                                .core
+                                .publish_event_batch(&to, &correlation_id, batch)
+                                .await
+                                == EventPublishOutcome::Rejected
+                            {
+                                let _ = send(
+                                    &mut sink,
+                                    BrokerFrame::Error {
+                                        reason: "invalid or durable batch on live event lane".into(),
+                                        id: None,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                         Ok(Some(ClientFrame::Subscribe)) => {
                             match self.core.subscribe_with_lease(&session_id, role.as_deref()).await {
-                                Ok((rx, lease)) => {
-                                    sub_rx = Some(rx);
+                                Ok((streams, lease)) => {
+                                    control_rx = Some(streams.control);
+                                    event_rx = Some(streams.events);
                                     subscription = Some(lease);
                                 }
                                 Err(e) => {
@@ -363,7 +390,7 @@ impl BrokerServer {
                         Err(e) => break Err(e),
                     }
                 }
-                pushed = next_pushed(&mut sub_rx) => {
+                pushed = next_pushed(&mut control_rx) => {
                     match pushed {
                         Some(PushItem::Message(m)) => {
                             if send(&mut sink, BrokerFrame::Message { message: m }).await.is_err() {
@@ -375,7 +402,32 @@ impl BrokerServer {
                                 break Ok(());
                             }
                         }
-                        None => sub_rx = None, // subscription channel closed
+                        None => control_rx = None, // subscription channel closed
+                    }
+                }
+                pushed = next_event(&mut event_rx) => {
+                    match pushed {
+                        Some(EventPush::Durable(message)) => {
+                            if send(&mut sink, BrokerFrame::Message { message }).await.is_err() {
+                                break Ok(());
+                            }
+                        }
+                        Some(EventPush::Live {
+                            correlation_id,
+                            batch,
+                            _permit,
+                        }) => {
+                            if send(
+                                &mut sink,
+                                BrokerFrame::EventBatch { correlation_id, batch },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break Ok(());
+                            }
+                        }
+                        None => event_rx = None,
                     }
                 }
             }
@@ -391,6 +443,13 @@ impl BrokerServer {
 /// Await the next pushed message, or never resolve when not subscribed (so the
 /// `select` arm is inert until a `Subscribe` arrives).
 async fn next_pushed(rx: &mut Option<mpsc::UnboundedReceiver<PushItem>>) -> Option<PushItem> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_event(rx: &mut Option<mpsc::UnboundedReceiver<EventPush>>) -> Option<EventPush> {
     match rx {
         Some(r) => r.recv().await,
         None => std::future::pending().await,

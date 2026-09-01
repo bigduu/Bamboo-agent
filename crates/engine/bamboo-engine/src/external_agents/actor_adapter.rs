@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use bamboo_subagent::fleet::{spawn_worker_on_bus, SpawnedChild};
 use bamboo_subagent::proto::{
-    AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame, PermissionPolicyContext, RunSpec,
-    SessionMessageDelivery, TerminalStatus,
+    ActorEventBatch, AgentRecord, ChildFrame, LogicalSessionIdentity, ParentFrame,
+    PermissionPolicyContext, RunSpec, SessionMessageDelivery, TerminalStatus,
 };
 use bamboo_subagent::provision::{
     ChildIdentity, ExecutorSpec, ModelRefSpec, Placement, ProvisionSpec, ScopedCredential,
@@ -35,8 +35,10 @@ use bamboo_subagent::transport::{client_config_trusting_cert, ChildClient};
 
 use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding, SpawnJob};
 
-/// Default cap on simultaneously running actor processes.
-pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 8;
+/// Default cap on simultaneously running actor activations. The event and
+/// broker transports are bounded independently, so 200 active sub-agents are a
+/// supported operating point rather than an opt-in escape hatch.
+pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 200;
 
 /// Max nesting depth for direct nested execution (Phase 6). A worker whose
 /// session `spawn_depth` is below this gets its own spawn stack + the real
@@ -51,7 +53,7 @@ const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
 /// Process-wide-per-runner cap across every reuse fingerprint. Without this,
 /// workloads that continually change role/model/workspace can leave one parked
 /// worker in an unbounded number of otherwise-small buckets.
-const DEFAULT_MAX_IDLE_TOTAL: usize = DEFAULT_MAX_CONCURRENT_ACTORS;
+const DEFAULT_MAX_IDLE_TOTAL: usize = 16;
 
 /// How long a pooled worker waits for its next assignment before reclaiming
 /// itself (must comfortably exceed the gap between sibling spawns).
@@ -520,6 +522,10 @@ pub struct ActorChildRunner {
     max_idle_per_key: usize,
     max_idle_total: usize,
     pool_reaper_started: AtomicBool,
+    /// Monotonic fencing token for concrete worker attempts in this runtime.
+    /// `activation_run_id` fences across runtime restarts; this epoch also
+    /// fences a late first worker when an activation is retried in-place.
+    next_execution_epoch: AtomicU64,
     /// Host-side decision for a child's gated-tool approval request (Phase 2).
     /// `None` ⇒ fail-closed DENY (the safe default). A wired decider (policy or
     /// human-routing bridge) returns approve/deny over the actor WS.
@@ -662,6 +668,7 @@ impl ActorChildRunner {
             max_idle_per_key: DEFAULT_MAX_IDLE_PER_KEY,
             max_idle_total: DEFAULT_MAX_IDLE_TOTAL,
             pool_reaper_started: AtomicBool::new(false),
+            next_execution_epoch: AtomicU64::new(0),
             approval_decider: None,
             approval_reviewer: None,
             escalation_bridge: Arc::new(std::sync::Mutex::new(None)),
@@ -1418,6 +1425,7 @@ impl ExternalChildRunner for ActorChildRunner {
         // no spawn fallback, so they never retry.
         let mut attempt = 0u8;
         let (result, actor) = loop {
+            let execution_epoch = self.next_execution_epoch.fetch_add(1, Ordering::Relaxed) + 1;
             let (actor, mut client) = match kind {
                 PlacementKind::Remote => {
                     // REMOTE branch: connect to a resident worker. No spawn, no pool
@@ -1628,6 +1636,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     permission_policy: permission_policy.clone(),
                     messages,
                     activation_run_id: bound_activation_run_id.clone(),
+                    execution_epoch,
                     initial_session_messages,
                     secrets: run_secrets.clone(),
                 }))
@@ -1676,6 +1685,8 @@ impl ExternalChildRunner for ActorChildRunner {
                 expected_permission_posture: expected_permission_posture.clone(),
                 session_inbox_runtime: session_inbox_runtime.as_ref(),
                 activation_run_id: bound_activation_run_id.as_deref(),
+                execution_epoch,
+                expected_source_actor_id: &actor.mailbox_id,
                 initial_inflight_claims,
                 // First-frame watchdog for EVERY placement: a wedged-but-connected
                 // worker (subscribed ≠ serving — e.g. stuck on a prior LLM call) emits
@@ -2179,6 +2190,8 @@ struct ActorDriveContext<'a> {
     expected_permission_posture: Option<ExpectedPermissionPosture>,
     session_inbox_runtime: Option<&'a SessionInboxRuntimeBinding>,
     activation_run_id: Option<&'a str>,
+    execution_epoch: u64,
+    expected_source_actor_id: &'a str,
     initial_inflight_claims: VecDeque<SessionInboxClaim>,
     first_frame_timeout: Option<Duration>,
 }
@@ -2267,6 +2280,160 @@ fn permission_posture_seed_from_event(
     )))
 }
 
+fn validate_actor_event_batch(
+    batch: &ActorEventBatch,
+    logical_session: &Session,
+    parent_session_id: &str,
+    activation_run_id: Option<&str>,
+    execution_epoch: u64,
+    expected_source_actor_id: &str,
+) -> Result<(), AgentError> {
+    batch
+        .validate()
+        .map_err(|error| AgentError::LLM(format!("actor emitted invalid event batch: {error}")))?;
+    let identity = batch.logical_session.as_ref().ok_or_else(|| {
+        AgentError::LLM("actor event batch omitted its logical session identity".to_string())
+    })?;
+    // Fence against the exact canonical identity used to build RunSpec. Some
+    // migrated/test sessions have not yet materialized parent ancestry on the
+    // in-memory Session, so comparing the batch directly with those raw fields
+    // can reject the identity the host itself just dispatched.
+    let expected_identity = LogicalSessionIdentity {
+        session_id: logical_session.id.clone(),
+        parent_session_id: logical_session
+            .parent_session_id
+            .clone()
+            .or_else(|| Some(parent_session_id.to_string())),
+        root_session_id: if logical_session.root_session_id.trim().is_empty() {
+            parent_session_id.to_string()
+        } else {
+            logical_session.root_session_id.clone()
+        },
+    };
+    if identity != &expected_identity {
+        return Err(AgentError::LLM(
+            "actor event batch targets a different logical session".to_string(),
+        ));
+    }
+    if batch.activation_id.as_deref() != activation_run_id {
+        return Err(AgentError::LLM(
+            "actor event batch belongs to a stale activation".to_string(),
+        ));
+    }
+    if batch.execution_epoch != execution_epoch {
+        return Err(AgentError::LLM(
+            "actor event batch belongs to a stale execution epoch".to_string(),
+        ));
+    }
+    if batch
+        .source_actor_id
+        .as_deref()
+        .is_some_and(|source| source != expected_source_actor_id)
+    {
+        return Err(AgentError::LLM(
+            "actor event batch declares a different physical actor".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_actor_event(
+    event: serde_json::Value,
+    strict_permission_events: bool,
+    permission_handshake: &mut PermissionPostureHandshake,
+    expected_permission_posture: Option<&ExpectedPermissionPosture>,
+    session_inbox_runtime: Option<&SessionInboxRuntimeBinding>,
+    logical_session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> crate::runtime::runner::Result<()> {
+    let event = match serde_json::from_value::<AgentEvent>(event) {
+        Ok(event) => event,
+        Err(error) if strict_permission_events => {
+            return Err(AgentError::LLM(format!(
+                "actor emitted malformed AgentEvent under a typed permission posture contract: {error}"
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+    if matches!(&event, AgentEvent::PermissionPostureActivated { .. }) {
+        if permission_handshake.posture_was_confirmed() {
+            return Err(AgentError::LLM(
+                "actor emitted a duplicate permission posture activation".to_string(),
+            ));
+        }
+        let seed = permission_posture_seed_from_event(logical_session, &event)
+            .map_err(AgentError::LLM)?
+            .ok_or_else(|| {
+                AgentError::LLM(
+                    "actor permission posture event did not decode as a posture".to_string(),
+                )
+            })?;
+        if let Some(expected) = expected_permission_posture {
+            if seed.policy_revision != expected.policy_revision
+                || seed.resolution != expected.resolution
+            {
+                return Err(AgentError::LLM(
+                    "permission posture event does not match the host-dispatched policy"
+                        .to_string(),
+                ));
+            }
+            if seed.executor_mapping() != expected.executor_mapping {
+                return Err(AgentError::LLM(
+                    "permission posture event does not match the host-dispatched executor mapping"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(binding) = session_inbox_runtime {
+            let saved = binding
+                .persistence
+                .record_permission_posture_activation(
+                    &logical_session.id,
+                    expected_permission_posture
+                        .and_then(|expected| expected.expected_audit_revision),
+                    &seed,
+                )
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "persist child permission posture bootstrap: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    AgentError::LLM(
+                        "persist child permission posture bootstrap: session not found".to_string(),
+                    )
+                })?;
+            let snapshot = bamboo_domain::PermissionAuditSnapshot::from_metadata(&saved.metadata)
+                .ok_or_else(|| {
+                AgentError::LLM(
+                    "persisted child permission posture audit is incomplete".to_string(),
+                )
+            })?;
+            snapshot.write_to(&mut logical_session.metadata);
+        } else {
+            // In-memory/custom actor embeddings still use a host-owned clock.
+            // Durable server paths always take the atomic branch.
+            bamboo_domain::record_permission_audit(&mut logical_session.metadata, &seed, None)
+                .map_err(|error| {
+                    AgentError::LLM(format!(
+                        "record in-memory child permission posture: {error}"
+                    ))
+                })?;
+        }
+        // Confirmation is deliberately last: matching alone is not enough.
+        // The host-owned audit write must succeed first.
+        *permission_handshake = PermissionPostureHandshake::Confirmed;
+    } else if permission_handshake.is_awaiting() {
+        return Err(AgentError::LLM(
+            "actor emitted an execution event before permission posture confirmation".to_string(),
+        ));
+    }
+    let _ = event_tx.send(event).await;
+    Ok(())
+}
+
 /// Pump child frames -> parent events until a terminal frame (or cancellation).
 /// On success, yields the actor's final result text (for session write-back).
 /// `live_rx` carries in-band frames (steering messages) from the live registry.
@@ -2295,6 +2462,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         expected_permission_posture,
         session_inbox_runtime,
         activation_run_id,
+        execution_epoch,
+        expected_source_actor_id,
         initial_inflight_claims,
         first_frame_timeout,
     } = context;
@@ -2311,6 +2480,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let strict_permission_events = expected_permission_posture.is_some();
     let mut permission_handshake =
         PermissionPostureHandshake::new(expected_permission_posture.as_ref());
+    let mut next_actor_event_seq = 1u64;
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -2353,103 +2523,57 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                 first_frame_watch = None;
                 match frame {
                     Ok(Some(ChildFrame::Event { event })) => {
-                        // AgentEvent is serialized verbatim on the wire (zero mapping).
-                        let ev = match serde_json::from_value::<AgentEvent>(event) {
-                            Ok(ev) => ev,
-                            Err(error) if strict_permission_events => {
-                                return Err(AgentError::LLM(format!(
-                                    "actor emitted malformed AgentEvent under a typed permission posture contract: {error}"
-                                )));
-                            }
-                            Err(_) => continue,
-                        };
-                        if matches!(&ev, AgentEvent::PermissionPostureActivated { .. }) {
-                            if permission_handshake.posture_was_confirmed() {
-                                return Err(AgentError::LLM(
-                                    "actor emitted a duplicate permission posture activation"
-                                        .to_string(),
-                                ));
-                            }
-                            let seed = permission_posture_seed_from_event(logical_session, &ev)
-                                .map_err(AgentError::LLM)?
-                                .ok_or_else(|| {
-                                    AgentError::LLM(
-                                        "actor permission posture event did not decode as a posture"
-                                            .to_string(),
-                                    )
-                                })?;
-                            if let Some(expected) = expected_permission_posture.as_ref() {
-                                if seed.policy_revision != expected.policy_revision
-                                    || seed.resolution != expected.resolution
-                                {
-                                    return Err(AgentError::LLM(
-                                        "permission posture event does not match the host-dispatched policy"
-                                            .to_string(),
-                                    ));
-                                }
-                                if seed.executor_mapping() != expected.executor_mapping {
-                                    return Err(AgentError::LLM(
-                                        "permission posture event does not match the host-dispatched executor mapping"
-                                            .to_string(),
-                                    ));
-                                }
-                            }
-                            if let Some(binding) = session_inbox_runtime {
-                                let saved = binding
-                                    .persistence
-                                    .record_permission_posture_activation(
-                                        &logical_session.id,
-                                        expected_permission_posture
-                                            .as_ref()
-                                            .and_then(|expected| expected.expected_audit_revision),
-                                        &seed,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        AgentError::LLM(format!(
-                                            "persist child permission posture bootstrap: {error}"
-                                        ))
-                                    })?
-                                    .ok_or_else(|| {
-                                        AgentError::LLM(
-                                            "persist child permission posture bootstrap: session not found"
-                                                .to_string(),
-                                        )
-                                    })?;
-                                let snapshot = bamboo_domain::PermissionAuditSnapshot::from_metadata(
-                                    &saved.metadata,
-                                )
-                                .ok_or_else(|| {
-                                    AgentError::LLM(
-                                        "persisted child permission posture audit is incomplete"
-                                            .to_string(),
-                                    )
-                                })?;
-                                snapshot.write_to(&mut logical_session.metadata);
-                            } else {
-                                // In-memory/custom actor embeddings still use a host-owned
-                                // clock. Durable server paths always take the atomic branch.
-                                bamboo_domain::record_permission_audit(
-                                    &mut logical_session.metadata,
-                                    &seed,
-                                    None,
-                                )
-                                .map_err(|error| {
-                                    AgentError::LLM(format!(
-                                        "record in-memory child permission posture: {error}"
-                                    ))
-                                })?;
-                            }
-                            // Confirmation is deliberately last: matching alone is not
-                            // enough. The host-owned audit write must succeed first.
-                            permission_handshake = PermissionPostureHandshake::Confirmed;
-                        } else if permission_handshake.is_awaiting() {
-                            return Err(AgentError::LLM(
-                                "actor emitted an execution event before permission posture confirmation"
-                                    .to_string(),
-                            ));
+                        // Rolling-upgrade compatibility: old actors have no
+                        // route/sequence metadata, but retain the same typed
+                        // permission handshake and event validation.
+                        process_actor_event(
+                            event,
+                            strict_permission_events,
+                            &mut permission_handshake,
+                            expected_permission_posture.as_ref(),
+                            session_inbox_runtime,
+                            logical_session,
+                            event_tx,
+                        )
+                        .await?;
+                    }
+                    Ok(Some(ChildFrame::EventBatch { batch })) => {
+                        validate_actor_event_batch(
+                            &batch,
+                            logical_session,
+                            parent_session_id,
+                            activation_run_id,
+                            execution_epoch,
+                            expected_source_actor_id,
+                        )?;
+                        if batch.last_seq < next_actor_event_seq {
+                            continue;
                         }
-                        let _ = event_tx.send(ev).await;
+                        if batch.first_seq > next_actor_event_seq {
+                            tracing::warn!(
+                                child_session_id,
+                                expected_seq = next_actor_event_seq,
+                                received_seq = batch.first_seq,
+                                "actor event sequence gap; authoritative session snapshot is required"
+                            );
+                        }
+                        let skip = next_actor_event_seq
+                            .saturating_sub(batch.first_seq)
+                            .min(batch.events.len() as u64) as usize;
+                        for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
+                            let seq = batch.first_seq + offset as u64;
+                            process_actor_event(
+                                event,
+                                strict_permission_events,
+                                &mut permission_handshake,
+                                expected_permission_posture.as_ref(),
+                                session_inbox_runtime,
+                                logical_session,
+                                event_tx,
+                            )
+                            .await?;
+                            next_actor_event_seq = seq.saturating_add(1);
+                        }
                     }
                     Ok(Some(ChildFrame::ApprovalRequest { id, body })) => {
                         if permission_handshake.is_awaiting() {
@@ -3289,6 +3413,95 @@ mod tests {
         }
     }
 
+    #[test]
+    fn actor_event_batch_is_fenced_by_session_activation_and_epoch() {
+        let session = Session::new_child("logical-child", "logical-parent", "model", "child");
+        let mut batch = ActorEventBatch {
+            logical_session: Some(LogicalSessionIdentity {
+                session_id: session.id.clone(),
+                parent_session_id: session.parent_session_id.clone(),
+                root_session_id: session.root_session_id.clone(),
+            }),
+            activation_id: Some("activation-7".into()),
+            execution_epoch: 11,
+            source_node_id: Some("node-a".into()),
+            source_actor_id: Some("worker-a".into()),
+            first_seq: 1,
+            last_seq: 1,
+            qos: bamboo_subagent::ActorEventQos::Ephemeral,
+            events: vec![serde_json::json!({"type":"token","content":"ok"})],
+        };
+        validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap();
+
+        batch.execution_epoch = 10;
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("execution epoch"));
+        batch.execution_epoch = 11;
+        batch.activation_id = Some("replaced-activation".into());
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("stale activation"));
+        batch.activation_id = Some("activation-7".into());
+        batch
+            .logical_session
+            .as_mut()
+            .expect("logical identity")
+            .session_id = "foreign-child".into();
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different logical session"));
+        batch
+            .logical_session
+            .as_mut()
+            .expect("logical identity")
+            .session_id = session.id.clone();
+        batch.source_actor_id = Some("worker-b".into());
+        assert!(validate_actor_event_batch(
+            &batch,
+            &session,
+            "logical-parent",
+            Some("activation-7"),
+            11,
+            "worker-a",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different physical actor"));
+    }
+
     fn completed_actor_frame() -> ChildFrame {
         ChildFrame::Terminal {
             status: TerminalStatus::Completed,
@@ -3334,6 +3547,8 @@ mod tests {
             expected_permission_posture: Some(expected),
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: session_id,
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -3723,6 +3938,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: Some(&binding),
             activation_run_id: Some(run_id),
+            execution_epoch: 0,
+            expected_source_actor_id: session_id,
             initial_inflight_claims: claims,
             first_frame_timeout: Some(Duration::from_secs(1)),
         })
@@ -4575,6 +4792,8 @@ mod tests {
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
+                execution_epoch: 0,
+                expected_source_actor_id: "child-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 first_frame_timeout: None,
             }),
@@ -4637,6 +4856,8 @@ mod tests {
                 expected_permission_posture: None,
                 session_inbox_runtime: None,
                 activation_run_id: None,
+                execution_epoch: 0,
+                expected_source_actor_id: "child-no-reviewer",
                 initial_inflight_claims: VecDeque::new(),
                 first_frame_timeout: None,
             }),
@@ -4696,6 +4917,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: "child-x",
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_millis(100)),
         })
@@ -4733,6 +4956,8 @@ mod tests {
             expected_permission_posture: None,
             session_inbox_runtime: None,
             activation_run_id: None,
+            execution_epoch: 0,
+            expected_source_actor_id: "child-y",
             initial_inflight_claims: VecDeque::new(),
             first_frame_timeout: Some(Duration::from_millis(50)),
         })

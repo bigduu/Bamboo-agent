@@ -977,7 +977,8 @@ enum BrokerCommands {
 
         /// Max concurrent WebSocket connections (#53 DoS defense). Beyond
         /// this, new connections are dropped immediately. Default is
-        /// generous — sized well above a normal multi-worker fabric.
+        /// sized with headroom for 200 concurrent actor activations and their
+        /// split control/event/MCP connections.
         #[arg(long, default_value_t = bamboo_broker::BrokerLimits::default().max_connections)]
         max_connections: usize,
 

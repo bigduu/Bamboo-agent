@@ -697,8 +697,9 @@ pub enum CodexApprovalPolicy {
 /// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
-    /// Maximum actor processes running at once; further spawns wait their
-    /// turn. Default: 8.
+    /// Maximum actor activations running at once; further spawns wait their
+    /// turn. Default: 200. Warm-idle process retention has a separate, smaller
+    /// bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent: Option<usize>,
     /// Expert: custom worker binary. Default: the current bamboo executable.
