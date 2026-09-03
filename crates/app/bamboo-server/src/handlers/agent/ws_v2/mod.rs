@@ -49,6 +49,9 @@
 //!   before authorization is IGNORED — no forwarder, no cancel, no channel data.
 //! - A token-less `hello` NEVER authorizes a connection that wasn't already
 //!   pre-authorized.
+//! - The first successfully authorized `hello` receives one reliable top-level
+//!   `{"type":"welcome"}` frame in the negotiated encoding. It is written
+//!   directly by the socket owner; later accepted hellos do not duplicate it.
 //! - An unauthenticated socket that never sends a valid `hello` within
 //!   [`AUTH_DEADLINE`] is CLOSED, so it cannot linger.
 //! - The token is NEVER logged.
@@ -71,8 +74,8 @@ use tokio_stream::StreamMap;
 use serde::Deserialize;
 
 use self::envelope::{
-    decode_client_frame, pong_frame, sys_keepalive_envelope, Channel, ClientFrame, Encoding,
-    OutFrame,
+    decode_client_frame, pong_frame, sys_keepalive_envelope, welcome_frame, Channel, ClientFrame,
+    Encoding, OutFrame,
 };
 use self::forwarders::{
     spawn_agent_forwarder, spawn_agent_terminal_forwarder, spawn_feed_forwarder, OutboundTx,
@@ -188,12 +191,14 @@ impl UnauthorizedAction {
 /// What the driver should do with a frame after the auth gate ran.
 #[derive(Debug, PartialEq, Eq)]
 enum GateOutcome {
-    /// The frame was fully handled by the gate (the connection is/was
-    /// unauthorized, or it just authorized): keep the socket open, do NOT fall
-    /// through to channel dispatch.
+    /// The frame was fully handled while the connection remains unauthorized:
+    /// keep the socket open, but do NOT fall through to channel dispatch.
     Handled,
     /// An invalid credential was presented: CLOSE the connection.
     Close,
+    /// A `hello` passed the authoritative gate. The driver must acknowledge it
+    /// with a direct socket write before processing another client frame.
+    AcknowledgeHello,
     /// The connection is authorized and this frame should proceed to the normal
     /// channel dispatch (subscribe/unsubscribe/stop/hello-rebind).
     Dispatch,
@@ -233,13 +238,11 @@ async fn apply_auth_gate(
             let config = state.config.read().await.clone();
             if crate::handlers::settings::verify_device_token(&config, device_id, token) {
                 *authorized = true;
-                // Bind device id for logging. NEVER log the token.
-                tracing::debug!("ws_v2: hello verified for device {device_id}; authorized");
-                GateOutcome::Handled
+                // Neither the credential nor its device identity belongs in logs.
+                tracing::debug!("ws_v2: hello credential verified; authorized");
+                GateOutcome::AcknowledgeHello
             } else {
-                tracing::warn!(
-                    "ws_v2: hello rejected — invalid device credential for {device_id}; closing"
-                );
+                tracing::warn!("ws_v2: hello rejected — invalid device credential; closing");
                 GateOutcome::Close
             }
         }
@@ -390,6 +393,10 @@ async fn drive(
     // / cookie / header clients are authorized immediately; everything else must
     // present a valid `hello` before any channel is served.
     let mut authorized = pre_authorized;
+    // The protocol acknowledges only the first successfully authorized `hello`
+    // on a socket. Later token-less/valid hellos remain harmless and a later
+    // credentialed hello is still re-verified, but none duplicates `welcome`.
+    let mut welcome_sent = false;
     // The unauthorized-deadline timer. Pinned + biased to fire while `!authorized`
     // and disarmed once the connection authorizes, so an unauthenticated socket
     // is closed but an authorized one runs indefinitely.
@@ -465,7 +472,7 @@ async fn drive(
                 match msg {
                     // The inbound frame type that matches the active encoding.
                     Some(Ok(Message::Text(text))) if encoding == Encoding::Json => {
-                        let keep_open = handle_client_bytes(ClientDispatchContext {
+                        let outcome = handle_client_bytes(ClientDispatchContext {
                             state: &state,
                             forwarders: &mut forwarders,
                             queues: &mut queues,
@@ -473,14 +480,26 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            welcome_sent,
                         }, text.as_bytes())
                         .await;
-                        if !keep_open {
-                            break;
+                        match outcome {
+                            ClientFrameOutcome::Continue => {}
+                            ClientFrameOutcome::Close => break,
+                            ClientFrameOutcome::WriteWelcome(frame) => {
+                                let write = match frame {
+                                    OutFrame::Text(s) => session.text(s).await,
+                                    OutFrame::Binary(b) => session.binary(b).await,
+                                };
+                                if write.is_err() {
+                                    break;
+                                }
+                                welcome_sent = true;
+                            }
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) if encoding == Encoding::Msgpack => {
-                        let keep_open = handle_client_bytes(ClientDispatchContext {
+                        let outcome = handle_client_bytes(ClientDispatchContext {
                             state: &state,
                             forwarders: &mut forwarders,
                             queues: &mut queues,
@@ -488,10 +507,22 @@ async fn drive(
                             batch_ms,
                             encoding,
                             authorized: &mut authorized,
+                            welcome_sent,
                         }, &bytes)
                         .await;
-                        if !keep_open {
-                            break;
+                        match outcome {
+                            ClientFrameOutcome::Continue => {}
+                            ClientFrameOutcome::Close => break,
+                            ClientFrameOutcome::WriteWelcome(frame) => {
+                                let write = match frame {
+                                    OutFrame::Text(s) => session.text(s).await,
+                                    OutFrame::Binary(b) => session.binary(b).await,
+                                };
+                                if write.is_err() {
+                                    break;
+                                }
+                                welcome_sent = true;
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(bytes))) => {
@@ -537,6 +568,36 @@ struct ClientDispatchContext<'a> {
     batch_ms: u64,
     encoding: Encoding,
     authorized: &'a mut bool,
+    /// Whether this socket has already completed its one successful welcome
+    /// write. Passed by value so only the sole socket writer marks it after the
+    /// direct write succeeds.
+    welcome_sent: bool,
+}
+
+/// The result of processing one client frame.
+///
+/// `WriteWelcome` is intentionally distinct from the best-effort `sys` queue:
+/// the driver owns the only WebSocket writer and writes this frame immediately,
+/// before polling another client frame or any newly-created subscription queue.
+#[derive(Debug, PartialEq)]
+enum ClientFrameOutcome {
+    Continue,
+    Close,
+    WriteWelcome(OutFrame),
+}
+
+fn acknowledge_hello(encoding: Encoding, welcome_sent: bool) -> ClientFrameOutcome {
+    if welcome_sent {
+        return ClientFrameOutcome::Continue;
+    }
+
+    match welcome_frame(encoding) {
+        Some(frame) => ClientFrameOutcome::WriteWelcome(frame),
+        None => {
+            tracing::error!("ws_v2: failed to encode hello acknowledgement; closing");
+            ClientFrameOutcome::Close
+        }
+    }
 }
 
 /// Decode one inbound frame's bytes per the connection's [`Encoding`] (serde_json
@@ -549,14 +610,17 @@ struct ClientDispatchContext<'a> {
 /// and auth logic is encoding-agnostic (the SAME `ClientFrame` flows through both
 /// paths), so the JSON behavior is byte-for-byte unchanged.
 ///
-/// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
-/// presents an INVALID device credential); `true` to keep it open.
-async fn handle_client_bytes(context: ClientDispatchContext<'_>, bytes: &[u8]) -> bool {
+/// Returns a direct-write action for the first authorized `hello`, a close
+/// action for an invalid credential, or `Continue` for all other frames.
+async fn handle_client_bytes(
+    context: ClientDispatchContext<'_>,
+    bytes: &[u8],
+) -> ClientFrameOutcome {
     let frame: ClientFrame = match decode_client_frame(context.encoding, bytes) {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("ws_v2: ignoring malformed client frame: {e}");
-            return true;
+            return ClientFrameOutcome::Continue;
         }
     };
     handle_client_frame(context, frame).await
@@ -572,9 +636,13 @@ async fn handle_client_bytes(context: ClientDispatchContext<'_>, bytes: &[u8]) -
 /// connection gets NO channel data and cancels nothing. The driver's deadline
 /// closes a socket that never authorizes.
 ///
-/// Returns `false` to signal the driver to CLOSE the connection (a `hello` that
-/// presents an INVALID device credential); `true` to keep it open.
-async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFrame) -> bool {
+/// The first authorized `hello` returns [`ClientFrameOutcome::WriteWelcome`].
+/// The driver performs that write directly and fail-closed; it never traverses
+/// the best-effort system queue.
+async fn handle_client_frame(
+    context: ClientDispatchContext<'_>,
+    frame: ClientFrame,
+) -> ClientFrameOutcome {
     let ClientDispatchContext {
         state,
         forwarders,
@@ -583,14 +651,18 @@ async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFr
         batch_ms,
         encoding,
         authorized,
+        welcome_sent,
     } = context;
 
     // Auth gate (#189). Until the connection is authorized, no frame may serve a
     // channel or cancel a session — the only frame that can change anything is a
     // `hello` that carries a verifiable device credential.
     match apply_auth_gate(state, &frame, authorized).await {
-        GateOutcome::Handled => return true,
-        GateOutcome::Close => return false,
+        GateOutcome::Handled => return ClientFrameOutcome::Continue,
+        GateOutcome::Close => return ClientFrameOutcome::Close,
+        GateOutcome::AcknowledgeHello => {
+            return acknowledge_hello(encoding, welcome_sent);
+        }
         GateOutcome::Dispatch => {}
     }
 
@@ -601,7 +673,7 @@ async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFr
         // Drop-on-full is deliberate. The next client heartbeat retries, and
         // the read loop must never wait behind a slow socket writer.
         try_enqueue_sys(sys_tx, pong_frame(encoding));
-        return true;
+        return ClientFrameOutcome::Continue;
     }
 
     // Authorized path: full dispatch.
@@ -614,19 +686,20 @@ async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFr
                 (Some(device_id), Some(token)) => {
                     let config = state.config.read().await.clone();
                     if crate::handlers::settings::verify_device_token(&config, &device_id, &token) {
-                        // NEVER log the token.
-                        tracing::debug!("ws_v2: hello verified for device {device_id}");
+                        // Neither the credential nor its device identity belongs in logs.
+                        tracing::debug!("ws_v2: hello credential verified");
                     } else {
                         tracing::warn!(
-                            "ws_v2: hello rejected — invalid device credential for {device_id}; closing"
+                            "ws_v2: hello rejected — invalid device credential; closing"
                         );
-                        return false;
+                        return ClientFrameOutcome::Close;
                     }
                 }
                 _ => {
                     tracing::debug!("ws_v2: token-less hello on authorized connection (no-op)");
                 }
             }
+            return acknowledge_hello(encoding, welcome_sent);
         }
         ClientFrame::Subscribe { ch, since } => {
             subscribe(state, forwarders, queues, batch_ms, encoding, &ch, since).await;
@@ -650,7 +723,7 @@ async fn handle_client_frame(context: ClientDispatchContext<'_>, frame: ClientFr
             tracing::debug!("ws_v2: ignoring unknown client frame type");
         }
     }
-    true
+    ClientFrameOutcome::Continue
 }
 
 /// Subscribe to a channel, replacing any existing forwarder for the same `ch`
@@ -995,12 +1068,12 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn valid_hello_authorizes() {
+    async fn valid_hello_authorizes_and_requests_acknowledgement() {
         let (state, cred, token) = app_state_with_device().await;
         let mut authorized = false;
         let frame = hello(Some(&cred.device_id), Some(&token));
         let outcome = apply_auth_gate(&state, &frame, &mut authorized).await;
-        assert_eq!(outcome, GateOutcome::Handled);
+        assert_eq!(outcome, GateOutcome::AcknowledgeHello);
         assert!(authorized, "a valid hello must authorize the connection");
     }
 
@@ -1050,7 +1123,7 @@ mod tests {
         let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
 
         let mut authorized = false;
-        assert!(
+        assert_eq!(
             handle_client_frame(
                 ClientDispatchContext {
                     state: &state,
@@ -1060,10 +1133,12 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    welcome_sent: false,
                 },
                 ClientFrame::Ping,
             )
-            .await
+            .await,
+            ClientFrameOutcome::Continue
         );
         assert!(
             sys_rx.try_recv().is_err(),
@@ -1071,7 +1146,7 @@ mod tests {
         );
 
         authorized = true;
-        assert!(
+        assert_eq!(
             handle_client_frame(
                 ClientDispatchContext {
                     state: &state,
@@ -1081,14 +1156,109 @@ mod tests {
                     batch_ms: 0,
                     encoding: Encoding::Json,
                     authorized: &mut authorized,
+                    welcome_sent: false,
                 },
                 ClientFrame::Ping,
             )
-            .await
+            .await,
+            ClientFrameOutcome::Continue
         );
         assert_eq!(
             sys_rx.try_recv().unwrap(),
             OutFrame::Text(r#"{"type":"pong"}"#.into())
+        );
+    }
+
+    #[actix_web::test]
+    async fn pre_authorized_hello_requests_one_direct_welcome_only() {
+        let (state, cred, token) = app_state_with_device().await;
+        let mut forwarders = HashMap::new();
+        let mut queues = StreamMap::new();
+        let (sys_tx, mut sys_rx) = mpsc::channel(SYS_OUTBOUND_BUFFER);
+        let mut authorized = true;
+
+        let first = handle_client_frame(
+            ClientDispatchContext {
+                state: &state,
+                forwarders: &mut forwarders,
+                queues: &mut queues,
+                sys_tx: &sys_tx,
+                batch_ms: 0,
+                encoding: Encoding::Json,
+                authorized: &mut authorized,
+                welcome_sent: false,
+            },
+            hello(None, None),
+        )
+        .await;
+        assert_eq!(
+            first,
+            ClientFrameOutcome::WriteWelcome(OutFrame::Text(r#"{"type":"welcome"}"#.to_string())),
+            "the first accepted hello must bypass the best-effort sys queue"
+        );
+        assert!(
+            sys_rx.try_recv().is_err(),
+            "welcome must never enter the best-effort sys queue"
+        );
+
+        let duplicate = handle_client_frame(
+            ClientDispatchContext {
+                state: &state,
+                forwarders: &mut forwarders,
+                queues: &mut queues,
+                sys_tx: &sys_tx,
+                batch_ms: 0,
+                encoding: Encoding::Json,
+                authorized: &mut authorized,
+                welcome_sent: true,
+            },
+            hello(None, None),
+        )
+        .await;
+        assert_eq!(
+            duplicate,
+            ClientFrameOutcome::Continue,
+            "later accepted hellos must not duplicate welcome on one socket"
+        );
+
+        let valid_rebind = handle_client_frame(
+            ClientDispatchContext {
+                state: &state,
+                forwarders: &mut forwarders,
+                queues: &mut queues,
+                sys_tx: &sys_tx,
+                batch_ms: 0,
+                encoding: Encoding::Json,
+                authorized: &mut authorized,
+                welcome_sent: true,
+            },
+            hello(Some(&cred.device_id), Some(&token)),
+        )
+        .await;
+        assert_eq!(
+            valid_rebind,
+            ClientFrameOutcome::Continue,
+            "a later valid credential must be reverified without duplicating welcome"
+        );
+
+        let invalid_rebind = handle_client_frame(
+            ClientDispatchContext {
+                state: &state,
+                forwarders: &mut forwarders,
+                queues: &mut queues,
+                sys_tx: &sys_tx,
+                batch_ms: 0,
+                encoding: Encoding::Json,
+                authorized: &mut authorized,
+                welcome_sent: true,
+            },
+            hello(Some(&cred.device_id), Some("bd1_wrongwrongwrong")),
+        )
+        .await;
+        assert_eq!(
+            invalid_rebind,
+            ClientFrameOutcome::Close,
+            "deduplication must not bypass later credential verification"
         );
     }
 
@@ -1110,7 +1280,7 @@ mod tests {
                 ch: SYS_CHANNEL.into(),
             },
         ] {
-            assert!(
+            assert_eq!(
                 handle_client_frame(
                     ClientDispatchContext {
                         state: &state,
@@ -1120,10 +1290,12 @@ mod tests {
                         batch_ms: 0,
                         encoding: Encoding::Json,
                         authorized: &mut authorized,
+                        welcome_sent: false,
                     },
                     frame,
                 )
-                .await
+                .await,
+                ClientFrameOutcome::Continue
             );
             assert!(
                 queues.contains_key(SYS_CHANNEL),

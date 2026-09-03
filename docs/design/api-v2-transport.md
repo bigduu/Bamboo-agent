@@ -290,11 +290,17 @@ bd1_<32 hex>          // 例如 bd1_4f8a...e2c9
 
 **loopback 桌面端**:`local_bypass` 语义保留——本地连接免 token(桌面开发零摩擦),仅公网连接强制 device token。
 
-> **当前实现边界:** 成功的 `hello` 只更新服务端连接的授权状态，尚不返回
-> `welcome` / `hello_ack`。客户端也不能以 socket open、首个业务事件或 pong
-> 推断认证成功。显式 acknowledgement 与订阅前等待 ACK 属于独立后续切片；在它
-> 落地前，`GET /api/v1/bootstrap` 只广告已经实现的
-> `auth.ws_device_hello.v1`，不会虚假广告 welcome/ACK 能力。
+成功通过授权门的首个 `hello` 会收到精确的顶层帧
+`{"type":"welcome"}`。JSON 子协议使用文本帧，MessagePack 子协议使用同形状的
+named-map 二进制帧。`welcome` 由连接唯一的 WebSocket writer 直接写出，不经过
+可丢弃的 heartbeat/sys 队列；写出失败即关闭连接。每个 socket 最多发送一次
+`welcome`：后续合法或无 token 的 `hello` 不重复 ACK，但后续携带 credential 的
+`hello` 仍会重新验证，无效 credential 仍立即关闭。
+
+`welcome` 只表示该 socket 已通过权威 hello/auth gate，不携带 token、device id、
+credential metadata、服务配置或 channel 数据。客户端不能以 socket open、首个
+业务事件或 pong 推断认证成功；支持这一契约的服务端在
+`GET /api/v1/bootstrap` 广告 `auth.ws_hello_ack.v1`。
 
 ### 4.4 管理
 
@@ -342,6 +348,7 @@ Sec-WebSocket-Extensions: permessage-deflate         # 压缩
 
 ```jsonc
 // 服务端 → 客户端
+{ "type": "welcome" }       // 首个已授权 hello 的可靠 ACK；每个 socket 最多一次
 {
   "ch": "agent.sess_abc",     // channel
   "seq": 42,                   // 该 channel 的单调序号(用于断线续传)
@@ -509,9 +516,13 @@ canonical public `GET /api/v1/bootstrap` 作为 Bamboo 身份、REST/realtime
   并带 `Cache-Control: no-store` 与
   `Vary: Cookie, Authorization, X-Device-Id`。
 
-Bootstrap 只证明 HTTP 发现契约；它不等价于 WebSocket hello acknowledgement。
-Lotus Next 在后续独立切片中增加显式 WSS ACK 后，才可在 ACK 前禁止 subscribe
-并将 negotiated connection state 作为 realtime authority。
+Bootstrap 只证明 HTTP 发现契约；它不等价于当前 WebSocket 已收到 hello
+acknowledgement。服务端通过 `auth.ws_hello_ack.v1` 广告 ACK 能力，客户端仍须在
+每条新 socket 上发送 `hello` 并等待 `welcome`，之后才能把该连接视为
+subscription-ready。Bamboo 为旧客户端保留兼容：已经由 loopback、cookie 或
+header 预授权的客户端仍可 subscribe-before-hello 或完全不发送 hello；此时继续
+立即服务 channel，但不会凭空发送 `welcome`。因此 `welcome` 先于订阅数据的顺序
+保证针对 hello-first 客户端。
 
 ### 8.3 认证迁移
 

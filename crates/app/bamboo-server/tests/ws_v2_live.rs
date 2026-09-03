@@ -202,6 +202,31 @@ async fn connect_local_msgpack(server: &TestServer) -> (WsConn, Option<String>) 
     (framed, echoed)
 }
 
+/// Open a NON-LOCAL WS connection negotiating MessagePack. Like
+/// [`connect_remote`], the public Host header makes the socket unauthorized
+/// until a valid device hello passes the authoritative gate.
+async fn connect_remote_msgpack(server: &TestServer) -> (WsConn, Option<String>) {
+    let mut request = server
+        .base_ws_url
+        .as_str()
+        .into_client_request()
+        .expect("remote msgpack ws request");
+    request
+        .headers_mut()
+        .insert(header::HOST, HeaderValue::from_static("bamboo.example.com"));
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static("bamboo.v2.msgpack"),
+    );
+    let (framed, resp) = connect_request(request, "remote msgpack ws upgrade").await;
+    let echoed = resp
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    (framed, echoed)
+}
+
 /// Send a client frame as a BINARY MessagePack frame (the inbound shape a msgpack
 /// client uses): the JSON `value` is re-encoded with `to_vec_named` so the wire
 /// bytes carry the SAME logical schema the server's `decode_client_frame` expects.
@@ -907,6 +932,49 @@ async fn agent_terminal_with_running_child_holds_open_then_closes() {
 
 // ── Scenario 4: hello auth-gate (#189/#195) ──────────────────────────────────
 
+/// A pre-authorized local connection receives exactly one welcome for its first
+/// token-less hello. Even when a duplicate hello and subscribe are already
+/// buffered, the direct welcome write precedes subscription data and is not
+/// repeated. Existing clients that never send hello are covered by the earlier
+/// subscribe scenarios and remain fully compatible.
+#[actix_web::test]
+async fn local_tokenless_hello_welcomes_once_before_subscribed_data() {
+    let server = TestServer::start(|_| {}).await;
+    server.state.account_sink.record(
+        None,
+        &AgentEvent::SessionDeleted {
+            session_id: "local-welcome-order".into(),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while server.state.account_sink.latest_seq() < 1 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut conn = connect_local(&server).await;
+    send_json(&mut conn, json!({"type": "hello"})).await;
+    send_json(&mut conn, json!({"type": "hello"})).await;
+    send_json(
+        &mut conn,
+        json!({"type": "subscribe", "ch": "feed", "since": 0}),
+    )
+    .await;
+
+    let welcome = next_envelope(&mut conn)
+        .await
+        .expect("pre-authorized hello receives welcome");
+    assert_eq!(welcome, json!({"type": "welcome"}));
+
+    let feed = next_envelope(&mut conn)
+        .await
+        .expect("subscription data follows welcome");
+    assert_eq!(feed["ch"], "feed");
+    assert_eq!(feed["seq"], 1);
+
+    server.stop().await;
+}
+
 /// A REMOTE (non-local) connection with an active device configured is NOT
 /// pre-authorized: a subscribe WITHOUT a valid hello serves NO channel data and
 /// the socket is CLOSED by the (shortened) auth deadline.
@@ -933,6 +1001,32 @@ async fn remote_without_hello_is_closed_by_deadline() {
     // The connection must be CLOSED by the deadline, having served nothing.
     expect_closed(&mut conn).await;
 
+    server.stop().await;
+}
+
+/// A token-less hello on an unauthorized remote socket does not earn a welcome
+/// or authorize a queued subscription; the existing auth deadline still closes
+/// the connection without serving application data.
+#[actix_web::test]
+async fn remote_tokenless_hello_stays_unauthorized_until_deadline() {
+    let mut captured = None;
+    let server = TestServer::start(|config| {
+        captured = Some(with_device(config));
+    })
+    .await;
+    let _ = captured;
+
+    let mut conn = connect_remote(&server).await;
+    send_json(&mut conn, json!({"type": "hello"})).await;
+    send_json(&mut conn, json!({"type": "subscribe", "ch": "feed"})).await;
+    server.state.account_sink.record(
+        None,
+        &AgentEvent::SessionDeleted {
+            session_id: "tokenless-remote".into(),
+        },
+    );
+
+    expect_closed(&mut conn).await;
     server.stop().await;
 }
 
@@ -966,18 +1060,74 @@ async fn remote_with_valid_hello_authorizes_then_subscribe_works() {
         json!({"type": "hello", "device_id": cred.device_id, "token": token}),
     )
     .await;
-    // After authorizing, a feed subscribe from cursor 0 backfills seq 1.
+    // Buffer subscribe immediately after hello: welcome must still be written
+    // first by the sole socket writer, before the feed forwarder can serve data.
     send_json(
         &mut conn,
         json!({"type": "subscribe", "ch": "feed", "since": 0}),
     )
     .await;
 
+    let welcome = next_envelope(&mut conn)
+        .await
+        .expect("a valid device hello must receive welcome");
+    assert_eq!(welcome, json!({"type": "welcome"}));
+
     let env = next_envelope(&mut conn)
         .await
         .expect("an authorized remote must receive feed data");
     assert_eq!(env["ch"], "feed");
     assert_eq!(env["seq"], 1);
+
+    server.stop().await;
+}
+
+/// The same valid-device hello contract is encoded as one binary MessagePack
+/// welcome, ordered before subscribed feed data.
+#[actix_web::test]
+async fn remote_msgpack_valid_hello_welcomes_before_subscribed_data() {
+    let mut captured = None;
+    let server = TestServer::start(|config| {
+        captured = Some(with_device(config));
+    })
+    .await;
+    let (cred, token) = captured.unwrap();
+
+    server.state.account_sink.record(
+        None,
+        &AgentEvent::SessionDeleted {
+            session_id: "msgpack-welcome-order".into(),
+        },
+    );
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while server.state.account_sink.latest_seq() < 1 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (mut conn, echoed) = connect_remote_msgpack(&server).await;
+    assert_eq!(echoed.as_deref(), Some("bamboo.v2.msgpack"));
+    send_msgpack(
+        &mut conn,
+        json!({"type": "hello", "device_id": cred.device_id, "token": token}),
+    )
+    .await;
+    send_msgpack(
+        &mut conn,
+        json!({"type": "subscribe", "ch": "feed", "since": 0}),
+    )
+    .await;
+
+    let welcome = next_msgpack_envelope(&mut conn)
+        .await
+        .expect("valid msgpack hello receives binary welcome");
+    assert_eq!(welcome, json!({"type": "welcome"}));
+
+    let feed = next_msgpack_envelope(&mut conn)
+        .await
+        .expect("msgpack feed data follows welcome");
+    assert_eq!(feed["ch"], "feed");
+    assert_eq!(feed["seq"], 1);
 
     server.stop().await;
 }
