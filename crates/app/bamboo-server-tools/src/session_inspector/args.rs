@@ -5,6 +5,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(super) enum SessionInspectorArgs {
+    /// Materialize a bounded, immutable observation of this root or its tree.
+    ExportContext { session_id: String },
+
     /// List sessions from the global index, with filtering/pagination.
     List {
         #[serde(default)]

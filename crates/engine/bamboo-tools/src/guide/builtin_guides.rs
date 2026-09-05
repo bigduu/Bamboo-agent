@@ -554,10 +554,15 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Inspect prior Bamboo session history from local SQLite storage. Use list/get_meta before deep reads when possible, then read bounded message slices, compressed conversation cache, or search results to recover previous discussion context. Distinct from `memory` (durable cross-session knowledge).",
-            "Do not use as a broad substitute for local code search, and do not delegate child-session inspection unless the user explicitly asks for delegated work.",
+            "Inspect prior Bamboo session history. Use list/get_meta before bounded messages, compressed history or search. A Root caller can export_context for itself or a same-tree target with the same optional Project identity, then Read the immutable status/brief files by offset/limit. Exports contain last persisted observations, not verified live progress. Distinct from memory (durable knowledge).",
+            "Do not use as a broad substitute for code search. export_context only materializes bounded read projections; it cannot control sessions, grant cross-tree access, or provide a complete task contract. Quota/corruption errors do not authorize deleting old snapshots. Keep child-session inspection local unless delegation is explicitly requested.",
             &["session_note", "Read", "Task"],
             vec![
+                example(
+                    "Read a bounded context file for this session tree",
+                    json!({"action":"export_context","session_id":"owned-child-123"}),
+                    "Use Read on the returned status_path or brief_path with a small offset/limit. Keep the returned revision fixed across continuation reads; a later export may produce a new revision. Output paths are runtime-derived.",
+                ),
                 example(
                     "Search prior discussion history",
                     json!({"action":"search","query":"release checklist","mode":"tail_messages","max_sessions":10,"tail_messages":6}),
