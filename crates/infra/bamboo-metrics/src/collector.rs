@@ -85,15 +85,30 @@ enum CollectorCommand {
     },
 }
 
+// Shared only by external collector clones. The scheduler itself holds no
+// owner reference, so dropping the last clone cancels its timer without a cycle.
+struct PruneScheduler {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PruneScheduler {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Clone)]
 pub struct MetricsCollector {
     tx: mpsc::UnboundedSender<CollectorCommand>,
+    _scheduler: Arc<PruneScheduler>,
 }
 
 impl MetricsCollector {
     pub fn spawn(storage: Arc<dyn MetricsStorage>, retention_days: u32) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<CollectorCommand>();
 
+        // Do not abort the consumer on owner release: closing the producers
+        // lets it finish initialization and drain accepted commands in order.
         tokio::spawn(async move {
             if let Err(error) = storage.init().await {
                 tracing::error!("metrics storage initialization failed: {}", error);
@@ -256,9 +271,11 @@ impl MetricsCollector {
             }
         });
 
-        let collector = Self { tx };
-        collector.schedule_prune(retention_days);
-        collector
+        let scheduler = Self::schedule_prune(tx.downgrade(), retention_days);
+        Self {
+            tx,
+            _scheduler: Arc::new(scheduler),
+        }
     }
 
     pub fn session_started(
@@ -476,15 +493,210 @@ impl MetricsCollector {
         });
     }
 
-    fn schedule_prune(&self, retention_days: u32) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
+    fn schedule_prune(
+        sender: mpsc::WeakUnboundedSender<CollectorCommand>,
+        retention_days: u32,
+    ) -> PruneScheduler {
+        let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
             loop {
                 interval.tick().await;
+                // This temporary producer is dropped before the next timer
+                // wait, allowing the consumer to close after external owners go.
+                let Some(tx) = sender.upgrade() else {
+                    break;
+                };
                 let cutoff = Utc::now() - Duration::days(i64::from(retention_days));
-                let _ = tx.send(CollectorCommand::Prune { cutoff });
+                if tx.send(CollectorCommand::Prune { cutoff }).is_err() {
+                    break;
+                }
             }
         });
+        PruneScheduler { task }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Weak;
+    use std::time::Duration as StdDuration;
+
+    use crate::storage::SqliteMetricsStorage;
+
+    use super::*;
+
+    async fn wait_for_reclaimed(
+        storage: &Weak<SqliteMetricsStorage>,
+        scheduler: &tokio::task::AbortHandle,
+    ) {
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while storage.strong_count() != 0 || !scheduler.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("collector should drain accepted commands and reclaim its tasks and storage");
+        assert!(scheduler.is_finished());
+        assert!(storage.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn final_owner_drop_before_initialization_drains_normal_and_prune_commands_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let storage = Arc::new(SqliteMetricsStorage::new(&path));
+        let storage_weak = Arc::downgrade(&storage);
+        let collector = MetricsCollector::spawn(storage, 90);
+        let scheduler = collector._scheduler.task.abort_handle();
+        let now = Utc::now();
+        let old = now - Duration::days(40);
+
+        // This current-thread test does not yield until after the final drop:
+        // initialization is still pending and all these commands are queued.
+        collector.session_started("drain", "model", old);
+        collector.round_started("old-round", "drain", "model", old);
+        collector.round_completed(
+            "old-round",
+            old,
+            RoundStatus::Success,
+            TokenUsage {
+                prompt_tokens: 6,
+                completion_tokens: 4,
+                total_tokens: 10,
+            },
+            0,
+            0,
+            None,
+        );
+        collector
+            .tx
+            .send(CollectorCommand::Prune {
+                cutoff: now - Duration::days(30),
+            })
+            .unwrap();
+        collector.session_message_count("drain", 1, now);
+        collector.round_started("new-round", "drain", "model", now);
+        collector.round_completed(
+            "new-round",
+            now,
+            RoundStatus::Success,
+            TokenUsage {
+                prompt_tokens: 12,
+                completion_tokens: 8,
+                total_tokens: 20,
+            },
+            0,
+            0,
+            None,
+        );
+        collector.session_message_count("drain", 42, now);
+        collector.session_completed("drain", SessionStatus::Completed, now);
+        drop(collector);
+
+        wait_for_reclaimed(&storage_weak, &scheduler).await;
+        // Reopen without initializing: the drained consumer had to create the
+        // schema and persist the complete FIFO sequence before releasing it.
+        let reopened = SqliteMetricsStorage::new(&path);
+        let detail = reopened.session_detail("drain").await.unwrap().unwrap();
+        assert_eq!(detail.rounds.len(), 1);
+        assert_eq!(detail.rounds[0].round_id, "new-round");
+        assert_eq!(detail.rounds[0].status, RoundStatus::Success);
+        assert_eq!(detail.session.total_rounds, 1);
+        assert_eq!(detail.session.total_token_usage.total_tokens, 20);
+        assert_eq!(detail.session.message_count, 42);
+        assert_eq!(detail.session.status, SessionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn remaining_clone_keeps_collection_and_periodic_retention_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let storage = Arc::new(SqliteMetricsStorage::new(&path));
+        storage.init().await.unwrap();
+        let now = Utc::now();
+        let old = now - Duration::days(100);
+        storage
+            .upsert_session_start("stale", "model", old)
+            .await
+            .unwrap();
+        storage
+            .insert_round_start("stale-round", "stale", "model", old)
+            .await
+            .unwrap();
+
+        let storage_weak = Arc::downgrade(&storage);
+        let collector = MetricsCollector::spawn(storage.clone(), 90);
+        let remaining = collector.clone();
+        let scheduler = collector._scheduler.task.abort_handle();
+        drop(collector);
+        remaining.session_started("kept", "model", now);
+        remaining.session_message_count("kept", 23, now);
+
+        // The interval's first tick is immediate, so observing its real prune
+        // needs no clock manipulation or six-hour delay.
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let stale = storage.session_detail("stale").await.unwrap().unwrap();
+                let kept = storage.session_detail("kept").await.unwrap();
+                if stale.rounds.is_empty()
+                    && kept.is_some_and(|detail| detail.session.message_count == 23)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remaining collector clone should accept events and retain its scheduler");
+        assert!(!scheduler.is_finished());
+        assert_eq!(remaining.tx.strong_count(), 1);
+
+        drop(storage);
+        drop(remaining);
+        wait_for_reclaimed(&storage_weak, &scheduler).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_collectors_in_one_runtime_release_storage_and_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        for iteration in 0..32 {
+            let storage = Arc::new(SqliteMetricsStorage::new(&path));
+            let storage_weak = Arc::downgrade(&storage);
+            let collector = MetricsCollector::spawn(storage, 90);
+            let scheduler = collector._scheduler.task.abort_handle();
+            let session_id = format!("session-{iteration}");
+            collector.session_started(&session_id, "model", Utc::now());
+            collector.session_message_count(&session_id, iteration + 1, Utc::now());
+            drop(collector);
+
+            wait_for_reclaimed(&storage_weak, &scheduler).await;
+        }
+
+        let reopened = SqliteMetricsStorage::new(&path);
+        for iteration in 0..32 {
+            let detail = reopened
+                .session_detail(&format!("session-{iteration}"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.session.message_count, iteration + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_stops_on_closed_receiver_while_producer_survives() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let scheduler = MetricsCollector::schedule_prune(tx.downgrade(), 90);
+        drop(rx);
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            while !scheduler.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed prune admission should terminate the scheduler");
+        assert_eq!(tx.strong_count(), 1);
     }
 }
