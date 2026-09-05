@@ -43,6 +43,11 @@ impl LlmManager for DefaultLlmManager {
             session_id,
             model_name,
             tool_schemas,
+            // This dormant lifecycle adapter does not yet carry the trusted
+            // execution-local prompt-memory provenance. `None` is unsupported
+            // coverage, not a zero-exposure observation; #1077 covers the
+            // canonical runner pipeline only.
+            None,
         )
         .await?;
 

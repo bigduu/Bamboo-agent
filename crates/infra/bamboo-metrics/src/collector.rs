@@ -5,7 +5,9 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
 use crate::storage::{MetricsStorage, ToolCallCompletion};
-use crate::types::{ForwardTokenDetails, RoundStatus, SessionStatus, TokenUsage};
+use crate::types::{
+    ForwardTokenDetails, PromptMemoryExposureObservation, RoundStatus, SessionStatus, TokenUsage,
+};
 
 #[derive(Debug)]
 enum CollectorCommand {
@@ -38,6 +40,9 @@ enum CollectorCommand {
         prompt_cached_tool_outputs: u32,
         prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
+    },
+    PromptMemoryExposure {
+        observation: PromptMemoryExposureObservation,
     },
     ToolStarted {
         tool_call_id: String,
@@ -173,6 +178,9 @@ impl MetricsCollector {
                                 error,
                             )
                             .await
+                    }
+                    CollectorCommand::PromptMemoryExposure { observation } => {
+                        storage.record_prompt_memory_exposure(&observation).await
                     }
                     CollectorCommand::ToolStarted {
                         tool_call_id,
@@ -352,6 +360,17 @@ impl MetricsCollector {
             prompt_cached_tool_tokens_saved,
             error,
         });
+    }
+
+    /// Queues a host-observed compact-memory prompt exposure.
+    ///
+    /// This is intentionally best-effort like the rest of the live metrics
+    /// collector. It neither blocks provider execution nor creates a durable
+    /// delivery acknowledgement protocol.
+    pub fn prompt_memory_exposure(&self, observation: PromptMemoryExposureObservation) {
+        let _ = self
+            .tx
+            .send(CollectorCommand::PromptMemoryExposure { observation });
     }
 
     pub fn record_agent_event(&self, session_id: &str, round_id: &str, event: &AgentEvent) {

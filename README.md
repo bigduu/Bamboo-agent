@@ -93,6 +93,31 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and the pers
 
 Jiandu defaults to the independent `~/.jiandu` data root. Bamboo configuration, sessions, and the prospective-record Ledger remain under `~/.bamboo`; the two stores are not mixed.
 
+**Prompt-memory observations.** The canonical native agent loop can record which
+compact relevant-memory records it supplied when a provider stream successfully
+bootstraps. Schema v1 keeps the first such observation for an execution-scoped
+logical round: retries do not increase its frequency or replace its membership,
+while a new execution/resume has a new round identity. This is host-side prompt
+exposure, not proof of provider processing, model adoption, or a full `memory get`.
+
+- Only trusted Project item IDs, lifecycle status, final rank and character
+  counts are retained. Headers also distinguish empty/disabled/failed recall and
+  count Global fallback without storing Global IDs. Jiandu v0.2.0 currently
+  chooses Project hits or Global fallback, not a mixed set; the observation
+  schema can represent mixed counts without assigning Global IDs to a Project.
+  Overall recall eligibility is not a Project lookup attempt or a Project
+  retrieval hit-rate denominator.
+- Records use the existing best-effort metrics collector and `metrics.db`, with
+  the existing 90-day round retention. Queued observations can be lost on a crash
+  or storage failure; this is not complete lifetime history or crash-exact delivery.
+- This captures the current round's fresh compact selection, not old memory text
+  retained in the append-only transcript. Management browsing and direct tool
+  execution do not emit observations; execution adapters without provenance are
+  unsupported coverage, not observed zeroes. There is no historical backfill.
+
+This producer does not add an aggregation endpoint or dashboard, alter Jiandu's
+canonical data, or store memory bodies, summaries, queries, prompts or outputs.
+
 **Gardener** (`bamboo-engine/src/gardener.rs`) specializes in splitting multi-topic blobs and consolidating duplicates. It has a hard per-run cap and **calls no LLM when the deterministic pre-screen finds no candidates**; only the model-reviewed maintenance decision has model cost.
 
 > Why it matters: the memory system lets the assistant understand your project better over long-term use, while keeping cost controlled and data local.

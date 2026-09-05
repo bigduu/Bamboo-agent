@@ -38,6 +38,8 @@ use bamboo_llm::{
 use bamboo_tools::exposure::activated_discoverable_tools;
 use sha2::{Digest, Sha256};
 
+use super::PromptMemoryExposureFrame;
+
 /// LLM-stream frame bundling per-request identification, observability, and
 /// model configuration parameters.  Passed into [`execute_llm_stream`] to
 /// keep its parameter count below the clippy threshold.
@@ -51,6 +53,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
+    pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
 
 const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
@@ -1189,6 +1192,23 @@ pub(super) async fn execute_llm_stream(
             AgentError::LLM(message)
         }
     })?;
+
+    // A successful stream bootstrap is the first point at which the final
+    // provider-visible PromptIR is known to have been accepted. Capture the
+    // typed fresh-selection snapshot once here; retries with the same round id
+    // are harmless because SQLite atomically preserves the first snapshot.
+    // Historical compact text already present in the append-only context ledger
+    // is intentionally not reparsed or backfilled into this round's observation.
+    if let (Some(collector), Some(exposure)) = (
+        config.metrics_collector.as_ref(),
+        frame.prompt_memory_exposure,
+    ) {
+        collector.prompt_memory_exposure(exposure.provenance.observation(
+            exposure.round_id,
+            session_id,
+            chrono::Utc::now(),
+        ));
+    }
 
     // Send token budget update AFTER LLM call succeeds.
     // This timing gives frontend time to subscribe to /events endpoint.

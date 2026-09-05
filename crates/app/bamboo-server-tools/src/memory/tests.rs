@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{ToolCtx, ToolExecutionContext};
+use bamboo_metrics::storage::MetricsStorage;
 use bamboo_storage::LockedSessionStore;
 use tokio::sync::RwLock;
 
@@ -691,6 +692,14 @@ async fn multilingual_retrieval_metadata_round_trips_through_query_and_get() {
     let dir = tempfile::tempdir().expect("tempdir");
     let tool = build_memory_tool(dir.path());
     let session_id = "multilingual-memory-session";
+    let round_id = "management-only-round";
+    let metrics_storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+        dir.path().join("metrics.db"),
+    ));
+    metrics_storage.init().await.expect("metrics init");
+    let collector = bamboo_metrics::MetricsCollector::spawn(metrics_storage.clone(), 7);
+    collector.session_started(session_id, "test-model", chrono::Utc::now());
+    collector.round_started(round_id, session_id, "test-model", chrono::Utc::now());
 
     let written = invoke_json(
         &tool,
@@ -743,6 +752,42 @@ async fn multilingual_retrieval_metadata_round_trips_through_query_and_get() {
     assert!(entities.contains(&json!("Project Suzaku")));
     assert_eq!(fetched["memory"]["body_truncated"], false);
     assert_eq!(fetched["memory"]["retrieval_metadata_truncated"], false);
+    invoke_json(
+        &tool,
+        json!({"action": "inspect", "scope": "global"}),
+        session_id,
+    )
+    .await;
+    invoke_json(
+        &tool,
+        json!({"action": "purge", "id": id, "mode": "archived"}),
+        session_id,
+    )
+    .await;
+
+    collector.session_message_count(session_id, 1, chrono::Utc::now());
+    let mut barrier_reached = false;
+    for _ in 0..100 {
+        if metrics_storage
+            .session_detail(session_id)
+            .await
+            .expect("metrics barrier query")
+            .is_some_and(|detail| detail.session.message_count == 1)
+        {
+            barrier_reached = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(barrier_reached, "metrics FIFO barrier did not persist");
+    assert!(
+        metrics_storage
+            .prompt_memory_exposure(round_id)
+            .await
+            .expect("query management exposure")
+            .is_none(),
+        "MemoryTool management actions must not count as provider prompt exposure"
+    );
 }
 
 #[tokio::test]

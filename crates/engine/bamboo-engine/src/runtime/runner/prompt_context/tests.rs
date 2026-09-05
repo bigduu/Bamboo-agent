@@ -762,13 +762,40 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
         "this query should not match anything relevant",
     ));
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
     .await;
+    let observation = exposure.observation("no-match-round", &session.id, chrono::Utc::now());
+    assert_eq!(
+        observation.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::NoMatch
+    );
+    assert_eq!(observation.all_compact_exposed_count, 0);
+    assert!(observation.project_items.is_empty());
+
+    let invalid_root = temp_dir.path().join("not-a-directory");
+    let invalid_index = invalid_root.join("memory/v1/scopes/global/indexes/lexical.json");
+    std::fs::create_dir_all(invalid_index.parent().expect("index parent")).expect("index dir");
+    std::fs::write(&invalid_index, "not-json").expect("write corrupt lexical index");
+    let invalid_store = bamboo_memory::memory_store::MemoryStore::new(&invalid_root);
+    let mut error_session = bamboo_agent_core::Session::new("lookup-error", "test-model");
+    error_session.add_message(bamboo_agent_core::Message::user("lookup error query"));
+    let lookup_error = super::refresh_external_memory_context_with_store(
+        &mut error_session,
+        &invalid_store,
+        crate::runtime::config::PromptMemoryFlags::default(),
+        None,
+    )
+    .await
+    .observation("lookup-error-round", &error_session.id, chrono::Utc::now());
+    assert_eq!(
+        lookup_error.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::LookupError
+    );
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -786,8 +813,9 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
     std::fs::create_dir_all(&workspace).expect("workspace dir");
     let project_key = project_id.to_string();
 
+    let mut written_ids = Vec::new();
     for idx in 0..4 {
-        project_memory
+        let written = project_memory
             .write_memory(
                 bamboo_memory::memory_store::MemoryScope::Project,
                 Some(project_key.as_str()),
@@ -802,6 +830,7 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
             )
             .await
             .expect("save project memory");
+        written_ids.push(written.frontmatter.id);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
@@ -814,13 +843,34 @@ async fn external_memory_limits_relevant_memories_to_top_k() {
     );
     session.add_message(bamboo_agent_core::Message::user("release freeze"));
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
     .await;
+    let observation = exposure.observation("top-k-round", &session.id, chrono::Utc::now());
+    assert_eq!(
+        observation.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
+    );
+    assert_eq!(observation.all_compact_exposed_count, 3);
+    assert_eq!(observation.project_items.len(), 3);
+    let observed_ids = observation
+        .project_items
+        .iter()
+        .map(|item| item.memory_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(observed_ids.len(), 3);
+    assert_eq!(
+        written_ids
+            .iter()
+            .filter(|id| !observed_ids.contains(id.as_str()))
+            .count(),
+        1,
+        "the fourth recall candidate must not be counted as provider-visible"
+    );
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -886,13 +936,22 @@ async fn external_memory_uses_global_relevant_memory_fallback_only_when_project_
     );
     session.add_message(bamboo_agent_core::Message::user("release checklist"));
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
     .await;
+    let observation = exposure.observation("global-only-round", &session.id, chrono::Utc::now());
+    assert_eq!(
+        observation.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
+    );
+    assert_eq!(observation.all_compact_exposed_count, 1);
+    assert_eq!(observation.project_exposed_count, 0);
+    assert!(observation.out_of_project_only);
+    assert!(observation.project_items.is_empty());
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -970,13 +1029,19 @@ async fn external_memory_uses_global_dream_fallback_when_project_dream_and_index
         workspace.to_string_lossy().to_string(),
     );
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
     .await;
+    assert_eq!(
+        exposure
+            .observation("no-query-round", &session.id, chrono::Utc::now())
+            .recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::NoQuery
+    );
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -1105,7 +1170,7 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
     );
     session.add_message(bamboo_agent_core::Message::user("concise answers"));
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -1116,6 +1181,12 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
         None,
     )
     .await;
+    assert_eq!(
+        exposure
+            .observation("disabled-round", &session.id, chrono::Utc::now())
+            .recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+    );
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -1203,7 +1274,7 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
         "release freeze for mobile launch",
     ));
 
-    super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_store(
         &mut session,
         &store,
         crate::runtime::config::PromptMemoryFlags {
@@ -1213,6 +1284,12 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
         Some(&runtime_context),
     )
     .await;
+    assert_eq!(
+        exposure
+            .observation("reranked-round", &session.id, chrono::Utc::now())
+            .recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Reranked
+    );
 
     let system_prompt = super::render_external_memory_section(&session)
         .expect("external memory section should be rendered");
@@ -1238,6 +1315,26 @@ async fn external_memory_uses_model_rerank_for_relevant_memories_when_enabled() 
     assert_eq!(
         requested_models.lock().expect("lock poisoned").as_slice(),
         ["rerank-fast-model"]
+    );
+
+    let fallback_context = super::PromptMemoryRuntimeContext {
+        llm: Arc::new(StaticResponseProvider::new("not a rerank response")),
+        background_model_name: Some("rerank-fallback-model".to_string()),
+    };
+    let fallback = super::refresh_external_memory_context_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..crate::runtime::config::PromptMemoryFlags::default()
+        },
+        Some(&fallback_context),
+    )
+    .await
+    .observation("rerank-fallback-round", &session.id, chrono::Utc::now());
+    assert_eq!(
+        fallback.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::RerankFallback
     );
 }
 

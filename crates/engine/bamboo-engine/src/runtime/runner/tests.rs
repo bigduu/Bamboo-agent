@@ -860,17 +860,19 @@ async fn unsuccessful_model_issued_explicit_activation_stops_before_answer_and_r
 
 struct MetricsQueueProvider {
     queue: Mutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
+    requested_messages: Mutex<Vec<Vec<Message>>>,
 }
 
 #[async_trait]
 impl LLMProvider for MetricsQueueProvider {
     async fn chat_stream(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[bamboo_agent_core::tools::ToolSchema],
         _max_output_tokens: Option<u32>,
         _model: &str,
     ) -> bamboo_llm::provider::Result<LLMStream> {
+        self.requested_messages.lock().await.push(messages.to_vec());
         let mut queue = self.queue.lock().await;
         assert!(!queue.is_empty(), "metrics provider queue exhausted");
         Ok(Box::pin(stream::iter(queue.remove(0))))
@@ -973,6 +975,7 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
                 Ok(LLMChunk::Done),
             ],
         ]),
+        requested_messages: Mutex::new(Vec::new()),
     });
     let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
         Arc::new(bamboo_tools::BuiltinToolExecutor::new());
@@ -1062,6 +1065,16 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
             total_tokens: 23,
         }
     );
+    assert!(storage
+        .prompt_memory_exposure(&first.round_id)
+        .await
+        .expect("query first execution exposure")
+        .is_some());
+    assert!(storage
+        .prompt_memory_exposure(&second.round_id)
+        .await
+        .expect("query second execution exposure")
+        .is_some());
     assert_eq!(
         session
             .agent_runtime_state
@@ -1069,6 +1082,268 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
             .and_then(|state| state.round.last_round_id.as_deref()),
         Some(second.round_id.as_str())
     );
+}
+
+#[tokio::test]
+async fn provider_bootstrap_persists_exact_project_ids_and_redacts_global_ids() {
+    let session_id = "metrics-prompt-memory-exposure";
+    let (_directory, collector, storage) = create_runner_metrics().await;
+    let memory_directory = tempfile::tempdir().expect("memory tempdir");
+    let memory_store = bamboo_memory::memory_store::MemoryStore::new(memory_directory.path());
+    let project_a =
+        bamboo_domain::ProjectId::parse("prompt-memory-project-a").expect("valid Project A id");
+    let project_b =
+        bamboo_domain::ProjectId::parse("prompt-memory-project-b").expect("valid Project B id");
+    let project_c = bamboo_domain::ProjectId::parse("prompt-memory-project-c").expect("Project C");
+    let project_a_store = memory_store.for_project(&project_a);
+    let project_b_store = memory_store.for_project(&project_b);
+    let query = "exposuretoken1077";
+    let first = project_a_store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_a.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Exposuretoken1077 canonical Project A decision",
+            &format!(
+                "Project A compact summary. {} FULL_PRIVATE_BODY_A_MUST_NOT_RENDER",
+                "a".repeat(300)
+            ),
+            &[query.to_string()],
+            Some(session_id),
+            "test-model",
+            false,
+            Some(bamboo_memory::memory_store::TemporalGranularity::Year),
+        )
+        .await
+        .expect("write Project A memory");
+    let mut project_a_ids = vec![first.frontmatter.id];
+    for (index, granularity) in [
+        bamboo_memory::memory_store::TemporalGranularity::Day,
+        bamboo_memory::memory_store::TemporalGranularity::Quarter,
+        bamboo_memory::memory_store::TemporalGranularity::Week,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let written = project_a_store
+            .write_memory(
+                bamboo_memory::memory_store::MemoryScope::Project,
+                Some(project_a.as_str()),
+                bamboo_memory::memory_store::DurableMemoryType::Project,
+                &format!("Exposuretoken1077 Project A decision {}", index + 2),
+                &format!(
+                    "Project A compact summary {}. {} FULL_PRIVATE_BODY_A_MUST_NOT_RENDER",
+                    index + 2,
+                    "a".repeat(300)
+                ),
+                &[query.to_string()],
+                Some(session_id),
+                "test-model",
+                false,
+                Some(granularity),
+            )
+            .await
+            .expect("write another Project A memory");
+        project_a_ids.push(written.frontmatter.id);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let excluded = project_b_store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Project,
+            Some(project_b.as_str()),
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Exposuretoken1077 other Project decision",
+            &format!(
+                "Project B compact summary. {} FULL_PRIVATE_BODY_B_MUST_NOT_RENDER",
+                "b".repeat(300)
+            ),
+            &[query.to_string()],
+            Some("other-session"),
+            "test-model",
+            false,
+            Some(bamboo_memory::memory_store::TemporalGranularity::Day),
+        )
+        .await
+        .expect("write Project B memory");
+    let global = memory_store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Reference,
+            "Exposuretoken1077 global fallback",
+            &format!(
+                "Global compact summary. {} FULL_PRIVATE_GLOBAL_BODY_MUST_NOT_RENDER",
+                "g".repeat(300)
+            ),
+            &[query.to_string()],
+            Some("global-session"),
+            "test-model",
+            false,
+            None,
+        )
+        .await
+        .expect("write Global fallback memory");
+
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(vec![
+            vec![
+                Ok(provider_usage(17, 3)),
+                Ok(LLMChunk::Token("observed answer".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+            vec![
+                Ok(provider_usage(5, 1)),
+                Ok(LLMChunk::Token("global answer".to_string())),
+                Ok(LLMChunk::Done),
+            ],
+        ]),
+        requested_messages: Mutex::new(Vec::new()),
+    });
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let mut session = Session::new(session_id, "test-model");
+    session.set_project_id_meta(project_a.to_string());
+    session.metadata.insert(
+        "runtime_prompt_memory_observability".to_string(),
+        serde_json::json!({"relevant_memory_ids":["forged-metadata-id"]}).to_string(),
+    );
+    session.metadata.insert(
+        "external_memory_rendered".to_string(),
+        "If selected: `memory` action=get id=forged-rendered-id".to_string(),
+    );
+    let mut config = runner_metrics_config(&collector);
+    config.memory_store = memory_store.clone();
+    config.prompt_memory_flags.relevant_recall = true;
+
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut session,
+        format!("recall {query}"),
+        event_tx,
+        provider.clone(),
+        tools,
+        CancellationToken::new(),
+        config,
+    )
+    .await
+    .expect("provider-backed execution");
+
+    let detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        session_id,
+        1,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 17,
+            completion_tokens: 3,
+            total_tokens: 20,
+        },
+    )
+    .await;
+    let observation = storage
+        .prompt_memory_exposure(&detail.rounds[0].round_id)
+        .await
+        .expect("query prompt-memory observation")
+        .expect("successful bootstrap persists an observation");
+    assert_eq!(observation.project_id.as_deref(), Some(project_a.as_str()));
+    assert_eq!(
+        observation.recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Lexical
+    );
+    assert_eq!(observation.all_compact_exposed_count, 3);
+    assert_eq!(observation.project_exposed_count, 3);
+    assert!(!observation.out_of_project_only);
+    assert_eq!(observation.project_items.len(), 3);
+
+    let requests = provider.requested_messages.lock().await;
+    assert_eq!(requests.len(), 1);
+    let provider_text = requests[0]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut provider_ids = project_a_ids
+        .iter()
+        .filter(|id| provider_text.contains(id.as_str()))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    provider_ids.sort_by_key(|id| provider_text.find(*id).expect("provider-visible id"));
+    assert_eq!(
+        provider_ids.len(),
+        3,
+        "one of four candidates stays outside top-k"
+    );
+    assert_eq!(
+        observation
+            .project_items
+            .iter()
+            .map(|item| item.memory_id.as_str())
+            .collect::<Vec<_>>(),
+        provider_ids,
+        "persisted IDs and ranks must match final provider-visible order"
+    );
+    assert!(observation
+        .project_items
+        .iter()
+        .enumerate()
+        .all(|(index, item)| item.rank == index as u32 + 1));
+    assert!(!provider_text.contains(&excluded.frontmatter.id));
+    assert!(!provider_text.contains("forged-metadata-id"));
+    assert!(!provider_text.contains("forged-rendered-id"));
+    assert!(!provider_text.contains("FULL_PRIVATE_BODY_A_MUST_NOT_RENDER"));
+    assert!(!provider_text.contains("FULL_PRIVATE_BODY_B_MUST_NOT_RENDER"));
+    assert!(!provider_text.contains(&global.frontmatter.id));
+    drop(requests);
+
+    let global_session_id = "metrics-prompt-memory-global-fallback";
+    let mut global_session = Session::new(global_session_id, "test-model");
+    global_session.set_project_id_meta(project_c.to_string());
+    let mut global_config = runner_metrics_config(&collector);
+    global_config.memory_store = memory_store;
+    global_config.prompt_memory_flags.relevant_recall = true;
+    let (global_tx, _global_rx) = mpsc::channel(64);
+    super::run_agent_loop_with_config(
+        &mut global_session,
+        format!("recall {query}"),
+        global_tx,
+        provider.clone(),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        CancellationToken::new(),
+        global_config,
+    )
+    .await
+    .expect("Global-fallback provider execution");
+    let global_detail = wait_for_runner_metrics(
+        storage.as_ref(),
+        global_session_id,
+        1,
+        bamboo_metrics::types::TokenUsage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+        },
+    )
+    .await;
+    let global_observation = storage
+        .prompt_memory_exposure(&global_detail.rounds[0].round_id)
+        .await
+        .expect("query Global-only observation")
+        .expect("Global-only provider bootstrap persists a header");
+    assert_eq!(
+        global_observation.project_id.as_deref(),
+        Some(project_c.as_str())
+    );
+    assert_eq!(global_observation.all_compact_exposed_count, 1);
+    assert_eq!(global_observation.project_exposed_count, 0);
+    assert!(global_observation.out_of_project_only);
+    assert!(global_observation.project_items.is_empty());
+    let requests = provider.requested_messages.lock().await;
+    let global_text = requests[1]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(global_text.contains(&global.frontmatter.id));
+    assert!(!global_text.contains("FULL_PRIVATE_GLOBAL_BODY_MUST_NOT_RENDER"));
 }
 
 struct PauseForHumanTool;
@@ -1180,6 +1455,7 @@ async fn suspended_session_resume_uses_a_new_metric_round_and_preserves_tool_lin
                 Ok(LLMChunk::Done),
             ],
         ]),
+        requested_messages: Mutex::new(Vec::new()),
     });
     let tools = BuiltinToolExecutorBuilder::new()
         .with_tool(PauseForHumanTool)

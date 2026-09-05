@@ -71,6 +71,17 @@ pub(crate) struct RoundLlmExecutionOutput {
     pub terminal_validation_error: Option<AgentError>,
 }
 
+/// Trusted execution-local prompt-memory snapshot paired with the stable
+/// execution-scoped round identity used for durable metrics deduplication.
+///
+/// `None` means this execution path does not implement #1077 capture. It must
+/// not be converted into a supported zero-exposure observation.
+#[derive(Clone, Copy)]
+pub(crate) struct PromptMemoryExposureFrame<'a> {
+    pub round_id: &'a str,
+    pub provenance: &'a crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance,
+}
+
 /// Resolve one billed attempt's canonical token usage.
 ///
 /// Availability is decided independently for prompt and completion tokens:
@@ -114,6 +125,7 @@ pub(crate) async fn execute_llm_round(
     session_id: &str,
     model_name: &str,
     tool_schemas: &[ToolSchema],
+    prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     let required_tool = required_tool_for_session(session);
     let capability_loading_mode = llm.capability_loading_mode(model_name, required_tool).await;
@@ -147,6 +159,7 @@ pub(crate) async fn execute_llm_round(
         reasoning_effort: config.reasoning_effort,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        prompt_memory_exposure,
     };
 
     let (stream_output, llm_duration) = stream_execution::execute_llm_stream(
@@ -343,6 +356,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
         )
         .await
         .unwrap();
@@ -388,6 +402,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
         )
         .await
         .unwrap();

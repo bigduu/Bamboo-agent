@@ -91,8 +91,10 @@ use thiserror::Error;
 use crate::metrics::types::{
     DailyMetrics, ForwardEndpointMetrics, ForwardMetricsFilter, ForwardMetricsSummary,
     ForwardRequestMetrics, ForwardStatus, ForwardTokenDetails, MetricsDateFilter, MetricsSummary,
-    ModelMetrics, ModelMetricsDateFilter, RoundMetrics, RoundStatus, SessionDetail, SessionMetrics,
-    SessionMetricsFilter, SessionStatus, TokenUsage, ToolCallMetrics,
+    ModelMetrics, ModelMetricsDateFilter, PromptMemoryExposureItem,
+    PromptMemoryExposureObservation, PromptMemoryRecallOutcome, RoundMetrics, RoundStatus,
+    SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus, TokenUsage,
+    ToolCallMetrics,
 };
 
 /// Result type for metrics storage operations.
@@ -313,6 +315,23 @@ pub trait MetricsStorage: Send + Sync {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()>;
+
+    /// Persists the first successfully bootstrapped prompt-memory observation
+    /// for one logical round.
+    ///
+    /// Storage implementations that do not support this additive metric fail
+    /// explicitly instead of treating an unobserved path as an observed empty
+    /// round. The live collector logs that best-effort failure without blocking
+    /// agent execution.
+    async fn record_prompt_memory_exposure(
+        &self,
+        _observation: &PromptMemoryExposureObservation,
+    ) -> MetricsResult<()> {
+        Err(MetricsError::InvalidData(
+            "prompt-memory exposure observations are not supported by this metrics storage"
+                .to_string(),
+        ))
+    }
 
     /// Completes a round with final metrics and status.
     ///
@@ -941,6 +960,19 @@ impl SqliteMetricsStorage {
         }
     }
 
+    /// Loads one persisted prompt-memory observation by logical round.
+    ///
+    /// This is a narrow storage primitive used by producer verification. Public
+    /// Project-authoritative aggregation remains a separate API slice.
+    pub async fn prompt_memory_exposure(
+        &self,
+        round_id: &str,
+    ) -> MetricsResult<Option<PromptMemoryExposureObservation>> {
+        let round_id = round_id.to_string();
+        self.with_connection(move |connection| load_prompt_memory_exposure(connection, &round_id))
+            .await
+    }
+
     /// Executes a function with a database connection in a blocking context.
     ///
     /// This helper method handles:
@@ -1021,6 +1053,47 @@ impl MetricsStorage for SqliteMetricsStorage {
                     FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS prompt_memory_round_observations (
+                    round_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT,
+                    observed_at TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    recall_enabled INTEGER NOT NULL,
+                    query_present INTEGER NOT NULL,
+                    recall_outcome TEXT NOT NULL,
+                    all_compact_exposed_count INTEGER NOT NULL,
+                    project_exposed_count INTEGER NOT NULL,
+                    out_of_project_only INTEGER NOT NULL,
+                    compact_section_chars INTEGER NOT NULL,
+                    FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
+                    FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE,
+                    CHECK(schema_version = 1),
+                    CHECK(recall_enabled IN (0, 1)),
+                    CHECK(query_present IN (0, 1)),
+                    CHECK(recall_outcome IN ('disabled', 'no_query', 'no_match', 'lookup_error', 'lexical', 'reranked', 'rerank_fallback')),
+                    CHECK(all_compact_exposed_count >= 0),
+                    CHECK(project_exposed_count >= 0),
+                    CHECK(project_exposed_count <= all_compact_exposed_count),
+                    CHECK(out_of_project_only IN (0, 1)),
+                    CHECK(compact_section_chars >= 0)
+                );
+
+                CREATE TABLE IF NOT EXISTS prompt_memory_project_exposures (
+                    round_id TEXT NOT NULL,
+                    memory_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    status_at_observation TEXT NOT NULL,
+                    rank INTEGER NOT NULL,
+                    rendered_chars INTEGER NOT NULL,
+                    PRIMARY KEY(round_id, memory_id),
+                    FOREIGN KEY(round_id) REFERENCES prompt_memory_round_observations(round_id) ON DELETE CASCADE,
+                    CHECK(scope = 'project'),
+                    CHECK(status_at_observation IN ('active', 'stale', 'superseded', 'contradicted', 'archived')),
+                    CHECK(rank > 0),
+                    CHECK(rendered_chars > 0)
+                );
+
                 CREATE TABLE IF NOT EXISTS tool_call_metrics (
                     tool_call_id TEXT PRIMARY KEY,
                     round_id TEXT NOT NULL,
@@ -1041,6 +1114,8 @@ impl MetricsStorage for SqliteMetricsStorage {
                 -- Repeated or interrupted initialization always retains a session lookup.
                 DROP INDEX IF EXISTS idx_round_session;
                 CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
+                CREATE INDEX IF NOT EXISTS idx_prompt_memory_project_observed_at ON prompt_memory_round_observations(project_id, observed_at, round_id);
+                CREATE INDEX IF NOT EXISTS idx_prompt_memory_item_memory_round ON prompt_memory_project_exposures(memory_id, round_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_round_started_at ON tool_call_metrics(round_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
@@ -1221,6 +1296,102 @@ impl MetricsStorage for SqliteMetricsStorage {
                     params![round_id, session_id, model, started_at_str],
                 )?;
                 refresh_session_aggregates(connection, &session_id, started_at)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn record_prompt_memory_exposure(
+        &self,
+        observation: &PromptMemoryExposureObservation,
+    ) -> MetricsResult<()> {
+        let observation = observation.clone();
+        self.with_connection(move |connection| {
+            with_immediate_transaction(connection, || {
+                validate_prompt_memory_exposure(&observation)?;
+
+                let round_session_id = connection
+                    .query_row(
+                        "SELECT session_id FROM round_metrics WHERE round_id = ?1",
+                        params![observation.round_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        MetricsError::InvalidData(format!(
+                            "prompt-memory observation references unknown round '{}'",
+                            observation.round_id
+                        ))
+                    })?;
+                if round_session_id != observation.session_id {
+                    return Err(MetricsError::InvalidData(format!(
+                        "prompt-memory observation session '{}' does not own round '{}'",
+                        observation.session_id, observation.round_id
+                    )));
+                }
+
+                if let Some(existing) =
+                    load_prompt_memory_exposure(connection, &observation.round_id)?
+                {
+                    // First successful bootstrap owns the logical round. Later
+                    // retries by that same Session/Project are harmless no-ops,
+                    // even if request membership changed after recovery.
+                    if existing.session_id == observation.session_id
+                        && existing.project_id == observation.project_id
+                    {
+                        return Ok(());
+                    }
+                    return Err(MetricsError::InvalidData(format!(
+                        "prompt-memory observation ownership conflict for round '{}'",
+                        observation.round_id
+                    )));
+                }
+
+                connection.execute(
+                    r#"
+                    INSERT INTO prompt_memory_round_observations (
+                        round_id, session_id, project_id, observed_at,
+                        schema_version, recall_enabled, query_present,
+                        recall_outcome, all_compact_exposed_count,
+                        project_exposed_count, out_of_project_only,
+                        compact_section_chars
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    "#,
+                    params![
+                        observation.round_id,
+                        observation.session_id,
+                        observation.project_id,
+                        format_timestamp(observation.observed_at),
+                        i64::from(observation.schema_version),
+                        i64::from(observation.recall_enabled),
+                        i64::from(observation.query_present),
+                        observation.recall_outcome.as_str(),
+                        i64::from(observation.all_compact_exposed_count),
+                        i64::from(observation.project_exposed_count),
+                        i64::from(observation.out_of_project_only),
+                        i64::from(observation.compact_section_chars),
+                    ],
+                )?;
+
+                for item in &observation.project_items {
+                    connection.execute(
+                        r#"
+                        INSERT INTO prompt_memory_project_exposures (
+                            round_id, memory_id, scope, status_at_observation,
+                            rank, rendered_chars
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        "#,
+                        params![
+                            observation.round_id,
+                            item.memory_id,
+                            item.scope,
+                            item.status_at_observation,
+                            i64::from(item.rank),
+                            i64::from(item.rendered_chars),
+                        ],
+                    )?;
+                }
                 Ok(())
             })
         })
@@ -2518,6 +2689,289 @@ fn parse_timestamp(raw: String) -> MetricsResult<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&raw)?.with_timezone(&Utc))
 }
 
+fn validate_prompt_memory_exposure(
+    observation: &PromptMemoryExposureObservation,
+) -> MetricsResult<()> {
+    if observation.schema_version != 1 {
+        return Err(MetricsError::InvalidData(format!(
+            "unsupported prompt-memory observation schema version {}",
+            observation.schema_version
+        )));
+    }
+    if observation.round_id.trim().is_empty() || observation.session_id.trim().is_empty() {
+        return Err(MetricsError::InvalidData(
+            "prompt-memory observation requires non-empty round and session identities".to_string(),
+        ));
+    }
+    if observation
+        .project_id
+        .as_deref()
+        .is_some_and(|project_id| project_id.trim().is_empty())
+    {
+        return Err(MetricsError::InvalidData(
+            "prompt-memory observation Project identity cannot be blank".to_string(),
+        ));
+    }
+    if observation.project_exposed_count > observation.all_compact_exposed_count {
+        return Err(MetricsError::InvalidData(
+            "Project prompt-memory exposure count exceeds the complete compact count".to_string(),
+        ));
+    }
+    let item_count = u32::try_from(observation.project_items.len()).map_err(|_| {
+        MetricsError::InvalidData("too many Project prompt-memory exposure items".to_string())
+    })?;
+    if observation.project_exposed_count != item_count {
+        return Err(MetricsError::InvalidData(format!(
+            "Project prompt-memory exposure count {} does not match {} items",
+            observation.project_exposed_count, item_count
+        )));
+    }
+    if item_count > 0 && observation.project_id.is_none() {
+        return Err(MetricsError::InvalidData(
+            "Project prompt-memory items require a server-resolved Project identity".to_string(),
+        ));
+    }
+    let expected_out_of_project_only =
+        observation.all_compact_exposed_count > 0 && observation.project_exposed_count == 0;
+    if observation.out_of_project_only != expected_out_of_project_only {
+        return Err(MetricsError::InvalidData(
+            "out-of-Project-only flag does not match prompt-memory exposure counts".to_string(),
+        ));
+    }
+
+    match observation.recall_outcome {
+        PromptMemoryRecallOutcome::Disabled if observation.recall_enabled => {
+            return Err(MetricsError::InvalidData(
+                "disabled recall outcome requires recall to be disabled".to_string(),
+            ));
+        }
+        PromptMemoryRecallOutcome::NoQuery
+            if !observation.recall_enabled || observation.query_present =>
+        {
+            return Err(MetricsError::InvalidData(
+                "no-query recall outcome requires enabled recall without a query".to_string(),
+            ));
+        }
+        PromptMemoryRecallOutcome::NoMatch
+        | PromptMemoryRecallOutcome::LookupError
+        | PromptMemoryRecallOutcome::Lexical
+        | PromptMemoryRecallOutcome::Reranked
+        | PromptMemoryRecallOutcome::RerankFallback
+            if !observation.recall_enabled || !observation.query_present =>
+        {
+            return Err(MetricsError::InvalidData(
+                "observed recall outcome requires enabled recall and a query".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    if matches!(
+        observation.recall_outcome,
+        PromptMemoryRecallOutcome::Disabled
+            | PromptMemoryRecallOutcome::NoQuery
+            | PromptMemoryRecallOutcome::NoMatch
+            | PromptMemoryRecallOutcome::LookupError
+    ) && observation.all_compact_exposed_count != 0
+    {
+        return Err(MetricsError::InvalidData(
+            "non-selection recall outcome cannot contain compact exposures".to_string(),
+        ));
+    }
+
+    let mut memory_ids = BTreeSet::new();
+    let mut ranks = BTreeSet::new();
+    let mut rendered_item_chars = 0_u64;
+    for item in &observation.project_items {
+        if item.memory_id.trim().is_empty() {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item identity cannot be blank".to_string(),
+            ));
+        }
+        if !matches!(
+            item.status_at_observation.as_str(),
+            "active" | "stale" | "superseded" | "contradicted" | "archived"
+        ) {
+            return Err(MetricsError::InvalidData(
+                "invalid prompt-memory lifecycle status".to_string(),
+            ));
+        }
+        if item.scope != "project" {
+            return Err(MetricsError::InvalidData(
+                "schema v1 persists only Project prompt-memory item identities".to_string(),
+            ));
+        }
+        if item.rank == 0 || item.rendered_chars == 0 {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item rank and rendered characters must be positive".to_string(),
+            ));
+        }
+        if item.rank > observation.all_compact_exposed_count {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item rank exceeds the complete compact exposure count".to_string(),
+            ));
+        }
+        rendered_item_chars = rendered_item_chars.saturating_add(u64::from(item.rendered_chars));
+        if !memory_ids.insert(item.memory_id.as_str()) || !ranks.insert(item.rank) {
+            return Err(MetricsError::InvalidData(
+                "prompt-memory item identities and ranks must be unique within a round".to_string(),
+            ));
+        }
+    }
+    if observation.all_compact_exposed_count > 0 && observation.compact_section_chars == 0 {
+        return Err(MetricsError::InvalidData(
+            "non-empty compact exposure requires a rendered section".to_string(),
+        ));
+    }
+    if u64::from(observation.compact_section_chars) < rendered_item_chars {
+        return Err(MetricsError::InvalidData(
+            "compact section characters cannot be smaller than its Project items".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_prompt_memory_exposure(
+    connection: &Connection,
+    round_id: &str,
+) -> MetricsResult<Option<PromptMemoryExposureObservation>> {
+    type HeaderRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+    let header: Option<HeaderRow> = connection
+        .query_row(
+            r#"
+            SELECT round_id, session_id, project_id, observed_at,
+                   schema_version, recall_enabled, query_present, recall_outcome,
+                   all_compact_exposed_count, project_exposed_count,
+                   out_of_project_only, compact_section_chars
+            FROM prompt_memory_round_observations
+            WHERE round_id = ?1
+            "#,
+            params![round_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        round_id,
+        session_id,
+        project_id,
+        observed_at,
+        schema_version,
+        recall_enabled,
+        query_present,
+        recall_outcome,
+        all_compact_exposed_count,
+        project_exposed_count,
+        out_of_project_only,
+        compact_section_chars,
+    )) = header
+    else {
+        return Ok(None);
+    };
+
+    let mut statement = connection.prepare(
+        r#"
+        SELECT memory_id, scope, status_at_observation, rank, rendered_chars
+        FROM prompt_memory_project_exposures
+        WHERE round_id = ?1
+        ORDER BY rank ASC, memory_id ASC
+        "#,
+    )?;
+    let project_items = statement
+        .query_map(params![round_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .map(|row| {
+            let (memory_id, scope, status_at_observation, rank, rendered_chars) = row?;
+            Ok(PromptMemoryExposureItem {
+                memory_id,
+                scope,
+                status_at_observation,
+                rank: metric_i64_to_u32(rank, "prompt-memory item rank")?,
+                rendered_chars: metric_i64_to_u32(
+                    rendered_chars,
+                    "prompt-memory item rendered characters",
+                )?,
+            })
+        })
+        .collect::<MetricsResult<Vec<_>>>()?;
+
+    let observation = PromptMemoryExposureObservation {
+        schema_version: metric_i64_to_u32(
+            schema_version,
+            "prompt-memory observation schema version",
+        )?,
+        round_id,
+        session_id,
+        project_id,
+        observed_at: parse_timestamp(observed_at)?,
+        recall_enabled: metric_i64_to_bool(recall_enabled, "recall-enabled flag")?,
+        query_present: metric_i64_to_bool(query_present, "query-present flag")?,
+        recall_outcome: PromptMemoryRecallOutcome::from_db(&recall_outcome).ok_or_else(|| {
+            MetricsError::InvalidData("unknown prompt-memory recall outcome".to_string())
+        })?,
+        all_compact_exposed_count: metric_i64_to_u32(
+            all_compact_exposed_count,
+            "all compact exposure count",
+        )?,
+        project_exposed_count: metric_i64_to_u32(project_exposed_count, "Project exposure count")?,
+        out_of_project_only: metric_i64_to_bool(out_of_project_only, "out-of-Project-only flag")?,
+        compact_section_chars: metric_i64_to_u32(
+            compact_section_chars,
+            "compact section characters",
+        )?,
+        project_items,
+    };
+    validate_prompt_memory_exposure(&observation)?;
+    Ok(Some(observation))
+}
+
+fn metric_i64_to_u32(value: i64, field: &str) -> MetricsResult<u32> {
+    u32::try_from(value).map_err(|_| MetricsError::InvalidData(format!("invalid {field}: {value}")))
+}
+
+fn metric_i64_to_bool(value: i64, field: &str) -> MetricsResult<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(MetricsError::InvalidData(format!(
+            "invalid {field}: {value}"
+        ))),
+    }
+}
+
 /// Parses an optional RFC3339 timestamp string.
 ///
 /// # Arguments
@@ -3448,6 +3902,10 @@ fn load_execute_sync_mismatch_breakdown(
 const LOAD_ROUNDS_SQL: &str = "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC";
 
 const LOAD_TOOL_CALLS_SQL: &str = "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC";
+
+#[cfg(test)]
+#[path = "storage/prompt_memory_tests.rs"]
+mod prompt_memory_tests;
 
 #[cfg(test)]
 mod tests {

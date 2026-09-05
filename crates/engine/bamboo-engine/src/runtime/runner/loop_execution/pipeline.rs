@@ -2661,15 +2661,16 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
-            session,
-            &mut state.runtime_state,
-            config,
-            cancel_token,
-            state.metrics_collector.as_ref(),
-            Some(&runtime_context),
-        )
-        .await?;
+        let prompt_memory_exposure =
+            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+                session,
+                &mut state.runtime_state,
+                config,
+                cancel_token,
+                state.metrics_collector.as_ref(),
+                Some(&runtime_context),
+            )
+            .await?;
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -2739,6 +2740,12 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
+                Some(
+                    crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
+                        round_id: &round_id,
+                        provenance: &prompt_memory_exposure,
+                    },
+                ),
             )
             .await
             {
@@ -2815,6 +2822,12 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
+                                Some(
+                                    crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
+                                        round_id: &round_id,
+                                        provenance: &prompt_memory_exposure,
+                                    },
+                                ),
                             )
                             .await
                             {
@@ -6509,7 +6522,9 @@ mod tests {
         });
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
         let mut state = e2e_loop_state(session_id);
-        state.metrics_collector = Some(collector);
+        state.metrics_collector = Some(collector.clone());
+        let mut config = canonical_usage_pipeline_config();
+        config.metrics_collector = Some(collector);
 
         super::run_pipeline(
             &mut session,
@@ -6517,7 +6532,7 @@ mod tests {
             provider.clone(),
             tools,
             &tokio_util::sync::CancellationToken::new(),
-            &canonical_usage_pipeline_config(),
+            &config,
             &mut state,
         )
         .await
@@ -6545,6 +6560,16 @@ mod tests {
         assert_eq!(detail.rounds.len(), 1, "both attempts belong to one round");
         assert_eq!(detail.rounds[0].token_usage, expected);
         assert_eq!(detail.session.total_token_usage, expected);
+        let exposure = storage
+            .prompt_memory_exposure(&detail.rounds[0].round_id)
+            .await
+            .expect("query retry exposure")
+            .expect("both successful bootstraps share one first-wins observation");
+        assert_eq!(
+            exposure.recall_outcome,
+            bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+        );
+        assert_eq!(exposure.all_compact_exposed_count, 0);
         assert_eq!(state.runtime_state.round.total_prompt_tokens, 30);
         assert_eq!(state.runtime_state.round.total_completion_tokens, 8);
     }
