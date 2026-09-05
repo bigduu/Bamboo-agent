@@ -7,6 +7,7 @@ use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome}
 use bamboo_storage::SessionStoreV2;
 
 mod args;
+mod context_view;
 mod handlers;
 mod helpers;
 
@@ -55,7 +56,7 @@ impl Tool for SessionInspectorTool {
     }
 
     fn description(&self) -> &str {
-        "Read-only viewer over the local SQLite session history. Use this to list prior sessions, inspect metadata, read bounded message slices, read the compressed conversation cache, and full-text search prior conversation history before asking the user to repeat information. This is purely a read tool — it has no runtime control and cannot influence live sessions. Distinct from the `memory` tool, which manages durable cross-session knowledge."
+        "Read-only viewer over local session history. List sessions, inspect metadata, read bounded message slices or compressed history, and search prior conversations. A Root caller can use export_context for itself or a same-tree, same-Project target: it materializes bounded immutable status/brief files for Read offset/limit, without changing session state. Exported status is a last persisted observation, not verified live progress. This viewer has no runtime control. Distinct from memory, which manages durable cross-session knowledge."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -65,7 +66,7 @@ impl Tool for SessionInspectorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "get_meta", "read_messages", "read_compressed_cache", "search"],
+                    "enum": ["list", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
                     "description": "Which inspection action to perform."
                 },
                 "query": { "type": "string", "description": "Search string (list/search)." },
@@ -76,7 +77,7 @@ impl Tool for SessionInspectorTool {
                 "created_by_schedule_id": { "type": "string", "description": "Filter sessions created by a schedule (list)." },
                 "limit": { "type": "number", "description": "Max items/messages to return (list/read_messages)." },
                 "offset": { "type": "number", "description": "Offset (list/read_messages)." },
-                "session_id": { "type": "string", "description": "Target session id (get_meta/read_messages)." },
+                "session_id": { "type": "string", "description": "Target session id. export_context requires a persisted Root caller and a target in its own tree with the same optional Project identity; output paths are runtime-owned." },
                 "from_end": { "type": "boolean", "description": "Read from end (read_messages)." },
                 "truncate_chars": { "type": "number", "description": "Max chars per message (read_messages)." },
                 "include_system": { "type": "boolean" },
@@ -103,17 +104,31 @@ impl Tool for SessionInspectorTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
-        let _caller_session_id = ctx.session_id().ok_or_else(|| {
+        let caller_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution(
                 "session_history requires a session_id in tool context".to_string(),
             )
         })?;
 
+        if args.get("action").and_then(serde_json::Value::as_str) == Some("export_context")
+            && args.as_object().is_some_and(|fields| {
+                fields
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "action" | "session_id"))
+            })
+        {
+            return Err(ToolError::InvalidArguments(
+                "export_context only accepts action and session_id; caller identity and output paths are runtime-derived".to_string(),
+            ));
+        }
         let parsed: SessionInspectorArgs = serde_json::from_value(args).map_err(|e| {
             ToolError::InvalidArguments(format!("Invalid session_history args: {e}"))
         })?;
 
         match parsed {
+            SessionInspectorArgs::ExportContext { session_id } => {
+                context_view::export_context(self, caller_session_id, &session_id).await
+            }
             SessionInspectorArgs::List {
                 query,
                 kind,
