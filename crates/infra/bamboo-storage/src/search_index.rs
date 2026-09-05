@@ -23,16 +23,17 @@ fn to_io_error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
 }
 
-/// Open the search-index SQLite database with a `busy_timeout` set.
+/// Apply the search index's busy timeout and NORMAL synchronization policy.
 ///
-/// `busy_timeout` is a **per-connection** setting (not persisted in the DB
-/// file), so every connection opener must go through this rather than calling
-/// `Connection::open` directly. #357.
+/// Both settings are per connection, so all readers and writers must open via
+/// this helper. WAL remains a persistent database setting applied by init_db.
 fn open_db(db_path: &Path) -> std::io::Result<Connection> {
     let conn =
         Connection::open(db_path).map_err(|e| to_io_error(format!("sqlite open failed: {e}")))?;
     conn.busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
         .map_err(|e| to_io_error(format!("sqlite busy_timeout failed: {e}")))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| to_io_error(format!("sqlite pragma synchronous failed: {e}")))?;
     Ok(conn)
 }
 
@@ -215,8 +216,6 @@ fn init_db(db_path: &Path) -> std::io::Result<()> {
     let conn = open_db(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| to_io_error(format!("sqlite pragma journal_mode failed: {e}")))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .map_err(|e| to_io_error(format!("sqlite pragma synchronous failed: {e}")))?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS session_search_meta (
@@ -526,6 +525,45 @@ fn maybe_vacuum_db(db_path: &Path, purged_rows: usize) -> std::io::Result<bool> 
     Ok(true)
 }
 
+// Keep the bm25 score columns, but order by the qualified hidden rank so
+// SQLite can consume FTS5 results in rank order without a temporary sort.
+const SESSION_SEARCH_SQL: &str = r#"
+SELECT
+    session_id,
+    title,
+    summary,
+    bm25(sessions_search_fts) AS rank,
+    snippet(sessions_search_fts, 1, '[', ']', '...', 24) AS snippet
+FROM sessions_search_fts
+WHERE sessions_search_fts MATCH ?1
+ORDER BY sessions_search_fts.rank
+LIMIT ?2
+"#;
+
+const MESSAGE_SEARCH_SQL: &str = r#"
+SELECT
+    s.session_id,
+    s.title,
+    s.kind,
+    s.root_session_id,
+    s.parent_session_id,
+    s.pinned,
+    s.updated_at,
+    bm25(session_messages_search_fts) AS rank,
+    m.message_id,
+    m.message_index,
+    m.role,
+    snippet(session_messages_search_fts, 4, '[', ']', '...', 24) AS snippet
+FROM session_messages_search_fts
+JOIN sessions_search s ON s.session_id = session_messages_search_fts.session_id
+JOIN session_messages_search m
+  ON m.session_id = session_messages_search_fts.session_id
+ AND m.message_id = session_messages_search_fts.message_id
+WHERE session_messages_search_fts MATCH ?1
+ORDER BY session_messages_search_fts.rank
+LIMIT ?2
+"#;
+
 fn search_db(
     db_path: &Path,
     query: &str,
@@ -536,20 +574,7 @@ fn search_db(
     let mut matches = Vec::new();
 
     let mut session_stmt = conn
-        .prepare(
-            r#"
-            SELECT
-                session_id,
-                title,
-                summary,
-                bm25(sessions_search_fts) AS rank,
-                snippet(sessions_search_fts, 1, '[', ']', '...', 24) AS snippet
-            FROM sessions_search_fts
-            WHERE sessions_search_fts MATCH ?1
-            ORDER BY rank
-            LIMIT ?2
-            "#,
-        )
+        .prepare(SESSION_SEARCH_SQL)
         .map_err(|e| to_io_error(format!("sqlite prepare session search failed: {e}")))?;
     let session_rows = session_stmt
         .query_map(params![fts_query, limit as i64], |row| {
@@ -616,31 +641,7 @@ fn search_db(
     if matches.len() < limit {
         let remaining = limit - matches.len();
         let mut message_stmt = conn
-            .prepare(
-                r#"
-                SELECT
-                    s.session_id,
-                    s.title,
-                    s.kind,
-                    s.root_session_id,
-                    s.parent_session_id,
-                    s.pinned,
-                    s.updated_at,
-                    bm25(session_messages_search_fts) AS rank,
-                    m.message_id,
-                    m.message_index,
-                    m.role,
-                    snippet(session_messages_search_fts, 4, '[', ']', '...', 24) AS snippet
-                FROM session_messages_search_fts
-                JOIN sessions_search s ON s.session_id = session_messages_search_fts.session_id
-                JOIN session_messages_search m
-                  ON m.session_id = session_messages_search_fts.session_id
-                 AND m.message_id = session_messages_search_fts.message_id
-                WHERE session_messages_search_fts MATCH ?1
-                ORDER BY rank
-                LIMIT ?2
-                "#,
-            )
+            .prepare(MESSAGE_SEARCH_SQL)
             .map_err(|e| to_io_error(format!("sqlite prepare message search failed: {e}")))?;
         let message_rows = message_stmt
             .query_map(params![build_fts_query(query), remaining as i64], |row| {
@@ -833,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn open_db_sets_busy_timeout() {
+    fn open_db_sets_busy_timeout_and_normal_synchronization() {
         // #357: every connection must carry a non-zero busy_timeout so a contended
         // writer blocks-and-retries instead of failing immediately with SQLITE_BUSY.
         let temp = TempDir::new().expect("tempdir");
@@ -842,6 +843,65 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("read busy_timeout");
         assert_eq!(timeout, SQLITE_BUSY_TIMEOUT_MS as i64);
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("read synchronous");
+        assert_eq!(synchronous, 1, "fresh connections use NORMAL");
+        conn.pragma_update(None, "synchronous", "FULL").unwrap();
+        drop(conn);
+        let reopened = open_db(&temp.path().join("search.db")).unwrap();
+        let synchronous: i64 = reopened
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "reopened connections reapply NORMAL");
+    }
+
+    #[tokio::test]
+    async fn populated_search_index_retains_data_and_connection_policy_across_init() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("search.db");
+        let index = SessionSearchIndex::new(&path);
+        index.init().await.unwrap();
+        index.upsert_session(&sample_session()).await.unwrap();
+        // Existing files use the same schema. Simulate the old opener on a
+        // populated database before reopening through the per-connection policy.
+        let legacy_connection = Connection::open(&path).unwrap();
+        legacy_connection
+            .pragma_update(None, "synchronous", "FULL")
+            .unwrap();
+        drop(legacy_connection);
+        let title_before =
+            serde_json::to_value(index.search("Compression", 10).await.unwrap()).unwrap();
+        let message_before =
+            serde_json::to_value(index.search("SQLite", 10).await.unwrap()).unwrap();
+        for _ in 0..2 {
+            index
+                .init()
+                .await
+                .expect("existing index initialization remains idempotent");
+            let connection = open_db(&path).unwrap();
+            let timeout: i64 = connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            let synchronous: i64 = connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            let journal: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(timeout, 5000);
+            assert_eq!(synchronous, 1);
+            assert_eq!(journal, "wal");
+            drop(connection);
+            assert_eq!(
+                serde_json::to_value(index.search("Compression", 10).await.unwrap()).unwrap(),
+                title_before
+            );
+            assert_eq!(
+                serde_json::to_value(index.search("SQLite", 10).await.unwrap()).unwrap(),
+                message_before
+            );
+        }
     }
 
     #[tokio::test]
@@ -862,6 +922,246 @@ mod tests {
         assert!(message_matches
             .iter()
             .any(|m| m.match_type == "message" || m.match_type == "session"));
+    }
+
+    async fn populate_rank_fixture(index: &SessionSearchIndex) -> Vec<Session> {
+        let mut sessions = Vec::new();
+        for (id, title, contents) in [
+            ("rank-a", "nebula nebula nebula", vec!["nebula context"]),
+            (
+                "rank-b",
+                "nebula",
+                vec!["nebula sparse context", "messageonly token"],
+            ),
+            ("rank-c", "nebula", vec!["messageonly token"]),
+            (
+                "rank-d",
+                "background",
+                vec!["nebula nebula nebula", "messageonly token"],
+            ),
+        ] {
+            let mut session = Session::new(id, "fixture-model");
+            session.title = title.to_string();
+            if id == "rank-c" {
+                session.kind = SessionKind::Child;
+                session.root_session_id = "rank-a".to_string();
+                session.parent_session_id = Some("rank-a".to_string());
+                session.pinned = true;
+            }
+            for (message_index, content) in contents.into_iter().enumerate() {
+                let mut message = if message_index % 2 == 0 {
+                    Message::user(content)
+                } else {
+                    Message::assistant(content, None)
+                };
+                message.id = format!("{id}-message-{message_index}");
+                session.add_message(message);
+            }
+            index.upsert_session(&session).await.unwrap();
+            sessions.push(session);
+        }
+        sessions
+    }
+
+    #[tokio::test]
+    async fn production_search_queries_use_native_rank_without_temporary_order_sort() {
+        let temp = TempDir::new().unwrap();
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.unwrap();
+        populate_rank_fixture(&index).await;
+        let connection = open_db(index.db_path()).unwrap();
+        for sql in [SESSION_SEARCH_SQL, MESSAGE_SEARCH_SQL] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan = statement
+                .query_map(params![build_fts_query("nebula"), 10], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.contains("TEMP B-TREE") && step.contains("ORDER BY")),
+                "production FTS ordering must not require a temporary ORDER BY tree: {plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_rank_preserves_bm25_scores_snippets_metadata_and_session_first_results() {
+        use std::collections::HashMap;
+
+        let temp = TempDir::new().unwrap();
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.unwrap();
+        let sessions = populate_rank_fixture(&index).await;
+        let connection = open_db(index.db_path()).unwrap();
+        for query in ["nebula", "messageonly"] {
+            // Use the previous explicit bm25 ordering as the score/snippet
+            // oracle, keyed by identity so equal ranks imply no tie order.
+            let mut expected = HashMap::new();
+            for (sql, table, score_column, snippet_column, message_column) in [
+                (SESSION_SEARCH_SQL, "sessions_search_fts", 3, 4, None),
+                (
+                    MESSAGE_SEARCH_SQL,
+                    "session_messages_search_fts",
+                    7,
+                    11,
+                    Some(8),
+                ),
+            ] {
+                let baseline = sql.replace(
+                    &format!("ORDER BY {table}.rank"),
+                    &format!("ORDER BY bm25({table})"),
+                );
+                let mut statement = connection.prepare(&baseline).unwrap();
+                let rows = statement
+                    .query_map(params![build_fts_query(query), 200], |row| {
+                        Ok((
+                            (
+                                row.get::<_, String>(0)?,
+                                message_column
+                                    .map(|column| row.get::<_, String>(column))
+                                    .transpose()?,
+                            ),
+                            (
+                                row.get::<_, f64>(score_column)?,
+                                row.get::<_, Option<String>>(snippet_column)?,
+                            ),
+                        ))
+                    })
+                    .unwrap();
+                for row in rows {
+                    let (key, value) = row.unwrap();
+                    assert!(expected.insert(key, value).is_none());
+                }
+            }
+            let matches = index.search(query, 200).await.unwrap();
+            assert_eq!(matches.len(), expected.len());
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|hit| (hit.session_id.clone(), hit.message_id.clone()))
+                    .collect::<std::collections::HashSet<_>>(),
+                expected
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>(),
+                "all matching identities survive even when bm25 scores tie"
+            );
+            for hit in &matches {
+                let (rank, snippet) = expected
+                    .get(&(hit.session_id.clone(), hit.message_id.clone()))
+                    .unwrap();
+                assert_eq!(hit.rank, *rank);
+                assert_eq!(hit.content_preview, *snippet);
+                let session = sessions
+                    .iter()
+                    .find(|session| session.id == hit.session_id)
+                    .unwrap();
+                assert_eq!(hit.session_title, session.title);
+                assert_eq!(
+                    hit.session_kind,
+                    if session.kind == SessionKind::Child {
+                        "child"
+                    } else {
+                        "root"
+                    }
+                );
+                assert_eq!(hit.root_session_id, session.root_session_id);
+                assert_eq!(hit.parent_session_id, session.parent_session_id);
+                assert_eq!(hit.pinned, session.pinned);
+                assert_eq!(hit.updated_at, session.updated_at);
+                if let Some(message_id) = &hit.message_id {
+                    let (message_index, message) = session
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .find(|(_, message)| &message.id == message_id)
+                        .unwrap();
+                    assert_eq!(hit.match_type, "message");
+                    assert_eq!(hit.message_index, Some(message_index));
+                    assert_eq!(
+                        hit.role.as_deref(),
+                        Some(if message.role == Role::User {
+                            "user"
+                        } else {
+                            "assistant"
+                        })
+                    );
+                } else {
+                    assert_eq!(hit.match_type, "session");
+                    assert!(hit.message_index.is_none());
+                    assert!(hit.role.is_none());
+                }
+            }
+            for match_type in ["session", "message"] {
+                let ranks = matches
+                    .iter()
+                    .filter(|hit| hit.match_type == match_type)
+                    .map(|hit| hit.rank)
+                    .collect::<Vec<_>>();
+                assert!(ranks.windows(2).all(|pair| pair[0] <= pair[1]));
+            }
+            if query == "nebula" {
+                assert!(matches[..3].iter().all(|hit| hit.match_type == "session"));
+                assert!(matches[3..].iter().all(|hit| hit.match_type == "message"));
+                let tied = matches
+                    .iter()
+                    .filter(|hit| {
+                        hit.match_type == "session"
+                            && matches!(hit.session_id.as_str(), "rank-b" | "rank-c")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(tied.len(), 2);
+                assert_eq!(tied[0].rank, tied[1].rank);
+                for limit in [1, 2, 3, 4] {
+                    let limited = index.search(query, limit).await.unwrap();
+                    assert_eq!(limited.len(), limit);
+                    assert!(limited[..limit.min(3)]
+                        .iter()
+                        .all(|hit| hit.match_type == "session"));
+                    if limit > 3 {
+                        assert_eq!(limited[3].match_type, "message");
+                    }
+                }
+            } else {
+                assert_eq!(matches.len(), 3);
+                assert!(matches.iter().all(|hit| hit.match_type == "message"));
+                assert!(matches.iter().all(|hit| hit.rank == matches[0].rank));
+            }
+            assert!(index.search(query, 0).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_rank_preserves_result_limit_cap_for_sessions_and_messages() {
+        let temp = TempDir::new().unwrap();
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.unwrap();
+        for id in 0..205 {
+            let mut session = Session::new(format!("capacity-{id}"), "fixture-model");
+            session.title = "titlecapacity".to_string();
+            session.add_message(Message::user("messagecapacity"));
+            index.upsert_session(&session).await.unwrap();
+        }
+        for (query, match_type) in [("titlecapacity", "session"), ("messagecapacity", "message")] {
+            let rows = index.search(query, usize::MAX).await.unwrap();
+            assert_eq!(rows.len(), 200);
+            assert!(rows.iter().all(|hit| hit.match_type == match_type));
+            let identities = rows
+                .iter()
+                .map(|hit| (&hit.session_id, &hit.message_id))
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(identities.len(), 200);
+            // All scores tie; the contract limits the count, not which tied
+            // identities SQLite happens to place on either side of the cutoff.
+            assert!(rows.iter().all(|hit| hit.rank == rows[0].rank));
+            assert!(index.search(query, 0).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]
