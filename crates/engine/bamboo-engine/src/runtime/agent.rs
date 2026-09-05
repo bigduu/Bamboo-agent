@@ -95,6 +95,29 @@ impl Agent {
         .await
     }
 
+    /// Resolve a proposed SDK Project assignment without publishing a runtime
+    /// workspace. The caller must persist the validated candidate before the
+    /// ordinary execution handoff publishes it or replays an approved tool.
+    pub async fn prepare_external_project_assignment_read_only(
+        &self,
+        session: &mut Session,
+    ) -> crate::runtime::runner::Result<()> {
+        let resolver = self
+            .runtime
+            .project_context_resolver
+            .as_deref()
+            .ok_or_else(|| {
+                bamboo_agent_core::AgentError::ProjectContext(
+                    "Project assignment requires a ProjectContextResolver".to_string(),
+                )
+            })?;
+        resolver
+            .refresh_session_prompt_read_only(session)
+            .await
+            .map(|_| ())
+            .map_err(|error| bamboo_agent_core::AgentError::ProjectContext(error.to_string()))
+    }
+
     /// Acquire direct logical-session ownership before an SDK facade performs
     /// pre-execution work such as replaying an approved mutating tool.
     pub async fn begin_direct_execution(

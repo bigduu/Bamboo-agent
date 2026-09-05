@@ -90,6 +90,7 @@ async fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
 #[derive(Deserialize)]
 struct MainIdentity {
     id: String,
+    created_at: DateTime<Utc>,
     #[serde(default)]
     kind: SessionKind,
     #[serde(default)]
@@ -150,6 +151,7 @@ impl SessionStoreV2 {
             || main.spawn_depth != 0
             || side.spawn_depth != 0
             || main.authority_identity != side.authority_identity
+            || main.created_at != side.created_at
         {
             return Err(invalid("canonical Root identity mismatch"));
         }

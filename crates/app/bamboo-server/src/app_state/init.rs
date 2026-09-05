@@ -55,16 +55,17 @@ pub async fn init_storage(
         },
     )?);
 
-    // One-shot, idempotent migration: split each legacy session's runtime
-    // control-plane into a `runtime.json` sidecar so the O(1) runtime-save path
-    // (used heavily during sub-agent spawn) is active immediately. Run inline
+    // One-shot, idempotent migration of legacy Child runtime sidecars. A Root
+    // with a missing sidecar may have lost a newer Project revision, so startup
+    // must not reconstruct its authority from old history. Run inline
     // before the server starts serving so it cannot race concurrent saves; it is
     // a no-op on already-migrated stores (marker file).
     match session_store.migrate_runtime_sidecars().await {
         Ok(0) => {}
         Ok(count) => tracing::info!("Runtime sidecar migration created {count} sidecar(s)"),
         Err(error) => {
-            // Non-fatal: loading tolerates a missing sidecar. Log and continue.
+            // Non-fatal: history reads remain available. Root mutations require
+            // valid canonical runtime authority and fail closed until restored.
             tracing::warn!("Runtime sidecar migration failed (continuing): {error}");
         }
     }

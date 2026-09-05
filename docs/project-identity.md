@@ -124,6 +124,37 @@ and revisions—never MCP headers, environment values, or credential secrets.
 
 ## Legacy Project assignment
 
+Root persistence protects Project membership with the existing
+`metadata_version` and `created_at`. Full and runtime writes revalidate the
+small canonical `runtime.json` under the cross-process session lock. An older
+revision, a changed creation time, or a different Project without exactly the
+next revision returns a typed storage conflict before files or caches publish.
+Project changes use checked revision increments, including removal and
+reassignment; overflow returns `409 session_metadata_revision_exhausted` from
+Project/Workspace PATCH. A concurrent context change caught at its final writer
+returns `409 session_authority_conflict` and requires reloading before retry.
+
+Merge-save adopts durable Project membership together with its revision and
+workspace context into the caller snapshot. The SDK's first assignment of an
+already persisted Unassigned Root validates the candidate without publishing a
+runtime workspace, advances the revision, commits its sidecar, and only then
+enters normal execution preparation. New unsaved sessions retain revision zero.
+These are stale-snapshot guarantees for trusted storage writers, not an ACL for
+arbitrary Rust callers that deliberately fabricate newer revisions.
+
+A Root with missing or corrupt runtime state remains readable through the
+legacy history fallback, but cannot be saved, cleared, or rebuilt by automatic
+sidecar migration or Task writes. A main-only legacy Root is indistinguishable
+from one that lost newer Project context. Restoring its correct canonical
+runtime state is required before mutation; reconstructing authority from old
+history is deliberately unavailable. Strict Root authority reads also require
+main/runtime creation times to match. Legacy Child sidecar migration remains
+available. No new identity registry, Project epoch or recovery journal is added.
+An interrupted first create with only empty layout directories can be retried.
+A full save can also complete a missing main file when the valid runtime still
+proves exactly the same creation identity, Project and revision; it cannot
+advance context during that repair. Runtime and Task writes require the pair.
+
 Migration dry-runs match only exact canonical bindings or a safely resolved
 common Git directory. Ambiguous names, missing paths, remote URLs, and path
 hashes remain Unassigned. When a dry-run session supplies only `workspace_path`,

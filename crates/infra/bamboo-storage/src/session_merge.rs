@@ -45,6 +45,13 @@ use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const AUTHORITATIVE_METADATA_KEYS: &[&str] = &["gold_config", "workflow.run_ids.v1"];
+const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
+    "workspace_source",
+    "workspace_binding_status",
+    "project_context_rendered",
+    "project_resources_rendered",
+    "runtime_prompt_snapshot",
+];
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
     CONSUMED_RESPONSE_OCCURRENCES_KEY,
@@ -1435,6 +1442,44 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
         session.authority_identity = latest.authority_identity.clone();
     }
+    // Project and its revision are one fence. Never stamp a newer disk revision
+    // onto the caller's old Project; that would manufacture a fresh-looking
+    // stale assignment. Equal-revision runtime workspace refreshes within the
+    // same Project remain valid, while an actual reassignment adopts its whole
+    // workspace context before the caller can be published to a cache.
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+        && session.created_at == latest.created_at
+        && latest.metadata_version >= session.metadata_version
+        && (latest.metadata_version > session.metadata_version
+            || latest.project_id_meta() != session.project_id_meta())
+    {
+        match latest.project_id_meta() {
+            Some(project) => session.set_project_id_meta(project),
+            None => session.clear_project_id_meta(),
+        }
+        match latest.workspace_path_meta() {
+            Some(workspace) => session.set_workspace_path_meta(workspace),
+            None => {
+                session.metadata.remove("workspace_path");
+                if let Some(metadata) = session.runtime_metadata.as_mut() {
+                    metadata.workspace_path = None;
+                }
+            }
+        }
+        session.workspace.clone_from(&latest.workspace);
+        for key in ROOT_PROJECT_CONTEXT_KEYS {
+            match latest.metadata.get(*key) {
+                Some(value) => {
+                    session.metadata.insert((*key).to_string(), value.clone());
+                }
+                None => {
+                    session.metadata.remove(*key);
+                }
+            }
+        }
+        session.prompt_snapshot.clone_from(&latest.prompt_snapshot);
+    }
     if latest.metadata_version >= session.metadata_version {
         session.title = latest.title.clone();
         session.title_version = latest.title_version;
@@ -1503,6 +1548,138 @@ mod tests {
         inner: Arc<SessionStoreV2>,
         reached: tokio::sync::Barrier,
         release: tokio::sync::Barrier,
+    }
+
+    #[tokio::test]
+    async fn root_project_merge_publishes_project_revision_and_workspace_together() {
+        for runtime_only in [false, true] {
+            for equal_revision in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let storage = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+                let mut stale = Session::new("root-project-merge", "model");
+                stale.set_project_id_meta("project-a");
+                stale.set_workspace_path_meta("/project-a");
+                stale.metadata.insert(
+                    "runtime_prompt_snapshot".into(),
+                    "old Project A prompt".into(),
+                );
+                stale.add_message(bamboo_domain::Message::user("Keep transcript"));
+                storage.save_session(&stale).await.unwrap();
+                let mut current = stale.clone();
+                current.metadata_version += 1;
+                current.set_project_id_meta("project-b");
+                current.set_workspace_path_meta("/project-b");
+                current.metadata.remove("runtime_prompt_snapshot");
+                current
+                    .metadata
+                    .insert("workspace_source".into(), "project_default".into());
+                current
+                    .metadata
+                    .insert("project_context_rendered".into(), "Project B".into());
+                storage.save_session(&current).await.unwrap();
+                if equal_revision {
+                    // The pre-fix merge could already have copied only the
+                    // version. Reconcile this equal-version divergent Project.
+                    stale.metadata_version = current.metadata_version;
+                }
+                let locked = LockedSessionStore::new(storage.clone());
+                let published = AtomicBool::new(false);
+                let publish = |saved: &Session| {
+                    assert!(!saved.metadata.contains_key("runtime_prompt_snapshot"));
+                    assert_eq!(saved.project_id_meta().as_deref(), Some("project-b"));
+                    assert_eq!(saved.workspace_path_meta().as_deref(), Some("/project-b"));
+                    assert_eq!(saved.metadata_version, current.metadata_version);
+                    assert_eq!(
+                        saved.metadata.get("workspace_source").map(String::as_str),
+                        Some("project_default")
+                    );
+                    assert_eq!(
+                        saved
+                            .metadata
+                            .get("project_context_rendered")
+                            .map(String::as_str),
+                        Some("Project B")
+                    );
+                    published.store(true, Ordering::SeqCst);
+                };
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, publish)
+                        .await
+                        .unwrap();
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |saved, committed| {
+                            assert!(committed);
+                            publish(saved);
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert!(published.load(Ordering::SeqCst));
+                assert_eq!(stale.project_id_meta(), current.project_id_meta());
+                let loaded = storage.load_session(&stale.id).await.unwrap().unwrap();
+                assert_eq!(loaded.project_id_meta(), current.project_id_meta());
+                assert_eq!(loaded.messages.len(), 1);
+                storage.flush_search_index().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_project_change_after_merge_read_rejects_without_cache_publication() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let mut stale = Session::new("root-project-race", "model");
+            stale.set_project_id_meta("project-a");
+            stale.add_message(bamboo_domain::Message::user("Keep transcript"));
+            first.save_session(&stale).await.unwrap();
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let mut current = stale.clone();
+            current.metadata_version += 1;
+            current.set_project_id_meta("project-b");
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let update = async {
+                paused.reached.wait().await;
+                second.save_session(&current).await.unwrap();
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, update)
+            })
+            .await
+            .expect("deterministic Project/save race completes");
+            assert!(!may_publish_runtime_result(&Err(result.unwrap_err())));
+            assert!(!published.load(Ordering::SeqCst));
+            let loaded = first.load_session(&current.id).await.unwrap().unwrap();
+            assert_eq!(loaded.project_id_meta(), current.project_id_meta());
+            assert_eq!(loaded.metadata_version, current.metadata_version);
+            assert_eq!(loaded.messages.len(), 1);
+            first.flush_search_index().await;
+            second.flush_search_index().await;
+        }
     }
 
     #[async_trait::async_trait]
@@ -2013,6 +2190,7 @@ mod tests {
         storage.save_session(&durable).await.unwrap();
 
         let mut cached = fresh(session_id);
+        cached.created_at = durable.created_at;
         cached.title = "Stale cached title".to_string();
         cached.updated_at = durable.updated_at + chrono::Duration::seconds(1);
         cached.set_pending_question(
@@ -2265,9 +2443,11 @@ mod tests {
             ),
         ];
         let mut previous_revision = 0;
+        let created_at = fresh(session_id).created_at;
 
         for (index, (requested, configured, expected_effective)) in cases.into_iter().enumerate() {
             let mut activation = fresh(session_id);
+            activation.created_at = created_at;
             activation
                 .agent_runtime_state
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
@@ -2630,6 +2810,7 @@ mod tests {
         storage.save_session(&durable).await.unwrap();
 
         let mut stale = fresh(session_id);
+        stale.created_at = durable.created_at;
         store.merge_save_runtime(&mut stale).await.unwrap();
         let saved = storage.load_session(session_id).await.unwrap().unwrap();
         assert_eq!(
@@ -3667,6 +3848,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale Default".to_string();
         runtime_copy.title_version = 0;
         runtime_copy.title_generated = false;
@@ -3697,6 +3879,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale".to_string();
         runtime_copy.title_version = 1;
         runtime_copy.metadata_version = 0;
@@ -3722,6 +3905,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.pinned = false;
         runtime_copy.metadata_version = 0;
 
@@ -3749,6 +3933,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut authoritative_copy = fresh(session_id);
+        authoritative_copy.created_at = on_disk.created_at;
         authoritative_copy.title = "New Authoritative".to_string();
         authoritative_copy.title_version = 2;
         authoritative_copy.metadata_version = 4;
@@ -3777,6 +3962,7 @@ mod tests {
         storage.save_session(&on_disk).await.unwrap();
 
         let mut runtime_copy = fresh(session_id);
+        runtime_copy.created_at = on_disk.created_at;
         runtime_copy.title = "Stale".to_string();
         runtime_copy.metadata_version = 0;
         runtime_copy.messages = vec![bamboo_domain::session::types::Message {
