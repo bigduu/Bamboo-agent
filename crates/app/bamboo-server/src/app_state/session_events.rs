@@ -66,29 +66,31 @@ impl bamboo_engine::execution::ChildRunLaunchHook for NotificationRelayLaunchHoo
 ///   on every notification so a hot-reloaded topic/token/toggle takes effect
 ///   immediately.
 ///
-/// Idempotent: at most one relay per session (tracked by the notification
-/// service via `try_begin_relay`). The relay does not hold a `Sender` clone,
-/// so the channel still closes naturally (`RecvError::Closed`) when the
-/// session is torn down, and this task exits cleanly with it — nothing leaks.
+/// Idempotent for the exact session channel. Its RAII subscription releases the
+/// registration on normal close, cancellation, or panic, and permits a recreated
+/// channel to replace a still-draining old relay without losing notifications.
 pub fn ensure_notification_relay(
     deps: &NotificationRelayDeps,
     session_id: &str,
     sender: broadcast::Sender<AgentEvent>,
 ) {
-    if !deps.notification_service.try_begin_relay(session_id) {
+    let Some(mut subscription) = deps.session_watchers.begin_notification_relay(
+        deps.notification_service.clone(),
+        session_id,
+        &sender,
+    ) else {
         return;
-    }
+    };
     let service = deps.notification_service.clone();
-    let senders = deps.session_event_senders.clone();
+    let channel = sender.downgrade();
     let watchers = deps.session_watchers.clone();
     let config = deps.config.clone();
     let sid = session_id.to_string();
-    let mut rx = sender.subscribe();
     drop(sender);
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
-            match rx.recv().await {
+            match subscription.recv().await {
                 Ok(event) => {
                     if let Some(notification) = service.notify(&sid, &event) {
                         // Build the sink payload before `notification` is moved
@@ -96,8 +98,10 @@ pub fn ensure_notification_relay(
                         let sink_notification =
                             crate::notify_sinks::SinkNotification::from_event(&notification);
 
-                        let tx = senders.read().await.get(&sid).cloned();
-                        if let Some(tx) = tx {
+                        // Publish back onto this generation only. Re-reading
+                        // the map could inject a delayed old notification into
+                        // a replacement channel after idle eviction/resume.
+                        if let Some(tx) = channel.upgrade() {
                             let _ = tx.send(notification);
                         }
 
@@ -116,7 +120,6 @@ pub fn ensure_notification_relay(
                 Err(RecvError::Closed) => break,
             }
         }
-        service.end_relay(&sid);
     });
 }
 

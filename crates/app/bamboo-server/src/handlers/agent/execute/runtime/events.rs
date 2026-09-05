@@ -50,17 +50,18 @@ pub(crate) fn spawn_event_forwarder(
                 session_id: session_id.clone(),
                 started_at: chrono::Utc::now().to_rfc3339(),
             };
-            {
+            let publication = {
                 let runners = state.agent_runners.read().await;
-                if runners
+                let Some(runner) = runners
                     .get(&session_id)
-                    .is_none_or(|runner| runner.run_id != run_id)
-                {
+                    .filter(|runner| runner.run_id == run_id)
+                else {
                     return;
-                }
+                };
                 state.account_sink.record(Some(&session_id), &started_event);
                 let _ = session_tx.send(started_event);
-            }
+                runner.event_publication.clone()
+            };
             let mut forwarded_lifecycle_ids = HashSet::new();
             while let Some(event) = mpsc_rx.recv().await {
                 let lifecycle_id = match &event {
@@ -110,19 +111,13 @@ pub(crate) fn spawn_event_forwarder(
                     state.account_sink.record(Some(route_session_id), &event);
                     let _ = session_tx.send(event);
                 } else {
-                    let runners = state.agent_runners.read().await;
-                    if runners
-                        .get(&session_id)
-                        .is_none_or(|runner| runner.run_id != run_id)
-                    {
+                    if !publication.publish(|| {
+                        let route_session_id = event.session_id().unwrap_or(&session_id);
+                        state.account_sink.record(Some(route_session_id), &event);
+                        let _ = session_tx.send(event);
+                    }) {
                         return;
                     }
-                    // The read guard remains held through both synchronous
-                    // sends, closing the check-then-publish replacement race
-                    // without taking a write lock for token-hot paths.
-                    let route_session_id = event.session_id().unwrap_or(&session_id);
-                    state.account_sink.record(Some(route_session_id), &event);
-                    let _ = session_tx.send(event);
                 }
             }
 
@@ -233,6 +228,50 @@ mod tests {
 
     async fn current_run_id(state: &actix_web::web::Data<AppState>, session_id: &str) -> String {
         state.agent_runners.read().await[session_id].run_id.clone()
+    }
+
+    #[tokio::test]
+    async fn server_tokens_progress_without_the_shared_runner_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            actix_web::web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let id = "server-independent-tokens";
+        let sender = state.get_session_event_sender(id).await;
+        let mut receiver = sender.subscribe();
+        bamboo_engine::execution::reserve_runner_core(
+            &state.agent_runners,
+            &state.session_event_senders,
+            id,
+            &sender,
+        )
+        .await;
+        let run_id = current_run_id(&state, id).await;
+        let (input, events) = mpsc::channel(8);
+        spawn_event_forwarder(state.clone(), id.into(), run_id, events, sender, None);
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        let registry = state.agent_runners.write().await;
+        input
+            .send(AgentEvent::Token {
+                content: "independent".into(),
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let AgentEvent::Token { content } = receiver.recv().await.unwrap() {
+                    assert_eq!(content, "independent");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the server token path must not wait for runner registry ownership");
+        assert!(registry[id].last_activity_at().is_some());
+        drop(registry);
+        drop(input);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

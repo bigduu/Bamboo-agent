@@ -277,7 +277,11 @@ async fn rollback_startup(
         .get(session_id)
         .is_some_and(|runner| runner.run_id == run_id)
     {
-        runners.remove(session_id);
+        bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+            &mut runners,
+            session_id,
+        )
+        .await;
     }
     drop(runners);
 

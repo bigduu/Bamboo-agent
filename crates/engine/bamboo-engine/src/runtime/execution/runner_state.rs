@@ -61,6 +61,8 @@ pub enum AgentStatus {
 /// an in-progress agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentRunner {
+    /// Generation fence and activity clock shared only by this run's producers.
+    pub event_publication: std::sync::Arc<super::event_publication::EventPublication>,
     /// Broadcast sender for agent events.
     ///
     /// Allows multiple clients to subscribe to agent events
@@ -124,6 +126,11 @@ impl Default for AgentRunner {
 }
 
 impl AgentRunner {
+    /// Includes lock-free event traffic as well as legacy diagnostic updates.
+    pub fn last_activity_at(&self) -> Option<DateTime<Utc>> {
+        self.last_event_at
+            .max(self.event_publication.last_event_at())
+    }
     /// Broadcast channel capacity for agent events.
     pub const EVENT_CHANNEL_CAPACITY: usize = 1000;
 
@@ -138,6 +145,7 @@ impl AgentRunner {
         let (event_sender, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
         Self {
             event_sender,
+            event_publication: std::sync::Arc::default(),
             cancel_token: CancellationToken::new(),
             status: AgentStatus::Pending,
             started_at: Utc::now(),

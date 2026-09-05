@@ -309,20 +309,12 @@ pub(crate) const SESSION_MAP_IDLE_TTL_SECS: i64 = 300;
 /// Single idle-eviction pass over the per-session runner + event-sender maps.
 ///
 /// Drops a `(agent_runners, session_event_senders)` pair together when the
-/// runner is terminal, older than `ttl_secs`, and its broadcast channel has **no
-/// live receivers**. Returns the number of runners evicted.
-///
-/// # Why `receiver_count() == 0` is required
-///
-/// A runner's `event_sender` is a clone of the session's long-lived sender (see
-/// `reserve_runner` / `try_reserve_runner`), so `receiver_count()` reflects
-/// every SSE/WS subscriber on the session stream. Evicting while a receiver is
-/// live would (a) yank the replay cache out from under a client that just
-/// subscribed after `Complete`, and (b) silently drop a terminal parent whose
-/// still-running children forward events into this stream (that parent keeps a
-/// live subscription). So we only reclaim genuinely-idle terminal sessions —
-/// exactly the ephemeral sub-agent / guardian / scheduled runs that never had a
-/// UI subscription and whose count therefore reaches zero.
+/// runner is terminal, older than `ttl_secs`, and has no external subscribers
+/// or active producer handles. The internal notification relay is classified
+/// by exact channel identity, so its own receiver cannot prevent reclamation.
+/// A live UI receiver retains replay; a sender held by a still-running child's
+/// heartbeat retains its parent stream even after the parent turn finishes.
+/// Returns the number of runners evicted.
 ///
 /// Removing the map's `Sender` (the last clone once the terminal runner's own
 /// clone is dropped by the `retain`) closes the channel, which also lets any
@@ -334,11 +326,13 @@ pub(crate) const SESSION_MAP_IDLE_TTL_SECS: i64 = 300;
 pub(crate) fn evict_idle_session_entries(
     runners: &mut HashMap<String, AgentRunner>,
     senders: &mut HashMap<String, broadcast::Sender<AgentEvent>>,
+    watchers: &super::watchers::SessionWatchers,
+    sessions: &bamboo_engine::SessionCache,
     ttl_secs: i64,
     now: chrono::DateTime<Utc>,
     log_prefix: Option<&'static str>,
 ) -> usize {
-    let mut evicted: Vec<String> = Vec::new();
+    let mut evicted = Vec::new();
 
     runners.retain(|session_id, runner| {
         let keep = match &runner.status {
@@ -347,13 +341,21 @@ pub(crate) fn evict_idle_session_entries(
                 let age =
                     now.signed_duration_since(runner.completed_at.unwrap_or(runner.started_at));
                 let expired = age.num_seconds() >= ttl_secs;
-                let has_receivers = runner.event_sender.receiver_count() > 0;
-                // Keep unless it is BOTH past the TTL AND has no live receiver.
-                !expired || has_receivers
+                let has_receivers =
+                    watchers.has_external_receivers(session_id, &runner.event_sender);
+                let paired_sender = senders
+                    .get(session_id)
+                    .is_some_and(|sender| sender.same_channel(&runner.event_sender));
+                let owned_senders = 1 + usize::from(paired_sender);
+                let has_producers = runner.event_sender.strong_count() > owned_senders;
+                !expired
+                    || has_receivers
+                    || has_producers
+                    || !runner.event_publication.retire_if_idle()
             }
         };
         if !keep {
-            evicted.push(session_id.clone());
+            evicted.push((session_id.clone(), runner.event_sender.downgrade()));
             if let Some(prefix) = log_prefix {
                 tracing::debug!("[{}:{}] Evicting idle terminal runner", prefix, session_id);
             } else {
@@ -363,19 +365,39 @@ pub(crate) fn evict_idle_session_entries(
         keep
     });
 
-    // Drop the paired long-lived sender for each evicted runner, but only if it
-    // too has no live receiver (re-checked here; it is the same channel as the
-    // runner's `event_sender`, so this is normally a formality — a session sender
-    // can, however, outlive its runner, and we must never close a channel a
-    // client is actively reading).
-    for session_id in &evicted {
-        if senders
-            .get(session_id)
-            .is_some_and(|sender| sender.receiver_count() == 0)
-        {
+    // Recheck the paired sender after removing its runner. No external handle
+    // can start a subscription unnoticed: a pre-existing sender clone itself
+    // prevents eviction until its owner releases it.
+    for (session_id, channel) in &evicted {
+        // The durable Session remains authoritative. Drop the bulky completed
+        // transcript under the same runner lock that excludes a live successor.
+        sessions.remove(session_id);
+        if senders.get(session_id).is_some_and(|sender| {
+            channel
+                .upgrade()
+                .is_some_and(|old| old.same_channel(sender))
+                && !watchers.has_external_receivers(session_id, sender)
+                && sender.strong_count() == 1
+        }) {
             senders.remove(session_id);
         }
     }
+
+    // Admission can fail after observer setup but before a runner is reserved.
+    // Such orphan channels have no runner timestamp; their exact relay's start
+    // time supplies the same replay grace period and prevents permanent leaks.
+    senders.retain(|session_id, sender| {
+        let keep = runners.contains_key(session_id)
+            || sender.strong_count() > 1
+            || watchers.has_external_receivers(session_id, sender)
+            || watchers
+                .relay_started_at(session_id, sender)
+                .is_none_or(|started| now.signed_duration_since(started).num_seconds() < ttl_secs);
+        if !keep {
+            sessions.remove(session_id);
+        }
+        keep
+    });
 
     evicted.len()
 }
@@ -383,17 +405,28 @@ pub(crate) fn evict_idle_session_entries(
 /// Spawn a background task that idle-evicts completed agent runners **and their
 /// paired session event senders** after [`SESSION_MAP_IDLE_TTL_SECS`].
 ///
-/// Fire-and-forget (runs for the process lifetime), matching the other
-/// background maintenance tickers. See [`evict_idle_session_entries`] for the
-/// eviction predicate and its race-freedom argument.
+/// Detached maintenance holds only weak map/cache references between sweeps,
+/// so releasing the server or worker executor also releases its resources.
+/// The task exits on the next tick after an owner disappears. See
+/// [`evict_idle_session_entries`] for the eviction predicate and ordering.
 pub fn spawn_session_map_cleanup_task(
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    watchers: Arc<super::watchers::SessionWatchers>,
+    sessions: bamboo_engine::SessionCache,
     log_prefix: Option<&'static str>,
 ) {
+    let runners = Arc::downgrade(&runners);
+    let senders = Arc::downgrade(&senders);
+    let sessions = Arc::downgrade(&sessions);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            let (Some(runners), Some(senders), Some(sessions)) =
+                (runners.upgrade(), senders.upgrade(), sessions.upgrade())
+            else {
+                break;
+            };
 
             // Lock order: runners ⊃ senders. This matches `reserve_runner_core`
             // (which nests senders inside the runners write lock to re-assert the
@@ -414,6 +447,8 @@ pub fn spawn_session_map_cleanup_task(
             let evicted = evict_idle_session_entries(
                 &mut runners_guard,
                 &mut senders_guard,
+                &watchers,
+                &sessions,
                 SESSION_MAP_IDLE_TTL_SECS,
                 now,
                 log_prefix,
@@ -688,6 +723,208 @@ mod eviction_tests {
 
     const TTL: i64 = SESSION_MAP_IDLE_TTL_SECS;
 
+    #[tokio::test]
+    async fn sleeping_cleanup_does_not_retain_released_worker_maps_or_transcripts() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let senders = Arc::new(RwLock::new(HashMap::new()));
+        let sessions = bamboo_engine::SessionCache::default();
+        let weak_runners = Arc::downgrade(&runners);
+        let weak_senders = Arc::downgrade(&senders);
+        let weak_sessions = Arc::downgrade(&sessions);
+        spawn_session_map_cleanup_task(
+            runners.clone(),
+            senders.clone(),
+            super::super::watchers::SessionWatchers::new(),
+            sessions.clone(),
+            Some("released-worker"),
+        );
+        // Let maintenance park at its first tick, as in a warm worker runtime.
+        tokio::task::yield_now().await;
+        drop((runners, senders, sessions));
+        assert!(weak_runners.upgrade().is_none());
+        assert!(weak_senders.upgrade().is_none());
+        assert!(weak_sessions.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_admission_channel_obeys_ttl_and_live_subscriber_retention() {
+        use super::super::session_events::{ensure_notification_relay, NotificationRelayDeps};
+        let dir = tempfile::tempdir().unwrap();
+        let deps = NotificationRelayDeps {
+            notification_service: Arc::new(bamboo_notification::NotificationService::new(
+                dir.path().join("notifications.json"),
+            )),
+            session_event_senders: Arc::new(RwLock::new(HashMap::new())),
+            session_watchers: super::super::watchers::SessionWatchers::new(),
+            config: Arc::new(RwLock::new(Config::default())),
+        };
+        let (sender, _) = broadcast::channel(16);
+        let mut senders = deps.session_event_senders.write().await;
+        senders.insert("failed-child".into(), sender.clone());
+        let ui_receiver = sender.subscribe();
+        ensure_notification_relay(&deps, "failed-child", sender);
+        let cache = bamboo_engine::SessionCache::default();
+        cache.insert(
+            "failed-child".into(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(
+                bamboo_agent_core::Session::new_child("failed-child", "parent", "model", "Child"),
+            )),
+        );
+        let mut runners = HashMap::new();
+        let now = Utc::now();
+        evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &deps.session_watchers,
+            &cache,
+            TTL,
+            now,
+            None,
+        );
+        assert!(
+            senders.contains_key("failed-child"),
+            "new channel retains replay window"
+        );
+        let expired = now + ChronoDuration::seconds(TTL + 1);
+        evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &deps.session_watchers,
+            &cache,
+            TTL,
+            expired,
+            None,
+        );
+        assert!(
+            senders.contains_key("failed-child"),
+            "actual UI receiver retains channel beyond TTL"
+        );
+        assert!(cache.contains_key("failed-child"));
+        drop(ui_receiver);
+        evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &deps.session_watchers,
+            &cache,
+            TTL,
+            expired,
+            None,
+        );
+        assert!(
+            senders.is_empty(),
+            "failed launch channel can be collected without a runner"
+        );
+        assert!(
+            cache.is_empty(),
+            "failed launch transcript leaves cache with its channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_children_with_real_notification_relays_are_reclaimed() {
+        use super::super::session_events::{ensure_notification_relay, NotificationRelayDeps};
+        let dir = tempfile::tempdir().unwrap();
+        let deps = NotificationRelayDeps {
+            notification_service: Arc::new(bamboo_notification::NotificationService::new(
+                dir.path().join("notifications.json"),
+            )),
+            session_event_senders: Arc::new(RwLock::new(HashMap::new())),
+            session_watchers: super::super::watchers::SessionWatchers::new(),
+            config: Arc::new(RwLock::new(Config::default())),
+        };
+        let cache = bamboo_engine::SessionCache::default();
+        let mut runners = HashMap::new();
+        let now = Utc::now();
+        let mut senders = deps.session_event_senders.write().await;
+        for index in 0..512 {
+            let id = format!("completed-child-{index}");
+            let (sender, _) = broadcast::channel(16);
+            runners.insert(id.clone(), terminal_runner(&sender, TTL + 1, now));
+            cache.insert(
+                id.clone(),
+                Arc::new(bamboo_engine::SessionSnapshot::new(
+                    bamboo_agent_core::Session::new_child(&id, "parent", "model", "Child"),
+                )),
+            );
+            senders.insert(id.clone(), sender.clone());
+            ensure_notification_relay(&deps, &id, sender);
+        }
+        // Real relay receivers are present even without any frontend clients.
+        assert!(senders.values().all(|sender| sender.receiver_count() == 1));
+        assert_eq!(
+            evict_idle_session_entries(
+                &mut runners,
+                &mut senders,
+                &deps.session_watchers,
+                &cache,
+                TTL,
+                now,
+                None,
+            ),
+            512,
+        );
+        assert!(runners.is_empty());
+        assert!(
+            cache.is_empty(),
+            "completed child transcripts leave the memory cache"
+        );
+        assert!(senders.is_empty());
+        drop(senders);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for index in 0..512 {
+                let id = format!("completed-child-{index}");
+                while !deps.notification_service.try_begin_relay(&id) {
+                    tokio::task::yield_now().await;
+                }
+                deps.notification_service.end_relay(&id);
+            }
+        })
+        .await
+        .expect("all relay tasks release their registrations after eviction");
+    }
+
+    #[test]
+    fn terminal_parent_retains_channel_while_child_producer_is_alive() {
+        let now = Utc::now();
+        let (sender, _) = broadcast::channel(16);
+        let mut runners = HashMap::new();
+        let mut senders = HashMap::new();
+        insert_pair(
+            &mut runners,
+            &mut senders,
+            "parent",
+            terminal_runner(&sender, TTL + 1, now),
+            sender.clone(),
+        );
+        let watchers = super::super::watchers::SessionWatchers::default();
+        assert_eq!(
+            evict_idle_session_entries(
+                &mut runners,
+                &mut senders,
+                &watchers,
+                &bamboo_engine::SessionCache::default(),
+                TTL,
+                now,
+                None
+            ),
+            0,
+            "a child's heartbeat sender keeps its finished parent addressable",
+        );
+        drop(sender);
+        assert_eq!(
+            evict_idle_session_entries(
+                &mut runners,
+                &mut senders,
+                &watchers,
+                &bamboo_engine::SessionCache::default(),
+                TTL,
+                now,
+                None
+            ),
+            1,
+        );
+    }
+
     /// A terminal (Completed) runner whose `event_sender` shares `tx`'s channel,
     /// exactly as production sets it in `reserve_runner`.
     fn terminal_runner(
@@ -727,7 +964,16 @@ mod eviction_tests {
             tx.clone(),
         );
 
-        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+        drop(tx);
+        let evicted = evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &super::super::watchers::SessionWatchers::default(),
+            &bamboo_engine::SessionCache::default(),
+            TTL,
+            now,
+            None,
+        );
 
         assert_eq!(evicted, 1);
         assert!(runners.is_empty(), "terminal idle runner must be dropped");
@@ -755,7 +1001,16 @@ mod eviction_tests {
             tx.clone(),
         );
 
-        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+        drop(tx);
+        let evicted = evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &super::super::watchers::SessionWatchers::default(),
+            &bamboo_engine::SessionCache::default(),
+            TTL,
+            now,
+            None,
+        );
 
         assert_eq!(evicted, 0, "must not evict while a receiver is live");
         assert!(runners.contains_key("s1"));
@@ -777,7 +1032,16 @@ mod eviction_tests {
             tx.clone(),
         );
 
-        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+        drop(tx);
+        let evicted = evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &super::super::watchers::SessionWatchers::default(),
+            &bamboo_engine::SessionCache::default(),
+            TTL,
+            now,
+            None,
+        );
 
         assert_eq!(
             evicted, 0,
@@ -801,7 +1065,16 @@ mod eviction_tests {
         let mut senders = HashMap::new();
         insert_pair(&mut runners, &mut senders, "s1", runner, tx.clone());
 
-        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+        drop(tx);
+        let evicted = evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &super::super::watchers::SessionWatchers::default(),
+            &bamboo_engine::SessionCache::default(),
+            TTL,
+            now,
+            None,
+        );
 
         assert_eq!(evicted, 0, "a Running runner is never evicted");
         assert!(runners.contains_key("s1"));
@@ -826,9 +1099,18 @@ mod eviction_tests {
             "s1".to_string(),
             terminal_runner(&runner_tx, TTL + 100, now),
         );
-        senders.insert("s1".to_string(), sender_tx.clone());
+        senders.insert("s1".to_string(), sender_tx);
+        drop(runner_tx);
 
-        let evicted = evict_idle_session_entries(&mut runners, &mut senders, TTL, now, None);
+        let evicted = evict_idle_session_entries(
+            &mut runners,
+            &mut senders,
+            &super::super::watchers::SessionWatchers::default(),
+            &bamboo_engine::SessionCache::default(),
+            TTL,
+            now,
+            None,
+        );
 
         assert_eq!(evicted, 1, "runner (no receivers) is evicted");
         assert!(runners.is_empty());

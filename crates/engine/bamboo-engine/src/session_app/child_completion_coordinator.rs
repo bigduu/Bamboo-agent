@@ -303,9 +303,8 @@ fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<
 ///
 /// The inner `std::sync::Mutex` guards only the brief HashMap lookup/insert
 /// (no await inside); the per-parent `tokio::sync::Mutex` is the one held
-/// across the async critical section. Entries accumulate but are small
-/// (`Arc<tokio::sync::Mutex<()>>` ≈ 24 bytes) and bounded by the number of
-/// distinct parent sessions.
+/// across the async critical section. Entries exist only while a holder or
+/// waiter owns a `SessionResumeLock`; historical parent IDs are reclaimed.
 fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
@@ -318,11 +317,44 @@ fn parent_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::
 /// ([`BashCompletionSink::on_bash_completed`]), and the bash **backstop** poll
 /// ([`ChildCompletionCoordinator::bash_self_resume`]) — can never double-resume.
 /// The inner sync `Mutex` guards only the brief map lookup (no await inside).
-fn session_resume_lock(session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+fn session_resume_lock(session_id: &str) -> SessionResumeLock {
     let mut map = parent_locks().lock().recover_poison();
-    map.entry(session_id.to_string())
+    let lock = map
+        .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+        .clone();
+    SessionResumeLock {
+        session_id: session_id.to_string(),
+        lock: Some(lock),
+    }
+}
+
+/// The lease is constructed before awaiting the mutex, so cancelled waiters
+/// also reclaim their registration. Lookup and last-owner removal use the same
+/// brief registry lock; two live mutexes can never exist for the same ID.
+struct SessionResumeLock {
+    session_id: String,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl std::ops::Deref for SessionResumeLock {
+    type Target = tokio::sync::Mutex<()>;
+    fn deref(&self) -> &Self::Target {
+        self.lock.as_ref().expect("live resume-lock lease")
+    }
+}
+
+impl Drop for SessionResumeLock {
+    fn drop(&mut self) {
+        self.lock.take();
+        let mut map = parent_locks().lock().recover_poison();
+        if map
+            .get(&self.session_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            map.remove(&self.session_id);
+        }
+    }
 }
 
 fn wait_policy_satisfied(
@@ -2502,7 +2534,7 @@ impl ChildCompletionCoordinator {
                     // per-child watchdog machinery itself is dead (task
                     // panicked or lost), because it would have cancelled and
                     // published a timeout long before.
-                    let last_activity = runner.last_event_at.unwrap_or(runner.started_at);
+                    let last_activity = runner.last_activity_at().unwrap_or(runner.started_at);
                     let idle_secs = now.signed_duration_since(last_activity).num_seconds();
                     let total_secs = now.signed_duration_since(runner.started_at).num_seconds();
                     let policy = match &control_plane {
@@ -2802,6 +2834,49 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_resume_waiters_do_not_retain_historical_parent_ids() {
+        for index in 0..512 {
+            let id = format!("resume-lock-reclaim-{index}");
+            let owner = session_resume_lock(&id);
+            let held = owner.lock().await;
+            let waiter = session_resume_lock(&id);
+            let mut waiting = Box::pin(waiter.lock());
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            drop(held);
+            drop(owner);
+            drop(waiting);
+            drop(waiter);
+            assert!(!parent_locks().lock().recover_poison().contains_key(&id));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_lock_reclamation_preserves_exclusive_parent_wake_ownership() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let active = active.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..16 {
+                    let lease = session_resume_lock("resume-lock-exclusive");
+                    let _guard = lease.lock().await;
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    tokio::task::yield_now().await;
+                    assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(!parent_locks()
+            .lock()
+            .recover_poison()
+            .contains_key("resume-lock-exclusive"));
+    }
     use bamboo_agent_core::Message;
     use bamboo_domain::SessionInboxPort;
     use futures::stream;
