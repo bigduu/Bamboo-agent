@@ -17,9 +17,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::codex_discovery::discover_codex_app_server;
@@ -31,6 +32,7 @@ use bamboo_subagent::proto::RunSpec;
 
 use crate::codex_cli_executor::{
     read_bounded_line, terminate_child, CodexAuthConfig, CodexAuthMode, CodexPermissionConfig,
+    ProcessTreeChild,
 };
 
 const MAX_STDOUT_LINE_BYTES: usize = 10 * 1024 * 1024;
@@ -63,14 +65,15 @@ struct AppServerSessionStore {
 }
 
 struct AppServerConnection {
-    child: Child,
+    child: ProcessTreeChild,
     write_tx: mpsc::UnboundedSender<Value>,
     incoming_rx: mpsc::Receiver<Value>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
     next_id: AtomicU64,
     stderr_tail: Arc<Mutex<String>>,
-    writer_task: tokio::task::JoinHandle<()>,
-    reader_task: tokio::task::JoinHandle<()>,
+    writer_task: AbortOnDropHandle<()>,
+    reader_task: AbortOnDropHandle<()>,
+    _stderr_task: Option<AbortOnDropHandle<()>>,
 }
 
 impl AppServerConnection {
@@ -130,23 +133,6 @@ impl AppServerConnection {
 
     async fn stderr_summary(&self) -> String {
         self.stderr_tail.lock().await.trim().to_string()
-    }
-}
-
-impl Drop for AppServerConnection {
-    fn drop(&mut self) {
-        self.writer_task.abort();
-        self.reader_task.abort();
-        #[cfg(unix)]
-        if let Some(pgid) = self.child.id().map(|pid| pid as libc::pid_t) {
-            // The executor normally uses the graceful interrupt plus
-            // TERM/KILL ladder. Drop is the last-resort worker-shutdown path,
-            // so synchronously kill the whole process group rather than
-            // allowing an in-flight Codex tool descendant to outlive Bamboo.
-            // SAFETY: a negative live child pid targets only its process group.
-            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        }
-        let _ = self.child.start_kill();
     }
 }
 
@@ -383,7 +369,7 @@ impl CodexAppServerExecutor {
 
     async fn start_connection(&self) -> Result<AppServerConnection, String> {
         self.prepare_auth_home().await?;
-        let mut child =
+        let child =
             spawn_with_etxtbsy_retry(|| self.build_command().map_err(std::io::Error::other))
                 .await
                 .map_err(|error| {
@@ -392,6 +378,7 @@ impl CodexAppServerExecutor {
                         self.binary.display()
                     )
                 })?;
+        let mut child = ProcessTreeChild::new(child);
         let stdin = child
             .stdin
             .take()
@@ -403,7 +390,7 @@ impl CodexAppServerExecutor {
         let stderr = child.stderr.take();
 
         let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Value>();
-        let writer_task = tokio::spawn(async move {
+        let writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(value) = write_rx.recv().await {
                 let Ok(mut bytes) = serde_json::to_vec(&value) else {
@@ -414,7 +401,7 @@ impl CodexAppServerExecutor {
                     break;
                 }
             }
-        });
+        }));
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -423,7 +410,7 @@ impl CodexAppServerExecutor {
         // without limit. Client responses bypass this queue via `pending`.
         let (incoming_tx, incoming_rx) = mpsc::channel(128);
         let reader_pending = pending.clone();
-        let reader_task = tokio::spawn(async move {
+        let reader_task = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             loop {
                 let line = match read_bounded_line(&mut reader, MAX_STDOUT_LINE_BYTES).await {
@@ -464,13 +451,15 @@ impl CodexAppServerExecutor {
                 }
             }
             reader_pending.lock().await.clear();
-        });
+        }));
 
         let stderr_tail = Arc::new(Mutex::new(String::new()));
-        if let Some(stderr) = stderr {
+        let stderr_task = stderr.map(|stderr| {
             let tail = stderr_tail.clone();
-            tokio::spawn(async move { drain_stderr_tail(stderr, tail).await });
-        }
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                drain_stderr_tail(stderr, tail).await
+            }))
+        });
         let connection = AppServerConnection {
             child,
             write_tx,
@@ -480,6 +469,7 @@ impl CodexAppServerExecutor {
             stderr_tail,
             writer_task,
             reader_task,
+            _stderr_task: stderr_task,
         };
         connection
             .request(
@@ -498,18 +488,13 @@ impl CodexAppServerExecutor {
         Ok(connection)
     }
 
-    async fn ensure_connection<'a>(
-        &'a self,
-        slot: &'a mut Option<AppServerConnection>,
-    ) -> Result<&'a mut AppServerConnection, String> {
-        let alive = slot.as_mut().is_some_and(AppServerConnection::is_alive);
-        if !alive {
-            if let Some(mut stale) = slot.take() {
-                terminate_child(&mut stale.child).await;
-            }
-            *slot = Some(self.start_connection().await?);
+    async fn take_connection(&self) -> Result<AppServerConnection, String> {
+        let mut previous = self.connection.lock().await.take();
+        if previous.as_mut().is_some_and(AppServerConnection::is_alive) {
+            return Ok(previous.expect("live connection"));
         }
-        Ok(slot.as_mut().expect("connection installed"))
+        drop(previous);
+        self.start_connection().await
     }
 
     fn thread_params(&self, policy: AppServerRunPolicy<'_>) -> Value {
@@ -594,7 +579,7 @@ impl CodexAppServerExecutor {
         turn_id: &str,
         events: &EventSink,
         steer: &mut SteerInbox,
-        approval_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+        approval_tasks: &mut Vec<AbortOnDropHandle<()>>,
         force_cancelled: bool,
         approval_disposition: UnexpectedApprovalDisposition,
     ) -> ChildOutcome {
@@ -616,7 +601,7 @@ impl CodexAppServerExecutor {
                                 "executor": "codex_app_server",
                                 "phase": "steer_rejected",
                                 "message": error,
-                            }));
+                            })).await;
                         }
                     } else {
                         steer_open = false;
@@ -677,7 +662,7 @@ impl CodexAppServerExecutor {
                         events,
                         &mut state,
                         force_cancelled,
-                    ) {
+                    ).await {
                         return outcome;
                     }
                 }
@@ -723,9 +708,11 @@ impl CodexAppServerExecutor {
         {
             Ok(activation) => activation,
             Err(error) => {
-                events.emit(event_json(AgentEvent::Error {
-                    message: error.clone(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Error {
+                        message: error.clone(),
+                    }))
+                    .await;
                 return ChildOutcome::error(error);
             }
         };
@@ -733,16 +720,20 @@ impl CodexAppServerExecutor {
             let message = format!(
                 "Codex app-server cannot safely enforce Bamboo explicit-deny policy: {reason}"
             );
-            events.emit(event_json(AgentEvent::PermissionPostureActivated {
-                session_id: logical_session.clone(),
-                policy_revision: activation.policy_revision,
-                requested_mode: activation.resolution.requested.as_str().to_string(),
-                effective_mode: activation.resolution.effective.as_str().to_string(),
-                executor_mapping: "codex_app_server:blocked_explicit_deny".to_string(),
-            }));
-            events.emit(event_json(AgentEvent::Error {
-                message: message.clone(),
-            }));
+            events
+                .emit(event_json(AgentEvent::PermissionPostureActivated {
+                    session_id: logical_session.clone(),
+                    policy_revision: activation.policy_revision,
+                    requested_mode: activation.resolution.requested.as_str().to_string(),
+                    effective_mode: activation.resolution.effective.as_str().to_string(),
+                    executor_mapping: "codex_app_server:blocked_explicit_deny".to_string(),
+                }))
+                .await;
+            events
+                .emit(event_json(AgentEvent::Error {
+                    message: message.clone(),
+                }))
+                .await;
             return ChildOutcome::error(message);
         }
         let approval_policy = if activation.resolution.suppress_approval_prompts()
@@ -771,52 +762,61 @@ impl CodexAppServerExecutor {
             approval_policy,
             network_access,
         };
-        events.emit(event_json(AgentEvent::PermissionPostureActivated {
-            session_id: logical_session.clone(),
-            policy_revision: activation.policy_revision,
-            requested_mode: activation.resolution.requested.as_str().to_string(),
-            effective_mode: activation.resolution.effective.as_str().to_string(),
-            executor_mapping: executor_mapping.clone(),
-        }));
+        events
+            .emit(event_json(AgentEvent::PermissionPostureActivated {
+                session_id: logical_session.clone(),
+                policy_revision: activation.policy_revision,
+                requested_mode: activation.resolution.requested.as_str().to_string(),
+                effective_mode: activation.resolution.effective.as_str().to_string(),
+                executor_mapping: executor_mapping.clone(),
+            }))
+            .await;
         for warning in warnings {
-            events.emit(json!({
+            events
+                .emit(json!({
+                    "type": "runner_progress",
+                    "session_id": logical_session,
+                    "round_count": 0,
+                    "level": "warning",
+                    "message": warning,
+                }))
+                .await;
+        }
+        events
+            .emit(json!({
                 "type": "runner_progress",
                 "session_id": logical_session,
                 "round_count": 0,
-                "level": "warning",
-                "message": warning,
-            }));
-        }
-        events.emit(json!({
-            "type": "runner_progress",
-            "session_id": logical_session,
-            "round_count": 0,
-            "executor": "codex_app_server",
-            "binary": self.binary,
-            "version": self.version,
-            "model": self.model,
-            "auth_mode": self.auth.mode().as_str(),
-            "codex_home_mode": self.codex_home_mode(),
-            "sandbox": sandbox,
-            "approval_policy": approval_policy,
-            "approvals_reviewer": (!activation.resolution.suppress_approval_prompts()
-                && activation.resolution.effective != bamboo_domain::PermissionMode::Plan)
-                .then_some("user"),
-            "network_access": network_access,
-            "permission_profile": self.permissions.permission_profile(),
-            "requested_mode": activation.resolution.requested.as_str(),
-            "effective_mode": activation.resolution.effective.as_str(),
-            "executor_mapping": executor_mapping,
-        }));
+                "executor": "codex_app_server",
+                "binary": self.binary,
+                "version": self.version,
+                "model": self.model,
+                "auth_mode": self.auth.mode().as_str(),
+                "codex_home_mode": self.codex_home_mode(),
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "approvals_reviewer": (!activation.resolution.suppress_approval_prompts()
+                    && activation.resolution.effective != bamboo_domain::PermissionMode::Plan)
+                    .then_some("user"),
+                "network_access": network_access,
+                "permission_profile": self.permissions.permission_profile(),
+                "requested_mode": activation.resolution.requested.as_str(),
+                "effective_mode": activation.resolution.effective.as_str(),
+                "executor_mapping": executor_mapping,
+            }))
+            .await;
 
         if spec.messages.is_empty() {
             self.forget_thread(&logical_session).await;
         }
-        let mut slot = self.connection.lock().await;
-        let connection = match self.ensure_connection(&mut slot).await {
+        // The active future owns the connection. A transport abort can drop
+        // this future while interrupt/approval/output awaits are pending; it
+        // must destroy that turn instead of leaving it in the warm slot.
+        let mut active_connection = match self.take_connection().await {
             Ok(connection) => connection,
             Err(error) => return ChildOutcome::error(error),
         };
+        let connection = &mut active_connection;
 
         while connection.incoming_rx.try_recv().is_ok() {}
         let stored = if spec.messages.is_empty() {
@@ -836,7 +836,7 @@ impl CodexAppServerExecutor {
                         "executor": "codex_app_server",
                         "phase": "resume_fallback",
                         "message": "resume failed; starting a new thread with bounded history rehydration",
-                    }));
+                    })).await;
                     self.forget_thread(&logical_session).await;
                     let new_id = match self.start_thread(connection, run_policy).await {
                         Ok(id) => id,
@@ -875,10 +875,12 @@ impl CodexAppServerExecutor {
             Ok(id) => id,
             Err(error) => return ChildOutcome::error(error),
         };
-        events.emit(event_json(AgentEvent::RunnerProgress {
-            session_id: thread_id.clone(),
-            round_count: 1,
-        }));
+        events
+            .emit(event_json(AgentEvent::RunnerProgress {
+                session_id: thread_id.clone(),
+                round_count: 1,
+            }))
+            .await;
         let mut approval_tasks = Vec::new();
         let outcome = tokio::select! {
             outcome = self.drive_turn(
@@ -915,9 +917,7 @@ impl CodexAppServerExecutor {
                 ).await {
                     Ok(_) => ChildOutcome::cancelled(),
                     Err(_) => {
-                        if let Some(mut connection) = slot.take() {
-                            terminate_child(&mut connection.child).await;
-                        }
+                        terminate_child(&mut connection.child).await;
                         ChildOutcome::cancelled()
                     }
                 }
@@ -925,6 +925,12 @@ impl CodexAppServerExecutor {
         };
         for task in approval_tasks {
             task.abort();
+            let _ = task.await;
+        }
+        // Only a fully completed turn is eligible for warm reuse. Errors and
+        // cancelled turns are discarded even if interrupt appeared successful.
+        if outcome.status == bamboo_subagent::proto::TerminalStatus::Completed {
+            *self.connection.lock().await = Some(active_connection);
         }
         outcome
     }
@@ -960,7 +966,7 @@ struct AppRunState {
     started_items: HashSet<String>,
 }
 
-fn handle_notification(
+async fn handle_notification(
     method: &str,
     params: &Value,
     thread_id: &str,
@@ -992,16 +998,20 @@ fn handle_notification(
                     state.last_agent_message.clear();
                 }
                 state.last_agent_message.push_str(delta);
-                events.emit(event_json(AgentEvent::Token {
-                    content: delta.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Token {
+                        content: delta.to_string(),
+                    }))
+                    .await;
             }
         }
         "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
             if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                events.emit(event_json(AgentEvent::ReasoningToken {
-                    content: delta.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::ReasoningToken {
+                        content: delta.to_string(),
+                    }))
+                    .await;
             }
         }
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
@@ -1009,10 +1019,12 @@ fn handle_notification(
                 params.get("itemId").and_then(Value::as_str),
                 params.get("delta").and_then(Value::as_str),
             ) {
-                events.emit(event_json(AgentEvent::ToolToken {
-                    tool_call_id: item_id.to_string(),
-                    content: delta.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::ToolToken {
+                        tool_call_id: item_id.to_string(),
+                        content: delta.to_string(),
+                    }))
+                    .await;
             }
         }
         "item/mcpToolCall/progress" => {
@@ -1020,20 +1032,22 @@ fn handle_notification(
                 params.get("itemId").and_then(Value::as_str),
                 params.get("message").and_then(Value::as_str),
             ) {
-                events.emit(event_json(AgentEvent::ToolToken {
-                    tool_call_id: item_id.to_string(),
-                    content: message.to_string(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::ToolToken {
+                        tool_call_id: item_id.to_string(),
+                        content: message.to_string(),
+                    }))
+                    .await;
             }
         }
         "item/started" => {
             if let Some(item) = params.get("item") {
-                emit_item_started(item, events, state);
+                emit_item_started(item, events, state).await;
             }
         }
         "item/completed" => {
             if let Some(item) = params.get("item") {
-                emit_item_completed(item, events, state);
+                emit_item_completed(item, events, state).await;
             }
         }
         "thread/tokenUsage/updated" => {
@@ -1041,37 +1055,47 @@ fn handle_notification(
         }
         "turn/completed" => {
             if force_cancelled {
-                events.emit(event_json(AgentEvent::Cancelled {
-                    message: Some("Codex app-server turn interrupted".to_string()),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Cancelled {
+                        message: Some("Codex app-server turn interrupted".to_string()),
+                    }))
+                    .await;
                 return Some(ChildOutcome::cancelled());
             }
             let turn = params.get("turn").unwrap_or(&Value::Null);
             match turn.get("status").and_then(Value::as_str) {
                 Some("completed") => {
-                    events.emit(event_json(AgentEvent::Complete { usage: state.usage }));
+                    events
+                        .emit(event_json(AgentEvent::Complete { usage: state.usage }))
+                        .await;
                     return Some(ChildOutcome::completed(state.last_agent_message.clone()));
                 }
                 Some("interrupted") => {
-                    events.emit(event_json(AgentEvent::Cancelled {
-                        message: Some("Codex app-server turn interrupted".to_string()),
-                    }));
+                    events
+                        .emit(event_json(AgentEvent::Cancelled {
+                            message: Some("Codex app-server turn interrupted".to_string()),
+                        }))
+                        .await;
                     return Some(ChildOutcome::cancelled());
                 }
                 _ => {
                     let message = error_message(turn, "Codex app-server turn failed");
-                    events.emit(event_json(AgentEvent::Error {
-                        message: message.clone(),
-                    }));
+                    events
+                        .emit(event_json(AgentEvent::Error {
+                            message: message.clone(),
+                        }))
+                        .await;
                     return Some(ChildOutcome::error(message));
                 }
             }
         }
         "error" => {
             let message = error_message(params, "Codex app-server error");
-            events.emit(event_json(AgentEvent::Error {
-                message: message.clone(),
-            }));
+            events
+                .emit(event_json(AgentEvent::Error {
+                    message: message.clone(),
+                }))
+                .await;
             return Some(ChildOutcome::error(message));
         }
         other => tracing::debug!(
@@ -1082,7 +1106,7 @@ fn handle_notification(
     None
 }
 
-fn emit_item_started(item: &Value, events: &EventSink, state: &mut AppRunState) {
+async fn emit_item_started(item: &Value, events: &EventSink, state: &mut AppRunState) {
     let item_id = item
         .get("id")
         .and_then(Value::as_str)
@@ -1118,14 +1142,16 @@ fn emit_item_started(item: &Value, events: &EventSink, state: &mut AppRunState) 
         Some("webSearch") => ("WebSearch".to_string(), json!({"query": item.get("query")})),
         _ => return,
     };
-    events.emit(event_json(AgentEvent::ToolStart {
-        tool_call_id: item_id.to_string(),
-        tool_name,
-        arguments,
-    }));
+    events
+        .emit(event_json(AgentEvent::ToolStart {
+            tool_call_id: item_id.to_string(),
+            tool_name,
+            arguments,
+        }))
+        .await;
 }
 
-fn emit_item_completed(item: &Value, events: &EventSink, state: &mut AppRunState) {
+async fn emit_item_completed(item: &Value, events: &EventSink, state: &mut AppRunState) {
     if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
         if let Some(text) = item.get("text").and_then(Value::as_str) {
             state.last_agent_item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
@@ -1133,7 +1159,7 @@ fn emit_item_completed(item: &Value, events: &EventSink, state: &mut AppRunState
         }
         return;
     }
-    emit_item_started(item, events, state);
+    emit_item_started(item, events, state).await;
     let item_id = item
         .get("id")
         .and_then(Value::as_str)
@@ -1154,10 +1180,12 @@ fn emit_item_completed(item: &Value, events: &EventSink, state: &mut AppRunState
             })
         });
     if let Some(error) = error {
-        events.emit(event_json(AgentEvent::ToolError {
-            tool_call_id: item_id.to_string(),
-            error: truncate_chars(&error, TOOL_RESULT_TRUNCATE_CHARS),
-        }));
+        events
+            .emit(event_json(AgentEvent::ToolError {
+                tool_call_id: item_id.to_string(),
+                error: truncate_chars(&error, TOOL_RESULT_TRUNCATE_CHARS),
+            }))
+            .await;
     } else {
         let result = item
             .get("aggregatedOutput")
@@ -1165,10 +1193,12 @@ fn emit_item_completed(item: &Value, events: &EventSink, state: &mut AppRunState
             .or_else(|| item.get("changes"))
             .map(value_text)
             .unwrap_or_else(|| status.to_string());
-        events.emit(event_json(AgentEvent::ToolComplete {
-            tool_call_id: item_id.to_string(),
-            result: ToolResult::text(true, truncate_chars(&result, TOOL_RESULT_TRUNCATE_CHARS)),
-        }));
+        events
+            .emit(event_json(AgentEvent::ToolComplete {
+                tool_call_id: item_id.to_string(),
+                result: ToolResult::text(true, truncate_chars(&result, TOOL_RESULT_TRUNCATE_CHARS)),
+            }))
+            .await;
     }
 }
 
@@ -1188,8 +1218,8 @@ fn spawn_approval_relay(
     request: Value,
     host: Option<HostBridge>,
     timeout: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request
             .get("method")
@@ -1238,7 +1268,7 @@ fn spawn_approval_relay(
             false
         };
         let _ = write_tx.send(approval_response_parts(id, &method, approved));
-    })
+    }))
 }
 
 fn approval_matches_active_turn(request: &Value, thread_id: &str, turn_id: &str) -> bool {
@@ -1500,6 +1530,123 @@ while IFS= read -r ignored; do :; done
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn websocket_cancel_and_owner_abort_discard_turn_then_reuse_clean_connection() {
+        use crate::codex_cli_executor::process_lifecycle_tests::{
+            assert_processes_gone, interrupt_over_websocket,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for abort_owner in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let binary = root.path().join("codex-cancel-stub.sh");
+            std::fs::write(&binary, r###"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
+if [ "$1" = "exec" ]; then echo '--json --output-last-message --config --sandbox --dangerously-bypass-approvals-and-sandbox stdin'; exit 0; fi
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then echo '--listen stdio:// --stdio'; exit 0; fi
+DIR=$(cd "$(dirname "$0")" && pwd)
+trap '' TERM
+while IFS= read -r request; do
+  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$request" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thread-stub"}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"result":{"turn":{"id":"turn-stub","status":"inProgress","items":[]}}}\n' "$id"
+      case "$request" in
+        *'finish'*) echo '{"method":"turn/completed","params":{"threadId":"thread-stub","turn":{"id":"turn-stub","status":"completed","items":[]}}}' ;;
+        *)
+          (trap '' TERM; sleep 60) &
+          printf '%s %s\n' "$$" "$!" > "$DIR/pids"
+          echo '{"id":41,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-stub","turnId":"turn-stub","itemId":"item-1","command":"sleep 60","cwd":"/tmp","reason":"pending approval"}}'
+          ;;
+      esac ;;
+    *'"method":"turn/interrupt"'*) : ;; # Deliberately never acknowledge interrupt.
+  esac
+done
+"###).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let permissions = resolve_codex_app_server_permission_config(
+                Some("workspace-write"),
+                Some("on-request"),
+                false,
+                false,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            let executor = Arc::new(
+                CodexAppServerExecutor::new(
+                    Some(binary.to_string_lossy().into_owned()),
+                    None,
+                    Some(root.path().to_string_lossy().into_owned()),
+                    Some(root.path().join("state")),
+                    Vec::new(),
+                    CodexAuthConfig::inherit(),
+                    permissions,
+                )
+                .await
+                .unwrap(),
+            );
+            let spec = |assignment: &str| -> RunSpec {
+                serde_json::from_value(json!({
+                    "assignment": assignment,
+                    "logical_session": {"session_id": "process-test", "root_session_id": "process-test"}
+                })).unwrap()
+            };
+            let old_pid = interrupt_over_websocket(
+                executor.clone(),
+                spec("hang"),
+                &root.path().join("pids"),
+                abort_owner,
+            )
+            .await;
+            assert!(
+                executor.connection.lock().await.is_none(),
+                "aborted turn cannot remain warm"
+            );
+
+            let mut warm_pid = None;
+            for _ in 0..2 {
+                let (events, receiver) = EventSink::channel();
+                drop(receiver);
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    executor.run(
+                        spec("finish"),
+                        events,
+                        SteerInbox::disconnected(),
+                        CancellationToken::new(),
+                    ),
+                )
+                .await
+                .expect("subsequent warm run must be clean");
+                assert_eq!(
+                    outcome.status,
+                    bamboo_subagent::proto::TerminalStatus::Completed
+                );
+                let pid = executor
+                    .connection
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .child
+                    .id()
+                    .unwrap() as libc::pid_t;
+                assert_ne!(pid, old_pid, "interrupted connection must be replaced");
+                if let Some(warm_pid) = warm_pid {
+                    assert_eq!(pid, warm_pid, "completed connection should be reusable");
+                }
+                warm_pid = Some(pid);
+            }
+            drop(executor);
+            assert_processes_gone(&[warm_pid.unwrap()]).await;
+        }
+    }
+
+    #[cfg(unix)]
     async fn run_stub(
         approved: Option<bool>,
         run_auto_approve_permissions: Option<bool>,
@@ -1655,6 +1802,25 @@ while IFS= read -r ignored; do :; done
         task.await.unwrap();
         let response = write_rx.recv().await.expect("app-server response");
         assert_eq!(response, json!({"id": 9, "result": {"decision": "accept"}}));
+    }
+
+    #[tokio::test]
+    async fn dropping_approval_owner_releases_pending_host_reply() {
+        let (host, mut host_rx) = HostBridge::channel();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+        let task = spawn_approval_relay(
+            write_tx,
+            json!({"id": 10, "method": "item/fileChange/requestApproval", "params": {}}),
+            Some(host),
+            Duration::from_secs(300),
+        );
+        let mut request = host_rx.recv().await.unwrap();
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), request.reply.closed())
+            .await
+            .unwrap();
+        assert!(host_rx.recv().await.is_none());
+        assert!(write_rx.recv().await.is_none());
     }
 
     #[tokio::test]

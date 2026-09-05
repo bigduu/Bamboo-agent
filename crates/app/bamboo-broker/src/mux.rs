@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, MsgId};
@@ -29,7 +29,21 @@ use crate::proto::ClientFrame;
 /// Bound on the delivery-receipt wait (mirrors `client::DELIVER_RECEIPT_TIMEOUT`).
 const DELIVER_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Pending = Arc<Mutex<HashMap<MsgId, oneshot::Sender<InboxMessage>>>>;
+type Pending = Arc<StdMutex<HashMap<MsgId, oneshot::Sender<InboxMessage>>>>;
+
+struct PendingRequest {
+    pending: Pending,
+    id: MsgId,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
+}
 
 /// A multiplexed request/reply driver over one broker connection. Built from a
 /// connected + subscribed [`crate::client::BrokerClient`] via
@@ -66,12 +80,16 @@ impl MultiplexedClient {
         reader_alive: Arc<AtomicBool>,
         me: AgentRef,
     ) -> Self {
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
         let routed = pending.clone();
         let router = tokio::spawn(async move {
             while let Some(msg) = messages.recv().await {
                 if let Some(cid) = msg.correlation_id.clone() {
-                    if let Some(tx) = routed.lock().await.remove(&cid) {
+                    if let Some(tx) = routed
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&cid)
+                    {
                         let _ = tx.send(msg);
                         continue;
                     }
@@ -83,7 +101,10 @@ impl MultiplexedClient {
             // `messages` closed == the reader exited == the connection is dead.
             // Drop every pending sender so all in-flight waiters resolve to an
             // error instead of hanging forever.
-            routed.lock().await.clear();
+            routed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
         });
 
         Self {
@@ -143,10 +164,22 @@ impl MultiplexedClient {
 
         // Register the waiter BEFORE sending, so a fast reply can't arrive before
         // the waiter exists (the router would otherwise drop it).
-        self.pending.lock().await.insert(qid.clone(), tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(qid.clone(), tx);
+        // Register cleanup before the first await: caller cancellation can
+        // happen while waiting for a receipt or a reply, not only at timeout.
+        let _pending_request = PendingRequest {
+            pending: self.pending.clone(),
+            id: qid.clone(),
+        };
 
         if let Err(e) = self.deliver(target, msg).await {
-            self.pending.lock().await.remove(&qid);
+            self.pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&qid);
             return Err(e);
         }
 
@@ -154,7 +187,10 @@ impl MultiplexedClient {
             Ok(Ok(reply)) => Ok(reply.body),
             Ok(Err(_)) => {
                 // Sender dropped == the router cleared pending == connection dead.
-                self.pending.lock().await.remove(&qid);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&qid);
                 Err(BrokerError::Transport(
                     "connection closed before reply".into(),
                 ))
@@ -162,7 +198,10 @@ impl MultiplexedClient {
             Err(_) => {
                 // Timed out: drop our waiter so a late reply isn't mis-routed, and
                 // tell the worker to stop the abandoned run (out-of-band, #50 parity).
-                self.pending.lock().await.remove(&qid);
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&qid);
                 let _ = self.cancel(target, &qid).await;
                 Err(BrokerError::Transport(format!(
                     "request to '{target}' timed out after {timeout:?}"
@@ -333,8 +372,53 @@ mod tests {
             .await;
         assert!(err.is_err(), "request to a non-responder times out");
         assert!(
-            client.pending.lock().await.is_empty(),
+            client
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty(),
             "the timed-out waiter was unregistered"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_releases_its_correlation_waiter() {
+        let (endpoint, _dir) = start().await;
+        let client = Arc::new(mux(&endpoint, "cancel-request").await);
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request(
+                        "absent-worker",
+                        InboxKind::McpRequest,
+                        serde_json::json!({}),
+                        Duration::from_secs(60),
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !client
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(client
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty());
     }
 }

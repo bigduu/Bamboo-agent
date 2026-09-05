@@ -370,7 +370,7 @@ mod tests {
             mut steer: bamboo_subagent::SteerInbox,
             _cancel: tokio_util::sync::CancellationToken,
         ) -> bamboo_subagent::ChildOutcome {
-            events.emit(serde_json::json!({ "type": "ready" }));
+            events.emit(serde_json::json!({ "type": "ready" })).await;
             let s = steer.recv().await.unwrap_or_default();
             bamboo_subagent::ChildOutcome::completed(format!("steered: {s}"))
         }
@@ -394,18 +394,20 @@ mod tests {
                     root_session_id: "logical-root".to_string(),
                 })
             );
-            events.emit(serde_json::json!({ "type": "ready" }));
+            events.emit(serde_json::json!({ "type": "ready" })).await;
             let bamboo_subagent::SteerMessage::SessionMessage(delivery) =
                 steer.recv_message().await.expect("typed delivery")
             else {
                 panic!("expected typed delivery");
             };
-            events.confirm_session_message(bamboo_subagent::SessionMessageAdmissionConfirmation {
-                target_session_id: delivery.target_session_id,
-                envelope_id: delivery.envelope.id.as_str().to_string(),
-                canonical_claim_generation: delivery.canonical_claim_generation,
-                activation_run_id: delivery.activation_run_id,
-            });
+            events
+                .confirm_session_message(bamboo_subagent::SessionMessageAdmissionConfirmation {
+                    target_session_id: delivery.target_session_id,
+                    envelope_id: delivery.envelope.id.as_str().to_string(),
+                    canonical_claim_generation: delivery.canonical_claim_generation,
+                    activation_run_id: delivery.activation_run_id,
+                })
+                .await;
             bamboo_subagent::ChildOutcome::completed("confirmed")
         }
     }

@@ -45,7 +45,7 @@ fn spec(assignment: &str, messages: Vec<serde_json::Value>) -> RunSpec {
 }
 
 async fn drain_events(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
     let mut all = Vec::new();
     while let Some(ev) = rx.recv().await {

@@ -15,6 +15,18 @@ use bamboo_subagent::proto::{PermissionPolicyContext, RunSecrets, RunSpec};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+fn collect_events(
+    mut receiver: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) -> tokio_util::task::AbortOnDropHandle<Vec<serde_json::Value>> {
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        events
+    }))
+}
+
 #[tokio::test]
 #[ignore = "requires an authenticated real Codex CLI and intentionally exercises allow/deny command approvals"]
 async fn live_app_server_relays_allow_and_deny_across_resume() {
@@ -49,7 +61,8 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
     .await
     .unwrap();
 
-    let (sink, mut event_rx) = EventSink::channel();
+    let (sink, event_rx) = EventSink::channel();
+    let event_rx = collect_events(event_rx);
     let (host, mut host_rx) = HostBridge::channel();
     let approvals = Arc::new(Mutex::new(Vec::new()));
     let seen = approvals.clone();
@@ -110,7 +123,7 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
     let _ = tokio::fs::remove_file(&marker).await;
     assert!(allowed_executed, "approved command did not execute");
     let mut saw_complete = false;
-    while let Ok(event) = event_rx.try_recv() {
+    for event in event_rx.await.unwrap() {
         saw_complete |= event["type"] == "complete";
     }
     assert!(saw_complete);
@@ -120,7 +133,8 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
         std::process::id()
     ));
     let _ = tokio::fs::remove_file(&denied_marker).await;
-    let (deny_sink, mut deny_events) = EventSink::channel();
+    let (deny_sink, deny_events) = EventSink::channel();
+    let deny_events = collect_events(deny_events);
     let deny_outcome = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(
@@ -179,7 +193,9 @@ async fn live_app_server_relays_allow_and_deny_across_resume() {
         approvals.lock().await.len() >= 2,
         "expected allow and deny approvals"
     );
-    assert!(
-        std::iter::from_fn(|| deny_events.try_recv().ok()).any(|event| event["type"] == "complete")
-    );
+    assert!(deny_events
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|event| event["type"] == "complete"));
 }

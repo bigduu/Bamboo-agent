@@ -75,15 +75,18 @@ impl HostBridge {
 /// Sink an executor emits events into; the transport forwards each as a `ChildFrame::Event`.
 #[derive(Clone)]
 pub struct EventSink {
-    tx: mpsc::UnboundedSender<serde_json::Value>,
-    control_tx: Option<mpsc::UnboundedSender<ExecutorControl>>,
+    tx: mpsc::Sender<serde_json::Value>,
+    control_tx: Option<mpsc::Sender<ExecutorControl>>,
     host: Option<HostBridge>,
 }
 
 impl EventSink {
+    pub const EVENT_CAPACITY: usize = 256;
+    pub const CONTROL_CAPACITY: usize = 32;
+
     /// Create a sink + the receiver the transport pumps to the wire.
-    pub fn channel() -> (Self, mpsc::UnboundedReceiver<serde_json::Value>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn channel() -> (Self, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel(Self::EVENT_CAPACITY);
         (
             EventSink {
                 tx,
@@ -96,11 +99,11 @@ impl EventSink {
     /// Create a sink with a control channel for protocol-level confirmations.
     pub fn channel_with_control() -> (
         Self,
-        mpsc::UnboundedReceiver<serde_json::Value>,
-        mpsc::UnboundedReceiver<ExecutorControl>,
+        mpsc::Receiver<serde_json::Value>,
+        mpsc::Receiver<ExecutorControl>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(Self::EVENT_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(Self::CONTROL_CAPACITY);
         (
             EventSink {
                 tx,
@@ -120,15 +123,19 @@ impl EventSink {
     pub fn host(&self) -> Option<&HostBridge> {
         self.host.as_ref()
     }
-    /// Emit one event (serialized agent event). Dropped silently if the peer is gone.
-    pub fn emit(&self, event: serde_json::Value) {
-        let _ = self.tx.send(event);
+    /// Emit one event with bounded producer backpressure. Transport QoS still
+    /// decides whether a sequenced live batch can be dropped; durable events
+    /// cannot accumulate without bound ahead of that transport or be lost here.
+    pub async fn emit(&self, event: serde_json::Value) {
+        let _ = self.tx.send(event).await;
     }
     /// Confirm a forwarded SessionInbox message only after the executor has
     /// observed its durable local admitted receipt.
-    pub fn confirm_session_message(&self, confirmation: SessionMessageAdmissionConfirmation) {
+    pub async fn confirm_session_message(&self, confirmation: SessionMessageAdmissionConfirmation) {
         if let Some(tx) = &self.control_tx {
-            let _ = tx.send(ExecutorControl::SessionMessageAdmitted(confirmation));
+            let _ = tx
+                .send(ExecutorControl::SessionMessageAdmitted(confirmation))
+                .await;
         }
     }
 }
@@ -316,11 +323,13 @@ impl ChildExecutor for EchoExecutor {
             if cancel.is_cancelled() {
                 return ChildOutcome::cancelled();
             }
-            events.emit(serde_json::json!({ "type": "token", "content": format!("{word} ") }));
+            events
+                .emit(serde_json::json!({ "type": "token", "content": format!("{word} ") }))
+                .await;
             // tiny yield so cancellation can interleave; not a real delay
             tokio::task::yield_now().await;
         }
-        events.emit(serde_json::json!({ "type": "complete" }));
+        events.emit(serde_json::json!({ "type": "complete" })).await;
         ChildOutcome::completed(format!("echo: {}", words.join(" ")))
     }
 }
@@ -328,6 +337,39 @@ impl ChildExecutor for EchoExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_event_queue_backpressures_without_losing_durable_order_or_blocking_control() {
+        let (sink, mut events, mut controls) = EventSink::channel_with_control();
+        for index in 0..EventSink::EVENT_CAPACITY {
+            sink.emit(serde_json::json!({"type":"tool_start","index":index}))
+                .await;
+        }
+        assert_eq!(events.len(), EventSink::EVENT_CAPACITY);
+        let terminal = sink.emit(serde_json::json!({"type":"complete"}));
+        tokio::pin!(terminal);
+        assert!(futures_util::poll!(&mut terminal).is_pending());
+
+        // Admission control has its own bounded lane even while event
+        // production is parked at capacity.
+        let confirmation = SessionMessageAdmissionConfirmation {
+            target_session_id: "bounded-child".into(),
+            envelope_id: "message".into(),
+            canonical_claim_generation: 1,
+            activation_run_id: "activation".into(),
+        };
+        sink.confirm_session_message(confirmation.clone()).await;
+        assert_eq!(
+            controls.recv().await.unwrap(),
+            ExecutorControl::SessionMessageAdmitted(confirmation)
+        );
+        assert_eq!(events.recv().await.unwrap()["index"], 0);
+        terminal.await;
+        for index in 1..EventSink::EVENT_CAPACITY {
+            assert_eq!(events.recv().await.unwrap()["index"], index);
+        }
+        assert_eq!(events.recv().await.unwrap()["type"], "complete");
+    }
 
     #[test]
     fn echo_explicitly_opts_into_high_parallelism() {
