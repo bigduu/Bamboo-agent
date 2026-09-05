@@ -196,6 +196,14 @@ async fn build_test_harness_with_options(
     subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
     workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
 ) -> TestHarness {
+    build_test_harness_with_storage(subagent_model_resolver, workspace_resolver, false).await
+}
+
+async fn build_test_harness_with_storage(
+    subagent_model_resolver: crate::tools::OptionalSubagentModelResolver,
+    workspace_resolver: Option<bamboo_agent_core::workspace_state::WorkspaceResolver>,
+    use_v2_storage: bool,
+) -> TestHarness {
     let bamboo_home = make_temp_dir("bamboo-sub-agent-test");
     tokio::fs::create_dir_all(&bamboo_home).await.unwrap();
     let workspace_path = bamboo_home.join("workspace");
@@ -205,11 +213,15 @@ async fn build_test_harness_with_options(
     let session_store = Arc::new(SessionStoreV2::new(bamboo_home.clone()).await.unwrap());
     let project_store =
         Arc::new(bamboo_projects::ProjectStore::open(&bamboo_home).expect("Project store"));
-    let storage_dir = bamboo_home.join("storage");
-    tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-    let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
-    jsonl.init().await.unwrap();
-    let storage: Arc<dyn Storage> = Arc::new(jsonl);
+    let storage: Arc<dyn Storage> = if use_v2_storage {
+        session_store.clone()
+    } else {
+        let storage_dir = bamboo_home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        Arc::new(jsonl)
+    };
     let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
 
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
@@ -436,6 +448,86 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
     assert!(
         published.is_dir(),
         "the same instance resolver that validated the relocated target must materialize it"
+    );
+}
+
+#[tokio::test]
+async fn supervisor_common_child_constructor_keeps_ordinary_identity_for_all_role_labels() {
+    let harness = build_test_harness().await;
+    let store = &harness.adapter.session_store;
+    let receipt = store
+        .get_or_create_default_supervisor("test-model")
+        .await
+        .unwrap();
+    let root = store
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut nested_parent: Option<Session> = None;
+    // This matrix exercises common child construction, including cosmetic role
+    // labels; it does not invoke the separate GuardianSpawner entry point.
+    for (role, lifecycle, name) in [
+        ("worker", None, None),
+        ("resident", Some("resident"), Some("authority-resident")),
+        ("guardian", None, None),
+        ("nested", None, None),
+    ] {
+        let parent = if role == "nested" {
+            nested_parent.clone().unwrap()
+        } else {
+            root.clone()
+        };
+        let child_id = format!("ordinary-{role}-{}", Uuid::new_v4());
+        child_session::create_child_action(
+            harness.adapter.as_ref(),
+            child_session::CreateChildInput {
+                parent_session: parent,
+                child_id: child_id.clone(),
+                title: role.into(),
+                responsibility: "Inspect".into(),
+                assignment_prompt: "Inspect".into(),
+                subagent_type: role.into(),
+                workspace: harness.workspace_path.to_string_lossy().into_owned(),
+                workspace_source: bamboo_engine::project_context::WorkspaceSource::Explicit,
+                model_override: None,
+                model_ref_override: None,
+                runtime_metadata: HashMap::from([
+                    ("authority_identity".into(), "supervisor".into()),
+                    ("role".into(), "supervisor".into()),
+                ]),
+                auto_run: false,
+                reasoning_effort: None,
+                lifecycle: lifecycle.map(str::to_string),
+                resident_name: name.map(str::to_string),
+                resident_context: None,
+                disabled_tools: None,
+                context_fork: None,
+            },
+        )
+        .await
+        .unwrap();
+        let child = harness
+            .storage
+            .load_session(&child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(child.authority_identity.is_ordinary(), "{role}");
+        assert_eq!(child.root_session_id, receipt.session_id);
+        assert_eq!(child.project_id_meta(), root.project_id_meta());
+        if role == "worker" {
+            nested_parent = Some(child);
+        }
+    }
+    assert_eq!(
+        store
+            .load_root_authority(&receipt.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority_identity,
+        root.authority_identity
     );
 }
 
@@ -1167,6 +1259,107 @@ async fn create_uses_async_subagent_model_resolver() {
 }
 
 #[tokio::test]
+async fn supervisor_resident_reset_and_accumulate_stay_ordinary_in_canonical_v2() {
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let canonical: Arc<dyn Storage> = harness.adapter.session_store.clone();
+    assert!(Arc::ptr_eq(&harness.storage, &canonical));
+    let receipt = harness
+        .storage
+        .get_or_create_default_supervisor("gpt-5")
+        .await
+        .unwrap();
+    let expected_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+        incarnation_id: receipt.incarnation_id,
+    };
+    assert_eq!(
+        harness
+            .storage
+            .load_session(&receipt.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority_identity,
+        expected_identity
+    );
+
+    let first_brief = "First Supervisor resident assignment";
+    let reset_brief = "Replacement Supervisor resident assignment";
+    let accumulated_brief = "Additional Supervisor resident assignment";
+    let mut resident_id = None;
+    for (step, context, brief) in [
+        (0, "reset", first_brief),
+        (1, "reset", reset_brief),
+        (2, "accumulate", accumulated_brief),
+    ] {
+        let result = invoke_completed(
+            &harness.tool,
+            json!({
+                "action": "create",
+                "lifecycle": "resident",
+                "name": "supervisor-resident",
+                "context": context,
+                "title": format!("Supervisor resident task {step}"),
+                "responsibility": "Inspect one bounded task",
+                "prompt": brief,
+                "workspace": harness.workspace_path.to_string_lossy(),
+                "auto_run": false
+            }),
+            subagent_test_ctx(&receipt.session_id, &format!("supervisor-resident-{step}")),
+        )
+        .await
+        .expect("real SubAgent create or reuse must succeed");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let id = payload["child_session_id"].as_str().unwrap().to_string();
+        assert_eq!(payload["reused"], json!(step != 0));
+        if let Some(previous_id) = resident_id.as_ref() {
+            assert_eq!(
+                &id, previous_id,
+                "reset and accumulate must reuse the resident"
+            );
+        } else {
+            resident_id = Some(id.clone());
+        }
+        // No manual index mirroring: the production V2 save must make the
+        // resident discoverable by the next real SubAgent invocation.
+        let child = harness.storage.load_session(&id).await.unwrap().unwrap();
+        assert!(child.authority_identity.is_ordinary(), "step {step}");
+        assert_eq!(
+            child.parent_session_id.as_deref(),
+            Some(receipt.session_id.as_str())
+        );
+        assert_eq!(child.root_session_id, receipt.session_id);
+        assert!(child.messages.last().unwrap().content.contains(brief));
+        if step > 0 {
+            assert!(!child
+                .messages
+                .iter()
+                .any(|message| message.content.contains(first_brief)));
+            assert_eq!(
+                child.metadata.get("assignment_prompt").map(String::as_str),
+                Some(reset_brief)
+            );
+        }
+        if step == 2 {
+            assert!(child
+                .messages
+                .iter()
+                .any(|message| message.content.contains(reset_brief)));
+        }
+        assert_eq!(
+            harness
+                .storage
+                .load_root_authority(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authority_identity,
+            expected_identity,
+            "resident provisioning must preserve the parent incarnation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn resident_create_reuses_same_child_session() {
     let harness = build_test_harness().await;
     let workspace = tempfile::tempdir().expect("workspace");
@@ -1249,6 +1442,7 @@ async fn resident_create_reuses_same_child_session() {
         .await
         .unwrap()
         .expect("child exists");
+    assert!(child.authority_identity.is_ordinary());
     assert_eq!(
         child.metadata.get("lifecycle").map(String::as_str),
         Some("resident")

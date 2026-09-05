@@ -674,6 +674,55 @@ mod optional_model_e2e {
         web::Data::new(app_state)
     }
 
+    #[actix_web::test]
+    async fn implicit_chat_at_reserved_id_is_ordinary_and_blocks_supervisor_bootstrap() {
+        let provider = BlockingTitleProvider::new();
+        provider.release.add_permits(1);
+        let state = title_test_state(provider).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let id = bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .set_json(serde_json::json!({
+                    "session_id":id,"message":"ordinary chat","model":"chat-model",
+                    "authority_identity":{"kind":"supervisor","incarnation_id":uuid::Uuid::new_v4()}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(persisted.authority_identity.is_ordinary());
+        assert!(persisted
+            .messages
+            .iter()
+            .any(|m| m.content == "ordinary chat"));
+        assert_eq!(
+            state
+                .storage
+                .get_or_create_default_supervisor("initial-model")
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(state
+            .storage
+            .load_session(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .authority_identity
+            .is_ordinary());
+    }
+
     /// #793: a durable user message is the trigger. No `/execute` request is
     /// made, and a second message while the provider is blocked must not start
     /// duplicate title work.

@@ -620,13 +620,18 @@ impl ChildCompletionCoordinator {
     }
 
     async fn save_and_cache(&self, session: &mut Session) {
-        if let Err(error) = self.persistence.merge_save_runtime(session).await {
+        if let Err(error) = self
+            .persistence
+            .merge_save_runtime_and_publish(session, |saved, _| {
+                self.sessions.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+        {
             tracing::warn!(session_id = %session.id, %error, "failed to persist session");
         }
-        self.sessions.insert(
-            session.id.clone(),
-            Arc::new(crate::SessionSnapshot::new(session.clone())),
-        );
     }
 }
 
@@ -3023,6 +3028,53 @@ mod tests {
             None,
         ));
         (temp, store, inbox, coordinator, reservations, launches)
+    }
+
+    #[tokio::test]
+    async fn supervisor_resume_rejects_old_incarnation_without_replacing_cache() {
+        let (_temp, store, _inbox, coordinator, _reservations, _launches) =
+            completion_inbox_fixture().await;
+        let original = store
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap();
+        let mut stale = store
+            .load_session(&original.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        store.delete_session(&original.session_id).await.unwrap();
+        let recreated = store
+            .get_or_create_default_supervisor("replacement")
+            .await
+            .unwrap();
+        assert_ne!(original.incarnation_id, recreated.incarnation_id);
+        let mut current = store
+            .load_session(&recreated.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.save_and_cache(&mut current).await;
+        let cached = coordinator
+            .sessions
+            .get(&current.id)
+            .unwrap()
+            .value()
+            .clone();
+        coordinator.save_and_cache(&mut stale).await;
+        assert!(Arc::ptr_eq(
+            &cached,
+            coordinator.sessions.get(&current.id).unwrap().value()
+        ));
+        assert_eq!(
+            store
+                .load_session(&current.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .authority_identity,
+            current.authority_identity
+        );
     }
 
     // ── child-wait watchdog pure helpers (issue #546) ────────────────────

@@ -969,7 +969,13 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Save session via merge-save so any concurrent UI edits to
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
-            if let Err(error) = agent.persistence().save_runtime_session(&mut session).await {
+            let saved = agent.persistence().save_runtime_session(&mut session).await;
+            let authority_conflict = saved.as_ref().err().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+            });
+            if let Err(error) = saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
 
@@ -1012,11 +1018,14 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             let child_status = session.last_run_status();
             let child_error = session.last_run_error();
 
-            // Update memory cache.
-            sessions_cache.insert(
-                session_id.clone(),
-                Arc::new(crate::SessionSnapshot::new(session)),
-            );
+            // Preserve normal I/O failure behavior, but never overwrite a
+            // current Root's cache with a rejected authority/incarnation.
+            if !authority_conflict {
+                sessions_cache.insert(
+                    session_id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(session)),
+                );
+            }
 
             if let (Some(handler), Some(parent_session_id), Some(status)) =
                 (child_completion, parent_session_id, child_status)

@@ -857,6 +857,47 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn ordinary_create_and_real_title_patch_cannot_forge_supervisor_identity() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let forged = serde_json::json!({"kind":"supervisor","incarnation_id":uuid::Uuid::new_v4()});
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({"title":"Ordinary", "authority_identity":forged}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(response).await;
+        let id = body["session"]["id"].as_str().unwrap();
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        assert!(before.authority_identity.is_ordinary());
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{id}"))
+                .insert_header((header::IF_MATCH, format!("\"{}\"", before.metadata_version)))
+                .set_json(
+                    serde_json::json!({"title":"Really patched", "authority_identity":forged}),
+                )
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(persisted.title, "Really patched");
+        assert!(persisted.metadata_version > before.metadata_version);
+        assert!(persisted.authority_identity.is_ordinary());
+    }
+
+    #[actix_web::test]
     async fn permission_mode_auto_persists_and_is_indexed_distinctly() {
         let state = new_state().await;
         let app = test::init_service(
