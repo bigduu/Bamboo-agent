@@ -15,6 +15,18 @@ use bamboo_subagent::proto::{RunSpec, TerminalStatus};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+fn collect_events(
+    mut receiver: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) -> tokio_util::task::AbortOnDropHandle<Vec<serde_json::Value>> {
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        events
+    }))
+}
+
 #[tokio::test]
 #[ignore = "requires an installed Codex CLI >= 0.144 on PATH"]
 async fn real_codex_discovery_reports_path_version_and_actionable_missing_error() {
@@ -67,7 +79,8 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
     )
     .await
     .expect("Codex preflight succeeds");
-    let (sink, mut rx) = EventSink::channel();
+    let (sink, rx) = EventSink::channel();
+    let rx = collect_events(rx);
     let outcome = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(
@@ -95,7 +108,7 @@ async fn real_codex_completes_trivial_turn_and_reports_bootstrap_metadata() {
     assert_eq!(outcome.result.as_deref().map(str::trim), Some("PONG"));
     let mut bootstrap = None;
     let mut usage = None;
-    while let Ok(event) = rx.try_recv() {
+    for event in rx.await.unwrap() {
         println!("EVENT: {event}");
         if event["executor"] == "codex" {
             bootstrap = Some(event);
@@ -172,7 +185,8 @@ async fn real_workspace_write_denies_outside_write_and_emits_tool_error() {
     )
     .await
     .expect("Codex preflight succeeds");
-    let (sink, mut receiver) = EventSink::channel();
+    let (sink, receiver) = EventSink::channel();
+    let receiver = collect_events(receiver);
     let outcome = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(
@@ -209,7 +223,7 @@ async fn real_workspace_write_denies_outside_write_and_emits_tool_error() {
         "sandbox allowed an outside-workspace write"
     );
 
-    let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+    let events = receiver.await.unwrap();
     assert!(
         events.iter().any(|event| event["type"] == "tool_error"),
         "outside denial was not surfaced as a tool error: {events:?}"
@@ -251,7 +265,8 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
     .await
     .expect("Codex preflight succeeds");
 
-    let (sink, _events) = EventSink::channel();
+    let (sink, unused_events) = EventSink::channel();
+    drop(unused_events);
     let first = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(
@@ -287,7 +302,8 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
         .is_some_and(|thread_id| !thread_id.is_empty()));
 
     let current_task = "What exact nonce did I ask you to remember? Reply with that nonce only.";
-    let (sink, mut events) = EventSink::channel();
+    let (sink, events) = EventSink::channel();
+    let events = collect_events(events);
     let second = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(
@@ -316,7 +332,7 @@ async fn real_codex_second_activation_resumes_and_recalls_native_context() {
     assert_eq!(second.status, TerminalStatus::Completed, "{second:?}");
     assert_eq!(second.result.as_deref().map(str::trim), Some(NONCE));
 
-    let emitted = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+    let emitted = events.await.unwrap();
     assert!(
         !emitted
             .iter()
@@ -367,7 +383,8 @@ async fn real_cancellation_kills_the_process_group_and_the_session_can_resume() 
     let pid_file = workspace.path().join("cancel-child.pid");
     let cancel = CancellationToken::new();
     let cancel_for_run = cancel.clone();
-    let (sink, _events) = EventSink::channel();
+    let (sink, unused_events) = EventSink::channel();
+    drop(unused_events);
     let first = executor.run(
         RunSpec {
             assignment: "Run this exact command now and wait for it to finish: /bin/sh -c 'echo $$ > ./cancel-child.pid; sleep 120'".to_string(),
@@ -429,7 +446,8 @@ async fn real_cancellation_kills_the_process_group_and_the_session_can_resume() 
     );
 
     let assignment = "Reply with exactly RECOVERED and nothing else.";
-    let (sink, _events) = EventSink::channel();
+    let (sink, unused_events) = EventSink::channel();
+    drop(unused_events);
     let resumed = tokio::time::timeout(
         Duration::from_secs(180),
         executor.run(

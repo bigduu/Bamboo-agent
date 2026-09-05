@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use bamboo_agent_core::{AgentEvent, TokenUsage, ToolResult};
 use bamboo_subagent::codex_discovery::discover_codex_cli;
@@ -1042,7 +1043,7 @@ impl CodexExecutor {
         }
     }
 
-    fn handle_event(
+    async fn handle_event(
         &self,
         value: Value,
         policy: &EffectiveCodexPolicy,
@@ -1061,35 +1062,39 @@ impl CodexExecutor {
                 if !state.thread_id.is_empty() {
                     captured_thread_id = Some(state.thread_id.clone());
                 }
-                events.emit(json!({
-                    "type": "runner_progress",
-                    "session_id": state.thread_id,
-                    "round_count": 0,
-                    "executor": "codex",
-                    "binary": self.binary,
-                    "version": self.version,
-                    "model": self.model,
-                    "auth_mode": self.auth.mode().as_str(),
-                    "codex_home_mode": self.codex_home_mode(),
-                    "forward_env": self.forward_env,
-                    "sandbox": policy.sandbox.as_str(),
-                    "approval_policy": policy.approval_policy.as_str(),
-                    "network_access": policy.network_access,
-                    "policy_invocation": policy.invocation.as_str(),
-                    "permission_profile": self.permissions.permission_profile.as_deref(),
-                }));
+                events
+                    .emit(json!({
+                        "type": "runner_progress",
+                        "session_id": state.thread_id,
+                        "round_count": 0,
+                        "executor": "codex",
+                        "binary": self.binary,
+                        "version": self.version,
+                        "model": self.model,
+                        "auth_mode": self.auth.mode().as_str(),
+                        "codex_home_mode": self.codex_home_mode(),
+                        "forward_env": self.forward_env,
+                        "sandbox": policy.sandbox.as_str(),
+                        "approval_policy": policy.approval_policy.as_str(),
+                        "network_access": policy.network_access,
+                        "policy_invocation": policy.invocation.as_str(),
+                        "permission_profile": self.permissions.permission_profile.as_deref(),
+                    }))
+                    .await;
             }
             "turn.started" => {
                 state.turn_started = true;
-                events.emit(event_json(AgentEvent::RunnerProgress {
-                    session_id: state.session_id(),
-                    round_count: 1,
-                }));
+                events
+                    .emit(event_json(AgentEvent::RunnerProgress {
+                        session_id: state.session_id(),
+                        round_count: 1,
+                    }))
+                    .await;
             }
             "item.started" | "item.updated" | "item.completed" => {
                 let phase = event_type.trim_start_matches("item.");
                 if let Some(item) = value.get("item") {
-                    handle_item(phase, item, events, state);
+                    handle_item(phase, item, events, state).await;
                     // Codex CLI 0.144 can omit the command_execution item when
                     // the OS sandbox itself rejects the command, even though
                     // it reports the exit status and errno to the model. Keep
@@ -1111,10 +1116,12 @@ impl CodexExecutor {
                         let error = item.get("text").and_then(Value::as_str).unwrap_or(
                             "Codex reported that the OS sandbox denied a tool operation",
                         );
-                        events.emit(event_json(AgentEvent::ToolError {
-                            tool_call_id: format!("{item_id}-sandbox-denial"),
-                            error: truncate_chars(error, TOOL_RESULT_TRUNCATE_CHARS),
-                        }));
+                        events
+                            .emit(event_json(AgentEvent::ToolError {
+                                tool_call_id: format!("{item_id}-sandbox-denial"),
+                                error: truncate_chars(error, TOOL_RESULT_TRUNCATE_CHARS),
+                            }))
+                            .await;
                         state.tool_error_emitted = true;
                     }
                 }
@@ -1125,17 +1132,19 @@ impl CodexExecutor {
                 if let Some(text) = final_text_from_terminal(&value) {
                     state.last_agent_message = text;
                 }
-                events.emit(event_json(AgentEvent::Complete { usage: state.usage }));
+                events
+                    .emit(event_json(AgentEvent::Complete { usage: state.usage }))
+                    .await;
             }
             "turn.failed" => {
                 let message = error_message(&value, "Codex turn failed");
                 state.failure = Some(message.clone());
-                events.emit(event_json(AgentEvent::Error { message }));
+                events.emit(event_json(AgentEvent::Error { message })).await;
             }
             "error" => {
                 let message = error_message(&value, "Codex CLI error");
                 state.failure = Some(message.clone());
-                events.emit(event_json(AgentEvent::Error { message }));
+                events.emit(event_json(AgentEvent::Error { message })).await;
             }
             other => {
                 tracing::debug!(event_type = other, "codex: unrecognized JSONL event");
@@ -1163,7 +1172,8 @@ impl CodexExecutor {
         let policy = self
             .permissions
             .effective_for_session(permission, running_as_root());
-        self.emit_policy_bootstrap(&policy, permission, events);
+        self.emit_policy_bootstrap(&policy, permission, events)
+            .await;
         // Warm workers reuse this executor across activations. Reassert the
         // isolated-home invariant at every run boundary so a prior Codex
         // process cannot leave an auth artifact or mutate provider routing for
@@ -1181,7 +1191,7 @@ impl CodexExecutor {
         })
         .await
         {
-            Ok(child) => child,
+            Ok(child) => ProcessTreeChild::new(child),
             Err(error) => {
                 return (
                     ChildOutcome::error(format!(
@@ -1212,7 +1222,7 @@ impl CodexExecutor {
                 terminate_child(&mut child).await;
                 events.emit(event_json(AgentEvent::Cancelled {
                     message: Some("Codex child cancelled".to_string()),
-                }));
+                })).await;
                 return (ChildOutcome::cancelled(), false);
             }
         };
@@ -1228,7 +1238,9 @@ impl CodexExecutor {
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let stderr_task = stderr.map(|stderr| {
             let tail = stderr_tail.clone();
-            tokio::spawn(async move { drain_stderr_tail(stderr, tail).await })
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                drain_stderr_tail(stderr, tail).await
+            }))
         });
 
         let mut reader = BufReader::with_capacity(64 * 1024, stdout);
@@ -1255,7 +1267,7 @@ impl CodexExecutor {
                                         &policy,
                                         events,
                                         &mut state,
-                                    ) {
+                                    ).await {
                                         self.write_session_state(&thread_id).await;
                                     }
                                 }
@@ -1285,14 +1297,18 @@ impl CodexExecutor {
             }
         };
         if let Some(task) = stderr_task {
-            let _ = task.await;
+            // A surviving tool may still hold stderr open after the leader
+            // exits. Do not let its pipe prevent the process owner from dropping.
+            let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
         }
         let stderr = stderr_tail.lock().await.clone();
 
         if cancelled {
-            events.emit(event_json(AgentEvent::Cancelled {
-                message: Some("Codex child cancelled".to_string()),
-            }));
+            events
+                .emit(event_json(AgentEvent::Cancelled {
+                    message: Some("Codex child cancelled".to_string()),
+                }))
+                .await;
             return (ChildOutcome::cancelled(), false);
         }
 
@@ -1334,7 +1350,7 @@ impl CodexExecutor {
         (outcome, exited_without_turn)
     }
 
-    fn emit_policy_bootstrap(
+    async fn emit_policy_bootstrap(
         &self,
         policy: &EffectiveCodexPolicy,
         permission: bamboo_domain::PermissionModeResolution,
@@ -1344,42 +1360,46 @@ impl CodexExecutor {
             "codex_exec:approval_policy={}",
             policy.approval_policy.as_str()
         );
-        events.emit(json!({
-            "type": "runner_progress",
-            "session_id": "codex",
-            "round_count": 0,
-            "executor": "codex",
-            "phase": "bootstrap",
-            "binary": self.binary,
-            "version": self.version,
-            "model": self.model,
-            "auth_mode": self.auth.mode().as_str(),
-            "codex_home_mode": self.codex_home_mode(),
-            "forward_env": self.forward_env,
-            "sandbox": policy.sandbox.as_str(),
-            "approval_policy": policy.approval_policy.as_str(),
-            "network_access": policy.network_access,
-            "policy_invocation": policy.invocation.as_str(),
-            "permission_profile": self.permissions.permission_profile.as_deref(),
-            "requested_mode": permission.requested.as_str(),
-            "effective_mode": permission.effective.as_str(),
-            "executor_mapping": executor_mapping,
-        }));
-        for warning in &policy.warnings {
-            tracing::warn!(message = %warning, "Codex spawn policy warning");
-            events.emit(json!({
+        events
+            .emit(json!({
                 "type": "runner_progress",
                 "session_id": "codex",
                 "round_count": 0,
                 "executor": "codex",
-                "phase": "policy_warning",
-                "level": "warning",
-                "message": warning,
+                "phase": "bootstrap",
+                "binary": self.binary,
+                "version": self.version,
+                "model": self.model,
+                "auth_mode": self.auth.mode().as_str(),
+                "codex_home_mode": self.codex_home_mode(),
+                "forward_env": self.forward_env,
                 "sandbox": policy.sandbox.as_str(),
                 "approval_policy": policy.approval_policy.as_str(),
                 "network_access": policy.network_access,
                 "policy_invocation": policy.invocation.as_str(),
-            }));
+                "permission_profile": self.permissions.permission_profile.as_deref(),
+                "requested_mode": permission.requested.as_str(),
+                "effective_mode": permission.effective.as_str(),
+                "executor_mapping": executor_mapping,
+            }))
+            .await;
+        for warning in &policy.warnings {
+            tracing::warn!(message = %warning, "Codex spawn policy warning");
+            events
+                .emit(json!({
+                    "type": "runner_progress",
+                    "session_id": "codex",
+                    "round_count": 0,
+                    "executor": "codex",
+                    "phase": "policy_warning",
+                    "level": "warning",
+                    "message": warning,
+                    "sandbox": policy.sandbox.as_str(),
+                    "approval_policy": policy.approval_policy.as_str(),
+                    "network_access": policy.network_access,
+                    "policy_invocation": policy.invocation.as_str(),
+                }))
+                .await;
         }
     }
 }
@@ -1413,44 +1433,54 @@ impl ChildExecutor for CodexExecutor {
         {
             Ok(activation) => activation,
             Err(error) => {
-                events.emit(event_json(AgentEvent::Error {
-                    message: error.clone(),
-                }));
+                events
+                    .emit(event_json(AgentEvent::Error {
+                        message: error.clone(),
+                    }))
+                    .await;
                 return ChildOutcome::error(error);
             }
         };
         if let Some(reason) = activation.explicit_deny_reason.as_ref() {
             let message =
                 format!("Codex exec cannot safely enforce Bamboo explicit-deny policy: {reason}");
-            events.emit(event_json(AgentEvent::PermissionPostureActivated {
-                session_id: logical_session_id,
-                policy_revision: activation.policy_revision,
-                requested_mode: activation.resolution.requested.as_str().to_string(),
-                effective_mode: activation.resolution.effective.as_str().to_string(),
-                executor_mapping: "codex_exec:blocked_explicit_deny".to_string(),
-            }));
-            events.emit(event_json(AgentEvent::Error {
-                message: message.clone(),
-            }));
+            events
+                .emit(event_json(AgentEvent::PermissionPostureActivated {
+                    session_id: logical_session_id,
+                    policy_revision: activation.policy_revision,
+                    requested_mode: activation.resolution.requested.as_str().to_string(),
+                    effective_mode: activation.resolution.effective.as_str().to_string(),
+                    executor_mapping: "codex_exec:blocked_explicit_deny".to_string(),
+                }))
+                .await;
+            events
+                .emit(event_json(AgentEvent::Error {
+                    message: message.clone(),
+                }))
+                .await;
             return ChildOutcome::error(message);
         }
         let bootstrap_policy = self
             .permissions
             .effective_for_session(activation.resolution, running_as_root());
-        events.emit(event_json(AgentEvent::PermissionPostureActivated {
-            session_id: logical_session_id,
-            policy_revision: activation.policy_revision,
-            requested_mode: activation.resolution.requested.as_str().to_string(),
-            effective_mode: activation.resolution.effective.as_str().to_string(),
-            executor_mapping: format!(
-                "codex_exec:approval_policy={}",
-                bootstrap_policy.approval_policy.as_str()
-            ),
-        }));
+        events
+            .emit(event_json(AgentEvent::PermissionPostureActivated {
+                session_id: logical_session_id,
+                policy_revision: activation.policy_revision,
+                requested_mode: activation.resolution.requested.as_str().to_string(),
+                effective_mode: activation.resolution.effective.as_str().to_string(),
+                executor_mapping: format!(
+                    "codex_exec:approval_policy={}",
+                    bootstrap_policy.approval_policy.as_str()
+                ),
+            }))
+            .await;
 
         // `codex exec` v1 has no mid-turn steering channel. Drain the inbox so
         // transport senders cannot build an unbounded backlog.
-        let steer_drain = tokio::spawn(async move { while steer.recv().await.is_some() {} });
+        let steer_drain = AbortOnDropHandle::new(tokio::spawn(async move {
+            while steer.recv().await.is_some() {}
+        }));
         if spec.messages.is_empty() {
             self.delete_session_state().await;
         }
@@ -1490,7 +1520,7 @@ impl ChildExecutor for CodexExecutor {
                 "executor": "codex",
                 "phase": "resume_fallback",
                 "message": "resume failed before turn progress; retrying once with rehydrated history",
-            }));
+            })).await;
             self.delete_session_state().await;
             let fallback_body = build_rehydrated_turn(&spec.messages, &spec.assignment);
             self.run_process(
@@ -1535,7 +1565,7 @@ impl RunState {
     }
 }
 
-fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunState) {
+async fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunState) {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     let item_id = item
         .get("id")
@@ -1553,7 +1583,8 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 &mut state.item_text,
                 |delta| AgentEvent::Token { content: delta },
                 events,
-            );
+            )
+            .await;
             if phase == "completed" && !text.is_empty() {
                 state.last_agent_message = text.to_string();
             }
@@ -1566,7 +1597,8 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 &mut state.item_text,
                 |delta| AgentEvent::ReasoningToken { content: delta },
                 events,
-            );
+            )
+            .await;
         }
         "command_execution" => {
             ensure_tool_started(
@@ -1575,34 +1607,39 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 json!({ "command": item.get("command").cloned().unwrap_or(Value::Null) }),
                 events,
                 state,
-            );
+            )
+            .await;
             let output = item
                 .get("aggregated_output")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            emit_tool_output_delta(&item_id, output, events, state);
+            emit_tool_output_delta(&item_id, output, events, state).await;
             if phase == "completed" {
                 let exit_code = item.get("exit_code").and_then(Value::as_i64);
                 let successful = exit_code == Some(0)
                     && item.get("status").and_then(Value::as_str) != Some("failed");
                 if successful {
-                    events.emit(event_json(AgentEvent::ToolComplete {
-                        tool_call_id: item_id,
-                        result: ToolResult::text(
-                            true,
-                            truncate_chars(output, TOOL_RESULT_TRUNCATE_CHARS),
-                        ),
-                    }));
+                    events
+                        .emit(event_json(AgentEvent::ToolComplete {
+                            tool_call_id: item_id,
+                            result: ToolResult::text(
+                                true,
+                                truncate_chars(output, TOOL_RESULT_TRUNCATE_CHARS),
+                            ),
+                        }))
+                        .await;
                 } else {
                     let error = if output.trim().is_empty() {
                         format!("command failed with exit code {exit_code:?}")
                     } else {
                         truncate_chars(output, TOOL_RESULT_TRUNCATE_CHARS)
                     };
-                    events.emit(event_json(AgentEvent::ToolError {
-                        tool_call_id: item_id,
-                        error,
-                    }));
+                    events
+                        .emit(event_json(AgentEvent::ToolError {
+                            tool_call_id: item_id,
+                            error,
+                        }))
+                        .await;
                     state.tool_error_emitted = true;
                 }
             }
@@ -1619,9 +1656,10 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 json!({ "changes": detail }),
                 events,
                 state,
-            );
+            )
+            .await;
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events, state);
+                complete_structured_tool(&item_id, item, events, state).await;
             }
         }
         "mcp_tool_call" => {
@@ -1637,9 +1675,9 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 .or_else(|| item.get("input"))
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            ensure_tool_started(&item_id, &tool_name, arguments, events, state);
+            ensure_tool_started(&item_id, &tool_name, arguments, events, state).await;
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events, state);
+                complete_structured_tool(&item_id, item, events, state).await;
             }
         }
         "web_search" => {
@@ -1650,19 +1688,22 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
                 json!({ "query": query }),
                 events,
                 state,
-            );
+            )
+            .await;
             if phase == "completed" {
-                complete_structured_tool(&item_id, item, events, state);
+                complete_structured_tool(&item_id, item, events, state).await;
             }
         }
         "todo_list" => {
-            events.emit(json!({
-                "type": "runner_progress",
-                "session_id": state.session_id(),
-                "round_count": 1,
-                "codex_item_type": "todo_list",
-                "item": item,
-            }));
+            events
+                .emit(json!({
+                    "type": "runner_progress",
+                    "session_id": state.session_id(),
+                    "round_count": 1,
+                    "codex_item_type": "todo_list",
+                    "item": item,
+                }))
+                .await;
         }
         other => {
             tracing::debug!(item_type = other, phase, "codex: unrecognized item type");
@@ -1670,7 +1711,7 @@ fn handle_item(phase: &str, item: &Value, events: &EventSink, state: &mut RunSta
     }
 }
 
-fn ensure_tool_started(
+async fn ensure_tool_started(
     item_id: &str,
     tool_name: &str,
     arguments: Value,
@@ -1678,15 +1719,22 @@ fn ensure_tool_started(
     state: &mut RunState,
 ) {
     if state.started_items.insert(item_id.to_string()) {
-        events.emit(event_json(AgentEvent::ToolStart {
-            tool_call_id: item_id.to_string(),
-            tool_name: tool_name.to_string(),
-            arguments,
-        }));
+        events
+            .emit(event_json(AgentEvent::ToolStart {
+                tool_call_id: item_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments,
+            }))
+            .await;
     }
 }
 
-fn emit_tool_output_delta(item_id: &str, output: &str, events: &EventSink, state: &mut RunState) {
+async fn emit_tool_output_delta(
+    item_id: &str,
+    output: &str,
+    events: &EventSink,
+    state: &mut RunState,
+) {
     let previous = state.item_output.entry(item_id.to_string()).or_default();
     let delta = if output.starts_with(previous.as_str()) {
         &output[previous.len()..]
@@ -1694,20 +1742,29 @@ fn emit_tool_output_delta(item_id: &str, output: &str, events: &EventSink, state
         output
     };
     if !delta.is_empty() {
-        events.emit(event_json(AgentEvent::ToolToken {
-            tool_call_id: item_id.to_string(),
-            content: delta.to_string(),
-        }));
+        events
+            .emit(event_json(AgentEvent::ToolToken {
+                tool_call_id: item_id.to_string(),
+                content: delta.to_string(),
+            }))
+            .await;
     }
     *previous = output.to_string();
 }
 
-fn complete_structured_tool(item_id: &str, item: &Value, events: &EventSink, state: &mut RunState) {
+async fn complete_structured_tool(
+    item_id: &str,
+    item: &Value,
+    events: &EventSink,
+    state: &mut RunState,
+) {
     if let Some(error) = item.get("error").filter(|value| !value.is_null()) {
-        events.emit(event_json(AgentEvent::ToolError {
-            tool_call_id: item_id.to_string(),
-            error: value_text(error),
-        }));
+        events
+            .emit(event_json(AgentEvent::ToolError {
+                tool_call_id: item_id.to_string(),
+                error: value_text(error),
+            }))
+            .await;
         state.tool_error_emitted = true;
         return;
     }
@@ -1716,13 +1773,15 @@ fn complete_structured_tool(item_id: &str, item: &Value, events: &EventSink, sta
         .or_else(|| item.get("output"))
         .cloned()
         .unwrap_or_else(|| item.clone());
-    events.emit(event_json(AgentEvent::ToolComplete {
-        tool_call_id: item_id.to_string(),
-        result: ToolResult::text(
-            true,
-            truncate_chars(&value_text(&result), TOOL_RESULT_TRUNCATE_CHARS),
-        ),
-    }));
+    events
+        .emit(event_json(AgentEvent::ToolComplete {
+            tool_call_id: item_id.to_string(),
+            result: ToolResult::text(
+                true,
+                truncate_chars(&value_text(&result), TOOL_RESULT_TRUNCATE_CHARS),
+            ),
+        }))
+        .await;
 }
 
 fn looks_like_sandbox_denial(text: &str) -> bool {
@@ -1737,7 +1796,7 @@ fn looks_like_sandbox_denial(text: &str) -> bool {
     denied && operation
 }
 
-fn emit_text_delta<F>(
+async fn emit_text_delta<F>(
     item_id: &str,
     text: &str,
     seen: &mut HashMap<String, String>,
@@ -1753,7 +1812,7 @@ fn emit_text_delta<F>(
         text
     };
     if !delta.is_empty() {
-        events.emit(event_json(build(delta.to_string())));
+        events.emit(event_json(build(delta.to_string()))).await;
     }
     *previous = text.to_string();
 }
@@ -1910,6 +1969,64 @@ fn validate_codex_forward_env(mode: CodexAuthMode, names: &[String]) -> Result<(
     Ok(())
 }
 
+/// Owns a CLI process and its process group for the entire activation. Async
+/// TERM/KILL cleanup may itself be dropped by the transport cancellation bound;
+/// the fallback must therefore live in the owner, not only in that future.
+/// Commands wrapped here must be spawned with `process_group(0)` on Unix.
+pub(crate) struct ProcessTreeChild {
+    child: Child,
+    #[cfg(unix)]
+    pgid: Option<libc::pid_t>,
+    #[cfg(unix)]
+    terminating_descendants: Vec<libc::pid_t>,
+}
+
+impl ProcessTreeChild {
+    pub(crate) fn new(child: Child) -> Self {
+        Self {
+            #[cfg(unix)]
+            pgid: child.id().map(|pid| pid as libc::pid_t),
+            child,
+            #[cfg(unix)]
+            terminating_descendants: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for ProcessTreeChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for ProcessTreeChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for ProcessTreeChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // Capture descendants before killing the leader, including tools
+            // that created their own group. Retain the earlier TERM snapshot:
+            // those processes may already have been reparented during shutdown.
+            if self.child.id().is_some() {
+                self.terminating_descendants
+                    .extend(descendant_processes(pgid));
+            }
+            for &pid in self.terminating_descendants.iter().rev() {
+                signal_process(pid, ProcessSignal::Kill);
+            }
+            signal_process_group(pgid, ProcessSignal::Kill);
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ProcessSignal {
     Term,
@@ -1988,7 +2105,7 @@ fn process_group_exists(pgid: libc::pid_t) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) async fn terminate_child(child: &mut Child) {
+pub(crate) async fn terminate_child(child: &mut ProcessTreeChild) {
     let Some(pgid) = child.id().map(|pid| pid as libc::pid_t) else {
         return;
     };
@@ -1996,6 +2113,7 @@ pub(crate) async fn terminate_child(child: &mut Child) {
     // the full descendant tree before terminating the Codex leader; otherwise
     // those commands are reparented to init and escape a group-only signal.
     let descendants = descendant_processes(pgid);
+    child.terminating_descendants = descendants.clone();
     for &pid in descendants.iter().rev() {
         signal_process(pid, ProcessSignal::Term);
     }
@@ -2007,6 +2125,8 @@ pub(crate) async fn terminate_child(child: &mut Child) {
         let _ = child.try_wait();
         if !process_group_exists(pgid) && !descendants.iter().copied().any(process_exists) {
             let _ = child.wait().await;
+            child.pgid = None;
+            child.terminating_descendants.clear();
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2023,7 +2143,7 @@ pub(crate) async fn terminate_child(child: &mut Child) {
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn terminate_child(child: &mut Child) {
+pub(crate) async fn terminate_child(child: &mut ProcessTreeChild) {
     if tokio::time::timeout(SIGTERM_WAIT, child.wait())
         .await
         .is_ok()
@@ -2097,6 +2217,108 @@ async fn drain_stderr_tail(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod process_lifecycle_tests {
+    use super::*;
+    use bamboo_subagent::proto::{ChildFrame, ParentFrame, TerminalStatus};
+    use bamboo_subagent::transport::{ChildClient, WsServer};
+
+    struct Cleanup(std::path::PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(contents) = std::fs::read_to_string(&self.0) {
+                let pids: Vec<libc::pid_t> = contents
+                    .split_whitespace()
+                    .filter_map(|pid| pid.parse().ok())
+                    .collect();
+                for &pid in pids.iter().rev() {
+                    signal_process(pid, ProcessSignal::Kill);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn assert_processes_gone(pids: &[libc::pid_t]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pids.iter().copied().any(process_exists) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the executor process and its tool descendants must exit");
+    }
+
+    /// Exercise actual transport cancellation, not just the executor's token.
+    /// Keeping the executor Arc alive reproduces warm-worker retention bugs.
+    pub(crate) async fn interrupt_over_websocket(
+        executor: Arc<dyn ChildExecutor>,
+        spec: RunSpec,
+        pid_file: &std::path::Path,
+        abort_owner: bool,
+    ) -> libc::pid_t {
+        let server = WsServer::bind_loopback().await.unwrap();
+        let endpoint = server.ws_endpoint();
+        let server_task =
+            AbortOnDropHandle::new(tokio::spawn(
+                async move { server.serve_one(executor).await },
+            ));
+        let _cleanup = Cleanup(pid_file.to_path_buf());
+        let mut client = ChildClient::connect(&endpoint).await.unwrap();
+        client.send(ParentFrame::Run(spec)).await.unwrap();
+        let pids = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(pid_file) {
+                    let pids: Vec<libc::pid_t> = contents
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse().ok())
+                        .collect();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::select! {
+                    frame = client.next_frame() => {
+                        if let Some(ChildFrame::Terminal { status, result, error, .. }) = frame.unwrap() {
+                            panic!("stub terminated before process readiness: {status:?} {result:?} {error:?}");
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("stub must record its process tree before cancellation");
+        if abort_owner {
+            server_task.abort();
+            assert!(server_task.await.unwrap_err().is_cancelled());
+        } else {
+            client.send(ParentFrame::Cancel).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    match client.next_frame().await.unwrap().expect("terminal frame") {
+                        ChildFrame::Terminal { status, .. } => {
+                            assert_eq!(status, TerminalStatus::Cancelled);
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("explicit cancellation must return a bounded terminal");
+            client.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), server_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_processes_gone(&pids).await;
+        pids[0]
     }
 }
 
@@ -2248,18 +2470,20 @@ mod tests {
         }
     }
 
-    fn map_fixture(input: &str) -> (RunState, Vec<Value>) {
+    async fn map_fixture(input: &str) -> (RunState, Vec<Value>) {
         let executor = fixture_executor();
         let (sink, mut rx) = EventSink::channel();
         let mut state = RunState::default();
         let policy = default_policy(&executor);
         for line in input.lines().filter(|line| !line.trim().is_empty()) {
-            executor.handle_event(
-                serde_json::from_str(line).unwrap(),
-                &policy,
-                &sink,
-                &mut state,
-            );
+            executor
+                .handle_event(
+                    serde_json::from_str(line).unwrap(),
+                    &policy,
+                    &sink,
+                    &mut state,
+                )
+                .await;
         }
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -2554,8 +2778,8 @@ mod tests {
         assert!(!args.iter().any(|argument| argument == "--full-auto"));
     }
 
-    #[test]
-    fn danger_bypass_emits_loud_audit_warning() {
+    #[tokio::test]
+    async fn danger_bypass_emits_loud_audit_warning() {
         let mut executor = fixture_executor();
         executor.permissions = permissions(
             Some("danger-full-access"),
@@ -2568,14 +2792,16 @@ mod tests {
         );
         let policy = executor.permissions.effective(true, false);
         let (sink, mut receiver) = EventSink::channel();
-        executor.emit_policy_bootstrap(
-            &policy,
-            bamboo_domain::resolve_permission_mode(
-                bamboo_domain::SessionPermissionMode::Bypass,
-                bamboo_domain::PermissionMode::Default,
-            ),
-            &sink,
-        );
+        executor
+            .emit_policy_bootstrap(
+                &policy,
+                bamboo_domain::resolve_permission_mode(
+                    bamboo_domain::SessionPermissionMode::Bypass,
+                    bamboo_domain::PermissionMode::Default,
+                ),
+                &sink,
+            )
+            .await;
 
         let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| {
@@ -2850,8 +3076,8 @@ mod tests {
         assert_eq!(usage.total_tokens, 13_466);
     }
 
-    #[test]
-    fn recorded_jsonl_fixtures_map_agent_and_command_events() {
+    #[tokio::test]
+    async fn recorded_jsonl_fixtures_map_agent_and_command_events() {
         let cases = [
             (
                 include_str!("../tests/fixtures/codex-cli/0.144.5-simple.jsonl"),
@@ -2868,7 +3094,7 @@ mod tests {
         ];
 
         for (fixture, expected_final, expects_tool, total_tokens) in cases {
-            let (state, events) = map_fixture(fixture);
+            let (state, events) = map_fixture(fixture).await;
             assert!(state.completed);
             assert_eq!(state.last_agent_message, expected_final);
             assert_eq!(state.usage.total_tokens, total_tokens);
@@ -2888,8 +3114,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn item_mapping_table_covers_non_command_codex_items() {
+    #[tokio::test]
+    async fn item_mapping_table_covers_non_command_codex_items() {
         let cases = [
             (
                 json!({"id":"r1","type":"reasoning","text":"thinking"}),
@@ -2921,7 +3147,7 @@ mod tests {
         for (item, expected_type, expected_tool) in cases {
             let (sink, mut rx) = EventSink::channel();
             let mut state = RunState::default();
-            handle_item("completed", &item, &sink, &mut state);
+            handle_item("completed", &item, &sink, &mut state).await;
             let first = rx.try_recv().expect("mapping emitted an event");
             assert_eq!(first["type"], expected_type, "item: {item}");
             if let Some(tool) = expected_tool {
@@ -2933,31 +3159,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unknown_event_and_item_types_are_tolerated() {
+    #[tokio::test]
+    async fn unknown_event_and_item_types_are_tolerated() {
         let executor = fixture_executor();
         let (sink, mut rx) = EventSink::channel();
         let mut state = RunState::default();
         let policy = default_policy(&executor);
-        executor.handle_event(
-            json!({"type":"future.event","payload":{"schema":2}}),
-            &policy,
-            &sink,
-            &mut state,
-        );
-        executor.handle_event(
-            json!({"type":"item.completed","item":{"id":"x","type":"future_item"}}),
-            &policy,
-            &sink,
-            &mut state,
-        );
+        executor
+            .handle_event(
+                json!({"type":"future.event","payload":{"schema":2}}),
+                &policy,
+                &sink,
+                &mut state,
+            )
+            .await;
+        executor
+            .handle_event(
+                json!({"type":"item.completed","item":{"id":"x","type":"future_item"}}),
+                &policy,
+                &sink,
+                &mut state,
+            )
+            .await;
         assert!(rx.try_recv().is_err());
         assert!(!state.completed);
         assert!(state.failure.is_none());
     }
 
-    #[test]
-    fn sandbox_denial_report_without_cli_tool_item_becomes_tool_error() {
+    #[tokio::test]
+    async fn sandbox_denial_report_without_cli_tool_item_becomes_tool_error() {
         let executor = fixture_executor();
         let policy = executor.permissions.effective(false, false);
         let (sink, mut receiver) = EventSink::channel();
@@ -2974,7 +3204,7 @@ mod tests {
             &policy,
             &sink,
             &mut state,
-        );
+        ).await;
 
         let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| event["type"] == "token"));
@@ -3721,6 +3951,32 @@ exit 1
                 1
             );
             assert!(!state_path.exists());
+        }
+
+        #[tokio::test]
+        async fn websocket_cancel_and_owner_abort_reap_codex_process_tree() {
+            for abort_owner in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                let bin_dir = tempfile::tempdir().unwrap();
+                let bin = write_stub(
+                    bin_dir.path(),
+                    r#"
+DIR=$(cd "$(dirname "$0")" && pwd)
+read -r prompt
+trap '' TERM
+(trap '' TERM; sleep 60) &
+printf '%s %s\n' "$$" "$!" > "$DIR/pids"
+wait
+"#,
+                );
+                process_lifecycle_tests::interrupt_over_websocket(
+                    Arc::new(executor(bin, workspace.path())),
+                    run_spec("wait"),
+                    &bin_dir.path().join("pids"),
+                    abort_owner,
+                )
+                .await;
+            }
         }
 
         #[tokio::test]
