@@ -1036,9 +1036,13 @@ impl MetricsStorage for SqliteMetricsStorage {
 
                 CREATE INDEX IF NOT EXISTS idx_session_started_at ON session_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_session_model ON session_metrics(model);
-                CREATE INDEX IF NOT EXISTS idx_round_session ON round_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_round_session_started_at ON round_metrics(session_id, started_at);
+                -- Install the replacement before dropping our redundant prefix index.
+                -- Repeated or interrupted initialization always retains a session lookup.
+                DROP INDEX IF EXISTS idx_round_session;
                 CREATE INDEX IF NOT EXISTS idx_round_started_at ON round_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_call_metrics(session_id);
+                CREATE INDEX IF NOT EXISTS idx_tool_round_started_at ON tool_call_metrics(round_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_started_at ON tool_call_metrics(started_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_call_metrics(tool_name);
 
@@ -3128,9 +3132,7 @@ fn load_tool_breakdown(
 /// - Timestamp parsing fails
 /// - Status values are invalid
 fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<RoundMetrics>> {
-    let mut stmt = connection.prepare(
-        "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC",
-    )?;
+    let mut stmt = connection.prepare(LOAD_ROUNDS_SQL)?;
     let mut rows = stmt.query(params![session_id])?;
     let mut rounds = Vec::new();
 
@@ -3182,9 +3184,7 @@ fn load_rounds(connection: &Connection, session_id: &str) -> MetricsResult<Vec<R
 ///
 /// A vector of ToolCallMetrics ordered by started_at ascending.
 fn load_tool_calls(connection: &Connection, round_id: &str) -> MetricsResult<Vec<ToolCallMetrics>> {
-    let mut stmt = connection.prepare(
-        "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC",
-    )?;
+    let mut stmt = connection.prepare(LOAD_TOOL_CALLS_SQL)?;
     let mut rows = stmt.query(params![round_id])?;
     let mut tools = Vec::new();
 
@@ -3445,6 +3445,10 @@ fn load_execute_sync_mismatch_breakdown(
     Ok(breakdown)
 }
 
+const LOAD_ROUNDS_SQL: &str = "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC";
+
+const LOAD_TOOL_CALLS_SQL: &str = "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC";
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3457,6 +3461,307 @@ mod tests {
         ForwardMetricsFilter, ForwardStatus, ForwardTokenDetails, MetricsDateFilter,
         ModelMetricsDateFilter, RoundStatus, SessionMetricsFilter, SessionStatus, TokenUsage,
     };
+
+    // The pre-#1075 layout is independent of init() so this exercises a real
+    // populated database migration rather than deriving the old schema from it.
+    const LEGACY_ROUND_SCHEMA: &str = r#"
+        CREATE TABLE session_metrics (
+            session_id TEXT PRIMARY KEY, model TEXT NOT NULL, started_at TEXT NOT NULL,
+            completed_at TEXT, status TEXT NOT NULL DEFAULT 'running',
+            total_rounds INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_tokens_saved INTEGER NOT NULL DEFAULT 0,
+            total_compression_events INTEGER NOT NULL DEFAULT 0,
+            total_tokens_saved INTEGER NOT NULL DEFAULT 0, tool_call_count INTEGER NOT NULL DEFAULT 0,
+            message_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE round_metrics (
+            round_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, model TEXT NOT NULL,
+            started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL DEFAULT 'running',
+            prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0, prompt_cached_tool_outputs INTEGER NOT NULL DEFAULT 0,
+            prompt_cached_tool_tokens_saved INTEGER NOT NULL DEFAULT 0,
+            compression_count INTEGER NOT NULL DEFAULT 0, tokens_saved INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE tool_call_metrics (
+            tool_call_id TEXT PRIMARY KEY, round_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
+            success INTEGER, error TEXT,
+            FOREIGN KEY(round_id) REFERENCES round_metrics(round_id) ON DELETE CASCADE,
+            FOREIGN KEY(session_id) REFERENCES session_metrics(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_session_started_at ON session_metrics(started_at);
+        CREATE INDEX idx_session_model ON session_metrics(model);
+        CREATE INDEX idx_round_session ON round_metrics(session_id);
+        CREATE INDEX idx_round_started_at ON round_metrics(started_at);
+        CREATE INDEX idx_tool_session ON tool_call_metrics(session_id);
+        CREATE INDEX idx_tool_started_at ON tool_call_metrics(started_at);
+        CREATE INDEX idx_tool_name ON tool_call_metrics(tool_name);
+        CREATE INDEX custom_tool_success ON tool_call_metrics(success);
+    "#;
+
+    fn seed_round_index_fixture(connection: &rusqlite::Connection) {
+        let now = Utc.with_ymd_and_hms(2026, 2, 10, 12, 0, 0).unwrap();
+        super::with_immediate_transaction(connection, || {
+            // Target plus 64 unrelated sessions, 195 rounds and 585 tools.
+            // Reverse insertion order ensures detail ordering comes from SQL.
+            for session in 0..65 {
+                let sid = format!("index-session-{session}");
+                connection.execute(
+                    "INSERT INTO session_metrics(session_id,model,started_at,message_count,updated_at) VALUES (?1,'model',?2,7,?2)",
+                    rusqlite::params![sid, super::format_timestamp(now)],
+                )?;
+                for round in (0..3).rev() {
+                    let rid = format!("index-round-{session}-{round}");
+                    let started = if session == 0 && round == 0 {
+                        now - chrono::Duration::days(40)
+                    } else {
+                        now + chrono::Duration::minutes(round)
+                    };
+                    connection.execute(
+                        "INSERT INTO round_metrics(round_id,session_id,model,started_at,completed_at,status,prompt_tokens,completion_tokens,total_tokens,prompt_cached_tool_outputs,prompt_cached_tool_tokens_saved,tokens_saved) VALUES (?1,?2,'model',?3,?3,'success',10,2,12,1,3,3)",
+                        rusqlite::params![rid, sid, super::format_timestamp(started)],
+                    )?;
+                    for tool in (0..3).rev() {
+                        connection.execute(
+                            "INSERT INTO tool_call_metrics(tool_call_id,round_id,session_id,tool_name,started_at,completed_at,success) VALUES (?1,?2,?3,'fixture_tool',?4,?4,1)",
+                            rusqlite::params![format!("index-tool-{session}-{round}-{tool}"), rid, sid, super::format_timestamp(started + chrono::Duration::seconds(tool))],
+                        )?;
+                    }
+                }
+                super::refresh_session_aggregates(connection, &sid, now)?;
+            }
+            Ok(())
+        }).expect("seed populated metrics fixture");
+        connection
+            .execute_batch("ANALYZE")
+            .expect("analyze fixture");
+    }
+
+    fn assert_round_lookup_plans(connection: &rusqlite::Connection) {
+        for (query, key, table, column) in [
+            (
+                super::LOAD_TOOL_CALLS_SQL,
+                "index-round-0-1",
+                "tool_call_metrics",
+                "round_id",
+            ),
+            (
+                super::LOAD_ROUNDS_SQL,
+                "index-session-0",
+                "round_metrics",
+                "session_id",
+            ),
+            (
+                "DELETE FROM round_metrics WHERE round_id = ?1",
+                "index-round-0-1",
+                "tool_call_metrics",
+                "round_id",
+            ),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let plan = statement
+                .query_map([key], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| {
+                    step.starts_with(&format!("SEARCH {table} "))
+                        && step.contains(&format!("({column}=?"))
+                }),
+                "lookup must be keyed by {column}: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|step| step.starts_with(&format!("SCAN {table}"))),
+                "lookup must not scan unrelated {table} rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "ordered detail must not need a temporary sort: {plan:?}"
+            );
+        }
+    }
+
+    fn assert_round_indexes(connection: &rusqlite::Connection) {
+        for (name, expected) in [
+            ("idx_round_session_started_at", ["session_id", "started_at"]),
+            ("idx_tool_round_started_at", ["round_id", "started_at"]),
+        ] {
+            let columns = connection
+                .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                .unwrap()
+                .query_map([name], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(columns, expected, "index columns for {name}");
+        }
+        let old_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='idx_round_session'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(old_count, 0, "owned redundant prefix index is replaced");
+    }
+
+    type MetricRows = Vec<Vec<rusqlite::types::Value>>;
+
+    fn snapshot_round_fixture(
+        connection: &rusqlite::Connection,
+        unrelated_only: bool,
+    ) -> Vec<MetricRows> {
+        ["session_metrics", "round_metrics", "tool_call_metrics"]
+            .iter()
+            .map(|table| {
+                let filter = if unrelated_only {
+                    "WHERE session_id != 'index-session-0'"
+                } else {
+                    ""
+                };
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table} {filter} ORDER BY 1"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get(index))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_round_indexes_use_keyed_lookups_and_preserve_detail_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let storage = SqliteMetricsStorage::new(&path);
+        storage.init().await.unwrap();
+        storage
+            .init()
+            .await
+            .expect("fresh initialization is idempotent");
+        let connection = super::open_connection(&path).unwrap();
+        assert_round_indexes(&connection);
+        seed_round_index_fixture(&connection);
+        assert_round_lookup_plans(&connection);
+        drop(connection);
+
+        let detail = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail
+                .rounds
+                .iter()
+                .map(|round| round.round_id.as_str())
+                .collect::<Vec<_>>(),
+            ["index-round-0-0", "index-round-0-1", "index-round-0-2"]
+        );
+        for (round_index, round) in detail.rounds.iter().enumerate() {
+            assert_eq!(
+                round
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.tool_call_id.clone())
+                    .collect::<Vec<_>>(),
+                (0..3)
+                    .map(|tool| format!("index-tool-0-{round_index}-{tool}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn populated_legacy_round_indexes_migrate_without_loss_and_preserve_retention() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("metrics.db");
+        let connection = super::open_connection(&path).unwrap();
+        connection.execute_batch(LEGACY_ROUND_SCHEMA).unwrap();
+        seed_round_index_fixture(&connection);
+        let before = snapshot_round_fixture(&connection, false);
+        let unrelated_before = snapshot_round_fixture(&connection, true);
+        drop(connection);
+
+        let storage = SqliteMetricsStorage::new(&path);
+        let detail_before = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            storage
+                .init()
+                .await
+                .expect("migrate/reinitialize populated legacy database");
+            let connection = super::open_connection(&path).unwrap();
+            assert_round_indexes(&connection);
+            assert_round_lookup_plans(&connection);
+            assert_eq!(
+                snapshot_round_fixture(&connection, false),
+                before,
+                "migration preserves every existing row"
+            );
+            let unrelated_index: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='custom_tool_success'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(unrelated_index, 1, "unrelated indexes are preserved");
+        }
+        assert_eq!(
+            storage
+                .session_detail("index-session-0")
+                .await
+                .unwrap()
+                .unwrap(),
+            detail_before
+        );
+        let cutoff = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        assert_eq!(storage.prune_rounds_before(cutoff).await.unwrap(), 1);
+        assert_eq!(storage.prune_rounds_before(cutoff).await.unwrap(), 0);
+        let detail = storage
+            .session_detail("index-session-0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.rounds, detail_before.rounds[1..]);
+        assert_eq!(detail.session.total_rounds, 2);
+        assert_eq!(detail.session.total_token_usage.total_tokens, 24);
+        assert_eq!(detail.session.tool_call_count, 6);
+        assert_eq!(detail.session.prompt_cached_tool_outputs, 2);
+        assert_eq!(detail.session.prompt_cached_tool_tokens_saved, 6);
+        assert_eq!(detail.session.total_tokens_saved, 6);
+        assert_eq!(detail.session.message_count, 7);
+        let connection = super::open_connection(&path).unwrap();
+        assert_eq!(snapshot_round_fixture(&connection, true), unrelated_before);
+        let orphans: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call_metrics WHERE round_id='index-round-0-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0, "pruning cascades to the expired round's tools");
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
 
     #[test]
     fn open_connection_sets_busy_timeout() {
