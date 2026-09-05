@@ -181,6 +181,67 @@ async fn ordinary_reserved_id_is_a_conflict_and_cannot_be_promoted() {
 }
 
 #[tokio::test]
+async fn child_reserved_id_blocks_bootstrap_despite_missing_or_stale_index() {
+    for index_state in ["indexed", "missing", "stale"] {
+        let (store, home) = fixture().await;
+        let stale = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let root = Session::new("other-root", "model");
+        store.save_session(&root).await.unwrap();
+        let id = DEFAULT_SUPERVISOR_SESSION_ID;
+        let mut child = Session::new_child_of(id, &root, "model", "child");
+        child.add_message(Message::user("existing child history"));
+        store.save_session(&child).await.unwrap();
+        let control = store.load_runtime_control_plane(id).await.unwrap().unwrap();
+        assert_eq!(control.kind, SessionKind::Child);
+        assert!(control.authority_identity.is_ordinary());
+        assert!(control.messages.is_empty());
+        if index_state == "missing" {
+            store
+                .update_index(|index| {
+                    index.sessions.remove(id);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let child_dir = store
+            .sessions_root_dir()
+            .join(&root.id)
+            .join("children")
+            .join(id);
+        let paths = [
+            child_dir.join("session.json"),
+            child_dir.join(RUNTIME_SIDECAR_FILE),
+            store.index_path().to_path_buf(),
+        ];
+        let mut before = Vec::new();
+        for path in &paths {
+            before.push(fs::read(path).await.unwrap());
+        }
+        let caller = if index_state == "stale" {
+            &stale
+        } else {
+            &store
+        };
+        assert_eq!(
+            caller
+                .get_or_create_default_supervisor("supervisor")
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists,
+            "{index_state}"
+        );
+        for (path, expected) in paths.iter().zip(before) {
+            assert_eq!(fs::read(path).await.unwrap(), expected, "{index_state}");
+        }
+        assert!(!directory(&store).exists(), "{index_state}");
+    }
+}
+
+#[tokio::test]
 async fn ordinary_save_cannot_forge_supervisor_identity_on_new_or_existing_root() {
     for id in ["forged-supervisor", DEFAULT_SUPERVISOR_SESSION_ID] {
         let (store, _home) = fixture().await;

@@ -225,6 +225,27 @@ impl SessionStoreV2 {
                 created: false,
             });
         }
+        // The ID namespace also includes children. Only cold bootstrap scans
+        // their canonical placements; the rebuildable index cannot prove absence.
+        let mut roots = fs::read_dir(&self.sessions_dir).await?;
+        while let Some(root) = roots.next_entry().await? {
+            let kind = root.file_type().await?;
+            if kind.is_file() {
+                continue;
+            }
+            if !kind.is_dir() {
+                return Err(invalid("non-directory canonical Root placement"));
+            }
+            let children = root.path().join("children");
+            if real_directory(&children).await?
+                && real_directory(&children.join(DEFAULT_SUPERVISOR_SESSION_ID)).await?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "default Supervisor ID is occupied by a Child placement",
+                ));
+            }
+        }
         if initial_model.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

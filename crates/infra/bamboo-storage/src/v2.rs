@@ -2410,7 +2410,11 @@ impl SessionStoreV2 {
     ) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
         if session_id == DEFAULT_SUPERVISOR_SESSION_ID {
-            return self.load_root_authority_unchecked(session_id).await;
+            if let Some(root) = self.load_root_authority_unchecked(session_id).await? {
+                return Ok(Some(root));
+            }
+            // An Ordinary Child may already own this ID in another tree.
+            // Only canonical Root absence permits its normal control-plane read.
         }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
             return Ok(Some(side));

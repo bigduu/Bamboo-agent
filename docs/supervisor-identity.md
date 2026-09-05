@@ -39,6 +39,10 @@ explicit conflict and preserves that Session. The host must resolve that
 conflict through its normal Session management policy; bootstrap never promotes
 or deletes the existing conversation.
 
+Cold bootstrap also checks canonical child placements on disk, so a missing or
+stale index cannot make an occupied child ID available. This scans Root directories
+only when no default Supervisor Root exists; ordinary repeat calls avoid the scan.
+
 The V2 implementation publishes a complete `session.json`/`runtime.json` pair
 through one staged-directory publication. Existing lifecycle, Task and per-Session
 cross-process locks serialize it with ordinary writers. The session index remains
@@ -52,8 +56,8 @@ Supervisor authority fails closed, including during repair and writeback. It
 does not recover authority from an older `session.json` when the runtime sidecar
 is unavailable. Pair validation still reads the canonical main file's bytes;
 the control-plane return type does not promise partial or constant-size disk I/O.
-Generic Ordinary-session compatibility reads retain their
-existing fallback behavior. Unsupported Storage implementations return
+Ordinary sessions outside the reserved Root keep their existing compatibility
+reads. Unsupported Storage implementations return
 `ErrorKind::Unsupported` for both new ports, without ordinary load/save fallback.
 
 Merge/save adopts durable identity into an Ordinary snapshot of the same Root
