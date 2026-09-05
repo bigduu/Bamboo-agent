@@ -39,8 +39,13 @@ use uuid::Uuid;
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
 use bamboo_domain::{
-    MessagePart, ProjectId, Role, Session, SessionKind, TaskList, TokenBudgetUsage,
+    MessagePart, ProjectId, Role, Session, SessionAuthorityIdentity, SessionKind,
+    SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
+
+mod supervisor;
+#[cfg(test)]
+mod supervisor_tests;
 
 use crate::search_index::{should_index_session, SessionSearchIndex};
 use bamboo_domain::AttachmentReader;
@@ -1034,6 +1039,8 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
+    #[cfg(test)]
+    supervisor_bootstrap_fault: std::sync::Mutex<Option<supervisor::SupervisorBootstrapFault>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1088,6 +1095,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
 fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
+    copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -1328,6 +1336,8 @@ impl SessionStoreV2 {
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            supervisor_bootstrap_fault: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -1565,6 +1575,10 @@ impl SessionStoreV2 {
                     None
                 }
             };
+        if let Err(error) = supervisor::validate_overlay(&main, sidecar.as_ref()) {
+            tracing::warn!("index rebuild: skipping invalid authority for {id}: {error}");
+            return None;
+        }
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Some(session)
@@ -1639,6 +1653,7 @@ impl SessionStoreV2 {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -2143,6 +2158,7 @@ impl SessionStoreV2 {
         })?;
         let sidecar =
             Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), session_id).await?;
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.clear_stale_root_token_budget();
         if session.id != session_id || session.kind != SessionKind::Root {
@@ -2393,6 +2409,9 @@ impl SessionStoreV2 {
         session_id: &str,
     ) -> io::Result<Option<Session>> {
         validate_session_id(session_id)?;
+        if session_id == DEFAULT_SUPERVISOR_SESSION_ID {
+            return self.load_root_authority_unchecked(session_id).await;
+        }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
             return Ok(Some(side));
         }
@@ -2406,6 +2425,7 @@ impl SessionStoreV2 {
         };
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+        supervisor::validate_identity(&session)?;
         session.messages.clear();
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -2722,6 +2742,7 @@ impl SessionStoreV2 {
                 ));
             }
         }
+        supervisor::validate_overlay(&main, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.messages.clear();
         session.clear_stale_root_token_budget();
@@ -3333,7 +3354,9 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
-        if !Self::runtime_task_owned_snapshot_matches(&current, original)? {
+        if current.authority_identity != original.authority_identity
+            || !Self::runtime_task_owned_snapshot_matches(&current, original)?
+        {
             return Ok(false);
         }
         let mut committed = current;
@@ -3421,7 +3444,9 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
-        if !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
+        if current_first.authority_identity != first_original.authority_identity
+            || current_second.authority_identity != second_original.authority_identity
+            || !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
             || !Self::runtime_task_owned_snapshot_matches(&current_second, second_original)?
         {
             return Ok(false);
@@ -3702,6 +3727,16 @@ impl SessionStoreV2 {
                     continue;
                 }
             };
+            supervisor::validate_identity(&session)?;
+            if !matches!(
+                session.authority_identity,
+                SessionAuthorityIdentity::Ordinary
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot reconstruct missing Supervisor authority from session.json",
+                ));
+            }
             self.write_runtime_sidecar(&abs_dir, &session).await?;
             migrated += 1;
         }
@@ -3730,7 +3765,8 @@ impl SessionStoreV2 {
 
     /// Read + deserialize a runtime sidecar (`runtime.json`) from a known path.
     /// A missing file yields `None`; a corrupt one is ignored with a warning
-    /// (the authoritative copy still lives in `session.json`). Shared by
+    /// for Ordinary compatibility. Supervisor callers validate the canonical
+    /// pair and reject missing or corrupt runtime authority. Shared by
     /// [`Self::read_runtime_sidecar`] (index-resolved path) and the index
     /// rebuild (directory-scanned path) so both overlay the sidecar identically.
     async fn read_runtime_sidecar_at(path: &Path, id: &str) -> io::Result<Option<Session>> {
@@ -3740,14 +3776,15 @@ impl SessionStoreV2 {
         let raw = fs::read_to_string(path).await?;
         match serde_json::from_str::<Session>(&raw) {
             Ok(mut side) => {
+                supervisor::validate_identity(&side)?;
                 // The control-plane path (`load_runtime_control_plane`) returns
                 // this directly, so migrate a stale Root token_budget here too (#230).
                 side.clear_stale_root_token_budget();
                 Ok(Some(side))
             }
             Err(error) => {
-                // A corrupt sidecar must never make a session unloadable — the
-                // authoritative copy still lives in session.json. Warn and ignore.
+                // Ordinary Sessions may recover from session.json. Supervisor
+                // pair validation rejects this fallback before use or writes.
                 tracing::warn!("ignoring corrupt runtime sidecar for {id}: {error}");
                 Ok(None)
             }
@@ -4764,6 +4801,7 @@ impl SessionStoreV2 {
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
         let sidecar = self.read_runtime_sidecar(session_id).await?;
+        supervisor::validate_overlay(&session, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
         // Drop a stale pre-#180 Root token_budget cache so it re-resolves (#230).
         session.clear_stale_root_token_budget();
@@ -4773,12 +4811,27 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn get_or_create_default_supervisor(
+        &self,
+        initial_model: &str,
+    ) -> io::Result<SupervisorBootstrapReceipt> {
+        self.bootstrap_default_supervisor(initial_model).await
+    }
+
+    async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_root_authority_unchecked(session_id).await
+    }
+
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let _session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
+        self.validate_authority_for_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
 
         let mut stages = SaveStageDurations::default();
@@ -4860,7 +4913,8 @@ impl Storage for SessionStoreV2 {
     async fn save_runtime_state(&self, session: &Session) -> io::Result<()> {
         // Fast path: write ONLY the small runtime sidecar (no messages), leaving
         // session.json — which carries the full conversation history — untouched.
-        // This is O(1) in conversation length, unlike `save_session`.
+        // Ordinary sessions retain O(1) I/O in conversation length. Supervisor
+        // validation additionally reads main-file bytes to verify its identity.
         let Some(rel) = self.resolve_rel_path(&session.id).await else {
             // Session was never fully persisted yet — fall back to a full save so
             // session.json and the index get created. Deliberately acquire no
@@ -4873,6 +4927,7 @@ impl Storage for SessionStoreV2 {
         let _session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Runtime)
             .await?;
+        self.validate_authority_for_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
         let abs_dir = self.abs_path_from_rel(&rel);
         let mut stages = SaveStageDurations::default();

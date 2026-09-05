@@ -85,7 +85,12 @@ pub use bamboo_domain::{
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
     SessionProviderMessage, SessionRuntimeInstruction, TaskItem, TaskItemStatus, TaskList,
 };
+pub use bamboo_domain::{
+    SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
+    DEFAULT_SUPERVISOR_SESSION_ID,
+};
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
+pub use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 pub use bamboo_engine::{
     Agent as RuntimeAgent, AgentBuilder as RuntimeAgentBuilder, ExecuteRequest, HookRunner,
     LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook,
@@ -596,6 +601,12 @@ impl Agent {
     /// Access the shared storage backend.
     pub fn storage(&self) -> &Arc<dyn bamboo_agent_core::storage::Storage> {
         self.inner.storage()
+    }
+
+    /// Trusted identity bootstrap using this Agent's canonical Storage backend.
+    /// Creating this service does not create a Session or inherit SDK Project settings.
+    pub fn supervisor_sessions(&self) -> SupervisorSessionService {
+        SupervisorSessionService::new(self.storage().clone())
     }
 
     /// Access the runtime persistence adapter.

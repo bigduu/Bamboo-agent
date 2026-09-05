@@ -30,6 +30,10 @@ pub use agent::{
     SessionRunRegistrationError, SessionRuntimeInstruction, ShellCommandHook, ShellHookEvent,
 };
 pub use agent::{FileSessionInbox, SessionIndexEntry};
+pub use agent::{
+    SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
+    SupervisorSessionService, DEFAULT_SUPERVISOR_SESSION_ID,
+};
 
 // Tool catalog surfaced by `agent::mod`.
 pub use agent::{

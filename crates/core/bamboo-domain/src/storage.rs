@@ -4,6 +4,7 @@
 //! implementations. Concrete implementations live in infrastructure crates.
 
 use crate::session::types::Session;
+use crate::SupervisorBootstrapReceipt;
 
 /// Trait for session storage backends.
 ///
@@ -12,6 +13,33 @@ use crate::session::types::Session;
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Trusted host bootstrap for one stable default Supervisor Root. Only the
+    /// initial model is caller supplied and is used on first creation only.
+    /// Implementations must publish the complete identity atomically, protect it
+    /// from ordinary writers, and return a receipt rather than a partial Session.
+    async fn get_or_create_default_supervisor(
+        &self,
+        initial_model: &str,
+    ) -> std::io::Result<SupervisorBootstrapReceipt> {
+        let _ = initial_model;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support trusted Supervisor bootstrap",
+        ))
+    }
+
+    /// Strict canonical Root control-plane read for authority decisions.
+    /// `None` means absent; partial/corrupt/mismatched published authority is an
+    /// error, never a fallback to stale session.json. Returned messages are empty;
+    /// this observation must not replace a full Session in a history cache.
+    async fn load_root_authority(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+        let _ = session_id;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support strict Root authority reads",
+        ))
+    }
+
     /// Saves a session's metadata.
     async fn save_session(&self, session: &Session) -> std::io::Result<()>;
 

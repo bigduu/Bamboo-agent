@@ -61,6 +61,14 @@ const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
 
+fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
+    !result.as_ref().err().is_some_and(|error| {
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+    })
+}
+
 /// A pending response is an authoritative compare-and-consume transaction.
 /// When a stale runner still carries the consumed ask, its terminal save must
 /// adopt the durable response control plane instead of resurrecting the ask or
@@ -412,7 +420,8 @@ impl LockedSessionStore {
     /// guard across an await. The callback also runs when the durable save
     /// fails, preserving [`RuntimeSessionPersistence::save_runtime_control_plane`]
     /// implementations that publish current runtime authorization state while
-    /// still returning the storage error.
+    /// still returning the storage error. Authority conflicts are excluded:
+    /// publishing a rejected identity would disagree with durable authority.
     pub async fn save_runtime_only_and_publish<F>(
         &self,
         session: &mut Session,
@@ -436,7 +445,9 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        publish(session);
+        if may_publish_runtime_result(&result) {
+            publish(session);
+        }
         result
     }
 
@@ -660,9 +671,10 @@ impl LockedSessionStore {
     /// Merge-save a runtime session and synchronously publish the resulting
     /// snapshot before releasing its per-session serialization lock.
     ///
-    /// The callback receives whether the durable save committed. It always runs
+    /// The callback receives whether the durable save committed. It runs
     /// after the save attempt so repository callers can preserve their existing
-    /// cache-on-failure policy without reopening a durable-to-cache race.
+    /// cache-on-failure policy without reopening a durable-to-cache race,
+    /// except when authority validation rejects the snapshot.
     pub async fn merge_save_runtime_and_publish<F>(
         &self,
         session: &mut Session,
@@ -726,7 +738,9 @@ impl LockedSessionStore {
         }
 
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
     }
 
@@ -813,7 +827,9 @@ impl LockedSessionStore {
             adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
     }
 
@@ -874,7 +890,9 @@ impl LockedSessionStore {
         incoming_audit.write_to(&mut session.metadata);
 
         let result = self.save_session_rebasing_task_conflicts(session).await;
-        publish(session, result.is_ok());
+        if may_publish_runtime_result(&result) {
+            publish(session, result.is_ok());
+        }
         result
     }
 
@@ -1408,6 +1426,15 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    // Identity is independent of the UI metadata revision. Preserve it in the
+    // caller snapshot too, so a successful merge-save cannot downgrade the cache.
+    // Never replace an explicit Supervisor incarnation: the final storage guard
+    // must reject stale identities after deletion/recreation rather than hiding them.
+    // A newly constructed or previously deleted Ordinary session with this ID
+    // is not a snapshot of the current Root and must not be rebound to it.
+    if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
+        session.authority_identity = latest.authority_identity.clone();
+    }
     if latest.metadata_version >= session.metadata_version {
         session.title = latest.title.clone();
         session.title_version = latest.title_version;
@@ -1452,6 +1479,197 @@ mod tests {
     use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn authority_merge_updates_ordinary_cache_but_does_not_hide_stale_incarnation() {
+        let mut latest = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        latest.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let mut stale = latest.clone();
+        stale.authority_identity = bamboo_domain::SessionAuthorityIdentity::Ordinary;
+        stale.metadata_version = 100;
+        apply_authoritative_metadata(&mut stale, &latest);
+        assert_eq!(stale.authority_identity, latest.authority_identity);
+        let old_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        stale.authority_identity = old_identity.clone();
+        apply_authoritative_metadata(&mut stale, &latest);
+        assert_eq!(stale.authority_identity, old_identity);
+    }
+
+    struct AuthoritySavePauseStorage {
+        inner: Arc<SessionStoreV2>,
+        reached: tokio::sync::Barrier,
+        release: tokio::sync::Barrier,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for AuthoritySavePauseStorage {
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+        async fn load_runtime_control_plane(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_runtime_control_plane(id).await
+        }
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.reached.wait().await;
+            self.release.wait().await;
+            self.inner.save_session(session).await
+        }
+        async fn save_runtime_state(&self, session: &Session) -> std::io::Result<()> {
+            self.reached.wait().await;
+            self.release.wait().await;
+            self.inner.save_runtime_state(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_bootstrap_between_merge_read_and_save_rejects_without_publishing() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let store = LockedSessionStore::new(paused.clone());
+            let mut stale = Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "stale");
+            stale.add_message(bamboo_domain::Message::user(
+                "must not enter new Supervisor",
+            ));
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    store
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    store
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let bootstrap = async {
+                // The merge read saw None. Publish from an independent V2 store
+                // before allowing the loser to take its final filesystem lock.
+                paused.reached.wait().await;
+                let receipt = second
+                    .get_or_create_default_supervisor("supervisor")
+                    .await
+                    .unwrap();
+                paused.release.wait().await;
+                receipt
+            };
+            let (result, receipt) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(save, bootstrap)
+                })
+                .await
+                .expect("deterministic bootstrap/save race completes");
+            let error = result.unwrap_err();
+            assert!(!may_publish_runtime_result(&Err(error)));
+            assert!(!published.load(Ordering::SeqCst));
+            assert!(stale.authority_identity.is_ordinary());
+            let observed = first
+                .load_root_authority(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            // The independent store's ordinary lookup index can remain stale;
+            // strict authority must observe canonical publication without it.
+            let durable = second
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.model, "supervisor");
+            assert_eq!(observed.authority_identity, durable.authority_identity);
+            assert!(durable.messages.is_empty());
+            assert_eq!(
+                durable.authority_identity,
+                bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: receipt.incarnation_id,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_merge_publishes_adopted_identity_but_never_a_rejected_incarnation() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let receipt = storage
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let baseline = storage
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = baseline.authority_identity.clone();
+            let store = LockedSessionStore::new(storage.clone());
+            for case in 0..3 {
+                let rejected = case != 0;
+                let mut snapshot = baseline.clone();
+                snapshot.authority_identity = if case == 1 {
+                    bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    }
+                } else {
+                    bamboo_domain::SessionAuthorityIdentity::Ordinary
+                };
+                if case == 2 {
+                    snapshot.created_at -= chrono::Duration::seconds(1);
+                    snapshot.model = "stale Ordinary instance".into();
+                    snapshot.add_message(bamboo_domain::Message::user("must not be rebound"));
+                }
+                let published = AtomicBool::new(false);
+                let callback = |saved: &Session| {
+                    assert_eq!(saved.authority_identity, expected);
+                    published.store(true, Ordering::SeqCst);
+                };
+                let result = if runtime_only {
+                    store
+                        .save_runtime_only_and_publish(&mut snapshot, callback)
+                        .await
+                } else {
+                    store
+                        .merge_save_runtime_and_publish(&mut snapshot, |saved, committed| {
+                            assert!(committed);
+                            callback(saved);
+                        })
+                        .await
+                };
+                assert_eq!(result.is_err(), rejected);
+                assert_eq!(published.load(Ordering::SeqCst), !rejected);
+                if !rejected {
+                    assert_eq!(snapshot.authority_identity, expected);
+                }
+                let durable = storage
+                    .load_session(&receipt.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(durable.authority_identity, expected);
+                assert_eq!(durable.created_at, baseline.created_at);
+                assert_eq!(durable.model, baseline.model);
+                assert!(durable.messages.is_empty());
+            }
+        }
+    }
 
     struct CountingControlPlaneStorage {
         inner: Arc<SessionStoreV2>,

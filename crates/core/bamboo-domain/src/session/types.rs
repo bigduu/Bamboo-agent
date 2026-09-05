@@ -1,5 +1,6 @@
 use crate::provider_model_ref::ProviderModelRef;
 use crate::reasoning::ReasoningEffort;
+use crate::session::authority::SessionAuthorityIdentity;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
 use crate::session::message_part::{ImageUrlRef, MessagePart};
 use crate::session::task::{TaskItemStatus, TaskList};
@@ -653,6 +654,9 @@ pub struct Session {
     pub metadata_version: u64,
     #[serde(default)]
     pub kind: SessionKind,
+    /// Trusted identity; raw metadata and ordinary persistence cannot assign it.
+    #[serde(default, skip_serializing_if = "SessionAuthorityIdentity::is_ordinary")]
+    pub authority_identity: SessionAuthorityIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(default)]
@@ -787,6 +791,7 @@ impl Session {
             title_generated: false,
             metadata_version: 0,
             kind: SessionKind::Root,
+            authority_identity: SessionAuthorityIdentity::Ordinary,
             parent_session_id: None,
             root_session_id: id,
             spawn_depth: 0,
@@ -873,6 +878,7 @@ impl Session {
             title_generated: true,
             metadata_version: 0,
             kind: SessionKind::Child,
+            authority_identity: SessionAuthorityIdentity::Ordinary,
             parent_session_id: Some(parent_session_id),
             root_session_id,
             spawn_depth,
