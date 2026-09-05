@@ -6763,6 +6763,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_rebuild_repairs_unchanged_snapshots_without_replacing_message_ids(
+    ) -> io::Result<()> {
+        let (storage, temp) = create_temp_storage().await?;
+        let mut session = session_with_history("search-repair", 2, "run-a");
+        session.title = "repairable beacon".into();
+        session.messages[0].content = "repairable quartz".into();
+        storage.save_session(&session).await?;
+        storage.flush_search_index().await;
+        let conn = rusqlite::Connection::open(storage.search_index().db_path()).unwrap();
+        let identities = |conn: &rusqlite::Connection| {
+            conn.prepare(
+                "SELECT message_id, search_rowid FROM session_messages_search ORDER BY message_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = identities(&conn);
+        conn.execute_batch(
+            "DELETE FROM sessions_search_fts;
+            UPDATE session_messages_search_fts SET content='stale payload';",
+        )
+        .unwrap();
+        drop(storage);
+
+        // Reopen the store and run the same rebuild used by server startup.
+        let reopened = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        reopened.rebuild_search_index().await?;
+        assert_eq!(identities(&conn), before);
+        assert_eq!(reopened.search_index().search("beacon", 10).await?.len(), 1);
+        assert_eq!(reopened.search_index().search("quartz", 10).await?.len(), 1);
+        assert!(reopened
+            .search_index()
+            .search("stale", 10)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn persistence_metrics_report_bounded_create_latency_percentiles() -> io::Result<()> {
         let (storage, _temp) = create_temp_storage().await?;
         for millis in [10, 20, 30, 40, 50] {
