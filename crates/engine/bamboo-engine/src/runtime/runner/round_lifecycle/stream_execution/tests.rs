@@ -239,7 +239,7 @@ async fn wait_for_prompt_exposure(
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("prompt-memory observation was not persisted for {round_id}");
+    panic!("prompt-memory observation was not persisted");
 }
 
 async fn assert_no_prompt_exposure_after_collector_barrier(
@@ -266,7 +266,7 @@ async fn assert_no_prompt_exposure_after_collector_barrier(
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("metrics collector barrier was not observed for {session_id}");
+    panic!("metrics collector barrier was not observed");
 }
 
 /// The system field that a base prompt resolves to once the framework-invariant
