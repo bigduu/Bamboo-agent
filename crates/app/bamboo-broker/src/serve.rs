@@ -1555,7 +1555,9 @@ mod tests {
             )
             .await
             .expect("reply-only execution must not await an unused stream consumer");
-            assert!(matches!(handled, Handled::Reply(answer) if answer == question));
+            assert!(
+                matches!(handled, Handled::Reply(answer) if answer == format!("echo: {question}"))
+            );
             assert_eq!(
                 context.lock().await.len(),
                 if kind == InboxKind::Task { 2 } else { 0 }
