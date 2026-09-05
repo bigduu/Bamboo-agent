@@ -63,7 +63,7 @@ pub async fn copy_session(
     // cache only after the durable transaction succeeds.
     state.sessions.insert(
         new_id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(copied.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(copied.clone())),
     );
 
     // Copy preserves the source's workspace assignment. Publish the copied

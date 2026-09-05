@@ -1223,7 +1223,7 @@ mod optional_model_e2e {
         state.storage.save_session(&session).await.unwrap();
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
         bamboo_agent_core::workspace_state::set_workspace(
             session_id,
@@ -1275,7 +1275,7 @@ mod optional_model_e2e {
             .unwrap();
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(latest)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(latest)),
         );
         bamboo_agent_core::workspace_state::set_workspace(
             session_id,
@@ -1334,7 +1334,7 @@ mod optional_model_e2e {
         stale_cache.updated_at = chrono::Utc::now() + chrono::Duration::hours(1);
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(stale_cache)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(stale_cache)),
         );
         let app = test::init_service(
             App::new()

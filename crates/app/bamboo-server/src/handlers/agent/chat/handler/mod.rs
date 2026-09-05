@@ -51,7 +51,7 @@ async fn persist_and_cache_session_locked(
     state.persistence.storage().save_session(session).await?;
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
     Ok(())
 }

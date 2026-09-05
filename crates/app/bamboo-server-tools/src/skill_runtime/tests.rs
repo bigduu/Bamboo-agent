@@ -128,7 +128,7 @@ RUNNER_RUNTIME_INSTRUCTIONS"#,
     manager.initialize().await.expect("manager");
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
-    let cache = Arc::new(dashmap::DashMap::new());
+    let cache = bamboo_engine::SessionCache::default();
     let repo = bamboo_engine::SessionRepository::new(cache, storage.clone(), locked.clone());
     let config = Arc::new(RwLock::new(Config::default()));
     let load_skill = LoadSkillTool::new(manager.clone(), config.clone(), repo.clone());
@@ -375,7 +375,7 @@ async fn explicit_fail_closed_dynamic_context_stop_matrix_keeps_main_runner_aliv
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
     let repo = bamboo_engine::SessionRepository::new(
-        Arc::new(dashmap::DashMap::new()),
+        bamboo_engine::SessionCache::default(),
         storage.clone(),
         locked,
     );
@@ -996,10 +996,10 @@ fn dynamic_context_plan_helper_fail_closes_mutating_and_unknown_tools() {
 
 /// Build a per-session-locked session cache pre-populated with one session.
 fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::SessionCache {
-    let cache = Arc::new(dashmap::DashMap::new());
+    let cache = bamboo_engine::SessionCache::default();
     cache.insert(
         session_id.to_string(),
-        Arc::new(parking_lot::RwLock::new(session.clone())),
+        Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
     cache
 }
@@ -1764,11 +1764,11 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
         r#"["shared-workflow"]"#.to_string(),
     );
-    let sessions = Arc::new(dashmap::DashMap::new());
+    let sessions = bamboo_engine::SessionCache::default();
     for session in [&session_one, &session_two] {
         sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
     }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
@@ -1911,7 +1911,7 @@ async fn runtime_skill_store_keeps_project_home_across_workspace_switches() {
     manager.initialize().await.expect("initialize manager");
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
-    let sessions = Arc::new(dashmap::DashMap::new());
+    let sessions = bamboo_engine::SessionCache::default();
     let repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
     let mut session = Session::new("project-runtime-skill", "model");
     session.set_project_id_meta(project.id.to_string());

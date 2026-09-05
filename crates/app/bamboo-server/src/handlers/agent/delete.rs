@@ -185,11 +185,11 @@ mod tests {
             .expect("save child index");
         state.sessions.insert(
             root.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(root.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())),
         );
         state.sessions.insert(
             child.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(child.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
         );
         let ids = vec!["review".to_string()];
         for session_id in [&root.id, &child.id] {

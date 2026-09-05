@@ -304,6 +304,6 @@ async fn refresh_in_memory_cache(
 ) {
     state.sessions().insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(crate::SessionSnapshot::new(session)),
     );
 }

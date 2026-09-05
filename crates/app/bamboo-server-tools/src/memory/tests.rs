@@ -50,7 +50,7 @@ fn test_context(session_id: &str) -> ToolCtx {
 }
 
 fn build_memory_tool(data_dir: &std::path::Path) -> MemoryTool {
-    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions: bamboo_engine::SessionCache = Arc::default();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
     let session_repo = bamboo_engine::SessionRepository::new(sessions, storage, persistence);
@@ -61,7 +61,7 @@ async fn build_memory_tool_with_session(
     data_dir: &std::path::Path,
     session: Session,
 ) -> MemoryTool {
-    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions: bamboo_engine::SessionCache = Arc::default();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
     storage.save_session(&session).await.expect("save session");
     let persistence = Arc::new(LockedSessionStore::new(storage.clone()));

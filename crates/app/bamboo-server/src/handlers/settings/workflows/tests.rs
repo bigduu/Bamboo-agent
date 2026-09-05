@@ -205,7 +205,7 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
     let session = bamboo_agent_core::Session::new("global-session", "test-model");
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
         "/catalog",
@@ -379,7 +379,7 @@ async fn project_builtin_clone_uses_durable_session_project_authority() {
         .expect("persist Project Session");
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let project_home = state.project_store.paths().project_home(&project.id);
     let store = state
@@ -521,7 +521,7 @@ async fn assigned_project_workflow_catalog_reports_workspace_then_project_source
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
         "/catalog",
@@ -591,7 +591,7 @@ async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
         .expect("persist cross-Project Session");
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
 
     let app = actix_web::test::init_service(
@@ -686,7 +686,7 @@ async fn project_legacy_workflow_migration_is_exact_non_destructive_and_idempote
         .expect("persist migration Session");
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -932,7 +932,7 @@ async fn global_legacy_workflow_migrates_into_canonical_user_skills() {
         .expect("persist migration Session");
     state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()
@@ -1221,7 +1221,7 @@ async fn global_workflow_create_update_delete_is_immediate_in_cached_session_vie
     workspace_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     state.sessions.insert(
         workspace_session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(workspace_session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(workspace_session)),
     );
     let mut project_session =
         bamboo_agent_core::Session::new("project-cache-session", "test-model");
@@ -1229,7 +1229,7 @@ async fn global_workflow_create_update_delete_is_immediate_in_cached_session_vie
     project_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
     state.sessions.insert(
         project_session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(project_session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(project_session)),
     );
     let app = actix_web::test::init_service(
         actix_web::App::new()

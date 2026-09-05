@@ -215,7 +215,7 @@ async fn build_test_harness_with_options(
     let metrics_storage = Arc::new(SqliteMetricsStorage::new(bamboo_home.join("metrics.db")));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
-    let sessions_cache: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions_cache: bamboo_engine::SessionCache = Arc::default();
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
     let session_event_senders = Arc::new(RwLock::new(HashMap::<
         String,

@@ -847,7 +847,7 @@ async fn startup_failure_waiting_on_lock_cannot_overwrite_newer_turn() {
         .expect("persist newer turn while owning session lock");
     state.sessions.insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     drop(chat_guard);
     failure.await.expect("failure task completes");

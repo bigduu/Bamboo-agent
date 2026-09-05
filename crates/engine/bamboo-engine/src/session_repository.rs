@@ -93,7 +93,7 @@ impl SessionRepository {
             Ok(Some(session)) => {
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(session.clone())),
+                    Arc::new(crate::SessionSnapshot::new(session.clone())),
                 );
                 Some(session)
             }
@@ -120,7 +120,7 @@ impl SessionRepository {
         if let Some(ref session) = loaded {
             self.cache.insert(
                 session_id.to_string(),
-                Arc::new(parking_lot::RwLock::new(session.clone())),
+                Arc::new(crate::SessionSnapshot::new(session.clone())),
             );
         }
         Ok(loaded)
@@ -137,7 +137,7 @@ impl SessionRepository {
                     self.run_post_durable_hook("save_full", &saved.id);
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
             })
@@ -159,14 +159,15 @@ impl SessionRepository {
         self.persistence
             .update_runtime_config_and_publish(session_id, mutate, |saved| {
                 if let Some(cached) = self.cache.get(session_id) {
-                    let mut cached = cached.write();
-                    for key in metadata_keys {
-                        if let Some(value) = saved.metadata.get(*key) {
-                            cached.metadata.insert((*key).to_string(), value.clone());
-                        } else {
-                            cached.metadata.remove(*key);
+                    cached.update(|cached| {
+                        for key in metadata_keys {
+                            if let Some(value) = saved.metadata.get(*key) {
+                                cached.metadata.insert((*key).to_string(), value.clone());
+                            } else {
+                                cached.metadata.remove(*key);
+                            }
                         }
-                    }
+                    });
                 }
             })
             .await
@@ -235,7 +236,7 @@ impl SessionRepository {
                 if prefer_storage && chosen.updated_at >= memory_updated_at {
                     self.cache.insert(
                         session_id.to_string(),
-                        Arc::new(parking_lot::RwLock::new(chosen.clone())),
+                        Arc::new(crate::SessionSnapshot::new(chosen.clone())),
                     );
                 }
                 Some(chosen)
@@ -244,7 +245,7 @@ impl SessionRepository {
             (None, Some(storage)) => {
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(storage.clone())),
+                    Arc::new(crate::SessionSnapshot::new(storage.clone())),
                 );
                 Some(storage)
             }
@@ -279,7 +280,7 @@ impl SessionRepository {
                 self.run_post_durable_hook("save_and_cache", &saved.id);
                 self.cache.insert(
                     saved.id.clone(),
-                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
                 );
             })
             .await;
@@ -292,7 +293,7 @@ impl SessionRepository {
         match self.storage.load_runtime_control_plane(session_id).await {
             Ok(Some(durable)) => {
                 if let Some(cached) = self.cache.get(session_id) {
-                    adopt_task_control_plane(&mut cached.write(), &durable);
+                    cached.update(|cached| adopt_task_control_plane(cached, &durable));
                 }
             }
             Ok(None) => {}
@@ -356,7 +357,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 self.run_post_durable_hook("save_runtime_session", &saved.id);
                 self.cache.insert(
                     saved.id.clone(),
-                    Arc::new(parking_lot::RwLock::new(saved.clone())),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
                 );
             })
             .await
@@ -370,7 +371,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 if committed {
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
             })
@@ -393,7 +394,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                     self.run_post_durable_hook("permission_posture_activation", &saved.id);
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 },
             )
@@ -414,25 +415,26 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 // persistence and is therefore preserved alongside the cached
                 // messages, matching the V2 sidecar overlay contract.
                 if let Some(cached) = self.cache.get(&saved.id) {
-                    let mut cached = cached.write();
-                    let messages = cached.messages.clone();
-                    let provider_transcript = cached.provider_transcript.clone();
-                    let admission = cached
-                        .runtime_metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.session_inbox_admission.clone());
-                    let mut refreshed = saved.clone();
-                    refreshed.messages = messages;
-                    refreshed.provider_transcript = provider_transcript;
-                    if let Some(admission) = admission {
-                        refreshed
+                    cached.update(|cached| {
+                        let messages = cached.messages.clone();
+                        let provider_transcript = cached.provider_transcript.clone();
+                        let admission = cached
                             .runtime_metadata
-                            .get_or_insert_with(Default::default)
-                            .session_inbox_admission = Some(admission);
-                    } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
-                        metadata.session_inbox_admission = None;
-                    }
-                    *cached = refreshed;
+                            .as_ref()
+                            .and_then(|metadata| metadata.session_inbox_admission.clone());
+                        let mut refreshed = saved.clone();
+                        refreshed.messages = messages;
+                        refreshed.provider_transcript = provider_transcript;
+                        if let Some(admission) = admission {
+                            refreshed
+                                .runtime_metadata
+                                .get_or_insert_with(Default::default)
+                                .session_inbox_admission = Some(admission);
+                        } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+                            metadata.session_inbox_admission = None;
+                        }
+                        *cached = refreshed;
+                    });
                 }
             })
             .await
@@ -467,9 +469,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 // in memory cannot be replaced by a stale whole-control-
                 // plane snapshot.
                 if let Some(cached) = self.cache.get(session_id) {
-                    let mut cached = cached.write();
-                    cached.set_task_list(task_list.clone());
-                    cached.set_task_list_version_meta(version.to_string());
+                    cached.update(|cached| {
+                        cached.set_task_list(task_list.clone());
+                        cached.set_task_list_version_meta(version.to_string());
+                    });
                 }
             })
             .await;
@@ -503,9 +506,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 version,
                 |_| {
                     if let Some(cached) = self.cache.get(session_id) {
-                        let mut cached = cached.write();
-                        cached.set_task_list(task_list.clone());
-                        cached.set_task_list_version_meta(version.to_string());
+                        cached.update(|cached| {
+                            cached.set_task_list(task_list.clone());
+                            cached.set_task_list_version_meta(version.to_string());
+                        });
                     }
                 },
             )
@@ -532,9 +536,10 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 |_, _| {
                     for id in [session_id, shared_session_id] {
                         if let Some(cached) = self.cache.get(id) {
-                            let mut cached = cached.write();
-                            cached.set_task_list(task_list.clone());
-                            cached.set_task_list_version_meta(version.to_string());
+                            cached.update(|cached| {
+                                cached.set_task_list(task_list.clone());
+                                cached.set_task_list_version_meta(version.to_string());
+                            });
                         }
                     }
                 },
@@ -556,7 +561,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 if committed {
                     self.cache.insert(
                         saved.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(saved.clone())),
+                        Arc::new(crate::SessionSnapshot::new(saved.clone())),
                     );
                 }
             })
@@ -582,7 +587,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 self.run_post_durable_hook("clear_legacy", session_id);
                 self.cache.insert(
                     session_id.to_string(),
-                    Arc::new(parking_lot::RwLock::new(latest.clone())),
+                    Arc::new(crate::SessionSnapshot::new(latest.clone())),
                 );
             })
             .await
@@ -708,7 +713,7 @@ mod tests {
     }
 
     fn test_repo(storage: Arc<dyn Storage>) -> SessionRepository {
-        let cache: SessionCache = Arc::new(dashmap::DashMap::new());
+        let cache: SessionCache = Arc::default();
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
         SessionRepository::new(cache, storage, persistence)
     }
@@ -716,7 +721,7 @@ mod tests {
     fn cache_put(repo: &SessionRepository, session: &Session) {
         repo.cache().insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(crate::SessionSnapshot::new(session.clone())),
         );
     }
 

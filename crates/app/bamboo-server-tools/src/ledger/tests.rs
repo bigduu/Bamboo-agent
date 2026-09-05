@@ -70,11 +70,11 @@ fn build_tool_with_optional_session(
     session: Option<Session>,
     project_store: Option<Arc<bamboo_projects::ProjectStore>>,
 ) -> (LedgerTool, Arc<dyn Storage>) {
-    let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions: bamboo_engine::SessionCache = Arc::default();
     if let Some(session) = session {
         sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session)),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
     }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());

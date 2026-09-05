@@ -34,16 +34,7 @@ use crate::session_activation::{
     SessionActivationRouter, SessionRunRegistration, SessionRunRegistrationError,
 };
 
-/// Shared, per-session-locked session cache.
-///
-/// A `DashMap` gives each session id its own shard-level lock (so unrelated
-/// sessions never contend), and the inner `parking_lot::RwLock` is a *sync*
-/// lock held only to briefly clone-out or mutate-and-write-back a single
-/// `Session` — never across an `.await`. Using a sync lock makes "no guard
-/// across await" a compile-time guarantee in Send futures.
-pub type SessionCache = std::sync::Arc<
-    dashmap::DashMap<String, std::sync::Arc<parking_lot::RwLock<bamboo_agent_core::Session>>>,
->;
+pub use crate::session_cache::SessionCache;
 
 enum SessionExecutionActivationOwnership {
     /// This runtime was built without a SessionInbox activation router.
@@ -434,8 +425,8 @@ pub async fn reserve_session_execution(
     SessionExecutionReserveOutcome::Reserved(execution_reservation)
 }
 
-/// Read a session out of the in-memory cache, cloning it out from under the
-/// brief sync read-lock. Returns `None` on a cache miss.
+/// Read a consistent session snapshot without acquiring a session or index
+/// lock. Returns `None` on a cache miss.
 ///
 /// This is the single canonical cache-read used everywhere a caller holds a
 /// `SessionCache` (HTTP handlers, server tools, the app-state loader). It
@@ -1024,7 +1015,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Update memory cache.
             sessions_cache.insert(
                 session_id.clone(),
-                Arc::new(parking_lot::RwLock::new(session)),
+                Arc::new(crate::SessionSnapshot::new(session)),
             );
 
             if let (Some(handler), Some(parent_session_id), Some(status)) =

@@ -595,7 +595,7 @@ impl BambooRuntimeExecutor {
         // read_skill_resource) over its synced skills_dir, so it can pull a
         // skill's full SKILL.md — not just see the description. The orchestrator's
         // root surface has these; the worker previously only had the builtin set.
-        let worker_sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        let worker_sessions: bamboo_engine::SessionCache = Arc::default();
         let worker_runners = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let worker_event_senders =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));

@@ -50,7 +50,7 @@ pub(super) async fn save_and_cache_session(
 
     state.sessions.insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     Ok(())
 }

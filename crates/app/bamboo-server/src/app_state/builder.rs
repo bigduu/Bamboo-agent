@@ -279,7 +279,7 @@ impl AppState {
         ));
 
         // In-memory session cache (shared across handlers and background jobs).
-        let sessions: bamboo_engine::SessionCache = Arc::new(dashmap::DashMap::new());
+        let sessions: bamboo_engine::SessionCache = Arc::default();
 
         // Embed the mailbox bus (broker) in-process unless an external one is
         // configured. Mutates `config.subagents.broker` to point at the loopback
