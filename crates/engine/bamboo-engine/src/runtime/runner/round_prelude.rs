@@ -14,7 +14,8 @@ use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 
 use super::prompt_context::{
-    refresh_external_memory_context, PromptMemoryRuntimeContext, PROMPT_MEMORY_OBSERVABILITY_KEY,
+    refresh_external_memory_context, PromptMemoryExposureProvenance, PromptMemoryRuntimeContext,
+    PROMPT_MEMORY_OBSERVABILITY_KEY,
 };
 use super::session_setup::prompt_setup::{persist_prompt_snapshot_metadata, PromptAssemblyReport};
 use bamboo_agent_core::PromptSnapshot;
@@ -46,9 +47,9 @@ pub(crate) async fn refresh_round_prompt_context(
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&crate::project_context::ProjectContextResolver>,
     app_data_dir: Option<&std::path::Path>,
-) -> Result<(), AgentError> {
+) -> Result<PromptMemoryExposureProvenance, AgentError> {
     refresh_project_context(session, project_context_resolver).await?;
-    refresh_external_memory_context(
+    let prompt_memory_exposure = refresh_external_memory_context(
         session,
         memory,
         prompt_memory_flags,
@@ -72,7 +73,7 @@ pub(crate) async fn refresh_round_prompt_context(
         persist_round_prompt_metadata(session, &prompt);
         log_round_prompt_refresh_summary(session_id.as_str(), &prompt);
     }
-    Ok(())
+    Ok(prompt_memory_exposure)
 }
 
 async fn refresh_project_context(
@@ -101,7 +102,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
-) -> Result<(), AgentError> {
+) -> Result<PromptMemoryExposureProvenance, AgentError> {
     if let Some(notifications) = config.session_activation_notifications.as_ref() {
         let mut receiver = notifications.lock();
         if receiver.has_changed().unwrap_or(false) {
@@ -143,7 +144,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         session.messages.len(),
     )?;
 
-    refresh_round_prompt_context(
+    let prompt_memory_exposure = refresh_round_prompt_context(
         session,
         &config.memory_store,
         config.prompt_memory_flags,
@@ -162,7 +163,8 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         metrics_collector,
         &session.id,
         session.messages.len(),
-    )
+    )?;
+    Ok(prompt_memory_exposure)
 }
 
 // ---- round_state functions ----

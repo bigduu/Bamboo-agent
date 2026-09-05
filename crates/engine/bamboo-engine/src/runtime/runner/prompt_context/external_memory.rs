@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,6 +12,9 @@ use bamboo_memory::ledger_store::{AgendaItem, AgendaSnapshot, LedgerStore};
 use bamboo_memory::memory_store::{
     render_memory_freshness_note, truncate_chars as memory_truncate_chars, FreshnessKind,
     MemoryRecallCandidate, MemoryRecallOptions, MemoryScope, MemoryStore, TemporalGranularity,
+};
+use bamboo_metrics::types::{
+    PromptMemoryExposureItem, PromptMemoryExposureObservation, PromptMemoryRecallOutcome,
 };
 
 use super::memory_rerank::{
@@ -104,6 +108,7 @@ struct RelevantMemorySnippet {
 struct RelevantMemoryLoadResult {
     snippets: Vec<RelevantMemorySnippet>,
     strategy: MemoryRecallStrategy,
+    outcome: PromptMemoryRecallOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -118,12 +123,75 @@ pub(crate) struct PromptMemoryRuntimeContext {
     pub background_model_name: Option<String>,
 }
 
+/// Engine-private, execution-local provenance for the final compact memories
+/// selected during this round's trusted prompt refresh.
+///
+/// This value is returned directly to the runner and never stored in Session
+/// metadata, so an HTTP metadata patch cannot forge the metrics observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptMemoryExposureProvenance {
+    project_id: Option<String>,
+    recall_enabled: bool,
+    query_present: bool,
+    recall_outcome: PromptMemoryRecallOutcome,
+    all_compact_exposed_count: u32,
+    project_exposed_count: u32,
+    out_of_project_only: bool,
+    compact_section_chars: u32,
+    project_items: Vec<PromptMemoryExposureItem>,
+}
+
+impl PromptMemoryExposureProvenance {
+    pub(crate) fn observation(
+        &self,
+        round_id: &str,
+        session_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> PromptMemoryExposureObservation {
+        PromptMemoryExposureObservation {
+            schema_version: 1,
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            project_id: self.project_id.clone(),
+            observed_at,
+            recall_enabled: self.recall_enabled,
+            query_present: self.query_present,
+            recall_outcome: self.recall_outcome,
+            all_compact_exposed_count: self.all_compact_exposed_count,
+            project_exposed_count: self.project_exposed_count,
+            out_of_project_only: self.out_of_project_only,
+            compact_section_chars: self.compact_section_chars,
+            project_items: self.project_items.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn supported_empty_for_test(project_id: Option<&str>) -> Self {
+        Self {
+            project_id: project_id.map(str::to_string),
+            recall_enabled: false,
+            query_present: false,
+            recall_outcome: PromptMemoryRecallOutcome::Disabled,
+            all_compact_exposed_count: 0,
+            project_exposed_count: 0,
+            out_of_project_only: false,
+            compact_section_chars: 0,
+            project_items: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ExternalMemoryRenderParts {
     session_note_section: String,
     #[allow(dead_code)]
     ledger_agenda_section: String,
     relevant_memory_section: String,
+    /// Typed records that survived the final granularity reorder and render
+    /// budget, in their provider-visible order. This is deliberately separate
+    /// from the rendered markdown so exposure telemetry never reparses prompt
+    /// text (including older compact text retained in the context ledger).
+    rendered_relevant_memories: Vec<RelevantMemorySnippet>,
     project_memory_index_section: String,
     project_dream_section: String,
     global_dream_fallback_section: String,
@@ -180,7 +248,7 @@ pub(super) async fn refresh_external_memory_context(
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
     app_data_dir: Option<&Path>,
-) {
+) -> PromptMemoryExposureProvenance {
     refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
@@ -189,7 +257,7 @@ pub(super) async fn refresh_external_memory_context(
         project_context_resolver,
         app_data_dir,
     )
-    .await;
+    .await
 }
 
 #[cfg(test)]
@@ -198,7 +266,7 @@ pub(super) async fn refresh_external_memory_context_with_store(
     memory: &MemoryStore,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
-) {
+) -> PromptMemoryExposureProvenance {
     refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
@@ -207,7 +275,7 @@ pub(super) async fn refresh_external_memory_context_with_store(
         None,
         None,
     )
-    .await;
+    .await
 }
 
 #[cfg(test)]
@@ -217,7 +285,7 @@ pub(super) async fn refresh_external_memory_context_with_stores(
     ledger_data_dir: &Path,
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
-) {
+) -> PromptMemoryExposureProvenance {
     refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
@@ -226,7 +294,7 @@ pub(super) async fn refresh_external_memory_context_with_stores(
         None,
         Some(ledger_data_dir),
     )
-    .await;
+    .await
 }
 
 #[cfg(test)]
@@ -236,7 +304,7 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
     prompt_memory_flags: PromptMemoryFlags,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
-) {
+) -> PromptMemoryExposureProvenance {
     refresh_external_memory_context_with_store_resolver_and_ledger(
         session,
         memory,
@@ -245,7 +313,7 @@ pub(super) async fn refresh_external_memory_context_with_store_and_resolver(
         project_context_resolver,
         None,
     )
-    .await;
+    .await
 }
 
 async fn refresh_external_memory_context_with_store_resolver_and_ledger(
@@ -255,7 +323,7 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
     runtime_context: Option<&PromptMemoryRuntimeContext>,
     project_context_resolver: Option<&ProjectContextResolver>,
     ledger_data_dir: Option<&Path>,
-) {
+) -> PromptMemoryExposureProvenance {
     // Computed each round and cached in a session field (NOT injected into the
     // system message), so a per-round memory change never invalidates the cached
     // system prefix; the request assembler reads the field to build a volatile
@@ -316,6 +384,7 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         RelevantMemoryLoadResult {
             snippets: Vec::new(),
             strategy: MemoryRecallStrategy::Lexical,
+            outcome: PromptMemoryRecallOutcome::Disabled,
         }
     };
     let relevant_memory_snippets = relevant_memory_result.snippets.clone();
@@ -345,6 +414,34 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         project_dream.as_ref(),
         global_dream_fallback.as_ref(),
     );
+    let all_compact_exposed_count = render_parts.rendered_relevant_memories.len() as u32;
+    let project_items = render_parts
+        .rendered_relevant_memories
+        .iter()
+        .enumerate()
+        .filter(|(_, snippet)| {
+            resolved_project_scope.is_some() && snippet.scope.as_str() == "project"
+        })
+        .map(|(index, snippet)| PromptMemoryExposureItem {
+            memory_id: snippet.id.clone(),
+            scope: "project".to_string(),
+            status_at_observation: snippet.status.clone(),
+            rank: index as u32 + 1,
+            rendered_chars: count_chars(&render_relevant_memory_item(snippet)) as u32,
+        })
+        .collect::<Vec<_>>();
+    let project_exposed_count = project_items.len() as u32;
+    let prompt_memory_exposure = PromptMemoryExposureProvenance {
+        project_id: resolved_project_key.clone(),
+        recall_enabled: prompt_memory_flags.relevant_recall,
+        query_present: latest_user_query_present,
+        recall_outcome: relevant_memory_result.outcome,
+        all_compact_exposed_count,
+        project_exposed_count,
+        out_of_project_only: all_compact_exposed_count > 0 && project_exposed_count == 0,
+        compact_section_chars: count_chars(&render_parts.relevant_memory_section) as u32,
+        project_items,
+    };
     if let Some(agenda) = &ledger_agenda {
         tracing::debug!(
             "[{}] Ledger agenda injected: items={}, chars={}",
@@ -409,6 +506,7 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         observability.dream_source,
         observability.external_memory_section_chars,
     );
+    prompt_memory_exposure
 }
 
 /// Load the agenda from Bamboo's ledger store. Jiandu memory owns a separate
@@ -610,6 +708,7 @@ async fn load_relevant_memory_snippets(
         return RelevantMemoryLoadResult {
             snippets: Vec::new(),
             strategy: MemoryRecallStrategy::Lexical,
+            outcome: PromptMemoryRecallOutcome::NoQuery,
         };
     };
 
@@ -652,8 +751,16 @@ async fn load_relevant_memory_snippets(
             return RelevantMemoryLoadResult {
                 snippets: Vec::new(),
                 strategy: MemoryRecallStrategy::Lexical,
+                outcome: PromptMemoryRecallOutcome::LookupError,
             };
         }
+    };
+
+    let outcome = match (selection.strategy, selection.candidates.is_empty()) {
+        (MemoryRecallStrategy::Lexical, true) => PromptMemoryRecallOutcome::NoMatch,
+        (MemoryRecallStrategy::Lexical, false) => PromptMemoryRecallOutcome::Lexical,
+        (MemoryRecallStrategy::Reranked, _) => PromptMemoryRecallOutcome::Reranked,
+        (MemoryRecallStrategy::RerankFallback, _) => PromptMemoryRecallOutcome::RerankFallback,
     };
 
     let mut rendered = Vec::new();
@@ -677,6 +784,7 @@ async fn load_relevant_memory_snippets(
     RelevantMemoryLoadResult {
         snippets: rendered,
         strategy: selection.strategy,
+        outcome,
     }
 }
 
@@ -805,11 +913,15 @@ fn build_external_memory_render_parts(
     let ledger_agenda_section = ledger_agenda
         .map(render_ledger_agenda_section)
         .unwrap_or_default();
-    let relevant_memory_section = if relevant_memory_snippets.is_empty() {
-        String::new()
+    let relevant_memory_render = if relevant_memory_snippets.is_empty() {
+        RelevantMemoryRender::default()
     } else {
-        render_relevant_memory_section(relevant_memory_snippets)
+        render_relevant_memory_section_with_budget(
+            relevant_memory_snippets,
+            RELEVANT_MEMORY_TOTAL_MAX_CHARS,
+        )
     };
+    let relevant_memory_section = relevant_memory_render.section;
     let project_memory_index_section = project_memory_index
         .map(render_project_memory_index_section)
         .unwrap_or_default();
@@ -896,6 +1008,7 @@ fn build_external_memory_render_parts(
         session_note_section,
         ledger_agenda_section,
         relevant_memory_section,
+        rendered_relevant_memories: relevant_memory_render.kept_snippets,
         project_memory_index_section,
         project_dream_section,
         global_dream_fallback_section,
@@ -1171,7 +1284,16 @@ fn render_relevant_memory_item(snippet: &RelevantMemorySnippet) -> String {
 /// `TemporalGranularity::is_high_churn`), the suffix segment is empty and
 /// `segments.combined()` degenerates to exactly the old flat concatenation in the
 /// same relative order, with no separator inserted.
-fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+#[derive(Debug, Clone, Default)]
+struct RelevantMemoryRender {
+    section: String,
+    kept_snippets: Vec<RelevantMemorySnippet>,
+}
+
+fn render_relevant_memory_section_with_budget(
+    snippets: &[RelevantMemorySnippet],
+    total_budget_chars: usize,
+) -> RelevantMemoryRender {
     let mut section = String::new();
     section.push_str("### Relevant Durable Memories\n");
     section.push_str(
@@ -1188,13 +1310,38 @@ fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String 
             )
         })
         .collect();
-    let segments = segment_by_granularity_budget(&items, RELEVANT_MEMORY_TOTAL_MAX_CHARS);
+    let segments = segment_by_granularity_budget(&items, total_budget_chars);
+    let dropped_ids = segments
+        .prefix_dropped_ids
+        .iter()
+        .chain(segments.suffix_dropped_ids.iter())
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let kept_snippets = snippets
+        .iter()
+        .filter(|snippet| !TemporalGranularity::is_high_churn(snippet.granularity))
+        .chain(
+            snippets
+                .iter()
+                .filter(|snippet| TemporalGranularity::is_high_churn(snippet.granularity)),
+        )
+        .filter(|snippet| !dropped_ids.contains(snippet.id.as_str()))
+        .cloned()
+        .collect();
     // `combined()` is prefix followed by suffix with no separator — for the
     // all-coarse case the suffix is empty and this is byte-identical to the old
     // flat per-snippet loop.
     section.push_str(&segments.combined());
     section.push('\n');
-    section
+    RelevantMemoryRender {
+        section,
+        kept_snippets,
+    }
+}
+
+#[cfg(test)]
+fn render_relevant_memory_section(snippets: &[RelevantMemorySnippet]) -> String {
+    render_relevant_memory_section_with_budget(snippets, RELEVANT_MEMORY_TOTAL_MAX_CHARS).section
 }
 
 fn render_project_memory_index_section(snippet: &ProjectMemoryIndexSnippet) -> String {
@@ -1421,7 +1568,11 @@ mod granularity_prompt_wiring_tests {
             "year summary",
         );
 
-        let section = render_relevant_memory_section(&[day, year]);
+        let rendered = render_relevant_memory_section_with_budget(
+            &[day, year],
+            RELEVANT_MEMORY_TOTAL_MAX_CHARS,
+        );
+        let section = rendered.section;
 
         let day_pos = section
             .find("Day Title Marker")
@@ -1433,6 +1584,53 @@ mod granularity_prompt_wiring_tests {
             year_pos < day_pos,
             "coarse (year) memory must render before fine (day) memory"
         );
+        assert_eq!(
+            rendered
+                .kept_snippets
+                .iter()
+                .map(|snippet| snippet.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["year-1", "day-1"],
+            "typed provenance order must match final provider-visible render order"
+        );
+    }
+
+    #[test]
+    fn typed_provenance_excludes_items_dropped_by_the_final_render_budget() {
+        let day = snippet(
+            "day-dropped",
+            Some(TemporalGranularity::Day),
+            "Day Dropped Marker",
+            "day summary",
+        );
+        let year = snippet(
+            "year-kept",
+            Some(TemporalGranularity::Year),
+            "Year Kept Marker",
+            "year summary",
+        );
+        let quarter = snippet(
+            "quarter-dropped",
+            Some(TemporalGranularity::Quarter),
+            "Quarter Dropped Marker",
+            "quarter summary",
+        );
+        let year_chars = count_chars(&render_relevant_memory_item(&year));
+
+        let rendered =
+            render_relevant_memory_section_with_budget(&[day, year, quarter], year_chars);
+
+        assert_eq!(
+            rendered
+                .kept_snippets
+                .iter()
+                .map(|snippet| snippet.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["year-kept"],
+        );
+        assert!(rendered.section.contains("Year Kept Marker"));
+        assert!(!rendered.section.contains("Quarter Dropped Marker"));
+        assert!(!rendered.section.contains("Day Dropped Marker"));
     }
 
     #[test]

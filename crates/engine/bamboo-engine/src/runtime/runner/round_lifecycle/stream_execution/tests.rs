@@ -18,7 +18,10 @@ use bamboo_llm::{
     Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
     ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
 };
+use bamboo_metrics::storage::MetricsStorage;
 use chrono::Utc;
+
+use super::super::PromptMemoryExposureFrame;
 
 fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
     let guard = crate::runtime::tests::env_cache_lock_acquire();
@@ -197,6 +200,75 @@ fn test_config(system_prompt: &str) -> crate::runtime::config::AgentLoopConfig {
     }
 }
 
+async fn prompt_exposure_metrics(
+    session_id: &str,
+    round_id: &str,
+) -> (
+    tempfile::TempDir,
+    bamboo_metrics::MetricsCollector,
+    Arc<bamboo_metrics::SqliteMetricsStorage>,
+) {
+    let directory = tempfile::tempdir().expect("metrics tempdir");
+    let storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+        directory.path().join("metrics.db"),
+    ));
+    storage.init().await.expect("initialize metrics storage");
+    storage
+        .upsert_session_start(session_id, "test-model", Utc::now())
+        .await
+        .expect("insert owning session");
+    storage
+        .insert_round_start(round_id, session_id, "test-model", Utc::now())
+        .await
+        .expect("insert owning round");
+    let collector = bamboo_metrics::MetricsCollector::spawn(storage.clone(), 90);
+    (directory, collector, storage)
+}
+
+async fn wait_for_prompt_exposure(
+    storage: &bamboo_metrics::SqliteMetricsStorage,
+    round_id: &str,
+) -> bamboo_metrics::types::PromptMemoryExposureObservation {
+    for _ in 0..100 {
+        if let Some(observation) = storage
+            .prompt_memory_exposure(round_id)
+            .await
+            .expect("query prompt-memory exposure")
+        {
+            return observation;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("prompt-memory observation was not persisted for {round_id}");
+}
+
+async fn assert_no_prompt_exposure_after_collector_barrier(
+    collector: &bamboo_metrics::MetricsCollector,
+    storage: &bamboo_metrics::SqliteMetricsStorage,
+    session_id: &str,
+    round_id: &str,
+) {
+    const BARRIER_MESSAGE_COUNT: u32 = 42_077_107;
+    collector.session_message_count(session_id, BARRIER_MESSAGE_COUNT, Utc::now());
+    for _ in 0..100 {
+        let barrier_reached = storage
+            .session_detail(session_id)
+            .await
+            .expect("query collector barrier")
+            .is_some_and(|detail| detail.session.message_count == BARRIER_MESSAGE_COUNT);
+        if barrier_reached {
+            assert!(storage
+                .prompt_memory_exposure(round_id)
+                .await
+                .expect("query prompt-memory exposure after barrier")
+                .is_none());
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("metrics collector barrier was not observed for {session_id}");
+}
+
 /// The system field that a base prompt resolves to once the framework-invariant
 /// agent directives are folded in — mirrors what `build_stable_prompt_frame_*`
 /// produces for a bare base (no workspace/env/skill/tool-guide contexts).
@@ -307,6 +379,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -376,6 +449,110 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
 }
 
 #[tokio::test]
+async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BoundaryCase {
+        BootstrapError,
+        PreCancelled,
+        StreamError,
+    }
+
+    struct BoundaryProvider(BoundaryCase);
+
+    #[async_trait]
+    impl LLMProvider for BoundaryProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            match self.0 {
+                BoundaryCase::BootstrapError => Err(bamboo_llm::provider::LLMError::Api(
+                    "injected bootstrap error".to_string(),
+                )),
+                BoundaryCase::PreCancelled => Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)]))),
+                BoundaryCase::StreamError => Ok(Box::pin(stream::iter(vec![Err(
+                    bamboo_llm::provider::LLMError::Stream("injected frame error".to_string()),
+                )]))),
+            }
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    for case in [
+        BoundaryCase::BootstrapError,
+        BoundaryCase::PreCancelled,
+        BoundaryCase::StreamError,
+    ] {
+        let session_id = format!("prompt-exposure-boundary-{case:?}");
+        let round_id = format!("{session_id}-run-test-round-1");
+        let (_metrics_dir, collector, storage) =
+            prompt_exposure_metrics(&session_id, &round_id).await;
+        let mut config = test_config("system");
+        config.metrics_collector = Some(collector.clone());
+        let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
+        let prepared_context = PreparedContext {
+            messages: vec![Message::system("system")],
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        let cancel = CancellationToken::new();
+        if case == BoundaryCase::PreCancelled {
+            cancel.cancel();
+        }
+        let provider: Arc<dyn LLMProvider> = Arc::new(BoundaryProvider(case));
+        let mut session = Session::new(&session_id, "test-model");
+
+        let result = execute_llm_stream(
+            &mut session,
+            &config,
+            &provider,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                session_id: &session_id,
+                model: "test-model",
+                provider_name: None,
+                provider_type: None,
+                reasoning_effort: None,
+                max_context_tokens: 400_000,
+                max_output_tokens: 128,
+                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                    round_id: &round_id,
+                    provenance: &provenance,
+                }),
+            },
+        )
+        .await;
+        assert!(result.is_err(), "{case:?} must fail the stream execution");
+
+        if case == BoundaryCase::StreamError {
+            assert!(wait_for_prompt_exposure(storage.as_ref(), &round_id)
+                .await
+                .project_items
+                .is_empty());
+        } else {
+            assert_no_prompt_exposure_after_collector_barrier(
+                &collector,
+                storage.as_ref(),
+                &session_id,
+                &round_id,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
     struct FailOncePersistence(std::sync::atomic::AtomicUsize);
 
@@ -392,7 +569,9 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
     }
 
     let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("session-ledger-checkpoint-failure", "test-model");
+    let session_id = "session-ledger-checkpoint-failure";
+    let round_id = "session-ledger-checkpoint-failure-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
     let assistant = Message::assistant("prior native response", None);
     let anchor = assistant.id.clone();
     session.add_message(assistant);
@@ -421,6 +600,9 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
     let mut config = test_config("system");
     let persistence = Arc::new(FailOncePersistence(std::sync::atomic::AtomicUsize::new(0)));
     config.persistence = Some(persistence.clone());
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
     let prepared_context = PreparedContext {
         messages: vec![Message::system("system"), Message::user("continue")],
         token_usage: usage(0, 22),
@@ -442,13 +624,17 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &LlmStreamFrame {
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
-            session_id: "session-ledger-checkpoint-failure",
+            session_id,
             model: "test-model",
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
         },
     )
     .await;
@@ -473,6 +659,13 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         session.provider_transcript, previous_provider_transcript,
         "native invalidation and model-context reset must roll back together"
     );
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
 
     execute_llm_stream(
         &mut session,
@@ -483,13 +676,17 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         &LlmStreamFrame {
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
-            session_id: "session-ledger-checkpoint-failure",
+            session_id,
             model: "test-model",
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
         },
     )
     .await
@@ -500,6 +697,12 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
         "retry must not bypass the failed durable checkpoint"
     );
     assert!(*llm.ir_invoked.lock().expect("ir_invoked lock"));
+    assert_eq!(
+        wait_for_prompt_exposure(storage.as_ref(), round_id)
+            .await
+            .recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+    );
 }
 
 #[tokio::test]
@@ -647,6 +850,7 @@ async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
                     reasoning_effort: None,
                     max_context_tokens: 400_000,
                     max_output_tokens: 128,
+                    prompt_memory_exposure: None,
                 },
             )
             .await
@@ -760,6 +964,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -1152,6 +1357,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -1244,6 +1450,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -1283,7 +1490,9 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
 #[tokio::test]
 async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch() {
     let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("session-ledger-final-budget", "test-model");
+    let session_id = "session-ledger-final-budget";
+    let round_id = "session-ledger-final-budget-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
     session.task_list = Some(TaskList {
         session_id: session.id.clone(),
         title: "Agent Tasks".to_string(),
@@ -1296,7 +1505,10 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
         created_at: Utc::now(),
         updated_at: Utc::now(),
     });
-    let config = test_config("system");
+    let mut config = test_config("system");
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
     let prepared_context = PreparedContext {
         messages: vec![Message::system("system"), Message::user("continue")],
         token_usage: usage(0, 24),
@@ -1334,13 +1546,17 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
         &LlmStreamFrame {
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
-            session_id: "session-ledger-final-budget",
+            session_id,
             model: "test-model",
             provider_name: Some("openai"),
             provider_type: Some("openai"),
             reasoning_effort: None,
             max_context_tokens: 2_000,
             max_output_tokens: 200,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
         },
     )
     .await;
@@ -1352,13 +1568,25 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
         .expect("messages lock")
         .is_empty());
     assert_eq!(session.model_context_state, inflated_state);
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatch() {
     let _env_lock = isolate_prompt_safe_env_cache();
-    let mut session = Session::new("session-schema-final-budget", "test-model");
-    let config = test_config("system");
+    let session_id = "session-schema-final-budget";
+    let round_id = "session-schema-final-budget-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
+    let mut config = test_config("system");
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
     let prepared_context = PreparedContext {
         messages: vec![Message::system("system"), Message::user("continue")],
         token_usage: usage(0, 24),
@@ -1395,13 +1623,17 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
         &LlmStreamFrame {
             event_tx: &event_tx,
             cancel_token: &CancellationToken::new(),
-            session_id: "session-schema-final-budget",
+            session_id,
             model: "test-model",
             provider_name: Some("test"),
             provider_type: Some("test"),
             reasoning_effort: None,
             max_context_tokens: 1_000,
             max_output_tokens: 200,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
         },
     )
     .await;
@@ -1425,6 +1657,13 @@ async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatc
         .lock()
         .expect("messages lock")
         .is_empty());
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1543,6 +1782,7 @@ async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
         reasoning_effort: None,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        prompt_memory_exposure: None,
     };
     execute_llm_stream(
         &mut session,
@@ -1982,6 +2222,7 @@ async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_g
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3204,6 +3445,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3367,6 +3609,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3462,6 +3705,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3548,6 +3792,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3648,6 +3893,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await
@@ -3757,6 +4003,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
             reasoning_effort: None,
             max_context_tokens: 400_000,
             max_output_tokens: 128,
+            prompt_memory_exposure: None,
         },
     )
     .await

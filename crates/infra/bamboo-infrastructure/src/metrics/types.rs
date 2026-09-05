@@ -191,6 +191,100 @@ pub struct SessionDetail {
     pub rounds: Vec<RoundMetrics>,
 }
 
+/// Outcome of Bamboo's automatic compact-memory recall at the prompt boundary.
+///
+/// This describes host-side selection only. It does not claim that a provider
+/// processed the request or that the model adopted any recalled fact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMemoryRecallOutcome {
+    /// Automatic relevant-memory recall was disabled for this round.
+    Disabled,
+    /// Recall was enabled, but there was no user query to search with.
+    NoQuery,
+    /// Recall completed successfully and found no candidate.
+    NoMatch,
+    /// The canonical memory lookup failed.
+    LookupError,
+    /// Deterministic lexical selection was used.
+    Lexical,
+    /// Model reranking selected the final compact records.
+    Reranked,
+    /// Model reranking failed and lexical selection was used instead.
+    RerankFallback,
+}
+
+impl PromptMemoryRecallOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoQuery => "no_query",
+            Self::NoMatch => "no_match",
+            Self::LookupError => "lookup_error",
+            Self::Lexical => "lexical",
+            Self::Reranked => "reranked",
+            Self::RerankFallback => "rerank_fallback",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "disabled" => Some(Self::Disabled),
+            "no_query" => Some(Self::NoQuery),
+            "no_match" => Some(Self::NoMatch),
+            "lookup_error" => Some(Self::LookupError),
+            "lexical" => Some(Self::Lexical),
+            "reranked" => Some(Self::Reranked),
+            "rerank_fallback" => Some(Self::RerankFallback),
+            _ => None,
+        }
+    }
+}
+
+/// One Project-scoped compact memory included in an observed provider request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptMemoryExposureItem {
+    /// Opaque canonical Jiandu record identity.
+    pub memory_id: String,
+    /// Scope at observation time. Schema v1 accepts only `project` items.
+    pub scope: String,
+    /// Coarse lifecycle status at observation time.
+    pub status_at_observation: String,
+    /// One-based position in the final compact-memory request ordering.
+    pub rank: u32,
+    /// Characters in this item's final rendered compact representation.
+    pub rendered_chars: u32,
+}
+
+/// First successfully bootstrapped compact-memory prompt observation for one
+/// execution-scoped logical round.
+///
+/// Metrics delivery remains best-effort. A row proves only that Bamboo reached
+/// its provider-stream bootstrap boundary with these compact records; it is not
+/// a durable delivery acknowledgement or evidence of model adoption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptMemoryExposureObservation {
+    pub schema_version: u32,
+    pub round_id: String,
+    pub session_id: String,
+    /// Server-resolved Project identity, absent for an unbound round.
+    pub project_id: Option<String>,
+    pub observed_at: DateTime<Utc>,
+    pub recall_enabled: bool,
+    pub query_present: bool,
+    pub recall_outcome: PromptMemoryRecallOutcome,
+    /// All final compact relevant-memory records, including Global fallback.
+    pub all_compact_exposed_count: u32,
+    /// Final Project records persisted in `project_items`.
+    pub project_exposed_count: u32,
+    /// True when the final compact set was non-empty but contained no Project item.
+    pub out_of_project_only: bool,
+    /// Characters in the final rendered relevant-memory section.
+    pub compact_section_chars: u32,
+    /// Project-only opaque identities. Global identities are never persisted.
+    pub project_items: Vec<PromptMemoryExposureItem>,
+}
+
 /// Aggregated metrics for a single day
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DailyMetrics {
