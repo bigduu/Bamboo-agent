@@ -854,7 +854,7 @@ mod tests {
         storage.save_session(&session).await.unwrap();
         let storage: Arc<dyn Storage> = storage;
         SessionRepository::new(
-            Arc::new(dashmap::DashMap::new()),
+            bamboo_engine::SessionCache::default(),
             storage.clone(),
             Arc::new(LockedSessionStore::new(storage)),
         )
