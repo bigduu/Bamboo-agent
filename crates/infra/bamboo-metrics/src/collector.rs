@@ -109,7 +109,7 @@ impl MetricsCollector {
 
         // Do not abort the consumer on owner release: closing the producers
         // lets it finish initialization and drain accepted commands in order.
-        tokio::spawn(async move {
+        let consumer = tokio::spawn(async move {
             if let Err(error) = storage.init().await {
                 tracing::error!("metrics storage initialization failed: {}", error);
             }
@@ -271,7 +271,7 @@ impl MetricsCollector {
             }
         });
 
-        let scheduler = Self::schedule_prune(tx.downgrade(), retention_days);
+        let scheduler = Self::schedule_prune(tx.downgrade(), consumer, retention_days);
         Self {
             tx,
             _scheduler: Arc::new(scheduler),
@@ -495,12 +495,19 @@ impl MetricsCollector {
 
     fn schedule_prune(
         sender: mpsc::WeakUnboundedSender<CollectorCommand>,
+        mut consumer: tokio::task::JoinHandle<()>,
         retention_days: u32,
     ) -> PruneScheduler {
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
             loop {
-                interval.tick().await;
+                // Observe consumer exit even between ticks. Aborting this
+                // scheduler only drops the JoinHandle, detaching the consumer
+                // so accepted work still drains after the final owner drops.
+                tokio::select! {
+                    _ = &mut consumer => break,
+                    _ = interval.tick() => {}
+                }
                 // This temporary producer is dropped before the next timer
                 // wait, allowing the consumer to close after external owners go.
                 let Some(tx) = sender.upgrade() else {
@@ -687,8 +694,8 @@ mod tests {
     #[tokio::test]
     async fn scheduler_stops_on_closed_receiver_while_producer_survives() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let scheduler = MetricsCollector::schedule_prune(tx.downgrade(), 90);
-        drop(rx);
+        let consumer = tokio::spawn(async move { drop(rx) });
+        let scheduler = MetricsCollector::schedule_prune(tx.downgrade(), consumer, 90);
 
         tokio::time::timeout(StdDuration::from_secs(5), async {
             while !scheduler.task.is_finished() {
@@ -696,7 +703,39 @@ mod tests {
             }
         })
         .await
-        .expect("failed prune admission should terminate the scheduler");
+        .expect("closed receiver should terminate the scheduler");
+        assert_eq!(tx.strong_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_stops_between_ticks_when_consumer_exits_with_live_producer() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let first_tick = Arc::new(tokio::sync::Notify::new());
+        let finish_consumer = Arc::new(tokio::sync::Notify::new());
+        let consumer = tokio::spawn({
+            let first_tick = first_tick.clone();
+            let finish_consumer = finish_consumer.clone();
+            async move {
+                assert!(matches!(
+                    rx.recv().await,
+                    Some(CollectorCommand::Prune { .. })
+                ));
+                first_tick.notify_one();
+                finish_consumer.notified().await;
+            }
+        });
+        let scheduler = MetricsCollector::schedule_prune(tx.downgrade(), consumer, 90);
+
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            first_tick.notified().await;
+            assert!(!scheduler.task.is_finished());
+            finish_consumer.notify_one();
+            while !scheduler.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consumer exit should stop the scheduler before its next six-hour tick");
         assert_eq!(tx.strong_count(), 1);
     }
 }
