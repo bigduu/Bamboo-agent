@@ -39,6 +39,62 @@ fn mirror_to_account_feed(inbox: &Option<AccountFeedInbox>, session_id: &str, ev
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hundreds_of_child_streams_progress_while_global_registry_is_locked() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let mut streams = Vec::new();
+        for index in 0..512 {
+            let id = format!("child-{index}");
+            let mut runner = AgentRunner::new();
+            runner.status = super::super::runner_state::AgentStatus::Running;
+            let mut receiver = runner.event_sender.subscribe();
+            let sender = runner.event_sender.clone();
+            let run_id = runner.run_id.clone();
+            runners.write().await.insert(id.clone(), runner);
+            let (input, task) = create_event_forwarder(id, run_id, sender, runners.clone(), None);
+            assert!(matches!(
+                receiver.recv().await.unwrap(),
+                AgentEvent::ExecutionStarted { .. }
+            ));
+            streams.push((input, receiver, task));
+        }
+        let held_registry = runners.write().await;
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            futures::future::join_all(streams.iter_mut().map(|(input, receiver, _)| async move {
+                for _ in 0..64 {
+                    input
+                        .send(AgentEvent::Token {
+                            content: "delta".into(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                for _ in 0..64 {
+                    assert!(matches!(
+                        receiver.recv().await.unwrap(),
+                        AgentEvent::Token { .. }
+                    ));
+                }
+            }))
+            .await;
+        })
+        .await
+        .expect("independent token streams must not wait for registry ownership");
+        eprintln!(
+            "512 child streams / 32768 tokens with held registry: {:?}",
+            started.elapsed()
+        );
+        assert!(held_registry
+            .values()
+            .all(|runner| runner.last_activity_at().is_some()));
+        drop(held_registry);
+        for (input, _, task) in streams {
+            drop(input);
+            task.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn child_approval_change_routes_to_parent_account_envelope() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -145,19 +201,37 @@ pub fn create_event_forwarder(
             session_id: session_id.clone(),
             started_at: Utc::now().to_rfc3339(),
         };
-        {
+        let publication = {
             let runners = runners.read().await;
-            if runners
+            let Some(runner) = runners
                 .get(&session_id)
-                .is_none_or(|runner| runner.run_id != run_id)
-            {
+                .filter(|runner| runner.run_id == run_id)
+            else {
                 return;
-            }
+            };
             mirror_to_account_feed(&account_feed_inbox, &session_id, &started_event);
             let _ = broadcast_tx.send(started_event);
-        }
+            runner.event_publication.clone()
+        };
 
         while let Some(event) = mpsc_rx.recv().await {
+            let needs_runner_update = event.is_replayable_session_state()
+                || matches!(
+                    &event,
+                    AgentEvent::TokenBudgetUpdated { .. }
+                        | AgentEvent::ToolStart { .. }
+                        | AgentEvent::ToolLifecycle { .. }
+                        | AgentEvent::RunnerProgress { .. }
+                );
+            if !needs_runner_update {
+                if !publication.publish(|| {
+                    mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
+                    let _ = broadcast_tx.send(event);
+                }) {
+                    return;
+                }
+                continue;
+            }
             let mut runners = runners.write().await;
             let Some(runner) = runners
                 .get_mut(&session_id)
@@ -170,6 +244,7 @@ pub fn create_event_forwarder(
                 return;
             };
             runner.last_event_at = Some(Utc::now());
+            publication.touch();
 
             // Cache live state before publication so a subscriber installed
             // between a clarification pause and its response sees the exact

@@ -62,7 +62,7 @@ pub async fn running_sessions_snapshot(state: web::Data<AppState>) -> Result<Htt
                 round_count: runner.round_count,
                 last_tool_name: runner.last_tool_name.clone(),
                 last_tool_phase: runner.last_tool_phase.clone(),
-                last_event_at: runner.last_event_at.map(|t| t.to_rfc3339()),
+                last_event_at: runner.last_activity_at().map(|t| t.to_rfc3339()),
                 last_critical_events: runner.last_critical_events.clone(),
                 running_child_session_ids,
             })

@@ -364,7 +364,7 @@ async fn remove_runner_exact(
         .get(session_id)
         .is_some_and(|runner| runner.run_id == run_id)
     {
-        runners.remove(session_id);
+        super::runner_lifecycle::remove_runner_entry(&mut runners, session_id).await;
         true
     } else {
         false

@@ -599,6 +599,13 @@ impl BambooRuntimeExecutor {
         let worker_runners = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let worker_event_senders =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        bamboo_server::app_state::init::spawn_session_map_cleanup_task(
+            worker_runners.clone(),
+            worker_event_senders.clone(),
+            bamboo_server::app_state::watchers::SessionWatchers::new(),
+            worker_sessions.clone(),
+            Some("actor-worker"),
+        );
         let default_tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = {
             let session_repo = bamboo_engine::SessionRepository::new(
                 worker_sessions.clone(),

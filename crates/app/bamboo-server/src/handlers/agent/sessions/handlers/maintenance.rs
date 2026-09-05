@@ -200,7 +200,13 @@ pub async fn cleanup_sessions(
         {
             let mut runners = state.agent_runners.write().await;
             for session_id in &result.deleted_session_ids {
-                if let Some(runner) = runners.remove(session_id) {
+                if let Some(runner) =
+                    bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+                        &mut runners,
+                        session_id,
+                    )
+                    .await
+                {
                     runner.cancel_token.cancel();
                 }
             }
