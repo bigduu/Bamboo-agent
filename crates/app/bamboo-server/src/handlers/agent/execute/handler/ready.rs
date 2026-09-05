@@ -177,7 +177,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     }
     state.sessions.insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();

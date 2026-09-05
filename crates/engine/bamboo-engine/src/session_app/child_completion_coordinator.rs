@@ -593,7 +593,7 @@ impl ChildCompletionCoordinator {
         }
         self.sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(crate::SessionSnapshot::new(session.clone())),
         );
     }
 }
@@ -881,7 +881,7 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
         }
         self.sessions.insert(
             parent.id.clone(),
-            Arc::new(parking_lot::RwLock::new(parent.clone())),
+            Arc::new(crate::SessionSnapshot::new(parent.clone())),
         );
 
         // Capture before releasing the per-parent lock so the borrow checker
@@ -1370,7 +1370,7 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // replace the shared cache entry.
                         launch_sessions.insert(
                             launch_session_id,
-                            Arc::new(parking_lot::RwLock::new(launch_session)),
+                            Arc::new(crate::SessionSnapshot::new(launch_session)),
                         );
                         let request = ResumeSpawnRequest {
                             session_id: request_session_id,
@@ -1436,7 +1436,7 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                         // snapshot only after router ownership commits.
                         launch_sessions.insert(
                             launch_session_id,
-                            Arc::new(parking_lot::RwLock::new(launch_session)),
+                            Arc::new(crate::SessionSnapshot::new(launch_session)),
                         );
                         // Dropping a JoinHandle detaches the task. The captured
                         // combined reservation remains RAII-protected if the
@@ -2065,7 +2065,7 @@ impl ChildCompletionCoordinator {
             }
             self.sessions.insert(
                 resumable.id.clone(),
-                Arc::new(parking_lot::RwLock::new(resumable)),
+                Arc::new(crate::SessionSnapshot::new(resumable)),
             );
         }
 
@@ -2663,8 +2663,10 @@ impl ChildCompletionCoordinator {
                         "child-wait watchdog: failed to persist synthesized terminal status"
                     );
                 }
-                self.sessions
-                    .insert(child.id.clone(), Arc::new(parking_lot::RwLock::new(child)));
+                self.sessions.insert(
+                    child.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(child)),
+                );
             }
             Ok(None) => {}
             Err(load_error) => {
@@ -2935,7 +2937,7 @@ mod tests {
         let coordinator = Arc::new(ChildCompletionCoordinator::new(
             storage,
             locked,
-            Arc::new(dashmap::DashMap::new()),
+            Arc::default(),
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
             agent,

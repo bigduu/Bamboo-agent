@@ -498,7 +498,7 @@ pub async fn patch_session(
                 })?;
             state.sessions.insert(
                 session_id.clone(),
-                std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+                std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
             );
             if let Some(workspace) = session
                 .workspace_path_meta()
@@ -755,7 +755,7 @@ pub async fn patch_session(
             })?;
         state.sessions.insert(
             session_id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
         drop(guard);
 
@@ -1402,7 +1402,7 @@ mod tests {
             .expect("seed session");
         state.sessions.insert(
             session_id.to_string(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
     }
 
@@ -1577,7 +1577,7 @@ mod tests {
             .expect("persist session");
         state.sessions.insert(
             session.id.clone(),
-            std::sync::Arc::new(parking_lot::RwLock::new(session)),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
         let app = test::init_service(
             App::new()

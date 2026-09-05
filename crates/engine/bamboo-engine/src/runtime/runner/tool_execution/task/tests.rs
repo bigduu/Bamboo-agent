@@ -836,10 +836,11 @@ async fn child_task_control_planes_reload_without_rewriting_history_or_unrelated
         .expect("backfill child cache");
     {
         let cached_root = repository.cache().get("reload-root").expect("cached root");
-        cached_root
-            .write()
-            .metadata
-            .insert("cache.concurrent".to_string(), "preserve".to_string());
+        cached_root.update(|session| {
+            session
+                .metadata
+                .insert("cache.concurrent".to_string(), "preserve".to_string());
+        });
     }
 
     let mut live_child = durable_child.clone();

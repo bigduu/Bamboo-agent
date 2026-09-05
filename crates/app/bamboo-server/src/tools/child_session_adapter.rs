@@ -116,7 +116,7 @@ impl ChildSessionAdapter {
         })?;
         self.sessions_cache.insert(
             child.id.clone(),
-            Arc::new(parking_lot::RwLock::new(child.clone())),
+            Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
         );
         Ok(())
     }
@@ -383,7 +383,7 @@ impl ChildSessionAdapter {
             })?;
         self.sessions_cache.insert(
             parent.id.clone(),
-            Arc::new(parking_lot::RwLock::new(parent)),
+            Arc::new(bamboo_engine::SessionSnapshot::new(parent)),
         );
 
         Ok(())
@@ -659,7 +659,7 @@ impl ChildSessionPort for ChildSessionAdapter {
                 |latest| {
                     self.sessions_cache.insert(
                         latest.id.clone(),
-                        Arc::new(parking_lot::RwLock::new(latest.clone())),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(latest.clone())),
                     );
                 },
             )

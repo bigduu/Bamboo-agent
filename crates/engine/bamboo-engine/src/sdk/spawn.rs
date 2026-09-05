@@ -297,7 +297,7 @@ async fn run_child_spawn_inner(
             .await;
         ctx.sessions_cache.insert(
             job.child_session_id.clone(),
-            Arc::new(parking_lot::RwLock::new(session)),
+            Arc::new(crate::SessionSnapshot::new(session)),
         );
         publish_child_completion_parts(
             &parent_event_publisher,
@@ -702,7 +702,7 @@ async fn run_child_spawn_inner(
         }
         sessions_cache.insert(
             session_id_clone.clone(),
-            Arc::new(parking_lot::RwLock::new(session)),
+            Arc::new(crate::SessionSnapshot::new(session)),
         );
 
         // Stop forwarding/heartbeats and emit terminal child status through the

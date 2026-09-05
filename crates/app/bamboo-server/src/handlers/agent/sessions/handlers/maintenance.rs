@@ -57,7 +57,7 @@ pub async fn clear_session(
         })?;
     state.sessions.insert(
         session_id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(cleared_session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(cleared_session)),
     );
 
     // Publish onto the account change feed so other clients drop their cached

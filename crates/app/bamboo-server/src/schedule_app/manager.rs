@@ -449,7 +449,7 @@ async fn run_schedule_job(
     }
     ctx.sessions_cache.insert(
         session_id.clone(),
-        Arc::new(parking_lot::RwLock::new(session.clone())),
+        Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     if let Some(reason) = prompt_hook_block {

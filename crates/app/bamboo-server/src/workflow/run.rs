@@ -1377,7 +1377,7 @@ mod tests {
         let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(
             storage_port.clone(),
         ));
-        let cache = Arc::new(dashmap::DashMap::new());
+        let cache = Arc::default();
         let repo = bamboo_engine::SessionRepository::new(cache, storage_port, persistence);
         let access = WorkflowRunAccess::new(directory.path(), tools, skills, repo.clone())
             .await
@@ -1913,7 +1913,7 @@ mod tests {
 
         let storage_port: Arc<dyn Storage> = storage;
         let reopened_repo = bamboo_engine::SessionRepository::new(
-            Arc::new(dashmap::DashMap::new()),
+            Arc::default(),
             storage_port.clone(),
             Arc::new(bamboo_storage::LockedSessionStore::new(storage_port)),
         );

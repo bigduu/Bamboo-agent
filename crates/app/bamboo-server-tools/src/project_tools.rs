@@ -423,7 +423,7 @@ impl Tool for ProjectWorkspaceTool {
                 })?;
             self.sessions.cache().insert(
                 session_id.to_string(),
-                Arc::new(parking_lot::RwLock::new(authoritative.clone())),
+                Arc::new(bamboo_engine::SessionSnapshot::new(authoritative.clone())),
             );
             drop(persistence_guard);
             project = authoritative_project;

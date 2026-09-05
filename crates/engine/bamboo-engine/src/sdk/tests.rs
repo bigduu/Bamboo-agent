@@ -414,7 +414,7 @@ async fn build_harness(
     ));
     let metrics_collector = MetricsCollector::spawn(metrics_storage, 7);
 
-    let sessions_cache: crate::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions_cache: crate::SessionCache = Arc::default();
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
     let session_event_senders = Arc::new(RwLock::new(HashMap::<
         String,
@@ -564,7 +564,7 @@ async fn build_terminal_delivery_harness(
             .expect("delivery test agent"),
     );
 
-    let sessions_cache: crate::SessionCache = Arc::new(dashmap::DashMap::new());
+    let sessions_cache: crate::SessionCache = Arc::default();
     let agent_runners = Arc::new(RwLock::new(HashMap::new()));
     let session_event_senders = Arc::new(RwLock::new(HashMap::<
         String,
@@ -1069,7 +1069,7 @@ async fn activation_already_running_never_replaces_live_session_cache_arc() {
     let mut live = Session::new(&harness.parent_session_id, "live-cache-model");
     live.metadata
         .insert("cache_owner".to_string(), "manual-run".to_string());
-    let live_arc = Arc::new(parking_lot::RwLock::new(live));
+    let live_arc = Arc::new(crate::SessionSnapshot::new(live));
     harness
         .ctx
         .sessions_cache
@@ -1169,7 +1169,8 @@ async fn direct_registration_waits_for_activation_without_creating_a_phantom_own
     let mut live = Session::new(&harness.parent_session_id, "manual-owner-model");
     live.metadata
         .insert("cache_owner".to_string(), "manual-router-owner".to_string());
-    let live_arc = Arc::new(parking_lot::RwLock::new(live));
+    let live_arc = Arc::new(crate::SessionSnapshot::new(live));
+    let before_commit = live_arc.read();
     harness
         .ctx
         .sessions_cache
@@ -1205,8 +1206,9 @@ async fn direct_registration_waits_for_activation_without_creating_a_phantom_own
         .unwrap()
         .value()
         .clone();
-    assert!(
-        Arc::ptr_eq(&cached_before_launch, &live_arc),
+    assert_eq!(
+        cached_before_launch.read().metadata.get("cache_owner"),
+        before_commit.metadata.get("cache_owner"),
         "prepared activation cache must remain unpublished before router ownership commits"
     );
 
@@ -1264,9 +1266,9 @@ async fn direct_registration_waits_for_activation_without_creating_a_phantom_own
         .unwrap()
         .value()
         .clone();
-    assert!(
-        !Arc::ptr_eq(&cached, &live_arc),
-        "the winning activation publishes its prepared snapshot only after owner commit"
+    assert_eq!(
+        before_commit.metadata["cache_owner"], "manual-router-owner",
+        "a reader retained across owner commit must keep its original snapshot"
     );
     assert!(
         !cached.read().metadata.contains_key("cache_owner"),

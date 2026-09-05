@@ -999,7 +999,7 @@ fn test_session_cache(session_id: &str, session: &Session) -> bamboo_engine::Ses
     let cache = Arc::new(dashmap::DashMap::new());
     cache.insert(
         session_id.to_string(),
-        Arc::new(parking_lot::RwLock::new(session.clone())),
+        Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
     cache
 }
@@ -1768,7 +1768,7 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
     for session in [&session_one, &session_two] {
         sessions.insert(
             session.id.clone(),
-            Arc::new(parking_lot::RwLock::new(session.clone())),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
     }
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());

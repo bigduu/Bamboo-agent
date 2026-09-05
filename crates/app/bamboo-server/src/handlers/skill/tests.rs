@@ -329,7 +329,7 @@ async fn filtered_tools_rejects_runner_marker_when_pinned_snapshot_is_missing() 
     );
     app_state.sessions.insert(
         session.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
     app_state.save_session(&mut session).await;
 
@@ -364,7 +364,7 @@ async fn filtered_tools_rejects_runner_marker_when_pinned_snapshot_is_missing() 
     );
     app_state.sessions.insert(
         mismatched.id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(mismatched.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(mismatched.clone())),
     );
     app_state.save_session(&mut mismatched).await;
     let mismatch_error = super::get_filtered_tools(

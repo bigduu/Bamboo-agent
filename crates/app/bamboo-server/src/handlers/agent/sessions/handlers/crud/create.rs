@@ -1166,7 +1166,7 @@ async fn create_session_once(
 
     state.sessions.insert(
         id.clone(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session.clone())),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
     );
 
     // Publish only the exact candidate that passed Project ownership checks,
@@ -2241,13 +2241,12 @@ mod tests {
             .await
             .unwrap();
         let original_arc = state.sessions.get(&session_id).unwrap().value().clone();
-        {
-            let mut live = original_arc.write();
+        original_arc.update(|live| {
             live.title = "LIVE-SENTINEL".to_string();
             live.metadata
                 .insert("live_sentinel".to_string(), "must-survive".to_string());
             live.updated_at = Utc::now() + Duration::minutes(5);
-        }
+        });
         // Publish the newer live summary into the global index, then restore
         // the older authoritative files to model a delayed transcript snapshot.
         // Succeeded replay must repair identity/path without regressing either

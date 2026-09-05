@@ -264,7 +264,7 @@ pub(crate) async fn transition_startup_failure_if_owned(
     }
     state.sessions.insert(
         session_id.to_string(),
-        std::sync::Arc::new(parking_lot::RwLock::new(session)),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
     );
     let sender = state.get_session_event_sender(session_id).await;
     let _ = sender.send(AgentEvent::Error { message });

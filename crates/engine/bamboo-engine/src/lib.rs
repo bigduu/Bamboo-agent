@@ -19,6 +19,8 @@ pub mod runtime;
 pub mod sdk;
 pub mod session_activation;
 pub mod session_app;
+pub mod session_cache;
+pub use session_cache::SessionSnapshot;
 pub mod session_messaging;
 pub mod session_repository;
 pub use session_repository::SessionRepository;
