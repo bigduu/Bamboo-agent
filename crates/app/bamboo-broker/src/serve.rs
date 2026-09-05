@@ -170,7 +170,7 @@ struct Completion {
 
 struct InflightHandler {
     cancel: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    task: AbortOnDropTask<()>,
     /// Number of mailbox deliveries with this id observed while the one active
     /// admission runs. None is acked until that admission completes successfully.
     deliveries: usize,
@@ -184,6 +184,12 @@ struct AbortOnDropTask<T>(Option<tokio::task::JoinHandle<T>>);
 impl<T> AbortOnDropTask<T> {
     fn new(task: tokio::task::JoinHandle<T>) -> Self {
         Self(Some(task))
+    }
+
+    fn abort(&self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 
     async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
@@ -546,7 +552,7 @@ where
             //    their acks don't starve behind a steady inbound stream.
             Some(done) = done_rx.recv() => {
                 let Completion { id, reply_to, handled } = done;
-                let Some(completed) = inflight.remove(&id) else {
+                let Some(mut completed) = inflight.remove(&id) else {
                     // A completion must belong to the one active admission for
                     // this id. Never let a stale/duplicate completion ack a
                     // later generation that happens to reuse the same MsgId.
@@ -604,7 +610,7 @@ where
                 } else {
                     Ok(())
                 };
-                let _ = completed.task.await;
+                let _ = completed.task.join().await;
                 if let Err(error) = wire_result {
                     tracing::warn!(%error, "broker worker completion delivery failed; cancelling remaining handlers");
                     messages_open = false;
@@ -705,7 +711,14 @@ where
                         let handler = Arc::clone(&handler);
                         let done_tx = done_tx.clone();
                         let task = tokio::spawn(async move {
-                            let handled = handler(msg, token).await;
+                            use futures_util::FutureExt;
+                            let handled = std::panic::AssertUnwindSafe(async { handler(msg, token).await })
+                                .catch_unwind()
+                                .await
+                                .unwrap_or_else(|_| {
+                                    tracing::error!(message_id = %id.as_str(), "broker handler panicked; preserving unacknowledged delivery");
+                                    Handled::Leave
+                                });
                             // Receiver gone == owner loop exited (conn dropped) -> drop.
                             let _ = done_tx.send(Completion { id, reply_to, handled });
                         });
@@ -713,7 +726,7 @@ where
                             inflight_id,
                             InflightHandler {
                                 cancel: inflight_cancel,
-                                task,
+                                task: AbortOnDropTask::new(task),
                                 deliveries: 1,
                             },
                         );
@@ -767,8 +780,8 @@ where
                     handler.task.abort();
                 }
                 let join_aborted = async move {
-                    for (_, handler) in stuck {
-                        let _ = handler.task.await;
+                    for (_, mut handler) in stuck {
+                        let _ = handler.task.join().await;
                     }
                 };
                 let abort_join_timed_out =
@@ -942,7 +955,7 @@ where
     // Per-run coordination so a SEPARATE Steer / ApprovalReply mailbox message can
     // reach the channels of the Run it belongs to (the Run + its control messages
     // arrive as independent messages handled by independent tasks).
-    let coords: RunCoords = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let waiters: ApprovalWaiters = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let me_owned = me.clone();
     let approval_timeout = DEFAULT_APPROVAL_TIMEOUT;
@@ -991,7 +1004,8 @@ where
                         if let Some(run_id) = &msg.correlation_id {
                             let steer = decode_steer_body(&msg.body, Some(msg.id.as_str()));
                             if let Some(steer) = steer {
-                                let coords = coords.lock().await;
+                                let coords =
+                                    coords.lock().unwrap_or_else(|error| error.into_inner());
                                 if let Some(coord) = coords.get(run_id) {
                                     let _ = coord.steer_tx.send(steer);
                                 }
@@ -1035,7 +1049,21 @@ where
 struct RunCoord {
     steer_tx: tokio::sync::mpsc::UnboundedSender<bamboo_subagent::SteerMessage>,
 }
-type RunCoords = Arc<tokio::sync::Mutex<HashMap<MsgId, RunCoord>>>;
+type RunCoords = Arc<std::sync::Mutex<HashMap<MsgId, RunCoord>>>;
+
+struct RunCoordRegistration {
+    coords: RunCoords,
+    run_id: MsgId,
+}
+
+impl Drop for RunCoordRegistration {
+    fn drop(&mut self) {
+        self.coords
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.run_id);
+    }
+}
 /// Pending gated-tool approvals a Run proxied up, keyed by approval-request id;
 /// an [`InboxKind::ApprovalReply`] fulfils the matching one.
 type ApprovalWaiters = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
@@ -1168,8 +1196,12 @@ where
     let (steer_tx, steer_inbox) = SteerInbox::channel();
     coords
         .lock()
-        .await
+        .unwrap_or_else(|error| error.into_inner())
         .insert(run_id.clone(), RunCoord { steer_tx });
+    let registration = RunCoordRegistration {
+        coords: coords.clone(),
+        run_id: run_id.clone(),
+    };
     // Approval: a host bridge on the sink; its requests are pumped to the parent.
     let (host_bridge, mut host_rx) = HostBridge::channel();
     let sink = sink.with_host_bridge(host_bridge);
@@ -1339,8 +1371,12 @@ where
 
     // Run to completion (events stream into `sink`); dropping `sink` closes the
     // forward loop's `events` (→ outcome) and the approval drain's `host_rx`.
-    let outcome = executor.run(spec, sink, steer_inbox, cancel).await;
-    coords.lock().await.remove(&run_id);
+    use futures_util::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(executor.run(spec, sink, steer_inbox, cancel))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| bamboo_subagent::ChildOutcome::error("actor executor panicked"));
+    drop(registration);
     let _ = outcome_tx.send(outcome);
     let _ = forward.join().await;
     let _ = approval.join().await;
@@ -1388,7 +1424,10 @@ where
     };
 
     let prior = context.lock().await.clone();
-    let (sink, _discard) = EventSink::channel();
+    let (sink, discard) = EventSink::channel();
+    // Ask/Task return only the final reply. Close the intentionally unused
+    // stream so bounded sends cannot wait forever for a nonexistent consumer.
+    drop(discard);
     let outcome = executor
         .run(
             RunSpec {
@@ -1492,6 +1531,154 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     const TOKEN: &str = "t";
+
+    #[tokio::test]
+    async fn reply_only_ask_and_task_do_not_block_on_discarded_event_capacity() {
+        let question = std::iter::repeat_n("word", bamboo_subagent::EventSink::EVENT_CAPACITY + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for kind in [InboxKind::Ask, InboxKind::Task] {
+            let mut message = ask("parent", &question);
+            if kind == InboxKind::Task {
+                message.kind = InboxKind::Task;
+                message.body = serde_json::json!({ "assignment": question });
+            }
+            let context = tokio::sync::Mutex::new(Vec::new());
+            let handled = tokio::time::timeout(
+                Duration::from_secs(2),
+                handle_with_executor(
+                    &bamboo_subagent::EchoExecutor,
+                    &context,
+                    message,
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("reply-only execution must not await an unused stream consumer");
+            assert!(
+                matches!(handled, Handled::Reply(answer) if answer == format!("echo: {question}"))
+            );
+            assert_eq!(
+                context.lock().await.len(),
+                if kind == InboxKind::Task { 2 } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn panicked_handler_releases_inflight_slot_and_preserves_unacked_delivery() {
+        let (endpoint, dir, core, connection) = start_single_connection().await;
+        core.deliver("panic-worker", &ask("parent", "panic"))
+            .await
+            .unwrap();
+        let me = AgentRef {
+            session_id: "panic-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn({
+            let started = started.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                serve_loop(
+                    &mut client,
+                    &me,
+                    move |_, _| {
+                        let started = started.clone();
+                        async move {
+                            started.notify_one();
+                            panic!("intentional mailbox handler panic");
+                            #[allow(unreachable_code)]
+                            Handled::Leave
+                        }
+                    },
+                    shutdown,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("panicked admission must not block graceful drain")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mailbox_pending_files(&dir, "panic-worker").await, 1);
+        connection.abort();
+    }
+
+    #[tokio::test]
+    async fn aborting_mailbox_owner_aborts_its_inflight_execution_and_coord_registration() {
+        let (endpoint, _dir, core, connection) = start_single_connection().await;
+        core.deliver("aborted-worker", &ask("parent", "hang"))
+            .await
+            .unwrap();
+        let me = AgentRef {
+            session_id: "aborted-worker".into(),
+            role: None,
+        };
+        let mut client = BrokerClient::connect(&endpoint, me.clone(), TOKEN)
+            .await
+            .unwrap();
+        client.subscribe().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coords: RunCoords = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let task = tokio::spawn({
+            let started = started.clone();
+            let dropped = dropped.clone();
+            let coords = coords.clone();
+            async move {
+                serve_loop(
+                    &mut client,
+                    &me,
+                    move |message, _| {
+                        let started = started.clone();
+                        let dropped = dropped.clone();
+                        let coords = coords.clone();
+                        async move {
+                            let _dropped = DropFlag(dropped);
+                            let (steer_tx, _inbox) = bamboo_subagent::SteerInbox::channel();
+                            coords
+                                .lock()
+                                .unwrap()
+                                .insert(message.id.clone(), RunCoord { steer_tx });
+                            let _registration = RunCoordRegistration {
+                                coords,
+                                run_id: message.id,
+                            };
+                            started.notify_one();
+                            std::future::pending::<Handled>().await
+                        }
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner drop must abort rather than detach handler");
+        assert!(coords.lock().unwrap().is_empty());
+        connection.abort();
+    }
 
     #[tokio::test]
     async fn shared_actor_uplink_accepts_200_parallel_live_runs() {

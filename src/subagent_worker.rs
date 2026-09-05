@@ -378,6 +378,16 @@ pub struct BambooRuntimeExecutor {
     child_runner: Option<Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>>,
 }
 
+/// The reusable runner must release its current run's host bridge on every
+/// exit. Descendants already capture their own clone when they are spawned.
+struct RunEscalationBinding(Arc<dyn bamboo_engine::execution::ExternalChildRunner>);
+
+impl Drop for RunEscalationBinding {
+    fn drop(&mut self) {
+        self.0.set_escalation_bridge(None);
+    }
+}
+
 fn provisioned_permission_resolution(
     capabilities: &bamboo_subagent::provision::Capabilities,
 ) -> Result<bamboo_domain::PermissionModeResolution, String> {
@@ -1448,12 +1458,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
                         delivery.envelope.id
                     ));
                 }
-                events.confirm_session_message(SessionMessageAdmissionConfirmation {
-                    target_session_id: delivery.target_session_id.clone(),
-                    envelope_id: delivery.envelope.id.as_str().to_string(),
-                    canonical_claim_generation: delivery.canonical_claim_generation,
-                    activation_run_id: delivery.activation_run_id.clone(),
-                });
+                events
+                    .confirm_session_message(SessionMessageAdmissionConfirmation {
+                        target_session_id: delivery.target_session_id.clone(),
+                        envelope_id: delivery.envelope.id.as_str().to_string(),
+                        canonical_claim_generation: delivery.canonical_claim_generation,
+                        activation_run_id: delivery.activation_run_id.clone(),
+                    })
+                    .await;
             }
         }
 
@@ -1466,8 +1478,9 @@ impl ChildExecutor for BambooRuntimeExecutor {
         let steer_events = events.clone();
         let steer_activation_run_id = expected_activation_run_id.clone();
         let steer_done = CancellationToken::new();
+        let _steer_cancel_on_drop = steer_done.clone().drop_guard();
         let steer_done_task = steer_done.clone();
-        let steer_task = tokio::spawn(async move {
+        let steer_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
                 let message = tokio::select! {
                     _ = steer_done_task.cancelled() => break,
@@ -1617,7 +1630,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                         .await
                     {
                         Ok(true) => {
-                            steer_events.confirm_session_message(confirmation);
+                            steer_events.confirm_session_message(confirmation).await;
                             break;
                         }
                         Ok(false) => {}
@@ -1637,7 +1650,7 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     }
                 }
             }
-        });
+        }));
 
         // Phase 2: if the host wired an approval bridge, install a per-run
         // ApprovalProxy so this run's gated tools delegate the decision to the
@@ -1662,19 +1675,20 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // a fire-and-forget grandchild outliving this run still escalates through
         // the run's own bridge rather than a stale/overwritten global. `None` for
         // a leaf worker (no spawn stack), which never drives grandchildren.
-        if let Some(runner) = &self.child_runner {
+        let _escalation_binding = self.child_runner.as_ref().map(|runner| {
             runner.set_escalation_bridge(events.host().cloned());
-        }
+            RunEscalationBinding(runner.clone())
+        });
 
         // AgentEvents stream to the parent verbatim (zero mapping).
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
-        let forward = tokio::spawn(async move {
+        let forward = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
                 if let Ok(value) = serde_json::to_value(&ev) {
-                    events.emit(value);
+                    events.emit(value).await;
                 }
             }
-        });
+        }));
         if let Some(audit) =
             bamboo_domain::PermissionAuditSnapshot::from_metadata(&session.metadata)
         {
@@ -1837,6 +1851,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingWorkerProvider {
         calls: std::sync::Mutex<Vec<Vec<Message>>>,
+        hold: bool,
+        started: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1849,6 +1865,10 @@ mod tests {
             _model: &str,
         ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
             self.calls.lock().unwrap().push(messages.to_vec());
+            if self.hold {
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+            }
             let chunks: Vec<bamboo_llm::provider::Result<LLMChunk>> =
                 vec![Ok(LLMChunk::Token("done".to_string())), Ok(LLMChunk::Done)];
             Ok(Box::pin(futures::stream::iter(chunks)))
@@ -1913,6 +1933,92 @@ mod tests {
             child_runner: None,
         };
         (temp, executor, store, inbox)
+    }
+
+    #[derive(Default)]
+    struct BridgeCapturingRunner(std::sync::Mutex<Option<bamboo_subagent::HostBridge>>);
+
+    #[async_trait]
+    impl bamboo_engine::execution::ExternalChildRunner for BridgeCapturingRunner {
+        async fn should_handle(&self, _session: &Session) -> bool {
+            false
+        }
+
+        async fn execute_external_child(
+            &self,
+            _session: &mut Session,
+            _job: &bamboo_engine::execution::SpawnJob,
+            _events: mpsc::Sender<AgentEvent>,
+            _cancel: CancellationToken,
+        ) -> bamboo_engine::runtime::runner::Result<()> {
+            unreachable!("fixture does not spawn descendants")
+        }
+
+        fn set_escalation_bridge(&self, bridge: Option<bamboo_subagent::HostBridge>) {
+            *self.0.lock().unwrap() = bridge;
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_warm_run_releases_its_nested_escalation_bridge() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (_temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider).await;
+        let runner = Arc::new(BridgeCapturingRunner::default());
+        executor.child_runner = Some(runner.clone());
+        let (bridge, mut requests) = bamboo_subagent::HostBridge::channel();
+        let (events, _event_rx) = EventSink::channel();
+        let outcome = executor
+            .run(
+                protocol_run("child-bridge", "bridge-run", Vec::new()),
+                events.with_host_bridge(bridge),
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert!(runner.0.lock().unwrap().is_none());
+        assert!(
+            matches!(
+                requests.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "completed worker must let the broker's approval drain finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_worker_run_releases_helpers_and_nested_escalation_bridge() {
+        let provider = Arc::new(RecordingWorkerProvider {
+            hold: true,
+            ..Default::default()
+        });
+        let (_temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider.clone()).await;
+        let runner = Arc::new(BridgeCapturingRunner::default());
+        executor.child_runner = Some(runner.clone());
+        let (bridge, mut requests) = bamboo_subagent::HostBridge::channel();
+        let (events, _event_rx) = EventSink::channel();
+        let (_steer_sender, steer) = SteerInbox::channel();
+        let task = tokio::spawn(async move {
+            executor
+                .run(
+                    protocol_run("aborted-bridge", "bridge-run", Vec::new()),
+                    events.with_host_bridge(bridge),
+                    steer,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            provider.started.notified(),
+        )
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(runner.0.lock().unwrap().is_none());
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.expect("aborted worker must drop forwarding and steering tasks, including their HostBridge clones");
+        assert!(request.is_none());
     }
 
     fn protocol_run(
