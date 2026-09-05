@@ -4,60 +4,16 @@ use bamboo_agent_core::AgentEvent;
 use chrono::{DateTime, Duration, Utc};
 use tokio::sync::mpsc;
 
-use crate::storage::{MetricsStorage, ToolCallCompletion};
+use crate::storage::{MetricsMutation, MetricsStorage, ToolCallCompletion, MAX_METRICS_BATCH_SIZE};
 use crate::types::{
     ForwardTokenDetails, PromptMemoryExposureObservation, RoundStatus, SessionStatus, TokenUsage,
 };
 
 #[derive(Debug)]
 enum CollectorCommand {
-    SessionStarted {
-        session_id: String,
-        model: String,
-        started_at: DateTime<Utc>,
-    },
-    SessionMessageCount {
-        session_id: String,
-        message_count: u32,
-        updated_at: DateTime<Utc>,
-    },
-    SessionCompleted {
-        session_id: String,
-        status: SessionStatus,
-        completed_at: DateTime<Utc>,
-    },
-    RoundStarted {
-        round_id: String,
-        session_id: String,
-        model: String,
-        started_at: DateTime<Utc>,
-    },
-    RoundCompleted {
-        round_id: String,
-        completed_at: DateTime<Utc>,
-        status: RoundStatus,
-        usage: TokenUsage,
-        prompt_cached_tool_outputs: u32,
-        prompt_cached_tool_tokens_saved: u32,
-        error: Option<String>,
-    },
+    Mutation(MetricsMutation),
     PromptMemoryExposure {
         observation: PromptMemoryExposureObservation,
-    },
-    ToolStarted {
-        tool_call_id: String,
-        round_id: String,
-        session_id: String,
-        tool_name: String,
-        started_at: DateTime<Utc>,
-    },
-    ToolCompleted {
-        tool_call_id: String,
-        completion: ToolCallCompletion,
-    },
-    ExecuteSyncMismatch {
-        reason: String,
-        occurred_at: DateTime<Utc>,
     },
     ContextCompressed {
         session_id: String,
@@ -68,22 +24,6 @@ enum CollectorCommand {
         usage_after_percent: f64,
         trigger_type: String,
         latency_ms: u64,
-    },
-    ForwardStarted {
-        forward_id: String,
-        endpoint: String,
-        model: String,
-        is_stream: bool,
-        started_at: DateTime<Utc>,
-    },
-    ForwardCompleted {
-        forward_id: String,
-        completed_at: DateTime<Utc>,
-        status_code: Option<u16>,
-        status: crate::types::ForwardStatus,
-        usage: Option<TokenUsage>,
-        token_details: Option<ForwardTokenDetails>,
-        error: Option<String>,
     },
     Prune {
         cutoff: DateTime<Utc>,
@@ -106,11 +46,17 @@ impl Drop for PruneScheduler {
 pub struct MetricsCollector {
     tx: mpsc::UnboundedSender<CollectorCommand>,
     _scheduler: Arc<PruneScheduler>,
+    #[cfg(test)]
+    received_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MetricsCollector {
     pub fn spawn(storage: Arc<dyn MetricsStorage>, retention_days: u32) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<CollectorCommand>();
+        #[cfg(test)]
+        let received_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let consumer_received_count = received_count.clone();
 
         // Do not abort the consumer on owner release: closing the producers
         // lets it finish initialization and drain accepted commands in order.
@@ -119,163 +65,56 @@ impl MetricsCollector {
                 tracing::error!("metrics storage initialization failed: {}", error);
             }
 
-            while let Some(command) = rx.recv().await {
-                let outcome = match command {
-                    CollectorCommand::SessionStarted {
-                        session_id,
-                        model,
-                        started_at,
-                    } => {
-                        storage
-                            .upsert_session_start(&session_id, &model, started_at)
-                            .await
+            let mut buffer = Vec::with_capacity(MAX_METRICS_BATCH_SIZE);
+            loop {
+                let received = rx.recv_many(&mut buffer, MAX_METRICS_BATCH_SIZE).await;
+                if received == 0 {
+                    break;
+                }
+                #[cfg(test)]
+                consumer_received_count.fetch_add(received, std::sync::atomic::Ordering::SeqCst);
+                let mut pending = Vec::with_capacity(buffer.len());
+                for command in buffer.drain(..) {
+                    if let CollectorCommand::Mutation(mutation) = command {
+                        pending.push(mutation);
+                        continue;
                     }
-                    CollectorCommand::SessionMessageCount {
-                        session_id,
-                        message_count,
-                        updated_at,
-                    } => {
-                        storage
-                            .update_session_message_count(&session_id, message_count, updated_at)
-                            .await
-                    }
-                    CollectorCommand::SessionCompleted {
-                        session_id,
-                        status,
-                        completed_at,
-                    } => {
-                        storage
-                            .complete_session(&session_id, status, completed_at)
-                            .await
-                    }
-                    CollectorCommand::RoundStarted {
-                        round_id,
-                        session_id,
-                        model,
-                        started_at,
-                    } => {
-                        storage
-                            .insert_round_start(&round_id, &session_id, &model, started_at)
-                            .await
-                    }
-                    CollectorCommand::RoundCompleted {
-                        round_id,
-                        completed_at,
-                        status,
-                        usage,
-                        prompt_cached_tool_outputs,
-                        prompt_cached_tool_tokens_saved,
-                        error,
-                    } => {
-                        storage
-                            .complete_round(
-                                &round_id,
-                                completed_at,
-                                status,
-                                usage,
-                                prompt_cached_tool_outputs,
-                                prompt_cached_tool_tokens_saved,
-                                error,
-                            )
-                            .await
-                    }
-                    CollectorCommand::PromptMemoryExposure { observation } => {
-                        storage.record_prompt_memory_exposure(&observation).await
-                    }
-                    CollectorCommand::ToolStarted {
-                        tool_call_id,
-                        round_id,
-                        session_id,
-                        tool_name,
-                        started_at,
-                    } => {
-                        storage
-                            .insert_tool_start(
-                                &tool_call_id,
-                                &round_id,
-                                &session_id,
-                                &tool_name,
-                                started_at,
-                            )
-                            .await
-                    }
-                    CollectorCommand::ToolCompleted {
-                        tool_call_id,
-                        completion,
-                    } => storage.complete_tool_call(&tool_call_id, completion).await,
-                    CollectorCommand::ExecuteSyncMismatch {
-                        reason,
-                        occurred_at,
-                    } => {
-                        storage
-                            .increment_execute_sync_mismatch(&reason, occurred_at)
-                            .await
-                    }
-                    CollectorCommand::ContextCompressed {
-                        session_id,
-                        round_id,
-                        messages_compressed,
-                        tokens_saved,
-                        usage_before_percent,
-                        usage_after_percent,
-                        trigger_type,
-                        latency_ms,
-                    } => {
-                        tracing::info!(
+                    Self::flush_mutations(storage.as_ref(), std::mem::take(&mut pending)).await;
+                    let outcome = match command {
+                        CollectorCommand::PromptMemoryExposure { observation } => {
+                            storage.record_prompt_memory_exposure(&observation).await
+                        }
+                        CollectorCommand::ContextCompressed {
+                            session_id,
+                            round_id,
+                            messages_compressed,
+                            tokens_saved,
+                            usage_before_percent,
+                            usage_after_percent,
+                            trigger_type,
+                            latency_ms,
+                        } => {
+                            tracing::info!(
                             "[{}] metrics: context compressed — round={}, messages={}, tokens_saved={}, before={:.1}%, after={:.1}%, trigger={}, latency={}ms",
                             session_id, round_id, messages_compressed, tokens_saved,
                             usage_before_percent, usage_after_percent, trigger_type, latency_ms,
                         );
-                        storage
-                            .record_round_compression(&round_id, Utc::now(), tokens_saved)
-                            .await
+                            storage
+                                .record_round_compression(&round_id, Utc::now(), tokens_saved)
+                                .await
+                        }
+                        CollectorCommand::Prune { cutoff } => {
+                            storage.prune_rounds_before(cutoff).await.map(|_| ())
+                        }
+                        CollectorCommand::Mutation(_) => {
+                            unreachable!("ordinary mutations handled above")
+                        }
+                    };
+                    if let Err(error) = outcome {
+                        tracing::warn!("metrics collector command failed: {}", error);
                     }
-                    CollectorCommand::ForwardStarted {
-                        forward_id,
-                        endpoint,
-                        model,
-                        is_stream,
-                        started_at,
-                    } => {
-                        storage
-                            .insert_forward_start(
-                                &forward_id,
-                                &endpoint,
-                                &model,
-                                is_stream,
-                                started_at,
-                            )
-                            .await
-                    }
-                    CollectorCommand::ForwardCompleted {
-                        forward_id,
-                        completed_at,
-                        status_code,
-                        status,
-                        usage,
-                        token_details,
-                        error,
-                    } => {
-                        storage
-                            .complete_forward(
-                                &forward_id,
-                                completed_at,
-                                status_code,
-                                status,
-                                usage,
-                                token_details,
-                                error,
-                            )
-                            .await
-                    }
-                    CollectorCommand::Prune { cutoff } => {
-                        storage.prune_rounds_before(cutoff).await.map(|_| ())
-                    }
-                };
-
-                if let Err(error) = outcome {
-                    tracing::warn!("metrics collector command failed: {}", error);
                 }
+                Self::flush_mutations(storage.as_ref(), pending).await;
             }
         });
 
@@ -283,6 +122,35 @@ impl MetricsCollector {
         Self {
             tx,
             _scheduler: Arc::new(scheduler),
+            #[cfg(test)]
+            received_count,
+        }
+    }
+
+    async fn flush_mutations(storage: &dyn MetricsStorage, mutations: Vec<MetricsMutation>) {
+        if mutations.is_empty() {
+            return;
+        }
+        let expected = mutations.len();
+        match storage.apply_batch(mutations).await {
+            Ok(results) => {
+                if results.len() != expected {
+                    tracing::error!(
+                        expected,
+                        actual = results.len(),
+                        "metrics backend violated batch result count; no replay is safe"
+                    );
+                }
+                for result in results {
+                    if let Err(error) = result {
+                        tracing::warn!("metrics collector command failed: {}", error);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                "metrics batch task failed; committed prefix cannot be replayed: {}",
+                error
+            ),
         }
     }
 
@@ -292,11 +160,13 @@ impl MetricsCollector {
         model: impl Into<String>,
         started_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::SessionStarted {
-            session_id: session_id.into(),
-            model: model.into(),
-            started_at,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::SessionStarted {
+                session_id: session_id.into(),
+                model: model.into(),
+                started_at,
+            },
+        ));
     }
 
     pub fn session_message_count(
@@ -305,11 +175,13 @@ impl MetricsCollector {
         message_count: u32,
         updated_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::SessionMessageCount {
-            session_id: session_id.into(),
-            message_count,
-            updated_at,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::SessionMessageCount {
+                session_id: session_id.into(),
+                message_count,
+                updated_at,
+            },
+        ));
     }
 
     pub fn session_completed(
@@ -318,11 +190,13 @@ impl MetricsCollector {
         status: SessionStatus,
         completed_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::SessionCompleted {
-            session_id: session_id.into(),
-            status,
-            completed_at,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::SessionCompleted {
+                session_id: session_id.into(),
+                status,
+                completed_at,
+            },
+        ));
     }
 
     pub fn round_started(
@@ -332,12 +206,14 @@ impl MetricsCollector {
         model: impl Into<String>,
         started_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::RoundStarted {
-            round_id: round_id.into(),
-            session_id: session_id.into(),
-            model: model.into(),
-            started_at,
-        });
+        let _ = self
+            .tx
+            .send(CollectorCommand::Mutation(MetricsMutation::RoundStarted {
+                round_id: round_id.into(),
+                session_id: session_id.into(),
+                model: model.into(),
+                started_at,
+            }));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -351,15 +227,17 @@ impl MetricsCollector {
         prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     ) {
-        let _ = self.tx.send(CollectorCommand::RoundCompleted {
-            round_id: round_id.into(),
-            completed_at,
-            status,
-            usage,
-            prompt_cached_tool_outputs,
-            prompt_cached_tool_tokens_saved,
-            error,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::RoundCompleted {
+                round_id: round_id.into(),
+                completed_at,
+                status,
+                usage,
+                prompt_cached_tool_outputs,
+                prompt_cached_tool_tokens_saved,
+                error,
+            },
+        ));
     }
 
     /// Queues a host-observed compact-memory prompt exposure.
@@ -380,43 +258,49 @@ impl MetricsCollector {
                 tool_name,
                 ..
             } => {
-                let _ = self.tx.send(CollectorCommand::ToolStarted {
-                    tool_call_id: tool_call_id.clone(),
-                    round_id: round_id.to_string(),
-                    session_id: session_id.to_string(),
-                    tool_name: tool_name.clone(),
-                    started_at: Utc::now(),
-                });
+                let _ = self
+                    .tx
+                    .send(CollectorCommand::Mutation(MetricsMutation::ToolStarted {
+                        tool_call_id: tool_call_id.clone(),
+                        round_id: round_id.to_string(),
+                        session_id: session_id.to_string(),
+                        tool_name: tool_name.clone(),
+                        started_at: Utc::now(),
+                    }));
             }
             AgentEvent::ToolComplete {
                 tool_call_id,
                 result,
             } => {
-                let _ = self.tx.send(CollectorCommand::ToolCompleted {
-                    tool_call_id: tool_call_id.clone(),
-                    completion: ToolCallCompletion {
-                        completed_at: Utc::now(),
-                        success: result.success,
-                        error: if result.success {
-                            None
-                        } else {
-                            Some(result.result.clone())
+                let _ = self
+                    .tx
+                    .send(CollectorCommand::Mutation(MetricsMutation::ToolCompleted {
+                        tool_call_id: tool_call_id.clone(),
+                        completion: ToolCallCompletion {
+                            completed_at: Utc::now(),
+                            success: result.success,
+                            error: if result.success {
+                                None
+                            } else {
+                                Some(result.result.clone())
+                            },
                         },
-                    },
-                });
+                    }));
             }
             AgentEvent::ToolError {
                 tool_call_id,
                 error,
             } => {
-                let _ = self.tx.send(CollectorCommand::ToolCompleted {
-                    tool_call_id: tool_call_id.clone(),
-                    completion: ToolCallCompletion {
-                        completed_at: Utc::now(),
-                        success: false,
-                        error: Some(error.clone()),
-                    },
-                });
+                let _ = self
+                    .tx
+                    .send(CollectorCommand::Mutation(MetricsMutation::ToolCompleted {
+                        tool_call_id: tool_call_id.clone(),
+                        completion: ToolCallCompletion {
+                            completed_at: Utc::now(),
+                            success: false,
+                            error: Some(error.clone()),
+                        },
+                    }));
             }
             _ => {}
         }
@@ -430,13 +314,15 @@ impl MetricsCollector {
         is_stream: bool,
         started_at: DateTime<Utc>,
     ) {
-        let _ = self.tx.send(CollectorCommand::ForwardStarted {
-            forward_id: forward_id.into(),
-            endpoint: endpoint.into(),
-            model: model.into(),
-            is_stream,
-            started_at,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::ForwardStarted {
+                forward_id: forward_id.into(),
+                endpoint: endpoint.into(),
+                model: model.into(),
+                is_stream,
+                started_at,
+            },
+        ));
     }
 
     pub fn forward_completed(
@@ -470,22 +356,26 @@ impl MetricsCollector {
         token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) {
-        let _ = self.tx.send(CollectorCommand::ForwardCompleted {
-            forward_id: forward_id.into(),
-            completed_at,
-            status_code,
-            status,
-            usage,
-            token_details,
-            error,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::ForwardCompleted {
+                forward_id: forward_id.into(),
+                completed_at,
+                status_code,
+                status,
+                usage,
+                token_details,
+                error,
+            },
+        ));
     }
 
     pub fn execute_sync_mismatch(&self, reason: impl Into<String>, occurred_at: DateTime<Utc>) {
-        let _ = self.tx.send(CollectorCommand::ExecuteSyncMismatch {
-            reason: reason.into(),
-            occurred_at,
-        });
+        let _ = self.tx.send(CollectorCommand::Mutation(
+            MetricsMutation::ExecuteSyncMismatch {
+                reason: reason.into(),
+                occurred_at,
+            },
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -758,3 +648,6 @@ mod tests {
         assert_eq!(tx.strong_count(), 1);
     }
 }
+
+#[cfg(test)]
+mod batch_tests;

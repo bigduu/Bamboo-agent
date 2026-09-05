@@ -1232,6 +1232,7 @@ dependencies = [
  "bamboo-domain",
  "bamboo-infrastructure",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
