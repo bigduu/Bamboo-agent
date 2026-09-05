@@ -883,7 +883,13 @@ impl ChildSessionPort for ChildSessionAdapter {
     ) -> Result<DeleteChildResult, ChildSessionError> {
         let cancelled_running_child = {
             let mut runners = self.agent_runners.write().await;
-            if let Some(runner) = runners.remove(child_id) {
+            if let Some(runner) =
+                bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+                    &mut runners,
+                    child_id,
+                )
+                .await
+            {
                 runner.cancel_token.cancel();
                 true
             } else {
@@ -931,7 +937,7 @@ impl ChildSessionPort for ChildSessionAdapter {
             completed_at: runner.completed_at,
             last_tool_name: runner.last_tool_name.clone(),
             last_tool_phase: runner.last_tool_phase.clone(),
-            last_event_at: runner.last_event_at,
+            last_event_at: runner.last_activity_at(),
             round_count: runner.round_count,
         })
     }

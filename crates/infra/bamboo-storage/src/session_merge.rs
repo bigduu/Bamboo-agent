@@ -299,12 +299,16 @@ impl LockedSessionStore {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let guard = lock.lock_owned().await;
-        SessionLockGuard {
-            guard: Some(guard),
+        // Arm cleanup before the cancellable wait. The previous holder may
+        // drop while this waiter owns the last extra Arc; cancelling that waiter
+        // must still reclaim the map entry without needing another acquisition.
+        let mut guard = SessionLockGuard {
+            guard: None,
             locks: self.locks.clone(),
             session_id: session_id.to_string(),
-        }
+        };
+        guard.guard = Some(lock.lock_owned().await);
+        guard
     }
 
     /// Save a full snapshot while preserving Task generations advanced by an
@@ -4614,6 +4618,28 @@ mod tests {
             0,
             "acquiring locks for many distinct ids must not grow the map"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_last_waiter_reclaims_hundreds_of_session_locks() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage);
+        for index in 0..512 {
+            let id = format!("cancelled-child-{index}");
+            let held = store.acquire_lock(&id).await;
+            let mut waiter = Box::pin(store.acquire_lock(&id));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(waiter.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            drop(held);
+            // Cancel after the previous holder handed ownership to the waiter,
+            // but before the waiter is polled again to construct its guard.
+            drop(waiter);
+        }
+        assert!(store.locks.is_empty());
     }
 
     #[tokio::test]

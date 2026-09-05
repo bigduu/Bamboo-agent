@@ -16,6 +16,7 @@
 pub mod agent_spawn;
 pub mod child_completion;
 pub mod event_forwarder;
+pub mod event_publication;
 pub mod runner_lifecycle;
 pub mod runner_state;
 pub mod session_events;

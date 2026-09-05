@@ -72,6 +72,9 @@ pub async fn reserve_runner_core(
     // registry. In particular, cancellation while waiting for the sender map
     // must not leave a `Running` slot with no task behind it.
     let mut senders_guard = senders.write().await;
+    if let Some(previous) = runners_guard.get(session_id) {
+        previous.event_publication.retire().await;
+    }
     runners_guard.remove(session_id);
 
     let mut runner = AgentRunner::new();
@@ -119,6 +122,19 @@ pub async fn try_reserve_runner(
             None
         }
     }
+}
+
+/// Drain publication before removing the old generation from the registry.
+/// If the caller is cancelled at the await, the closed old fence remains in
+/// the map, so a subsequent reservation still has to drain it before Started.
+pub async fn remove_runner_entry(
+    runners: &mut HashMap<String, AgentRunner>,
+    session_id: &str,
+) -> Option<AgentRunner> {
+    if let Some(runner) = runners.get(session_id) {
+        runner.event_publication.retire().await;
+    }
+    runners.remove(session_id)
 }
 
 /// Map an execution result to `AgentStatus`.
@@ -187,6 +203,40 @@ pub async fn finalize_rejected_runner_if_distinct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelling_removal_keeps_the_predecessor_fence_discoverable() {
+        use std::sync::Barrier;
+        let runner = AgentRunner::new();
+        let publication = runner.event_publication.clone();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let publisher = {
+            let publication = publication.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                publication.publish(|| {
+                    entered.wait();
+                    release.wait();
+                })
+            })
+        };
+        entered.wait();
+        let mut runners = HashMap::from([("child".to_string(), runner)]);
+        let mut removing = Box::pin(remove_runner_entry(&mut runners, "child"));
+        assert!(futures::poll!(removing.as_mut()).is_pending());
+        drop(removing);
+        assert!(
+            runners.contains_key("child"),
+            "a successor must still find the old fence after cancellation"
+        );
+        assert!(!publication.publish(|| panic!("retired run must reject late frames")));
+        release.wait();
+        publisher.join().unwrap();
+        assert!(remove_runner_entry(&mut runners, "child").await.is_some());
+        assert!(runners.is_empty());
+    }
 
     fn new_runners() -> Arc<RwLock<HashMap<String, AgentRunner>>> {
         Arc::new(RwLock::new(HashMap::new()))

@@ -1780,12 +1780,9 @@ impl SessionStoreV2 {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let guard = lock.lock_owned().await;
-        // Construct the self-cleaning guard before awaiting the cross-process
-        // file lock. If this future is cancelled while flock is contended, the
-        // process-local DashMap entry is still reclaimed.
+        // Arm cleanup before either the process-local or cross-process wait.
         let mut session_guard = SessionWriteGuard {
-            guard: Some(guard),
+            guard: None,
             file: None,
             locks: self.session_write_locks.clone(),
             session_id: session_id.to_string(),
@@ -1793,6 +1790,7 @@ impl SessionStoreV2 {
             acquired: Instant::now(),
             metrics: self.persistence_metrics.clone(),
         };
+        session_guard.guard = Some(lock.lock_owned().await);
         let file = self.open_session_write_lock_file(session_id).await?;
         session_guard.file = Some(file);
         drop(waiting);
@@ -6540,6 +6538,34 @@ mod tests {
             Some("run-after-full")
         );
         assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_last_waiter_reclaims_session_write_locks() -> io::Result<()> {
+        let temp = TempDir::new()?;
+        let store = SessionStoreV2::new(temp.path().to_path_buf()).await?;
+        for index in 0..512 {
+            let id = format!("cancelled-child-{index}");
+            let held = store.acquire_session_maintenance_lock(&id).await?;
+            let mut waiter = Box::pin(store.acquire_session_write_lock(&id, SaveKind::Runtime));
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    std::future::Future::poll(waiter.as_mut(), cx).is_pending()
+                ))
+                .await
+            );
+            drop(held);
+            drop(waiter);
+        }
+        assert!(store.session_write_locks.is_empty());
+        assert_eq!(
+            store
+                .persistence_metrics
+                .waiting_saves
+                .load(Ordering::Relaxed),
+            0
+        );
         Ok(())
     }
 

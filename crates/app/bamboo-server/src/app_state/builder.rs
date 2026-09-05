@@ -525,7 +525,13 @@ impl AppState {
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
         // owns handles to both maps.
-        spawn_session_map_cleanup_task(agent_runners.clone(), session_event_senders.clone(), None);
+        spawn_session_map_cleanup_task(
+            agent_runners.clone(),
+            session_event_senders.clone(),
+            session_watchers.clone(),
+            sessions.clone(),
+            None,
+        );
 
         // Bridge both instruction and orchestration catalog transitions onto
         // the same durable account feed used by SSE and v2 WebSocket clients.
