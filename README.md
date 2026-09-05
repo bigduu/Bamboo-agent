@@ -244,6 +244,8 @@ A global `--log-level <error|warn|info|debug|trace>` sets the default log level 
 - Data dir: `BAMBOO_DATA_DIR` or `${HOME}/.bamboo`
 - Default provider: `anthropic`
 
+**Search-index upgrade:** Before upgrading `session_search.db` from schema 3 to 4, stop all older Bamboo servers, workers, and embedded writers that share the data directory. Startup migrates this derived search cache in one atomic transaction; a failed migration preserves the previous schema and cache contents. Running old and new writers together during a rolling upgrade is unsupported because older writers can reset the schema version and do not preserve the new search row identities. Canonical session data is unchanged; do not delete it to perform or recover this upgrade.
+
 ### Call the agent loop
 
 Once the server is running, driving the **full agent loop** — the LLM plans, calls tools, and streams its work — is three HTTP calls: create the turn with `POST /api/v1/chat`, **start the loop** with `POST /api/v1/execute/{session_id}`, then watch the SSE feed `GET /api/v1/events/{session_id}`.

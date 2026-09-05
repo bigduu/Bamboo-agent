@@ -7,6 +7,11 @@ use tokio::task;
 
 use bamboo_domain::{Role, Session, SessionKind};
 
+mod delta;
+#[cfg(test)]
+mod incremental_tests;
+mod schema;
+
 const INDEX_RECENT_DAYS: i64 = 7;
 const PURGE_OLDER_THAN_DAYS: i64 = 10;
 const VACUUM_MIN_DB_BYTES: u64 = 256 * 1024 * 1024;
@@ -105,7 +110,7 @@ impl SessionSearchIndex {
     pub async fn upsert_session(&self, session: &Session) -> std::io::Result<()> {
         let db_path = self.db_path.clone();
         let session = session.clone();
-        task::spawn_blocking(move || upsert_session_db(&db_path, &session, None))
+        task::spawn_blocking(move || upsert_session_db(&db_path, &session, None).map(|_| ()))
             .await
             .map_err(|error| to_io_error(format!("session search upsert join error: {error}")))?
     }
@@ -122,11 +127,13 @@ impl SessionSearchIndex {
             path: revision_path.to_path_buf(),
             expected: expected_revision.to_string(),
         };
-        task::spawn_blocking(move || upsert_session_db(&db_path, &session, Some(&revision)))
-            .await
-            .map_err(|error| {
-                to_io_error(format!("guarded session search upsert join error: {error}"))
-            })?
+        task::spawn_blocking(move || {
+            upsert_session_db(&db_path, &session, Some(&revision)).map(|_| ())
+        })
+        .await
+        .map_err(|error| {
+            to_io_error(format!("guarded session search upsert join error: {error}"))
+        })?
     }
 
     pub async fn delete_session(&self, session_id: &str) -> std::io::Result<()> {
@@ -213,71 +220,17 @@ fn init_db(db_path: &Path) -> std::io::Result<()> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let conn = open_db(db_path)?;
+    let mut conn = open_db(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| to_io_error(format!("sqlite pragma journal_mode failed: {e}")))?;
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS session_search_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS sessions_search (
-            session_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            root_session_id TEXT NOT NULL,
-            parent_session_id TEXT,
-            pinned INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            summary TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS session_messages_search (
-            session_id TEXT NOT NULL,
-            message_id TEXT NOT NULL,
-            message_index INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            compressed INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (session_id, message_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_session_messages_search_session_id
-        ON session_messages_search(session_id, message_index);
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS sessions_search_fts USING fts5(
-            session_id UNINDEXED,
-            title,
-            summary
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_search_fts USING fts5(
-            session_id UNINDEXED,
-            message_id UNINDEXED,
-            message_index UNINDEXED,
-            role UNINDEXED,
-            content
-        );
-        "#,
-    )
-    .map_err(|e| to_io_error(format!("sqlite schema init failed: {e}")))?;
-    conn.execute(
-        r#"INSERT INTO session_search_meta (key, value) VALUES ('schema_version', '3')
-           ON CONFLICT(key) DO UPDATE SET value = excluded.value"#,
-        [],
-    )
-    .map_err(|e| to_io_error(format!("sqlite meta init failed: {e}")))?;
-    Ok(())
+    schema::initialize(&mut conn)
 }
 
 fn upsert_session_db(
     db_path: &Path,
     session: &Session,
     source_revision: Option<&SearchSourceRevision>,
-) -> std::io::Result<()> {
+) -> std::io::Result<delta::Changes> {
     let conn = open_db(db_path)?;
     conn.execute_batch("BEGIN IMMEDIATE TRANSACTION;")
         .map_err(|e| to_io_error(format!("sqlite begin transaction failed: {e}")))?;
@@ -290,13 +243,13 @@ fn upsert_session_db(
                     conn.execute_batch("COMMIT;").map_err(|e| {
                         to_io_error(format!("sqlite commit superseded no-op failed: {e}"))
                     })?;
-                    return Ok(());
+                    return Ok(delta::Changes::default());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     conn.execute_batch("COMMIT;").map_err(|e| {
                         to_io_error(format!("sqlite commit deleted-source no-op failed: {e}"))
                     })?;
-                    return Ok(());
+                    return Ok(delta::Changes::default());
                 }
                 Err(error) => return Err(error),
             }
@@ -318,114 +271,22 @@ fn upsert_session_db(
         if indexed_updated_at.is_some_and(|updated_at| updated_at > session.updated_at) {
             conn.execute_batch("COMMIT;")
                 .map_err(|e| to_io_error(format!("sqlite commit stale no-op failed: {e}")))?;
-            return Ok(());
+            return Ok(delta::Changes::default());
         }
 
         if !should_index_session(session.updated_at) {
             delete_session_rows(&conn, &session.id)?;
             conn.execute_batch("COMMIT;")
                 .map_err(|e| to_io_error(format!("sqlite commit expiry delete failed: {e}")))?;
-            return Ok(());
+            return Ok(delta::Changes::default());
         }
 
-        conn.execute(
-            r#"
-            INSERT INTO sessions_search (
-                session_id, title, kind, root_session_id, parent_session_id, pinned, updated_at, summary
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(session_id) DO UPDATE SET
-                title = excluded.title,
-                kind = excluded.kind,
-                root_session_id = excluded.root_session_id,
-                parent_session_id = excluded.parent_session_id,
-                pinned = excluded.pinned,
-                updated_at = excluded.updated_at,
-                summary = excluded.summary
-            "#,
-            params![
-                session.id,
-                session.title,
-                match session.kind {
-                    SessionKind::Root => "root",
-                    SessionKind::Child => "child",
-                },
-                session.root_session_id,
-                session.parent_session_id,
-                if session.pinned { 1 } else { 0 },
-                session.updated_at.to_rfc3339(),
-                session.conversation_summary.as_ref().map(|summary| summary.content.as_str()),
-            ],
-        )
-        .map_err(|e| to_io_error(format!("sqlite upsert session failed: {e}")))?;
-
-        conn.execute(
-            "DELETE FROM session_messages_search WHERE session_id = ?1",
-            params![session.id],
-        )
-        .map_err(|e| to_io_error(format!("sqlite delete old message rows failed: {e}")))?;
-        conn.execute(
-            "DELETE FROM sessions_search_fts WHERE session_id = ?1",
-            params![session.id],
-        )
-        .map_err(|e| to_io_error(format!("sqlite delete old session fts rows failed: {e}")))?;
-        conn.execute(
-            "DELETE FROM session_messages_search_fts WHERE session_id = ?1",
-            params![session.id],
-        )
-        .map_err(|e| to_io_error(format!("sqlite delete old message fts rows failed: {e}")))?;
-
-        conn.execute(
-            "INSERT INTO sessions_search_fts (session_id, title, summary) VALUES (?1, ?2, ?3)",
-            params![
-                session.id,
-                session.title,
-                session
-                    .conversation_summary
-                    .as_ref()
-                    .map(|summary| summary.content.as_str())
-                    .unwrap_or_default(),
-            ],
-        )
-        .map_err(|e| to_io_error(format!("sqlite insert session fts row failed: {e}")))?;
-
-        for (index, message) in session.messages.iter().enumerate() {
-            let role = match message.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
-            conn.execute(
-                r#"
-                INSERT INTO session_messages_search (
-                    session_id, message_id, message_index, role, content, compressed, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                "#,
-                params![
-                    session.id,
-                    message.id,
-                    index as i64,
-                    role,
-                    message.content,
-                    if message.compressed { 1 } else { 0 },
-                    message.created_at.to_rfc3339(),
-                ],
-            )
-            .map_err(|e| to_io_error(format!("sqlite insert message row failed: {e}")))?;
-            conn.execute(
-                r#"
-                INSERT INTO session_messages_search_fts (
-                    session_id, message_id, message_index, role, content
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-                params![session.id, message.id, index as i64, role, message.content],
-            )
-            .map_err(|e| to_io_error(format!("sqlite insert message fts row failed: {e}")))?;
-        }
+        let changes = delta::sync_session(&conn, session)
+            .map_err(|e| to_io_error(format!("sqlite synchronize session search failed: {e}")))?;
 
         conn.execute_batch("COMMIT;")
             .map_err(|e| to_io_error(format!("sqlite commit failed: {e}")))?;
-        Ok(())
+        Ok(changes)
     })();
 
     if result.is_err() {
@@ -467,27 +328,8 @@ fn delete_session_db(
 }
 
 fn delete_session_rows(conn: &Connection, session_id: &str) -> std::io::Result<()> {
-    conn.execute(
-        "DELETE FROM sessions_search WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| to_io_error(format!("sqlite delete session row failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM session_messages_search WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| to_io_error(format!("sqlite delete message rows failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM sessions_search_fts WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| to_io_error(format!("sqlite delete session fts row failed: {e}")))?;
-    conn.execute(
-        "DELETE FROM session_messages_search_fts WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| to_io_error(format!("sqlite delete message fts rows failed: {e}")))?;
-    Ok(())
+    delta::delete_session(conn, session_id)
+        .map_err(|e| to_io_error(format!("sqlite delete session search rows failed: {e}")))
 }
 
 fn prune_stale_sessions_db(db_path: &Path) -> std::io::Result<usize> {
