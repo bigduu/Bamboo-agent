@@ -405,9 +405,10 @@ pub(crate) fn evict_idle_session_entries(
 /// Spawn a background task that idle-evicts completed agent runners **and their
 /// paired session event senders** after [`SESSION_MAP_IDLE_TTL_SECS`].
 ///
-/// Fire-and-forget (runs for the process lifetime), matching the other
-/// background maintenance tickers. See [`evict_idle_session_entries`] for the
-/// eviction predicate and its race-freedom argument.
+/// Detached maintenance holds only weak map/cache references between sweeps,
+/// so releasing the server or worker executor also releases its resources.
+/// The task exits on the next tick after an owner disappears. See
+/// [`evict_idle_session_entries`] for the eviction predicate and ordering.
 pub fn spawn_session_map_cleanup_task(
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -415,9 +416,17 @@ pub fn spawn_session_map_cleanup_task(
     sessions: bamboo_engine::SessionCache,
     log_prefix: Option<&'static str>,
 ) {
+    let runners = Arc::downgrade(&runners);
+    let senders = Arc::downgrade(&senders);
+    let sessions = Arc::downgrade(&sessions);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            let (Some(runners), Some(senders), Some(sessions)) =
+                (runners.upgrade(), senders.upgrade(), sessions.upgrade())
+            else {
+                break;
+            };
 
             // Lock order: runners ⊃ senders. This matches `reserve_runner_core`
             // (which nests senders inside the runners write lock to re-assert the
@@ -713,6 +722,29 @@ mod eviction_tests {
     use chrono::Duration as ChronoDuration;
 
     const TTL: i64 = SESSION_MAP_IDLE_TTL_SECS;
+
+    #[tokio::test]
+    async fn sleeping_cleanup_does_not_retain_released_worker_maps_or_transcripts() {
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let senders = Arc::new(RwLock::new(HashMap::new()));
+        let sessions = bamboo_engine::SessionCache::default();
+        let weak_runners = Arc::downgrade(&runners);
+        let weak_senders = Arc::downgrade(&senders);
+        let weak_sessions = Arc::downgrade(&sessions);
+        spawn_session_map_cleanup_task(
+            runners.clone(),
+            senders.clone(),
+            super::super::watchers::SessionWatchers::new(),
+            sessions.clone(),
+            Some("released-worker"),
+        );
+        // Let maintenance park at its first tick, as in a warm worker runtime.
+        tokio::task::yield_now().await;
+        drop((runners, senders, sessions));
+        assert!(weak_runners.upgrade().is_none());
+        assert!(weak_senders.upgrade().is_none());
+        assert!(weak_sessions.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn failed_admission_channel_obeys_ttl_and_live_subscriber_retention() {
