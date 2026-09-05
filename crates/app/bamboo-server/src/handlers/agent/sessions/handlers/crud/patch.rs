@@ -1721,6 +1721,8 @@ mod tests {
             .expect("load session")
             .expect("session exists");
         session.set_project_id_meta("../malformed");
+        session.metadata_version = session.metadata_version.checked_add(1).unwrap();
+        let malformed_version = session.metadata_version;
         state
             .storage
             .save_session(&session)
@@ -1731,7 +1733,7 @@ mod tests {
             &app,
             test::TestRequest::patch()
                 .uri(&format!("/api/v1/sessions/{id}"))
-                .insert_header((header::IF_MATCH, "\"0\""))
+                .insert_header((header::IF_MATCH, format!("\"{malformed_version}\"")))
                 .set_json(serde_json::json!({ "project_id": null }))
                 .to_request(),
         )
@@ -1748,7 +1750,7 @@ mod tests {
             reloaded.project_id_meta().is_none(),
             "explicit null must clear even a malformed legacy value"
         );
-        assert_eq!(reloaded.metadata_version, 1);
+        assert_eq!(reloaded.metadata_version, malformed_version + 1);
     }
 
     #[actix_web::test]
