@@ -132,6 +132,10 @@ pub async fn remove_runner_entry(
     session_id: &str,
 ) -> Option<AgentRunner> {
     if let Some(runner) = runners.get(session_id) {
+        // Arm execution cancellation before the drain can suspend. Dropping a
+        // delete/rollback future must not leave a live runner with a closed
+        // event fence that a subsequent execute mistakes for healthy work.
+        runner.cancel_token.cancel();
         runner.event_publication.retire().await;
     }
     runners.remove(session_id)
@@ -207,7 +211,9 @@ mod tests {
     #[tokio::test]
     async fn cancelling_removal_keeps_the_predecessor_fence_discoverable() {
         use std::sync::Barrier;
-        let runner = AgentRunner::new();
+        let mut runner = AgentRunner::new();
+        runner.status = AgentStatus::Running;
+        let cancel = runner.cancel_token.clone();
         let publication = runner.event_publication.clone();
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
@@ -227,6 +233,10 @@ mod tests {
         let mut removing = Box::pin(remove_runner_entry(&mut runners, "child"));
         assert!(futures::poll!(removing.as_mut()).is_pending());
         drop(removing);
+        assert!(
+            cancel.is_cancelled(),
+            "retired execution must be told to stop even when removal is cancelled"
+        );
         assert!(
             runners.contains_key("child"),
             "a successor must still find the old fence after cancellation"
