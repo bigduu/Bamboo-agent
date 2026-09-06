@@ -380,7 +380,61 @@ impl Agent {
         let direct_lease = self.inner.begin_direct_execution(&session.id).await?;
         if session.project_id_meta().is_none() {
             if let Some(project_id) = self.project_id.as_ref() {
-                session.set_project_id_meta(project_id.to_string());
+                let existing = if session.kind == bamboo_domain::SessionKind::Root {
+                    match self.storage().load_root_authority(&session.id).await {
+                        // Preserve compatibility for custom Storage backends that
+                        // predate the strict Root port. V2 always uses its canonical
+                        // directory lookup, even when this instance's index is stale.
+                        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                            self.storage().load_session(&session.id).await
+                        }
+                        result => result,
+                    }
+                    .map_err(|error| AgentError::ProjectContext(error.to_string()))?
+                } else {
+                    None
+                };
+                if let Some(current) = existing {
+                    if current.kind != bamboo_domain::SessionKind::Root
+                        || current.created_at != session.created_at
+                        || current.metadata_version != session.metadata_version
+                        || current.authority_identity != session.authority_identity
+                        || current.project_id_meta().is_some()
+                    {
+                        return Err(AgentError::ProjectContext(
+                            "Session context changed; reload before assigning its first Project"
+                                .to_string(),
+                        ));
+                    }
+                    let next_version =
+                        current.metadata_version.checked_add(1).ok_or_else(|| {
+                            AgentError::ProjectContext(
+                                "Session metadata revision cannot advance".to_string(),
+                            )
+                        })?;
+                    let mut candidate = session.clone();
+                    candidate.set_project_id_meta(project_id.to_string());
+                    candidate.metadata_version = next_version;
+                    candidate.updated_at = std::time::SystemTime::now().into();
+                    self.inner
+                        .prepare_external_project_assignment_read_only(&mut candidate)
+                        .await?;
+                    #[cfg(test)]
+                    reexecute_and_child_approval_tests::pause_project_assignment(&session.id).await;
+                    // Commit the narrow context change before publishing a runtime
+                    // workspace or replaying an approved tool. The final writer
+                    // fences an independent store's competing assignment. The
+                    // V2 runtime path leaves conversation history untouched.
+                    self.storage()
+                        .save_runtime_state(&candidate)
+                        .await
+                        .map_err(|error| AgentError::ProjectContext(error.to_string()))?;
+                    *session = candidate;
+                } else {
+                    // First creation keeps its existing revision and persistence
+                    // lifecycle; Child assignment keeps its prior SDK semantics.
+                    session.set_project_id_meta(project_id.to_string());
+                }
             }
         }
 
@@ -1334,9 +1388,46 @@ mod reexecute_and_child_approval_tests {
     use bamboo_agent_core::tools::{
         FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolExecutionSessionFlags, ToolOutcome,
     };
+    use bamboo_domain::Storage as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
+
+    struct ProjectAssignmentHook {
+        reached: Notify,
+        resume: Notify,
+    }
+
+    fn project_assignment_hooks(
+    ) -> &'static StdMutex<std::collections::HashMap<String, Arc<ProjectAssignmentHook>>> {
+        static HOOKS: std::sync::OnceLock<
+            StdMutex<std::collections::HashMap<String, Arc<ProjectAssignmentHook>>>,
+        > = std::sync::OnceLock::new();
+        HOOKS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+    }
+
+    fn install_project_assignment_hook(session_id: &str) -> Arc<ProjectAssignmentHook> {
+        let hook = Arc::new(ProjectAssignmentHook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        project_assignment_hooks()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause_project_assignment(session_id: &str) {
+        let hook = project_assignment_hooks()
+            .lock()
+            .unwrap()
+            .remove(session_id);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
 
     /// A tool whose real output is trivially distinguishable from the
     /// synthetic "Selected response: Approve" placeholder `submit_pending_response`
@@ -1736,6 +1827,7 @@ mod reexecute_and_child_approval_tests {
             .expect("approve replay");
         let mut session = outcome.session;
         session.add_message(Message::user("continue after replay"));
+        let original_version = session.metadata_version;
 
         agent
             .run_session(&mut session)
@@ -1743,6 +1835,24 @@ mod reexecute_and_child_approval_tests {
             .expect("normal run should complete");
 
         assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.metadata_version, original_version + 1);
+        let reopened = bamboo_storage::SessionStoreV2::new(
+            agent
+                .session_store
+                .as_ref()
+                .unwrap()
+                .bamboo_home_dir()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let persisted = reopened
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, original_version + 1);
+        assert_eq!(persisted.project_id_meta(), session.project_id_meta());
         let canonical = project_path
             .path()
             .canonicalize()
@@ -1797,6 +1907,191 @@ mod reexecute_and_child_approval_tests {
         assert!(workspace_context.contains(canonical.to_string_lossy().as_ref()));
         assert!(workspace_context.contains("Workspace source: project_default"));
         assert!(workspace_context.contains("Binding status: registered"));
+    }
+
+    async fn root_context_test_agent(
+        data_dir: &std::path::Path,
+        project_path: &std::path::Path,
+    ) -> (Agent, Arc<RealOutputTool>, Arc<CountingDoneProvider>) {
+        let project = bamboo_projects::ProjectStore::open(data_dir)
+            .unwrap()
+            .create_with_project_path(
+                "Context fence Project",
+                None,
+                project_path.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        std::fs::write(
+            data_dir.join("config.json"),
+            r#"{
+            "provider":"anthropic",
+            "providers":{"anthropic":{"api_key":"test-key","model":"claude-test"}}
+        }"#,
+        )
+        .unwrap();
+        let tool = Arc::new(RealOutputTool::new());
+        let provider = Arc::new(CountingDoneProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let agent = AgentBuilder::new()
+            .provider(provider.clone())
+            .model("claude-test")
+            .instruction("configured System")
+            .project_id(project.id.to_string())
+            .tool_shared(tool.clone())
+            .with_defaults_for_data_dir(data_dir.to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        (agent, tool, provider)
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_rejects_final_store_race() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
+        let mut session = seed_gated_tool_session("sdk-root-context-race", "context-race-call");
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "context-race-call".to_string(),
+        );
+        agent.storage().save_session(&session).await.unwrap();
+        let second = bamboo_storage::SessionStoreV2::new(data.path().to_path_buf())
+            .await
+            .unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        let session_path = data
+            .path()
+            .join("sessions")
+            .join(&session.id)
+            .join("session.json");
+        let before_history = std::fs::read(&session_path).unwrap();
+        let before_workspace = bamboo_agent_core::workspace_state::get_workspace(&session.id);
+        let hook = install_project_assignment_hook(&session.id);
+        let mut winner = session.clone();
+        winner.set_project_id_meta("competing-project");
+        winner.metadata_version += 1;
+        let (tx, mut rx) = mpsc::channel(16);
+        let run = agent.execute_internal(&mut session, tx, CancellationToken::new());
+        let compete = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+                .await
+                .unwrap();
+            second.save_runtime_state(&winner).await.unwrap();
+            hook.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(run, compete);
+        let error = result.expect_err("final V2 writer must reject the competing assignment");
+        assert!(
+            matches!(error, AgentError::ProjectContext(ref message) if message.contains("authority conflict")),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+        assert_eq!(std::fs::read(&session_path).unwrap(), before_history);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&session.id),
+            before_workspace
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
+        let persisted = second
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.project_id_meta(), winner.project_id_meta());
+        assert_eq!(persisted.metadata_version, winner.metadata_version);
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_uses_canonical_root_with_stale_index()
+    {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, _, _) = root_context_test_agent(data.path(), workspace.path()).await;
+        let second = bamboo_storage::SessionStoreV2::new(data.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut session = Session::new("sdk-root-context-stale-index", "claude-test");
+        session.add_message(Message::user("continue"));
+        second.save_session(&session).await.unwrap();
+        assert!(
+            agent
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "SDK instance intentionally predates this Root"
+        );
+        agent.run_session(&mut session).await.unwrap();
+        let persisted = second
+            .load_root_authority(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 1);
+        assert_eq!(
+            persisted.project_id_meta().as_deref(),
+            agent.project_id.as_ref().map(|id| id.as_str())
+        );
+        assert_eq!(session.metadata_version, 1);
+
+        let mut unsaved = Session::new("sdk-root-context-new", "claude-test");
+        unsaved.add_message(Message::user("first run"));
+        agent.run_session(&mut unsaved).await.unwrap();
+        assert_eq!(
+            unsaved.metadata_version, 0,
+            "new sessions retain the initial revision"
+        );
+        let persisted = second
+            .load_root_authority(&unsaved.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata_version, 0);
+        assert_eq!(persisted.project_id_meta(), unsaved.project_id_meta());
+    }
+
+    #[tokio::test]
+    async fn root_context_fence_sdk_first_project_assignment_overflow_preserves_retry_state() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, tool, provider) = root_context_test_agent(data.path(), workspace.path()).await;
+        let mut session = seed_gated_tool_session("sdk-root-context-overflow", "overflow-call");
+        session.metadata_version = u64::MAX;
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.to_string(),
+            "overflow-call".to_string(),
+        );
+        agent.storage().save_session(&session).await.unwrap();
+        let before = serde_json::to_vec(&session).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let error = agent
+            .execute_internal(&mut session, tx, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::ProjectContext(ref message) if message.contains("revision cannot advance"))
+        );
+        assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+        let persisted = agent
+            .storage()
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&persisted).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap()
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

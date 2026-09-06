@@ -43,6 +43,9 @@ use bamboo_domain::{
     SupervisorBootstrapReceipt, TaskList, TokenBudgetUsage, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
+mod root_context;
+#[cfg(test)]
+mod root_context_tests;
 mod supervisor;
 #[cfg(test)]
 mod supervisor_tests;
@@ -2750,6 +2753,7 @@ impl SessionStoreV2 {
         let mut session = overlay_runtime_sidecar(main, sidecar);
         session.messages.clear();
         session.clear_stale_root_token_budget();
+        self.validate_root_context_for_save(&session).await?;
         Ok(Some((abs_dir, session)))
     }
 
@@ -3358,6 +3362,7 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        self.validate_root_context_for_save(&current).await?;
         if current.authority_identity != original.authority_identity
             || !Self::runtime_task_owned_snapshot_matches(&current, original)?
         {
@@ -3448,6 +3453,8 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        self.validate_root_context_for_save(&current_first).await?;
+        self.validate_root_context_for_save(&current_second).await?;
         if current_first.authority_identity != first_original.authority_identity
             || current_second.authority_identity != second_original.authority_identity
             || !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
@@ -3621,10 +3628,22 @@ impl SessionStoreV2 {
     /// their cache. Fail before any write so the locked persistence boundary
     /// can adopt the durable Task fields and retry with one coherent snapshot.
     async fn reject_regressing_runtime_task(&self, incoming: &Session) -> io::Result<()> {
-        if let Some(durable) = self
-            .load_runtime_control_plane_unchecked(&incoming.id)
+        let durable = if incoming.kind == SessionKind::Root {
+            // Root writers also operate with an out-of-date local index. The
+            // final Root fence has validated this canonical sidecar already.
+            Self::read_runtime_sidecar_at(
+                &self
+                    .sessions_dir
+                    .join(&incoming.id)
+                    .join(RUNTIME_SIDECAR_FILE),
+                &incoming.id,
+            )
             .await?
-        {
+        } else {
+            self.load_runtime_control_plane_unchecked(&incoming.id)
+                .await?
+        };
+        if let Some(durable) = durable {
             if Self::ordinary_task_write_would_regress(incoming, &durable)? {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -3663,6 +3682,7 @@ impl SessionStoreV2 {
     /// (potentially huge) `messages` history cleared. This is what makes
     /// runtime-only saves O(1) in conversation length.
     async fn write_runtime_sidecar(&self, abs_dir: &Path, session: &Session) -> io::Result<()> {
+        self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
         let bytes =
@@ -3678,6 +3698,7 @@ impl SessionStoreV2 {
         abs_dir: &Path,
         session: &Session,
     ) -> io::Result<()> {
+        self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
         let bytes = serde_json::to_vec_pretty(&snapshot)
@@ -3685,14 +3706,13 @@ impl SessionStoreV2 {
         durable_atomic_write(&path, &bytes).await
     }
 
-    /// One-shot migration: create the runtime sidecar (`runtime.json`) for every
-    /// existing session that predates the message/control-plane split.
+    /// One-shot migration of legacy Child sidecars (`runtime.json`).
     ///
     /// Loading already tolerates a missing sidecar (it falls back to the embedded
-    /// control-plane in `session.json`), so this is an *optimization* migration,
-    /// not a correctness one — but running it once means the fast runtime-save
-    /// path is in effect immediately for legacy sessions, and the denormalized
-    /// `children` id vectors (now `#[serde(skip)]`) drop out of the sidecar.
+    /// control-plane in `session.json`). A main-only Root is indistinguishable
+    /// from a Root that lost a newer Project revision, so it remains readable
+    /// but cannot be reconstructed here. Its canonical runtime must be restored
+    /// before any mutation; this migration cannot establish that authority.
     ///
     /// Idempotent and cheap on later boots: guarded by a marker file, and any
     /// session that already has a sidecar is skipped. Returns the number of
@@ -4320,6 +4340,8 @@ impl SessionStoreV2 {
             return Ok(false);
         };
 
+        self.validate_root_context_for_save(&session).await?;
+
         // Keep only the first System message if present; drop all other messages.
         let system_msg = session
             .messages
@@ -4836,6 +4858,7 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
         self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_full_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
 
         let mut stages = SaveStageDurations::default();
@@ -4919,7 +4942,27 @@ impl Storage for SessionStoreV2 {
         // session.json — which carries the full conversation history — untouched.
         // Ordinary sessions retain O(1) I/O in conversation length. Supervisor
         // validation additionally reads main-file bytes to verify its identity.
-        let Some(rel) = self.resolve_rel_path(&session.id).await else {
+        validate_session_id(&session.id)?;
+        let mut rel = self.resolve_rel_path(&session.id).await;
+        if rel.is_none() && session.kind == SessionKind::Root {
+            // The index is only a hint. Another Store may have created this
+            // Root since our index loaded. Keep the existing Root on the
+            // runtime path so a context update cannot overwrite its history.
+            // Either canonical file is enough to select this path, never to
+            // authorize it: the final guard requires the complete valid pair.
+            let directory = self.sessions_dir.join(&session.id);
+            for file in ["session.json", RUNTIME_SIDECAR_FILE] {
+                match fs::symlink_metadata(directory.join(file)).await {
+                    Ok(_) => {
+                        rel = Some(Self::root_rel_path(&session.id));
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let Some(rel) = rel else {
             // Session was never fully persisted yet — fall back to a full save so
             // session.json and the index get created. Deliberately acquire no
             // shared Task guard before this call: `save_session` owns that
@@ -4932,6 +4975,7 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Runtime)
             .await?;
         self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_save(session).await?;
         self.reject_regressing_runtime_task(session).await?;
         let abs_dir = self.abs_path_from_rel(&rel);
         let mut stages = SaveStageDurations::default();
@@ -4953,22 +4997,35 @@ impl Storage for SessionStoreV2 {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
-        let runtime_index_changed = self
-            .get_index_entry(&session.id)
-            .await
-            .is_some_and(|entry| {
-                entry.workspace_path != workspace_path || entry.project_id != project_id
-            });
+        let runtime_index_changed = self.get_index_entry(&session.id).await.is_none_or(|entry| {
+            entry.workspace_path != workspace_path || entry.project_id != project_id
+        });
         if runtime_index_changed {
             let index_started = Instant::now();
-            self.update_index(|index| {
-                if let Some(entry) = index.sessions.get_mut(&session.id) {
-                    entry.workspace_path = workspace_path;
-                    entry.project_id = project_id;
-                }
-                Ok(())
-            })
-            .await?;
+            let index_updated = self
+                .update_index(|index| {
+                    if let Some(entry) = index.sessions.get_mut(&session.id) {
+                        entry.workspace_path = workspace_path;
+                        entry.project_id = project_id;
+                        return Ok(true);
+                    }
+                    Ok(false)
+                })
+                .await?;
+            if !index_updated && session.kind == SessionKind::Root {
+                // Exceptional recovery of a globally missing index entry must
+                // preserve the real history count, not the caller's snapshot.
+                // Only this recovery path reads main; ordinary runtime saves
+                // and a merely stale local index remain transcript-independent.
+                let authoritative = self
+                    .load_authoritative_root_session(&session.id)
+                    .await?
+                    .ok_or_else(|| {
+                        other_io_error("runtime Root disappeared during index repair")
+                    })?;
+                self.repair_index_from_authoritative_session(&authoritative, rel.clone())
+                    .await?;
+            }
             stages.index_publication = index_started.elapsed();
         }
         let index_entry_count = self.index.read().await.sessions.len();
@@ -7090,6 +7147,7 @@ mod tests {
         );
 
         session.set_project_id_meta(" 01JPROJECTLATEST00000000000 ");
+        session.metadata_version += 1;
         storage.save_runtime_state(&session).await?;
         assert_eq!(
             storage
@@ -7247,15 +7305,21 @@ mod tests {
     // ── ⑤ Runtime sidecar migration ──────────────────────────────────────
 
     #[tokio::test]
-    async fn migration_backfills_sidecars_for_legacy_sessions() -> io::Result<()> {
+    async fn migration_backfills_sidecars_for_legacy_children() -> io::Result<()> {
         let temp_dir = TempDir::new().map_err(io::Error::other)?;
         let bamboo_home = temp_dir.path().to_path_buf();
         let storage = SessionStoreV2::new(bamboo_home.clone()).await?;
 
-        // Persist two sessions, then delete their sidecars to simulate the
-        // legacy on-disk layout (session.json only).
-        let a = session_with_history("mig-a", 3, "run-A");
-        let b = session_with_history("mig-b", 1, "run-B");
+        // Child migration remains compatible. A main-only Root is ambiguous
+        // and cannot establish a current Project revision through migration.
+        let parent = Session::new("migration-root", "model");
+        storage.save_session(&parent).await?;
+        let mut a = Session::new_child("mig-a", &parent.id, "model", "child");
+        a.messages = session_with_history("history-a", 3, "run-A").messages;
+        a.agent_runtime_state = Some(AgentRuntimeState::new("run-A"));
+        let mut b = Session::new_child("mig-b", &parent.id, "model", "child");
+        b.messages = session_with_history("history-b", 1, "run-B").messages;
+        b.agent_runtime_state = Some(AgentRuntimeState::new("run-B"));
         storage.save_session(&a).await?;
         storage.save_session(&b).await?;
         for id in ["mig-a", "mig-b"] {
@@ -7306,7 +7370,11 @@ mod tests {
         // old denormalized children id vectors. After migration the sidecar must
         // not contain them (they are now derived from the index).
         let (storage, _t) = create_temp_storage().await?;
-        let mut s = session_with_history("mig-legacy", 1, "run-L");
+        let parent = Session::new("migration-root", "model");
+        storage.save_session(&parent).await?;
+        let mut s = Session::new_child("mig-legacy", &parent.id, "model", "child");
+        s.messages = session_with_history("history-legacy", 1, "run-L").messages;
+        s.agent_runtime_state = Some(AgentRuntimeState::new("run-L"));
         storage.save_session(&s).await?;
 
         // Hand-write a legacy session.json containing children.active_ids and

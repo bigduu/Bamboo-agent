@@ -373,16 +373,9 @@ async fn strict_reads_distinguish_absence_from_legacy_compatibility_fallback() {
             .len(),
         1
     );
-    assert_eq!(store.migrate_runtime_sidecars().await.unwrap(), 1);
-    assert_eq!(
-        store
-            .load_root_authority(&legacy.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .authority_identity,
-        SessionAuthorityIdentity::Ordinary
-    );
+    assert!(store.migrate_runtime_sidecars().await.is_err());
+    assert!(!path.exists());
+    assert!(store.load_root_authority(&legacy.id).await.is_err());
 }
 
 #[tokio::test]
@@ -483,6 +476,7 @@ async fn copying_supervisor_preserves_conversation_context_but_creates_ordinary_
         .unwrap();
     source.title = "Coordinator discussion".into();
     source.set_project_id_meta("project-original");
+    source.metadata_version += 1;
     source.set_workspace_path_meta("/workspace/original");
     source.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::default());
     source

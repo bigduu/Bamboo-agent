@@ -966,6 +966,7 @@ mod tests {
                     .expect("test schedule Project")
                     .to_string(),
             );
+            caller.metadata_version = caller.metadata_version.checked_add(1).unwrap();
             state.storage.save_session(&caller).await.unwrap();
             let error = tool
                 .invoke(
