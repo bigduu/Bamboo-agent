@@ -77,8 +77,9 @@
 //! # Thread Safety
 //!
 //! All storage operations are thread-safe and can be called from multiple
-//! async tasks concurrently. SQLite connections are opened per-operation
-//! to avoid blocking the async runtime.
+//! async tasks concurrently. Each standalone operation or bounded batch segment
+//! opens a connection on the blocking pool. Commands retain their individual
+//! transaction boundaries; a segment does not create an outer transaction.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -96,6 +97,15 @@ use crate::metrics::types::{
     SessionDetail, SessionMetrics, SessionMetricsFilter, SessionStatus, TokenUsage,
     ToolCallMetrics,
 };
+
+pub use super::mutations::{MetricsMutation, MAX_METRICS_BATCH_SIZE};
+
+mod batch;
+#[cfg(test)]
+mod batch_probe;
+#[cfg(test)]
+mod batch_tests;
+mod writes;
 
 /// Result type for metrics storage operations.
 ///
@@ -232,6 +242,25 @@ pub struct ToolCallCompletion {
 /// ```
 #[async_trait]
 pub trait MetricsStorage: Send + Sync {
+    /// Apply ordinary writes in input order, preserving one result per item.
+    ///
+    /// The default calls the existing single-item API and continues after an
+    /// error. SQLite segments at 32 items and retains each command's original
+    /// commit boundary. An outer error means the blocking task failed outside
+    /// item isolation: a prefix may have committed, so do not replay the batch.
+    /// Runtime teardown is not a successful drain. Custom backend panics keep
+    /// their existing behavior; this default adds no new unwind boundary.
+    async fn apply_batch(
+        &self,
+        mutations: Vec<MetricsMutation>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        let mut results = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            results.push(mutation.apply(self).await);
+        }
+        Ok(results)
+    }
+
     /// Initializes the storage backend.
     ///
     /// This must be called before any other storage operations.
@@ -928,8 +957,9 @@ pub trait MetricsStorage: Send + Sync {
 ///
 /// # Thread Safety
 ///
-/// The storage can be safely cloned and shared across threads. Each operation
-/// opens its own database connection to avoid blocking and ensure thread safety.
+/// The storage can be safely cloned and shared across threads. Each standalone
+/// operation or bounded batch segment opens its own connection on the blocking
+/// pool. Each command retains its original transaction boundary.
 #[derive(Debug, Clone)]
 pub struct SqliteMetricsStorage {
     /// Path to the SQLite database file
@@ -973,6 +1003,13 @@ impl SqliteMetricsStorage {
             .await
     }
 
+    async fn write_one(&self, mutation: MetricsMutation) -> MetricsResult<()> {
+        self.with_connection(move |connection| {
+            writes::apply_mutation_on_connection(connection, mutation)
+        })
+        .await
+    }
+
     /// Executes a function with a database connection in a blocking context.
     ///
     /// This helper method handles:
@@ -1002,6 +1039,8 @@ impl SqliteMetricsStorage {
     {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            batch_probe::task_started(&db_path);
             let connection = open_connection(&db_path)?;
             func(&connection)
         })
@@ -1012,6 +1051,13 @@ impl SqliteMetricsStorage {
 
 #[async_trait]
 impl MetricsStorage for SqliteMetricsStorage {
+    async fn apply_batch(
+        &self,
+        mutations: Vec<MetricsMutation>,
+    ) -> MetricsResult<Vec<MetricsResult<()>>> {
+        self.apply_mutations(mutations).await
+    }
+
     async fn init(&self) -> MetricsResult<()> {
         self.with_connection(|connection| {
             connection.execute_batch(
@@ -1204,29 +1250,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let model = model.to_string();
-        let started_at = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO session_metrics (
-                    session_id, model, started_at, status, updated_at
-                ) VALUES (?1, ?2, ?3, 'running', ?3)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    model = excluded.model,
-                    started_at = CASE
-                        WHEN session_metrics.started_at <= excluded.started_at THEN session_metrics.started_at
-                        ELSE excluded.started_at
-                    END,
-                    completed_at = NULL,
-                    status = 'running',
-                    updated_at = excluded.updated_at
-                "#,
-                params![session_id, model, started_at],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::SessionStarted {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            started_at,
         })
         .await
     }
@@ -1237,15 +1264,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         message_count: u32,
         updated_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let updated_at = format_timestamp(updated_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                "UPDATE session_metrics SET message_count = ?1, updated_at = ?2 WHERE session_id = ?3",
-                params![i64::from(message_count), updated_at, session_id],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::SessionMessageCount {
+            session_id: session_id.to_string(),
+            message_count,
+            updated_at,
         })
         .await
     }
@@ -1256,18 +1278,10 @@ impl MetricsStorage for SqliteMetricsStorage {
         status: SessionStatus,
         completed_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let session_id = session_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                refresh_session_aggregates(connection, &session_id, completed_at)?;
-                connection.execute(
-                    "UPDATE session_metrics SET status = ?1, completed_at = ?2, updated_at = ?2 WHERE session_id = ?3",
-                    params![status.as_str(), completed_at_str, session_id],
-                )?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::SessionCompleted {
+            session_id: session_id.to_string(),
+            status,
+            completed_at,
         })
         .await
     }
@@ -1279,25 +1293,11 @@ impl MetricsStorage for SqliteMetricsStorage {
         model: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let round_id = round_id.to_string();
-        let session_id = session_id.to_string();
-        let model = model.to_string();
-        let started_at_str = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                connection.execute(
-                    r#"
-                    INSERT INTO round_metrics (
-                        round_id, session_id, model, started_at, status
-                    ) VALUES (?1, ?2, ?3, ?4, 'running')
-                    ON CONFLICT(round_id) DO NOTHING
-                    "#,
-                    params![round_id, session_id, model, started_at_str],
-                )?;
-                refresh_session_aggregates(connection, &session_id, started_at)?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::RoundStarted {
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+            started_at,
         })
         .await
     }
@@ -1408,64 +1408,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         prompt_cached_tool_tokens_saved: u32,
         error: Option<String>,
     ) -> MetricsResult<()> {
-        let round_id = round_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-        // SQLite INTEGER is signed 64-bit. Normalize before conversion so
-        // extreme provider values saturate instead of wrapping negative.
-        let usage = usage.clamped_for_durable_metrics();
-        let prompt_tokens = durable_token_to_i64(usage.prompt_tokens);
-        let completion_tokens = durable_token_to_i64(usage.completion_tokens);
-        let total_tokens = durable_token_to_i64(usage.total_tokens);
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                #[cfg(test)]
-                signal_complete_round_transaction_entered(&round_id);
-
-                let session_id: String = connection.query_row(
-                    "SELECT session_id FROM round_metrics WHERE round_id = ?1",
-                    params![round_id],
-                    |row| row.get(0),
-                )?;
-
-                connection.execute(
-                    r#"
-                    UPDATE round_metrics
-                    SET completed_at = ?1,
-                        status = ?2,
-                        prompt_tokens = ?3,
-                        completion_tokens = ?4,
-                        total_tokens = ?5,
-                        prompt_cached_tool_outputs = ?6,
-                        prompt_cached_tool_tokens_saved = ?7,
-                        -- `RoundCompleted` may be replayed. Replace its prompt-
-                        -- cache contribution while preserving tokens recorded by
-                        -- separate compression events, rather than adding the
-                        -- same completion payload again.
-                        tokens_saved = MAX(
-                            COALESCE(tokens_saved, 0) - COALESCE(prompt_cached_tool_tokens_saved, 0),
-                            0
-                        ) + ?8,
-                        error = ?9
-                    WHERE round_id = ?10
-                    "#,
-                    params![
-                        completed_at_str,
-                        status.as_str(),
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens,
-                        i64::from(prompt_cached_tool_outputs),
-                        i64::from(prompt_cached_tool_tokens_saved),
-                        i64::from(prompt_cached_tool_tokens_saved),
-                        error,
-                        round_id,
-                    ],
-                )?;
-
-                refresh_session_aggregates(connection, &session_id, completed_at)?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::RoundCompleted {
+            round_id: round_id.to_string(),
+            completed_at,
+            status,
+            usage,
+            prompt_cached_tool_outputs,
+            prompt_cached_tool_tokens_saved,
+            error,
         })
         .await
     }
@@ -1511,33 +1461,12 @@ impl MetricsStorage for SqliteMetricsStorage {
         tool_name: &str,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let tool_call_id = tool_call_id.to_string();
-        let round_id = round_id.to_string();
-        let session_id = session_id.to_string();
-        let tool_name = tool_name.to_string();
-        let started_at_str = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO tool_call_metrics (
-                    tool_call_id, round_id, session_id, tool_name, started_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
-                ON CONFLICT(tool_call_id) DO UPDATE SET
-                    round_id = excluded.round_id,
-                    session_id = excluded.session_id,
-                    tool_name = excluded.tool_name,
-                    started_at = excluded.started_at
-                "#,
-                params![
-                    tool_call_id,
-                    round_id,
-                    session_id,
-                    tool_name,
-                    started_at_str
-                ],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ToolStarted {
+            tool_call_id: tool_call_id.to_string(),
+            round_id: round_id.to_string(),
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            started_at,
         })
         .await
     }
@@ -1547,27 +1476,9 @@ impl MetricsStorage for SqliteMetricsStorage {
         tool_call_id: &str,
         completion: ToolCallCompletion,
     ) -> MetricsResult<()> {
-        let tool_call_id = tool_call_id.to_string();
-        let completed_at = format_timestamp(completion.completed_at);
-        let success = if completion.success { 1_i64 } else { 0_i64 };
-        let error = completion.error;
-
-        self.with_connection(move |connection| {
-            with_immediate_transaction(connection, || {
-                let session_id: String = connection.query_row(
-                    "SELECT session_id FROM tool_call_metrics WHERE tool_call_id = ?1",
-                    params![tool_call_id],
-                    |row| row.get(0),
-                )?;
-
-                connection.execute(
-                    "UPDATE tool_call_metrics SET completed_at = ?1, success = ?2, error = ?3 WHERE tool_call_id = ?4",
-                    params![completed_at, success, error, tool_call_id],
-                )?;
-
-                refresh_session_aggregates(connection, &session_id, completion.completed_at)?;
-                Ok(())
-            })
+        self.write_one(MetricsMutation::ToolCompleted {
+            tool_call_id: tool_call_id.to_string(),
+            completion,
         })
         .await
     }
@@ -1580,39 +1491,12 @@ impl MetricsStorage for SqliteMetricsStorage {
         is_stream: bool,
         started_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let forward_id = forward_id.to_string();
-        let endpoint = endpoint.to_string();
-        let model = model.to_string();
-        let is_stream_int = if is_stream { 1_i64 } else { 0_i64 };
-        let started_at_str = format_timestamp(started_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO forward_request_metrics (
-                    forward_id, endpoint, model, is_stream, started_at, status, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?5)
-                ON CONFLICT(forward_id) DO UPDATE SET
-                    endpoint = excluded.endpoint,
-                    model = excluded.model,
-                    is_stream = excluded.is_stream,
-                    started_at = excluded.started_at,
-                    completed_at = NULL,
-                    status_code = NULL,
-                    status = 'pending',
-                    prompt_tokens = NULL,
-                    completion_tokens = NULL,
-                    total_tokens = NULL,
-                    cache_creation_input_tokens = NULL,
-                    cache_read_input_tokens = NULL,
-                    cache_write_input_tokens = NULL,
-                    reasoning_output_tokens = NULL,
-                    error = NULL,
-                    updated_at = excluded.updated_at
-                "#,
-                params![forward_id, endpoint, model, is_stream_int, started_at_str],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ForwardStarted {
+            forward_id: forward_id.to_string(),
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            is_stream,
+            started_at,
         })
         .await
     }
@@ -1627,65 +1511,14 @@ impl MetricsStorage for SqliteMetricsStorage {
         token_details: Option<ForwardTokenDetails>,
         error: Option<String>,
     ) -> MetricsResult<()> {
-        let forward_id = forward_id.to_string();
-        let completed_at_str = format_timestamp(completed_at);
-        let status_code_int = status_code.map(|s| s as i64);
-        let (prompt, completion, total) = match usage {
-            Some(u) => (
-                Some(u.prompt_tokens as i64),
-                Some(u.completion_tokens as i64),
-                Some(u.total_tokens as i64),
-            ),
-            None => (None, None, None),
-        };
-        let token_details = token_details.unwrap_or_default();
-        let cache_creation = token_details
-            .cache_creation_input_tokens
-            .map(|value| value as i64);
-        let cache_read = token_details
-            .cache_read_input_tokens
-            .map(|value| value as i64);
-        let cache_write = token_details
-            .cache_write_input_tokens
-            .map(|value| value as i64);
-        let reasoning_output = token_details
-            .reasoning_output_tokens
-            .map(|value| value as i64);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                UPDATE forward_request_metrics
-                SET completed_at = ?1,
-                    status_code = ?2,
-                    status = ?3,
-                    prompt_tokens = ?4,
-                    completion_tokens = ?5,
-                    total_tokens = ?6,
-                    cache_creation_input_tokens = ?7,
-                    cache_read_input_tokens = ?8,
-                    cache_write_input_tokens = ?9,
-                    reasoning_output_tokens = ?10,
-                    error = ?11,
-                    updated_at = ?1
-                WHERE forward_id = ?12
-                "#,
-                params![
-                    completed_at_str,
-                    status_code_int,
-                    status.as_str(),
-                    prompt,
-                    completion,
-                    total,
-                    cache_creation,
-                    cache_read,
-                    cache_write,
-                    reasoning_output,
-                    error,
-                    forward_id,
-                ],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ForwardCompleted {
+            forward_id: forward_id.to_string(),
+            completed_at,
+            status_code,
+            status,
+            usage,
+            token_details,
+            error,
         })
         .await
     }
@@ -2431,22 +2264,9 @@ impl MetricsStorage for SqliteMetricsStorage {
         reason: &str,
         occurred_at: DateTime<Utc>,
     ) -> MetricsResult<()> {
-        let reason = reason.to_string();
-        let mismatch_date = occurred_at.date_naive().to_string();
-        let updated_at = format_timestamp(occurred_at);
-
-        self.with_connection(move |connection| {
-            connection.execute(
-                r#"
-                INSERT INTO execute_sync_mismatch_metrics (reason, mismatch_date, count, updated_at)
-                VALUES (?1, ?2, 1, ?3)
-                ON CONFLICT(reason, mismatch_date) DO UPDATE SET
-                    count = count + 1,
-                    updated_at = excluded.updated_at
-                "#,
-                params![reason, mismatch_date, updated_at],
-            )?;
-            Ok(())
+        self.write_one(MetricsMutation::ExecuteSyncMismatch {
+            reason: reason.to_string(),
+            occurred_at,
         })
         .await
     }
@@ -2644,6 +2464,8 @@ impl MetricsStorage for SqliteMetricsStorage {
 /// - Database file cannot be opened
 /// - PRAGMA settings fail to apply
 fn open_connection(path: &Path) -> MetricsResult<Connection> {
+    #[cfg(test)]
+    batch_probe::before_open(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2660,6 +2482,9 @@ fn open_connection(path: &Path) -> MetricsResult<Connection> {
         PRAGMA busy_timeout = 5000;
         "#,
     )?;
+    connection.set_prepared_statement_cache_capacity(32);
+    #[cfg(test)]
+    batch_probe::opened(path);
     Ok(connection)
 }
 
@@ -3402,7 +3227,11 @@ fn with_immediate_transaction<T>(
     connection.execute_batch("BEGIN IMMEDIATE")?;
     match operation() {
         Ok(value) => match connection.execute_batch("COMMIT") {
-            Ok(()) => Ok(value),
+            Ok(()) => {
+                #[cfg(test)]
+                batch_probe::committed(connection);
+                Ok(value)
+            }
             Err(error) => {
                 let _ = connection.execute_batch("ROLLBACK");
                 Err(error.into())
@@ -3457,6 +3286,8 @@ fn refresh_session_aggregates_in_transaction(
     session_id: &str,
     updated_at: DateTime<Utc>,
 ) -> MetricsResult<()> {
+    #[cfg(test)]
+    batch_probe::aggregated(connection, session_id);
     // Do not use SQLite SUM for token counters: summing otherwise-valid i64
     // round rows can overflow before an outer MIN/CASE can clamp it. Fold in
     // Rust with the same signed-64 saturation policy used by the runtime.
@@ -3464,7 +3295,8 @@ fn refresh_session_aggregates_in_transaction(
     #[cfg(test)]
     pause_after_session_token_fold(session_id);
     let updated_at = format_timestamp(updated_at);
-    connection.execute(
+    writes::execute_cached(
+        connection,
         r#"
         UPDATE session_metrics
         SET
@@ -3508,7 +3340,7 @@ fn load_session_token_aggregate(
     connection: &Connection,
     session_id: &str,
 ) -> MetricsResult<TokenUsage> {
-    let mut stmt = connection.prepare(
+    let mut stmt = connection.prepare_cached(
         "SELECT prompt_tokens, completion_tokens, total_tokens FROM round_metrics WHERE session_id = ?1",
     )?;
     let mut rows = stmt.query(params![session_id])?;
