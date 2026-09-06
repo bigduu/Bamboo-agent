@@ -590,6 +590,17 @@ pub async fn update_provider_instance(
                     })?;
 
                 let updated = apply_instance_update(&existing, &payload_inner)?;
+                // This closure runs under config_io_lock, before either the
+                // metadata or credential transaction can commit. Keep the
+                // explicit default valid instead of failing its reload after
+                // publishing a disabled instance (#1097).
+                if !updated.enabled
+                    && config.default_provider_instance.as_deref() == Some(&instance_id)
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "Cannot disable default provider instance '{instance_id}'; set another enabled provider instance as default first"
+                    )));
+                }
                 config
                     .provider_instances
                     .insert(instance_id.clone(), updated);
