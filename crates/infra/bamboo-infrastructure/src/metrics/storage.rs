@@ -3297,21 +3297,7 @@ fn refresh_session_aggregates_in_transaction(
     let updated_at = format_timestamp(updated_at);
     writes::execute_cached(
         connection,
-        r#"
-        UPDATE session_metrics
-        SET
-            total_rounds = COALESCE((SELECT COUNT(*) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_tokens = ?2,
-            completion_tokens = ?3,
-            total_tokens = ?4,
-            prompt_cached_tool_outputs = COALESCE((SELECT SUM(prompt_cached_tool_outputs) FROM round_metrics WHERE session_id = ?1), 0),
-            prompt_cached_tool_tokens_saved = COALESCE((SELECT SUM(prompt_cached_tool_tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
-            total_compression_events = COALESCE((SELECT SUM(compression_count) FROM round_metrics WHERE session_id = ?1), 0),
-            total_tokens_saved = COALESCE((SELECT SUM(tokens_saved) FROM round_metrics WHERE session_id = ?1), 0),
-            tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
-            updated_at = ?5
-        WHERE session_id = ?1
-        "#,
+        REFRESH_SESSION_AGGREGATES_SQL,
         params![
             session_id,
             durable_token_to_i64(token_usage.prompt_tokens),
@@ -3734,6 +3720,32 @@ fn load_execute_sync_mismatch_breakdown(
 const LOAD_ROUNDS_SQL: &str = "SELECT round_id, session_id, model, started_at, completed_at, status, prompt_tokens, completion_tokens, total_tokens, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved, compression_count, tokens_saved, error FROM round_metrics WHERE session_id = ?1 ORDER BY started_at ASC";
 
 const LOAD_TOOL_CALLS_SQL: &str = "SELECT tool_call_id, tool_name, started_at, completed_at, success, error FROM tool_call_metrics WHERE round_id = ?1 ORDER BY started_at ASC";
+
+// Keep these aggregates in the parent UPDATE: SQLite retains SUM's dynamic
+// numeric types and overflow errors, and skips them when no parent matches.
+// Token validation and its saturated fold still run first, in Rust.
+const REFRESH_SESSION_AGGREGATES_SQL: &str = r#"
+    UPDATE session_metrics
+    SET (total_rounds, prompt_cached_tool_outputs, prompt_cached_tool_tokens_saved,
+         total_compression_events, total_tokens_saved) = (
+            SELECT COUNT(*),
+                   COALESCE(SUM(prompt_cached_tool_outputs), 0),
+                   COALESCE(SUM(prompt_cached_tool_tokens_saved), 0),
+                   COALESCE(SUM(compression_count), 0),
+                   COALESCE(SUM(tokens_saved), 0)
+            FROM round_metrics WHERE session_id = ?1
+        ),
+        prompt_tokens = ?2,
+        completion_tokens = ?3,
+        total_tokens = ?4,
+        tool_call_count = COALESCE((SELECT COUNT(*) FROM tool_call_metrics WHERE session_id = ?1), 0),
+        updated_at = ?5
+    WHERE session_id = ?1
+"#;
+
+#[cfg(test)]
+#[path = "storage/aggregate_tests.rs"]
+mod aggregate_tests;
 
 #[cfg(test)]
 #[path = "storage/prompt_memory_tests.rs"]
