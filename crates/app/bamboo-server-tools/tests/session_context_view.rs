@@ -403,6 +403,7 @@ async fn optional_project_identity_must_match_exactly_and_be_valid() {
         let mut f = Fixture::new().await;
         if let Some(project) = root_project {
             f.root.set_project_id_meta(project);
+            f.root.metadata_version = f.root.metadata_version.checked_add(1).unwrap();
         }
         if let Some(project) = child_project {
             f.child.set_project_id_meta(project);
