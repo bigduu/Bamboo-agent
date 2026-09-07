@@ -1836,7 +1836,7 @@ fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
     json!({
         "name": tool.function.name,
         "description": tool.function.description,
-        "input_schema": tool.function.parameters,
+        "input_schema": crate::providers::common::tool_schema::canonicalize_json_value(&tool.function.parameters),
     })
 }
 
