@@ -12,6 +12,7 @@ pub mod search_index;
 pub mod session_inbox;
 pub mod session_merge;
 pub mod v2;
+pub mod v3;
 
 pub use jsonl::JsonlStorage;
 pub use search_index::{SessionSearchIndex, SessionSearchMatch};

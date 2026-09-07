@@ -272,7 +272,7 @@ pub struct SessionCopyProjectionGuard {
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
-fn runtime_sidecar_snapshot(session: &Session) -> Session {
+pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
     let mut snapshot = session.clone();
     snapshot.messages.clear();
     // Native transcript groups are committed atomically with the ordinary
