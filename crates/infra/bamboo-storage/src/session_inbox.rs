@@ -469,7 +469,7 @@ impl FileSessionInbox {
         }
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
-        for queue in ["new", "cur"] {
+        for queue in ["new", "cur", "cancelled"] {
             for (generation, _name, path) in Self::valid_queue_entries(dir, queue).await? {
                 let Ok(bytes) = tokio::fs::read(path).await else {
                     continue;
@@ -617,6 +617,15 @@ impl SessionInboxPort for FileSessionInbox {
         target_session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        self.claim_for_turn(target_session_id, limit, None).await
+    }
+
+    async fn claim_for_turn(
+        &self,
+        target_session_id: &str,
+        limit: usize,
+        active_run_id: Option<&str>,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
         let _lifecycle = self.lock_lifecycle().await?;
         let dir = self.inbox_dir(target_session_id).await?;
         let _guard = self.lock_operation(&dir).await?;
@@ -639,6 +648,21 @@ impl SessionInboxPort for FileSessionInbox {
         for queue in ["cur", "new"] {
             for (generation, name, _) in Self::valid_queue_entries(&dir, queue).await? {
                 if generation <= activation_generation {
+                    if let Some(run_id) = active_run_id {
+                        let path = dir.join(queue).join(&name);
+                        let bytes = tokio::fs::read(&path)
+                            .await
+                            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                        if let Ok(wrapper) = serde_json::from_slice::<InboxMessage>(&bytes) {
+                            if let Ok(envelope) =
+                                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body)
+                            {
+                                if envelope.guidance_waits_for_run(run_id) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     eligible.push((generation, name, queue == "cur"));
                 }
             }
@@ -851,6 +875,65 @@ impl SessionInboxPort for FileSessionInbox {
         }
     }
 
+    async fn pending_guidance(
+        &self,
+        target_session_id: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        let mut entries = Self::valid_queue_entries(&dir, "new").await?;
+        entries.sort_by_key(|entry| entry.0);
+        let mut result = Vec::new();
+        for (_, _, path) in entries {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let wrapper: InboxMessage = serde_json::from_slice(&bytes)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            if envelope.is_guidance() && envelope.target_session_id == target_session_id {
+                result.push(envelope);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn cancel_guidance(
+        &self,
+        target_session_id: &str,
+        id: &SessionMessageId,
+    ) -> Result<bool, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        // The same operation lock protects claim and withdrawal across adapters.
+        // Retain the original envelope as a permanent deduplication tombstone.
+        for (_, name, path) in Self::valid_queue_entries(&dir, "new").await? {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let wrapper: InboxMessage = serde_json::from_slice(&bytes)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            if &envelope.id == id
+                && envelope.is_guidance()
+                && envelope.target_session_id == target_session_id
+            {
+                tokio::fs::create_dir_all(dir.join("cancelled"))
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                tokio::fs::rename(path, dir.join("cancelled").join(name))
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn inspect(
         &self,
         target_session_id: &str,
@@ -904,6 +987,89 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_guidance_keeps_its_run_fence_across_retries_and_reopen() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let mut deferred = SessionMessageEnvelope::user_input("session-1", "after task");
+        deferred.correlation_id = Some("session-guidance-after-run:run-a".into());
+        let original = inbox.deliver(&deferred).await.unwrap();
+        let mut later = SessionMessageEnvelope::user_input("session-1", "after round");
+        later.correlation_id = Some("session-guidance".into());
+        inbox.deliver(&later).await.unwrap();
+        authorize_latest(&inbox).await;
+        let claims = inbox
+            .claim_for_turn("session-1", 128, Some("run-a"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id, later.id);
+        inbox.ack("session-1", &claims[0]).await.unwrap();
+        let mut retry = deferred.clone();
+        retry.correlation_id = Some("session-guidance-after-run:run-b".into());
+        assert_eq!(inbox.deliver(&retry).await.unwrap(), original);
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        assert_eq!(
+            reopened.pending_guidance("session-1").await.unwrap()[0],
+            deferred
+        );
+        assert!(reopened
+            .claim_for_turn("session-1", 128, Some("run-a"))
+            .await
+            .unwrap()
+            .is_empty());
+        let claims = reopened
+            .claim_for_turn("session-1", 128, Some("run-b"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.id, deferred.id);
+        reopened.ack("session-1", &claims[0]).await.unwrap();
+        assert_eq!(reopened.deliver(&retry).await.unwrap(), original);
+        assert!(!reopened
+            .inspect("session-1")
+            .await
+            .unwrap()
+            .activation_pending());
+    }
+
+    #[tokio::test]
+    async fn withdrawal_is_durable_and_never_retracts_a_claim() {
+        let (_temp, store, inbox) = fixture(SessionInboxLimits::default()).await;
+        let mut message = SessionMessageEnvelope::user_input("session-1", "guidance");
+        message.correlation_id = Some("session-guidance".into());
+        inbox.deliver(&message).await.unwrap();
+        assert_eq!(inbox.pending_guidance("session-1").await.unwrap().len(), 1);
+        assert!(inbox
+            .cancel_guidance("session-1", &message.id)
+            .await
+            .unwrap());
+        let reopened = FileSessionInbox::new(store, SessionInboxLimits::default());
+        reopened.deliver(&message).await.unwrap();
+        assert!(reopened
+            .pending_guidance("session-1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reopened
+                .inspect("session-1")
+                .await
+                .unwrap()
+                .oldest_generation,
+            None
+        );
+        message.id = SessionMessageId::new();
+        reopened.deliver(&message).await.unwrap();
+        authorize_latest(&reopened).await;
+        let claims = reopened.claim("session-1", 1).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert!(!reopened
+            .cancel_guidance("session-1", &message.id)
+            .await
+            .unwrap());
+        assert_eq!(reopened.inspect("session-1").await.unwrap().claimed, 1);
     }
 
     #[tokio::test]

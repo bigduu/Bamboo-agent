@@ -387,6 +387,7 @@ async fn admit_session_inbox(
     session: &mut Session,
     inbox: &Arc<dyn SessionInboxPort>,
     persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    active_run_id: Option<&str>,
 ) -> usize {
     let Some(persistence) = persistence else {
         tracing::warn!(
@@ -395,7 +396,7 @@ async fn admit_session_inbox(
         );
         return 0;
     };
-    let claims = match inbox.claim(&session.id, 128).await {
+    let claims = match inbox.claim_for_turn(&session.id, 128, active_run_id).await {
         Ok(claims) => claims,
         Err(error) => {
             tracing::warn!(session_id = %session.id, %error, "failed to claim SessionInbox");
@@ -599,6 +600,16 @@ pub async fn refresh_turn_boundary_with_inbox(
     persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     inbox: Option<&Arc<dyn SessionInboxPort>>,
 ) -> TurnBoundaryRefresh {
+    refresh_turn_boundary_with_inbox_for_run(session, storage, persistence, inbox, None).await
+}
+
+pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
+    session: &mut Session,
+    storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
+    persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    inbox: Option<&Arc<dyn SessionInboxPort>>,
+    active_run_id: Option<&str>,
+) -> TurnBoundaryRefresh {
     let latest = match storage {
         Some(storage) => match storage.load_session(&session.id).await {
             Ok(latest) => latest,
@@ -686,7 +697,7 @@ pub async fn refresh_turn_boundary_with_inbox(
     }
 
     if let Some(inbox) = inbox {
-        let merged = admit_session_inbox(session, inbox, persistence).await;
+        let merged = admit_session_inbox(session, inbox, persistence, active_run_id).await;
         return TurnBoundaryRefresh {
             merged,
             disk_permission_mode,
@@ -2093,6 +2104,90 @@ mod tests {
             .unwrap()
             .unwrap()
             .has_pending_injected_messages());
+    }
+
+    #[tokio::test]
+    async fn task_end_guidance_survives_later_round_admission_and_launches_one_successor() {
+        let (_temp, store, locked, inbox, mut running) =
+            durable_inbox_fixture("guidance-modes").await;
+        let storage: Arc<dyn Storage> = store;
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        let router = crate::SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let reservations = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        router
+            .set_spawner(Arc::new(BacklogActivationSpawner {
+                inbox: inbox.clone(),
+                reservations: reservations.clone(),
+                launches: launches.clone(),
+            }))
+            .await;
+        let mut registration = router.register_run(&running.id, "run-a").await.unwrap();
+        let mut deferred = SessionMessageEnvelope::user_input(&running.id, "task end");
+        deferred.correlation_id = Some("session-guidance-after-run:run-a".into());
+        let mut immediate = SessionMessageEnvelope::user_input(&running.id, "round end");
+        immediate.correlation_id = Some("session-guidance".into());
+        for envelope in [&deferred, &immediate] {
+            let receipt = deliver_interrupt_eligible(&inbox, envelope).await;
+            router
+                .request_activation(&running.id, receipt.generation)
+                .await
+                .unwrap();
+        }
+        let result = refresh_turn_boundary_with_inbox_for_run(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            Some("run-a"),
+        )
+        .await;
+        assert_eq!(result.merged, 1);
+        assert!(running
+            .messages
+            .iter()
+            .any(|message| message.id == immediate.id.as_str()));
+        assert!(!running
+            .messages
+            .iter()
+            .any(|message| message.id == deferred.id.as_str()));
+        let cursor = running
+            .session_inbox_admission()
+            .unwrap()
+            .last_admitted_sequence;
+        assert_eq!(cursor, 2);
+        assert_eq!(inbox.pending_guidance(&running.id).await.unwrap().len(), 1);
+        registration.begin_finalization().await;
+        assert_eq!(
+            registration.finish(cursor).await.unwrap(),
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let mut next = router
+            .register_run(&running.id, "successor-1")
+            .await
+            .unwrap();
+        let result = refresh_turn_boundary_with_inbox_for_run(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+            Some("successor-1"),
+        )
+        .await;
+        assert_eq!(result.merged, 1);
+        assert_eq!(
+            running
+                .messages
+                .iter()
+                .filter(|message| message.id == deferred.id.as_str())
+                .count(),
+            1
+        );
+        next.begin_finalization().await;
+        assert_eq!(next.finish(cursor).await.unwrap(), None);
+        assert_eq!(reservations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

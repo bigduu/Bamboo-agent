@@ -115,11 +115,12 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         }
     }
 
-    let turn_refresh = super::state_bridge::refresh_turn_boundary_with_inbox(
+    let turn_refresh = super::state_bridge::refresh_turn_boundary_with_inbox_for_run(
         session,
         config.storage.as_ref(),
         config.persistence.as_ref(),
         config.session_inbox.as_ref(),
+        config.guidance_active_run_id.as_deref(),
     )
     .await;
     if turn_refresh.merged > 0 {

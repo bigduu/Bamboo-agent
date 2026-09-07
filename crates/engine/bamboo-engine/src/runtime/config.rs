@@ -379,6 +379,7 @@ pub struct AgentLoopConfig {
     /// Optional runtime persistence for non-authoritative session saves.
     /// When set, engine save sites use this instead of `storage` for writes.
     pub(crate) persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+    pub(crate) guidance_active_run_id: Option<String>,
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
@@ -568,6 +569,7 @@ impl Default for AgentLoopConfig {
             skip_initial_user_message: false,
             storage: None,
             persistence: None,
+            guidance_active_run_id: None,
             session_inbox: None,
             session_activation_notifications: None,
             attachment_reader: None,
