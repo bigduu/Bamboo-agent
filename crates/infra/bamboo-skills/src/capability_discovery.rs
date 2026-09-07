@@ -135,6 +135,37 @@ struct IndexedCapability {
     normalized_summary: String,
 }
 
+/// Explanation of the existing automatic-selection policy, without query text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticSkillOutcome {
+    EmptyQuery,
+    NoMatch,
+    BelowThreshold,
+    Ambiguous,
+    ExactMatch,
+    StrongMatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SkillMatchEvidence {
+    pub capability_ref: String,
+    pub source: CapabilitySource,
+    pub revision: Option<u64>,
+    pub exact_identity: bool,
+    pub name_token_hits: usize,
+    pub summary_token_hits: usize,
+    pub strong_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AutomaticSkillDecision {
+    pub query_sha256: String,
+    pub outcome: AutomaticSkillOutcome,
+    pub candidates: Vec<SkillMatchEvidence>,
+    pub selected: Option<CapabilityMatch>,
+}
+
 /// Immutable searchable projection. Constructing and querying it performs no
 /// filesystem, network, model, execution, authorization, or persistence work.
 #[derive(Debug, Clone, Default)]
@@ -375,34 +406,40 @@ impl CapabilityDiscoveryIndex {
     /// remain useful for generic discovery, but must never turn an ambiguous
     /// automatic activation into an arbitrary choice.
     pub fn discover_unambiguous_automatic_skill(&self, query: &str) -> Option<CapabilityMatch> {
+        self.explain_automatic_skill(query).selected
+    }
+
+    pub fn explain_automatic_skill(&self, query: &str) -> AutomaticSkillDecision {
+        use sha2::{Digest, Sha256};
         let query = query
             .trim()
             .chars()
             .take(MAX_DISCOVERY_QUERY_CHARS)
             .collect::<String>();
-        if query.is_empty() {
-            return None;
-        }
-
+        let mut decision = AutomaticSkillDecision {
+            query_sha256: hex::encode(Sha256::digest(query.as_bytes())),
+            outcome: AutomaticSkillOutcome::EmptyQuery,
+            candidates: Vec::new(),
+            selected: None,
+        };
         let normalized_query = normalize_search_text(&query);
         let query_tokens = search_tokens(&normalized_query);
         if normalized_query.is_empty() || query_tokens.is_empty() {
-            return None;
+            return decision;
         }
-
         let mut ranked = self
             .candidates
             .iter()
             .filter(|candidate| candidate.value.kind == CapabilityKind::Skill)
             .filter_map(|candidate| {
-                let normalized_summary = normalize_search_text(&candidate.value.summary);
+                let summary = normalize_search_text(&candidate.value.summary);
                 rank_candidate(
                     candidate,
                     &query,
                     &normalized_query,
                     &query_tokens,
                     None,
-                    Some(&normalized_summary),
+                    Some(&summary),
                 )
                 .map(|rank| (rank, candidate))
             })
@@ -412,30 +449,56 @@ impl CapabilityDiscoveryIndex {
                 .cmp(left_rank)
                 .then_with(|| left.value.capability_ref.cmp(&right.value.capability_ref))
         });
-
+        decision.candidates = ranked
+            .iter()
+            .take(3)
+            .map(|(rank, candidate)| SkillMatchEvidence {
+                capability_ref: candidate.value.capability_ref.clone(),
+                source: candidate.value.source,
+                revision: candidate.value.revision,
+                exact_identity: rank.semantic.exact_identity,
+                name_token_hits: rank.semantic.name_token_hits,
+                summary_token_hits: rank.semantic.summary_token_hits,
+                strong_match: strong_fuzzy_skill_match(candidate, &query_tokens, rank.semantic),
+            })
+            .collect();
+        if ranked.is_empty() {
+            decision.outcome = AutomaticSkillOutcome::NoMatch;
+            return decision;
+        }
         let exact = ranked
             .iter()
             .filter(|(rank, _)| rank.semantic.exact_identity)
             .collect::<Vec<_>>();
         if !exact.is_empty() {
-            return (exact.len() == 1).then(|| exact[0].1.value.clone());
+            if exact.len() == 1 {
+                decision.outcome = AutomaticSkillOutcome::ExactMatch;
+                decision.selected = Some(exact[0].1.value.clone());
+            } else {
+                decision.outcome = AutomaticSkillOutcome::Ambiguous;
+            }
+            return decision;
         }
-
         let strong = ranked
-            .into_iter()
+            .iter()
             .filter(|(rank, candidate)| {
                 strong_fuzzy_skill_match(candidate, &query_tokens, rank.semantic)
             })
             .collect::<Vec<_>>();
-        let (top_rank, top) = strong.first()?;
+        let Some((top_rank, top)) = strong.first() else {
+            decision.outcome = AutomaticSkillOutcome::BelowThreshold;
+            return decision;
+        };
         if strong
             .get(1)
-            .is_some_and(|(next_rank, _)| next_rank.semantic == top_rank.semantic)
+            .is_some_and(|(rank, _)| rank.semantic == top_rank.semantic)
         {
-            return None;
+            decision.outcome = AutomaticSkillOutcome::Ambiguous;
+        } else {
+            decision.outcome = AutomaticSkillOutcome::StrongMatch;
+            decision.selected = Some(top.value.clone());
         }
-
-        Some(top.value.clone())
+        decision
     }
 }
 
@@ -2130,5 +2193,93 @@ mod tests {
             .discover(&request("edit"))
             .expect("raw schemas still resolve tool eligibility");
         assert!(legacy.matches.is_empty());
+    }
+    #[test]
+    fn automatic_decisions_explain_exact_weak_ambiguous_and_missing_matches() {
+        let entries = vec![
+            catalog_entry(
+                "review-a",
+                "Review Alpha",
+                "review code changes",
+                WorkflowKind::Instruction,
+                WorkflowSource::User,
+                7,
+            ),
+            catalog_entry(
+                "review-b",
+                "Review Beta",
+                "review code changes",
+                WorkflowKind::Instruction,
+                WorkflowSource::User,
+                8,
+            ),
+        ];
+        let search = index(
+            &[],
+            entries,
+            vec![],
+            CapabilityDiscoveryEligibility {
+                skill_invocation: InvocationEligibility::Automatic,
+                ..Default::default()
+            },
+        );
+        for (query, expected) in [
+            ("", AutomaticSkillOutcome::EmptyQuery),
+            ("review-a", AutomaticSkillOutcome::ExactMatch),
+            ("review", AutomaticSkillOutcome::BelowThreshold),
+            (
+                "please review code changes",
+                AutomaticSkillOutcome::Ambiguous,
+            ),
+            ("request-text-marker", AutomaticSkillOutcome::NoMatch),
+        ] {
+            let decision = search.explain_automatic_skill(query);
+            assert_eq!(decision.outcome, expected, "{query}");
+            assert!(decision.candidates.len() <= 3);
+            assert_eq!(
+                decision.selected,
+                search.discover_unambiguous_automatic_skill(query)
+            );
+            assert_eq!(decision, search.explain_automatic_skill(query));
+        }
+        let exact = search.explain_automatic_skill("review-a");
+        assert_eq!(exact.selected.unwrap().revision, Some(7));
+        let encoded =
+            serde_json::to_string(&search.explain_automatic_skill("request-text-marker")).unwrap();
+        assert!(!encoded.contains("request-text-marker"));
+    }
+
+    #[test]
+    fn decision_candidates_respect_disabled_and_shadowed_catalog_entries() {
+        let mut shadow = catalog_entry(
+            "shadow",
+            "Review",
+            "review code",
+            WorkflowKind::Instruction,
+            WorkflowSource::Builtin,
+            1,
+        );
+        shadow.winner = false;
+        let disabled = catalog_entry(
+            "disabled",
+            "Review",
+            "review code",
+            WorkflowKind::Instruction,
+            WorkflowSource::User,
+            2,
+        );
+        let search = index(
+            &[],
+            vec![shadow, disabled],
+            vec![],
+            CapabilityDiscoveryEligibility {
+                disabled_skill_ids: BTreeSet::from(["disabled".into()]),
+                ..Default::default()
+            },
+        );
+        let decision = search.explain_automatic_skill("review code");
+        assert_eq!(decision.outcome, AutomaticSkillOutcome::NoMatch);
+        assert!(decision.candidates.is_empty());
+        assert!(decision.selected.is_none());
     }
 }
