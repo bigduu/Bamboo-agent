@@ -469,7 +469,7 @@ impl FileSessionInbox {
         }
         let id = &requested.id;
         let requested_digest = Self::semantic_digest(requested)?;
-        for queue in ["new", "cur"] {
+        for queue in ["new", "cur", "cancelled"] {
             for (generation, _name, path) in Self::valid_queue_entries(dir, queue).await? {
                 let Ok(bytes) = tokio::fs::read(path).await else {
                     continue;
@@ -851,6 +851,71 @@ impl SessionInboxPort for FileSessionInbox {
         }
     }
 
+    async fn pending_guidance(
+        &self,
+        target_session_id: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        let mut entries = Self::valid_queue_entries(&dir, "new").await?;
+        entries.sort_by_key(|entry| entry.0);
+        let mut result = Vec::new();
+        for (_, _, path) in entries {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let wrapper: InboxMessage = serde_json::from_slice(&bytes)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            if envelope.source == SessionMessageSource::User
+                && envelope.kind == bamboo_domain::SessionMessageKind::UserInput
+                && envelope.correlation_id.as_deref() == Some("session-guidance")
+                && envelope.target_session_id == target_session_id
+            {
+                result.push(envelope);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn cancel_guidance(
+        &self,
+        target_session_id: &str,
+        id: &SessionMessageId,
+    ) -> Result<bool, SessionInboxError> {
+        let _lifecycle = self.lock_lifecycle().await?;
+        let dir = self.inbox_dir(target_session_id).await?;
+        let _guard = self.lock_operation(&dir).await?;
+        // The same operation lock protects claim and withdrawal across adapters.
+        // Retain the original envelope as a permanent deduplication tombstone.
+        for (_, name, path) in Self::valid_queue_entries(&dir, "new").await? {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let wrapper: InboxMessage = serde_json::from_slice(&bytes)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body)
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            if &envelope.id == id
+                && envelope.source == SessionMessageSource::User
+                && envelope.kind == bamboo_domain::SessionMessageKind::UserInput
+                && envelope.correlation_id.as_deref() == Some("session-guidance")
+                && envelope.target_session_id == target_session_id
+            {
+                tokio::fs::create_dir_all(dir.join("cancelled"))
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                tokio::fs::rename(path, dir.join("cancelled").join(name))
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn inspect(
         &self,
         target_session_id: &str,
@@ -904,6 +969,44 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn withdrawal_is_durable_and_never_retracts_a_claim() {
+        let (_temp, store, inbox) = fixture(SessionInboxLimits::default()).await;
+        let mut message = SessionMessageEnvelope::user_input("session-1", "guidance");
+        message.correlation_id = Some("session-guidance".into());
+        inbox.deliver(&message).await.unwrap();
+        assert_eq!(inbox.pending_guidance("session-1").await.unwrap().len(), 1);
+        assert!(inbox
+            .cancel_guidance("session-1", &message.id)
+            .await
+            .unwrap());
+        let reopened = FileSessionInbox::new(store, SessionInboxLimits::default());
+        reopened.deliver(&message).await.unwrap();
+        assert!(reopened
+            .pending_guidance("session-1")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reopened
+                .inspect("session-1")
+                .await
+                .unwrap()
+                .oldest_generation,
+            None
+        );
+        message.id = SessionMessageId::new();
+        reopened.deliver(&message).await.unwrap();
+        authorize_latest(&reopened).await;
+        let claims = reopened.claim("session-1", 1).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert!(!reopened
+            .cancel_guidance("session-1", &message.id)
+            .await
+            .unwrap());
+        assert_eq!(reopened.inspect("session-1").await.unwrap().claimed, 1);
     }
 
     #[tokio::test]
