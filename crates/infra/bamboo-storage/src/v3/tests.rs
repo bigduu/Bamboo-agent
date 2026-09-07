@@ -216,3 +216,20 @@ async fn v2_captured_tree_import_matches_every_session_and_preserves_source() {
     }
     v2.flush_search_index().await;
 }
+
+#[test]
+fn malformed_root_identity_is_rejected_before_the_first_write() {
+    let (_temp, store, mut session) = fixture();
+    session.spawn_depth = 1;
+    assert!(matches!(
+        store.put(&session, None),
+        Err(V3Error::Invalid(_))
+    ));
+    session.spawn_depth = 0;
+    session.parent_session_id = Some("parent".into());
+    assert!(matches!(
+        store.put(&session, None),
+        Err(V3Error::Invalid(_))
+    ));
+    assert!(store.load(&session.id).unwrap().is_none());
+}

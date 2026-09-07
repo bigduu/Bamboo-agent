@@ -325,6 +325,13 @@ fn validate_session(session: &Session) -> Result<()> {
     if session.id.trim().is_empty() {
         return Err(V3Error::Invalid("empty session id".into()));
     }
+    if session.kind == bamboo_domain::SessionKind::Root
+        && (session.parent_session_id.is_some()
+            || session.spawn_depth != 0
+            || root_id(session) != session.id)
+    {
+        return Err(V3Error::Invalid("invalid root identity".into()));
+    }
     let mut ids = HashSet::new();
     for message in &session.messages {
         if message.id.is_empty() || !ids.insert(&message.id) {
