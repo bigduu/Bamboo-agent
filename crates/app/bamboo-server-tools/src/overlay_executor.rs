@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bamboo_agent_core::tools::input_guard::{check_parsed_tool_input, check_raw_tool_input};
 
 use bamboo_agent_core::tools::{
     parse_tool_args_best_effort, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
@@ -70,7 +71,9 @@ impl OverlayToolExecutor {
         call: &ToolCall,
         ctx: ToolExecutionContext<'_>,
     ) -> Result<ToolOutcome, ToolError> {
+        check_raw_tool_input(self.overlay.name(), &call.function.arguments)?;
         let args = self.resolve_args(call, &ctx);
+        check_parsed_tool_input(self.overlay.name(), &args)?;
         if let Some(outcome) = self
             .base
             .check_permissions_for_resolved(call, self.overlay.name(), &args, &ctx)
@@ -342,6 +345,29 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_overlay_arguments_are_rejected_before_invocation() {
+        let overlay = OverlayToolExecutor::new(
+            std::sync::Arc::new(BaseExecutor),
+            std::sync::Arc::new(SubAgentOverlayTool),
+        );
+        let mut call = make_call("sub_task");
+        call.function.arguments = json!({"prompt": "x".repeat(256 * 1024)}).to_string();
+        assert!(matches!(
+            overlay.execute(&call).await,
+            Err(ToolError::InvalidArguments(_))
+        ));
+
+        call.function.arguments = "{}".into();
+        let args = json!({"prompt": "x".repeat(256 * 1024)});
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.pre_parsed_args = Some(&args);
+        assert!(matches!(
+            overlay.execute_with_context(&call, ctx).await,
+            Err(ToolError::InvalidArguments(_))
+        ));
     }
 
     #[tokio::test]

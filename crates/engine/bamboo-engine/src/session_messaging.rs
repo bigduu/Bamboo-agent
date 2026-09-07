@@ -269,12 +269,21 @@ impl SessionMessenger {
         &self,
         admission: &SessionMessengerAdmission,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.activate_with_policy(admission, SessionActivationPolicy::InterruptSpecificWait)
+            .await
+    }
+
+    pub async fn activate_with_policy(
+        &self,
+        admission: &SessionMessengerAdmission,
+        policy: SessionActivationPolicy,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         if let Err(error) = self
             .inbox
             .mark_activation_eligible(
                 &admission.target_session_id,
                 admission.delivery.generation,
-                SessionActivationPolicy::InterruptSpecificWait,
+                policy,
             )
             .await
         {

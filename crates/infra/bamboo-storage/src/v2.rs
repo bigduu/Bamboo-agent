@@ -3986,6 +3986,29 @@ impl SessionStoreV2 {
         raw_base64_or_data_url: &str,
         mime_hint: Option<&str>,
     ) -> io::Result<(String, String)> {
+        self.write_image_attachment_inner(session, raw_base64_or_data_url, mime_hint, false)
+            .await
+    }
+
+    /// Store immutable image content under a repeatable reference for durable
+    /// message admission retries. Ordinary chat attachment naming is unchanged.
+    pub async fn write_image_attachment_deduplicated(
+        &self,
+        session: &Session,
+        raw_base64_or_data_url: &str,
+        mime_hint: Option<&str>,
+    ) -> io::Result<(String, String)> {
+        self.write_image_attachment_inner(session, raw_base64_or_data_url, mime_hint, true)
+            .await
+    }
+
+    async fn write_image_attachment_inner(
+        &self,
+        session: &Session,
+        raw_base64_or_data_url: &str,
+        mime_hint: Option<&str>,
+        deduplicate: bool,
+    ) -> io::Result<(String, String)> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let (mime, base64_data) =
@@ -4000,7 +4023,20 @@ impl SessionStoreV2 {
             .decode(base64_data.as_bytes())
             .map_err(|e| other_io_error(format!("invalid base64 image data: {e}")))?;
 
-        let attachment_id = Uuid::new_v4().to_string();
+        let attachment_id = if deduplicate {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(mime.as_bytes());
+            digest.update([0]);
+            digest.update(&bytes);
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        } else {
+            Uuid::new_v4().to_string()
+        };
         let ext = mime_to_extension(mime.as_str()).unwrap_or("bin");
 
         let rel_path = self.ensure_session_dirs(session).await?;

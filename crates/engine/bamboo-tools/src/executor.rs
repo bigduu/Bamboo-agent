@@ -3,6 +3,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bamboo_agent_core::tools::input_guard::{check_parsed_tool_input, check_raw_tool_input};
 use bamboo_agent_core::{
     parse_tool_args_best_effort, Tool, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
     ToolOutcome, ToolResult, ToolSchema,
@@ -411,7 +412,9 @@ impl BuiltinToolExecutor {
             .registry
             .get(execution_name)
             .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        check_raw_tool_input(execution_name, &call.function.arguments)?;
         let mut args = self.parse_execution_args(call, &ctx);
+        check_parsed_tool_input(execution_name, &args)?;
         self.normalize_registered_builtin_args(
             &call.function.name,
             execution_name,
@@ -1004,6 +1007,22 @@ mod tests {
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         make_tool_call_with_id("call_1", name, args)
+    }
+
+    #[tokio::test]
+    async fn oversized_write_is_rejected_before_creating_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oversized.txt");
+        let call = make_tool_call(
+            "write_file",
+            json!({
+                "path": file,
+                "content": "x".repeat(1024 * 1024),
+            }),
+        );
+        let error = BuiltinToolExecutor::new().execute(&call).await.unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(!file.exists());
     }
 
     fn make_tool_call_with_id(id: &str, name: &str, args: serde_json::Value) -> ToolCall {

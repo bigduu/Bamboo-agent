@@ -95,6 +95,7 @@ pub mod agentic;
 pub mod bash_completion;
 pub mod context;
 pub mod executor;
+pub mod input_guard;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
