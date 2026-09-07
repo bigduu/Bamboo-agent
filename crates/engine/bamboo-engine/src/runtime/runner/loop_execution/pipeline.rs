@@ -2933,6 +2933,9 @@ async fn run_pipeline_inner(
                             None
                         };
                         if let Some(delay_ms) = recovery_delay {
+                            // Persist billed activity with the retry reservation. The live
+                            // round accumulator is committed once at the terminal boundary.
+                            state_bridge::write_runtime_state(session, &recovery_budget_state);
                             config
                                 .persistence
                                 .as_ref()
