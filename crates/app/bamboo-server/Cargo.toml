@@ -75,7 +75,7 @@ actix-server = "2"
 actix-service = "2"
 socket2 = "0.6"
 actix-cors = "0.7"
-actix-files = "0.6"
+actix-files = "0.7"
 # v2-P1 (#181): the `GET /v2/stream` unified WebSocket multiplex. `actix-ws`
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
