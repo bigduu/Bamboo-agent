@@ -2725,7 +2725,33 @@ async fn run_pipeline_inner(
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
 
-        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS {
+        if config.goal_loop_active() {
+            let goal = crate::runtime::goal_state::ensure_goal_state(
+                session,
+                config.active_goal().expect("active goal"),
+            );
+            crate::runtime::goal_state::write_goal_state(session, goal);
+        }
+        let extra_attempts = if config.goal_loop_active() {
+            config
+                .gold_config
+                .as_ref()
+                .map_or(0, |gold| gold.recovery.max_attempts.min(10)) as usize
+        } else {
+            0
+        };
+        for attempt in 1..=MAX_LLM_TURN_ATTEMPTS + extra_attempts {
+            if config.goal_loop_active() && extra_attempts > 0 {
+                if let Some(delay_ms) = crate::runtime::goal_recovery::pending_delay(
+                    session,
+                    Utc::now().timestamp_millis(),
+                ) {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    }
+                }
+            }
             // Retry cleanup may remove only an interrupted record created by
             // THIS attempt.  An older durable interrupted tail can legitimately
             // be the session's starting point and must never be mistaken for a
@@ -2874,9 +2900,57 @@ async fn run_pipeline_inner(
                             error,
                             delay_ms
                         );
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                        }
                         continue;
                     } else {
+                        let mut recovery_budget_state = state.runtime_state.clone();
+                        round_activity.commit_to_runtime(&mut recovery_budget_state);
+                        let recovery_delay = if attempt >= MAX_LLM_TURN_ATTEMPTS
+                            && config.goal_loop_active()
+                            && state.runtime_state.suspension.is_none()
+                            && state.runtime_state.waiting_for_children.is_none()
+                            && state.runtime_state.waiting_for_bash.is_none()
+                            && check_run_budget_exceeded(
+                                &recovery_budget_state.round,
+                                &config.run_budget,
+                            )
+                            .is_none()
+                            && config.persistence.is_some()
+                        {
+                            crate::runtime::goal_recovery::reserve_retry(
+                                session,
+                                &config
+                                    .gold_config
+                                    .as_ref()
+                                    .expect("active goal config")
+                                    .recovery,
+                                &error,
+                                Utc::now().timestamp_millis(),
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(delay_ms) = recovery_delay {
+                            config
+                                .persistence
+                                .as_ref()
+                                .expect("checked persistence")
+                                .checkpoint_runtime_session(session)
+                                .await
+                                .map_err(|error| {
+                                    AgentError::LLM(format!(
+                                        "Goal recovery checkpoint failed: {error}"
+                                    ))
+                                })?;
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => return Err(AgentError::Cancelled),
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                            }
+                            continue;
+                        }
                         tracing::error!(
                             "[{}] Turn {} LLM call failed terminally (attempt {}/{}): {}",
                             state.session_id,
@@ -10221,5 +10295,67 @@ mod tests {
             "blank final content must not add a stray context block:\n{}",
             recorded[0]
         );
+    }
+    #[tokio::test]
+    async fn goal_recovery_backoff_stops_without_waiting_for_the_deadline() {
+        let mut session = Session::new("goal-backoff-stop", "model");
+        session.add_message(Message::user("finish"));
+        let goal = crate::runtime::goal_state::ensure_goal_state(&session, "finish");
+        crate::runtime::goal_state::write_goal_state(&mut session, goal);
+        let policy = crate::runtime::goal_recovery::GoalRecoveryPolicy {
+            max_attempts: 3,
+            max_elapsed_seconds: 900,
+        };
+        let timeout = AgentError::StreamTimeout(bamboo_agent_core::StreamTimeoutError::new(
+            bamboo_agent_core::StreamTimeoutPhase::FirstSemantic,
+            std::time::Duration::from_secs(30),
+            None,
+            None,
+            std::time::Duration::ZERO,
+            None,
+            true,
+        ));
+        assert_eq!(
+            crate::runtime::goal_recovery::reserve_retry(
+                &mut session,
+                &policy,
+                &timeout,
+                chrono::Utc::now().timestamp_millis()
+            ),
+            Some(5000)
+        );
+        let config = crate::runtime::config::AgentLoopConfig {
+            gold_config: Some(crate::runtime::config::GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("finish".into()),
+                recovery: policy,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut state = e2e_loop_state("goal-backoff-stop");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(StubProvider),
+                Arc::new(AlwaysOkExecutor),
+                &cancel,
+                &config,
+                &mut state,
+            ),
+        )
+        .await
+        .expect("stop interrupts the persisted five-second backoff");
+        assert!(matches!(result, Err(AgentError::Cancelled)));
     }
 }
