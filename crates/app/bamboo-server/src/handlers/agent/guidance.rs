@@ -1,6 +1,7 @@
 //! Durable text guidance for the next available model turn.
 use crate::app_state::AppState;
-use actix_web::{web, HttpResponse};
+use crate::error::json_error;
+use actix_web::{http::StatusCode, web, HttpResponse};
 use bamboo_domain::{SessionInboxError, SessionMessageEnvelope, SessionMessageId};
 use bamboo_engine::session_messaging::SessionMessengerError;
 use serde::Deserialize;
@@ -15,20 +16,18 @@ pub struct GuidanceRequest {
 fn inbox_error(error: SessionInboxError) -> HttpResponse {
     match error {
         SessionInboxError::TargetNotFound(_) => {
-            HttpResponse::NotFound().json(json!({"error": "Session not found"}))
+            json_error(StatusCode::NOT_FOUND, "Session not found")
         }
         SessionInboxError::PayloadTooLarge { .. } => {
-            HttpResponse::PayloadTooLarge().json(json!({"error": error.to_string()}))
+            json_error(StatusCode::PAYLOAD_TOO_LARGE, error.to_string())
         }
         SessionInboxError::BacklogFull { .. } => {
-            HttpResponse::TooManyRequests().json(json!({"error": error.to_string()}))
+            json_error(StatusCode::TOO_MANY_REQUESTS, error.to_string())
         }
-        SessionInboxError::InvalidClaim(_) => {
-            HttpResponse::Conflict().json(json!({"error": error.to_string()}))
-        }
+        SessionInboxError::InvalidClaim(_) => json_error(StatusCode::CONFLICT, error.to_string()),
         other => {
             tracing::error!(%other, "guidance queue failed");
-            HttpResponse::InternalServerError().finish()
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Guidance storage failed")
         }
     }
 }
@@ -46,13 +45,11 @@ pub async fn list(state: web::Data<AppState>, path: web::Path<String>) -> HttpRe
 pub async fn cancel(state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
     let (session_id, message_id) = path.into_inner();
     let Ok(id) = SessionMessageId::parse(message_id) else {
-        return HttpResponse::BadRequest().finish();
+        return json_error(StatusCode::BAD_REQUEST, "Invalid guidance message id");
     };
     match state.session_inbox.cancel_guidance(&session_id, &id).await {
         Ok(true) => HttpResponse::NoContent().finish(),
-        Ok(false) => {
-            HttpResponse::Conflict().json(json!({"error": "Guidance is no longer pending"}))
-        }
+        Ok(false) => json_error(StatusCode::CONFLICT, "Guidance is no longer pending"),
         Err(error) => inbox_error(error),
     }
 }
@@ -63,13 +60,13 @@ pub async fn send(
     body: web::Json<GuidanceRequest>,
 ) -> HttpResponse {
     let Ok(id) = SessionMessageId::parse(body.id.clone()) else {
-        return HttpResponse::BadRequest().finish();
+        return json_error(StatusCode::BAD_REQUEST, "Invalid guidance message id");
     };
     if body.text.trim().is_empty() {
-        return HttpResponse::BadRequest().json(json!({"error": "Guidance cannot be empty"}));
+        return json_error(StatusCode::BAD_REQUEST, "Guidance cannot be empty");
     }
     if body.text.len() > 64 * 1024 {
-        return HttpResponse::PayloadTooLarge().finish();
+        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Guidance exceeds 64 KiB");
     }
     let mut envelope = SessionMessageEnvelope::user_input(path.into_inner(), body.text.clone());
     envelope.id = id;
@@ -80,14 +77,62 @@ pub async fn send(
         Err(SessionMessengerError::Activation { receipt, .. }) => {
             HttpResponse::Accepted().json(json!({"id": receipt.id, "activation_pending": true}))
         }
-        Err(SessionMessengerError::TargetNotFound(_)) => HttpResponse::NotFound().finish(),
+        Err(SessionMessengerError::TargetNotFound(_)) => {
+            json_error(StatusCode::NOT_FOUND, "Session not found")
+        }
         Err(SessionMessengerError::Inbox(error)) => inbox_error(error),
         Err(SessionMessengerError::InvalidEnvelope(error)) => {
-            HttpResponse::BadRequest().json(json!({"error": error}))
+            json_error(StatusCode::BAD_REQUEST, error)
         }
         Err(error) => {
             tracing::error!(%error, "guidance delivery failed");
-            HttpResponse::InternalServerError().finish()
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "Guidance storage failed")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[actix_web::test]
+    async fn inbox_errors_use_the_native_envelope_and_status() {
+        for (error, expected) in [
+            (
+                SessionInboxError::TargetNotFound("missing".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                SessionInboxError::PayloadTooLarge {
+                    actual: 20,
+                    limit: 10,
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                SessionInboxError::BacklogFull {
+                    current: 10,
+                    limit: 10,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                SessionInboxError::InvalidClaim("changed".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SessionInboxError::Storage("unavailable".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let response = inbox_error(error);
+            assert_eq!(response.status(), expected);
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert!(body["error"]["message"].is_string());
         }
     }
 }
