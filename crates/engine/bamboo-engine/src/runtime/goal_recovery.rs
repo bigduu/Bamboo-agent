@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn retries_have_a_durable_bound_and_require_structured_safe_timeouts() {
         let mut session = Session::new("s", "m");
-        let goal = ensure_goal_state(&mut session, "finish");
+        let goal = ensure_goal_state(&session, "finish");
         write_goal_state(&mut session, goal);
         let policy = GoalRecoveryPolicy {
             max_attempts: 2,
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn deadline_and_corrupt_state_fail_closed() {
         let mut session = Session::new("s", "m");
-        let goal = ensure_goal_state(&mut session, "finish");
+        let goal = ensure_goal_state(&session, "finish");
         write_goal_state(&mut session, goal);
         let policy = GoalRecoveryPolicy {
             max_attempts: 3,
