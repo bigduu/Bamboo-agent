@@ -2061,7 +2061,7 @@ async fn claim_canonical_deliveries(
 ) -> crate::runtime::runner::Result<Vec<(SessionInboxClaim, SessionMessageDelivery)>> {
     let claims = binding
         .inbox
-        .claim(&session.id, limit)
+        .claim_for_turn(&session.id, limit, Some(activation_run_id))
         .await
         .map_err(|error| {
             AgentError::LLM(format!(
