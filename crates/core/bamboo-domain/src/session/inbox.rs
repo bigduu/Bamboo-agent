@@ -247,6 +247,27 @@ pub struct SessionMessageEnvelope {
 }
 
 impl SessionMessageEnvelope {
+    /// Reserved user-guidance correlation markers include a server-selected
+    /// run fence. The fence controls scheduling, not the logical retry identity.
+    pub fn is_guidance(&self) -> bool {
+        self.source == SessionMessageSource::User
+            && self.kind == SessionMessageKind::UserInput
+            && self.correlation_id.as_deref().is_some_and(|value| {
+                value == "session-guidance"
+                    || value == "session-guidance-after-run"
+                    || value.starts_with("session-guidance-after-run:")
+            })
+    }
+
+    pub fn guidance_waits_for_run(&self, run_id: &str) -> bool {
+        self.is_guidance()
+            && self
+                .correlation_id
+                .as_deref()
+                .and_then(|value| value.strip_prefix("session-guidance-after-run:"))
+                == Some(run_id)
+    }
+
     pub fn user_input(target_session_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             id: SessionMessageId::new(),
@@ -376,6 +397,16 @@ impl SessionMessageEnvelope {
                 "data": instruction.data,
             }),
         };
+        let correlation_id = if self.is_guidance()
+            && self
+                .correlation_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("session-guidance-after-run:"))
+        {
+            Some("session-guidance-after-run")
+        } else {
+            self.correlation_id.as_deref()
+        };
         serde_json::json!({
             "source": &self.source,
             "target_session_id": &self.target_session_id,
@@ -383,7 +414,7 @@ impl SessionMessageEnvelope {
             "body": body,
             "thread_id": &self.thread_id,
             "in_reply_to": &self.in_reply_to,
-            "correlation_id": &self.correlation_id,
+            "correlation_id": correlation_id,
         })
     }
 
@@ -754,6 +785,23 @@ pub trait SessionInboxPort: Send + Sync {
         target_session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionInboxClaim>, SessionInboxError>;
+
+    /// Claim at a model boundary while leaving end-of-run guidance delivered
+    /// during this run pending for the successor owner.
+    async fn claim_for_turn(
+        &self,
+        target_session_id: &str,
+        limit: usize,
+        active_run_id: Option<&str>,
+    ) -> Result<Vec<SessionInboxClaim>, SessionInboxError> {
+        let claims = self.claim(target_session_id, limit).await?;
+        Ok(claims
+            .into_iter()
+            .filter(|claim| {
+                !active_run_id.is_some_and(|run_id| claim.envelope.guidance_waits_for_run(run_id))
+            })
+            .collect())
+    }
 
     /// Permanent durable receipt check. Unlike the bounded in-session cursor,
     /// this tombstone must remain true for the lifetime of the logical inbox.
