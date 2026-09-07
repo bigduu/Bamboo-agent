@@ -67,6 +67,8 @@ fn default_gold_min_confidence() -> GoldConfidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct GoldConfig {
+    #[serde(default)]
+    pub recovery: super::goal_recovery::GoalRecoveryPolicy,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
     pub enabled: bool,
@@ -115,6 +117,7 @@ pub struct GoldConfig {
 impl Default for GoldConfig {
     fn default() -> Self {
         Self {
+            recovery: Default::default(),
             enabled: false,
             auto_answer_enabled: false,
             auto_continue_enabled: false,
