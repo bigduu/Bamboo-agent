@@ -14,7 +14,6 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY, SKILL_RUNTIME_SELECTION_COUNT_KEY,
     SKILL_RUNTIME_SELECTION_SOURCE_KEY, SKILL_RUNTIME_SELECTION_TRACE_KEY,
 };
-use bamboo_tools::exposure::activated_discoverable_tools;
 
 use super::logging::DebugLogger;
 
@@ -310,11 +309,10 @@ The user explicitly selected `{skill_id}`. Your first response step MUST be exac
         }
     }
 
-    let tool_schemas =
-        tool_schemas::resolve_available_tool_schemas_for_session(config, tools, session);
+    let tool_schemas = tool_schemas::resolve_tool_schemas_for_round(config, tools, session);
     let base_prompt_for_language =
         prompt_setup::resolve_base_prompt_for_language(config, session).to_string();
-    let activated = activated_discoverable_tools(session);
+    let activated = tool_schemas::effective_guide_activation(config, session);
     let tool_guide_context = prompt_setup::build_tool_guide_context(
         config,
         &tool_schemas,

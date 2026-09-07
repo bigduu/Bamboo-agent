@@ -4043,3 +4043,85 @@ fn overflow_error_detection_matches_common_provider_messages() {
         "authentication error: invalid api key"
     ));
 }
+
+#[test]
+fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("guide-cache", "test-model");
+    session.messages.push(Message::user("start"));
+    let config = test_config("system");
+    let tools = bamboo_tools::BuiltinToolExecutor::new();
+    let schemas =
+        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &config,
+            &tools,
+            &mut session,
+        );
+    let prepare = |session: &Session| PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let prepared = prepare(&session);
+    let before = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas,
+        "test-model",
+    );
+    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
+    session.messages.push(Message::user("wait briefly"));
+    let schemas_after =
+        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &config,
+            &tools,
+            &mut session,
+        );
+    let prepared = prepare(&session);
+    let after = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas_after,
+        "test-model",
+    );
+    assert_eq!(
+        serde_json::to_string(&schemas).unwrap(),
+        serde_json::to_string(&schemas_after).unwrap()
+    );
+    let prefix = |envelope: &super::PreparedRequestEnvelope| {
+        envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::StablePrefix)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(before.ir.system_text, after.ir.system_text);
+    assert_eq!(prefix(&before), prefix(&after));
+    assert!(after
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .any(|m| m.content.contains("Activated Tool Guidance") && m.content.contains("Sleep")));
+    assert!(!session
+        .messages
+        .iter()
+        .any(|m| m.content.contains("Activated Tool Guidance")));
+    let third = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas_after,
+        "test-model",
+    );
+    assert_eq!(
+        after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
+        third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
+    );
+}
