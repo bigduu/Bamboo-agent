@@ -545,7 +545,9 @@ fn build_request_envelope_reconciled(
     if provider_changed {
         session.reset_model_context_epoch(ModelContextResetReason::ProviderSwitch);
     }
-    let activated = activated_discoverable_tools(session);
+    let activated = crate::runtime::runner::session_setup::tool_schemas::effective_guide_activation(
+        config, session,
+    );
     let (stable_frame, stable_prefix_sections) =
         build_stable_prompt_frame_with_sections(session, config, tool_schemas, &activated);
     let stable_instructions = stable_frame.stable_instructions.clone();
@@ -554,6 +556,45 @@ fn build_request_envelope_reconciled(
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
     let mut context_blocks = Vec::new();
+    let newly_activated = activated_discoverable_tools(session)
+        .difference(&activated)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if !newly_activated.is_empty() {
+        let names = tool_schemas
+            .iter()
+            .filter(|schema| {
+                newly_activated.contains(&bamboo_domain::canonical_tool_name(&schema.function.name))
+            })
+            .map(|schema| schema.function.name.clone())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            let mut guide_context =
+                bamboo_tools::guide::context::GuideBuildContext::from_system_prompt(
+                    &stable_instructions,
+                );
+            guide_context.activated_discoverable_tools = newly_activated;
+            guide_context.include_best_practices = false;
+            let schemas = tool_schemas
+                .iter()
+                .filter(|schema| names.contains(&schema.function.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            let content = bamboo_tools::guide::EnhancedPromptBuilder::build_for_tools(
+                Some(config.tool_registry.as_ref()),
+                &names,
+                &schemas,
+                &guide_context,
+            );
+            context_blocks.push(ContextBlock::new(
+                ContextBlockType::ToolGuide,
+                ContextBlockPriority::High,
+                ContextBlockStability::RoundDynamic,
+                "Activated Tool Guidance",
+                content,
+            ));
+        }
+    }
     if let Some(block) = build_active_workflow_context_block(session) {
         context_blocks.push(block);
     }
