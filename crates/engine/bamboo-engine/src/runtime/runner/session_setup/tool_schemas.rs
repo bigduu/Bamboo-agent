@@ -11,6 +11,67 @@ use bamboo_skills::runtime_metadata::{
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
 
+const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
+const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
+
+pub(crate) fn effective_guide_activation(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> std::collections::BTreeSet<String> {
+    if config.freeze_tool_exposure_for_cache {
+        if let Some(frozen) = session
+            .metadata
+            .get(EXPOSURE_ACTIVATED)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+        {
+            return frozen;
+        }
+    }
+    activated_discoverable_tools(session)
+}
+
+/// Capture presentation only; the catalog and execution authority are rebuilt live.
+pub(crate) fn resolve_tool_schemas_for_round(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &mut Session,
+) -> Vec<ToolSchema> {
+    if config.freeze_tool_exposure_for_cache {
+        use sha2::{Digest, Sha256};
+        let catalog = resolve_catalog_with_activation(
+            config,
+            tools,
+            session,
+            &std::collections::BTreeSet::new(),
+        );
+        let schemas = catalog
+            .iter()
+            .map(|entry| entry.schema())
+            .collect::<Vec<_>>();
+        let value = serde_json::to_value(schemas).expect("tool schemas serialize");
+        let bytes =
+            bamboo_llm::providers::common::tool_schema::canonicalize_json_value(&value).to_string();
+        let signature = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if session.metadata.get(EXPOSURE_SIGNATURE) != Some(&signature) {
+            session
+                .metadata
+                .insert(EXPOSURE_SIGNATURE.into(), signature);
+            session.metadata.insert(
+                EXPOSURE_ACTIVATED.into(),
+                serde_json::to_string(&activated_discoverable_tools(session))
+                    .expect("activation names serialize"),
+            );
+        }
+    } else {
+        session.metadata.remove(EXPOSURE_SIGNATURE);
+        session.metadata.remove(EXPOSURE_ACTIVATED);
+    }
+    resolve_available_tool_schemas_for_session(config, tools, session)
+}
+
 const COPILOT_CONCLUSION_WITH_OPTIONS_ENHANCEMENT_METADATA_KEY: &str =
     "copilot_conclusion_with_options_enhancement_enabled";
 const CONCLUSION_WITH_OPTIONS_ENHANCED_DESCRIPTION: &str = "Ask the user a question with options and wait for the user to select or enter a custom answer. If you are wrapping up a task turn, asking the user to choose next steps, or handing off execution, you must call this tool instead of ending with plain assistant text. For completion confirmation, include a `conclusion` object with both `summary` and `mermaid.graph`, and include `OK` as one of the options.";
@@ -67,6 +128,20 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     tools: &dyn ToolExecutor,
     session: &Session,
 ) -> Vec<ClassifiedToolSchema> {
+    resolve_catalog_with_activation(
+        config,
+        tools,
+        session,
+        &effective_guide_activation(config, session),
+    )
+}
+
+fn resolve_catalog_with_activation(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+    activated: &std::collections::BTreeSet<String>,
+) -> Vec<ClassifiedToolSchema> {
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
@@ -119,8 +194,6 @@ pub(crate) fn resolve_classified_tool_catalog_for_session(
     if explicit_activation_is_current || explicit_activation_degraded {
         tool_schemas.retain(|schema| schema.function.name != "load_skill");
     }
-
-    let activated = activated_discoverable_tools(session);
 
     // Legacy providers keep Deferred schemas visible during migration;
     // activation only controls the depth of the existing tool-guide summaries.

@@ -351,6 +351,8 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 /// rather than widening the snapshot.
 #[non_exhaustive]
 pub struct AgentLoopConfig {
+    /// Keep tool guidance stable while activation updates append to model context.
+    pub freeze_tool_exposure_for_cache: bool,
     pub(crate) max_rounds: usize,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
@@ -553,6 +555,7 @@ pub struct AgentLoopConfig {
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
+            freeze_tool_exposure_for_cache: true,
             max_rounds: 200,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),

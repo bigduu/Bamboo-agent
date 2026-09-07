@@ -23,7 +23,9 @@ use crate::runtime::runner::loop_execution::startup::{
     resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
-use crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session;
+use crate::runtime::runner::session_setup::tool_schemas::{
+    resolve_available_tool_schemas_for_session, resolve_tool_schemas_for_round,
+};
 use crate::runtime::stream::handler::StreamHandlingOutput;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
@@ -2708,8 +2710,7 @@ async fn run_pipeline_inner(
         );
 
         // --- Resolve tool schemas ---
-        let tool_schemas =
-            resolve_available_tool_schemas_for_session(config, tools.as_ref(), session);
+        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
