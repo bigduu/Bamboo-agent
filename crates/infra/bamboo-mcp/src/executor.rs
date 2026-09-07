@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bamboo_agent_core::tools::input_guard::{check_parsed_tool_input, check_raw_tool_input};
 use bamboo_agent_core::{
     parse_tool_args_best_effort, ToolCall, ToolError, ToolExecutionContext, ToolExecutor,
     ToolOutcome, ToolResult, ToolResultImage, ToolSchema,
@@ -175,9 +176,10 @@ impl ToolExecutor for McpToolExecutor {
             resolved.original_name()
         );
 
+        check_raw_tool_input(resolved.canonical_name(), &call.function.arguments)?;
         // Parse arguments
         let args_raw = call.function.arguments.trim();
-        let (args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
+        let (mut args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
         if let Some(warning) = parse_warning {
             warn!(
                 "MCP tool argument parsing fallback applied: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", warning={}",
@@ -190,6 +192,10 @@ impl ToolExecutor for McpToolExecutor {
             );
         }
 
+        check_parsed_tool_input(resolved.canonical_name(), &args)?;
+        if let Some(tool) = snapshot.tool(resolved.server_id(), resolved.original_name()) {
+            crate::arg_coercion::coerce_args_to_schema(&mut args, &tool.parameters);
+        }
         // Execute via manager
         match self.manager.call_resolved_tool(&resolved, args).await {
             Ok(result) => {
