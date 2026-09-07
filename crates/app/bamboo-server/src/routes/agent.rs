@@ -111,6 +111,18 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/subagents/snapshot",
             web::get().to(agent::subagent_snapshot::handler),
         )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::get().to(agent::guidance::list),
+        )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::post().to(agent::guidance::send),
+        )
+        .route(
+            "/sessions/{session_id}/guidance/{message_id}",
+            web::delete().to(agent::guidance::cancel),
+        )
         .route("/sessions", web::get().to(agent::sessions::list_sessions))
         .route("/sessions", web::post().to(agent::sessions::create_session))
         .route(

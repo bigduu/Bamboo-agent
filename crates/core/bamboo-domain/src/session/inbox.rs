@@ -772,6 +772,27 @@ pub trait SessionInboxPort: Send + Sync {
         claim: &SessionInboxClaim,
     ) -> Result<(), SessionInboxError>;
 
+    /// List unclaimed user guidance in delivery order.
+    async fn pending_guidance(
+        &self,
+        _target_session_id: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "guidance queue is unavailable".into(),
+        ))
+    }
+
+    /// Cancel only an unclaimed user envelope. False means it cannot be withdrawn.
+    async fn cancel_guidance(
+        &self,
+        _target_session_id: &str,
+        _id: &SessionMessageId,
+    ) -> Result<bool, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "guidance cancellation is unavailable".into(),
+        ))
+    }
+
     async fn inspect(
         &self,
         target_session_id: &str,

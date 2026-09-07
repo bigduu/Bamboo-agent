@@ -10,6 +10,7 @@ pub mod delete;
 pub mod dev;
 pub mod events;
 pub mod execute;
+pub mod guidance;
 pub mod health;
 pub mod history;
 pub mod ledger;
