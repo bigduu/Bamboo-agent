@@ -714,6 +714,10 @@ impl AgentRuntime {
             ))),
             None => None,
         };
+        let guidance_active_run_id = match self.activation_router.as_ref() {
+            Some(router) => router.current_run_id(&session.id).await,
+            None => None,
+        };
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
         let ExecuteRequest {
@@ -773,6 +777,7 @@ impl AgentRuntime {
         );
 
         let loop_config = AgentLoopConfig {
+            guidance_active_run_id,
             max_rounds: 200,
             system_prompt,
             // Snapshot the legacy model_limits from the live in-memory config so

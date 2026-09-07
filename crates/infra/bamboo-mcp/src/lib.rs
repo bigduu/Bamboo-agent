@@ -3,6 +3,7 @@
 //! This crate provides MCP client functionality allowing the agent to connect
 //! to MCP servers and use their tools.
 
+mod arg_coercion;
 pub mod config;
 pub mod error;
 pub mod executor;

@@ -67,6 +67,8 @@ fn default_gold_min_confidence() -> GoldConfidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct GoldConfig {
+    #[serde(default)]
+    pub recovery: super::goal_recovery::GoalRecoveryPolicy,
     /// Master switch for Gold observe-only evaluation.
     #[serde(default)]
     pub enabled: bool,
@@ -115,6 +117,7 @@ pub struct GoldConfig {
 impl Default for GoldConfig {
     fn default() -> Self {
         Self {
+            recovery: Default::default(),
             enabled: false,
             auto_answer_enabled: false,
             auto_continue_enabled: false,
@@ -351,6 +354,8 @@ impl From<&MemoryConfig> for PromptMemoryFlags {
 /// rather than widening the snapshot.
 #[non_exhaustive]
 pub struct AgentLoopConfig {
+    /// Keep tool guidance stable while activation updates append to model context.
+    pub freeze_tool_exposure_for_cache: bool,
     pub(crate) max_rounds: usize,
     pub(crate) system_prompt: Option<String>,
     /// Skill IDs that are disabled globally for this execution.
@@ -377,6 +382,7 @@ pub struct AgentLoopConfig {
     /// Optional runtime persistence for non-authoritative session saves.
     /// When set, engine save sites use this instead of `storage` for writes.
     pub(crate) persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+    pub(crate) guidance_active_run_id: Option<String>,
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
@@ -553,6 +559,7 @@ pub struct AgentLoopConfig {
 impl Default for AgentLoopConfig {
     fn default() -> Self {
         Self {
+            freeze_tool_exposure_for_cache: true,
             max_rounds: 200,
             system_prompt: None,
             disabled_skill_ids: BTreeSet::new(),
@@ -565,6 +572,7 @@ impl Default for AgentLoopConfig {
             skip_initial_user_message: false,
             storage: None,
             persistence: None,
+            guidance_active_run_id: None,
             session_inbox: None,
             session_activation_notifications: None,
             attachment_reader: None,
