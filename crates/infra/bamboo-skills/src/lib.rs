@@ -85,9 +85,14 @@ fn select_automatic_skill(
             ..Default::default()
         },
     );
-    let Some(matched) =
-        index.discover_unambiguous_automatic_skill(request_hint.unwrap_or_default())
-    else {
+    let decision = index.explain_automatic_skill(request_hint.unwrap_or_default());
+    tracing::debug!(
+        query_sha256 = %decision.query_sha256,
+        outcome = ?decision.outcome,
+        candidates = ?decision.candidates,
+        "Automatic skill selection evaluated"
+    );
+    let Some(matched) = decision.selected else {
         return Vec::new();
     };
     let CapabilityInvocationTarget::Skill {

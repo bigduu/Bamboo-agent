@@ -2225,3 +2225,46 @@ async fn runtime_skill_context_rejects_another_projects_workspace_overlay() {
         .metadata
         .contains_key(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY));
 }
+
+#[test]
+fn cached_tool_descriptions_stay_stable_while_live_disables_still_apply() {
+    use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
+    let mut config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Read"), schema("Sleep")],
+    };
+    let mut session = Session::new("cache", "model");
+    let before = resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
+    let after = resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&after).unwrap()
+    );
+    assert!(!effective_guide_activation(&config, &session).contains("Sleep"));
+    config.disabled_tools.insert("Sleep".into());
+    let disabled = resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    assert!(!disabled.iter().any(|s| s.function.name == "Sleep"));
+    config.disabled_tools.clear();
+    let restored = resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    assert!(restored.iter().any(|s| s.function.name == "Sleep"));
+    assert!(effective_guide_activation(&config, &session).contains("Sleep"));
+}
+
+#[test]
+fn disabling_cache_freeze_restores_live_guide_expansion() {
+    use super::tool_schemas::resolve_tool_schemas_for_round;
+    let mut config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("Sleep")],
+    };
+    let mut session = Session::new("cache", "model");
+    resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
+    config.freeze_tool_exposure_for_cache = false;
+    let live = resolve_tool_schemas_for_round(&config, &tools, &mut session);
+    assert!(!live[0].function.description.contains("Discoverable"));
+    assert!(!session
+        .metadata
+        .contains_key("prompt_tool_exposure_activated"));
+}
