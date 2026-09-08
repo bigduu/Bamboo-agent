@@ -87,7 +87,11 @@ pub use bamboo_domain::{
 };
 pub use bamboo_domain::{
     SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
-    DEFAULT_SUPERVISOR_SESSION_ID,
+    SupervisorLinkObservation, SupervisorManagedLink, SupervisorManagementMutation,
+    SupervisorManagementReceipt, SupervisorManagementRequest, SupervisorManagementState,
+    SupervisorReference, SupervisorScopeObservation, DEFAULT_SUPERVISOR_SESSION_ID,
+    MAX_SUPERVISOR_LINKS, MAX_SUPERVISOR_PROJECTS, MAX_SUPERVISOR_SESSION_ID_BYTES,
+    SUPERVISOR_MANAGEMENT_SCHEMA_VERSION,
 };
 pub use bamboo_engine::session_app::respond::PlanModeTransition;
 pub use bamboo_engine::session_app::supervisor::SupervisorSessionService;

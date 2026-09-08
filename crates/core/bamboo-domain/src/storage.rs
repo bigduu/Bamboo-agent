@@ -4,7 +4,10 @@
 //! implementations. Concrete implementations live in infrastructure crates.
 
 use crate::session::types::Session;
-use crate::SupervisorBootstrapReceipt;
+use crate::{
+    SupervisorBootstrapReceipt, SupervisorLinkObservation, SupervisorManagementReceipt,
+    SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
+};
 
 /// Trait for session storage backends.
 ///
@@ -42,6 +45,48 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "storage backend does not support trusted Supervisor bootstrap",
+        ))
+    }
+
+    /// Bounded trusted host scope observation, never a Session directory.
+    async fn inspect_supervisor_scope(
+        &self,
+        supervisor: &SupervisorReference,
+    ) -> std::io::Result<SupervisorScopeObservation> {
+        let _ = supervisor;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
+        ))
+    }
+
+    /// Trusted management CAS at the final durable boundary. Implementations
+    /// must revalidate identity/revision and any attach target under lifecycle,
+    /// Task and ordered Session locks retained through publication. A stale
+    /// revision returns WouldBlock; the caller must reload before a fresh retry.
+    async fn mutate_supervisor_management(
+        &self,
+        request: &SupervisorManagementRequest,
+    ) -> std::io::Result<SupervisorManagementReceipt> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
+        ))
+    }
+
+    /// Strict single-link observation under the same authority locks as CAS.
+    /// Returned authorization expires when those locks are released. A later
+    /// command needs an integrated final authorization + durable admission fence.
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+    ) -> std::io::Result<SupervisorLinkObservation> {
+        let _ = (supervisor, target_session_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor management",
         ))
     }
 
