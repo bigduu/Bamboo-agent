@@ -40,10 +40,14 @@
 //! The SDK never reimplements the agent loop. `run` / `run_stream` funnel into
 //! `bamboo_engine::Agent::execute` (the single canonical execution path).
 
+mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
 mod tools;
+
+#[cfg(test)]
+mod approval_replay_tests;
 
 use std::sync::Arc;
 
@@ -52,9 +56,7 @@ pub use builder::AgentBuilder;
 pub use execute_request::ExecuteRequestBuilder;
 use tokio::sync::mpsc;
 
-use bamboo_engine::session_app::approval_replay::{
-    refresh_approval_replay_posture, ApprovalReplayDecision,
-};
+use approval_replay::ReplayDisposition;
 use bamboo_engine::session_app::errors::{SessionLoadError, SessionSaveError};
 use bamboo_engine::session_app::repository::SessionAccess;
 use bamboo_engine::session_app::respond::{
@@ -456,12 +458,39 @@ impl Agent {
         // the re-execution marker `submit_pending_response` set — the gated tool
         // never actually ran (the permission gate intercepted it before
         // execution), so re-run it now for real and write the genuine output back
-        // before the loop resumes. No-op when the marker is absent (the common,
-        // non-permission path), so this is safe to run unconditionally on every
-        // entry into the loop, not just `resume`. See
+        // before the loop resumes. An unanswered typed request also keeps this
+        // entry waiting after its replay markers have been cleared. Check every
+        // ergonomic entry into the loop, not just `resume`. See
         // `reexecute_approved_tool_if_pending` for the full rationale.
-        self.reexecute_approved_tool_if_pending(session, &event_tx)
-            .await?;
+        match self
+            .reexecute_approved_tool_if_pending(session, &event_tx)
+            .await
+        {
+            Ok(ReplayDisposition::Continue) => {}
+            Ok(ReplayDisposition::AwaitingApproval(pending)) => {
+                direct_lease.abandon().await;
+                let _ = event_tx
+                    .send(AgentEvent::NeedClarification {
+                        question: pending.question,
+                        options: (!pending.options.is_empty()).then_some(pending.options),
+                        tool_call_id: Some(pending.tool_call_id),
+                        tool_name: Some(pending.tool_name),
+                        allow_custom: pending.allow_custom,
+                        source: Some(pending.source),
+                    })
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                direct_lease.abandon().await;
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+        }
 
         // Apply the instruction as the session's leading System message, set
         // the configured model, and refresh the typed prompt snapshot via the
@@ -496,165 +525,6 @@ impl Agent {
         self.inner
             .execute_direct_registered(session, builder.build(), direct_lease)
             .await
-    }
-
-    /// Port of `bamboo-server`'s `resume_adapter.rs` re-execution logic: after
-    /// [`answer`](Self::answer) approves a permission prompt,
-    /// `submit_pending_response` stamps `session.metadata` with
-    /// [`PERMISSION_REEXECUTE_METADATA_KEY`] (the approved tool call's id) — the
-    /// gated tool was intercepted BEFORE it ran, so its recorded result is only
-    /// the synthetic "Selected response: Approve" placeholder. This re-runs the
-    /// original tool call for real, against the SAME executor the loop itself
-    /// uses ([`bamboo_engine::Agent::default_tools`]), and overwrites the
-    /// placeholder tool-result message with the genuine output — so the resumed
-    /// loop sees what the operation actually did instead of inferring it.
-    ///
-    /// Emits the same `ToolStart`/`ToolComplete` (or `ToolError`) lifecycle
-    /// events onto `event_tx` that a normal dispatch would, so a streaming
-    /// consumer sees the re-run tool card update exactly like the HTTP surface
-    /// does. Best-effort persists the updated session via
-    /// [`persistence`](Self::persistence) so the real output survives even if the
-    /// process stops before the loop's own next save — logged, not propagated,
-    /// since the loop's subsequent save will also capture it.
-    ///
-    /// No-op (returns immediately) when the marker is absent, so it is safe to
-    /// call unconditionally at the top of every execution, not just resumes.
-    async fn reexecute_approved_tool_if_pending(
-        &self,
-        session: &mut Session,
-        event_tx: &mpsc::Sender<AgentEvent>,
-    ) -> Result<(), AgentError> {
-        let Some(tool_call_id) = session
-            .metadata
-            .get(PERMISSION_REEXECUTE_METADATA_KEY)
-            .cloned()
-        else {
-            return Ok(());
-        };
-
-        let Some(tool_call) = find_pending_tool_call(session, &tool_call_id) else {
-            session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-            tracing::warn!(
-                session_id = %session.id,
-                tool_call_id = %tool_call_id,
-                "Permission re-exec marker set but tool call not found in history"
-            );
-            return Ok(());
-        };
-
-        let tool_name = tool_call.function.name.clone();
-        let decision = refresh_approval_replay_posture(
-            self.storage().as_ref(),
-            session,
-            self.permission_mode,
-            &tool_name,
-        )
-        .await?;
-
-        let flags = match decision {
-            ApprovalReplayDecision::Execute(flags) => flags,
-            ApprovalReplayDecision::BlockedByPlan(_) => {
-                session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-                apply_tool_result(
-                    session,
-                    &tool_call_id,
-                    format!(
-                        "Plan mode blocked approved mutating tool '{tool_name}'; the stale approval was not executed"
-                    ),
-                    false,
-                );
-                if let Err(error) = self.persistence().save_runtime_session(session).await {
-                    tracing::warn!(
-                        session_id = %session.id,
-                        %error,
-                        "Failed to persist Plan-blocked approval replay (loop's own save will retry)"
-                    );
-                }
-                return Ok(());
-            }
-        };
-        session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
-
-        let executor = self.inner.default_tools();
-        let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
-            == bamboo_tools::orchestrator::ToolMutability::Mutating;
-
-        // Frame the re-run with the same lifecycle events the normal loop emits
-        // (via ToolEmitter) so a streaming consumer's tool card updates
-        // (running -> finished) and ToolComplete carries the REAL output — raw
-        // `execute_with_context` only streams tool tokens, not lifecycle.
-        let mut emitter = bamboo_tools::ToolEmitter::new(&tool_call.id, &tool_name, is_mutating);
-        emitter.set_auto_approved(true);
-        let _ = event_tx
-            .send(emitter.begin().clone().into_agent_event())
-            .await;
-
-        let exec_result = {
-            let ctx = bamboo_agent_core::tools::ToolExecutionContext {
-                executing_supervisor: None,
-                session_id: Some(session.id.as_str()),
-                root_session_id: Some(if session.root_session_id.trim().is_empty() {
-                    session.id.as_str()
-                } else {
-                    session.root_session_id.as_str()
-                }),
-                tool_call_id: tool_call_id.as_str(),
-                event_tx: Some(event_tx),
-                available_tool_schemas: None,
-                bypass_permissions: flags.bypass_permissions,
-                auto_approve_permissions: flags.auto_approve_permissions,
-                plan_read_only: flags.plan_read_only,
-                can_async_resume: false,
-                bash_completion_sink: None,
-                pre_parsed_args: None,
-            };
-            executor.execute_with_context(&tool_call, ctx).await
-        };
-
-        let (content, success) = match exec_result {
-            Ok(tool_result) => {
-                let _ = event_tx
-                    .send(
-                        emitter
-                            .finish(Some("Re-executed after approval".to_string()))
-                            .clone()
-                            .into_agent_event(),
-                    )
-                    .await;
-                let _ = event_tx
-                    .send(AgentEvent::ToolComplete {
-                        tool_call_id: tool_call.id.clone(),
-                        result: tool_result.clone(),
-                    })
-                    .await;
-                (tool_result.result, tool_result.success)
-            }
-            Err(error) => {
-                let message = format!("Tool re-execution after approval failed: {error}");
-                let _ = event_tx
-                    .send(emitter.error(message.clone()).clone().into_agent_event())
-                    .await;
-                (message, false)
-            }
-        };
-
-        tracing::info!(
-            session_id = %session.id,
-            tool_name = %tool_name,
-            tool_call_id = %tool_call_id,
-            success,
-            "Re-executed approved tool after permission grant"
-        );
-        apply_tool_result(session, &tool_call_id, content, success);
-
-        if let Err(error) = self.persistence().save_runtime_session(session).await {
-            tracing::warn!(
-                session_id = %session.id,
-                %error,
-                "Failed to persist session after tool re-execution (loop's own save will retry)"
-            );
-        }
-        Ok(())
     }
 
     /// Access the shared storage backend.
@@ -734,6 +604,12 @@ impl Agent {
     /// and overwrites the synthetic "Selected response: Approve" placeholder
     /// with the operation's genuine output before the loop continues — see
     /// `reexecute_approved_tool_if_pending`.
+    ///
+    /// This text-only method does not issue typed permission receipts. A typed
+    /// permission decision must be submitted through a typed response adapter
+    /// before resuming. Although a valid text option can consume the pending
+    /// question here, subsequent replay rejects its missing generation/receipt;
+    /// it does not restore the consumed question or infer approval from text.
     ///
     /// NOTE: `ChildApprovalRequested` (an out-of-process sub-agent worker's
     /// gated tool, proxied over the actor protocol) is a SEPARATE mechanism
@@ -1000,32 +876,6 @@ impl SessionAccess for Agent {
 
     async fn save_and_cache(&self, session: &mut Session) -> Result<(), SessionSaveError> {
         SessionAccess::save_session(self, session).await
-    }
-}
-
-/// Find the original tool call (with its arguments) by id in the session
-/// history. Mirrors `bamboo-server`'s `resume_adapter::find_pending_tool_call`.
-fn find_pending_tool_call(
-    session: &Session,
-    tool_call_id: &str,
-) -> Option<bamboo_agent_core::tools::ToolCall> {
-    session.messages.iter().find_map(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .and_then(|calls| calls.iter().find(|call| call.id == tool_call_id).cloned())
-    })
-}
-
-/// Overwrite the tool-result message for `tool_call_id` with the real tool
-/// output. Mirrors `bamboo-server`'s `resume_adapter::apply_tool_result`.
-fn apply_tool_result(session: &mut Session, tool_call_id: &str, content: String, success: bool) {
-    for message in &mut session.messages {
-        if message.tool_call_id.as_deref() == Some(tool_call_id) {
-            message.content = content;
-            message.tool_success = Some(success);
-            return;
-        }
     }
 }
 
