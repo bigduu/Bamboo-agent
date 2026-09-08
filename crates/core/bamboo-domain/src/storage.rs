@@ -13,6 +13,23 @@ use crate::SupervisorBootstrapReceipt;
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Trusted explicit recreation of a previously deleted Ordinary Root ID.
+    /// The backend constructs a blank Root and assigns a fresh birth marker;
+    /// callers cannot supply an old snapshot or choose its lifetime. Retrying
+    /// after a complete publication returns that surviving lifetime unchanged.
+    /// This is a host/SDK port, never a model-callable creation capability.
+    async fn recreate_root_session(
+        &self,
+        session_id: &str,
+        initial_model: &str,
+    ) -> std::io::Result<Session> {
+        let _ = (session_id, initial_model);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support trusted Root recreation",
+        ))
+    }
+
     /// Trusted host bootstrap for one stable default Supervisor Root. Only the
     /// initial model is caller supplied and is used on first creation only.
     /// Implementations must publish the complete identity atomically, protect it
@@ -40,7 +57,9 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Saves a session's metadata.
+    /// Saves a session's metadata. A backend may allow initial creation for a
+    /// never-deleted ID, but an ordinary snapshot must not recreate a deleted
+    /// lifetime. Use the trusted recreation port for an explicitly reused ID.
     async fn save_session(&self, session: &Session) -> std::io::Result<()>;
 
     /// Loads a session by ID, returns None if not found.

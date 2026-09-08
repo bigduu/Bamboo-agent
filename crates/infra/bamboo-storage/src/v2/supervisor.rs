@@ -1,17 +1,12 @@
 //! Trusted singleton identity. Canonical Session files are the only authority;
 //! the global index and unpublished staging directories never grant a role.
 
+use super::root_lifetime::RootPublicationFault;
 use super::*;
 use bamboo_domain::{
     SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
     DEFAULT_SUPERVISOR_SESSION_ID,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SupervisorBootstrapFault {
-    BeforePublish,
-    BeforeIndex,
-}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(
@@ -111,6 +106,9 @@ impl SessionStoreV2 {
         id: &str,
     ) -> io::Result<Option<Session>> {
         validate_session_id(id)?;
+        if self.root_directory_is_revoked(id).await? {
+            return Ok(None);
+        }
         if !real_directory(&self.sessions_dir).await? {
             return Err(invalid("sessions directory is missing"));
         }
@@ -167,8 +165,10 @@ impl SessionStoreV2 {
         &self,
         initial_model: &str,
     ) -> io::Result<SupervisorBootstrapReceipt> {
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+        let _task = self.lock_runtime_task_transaction_exclusive().await?;
+        self.recover_all_runtime_task_transactions_locked().await?;
+        self.recover_all_session_copy_transactions_locked().await?;
         let _session = self
             .acquire_session_maintenance_lock(DEFAULT_SUPERVISOR_SESSION_ID)
             .await?;
@@ -256,6 +256,8 @@ impl SessionStoreV2 {
         }
         let incarnation_id = Uuid::new_v4();
         let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, initial_model.trim());
+        session.created_at = self.fresh_root_birth(DEFAULT_SUPERVISOR_SESSION_ID).await?;
+        session.updated_at = session.created_at;
         session.title = "Supervisor".to_string();
         session.title_generated = true;
         session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id };
@@ -263,6 +265,8 @@ impl SessionStoreV2 {
             .bamboo_home_dir
             .join(format!(".supervisor-bootstrap-{}", Uuid::new_v4()));
         let destination = self.sessions_dir.join(DEFAULT_SUPERVISOR_SESSION_ID);
+        self.remove_revoked_root_directory(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await?;
         fs::create_dir(&staging).await?;
         let result = async {
             fs::create_dir(staging.join("children")).await?;
@@ -272,11 +276,11 @@ impl SessionStoreV2 {
             durable_atomic_write(&staging.join("session.json"), &bytes).await?;
             durable_atomic_write(&staging.join(RUNTIME_SIDECAR_FILE), &bytes).await?;
             sync_directory(&staging).await?;
-            self.maybe_fail_supervisor_bootstrap(SupervisorBootstrapFault::BeforePublish)?;
+            self.maybe_fail_root_publication(RootPublicationFault::BeforePublish)?;
             atomic_rename(&staging, &destination).await?;
             sync_parent_directory_entry(&staging).await?;
             sync_parent_directory_entry(&destination).await?;
-            self.maybe_fail_supervisor_bootstrap(SupervisorBootstrapFault::BeforeIndex)?;
+            self.maybe_fail_root_publication(RootPublicationFault::BeforeIndex)?;
             self.repair_index_from_authoritative_session(
                 &session,
                 Self::root_rel_path(DEFAULT_SUPERVISOR_SESSION_ID),
@@ -295,25 +299,6 @@ impl SessionStoreV2 {
             let _ = fs::remove_dir_all(&staging).await;
         }
         result
-    }
-
-    fn maybe_fail_supervisor_bootstrap(&self, fault: SupervisorBootstrapFault) -> io::Result<()> {
-        #[cfg(test)]
-        {
-            let mut pending = self
-                .supervisor_bootstrap_fault
-                .lock()
-                .expect("supervisor fault lock");
-            if pending.as_ref() == Some(&fault) {
-                *pending = None;
-                return Err(other_io_error(format!(
-                    "injected Supervisor bootstrap failure: {fault:?}"
-                )));
-            }
-        }
-        #[cfg(not(test))]
-        let _ = fault;
-        Ok(())
     }
 
     /// Called inside the final cross-process write lock. Merging callers must

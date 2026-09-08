@@ -1706,6 +1706,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_deleted_after_merge_read_rejects_without_cache_or_event_publication() {
+        for runtime_only in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let first = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let mut stale = Session::new("root-delete-race", "model");
+            stale.set_project_id_meta("project-a");
+            stale.add_message(bamboo_domain::Message::user("Old lifetime"));
+            first.save_session(&stale).await.unwrap();
+            let id = stale.id.clone();
+            let second = SessionStoreV2::new(temp.path().into()).await.unwrap();
+            let paused = Arc::new(AuthoritySavePauseStorage {
+                inner: first.clone(),
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let locked = LockedSessionStore::new(paused.clone());
+            let published = AtomicBool::new(false);
+            let save = async {
+                if runtime_only {
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                } else {
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            let delete = async {
+                paused.reached.wait().await;
+                assert!(second.delete_session(&id).await.unwrap());
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(save, delete)
+            })
+            .await
+            .expect("deterministic delete/save race completes");
+            assert!(!may_publish_runtime_result(&Err(result.unwrap_err())));
+            assert!(!published.load(Ordering::SeqCst));
+            assert!(first.load_root_authority(&id).await.unwrap().is_none());
+            assert!(!first.sessions_root_dir().join(&id).exists());
+            first.flush_search_index().await;
+            second.flush_search_index().await;
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_bootstrap_between_merge_read_and_save_rejects_without_publishing() {
         for runtime_only in [false, true] {
             let temp = tempfile::tempdir().unwrap();
