@@ -24,6 +24,9 @@ const CALL: &str = "reused-call";
 const CURRENT: &str = "generation-a";
 const SECOND: &str = "generation-b";
 
+#[path = "approval_supervisor_tests.rs"]
+mod supervisor;
+
 #[derive(Debug)]
 struct Invocation {
     name: String,

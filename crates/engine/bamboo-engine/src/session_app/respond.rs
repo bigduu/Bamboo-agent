@@ -415,6 +415,19 @@ fn apply_pending_response(
         .take()
         .ok_or(RespondError::NoPendingQuestion)?;
 
+    if session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(pending.tool_call_id.as_str()))
+        .is_some_and(result_payload_has_supervisor_authority)
+    {
+        session.pending_question = Some(pending);
+        return Err(RespondError::InvalidResponse(
+            "Supervisor authority cannot originate in a tool result payload".into(),
+        ));
+    }
+
     if let Some(expected) = expected_tool_call_id {
         if pending.tool_call_id != expected {
             let actual = pending.tool_call_id.clone();
@@ -720,6 +733,11 @@ pub fn update_or_append_tool_result_message(
 ) -> bool {
     for message in session.messages.iter_mut().rev() {
         if message.tool_call_id.as_deref() == Some(tool_call_id) {
+            // Retain invalid input for fail-closed inspection; replacing the
+            // payload must not disguise forged authority as absent legacy data.
+            if result_payload_has_supervisor_authority(message) {
+                return false;
+            }
             // Preserve the server-issued typed permission contract outside the
             // model-visible content before replacing the synthetic waiting
             // payload with the selected answer. This lets an exact durable
@@ -746,6 +764,12 @@ pub fn update_or_append_tool_result_message(
         true,
     ));
     false
+}
+
+fn result_payload_has_supervisor_authority(message: &Message) -> bool {
+    serde_json::from_str::<serde_json::Value>(&message.content).ok().is_some_and(|payload| {
+        payload.get(bamboo_agent_core::tools::ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY).is_some()
+    })
 }
 
 fn insert_message_metadata(message: &mut Message, key: &str, value: serde_json::Value) {
@@ -1815,7 +1839,7 @@ mod receipt_persistence_tests {
             serde_json::json!({"command":"current-command"}).to_string()
         );
         let config = PermissionConfig::new();
-        restore_permission_replay_authorization(&config, &restarted, &target).unwrap();
+        restore_permission_replay_authorization(&config, &restarted, &target, "Bash").unwrap();
         // Try mismatches before consuming the valid grant, so these assertions
         // cannot pass merely because the one-shot grant was already exhausted.
         for (session_id, call_id, generation, resource) in [

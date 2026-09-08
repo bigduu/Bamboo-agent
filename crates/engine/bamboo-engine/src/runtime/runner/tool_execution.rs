@@ -173,6 +173,7 @@ async fn execute_and_apply_single_tool_call(
                 tool_name
             );
             let outcome = per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
                 needs_human: None,
                 post_tool_hook_eligible: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
@@ -232,6 +233,7 @@ async fn execute_and_apply_single_tool_call(
                     policy_error
                 );
                 per_call::ToolExecutionOutcome {
+                    permission_replay_origin: None,
                     needs_human: None,
                     post_tool_hook_eligible: false,
                     result: Err(policy_error),
@@ -275,6 +277,7 @@ async fn execute_and_apply_single_tool_call(
                 message
             );
             per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
                 needs_human: None,
                 post_tool_hook_eligible: false,
                 result: Err(message),
@@ -681,6 +684,7 @@ pub(crate) async fn execute_round_tool_calls(
                         .await
                         .unwrap_or_else(|_| {
                             Ok(per_call::ToolExecutionOutcome {
+                                permission_replay_origin: None,
                                 needs_human: None,
                                 post_tool_hook_eligible: true,
                                 result: Err(format!(
@@ -705,6 +709,7 @@ pub(crate) async fn execute_round_tool_calls(
                     .iter()
                     .map(|_batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
+                            permission_replay_origin: None,
                             needs_human: None,
                             post_tool_hook_eligible: true,
                             result: Err(format!(

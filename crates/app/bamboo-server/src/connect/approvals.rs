@@ -32,8 +32,8 @@ use bamboo_engine::runtime::execution::agent_spawn::{
 };
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization, ApprovalReplayDecision,
-    PermissionReplayTarget,
+    repark_permission_replay, restore_permission_replay_authorization,
+    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
@@ -717,6 +717,22 @@ impl ResumeExecutionPort for ConnectResumePort {
                 }
                 let tool_call = replay_target.tool_call().clone();
                 let tool_name = tool_call.function.name.clone();
+                let executor = ctx.tools.clone();
+                let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
+                    executor.owns_exact_tool(name)
+                })
+                .unwrap_or_else(|| tool_name.clone());
+                let executing_supervisor = match validate_permission_replay_authority(
+                    &session,
+                    &replay_target,
+                    &replay_owner,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
+                        return;
+                    }
+                };
                 let configured_mode = ctx
                     .permission_checker
                     .permission_config()
@@ -768,6 +784,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             permission_config.as_ref(),
                             &session,
                             &replay_target,
+                            &replay_owner,
                         ) {
                             tracing::error!(
                                 %session_id,
@@ -777,7 +794,6 @@ impl ResumeExecutionPort for ConnectResumePort {
                             );
                             return;
                         }
-                        let executor = ctx.tools.clone();
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
                         let mut emitter = bamboo_tools::ToolEmitter::new(
@@ -793,10 +809,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_with_context(
+                            executor.execute_exact_with_context_outcome(
                                 &tool_call,
+                                &replay_owner,
                                 ToolExecutionContext {
-                                    executing_supervisor: None,
+                                    executing_supervisor,
                                     session_id: Some(session.id.as_str()),
                                     root_session_id: Some(
                                         if session.root_session_id.trim().is_empty() {
@@ -817,7 +834,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                                 },
                             ),
                         )
-                        .await;
+                        .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
 
                         match exec_result {
                             Ok(tool_result) => {
@@ -825,6 +842,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     &mut session,
                                     &replay_target,
                                     &tool_result,
+                                    &replay_owner,
                                 ) {
                                     Ok(Some(reparked)) => {
                                         let _ = mpsc_tx
@@ -993,6 +1011,82 @@ mod tests {
     use bamboo_agent_core::Message;
 
     use super::*;
+
+    fn supervisor_context(state: &crate::app_state::AppState) -> ConnectContext {
+        ConnectContext {
+            agent: state.agent.clone(),
+            tools: state.tools_for(crate::tools::ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(Default::default()),
+            permission_checker: state.permission_checker.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_supervisor_typed_replay_restores_identity_and_rejects_corruption() {
+        use crate::app_state::resume_adapter::supervisor_tests::Fixture;
+        for corrupt in [false, true] {
+            let fixture = Box::pin(Fixture::pending()).await;
+            fixture.prepare_workspace_catalog().await;
+            fixture.formal_approve().await;
+            if corrupt {
+                fixture.corrupt().await;
+            }
+            let ctx = supervisor_context(&fixture.state);
+            let session = fixture.reload().await;
+            let config = resolve_resume_config_snapshot(
+                &*ctx.config.read().await,
+                &ctx.provider_registry,
+                &session,
+                None,
+            );
+            let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+                &ConnectResumePort { ctx },
+                &session.id,
+                config,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
+            ));
+            fixture.settled(usize::from(!corrupt), corrupt).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_supervisor_text_answer_cannot_replace_a_typed_receipt() {
+        use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
+        let fixture = Box::pin(Fixture::pending()).await;
+        let responder = EngineResponder::new(supervisor_context(&fixture.state));
+        let outcome = responder
+            .respond_and_resume(&fixture.original.session_id, Some(CALL), "Approve".into())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RespondAndResumeOutcome::Resumed(_)));
+        fixture.settled(0, true).await;
+        let session = fixture.reload().await;
+        let result = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert!(result
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("permission_decision_receipt")
+            .is_none());
+    }
 
     fn append_permission_round(
         session: &mut Session,

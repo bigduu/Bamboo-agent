@@ -6,8 +6,9 @@ use bamboo_agent_core::{PendingQuestion, PendingQuestionSource};
 use bamboo_domain::resolve_tool_reference_name;
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization, ApprovalReplayDecision,
-    PermissionReplayTarget,
+    repark_permission_replay, restore_permission_replay_authorization,
+    validate_pending_permission_replay_authority, validate_permission_replay_authority,
+    ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
@@ -37,6 +38,16 @@ fn latest_result<'a>(session: &'a Session, id: &str) -> Option<&'a Message> {
 /// must never fall through the legacy path because generation extraction failed.
 fn typed_request(message: &Message) -> Result<Option<PermissionRequest>, AgentError> {
     let payload = serde_json::from_str::<serde_json::Value>(&message.content).ok();
+    let authority_key =
+        bamboo_agent_core::tools::ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY;
+    if payload
+        .as_ref()
+        .is_some_and(|value| value.get(authority_key).is_some())
+    {
+        return Err(invalid(
+            "Supervisor authority cannot originate in the result payload",
+        ));
+    }
     let metadata_request = message
         .metadata
         .as_ref()
@@ -58,13 +69,11 @@ fn typed_request(message: &Message) -> Result<Option<PermissionRequest>, AgentEr
         return Err(invalid("typed result does not have the Tool role"));
     }
     if request.is_none()
-        && (message
-            .metadata
+        && (message.metadata.as_ref().is_some_and(|value| {
+            value.get("permission_decision_receipt").is_some() || value.get(authority_key).is_some()
+        }) || payload
             .as_ref()
-            .is_some_and(|value| value.get("permission_decision_receipt").is_some())
-            || payload
-                .as_ref()
-                .is_some_and(|value| value.get("permission_decision_receipt").is_some()))
+            .is_some_and(|value| value.get("permission_decision_receipt").is_some()))
     {
         return Err(invalid("receipt is missing its typed request"));
     }
@@ -130,7 +139,8 @@ impl Agent {
                     let target =
                         find_permission_replay_target(session, &pending.tool_call_id, None)
                             .ok_or_else(|| invalid("pending operation is missing its tool call"))?;
-                    validate_request(session, &target, &request, executor.as_ref())?;
+                    let owner = validate_request(session, &target, &request, executor.as_ref())?;
+                    validate_pending_permission_replay_authority(session, &target, &owner)?;
                     let payload = serde_json::from_str::<serde_json::Value>(&message.content).ok();
                     if call_id.is_some()
                         || generation.is_some()
@@ -204,6 +214,12 @@ impl Agent {
 
         let tool_call = target.tool_call();
         let tool_name = &tool_call.function.name;
+        let replay_owner = execution_name.clone().unwrap_or_else(|| {
+            resolve_tool_reference_name(tool_name, |name| executor.owns_exact_tool(name))
+                .unwrap_or_else(|| tool_name.clone())
+        });
+        let executing_supervisor =
+            validate_permission_replay_authority(session, &target, &replay_owner)?;
         let decision = refresh_approval_replay_posture(
             self.storage().as_ref(),
             session,
@@ -217,7 +233,7 @@ impl Agent {
                 .as_ref()
                 .and_then(|checker| checker.permission_config())
                 .ok_or_else(|| invalid("typed authorization requires a PermissionConfig"))?;
-            restore_permission_replay_authorization(&config, session, &target)?;
+            restore_permission_replay_authorization(&config, session, &target, &replay_owner)?;
         }
         let flags = match decision {
             ApprovalReplayDecision::Execute(flags) => flags,
@@ -241,7 +257,7 @@ impl Agent {
             .await;
         let completed = async {
             let ctx = bamboo_agent_core::tools::ToolExecutionContext {
-                executing_supervisor: None,
+                executing_supervisor,
                 session_id: Some(session.id.as_str()),
                 root_session_id: Some(if session.root_session_id.trim().is_empty() {
                     session.id.as_str()
@@ -286,7 +302,7 @@ impl Agent {
                     )
                 }
             };
-            let reparked = repark_permission_replay(session, &target, &result)?;
+            let reparked = repark_permission_replay(session, &target, &result, &replay_owner)?;
             if reparked.is_none()
                 && !apply_permission_replay_result(
                     session,
