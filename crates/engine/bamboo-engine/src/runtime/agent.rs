@@ -37,6 +37,16 @@ pub struct DirectExecutionLease {
     registration: Option<crate::session_activation::SessionRunRegistration>,
 }
 
+impl DirectExecutionLease {
+    /// Release ownership before returning a handled pre-execution stop to an
+    /// SDK caller, so its next resume does not race the asynchronous Drop path.
+    pub async fn abandon(mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.abandon().await;
+        }
+    }
+}
+
 impl Agent {
     /// Wrap an existing [`AgentRuntime`] in an `Agent`.
     pub fn from_runtime(runtime: Arc<AgentRuntime>) -> Self {
