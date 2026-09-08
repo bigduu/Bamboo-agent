@@ -5,7 +5,7 @@ use super::root_lifetime::RootPublicationFault;
 use super::*;
 use bamboo_domain::{
     SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
-    DEFAULT_SUPERVISOR_SESSION_ID,
+    SupervisorManagementState, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
 fn invalid(message: &str) -> io::Error {
@@ -31,6 +31,51 @@ pub(super) fn validate_identity(session: &Session) -> io::Result<()> {
             return Err(invalid("invalid Supervisor identity or Root lineage"));
         }
     }
+    validate_management(
+        &session.authority_identity,
+        session.supervisor_management.as_ref(),
+    )?;
+    Ok(())
+}
+
+fn validate_management(
+    identity: &SessionAuthorityIdentity,
+    state: Option<&SupervisorManagementState>,
+) -> io::Result<()> {
+    if let Some(state) = state {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = identity else {
+            return Err(invalid(
+                "Ordinary Sessions cannot hold Supervisor management state",
+            ));
+        };
+        state.validate(*incarnation_id).map_err(invalid)?;
+    }
+    Ok(())
+}
+
+fn validate_management_overlay(
+    main: Option<&SupervisorManagementState>,
+    side: Option<&SupervisorManagementState>,
+) -> io::Result<()> {
+    if let Some(main) = main {
+        let side = side.ok_or_else(|| invalid("runtime lost Supervisor management state"))?;
+        if side.revision < main.revision || (side.revision == main.revision && side != main) {
+            return Err(invalid(
+                "Supervisor management overlay regressed or diverged",
+            ));
+        }
+        for (id, previous) in &main.links {
+            let current = side
+                .links
+                .get(id)
+                .ok_or_else(|| invalid("runtime lost a Supervisor link tombstone"))?;
+            if current.revision < previous.revision
+                || (current.revision == previous.revision && current != previous)
+            {
+                return Err(invalid("Supervisor link overlay regressed or diverged"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -53,6 +98,10 @@ pub(super) fn validate_overlay(main: &Session, side: Option<&Session>) -> io::Re
                 "runtime authority does not match the published Session",
             ));
         }
+        validate_management_overlay(
+            main.supervisor_management.as_ref(),
+            side.supervisor_management.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -96,6 +145,8 @@ struct MainIdentity {
     spawn_depth: u32,
     #[serde(default)]
     authority_identity: SessionAuthorityIdentity,
+    #[serde(default)]
+    supervisor_management: Option<SupervisorManagementState>,
 }
 
 impl SessionStoreV2 {
@@ -123,6 +174,14 @@ impl SessionStoreV2 {
             serde_json::from_slice(&read_regular(&directory.join(RUNTIME_SIDECAR_FILE)).await?)
                 .map_err(|_| invalid("invalid canonical runtime.json"))?;
         validate_identity(&side)?;
+        validate_management(
+            &main.authority_identity,
+            main.supervisor_management.as_ref(),
+        )?;
+        validate_management_overlay(
+            main.supervisor_management.as_ref(),
+            side.supervisor_management.as_ref(),
+        )?;
         let ordinary_legacy_root =
             matches!(main.authority_identity, SessionAuthorityIdentity::Ordinary)
                 && main.root_session_id.is_empty();

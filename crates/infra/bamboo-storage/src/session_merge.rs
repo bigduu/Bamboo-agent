@@ -1442,6 +1442,16 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
     if session.authority_identity.is_ordinary() && session.created_at == latest.created_at {
         session.authority_identity = latest.authority_identity.clone();
     }
+    // Relationships are a separate monotonic authority, independent of UI
+    // metadata. Adopt the canonical state into the actual caller snapshot only
+    // for the same Root lifetime/incarnation; never rebind stale identities.
+    if session.kind == bamboo_domain::SessionKind::Root
+        && latest.kind == bamboo_domain::SessionKind::Root
+        && session.created_at == latest.created_at
+        && session.authority_identity == latest.authority_identity
+    {
+        session.supervisor_management = latest.supervisor_management.clone();
+    }
     // Project and its revision are one fence. Never stamp a newer disk revision
     // onto the caller's old Project; that would manufacture a fresh-looking
     // stale assignment. Equal-revision runtime workspace refreshes within the
@@ -1954,6 +1964,181 @@ mod tests {
             self.inner
                 .save_task_control_plane_if_matches(original, updated)
                 .await
+        }
+
+        async fn save_task_control_planes_atomically(
+            &self,
+            first_original: &Session,
+            first_updated: &Session,
+            second_original: &Session,
+            second_updated: &Session,
+        ) -> std::io::Result<bool> {
+            self.commit_reached.wait().await;
+            self.release_commit.wait().await;
+            self.inner
+                .save_task_control_planes_atomically(
+                    first_original,
+                    first_updated,
+                    second_original,
+                    second_updated,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds(
+    ) {
+        use bamboo_domain::{
+            SupervisorManagementMutation, SupervisorManagementRequest, SupervisorReference,
+        };
+
+        for mode in 0..4 {
+            let home = tempfile::tempdir().unwrap();
+            let inner = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let receipt = inner
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let reference = SupervisorReference::from(&receipt);
+            let mut root = inner
+                .load_session(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let list = bamboo_domain::TaskList {
+                session_id: root.id.clone(),
+                title: "original".into(),
+                items: vec![],
+                created_at: root.created_at,
+                updated_at: root.created_at,
+            };
+            let updated = bamboo_domain::TaskList {
+                title: "updated".into(),
+                ..list.clone()
+            };
+            root.task_list = Some(list.clone());
+            root.set_task_list_version_meta("1");
+            inner.save_session(&root).await.unwrap();
+            let child_id = if mode == 2 { "aaa-child" } else { "zzz-child" };
+            let mut child = Session::new_child_of(child_id, &root, "model", "child");
+            child.task_list = Some(list.clone());
+            child.set_task_list_version_meta("1");
+            inner.save_session(&child).await.unwrap();
+            let independent = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let commit_reached = Arc::new(tokio::sync::Barrier::new(2));
+            let release_commit = Arc::new(tokio::sync::Barrier::new(2));
+            let paused = LockedSessionStore::new(Arc::new(SingleCommitPauseStorage {
+                inner: inner.clone(),
+                commit_reached: commit_reached.clone(),
+                release_commit: release_commit.clone(),
+            }));
+            let published = AtomicBool::new(false);
+            let loser = async {
+                if mode == 0 {
+                    paused
+                        .update_task_list_control_plane_and_publish(&root.id, &updated, "2", |_| {
+                            published.store(true, Ordering::SeqCst)
+                        })
+                        .await
+                } else if mode == 1 {
+                    paused
+                        .update_task_list_control_plane_if_version_and_publish(
+                            &root.id,
+                            "1",
+                            &list,
+                            &updated,
+                            "2",
+                            |_| published.store(true, Ordering::SeqCst),
+                        )
+                        .await
+                } else {
+                    paused
+                        .update_task_list_control_planes_if_version_and_publish(
+                            child_id,
+                            &root.id,
+                            "1",
+                            &list,
+                            &updated,
+                            "2",
+                            |_, _| published.store(true, Ordering::SeqCst),
+                        )
+                        .await
+                }
+            };
+            let winner = async {
+                commit_reached.wait().await;
+                independent
+                    .mutate_supervisor_management(&SupervisorManagementRequest {
+                        supervisor: reference.clone(),
+                        expected_state_revision: 0,
+                        mutation: SupervisorManagementMutation::ConfigureProjectScope {
+                            allowed_projects: ["project-a".parse().unwrap()].into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                release_commit.wait().await;
+            };
+            let (result, ()) = tokio::join!(loser, winner);
+            if mode == 0 {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert!(!published.load(Ordering::SeqCst));
+            for id in [&root.id, &child.id] {
+                assert_eq!(
+                    inner
+                        .load_runtime_control_plane(id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task_list_version_meta()
+                        .as_deref(),
+                    Some("1")
+                );
+            }
+            let fresh = LockedSessionStore::new(inner.clone());
+            let check = |saved: &Session| {
+                assert_eq!(saved.supervisor_management.as_ref().unwrap().revision, 1);
+                published.store(true, Ordering::SeqCst);
+            };
+            let retried = if mode == 0 {
+                fresh
+                    .update_task_list_control_plane_and_publish(&root.id, &updated, "2", check)
+                    .await
+            } else if mode == 1 {
+                fresh
+                    .update_task_list_control_plane_if_version_and_publish(
+                        &root.id, "1", &list, &updated, "2", check,
+                    )
+                    .await
+            } else {
+                fresh
+                    .update_task_list_control_planes_if_version_and_publish(
+                        child_id,
+                        &root.id,
+                        "1",
+                        &list,
+                        &updated,
+                        "2",
+                        |_, shared| check(shared),
+                    )
+                    .await
+            };
+            assert!(retried.unwrap());
+            assert!(published.load(Ordering::SeqCst));
+            assert_eq!(
+                inner
+                    .load_runtime_control_plane(&root.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .task_list_version_meta()
+                    .as_deref(),
+                Some("2")
+            );
         }
     }
 

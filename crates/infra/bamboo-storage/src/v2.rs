@@ -50,6 +50,9 @@ mod root_lifetime;
 #[cfg(test)]
 mod root_lifetime_tests;
 mod supervisor;
+mod supervisor_management;
+#[cfg(test)]
+mod supervisor_management_tests;
 #[cfg(test)]
 mod supervisor_tests;
 
@@ -1102,6 +1105,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
+    copy.supervisor_management = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -3400,6 +3404,7 @@ impl SessionStoreV2 {
         };
         self.validate_root_context_for_save(&current).await?;
         if current.authority_identity != original.authority_identity
+            || current.supervisor_management != original.supervisor_management
             || !Self::runtime_task_owned_snapshot_matches(&current, original)?
         {
             return Ok(false);
@@ -3493,6 +3498,8 @@ impl SessionStoreV2 {
         self.validate_root_context_for_save(&current_second).await?;
         if current_first.authority_identity != first_original.authority_identity
             || current_second.authority_identity != second_original.authority_identity
+            || current_first.supervisor_management != first_original.supervisor_management
+            || current_second.supervisor_management != second_original.supervisor_management
             || !Self::runtime_task_owned_snapshot_matches(&current_first, first_original)?
             || !Self::runtime_task_owned_snapshot_matches(&current_second, second_original)?
         {
@@ -4978,6 +4985,28 @@ impl Storage for SessionStoreV2 {
         let _task = self.lock_runtime_task_sidecar_shared().await?;
         let _session = self.acquire_session_maintenance_lock(session_id).await?;
         self.load_root_authority_unchecked(session_id).await
+    }
+
+    async fn inspect_supervisor_scope(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorScopeObservation> {
+        self.management_scope(supervisor).await
+    }
+
+    async fn mutate_supervisor_management(
+        &self,
+        request: &bamboo_domain::SupervisorManagementRequest,
+    ) -> io::Result<bamboo_domain::SupervisorManagementReceipt> {
+        self.management_mutate(request).await
+    }
+
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
+        self.management_link(supervisor, target_session_id).await
     }
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {

@@ -72,6 +72,7 @@ impl SessionStoreV2 {
         full: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
+        supervisor::validate_identity(incoming).map_err(|error| conflict(error.to_string()))?;
         self.validate_root_lifetime_for_write(incoming).await?;
         let directory = self.sessions_dir.join(&incoming.id);
         match fs::symlink_metadata(&directory).await {
@@ -110,6 +111,12 @@ impl SessionStoreV2 {
             .map_err(|error| conflict(error.to_string()))?;
         let current: Session = serde_json::from_slice(&bytes)
             .map_err(|error| conflict(format!("invalid canonical runtime: {error}")))?;
+        supervisor::validate_identity(&current).map_err(|error| conflict(error.to_string()))?;
+        if current.supervisor_management != incoming.supervisor_management {
+            return Err(conflict(
+                "Supervisor management changed; reload before saving",
+            ));
+        }
         if current.id != incoming.id
             || current.kind != SessionKind::Root
             || current.parent_session_id.is_some()

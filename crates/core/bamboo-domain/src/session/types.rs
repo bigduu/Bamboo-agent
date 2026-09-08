@@ -3,6 +3,7 @@ use crate::reasoning::ReasoningEffort;
 use crate::session::authority::SessionAuthorityIdentity;
 use crate::session::budget_types::{TokenBudget, TokenBudgetUsage};
 use crate::session::message_part::{ImageUrlRef, MessagePart};
+use crate::session::supervisor_management::SupervisorManagementState;
 use crate::session::task::{TaskItemStatus, TaskList};
 use crate::session::tool_types::ToolCall;
 use crate::tool_types::ToolResultImage;
@@ -657,6 +658,9 @@ pub struct Session {
     /// Trusted identity; raw metadata and ordinary persistence cannot assign it.
     #[serde(default, skip_serializing_if = "SessionAuthorityIdentity::is_ordinary")]
     pub authority_identity: SessionAuthorityIdentity,
+    /// Trusted host-managed scope and links; ordinary constructors never inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_management: Option<SupervisorManagementState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     #[serde(default)]
@@ -792,6 +796,7 @@ impl Session {
             metadata_version: 0,
             kind: SessionKind::Root,
             authority_identity: SessionAuthorityIdentity::Ordinary,
+            supervisor_management: None,
             parent_session_id: None,
             root_session_id: id,
             spawn_depth: 0,
@@ -879,6 +884,7 @@ impl Session {
             metadata_version: 0,
             kind: SessionKind::Child,
             authority_identity: SessionAuthorityIdentity::Ordinary,
+            supervisor_management: None,
             parent_session_id: Some(parent_session_id),
             root_session_id,
             spawn_depth,

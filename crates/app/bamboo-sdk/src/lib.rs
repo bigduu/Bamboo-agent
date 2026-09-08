@@ -32,7 +32,11 @@ pub use agent::{
 pub use agent::{FileSessionInbox, SessionIndexEntry};
 pub use agent::{
     SessionAuthorityConflict, SessionAuthorityIdentity, SupervisorBootstrapReceipt,
-    SupervisorSessionService, DEFAULT_SUPERVISOR_SESSION_ID,
+    SupervisorLinkObservation, SupervisorManagedLink, SupervisorManagementMutation,
+    SupervisorManagementReceipt, SupervisorManagementRequest, SupervisorManagementState,
+    SupervisorReference, SupervisorScopeObservation, SupervisorSessionService,
+    DEFAULT_SUPERVISOR_SESSION_ID, MAX_SUPERVISOR_LINKS, MAX_SUPERVISOR_PROJECTS,
+    MAX_SUPERVISOR_SESSION_ID_BYTES, SUPERVISOR_MANAGEMENT_SCHEMA_VERSION,
 };
 
 // Tool catalog surfaced by `agent::mod`.

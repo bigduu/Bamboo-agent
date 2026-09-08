@@ -63,4 +63,56 @@ async fn supervisor_facade_reuses_identity_without_replacing_model_or_history() 
     let value = serde_json::to_value(&again).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 3);
     assert!(value.get("messages").is_none());
+
+    let supervisor = bamboo_sdk::SupervisorReference::from(&first);
+    assert_eq!(
+        service
+            .inspect_scope(&supervisor)
+            .await
+            .unwrap()
+            .state_revision,
+        0
+    );
+    let mut target = bamboo_sdk::agent::Session::new("sdk-managed-root", "target-model");
+    target.set_project_id_meta("sdk-project");
+    target.add_message(bamboo_sdk::agent::Message::user(
+        "independent target history",
+    ));
+    agent.storage().save_session(&target).await.unwrap();
+    assert!(service.attach(&supervisor, 0, &target.id).await.is_err());
+    let configured: bamboo_sdk::SupervisorManagementReceipt = service
+        .configure_project_scope(&supervisor, 0, ["sdk-project".parse().unwrap()].into())
+        .await
+        .unwrap();
+    let attached = service
+        .attach(&supervisor, configured.state_revision, &target.id)
+        .await
+        .unwrap();
+    let observed: bamboo_sdk::agent::SupervisorLinkObservation =
+        service.inspect_link(&supervisor, &target.id).await.unwrap();
+    assert!(observed.authorized);
+    let receipt_json = serde_json::to_value(&attached).unwrap();
+    assert!(receipt_json.get("messages").is_none());
+    assert!(receipt_json.get("session").is_none());
+    service
+        .detach(&supervisor, attached.state_revision, &target.id)
+        .await
+        .unwrap();
+    assert!(
+        !service
+            .inspect_link(&supervisor, &target.id)
+            .await
+            .unwrap()
+            .authorized
+    );
+    let unchanged = agent
+        .storage()
+        .load_session(&target.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&unchanged).unwrap(),
+        serde_json::to_value(&target).unwrap()
+    );
 }
