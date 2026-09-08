@@ -172,6 +172,7 @@ mod tests {
 
     fn ctx(session_id: &str) -> ToolCtx {
         ToolCtx {
+            executing_supervisor: None,
             session_id: Some(std::sync::Arc::from(session_id)),
             tool_call_id: std::sync::Arc::from("call_1"),
             event_tx: None,

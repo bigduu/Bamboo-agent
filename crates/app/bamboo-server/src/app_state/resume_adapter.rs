@@ -373,6 +373,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             executor.execute_with_context(
                                     &tool_call,
                                 bamboo_agent_core::tools::ToolExecutionContext {
+                                    executing_supervisor: None,
                                     session_id: Some(session.id.as_str()),
                                     root_session_id: Some(
                                         if session.root_session_id.trim().is_empty() {

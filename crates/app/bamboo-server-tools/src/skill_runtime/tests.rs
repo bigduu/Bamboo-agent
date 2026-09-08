@@ -595,6 +595,7 @@ Use the dynamic context."#,
     .with_test_context_tools(provider.clone());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "dynamic-load",
@@ -676,6 +677,7 @@ Use the dynamic context."#,
     .with_fail_closed_context_registry(provider.clone());
     let calls_before = provider.calls.load(Ordering::SeqCst);
     let production_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(production_session_id),
         root_session_id: None,
         tool_call_id: "production-authority-load",
@@ -749,6 +751,7 @@ Use the dynamic context."#,
     let typed_tool = LoadSkillTool::new(manager, runtime_config, repo.clone())
         .with_permission_checked_context_registry(context_tools, Some(permission_config.clone()));
     let typed_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(typed_session_id),
         root_session_id: None,
         tool_call_id: "typed-authority-load",
@@ -864,6 +867,7 @@ Plan must block this provider before dispatch."#,
         .with_test_context_tools(provider.clone());
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "dynamic-approval-load",
@@ -903,6 +907,7 @@ Plan must block this provider before dispatch."#,
         .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
 
     let plan_read_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "dynamic-plan-read-load",
@@ -934,6 +939,7 @@ Plan must block this provider before dispatch."#,
     assert!(event_rx.try_recv().is_err());
 
     let invalid_write_context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "dynamic-invalid-write-load",
@@ -1140,6 +1146,7 @@ Use this demo skill."#,
         bamboo_engine::SessionRepository::new(sessions, storage, persistence),
     );
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-1",
@@ -1200,6 +1207,7 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
         .expect("publish automatic runtime selection");
     let tool = LoadSkillTool::new(skill_manager, config, repo.clone());
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-runtime-allowlist",
@@ -1312,6 +1320,7 @@ async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_c
         repo.clone(),
     );
     let context = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "runtime-pinned-load",
@@ -1432,6 +1441,7 @@ Use this demo skill."#,
         ),
     );
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-2",
@@ -1514,6 +1524,7 @@ Use this demo skill."#,
     let read_tool = ReadSkillResourceTool::new(skill_manager, config, session_repo);
 
     let load_ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-load",
@@ -1527,6 +1538,7 @@ Use this demo skill."#,
         pre_parsed_args: None,
     };
     let read_ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-read",
@@ -1795,6 +1807,7 @@ async fn session_workspace_skill_catalog_selection_and_runtime_roots_are_isolate
         ),
     ] {
         let context = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
             root_session_id: None,
             tool_call_id: "workspace-skill-call",

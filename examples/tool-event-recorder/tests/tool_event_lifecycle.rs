@@ -155,6 +155,7 @@ async fn execute_write(state: &AppState, call_id: &str, path: &Path, content: &s
         .execute_with_context(
             &call,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("recorder-session"),
                 root_session_id: Some("recorder-root-session"),
                 tool_call_id: &call.id,

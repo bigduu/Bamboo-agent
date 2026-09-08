@@ -1042,6 +1042,7 @@ mod tests {
         root_session_id: Option<&'a str>,
     ) -> ToolExecutionContext<'a> {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id,
             root_session_id,
             tool_call_id: &call.id,
@@ -1241,6 +1242,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(4);
         let call = make_tool_call("Write", args);
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -1732,6 +1734,7 @@ mod tests {
 
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-bypass"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -1777,6 +1780,7 @@ mod tests {
             json!({"file_path": path_str, "content": "allowed by hook"}),
         );
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-hook-allow"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -1828,6 +1832,7 @@ mod tests {
         });
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-hook-hard-dangerous"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -1877,6 +1882,7 @@ mod tests {
             json!({"file_path": path_str, "content": "must not be written"}),
         );
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-hook-explicit-deny"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -1928,6 +1934,7 @@ mod tests {
 
         let denied_call = make_tool_call("Bash", json!({"command": denied_command}));
         let denied_ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-forced"),
             root_session_id: None,
             tool_call_id: &denied_call.id,
@@ -1963,6 +1970,7 @@ mod tests {
             });
         let approved_call = make_tool_call("Bash", json!({"command": approved_command}));
         let approved_ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-forced"),
             root_session_id: None,
             tool_call_id: &approved_call.id,
@@ -2009,6 +2017,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-auto"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2054,6 +2063,7 @@ mod tests {
         let command = format!("printf blocked > {}", path.display());
         let call = make_tool_call("Bash", json!({"command": command}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("guardian-auto"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2094,6 +2104,7 @@ mod tests {
             json!({"file_path": path_str, "content": "blocked"}),
         );
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-explicit-deny"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2131,6 +2142,7 @@ mod tests {
             .build();
         let call = make_tool_call("Bash", json!({"command": "rm child-to-preserve"}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-explicit-delete-deny"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2161,6 +2173,7 @@ mod tests {
             json!({"file_path": path, "content": "must not run"}),
         );
         let write_ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("plan-auto"),
             root_session_id: None,
             tool_call_id: &write.id,
@@ -2183,6 +2196,7 @@ mod tests {
         tokio::fs::write(&path, "readable").await.unwrap();
         let read = make_tool_call("Read", json!({"file_path": path}));
         let read_ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("plan-auto"),
             root_session_id: None,
             tool_call_id: &read.id,
@@ -2208,6 +2222,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let call = make_tool_call("request_permissions", json!({}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("auto-no-prompt"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2250,6 +2265,7 @@ mod tests {
             json!({"file_path": "/etc/gated.conf", "content": "x"}),
         );
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-interactive"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2327,6 +2343,7 @@ mod tests {
             .execute_with_context(
                 &call,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("proactive-session"),
                     root_session_id: None,
                     tool_call_id: &call.id,
@@ -2367,6 +2384,7 @@ mod tests {
             .execute_with_context(
                 &call,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("proactive-session"),
                     root_session_id: None,
                     tool_call_id: &call.id,
@@ -2399,6 +2417,7 @@ mod tests {
             .execute_with_context(
                 &call,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("proactive-session"),
                     root_session_id: None,
                     tool_call_id: &call.id,
@@ -2560,6 +2579,7 @@ mod tests {
 
         let call = make_tool_call("Write", json!({"file_path": path_str, "content": "ok"}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-worker"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2601,6 +2621,7 @@ mod tests {
 
         let call = make_tool_call("Write", json!({"file_path": path_str, "content": "nope"}));
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-worker"),
             root_session_id: None,
             tool_call_id: &call.id,
@@ -2676,6 +2697,7 @@ mod tests {
             .execute_with_context(
                 &call,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("s1"),
                     root_session_id: None,
                     tool_call_id: &call.id,
@@ -3082,6 +3104,7 @@ mod tests {
         pre_parsed: Option<&'a serde_json::Value>,
     ) -> ToolExecutionContext<'a> {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("s-106"),
             root_session_id: None,
             tool_call_id: call_id,

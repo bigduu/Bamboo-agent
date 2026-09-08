@@ -6,8 +6,9 @@ use tokio::sync::mpsc;
 use crate::composition::CompositionExecutor;
 use crate::tools::executor::execute_tool_call_with_context;
 use crate::tools::{
-    convert_from_standard_result, plan_mode_allows_tool, AgenticToolResult, ToolCall, ToolError,
-    ToolExecutionContext, ToolExecutionSessionFlags, ToolExecutor, ToolResult,
+    convert_from_standard_result, plan_mode_allows_tool, AgenticToolResult,
+    ExecutingSupervisorObservation, ToolCall, ToolError, ToolExecutionContext,
+    ToolExecutionSessionFlags, ToolExecutor, ToolResult,
 };
 use crate::{AgentEvent, Message, PendingQuestionSource, Session};
 
@@ -432,6 +433,10 @@ async fn execute_sub_actions_with_persistence(
     composition_executor: Option<Arc<CompositionExecutor>>,
     clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> ToolHandlingOutcome {
+    // One executing lifetime owns the complete queue, including NeedMoreActions
+    // appended after an awaited tool. Configuration reloads cannot rebind it.
+    let executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(session);
     let mut pending: VecDeque<ToolCall> = actions.iter().cloned().collect();
     let mut processed = 0usize;
     let available_tools = tools.list_tools();
@@ -509,7 +514,8 @@ async fn execute_sub_actions_with_persistence(
             // re-parse leniently exactly as before — behavior preserved
             // (issue #106).
             None,
-        );
+        )
+        .with_executing_supervisor(executing_supervisor);
 
         match execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx)
             .await

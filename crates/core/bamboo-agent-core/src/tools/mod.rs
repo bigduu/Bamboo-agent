@@ -111,7 +111,9 @@ pub use agentic::{
     AgenticToolExecutor, AgenticToolResult, Interaction, InteractionRole, ToolGoal,
 };
 pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
-pub use context::{ToolExecutionContext, ToolExecutionSessionFlags};
+pub use context::{
+    ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
+};
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,

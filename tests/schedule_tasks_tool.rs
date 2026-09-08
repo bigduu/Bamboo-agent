@@ -92,6 +92,7 @@ impl ToolExecutor for NoopTools {
 
 fn ctx_for_session<'a>(session_id: &'a str) -> ToolExecutionContext<'a> {
     ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool_call",

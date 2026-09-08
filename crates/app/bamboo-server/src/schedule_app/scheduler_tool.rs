@@ -664,6 +664,7 @@ mod tests {
 
     fn context(session_id: &str) -> ToolCtx {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
             root_session_id: None,
             tool_call_id: "scheduler-test",
@@ -803,6 +804,7 @@ mod tests {
             .execute_with_context(
                 &interactive_call,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some(&interactive.id),
                     root_session_id: None,
                     tool_call_id: &interactive_call.id,

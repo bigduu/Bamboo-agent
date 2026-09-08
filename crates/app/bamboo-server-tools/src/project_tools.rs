@@ -834,6 +834,7 @@ mod tests {
 
     fn context(session_id: &str, tool: &str) -> ToolCtx {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
             root_session_id: None,
             tool_call_id: tool,

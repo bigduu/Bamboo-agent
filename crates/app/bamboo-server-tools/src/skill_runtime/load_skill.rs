@@ -364,7 +364,10 @@ impl LoadSkillTool {
                 false,
                 None,
                 Some(&provider_input),
-            );
+            )
+            // The repository Session above supplies configuration only. Keep
+            // the incoming lifetime, even if that ID was recreated meanwhile.
+            .with_executing_supervisor(ctx.executing_supervisor_for(&session.id));
             if !plan_allows_dynamic_provider(ctx.plan_read_only, &call.function.name) {
                 blocks.push(bamboo_skills::DynamicContextBlock {
                     provider_id: declaration.id,
