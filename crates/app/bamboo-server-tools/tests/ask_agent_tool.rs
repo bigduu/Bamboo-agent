@@ -18,6 +18,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
     // The in-server tool, as a root session would invoke it.
     let tool = AskAgentTool::new(endpoint, "tok");
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some("root-session"),
         root_session_id: None,
         tool_call_id: "tc1",
@@ -54,6 +55,7 @@ async fn ask_agent_tool_queries_a_broker_agent() {
 async fn ask_agent_tool_rejects_unknown_mode() {
     let tool = AskAgentTool::new("ws://127.0.0.1:1", "tok");
     let ctx = ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some("root-session"),
         root_session_id: None,
         tool_call_id: "tc2",
@@ -125,6 +127,7 @@ async fn concurrent_asks_to_one_worker_are_each_answered_correctly() {
             let sid = format!("root-{i}");
             let tc = format!("tc-{i}");
             let ctx = ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some(&sid),
                 root_session_id: None,
                 tool_call_id: &tc,

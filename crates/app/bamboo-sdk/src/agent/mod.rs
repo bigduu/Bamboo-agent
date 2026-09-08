@@ -591,6 +591,7 @@ impl Agent {
 
         let exec_result = {
             let ctx = bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some(session.id.as_str()),
                 root_session_id: Some(if session.root_session_id.trim().is_empty() {
                     session.id.as_str()

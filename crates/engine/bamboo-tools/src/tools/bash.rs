@@ -734,6 +734,7 @@ mod tests {
                     "command": mixed_output_command()
                 }),
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("session_1"),
                     root_session_id: None,
                     tool_call_id: "call_1",
@@ -1164,6 +1165,7 @@ mod tests {
                     "workdir": "nested"
                 }),
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some(&session_id),
                     root_session_id: None,
                     tool_call_id: "call_1",
@@ -1312,6 +1314,7 @@ mod tests {
         let tool = BashTool::new();
         let (tx, _rx) = mpsc::channel(32);
         let ctx = ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some("session_auto_fast"),
             root_session_id: None,
             tool_call_id: "call_auto_fast",

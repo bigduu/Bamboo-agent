@@ -137,6 +137,7 @@ mod tests {
             .invoke(
                 json!({ "command": "/hello world" }),
                 ToolCtx {
+                    executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from(session.as_str())),
                     tool_call_id: std::sync::Arc::from("call_1"),
                     event_tx: None,

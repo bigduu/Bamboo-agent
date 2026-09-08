@@ -38,6 +38,7 @@ async fn default_app_state_has_no_tool_event_background_work() {
         .execute_with_context(
             &call,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("no-sink-session"),
                 root_session_id: Some("no-sink-root"),
                 tool_call_id: &call.id,

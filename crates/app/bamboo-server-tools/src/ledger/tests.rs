@@ -38,6 +38,7 @@ impl Storage for TestStorage {
 
 fn test_context(session_id: &str) -> ToolCtx {
     ToolExecutionContext {
+        executing_supervisor: None,
         session_id: Some(session_id),
         root_session_id: None,
         tool_call_id: "tool-call-1",

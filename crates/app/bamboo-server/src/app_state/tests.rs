@@ -103,6 +103,7 @@ async fn injected_tool_event_publishers_are_isolated_between_app_states() {
         .execute_with_context(
             &call_a,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("state-a-session"),
                 root_session_id: Some("state-a-root-session"),
                 tool_call_id: &call_a.id,
@@ -130,6 +131,7 @@ async fn injected_tool_event_publishers_are_isolated_between_app_states() {
         .execute_with_context(
             &call_b,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("state-b-session"),
                 root_session_id: Some("state-b-root-session"),
                 tool_call_id: &call_b.id,
@@ -377,6 +379,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &write_target,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-target",
@@ -411,6 +414,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &write_source,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-source",
@@ -444,6 +448,7 @@ async fn memory_tool_merge_action_updates_existing_project_memory() {
         .execute_with_context(
             &merge_call,
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-merge",
@@ -498,6 +503,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-original",
@@ -532,6 +538,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-heuristic-merge",
@@ -562,6 +569,7 @@ async fn memory_tool_write_merges_near_identical_restatement_when_enabled() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-heuristic-merge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-inspect-heuristic-merge",
@@ -609,6 +617,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-target",
@@ -641,6 +650,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-contradict-source",
@@ -674,6 +684,7 @@ async fn memory_tool_merge_mode_contradict_marks_memory_contradicted() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-contradict"),
                 root_session_id: None,
                 tool_call_id: "tool-call-contradict",
@@ -728,6 +739,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-stale",
@@ -759,6 +771,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-mark-stale",
@@ -789,6 +802,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-active",
@@ -822,6 +836,7 @@ async fn memory_tool_batch_purge_archives_filtered_items() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-batch-purge"),
                 root_session_id: None,
                 tool_call_id: "tool-call-batch-purge",
@@ -861,6 +876,7 @@ async fn app_state_session_note_and_prompt_share_the_injected_jiandu_store() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-note-injected-store"),
                 root_session_id: None,
                 tool_call_id: "tool-call-session-note-injected-store",
@@ -916,6 +932,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
                 root_session_id: None,
                 tool_call_id: "tool-call-write-inspect",
@@ -943,6 +960,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
                 root_session_id: None,
                 tool_call_id: "tool-call-inspect",
@@ -980,6 +998,7 @@ async fn memory_tool_inspect_and_rebuild_expose_observability_fields() {
                 }),
             ),
             bamboo_agent_core::tools::ToolExecutionContext {
+                executing_supervisor: None,
                 session_id: Some("session-inspect"),
                 root_session_id: None,
                 tool_call_id: "tool-call-rebuild",

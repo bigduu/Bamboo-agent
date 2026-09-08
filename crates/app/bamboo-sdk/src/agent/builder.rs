@@ -972,6 +972,7 @@ mod tests {
         tool_call_id: &'a str,
     ) -> ToolExecutionContext<'a> {
         ToolExecutionContext {
+            executing_supervisor: None,
             session_id: Some(session_id),
             root_session_id: None,
             tool_call_id,
@@ -1988,6 +1989,7 @@ mod tests {
             .execute_with_context(
                 &call_a,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("sdk-a-session"),
                     root_session_id: Some("sdk-a-root-session"),
                     tool_call_id: &call_a.id,
@@ -2027,6 +2029,7 @@ mod tests {
             .execute_with_context(
                 &call_b,
                 ToolExecutionContext {
+                    executing_supervisor: None,
                     session_id: Some("sdk-b-session"),
                     root_session_id: Some("sdk-b-root-session"),
                     tool_call_id: &call_b.id,

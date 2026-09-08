@@ -7,7 +7,9 @@ use tokio::sync::mpsc;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
-use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
+use bamboo_agent_core::tools::{
+    ExecutingSupervisorObservation, ToolCall, ToolExecutor, ToolSchema,
+};
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, CapabilityLoadingMode, ClassifiedToolSchema,
@@ -56,6 +58,8 @@ mod loop_state;
 mod output_compressor;
 mod per_call;
 mod policy;
+#[cfg(test)]
+mod supervisor_dispatch_tests;
 mod task;
 pub(crate) mod tool_error_collector;
 
@@ -155,6 +159,8 @@ async fn execute_and_apply_single_tool_call(
             config.permission_mode.unwrap_or_default(),
         );
     let root_session_id = session.root_session_id.clone();
+    let executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(session);
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -243,6 +249,7 @@ async fn execute_and_apply_single_tool_call(
                         metrics_collector,
                         session_id,
                         root_session_id: &root_session_id,
+                        executing_supervisor,
                         round_id,
                         round,
                         tools,
@@ -642,6 +649,8 @@ pub(crate) async fn execute_round_tool_calls(
             );
             let root_session_id = session.root_session_id.clone();
             let root_session_id = root_session_id.as_str();
+            let executing_supervisor =
+                ExecutingSupervisorObservation::capture_from_executing_session(session);
             let outcomes = tokio::time::timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
@@ -657,6 +666,7 @@ pub(crate) async fn execute_round_tool_calls(
                                     metrics_collector,
                                     session_id,
                                     root_session_id,
+                                    executing_supervisor,
                                     round_id,
                                     round,
                                     tools,

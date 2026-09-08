@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::{
-    parse_tool_args_best_effort, ToolCall, ToolExecutionContext, ToolExecutionSessionFlags,
-    ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    parse_tool_args_best_effort, ExecutingSupervisorObservation, ToolCall, ToolExecutionContext,
+    ToolExecutionSessionFlags, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
 };
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
@@ -42,6 +42,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     /// Root-session identity snapshotted from the executing Session before any
     /// parallel dispatch borrow begins.
     pub root_session_id: &'a str,
+    /// Original executing lifetime captured before this call is handed off.
+    pub executing_supervisor: Option<ExecutingSupervisorObservation>,
     pub round_id: &'a str,
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
@@ -344,7 +346,8 @@ async fn execute_tool_call_only_with_execution_name(
         // `args` came from `parse_tool_args_best_effort`, the same parser the
         // executor would call, so reuse is byte-for-byte equivalent.
         Some(&args),
-    );
+    )
+    .with_executing_supervisor(ctx.executing_supervisor);
 
     // Outcome-aware dispatch. Extract a NeedsHuman pending question (handled in
     // apply before the success path) and collapse the rest to a ToolResult so the
@@ -1114,6 +1117,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call,
                 event_tx,
                 metrics_collector: None,
@@ -1199,6 +1203,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call: &unloaded_call,
                 event_tx: &event_tx,
                 metrics_collector: None,
@@ -1467,6 +1472,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
@@ -1526,6 +1532,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
@@ -1604,6 +1611,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,
@@ -1658,6 +1666,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
                 metrics_collector: None,
@@ -1789,6 +1798,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
                 metrics_collector: None,
@@ -1847,6 +1857,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
             metrics_collector: None,

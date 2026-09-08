@@ -172,6 +172,7 @@ pub async fn execute_tool(
         .execute_with_context(
             &call,
             ToolExecutionContext {
+                executing_supervisor: None,
                 session_id,
                 root_session_id: persisted_session.as_ref().map(|session| {
                     if session.root_session_id.trim().is_empty() {

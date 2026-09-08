@@ -296,6 +296,7 @@ mod tests {
             .unwrap();
         let file_path = file.path().to_string_lossy().to_string();
         let make_ctx = || ToolCtx {
+            executing_supervisor: None,
             session_id: Some(std::sync::Arc::from("session_binary_read")),
             tool_call_id: std::sync::Arc::from("call_1"),
             event_tx: None,

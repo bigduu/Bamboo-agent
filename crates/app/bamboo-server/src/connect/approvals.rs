@@ -796,6 +796,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                             executor.execute_with_context(
                                 &tool_call,
                                 ToolExecutionContext {
+                                    executing_supervisor: None,
                                     session_id: Some(session.id.as_str()),
                                     root_session_id: Some(
                                         if session.root_session_id.trim().is_empty() {
