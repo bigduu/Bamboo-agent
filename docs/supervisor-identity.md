@@ -26,6 +26,9 @@ The receipt contains only `session_id`, `incarnation_id` and `created`. Keep the
 incarnation with the ID: explicitly deleting and recreating the default Root
 produces a new incarnation. A receipt is an observation, not a transferable
 grant to inspect or control another Session.
+Root deletion also retains [canonical lifetime revocation evidence](root-session-lifetimes.md),
+so ordinary full/runtime snapshots cannot restore a deleted Root while its ID
+is absent. Trusted Supervisor bootstrap publishes a fresh birth after deletion.
 
 `Session.authority_identity` is a typed `Ordinary` or
 `Supervisor { incarnation_id }` value, separate from Root/Child kind and raw

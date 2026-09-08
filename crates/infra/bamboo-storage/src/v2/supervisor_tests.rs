@@ -549,8 +549,8 @@ async fn legacy_sidecar_migration_cannot_recreate_missing_supervisor_authority()
 #[tokio::test]
 async fn bootstrap_failure_before_publish_leaves_no_final_identity_and_can_retry() {
     let (store, _home) = fixture().await;
-    *store.supervisor_bootstrap_fault.lock().unwrap() =
-        Some(supervisor::SupervisorBootstrapFault::BeforePublish);
+    *store.root_publication_fault.lock().unwrap() =
+        Some(root_lifetime::RootPublicationFault::BeforePublish);
     assert!(store
         .get_or_create_default_supervisor("model")
         .await
@@ -571,8 +571,8 @@ async fn bootstrap_failure_before_publish_leaves_no_final_identity_and_can_retry
 #[tokio::test]
 async fn bootstrap_failure_before_index_keeps_complete_identity_and_retry_repairs_index() {
     let (store, home) = fixture().await;
-    *store.supervisor_bootstrap_fault.lock().unwrap() =
-        Some(supervisor::SupervisorBootstrapFault::BeforeIndex);
+    *store.root_publication_fault.lock().unwrap() =
+        Some(root_lifetime::RootPublicationFault::BeforeIndex);
     assert!(store
         .get_or_create_default_supervisor("first-model")
         .await

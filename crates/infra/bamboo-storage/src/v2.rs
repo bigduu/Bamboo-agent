@@ -46,6 +46,9 @@ use bamboo_domain::{
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
+mod root_lifetime;
+#[cfg(test)]
+mod root_lifetime_tests;
 mod supervisor;
 #[cfg(test)]
 mod supervisor_tests;
@@ -1043,7 +1046,7 @@ pub struct SessionStoreV2 {
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
     #[cfg(test)]
-    supervisor_bootstrap_fault: std::sync::Mutex<Option<supervisor::SupervisorBootstrapFault>>,
+    root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
@@ -1340,7 +1343,7 @@ impl SessionStoreV2 {
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
-            supervisor_bootstrap_fault: std::sync::Mutex::new(None),
+            root_publication_fault: std::sync::Mutex::new(None),
         };
 
         // Create and permission the private journal directory once at store
@@ -1362,10 +1365,24 @@ impl SessionStoreV2 {
             storage
                 .recover_all_session_copy_transactions_locked()
                 .await?;
+            storage.reconcile_root_revocations().await?;
         }
 
         if needs_rebuild {
             storage.rebuild_index_from_disk().await?;
+            // Compatibility rebuild reads can recover children or a main-file
+            // fallback from an unavailable recreated Root. Reconcile the same
+            // canonical revocation evidence after the scan as well, without
+            // introducing another durable quarantine or recovery state.
+            let _lifecycle = storage.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = storage.lock_runtime_task_transaction_exclusive().await?;
+            storage
+                .recover_all_runtime_task_transactions_locked()
+                .await?;
+            storage
+                .recover_all_session_copy_transactions_locked()
+                .await?;
+            storage.reconcile_root_revocations().await?;
         }
 
         Ok(storage)
@@ -1537,7 +1554,7 @@ impl SessionStoreV2 {
     ) -> io::Result<bool> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
-        let Some(session) = Self::load_session_from_dir(abs_dir, session_id).await else {
+        let Some(session) = self.load_session_from_dir(abs_dir, session_id).await else {
             return Ok(false);
         };
         self.repair_index_from_authoritative_session(&session, rel_path)
@@ -1554,7 +1571,7 @@ impl SessionStoreV2 {
     /// missing `session.json` yields `None` silently; a corrupt/unreadable one is
     /// skipped with a warning; a sidecar read error degrades to "no sidecar"
     /// rather than failing recovery. `id` is used only for log context.
-    async fn load_session_from_dir(abs_dir: &Path, id: &str) -> Option<Session> {
+    async fn load_session_from_dir(&self, abs_dir: &Path, id: &str) -> Option<Session> {
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
@@ -1570,6 +1587,14 @@ impl SessionStoreV2 {
                 return None;
             }
         };
+        match self.session_lifetime_is_live(&main).await {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                tracing::warn!("index rebuild: skipping unavailable Root lifetime {id}: {error}");
+                return None;
+            }
+        }
         let sidecar =
             match Self::read_runtime_sidecar_at(&abs_dir.join(RUNTIME_SIDECAR_FILE), id).await {
                 Ok(sidecar) => sidecar,
@@ -1591,6 +1616,7 @@ impl SessionStoreV2 {
     /// a missing source from corrupt/unreadable authoritative state and must
     /// never silently fall back to stale `session.json` control-plane data.
     async fn load_session_from_dir_strict(
+        &self,
         abs_dir: &Path,
         id: &str,
         expected_kind: SessionKind,
@@ -1625,6 +1651,9 @@ impl SessionStoreV2 {
         // normalize it before comparing/overlaying the runtime sidecar.
         if canonical_legacy_root {
             main.root_session_id = id.to_string();
+        }
+        if !self.session_lifetime_is_live(&main).await? {
+            return Ok(None);
         }
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let sidecar = match fs::read_to_string(&runtime_path).await {
@@ -2147,6 +2176,9 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
     ) -> io::Result<Option<Session>> {
+        if self.root_directory_is_revoked(session_id).await? {
+            return Ok(None);
+        }
         let abs_dir = self.sessions_dir.join(session_id);
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
@@ -2420,7 +2452,7 @@ impl SessionStoreV2 {
             // Only canonical Root absence permits its normal control-plane read.
         }
         if let Some(side) = self.read_runtime_sidecar(session_id).await? {
-            return Ok(Some(side));
+            return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
             return Ok(None);
@@ -2433,6 +2465,9 @@ impl SessionStoreV2 {
         let mut session: Session = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
+        if !self.session_lifetime_is_live(&session).await? {
+            return Ok(None);
+        }
         session.messages.clear();
         session.clear_stale_root_token_budget();
         Ok(Some(session))
@@ -3193,19 +3228,20 @@ impl SessionStoreV2 {
         })?;
         if state == SessionCopyJournalMarkerState::Committed {
             let target_dir = self.sessions_dir.join(&journal.target_id);
-            let target = Self::load_session_from_dir_strict(
-                &target_dir,
-                &journal.target_id,
-                SessionKind::Root,
-                &journal.target_id,
-            )
-            .await?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "committed copied session target is missing",
+            let target = self
+                .load_session_from_dir_strict(
+                    &target_dir,
+                    &journal.target_id,
+                    SessionKind::Root,
+                    &journal.target_id,
                 )
-            })?;
+                .await?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "committed copied session target is missing",
+                    )
+                })?;
             if target.kind != SessionKind::Root || target.root_session_id != target.id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -4146,21 +4182,28 @@ impl SessionStoreV2 {
                 "copied session id already exists",
             ));
         }
+        if self.root_revocation(new_id).await?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "copied session ID was deleted; use a new ID or trusted Root recreation",
+            ));
+        }
 
         let source_dir = self.abs_path_from_rel(&source_rel);
-        let source = Self::load_session_from_dir_strict(
-            &source_dir,
-            source_id,
-            expected_source_kind,
-            &expected_source_root,
-        )
-        .await?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "indexed source session.json is missing",
+        let source = self
+            .load_session_from_dir_strict(
+                &source_dir,
+                source_id,
+                expected_source_kind,
+                &expected_source_root,
             )
-        })?;
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "indexed source session.json is missing",
+                )
+            })?;
         let target_rel = Self::root_rel_path(new_id);
         let target_dir = self.abs_path_from_rel(&target_rel);
         if fs::try_exists(&target_dir).await? {
@@ -4365,13 +4408,9 @@ impl SessionStoreV2 {
         };
         let rel_path = entry.rel_path.clone();
         let abs_dir = self.abs_path_from_rel(&rel_path);
-        let Some(mut session) = Self::load_session_from_dir_strict(
-            &abs_dir,
-            session_id,
-            entry.kind,
-            &entry.root_session_id,
-        )
-        .await?
+        let Some(mut session) = self
+            .load_session_from_dir_strict(&abs_dir, session_id, entry.kind, &entry.root_session_id)
+            .await?
         else {
             return Ok(false);
         };
@@ -4530,9 +4569,12 @@ impl SessionStoreV2 {
 
     /// Development-only: hard reset all sessions and the index.
     ///
-    /// This is the supported "greenfield" mechanism. It deletes:
+    /// This is the supported "greenfield" history/index mechanism. It deletes:
     /// - `bamboo_home_dir/sessions/`
     /// - `bamboo_home_dir/sessions.json` (rewritten to empty index)
+    ///
+    /// Root revocations remain canonical so surviving processes cannot restore
+    /// their deleted snapshots after this reset.
     pub async fn dev_reset(&self) -> io::Result<()> {
         let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
@@ -4554,9 +4596,24 @@ impl SessionStoreV2 {
             })
             .collect::<Vec<_>>();
 
-        // Remove the sessions directory entirely.
-        let _ = fs::remove_dir_all(&self.sessions_dir).await;
+        // Revoke canonical Roots before removing the tree, including Roots
+        // omitted by this process's stale index. Preserve the revocations
+        // outside sessions/: stale writers may survive this development reset.
+        let mut roots = fs::read_dir(&self.sessions_dir).await?;
+        while let Some(root) = roots.next_entry().await? {
+            if root.file_type().await?.is_dir() {
+                if let Some(id) = root.file_name().to_str() {
+                    self.revoke_root_lifetime(id).await?;
+                }
+            }
+        }
+        match fs::remove_dir_all(&self.sessions_dir).await {
+            Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::create_dir_all(&self.sessions_dir).await?;
+        sync_parent_directory_entry(&self.sessions_dir).await?;
 
         // Reset through the same cross-process rebase/publish boundary as every
         // other index mutation; dev reset must not race a stale direct writer.
@@ -4594,7 +4651,65 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
+        validate_session_id(session_id)?;
         let entry = self.get_index_entry(session_id).await;
+        let root_birth = self.canonical_root_birth(session_id).await?;
+        let revoked_directory = root_birth.is_none()
+            && self.root_revocation(session_id).await?.is_some()
+            && fs::try_exists(self.sessions_dir.join(session_id)).await?;
+        if root_birth.is_some()
+            || revoked_directory
+            || entry
+                .as_ref()
+                .is_some_and(|entry| entry.kind == SessionKind::Root)
+        {
+            if !force
+                && (entry.as_ref().is_some_and(|entry| entry.pinned)
+                    || self
+                        .load_authoritative_root_session(session_id)
+                        .await?
+                        .is_some_and(|root| root.pinned))
+            {
+                return Err(other_io_error(
+                    "refusing to delete pinned session without force",
+                ));
+            }
+            if !self.revoke_root_lifetime(session_id).await? {
+                return Err(other_io_error(
+                    "cannot revoke Root without canonical birth evidence",
+                ));
+            }
+            let directory = self.sessions_dir.join(session_id);
+            match fs::remove_dir_all(&directory).await {
+                Ok(()) => sync_parent_directory_entry(&directory).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let removed = self
+                .update_index(|index| {
+                    let removed = index
+                        .sessions
+                        .values()
+                        .filter(|entry| {
+                            entry.id == session_id || entry.root_session_id == session_id
+                        })
+                        .map(|entry| (entry.id.clone(), entry.rel_path.clone()))
+                        .collect::<Vec<_>>();
+                    for (id, _) in &removed {
+                        index.sessions.remove(id);
+                    }
+                    Ok(removed)
+                })
+                .await?;
+            for (id, rel) in removed {
+                self.search_index_queue.enqueue_delete(
+                    &id,
+                    self.abs_path_from_rel(&rel)
+                        .join(SEARCH_INDEX_REVISION_FILE),
+                );
+            }
+            return Ok(true);
+        }
         let Some(entry) = entry else {
             return Ok(false);
         };
@@ -4618,40 +4733,7 @@ impl SessionStoreV2 {
                     .enqueue_delete(session_id, abs_dir.join(SEARCH_INDEX_REVISION_FILE));
                 Ok(true)
             }
-            SessionKind::Root => {
-                let root_id = entry.id.clone();
-                let abs_dir = self.abs_path_from_rel(&entry.rel_path);
-                let _ = fs::remove_dir_all(&abs_dir).await;
-
-                let to_remove = {
-                    let index = self.index.read().await;
-                    index
-                        .sessions
-                        .values()
-                        .filter(|e| e.root_session_id == root_id)
-                        .map(|entry| {
-                            (
-                                entry.id.clone(),
-                                self.abs_path_from_rel(&entry.rel_path)
-                                    .join(SEARCH_INDEX_REVISION_FILE),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                };
-
-                self.update_index(|index| {
-                    for (id, _) in &to_remove {
-                        index.sessions.remove(id);
-                    }
-                    Ok(())
-                })
-                .await?;
-
-                for (id, revision_path) in to_remove {
-                    self.search_index_queue.enqueue_delete(&id, revision_path);
-                }
-                Ok(true)
-            }
+            SessionKind::Root => unreachable!("Root deletion handled from canonical placement"),
         }
     }
 }
@@ -4862,6 +4944,9 @@ impl SessionStoreV2 {
         let raw = fs::read_to_string(path).await?;
         let session: Session = serde_json::from_str(&raw)
             .map_err(|e| other_io_error(format!("invalid session.json: {e}")))?;
+        if !self.session_lifetime_is_live(&session).await? {
+            return Ok(None);
+        }
         let sidecar = self.read_runtime_sidecar(session_id).await?;
         supervisor::validate_overlay(&session, sidecar.as_ref())?;
         let mut session = overlay_runtime_sidecar(session, sidecar);
@@ -4873,6 +4958,14 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn recreate_root_session(
+        &self,
+        session_id: &str,
+        initial_model: &str,
+    ) -> io::Result<Session> {
+        self.recreate_ordinary_root(session_id, initial_model).await
+    }
+
     async fn get_or_create_default_supervisor(
         &self,
         initial_model: &str,
@@ -6840,6 +6933,9 @@ mod tests {
             .iter()
             .all(|entry| entry.session_id != "search-generation"));
 
+        session = storage
+            .recreate_root_session(&session.id, &session.model)
+            .await?;
         session.title = "recreated searchable title".to_string();
         session.updated_at = Utc::now() + chrono::Duration::milliseconds(2);
         storage.save_session(&session).await?;

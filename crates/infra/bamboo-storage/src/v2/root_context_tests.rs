@@ -260,9 +260,12 @@ async fn deleting_and_recreating_a_root_does_not_revalidate_its_old_snapshot() {
         .unwrap()
         .unwrap();
     assert!(fixture.first.delete_session(&initial.id).await.unwrap());
-    let mut replacement = initial.clone();
-    replacement.created_at += chrono::Duration::seconds(1);
-    replacement.model = "replacement-model".into();
+    let mut replacement = fixture
+        .first
+        .recreate_root_session(&initial.id, "replacement-model")
+        .await
+        .unwrap();
+    replacement.agent_runtime_state = initial.agent_runtime_state.clone();
     replacement.messages = vec![Message::user("Replacement history")];
     fixture.first.save_session(&replacement).await.unwrap();
 

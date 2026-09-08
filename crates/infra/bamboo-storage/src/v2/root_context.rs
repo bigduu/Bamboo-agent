@@ -72,6 +72,7 @@ impl SessionStoreV2 {
         full: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
+        self.validate_root_lifetime_for_write(incoming).await?;
         let directory = self.sessions_dir.join(&incoming.id);
         match fs::symlink_metadata(&directory).await {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
