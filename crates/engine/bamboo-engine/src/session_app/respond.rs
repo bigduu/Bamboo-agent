@@ -526,11 +526,11 @@ fn apply_pending_response(
         response_source,
     );
     if let Some(receipt) = permission_receipt {
-        debug_assert!(persist_permission_decision_receipt(
-            session,
-            &tool_call_id,
-            receipt
-        ));
+        if !persist_permission_decision_receipt(session, &tool_call_id, receipt) {
+            return Err(RespondError::InvalidResponse(
+                "permission receipt could not be persisted for the pending operation".to_string(),
+            ));
+        }
     }
     if found {
         tracing::info!(
@@ -1609,5 +1609,360 @@ mod tests {
             Err(RespondError::InvalidResponse(_))
         ));
         assert!(legacy.pending_question.is_some());
+    }
+}
+
+#[cfg(test)]
+mod receipt_persistence_tests {
+    use super::*;
+    use crate::session_app::approval_replay::{
+        find_permission_replay_target, restore_permission_replay_authorization,
+    };
+    use crate::{read_cached_session, SessionCache, SessionRepository};
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+    use bamboo_storage::{LockedSessionStore, SessionStoreV2};
+    use bamboo_tools::permission::{
+        PermissionConfig, PermissionDecision, PermissionMode, PermissionReasonCode,
+        PermissionRequest, RiskLevel,
+    };
+
+    fn pending_permission(
+        session_id: &str,
+    ) -> (Session, PermissionRequest, PermissionDecisionReceipt) {
+        let mut session = Session::new(session_id, "test-model");
+        session.agent_runtime_state = Some(AgentRuntimeState::new("receipt-test-run"));
+        let request = |generation: &str, resource: &str| PermissionRequest {
+            request_id: "permission-reused".into(),
+            request_generation: generation.into(),
+            session_id: session_id.into(),
+            workspace_path: None,
+            tool_name: "Bash".into(),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: resource.into(),
+            operation_summary: format!("execute {resource}"),
+            risk_level: RiskLevel::High,
+            reason_code: PermissionReasonCode::RiskThreshold,
+            effective_mode: PermissionMode::Default,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            policy_revision: 4,
+            matched_rule: None,
+            allowed_decisions: vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce,
+            ],
+            suggested_matchers: vec![],
+        };
+        let current = request("generation-current", "current-command");
+        for (name, request) in [
+            ("old", request("generation-old", "old-command")),
+            ("current", current.clone()),
+        ] {
+            session.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: request.request_id.clone(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: request.tool_name.clone(),
+                        arguments: serde_json::json!({"command": request.resource}).to_string(),
+                    },
+                }]),
+            ));
+            let mut result = Message::tool_result_with_status(
+                &request.request_id,
+                serde_json::json!({
+                    "status": "awaiting_permission_approval",
+                    "permission_type": request.permission_type,
+                    "resource": request.resource,
+                    "permission_request": request,
+                })
+                .to_string(),
+                false,
+            );
+            result.id = format!("result-{name}");
+            session.add_message(result);
+        }
+        session.set_pending_question_with_source(
+            current.request_id.clone(),
+            current.tool_name.clone(),
+            "允许本次操作？".into(),
+            vec!["允许".into(), "拒绝".into()],
+            false,
+            bamboo_agent_core::PendingQuestionSource::PauseTool,
+        );
+        session.metadata.insert(
+            "runtime.suspend_reason".into(),
+            "awaiting_clarification".into(),
+        );
+        let receipt = PermissionDecisionReceipt {
+            session_id: session_id.into(),
+            decision: PermissionDecision {
+                request_id: current.request_id.clone(),
+                request_generation: current.request_generation.clone(),
+                decision: PermissionDecisionKind::AllowOnce,
+                matcher_id: None,
+                expected_policy_revision: Some(current.policy_revision),
+                confirm_global: false,
+            },
+            decided_at: Utc::now(),
+        };
+        (session, current, receipt)
+    }
+
+    async fn repository(
+        session: &mut Session,
+    ) -> (tempfile::TempDir, Arc<SessionStoreV2>, SessionRepository) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let repo = SessionRepository::new(
+            SessionCache::default(),
+            storage.clone(),
+            Arc::new(LockedSessionStore::new(storage)),
+        );
+        repo.save(session).await.unwrap();
+        (directory, store, repo)
+    }
+
+    fn input(session_id: &str) -> RespondInput {
+        RespondInput {
+            session_id: session_id.into(),
+            user_response: "允许".into(),
+            model: None,
+            model_ref: None,
+            provider: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_response_round_trip_restores_only_the_exact_allow_once() {
+        eprintln!("debug_assertions={}", cfg!(debug_assertions));
+        let (mut session, request, receipt) = pending_permission("receipt-round-trip");
+        let (_directory, store, repo) = repository(&mut session).await;
+        let old_occurrence = serde_json::to_value(&session.messages[..2]).unwrap();
+        let guard = acquire_pending_response_guard(&session.id).await;
+        let (accepted, _, _, _) = submit_pending_permission_response_checked_guarded(
+            &repo,
+            input(&session.id),
+            Some(request.request_id.clone()),
+            receipt.clone(),
+            &guard,
+        )
+        .await
+        .expect("public typed response accepts the current occurrence");
+        let durable = store.load_session(&session.id).await.unwrap().unwrap();
+        let restarted: Session =
+            serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+        assert!(accepted.pending_question.is_none() && restarted.pending_question.is_none());
+        assert_eq!(
+            serde_json::to_value(&restarted.messages[..2]).unwrap(),
+            old_occurrence
+        );
+        let message = restarted
+            .messages
+            .iter()
+            .find(|message| message.id == "result-current")
+            .unwrap();
+        assert_eq!(
+            message.tool_call_id.as_deref(),
+            Some(request.request_id.as_str())
+        );
+        assert_eq!(message.content, "Selected response: 允许");
+        assert_eq!(message.tool_success, Some(true));
+        let metadata = message
+            .metadata
+            .as_ref()
+            .expect("preserved typed request metadata");
+        assert_eq!(
+            metadata.get("permission_request"),
+            Some(&serde_json::to_value(&request).unwrap())
+        );
+        assert_eq!(
+            metadata.get("permission_decision_receipt"),
+            Some(&serde_json::to_value(&receipt).unwrap()),
+            "the public response must persist the complete receipt, including decided_at"
+        );
+        assert_eq!(
+            restarted.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+            Some(&request.request_id)
+        );
+        assert_eq!(
+            restarted
+                .metadata
+                .get(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY),
+            Some(&request.request_generation)
+        );
+
+        let target = find_permission_replay_target(
+            &restarted,
+            &request.request_id,
+            Some(&request.request_generation),
+        )
+        .expect("replay resolves the exact current occurrence after reload");
+        assert_eq!(
+            target.request_generation(),
+            Some(request.request_generation.as_str())
+        );
+        assert_eq!(
+            target.tool_call().function.arguments,
+            serde_json::json!({"command":"current-command"}).to_string()
+        );
+        let config = PermissionConfig::new();
+        restore_permission_replay_authorization(&config, &restarted, &target).unwrap();
+        // Try mismatches before consuming the valid grant, so these assertions
+        // cannot pass merely because the one-shot grant was already exhausted.
+        for (session_id, call_id, generation, resource) in [
+            (
+                restarted.id.as_str(),
+                request.request_id.as_str(),
+                "generation-old",
+                request.resource.as_str(),
+            ),
+            (
+                restarted.id.as_str(),
+                request.request_id.as_str(),
+                request.request_generation.as_str(),
+                "other-command",
+            ),
+            (
+                "other-session",
+                request.request_id.as_str(),
+                request.request_generation.as_str(),
+                request.resource.as_str(),
+            ),
+        ] {
+            assert!(!config.consume_once_for_generation(
+                session_id,
+                call_id,
+                generation,
+                request.permission_type,
+                resource
+            ));
+        }
+        assert!(config.consume_once_for_generation(
+            &restarted.id,
+            &request.request_id,
+            &request.request_generation,
+            request.permission_type,
+            &request.resource
+        ));
+        assert!(!config.consume_once_for_generation(
+            &restarted.id,
+            &request.request_id,
+            &request.request_generation,
+            request.permission_type,
+            &request.resource
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_deny_round_trip_retains_receipt_without_grants_or_replay() {
+        eprintln!("debug_assertions={}", cfg!(debug_assertions));
+        let (mut session, request, mut receipt) = pending_permission("receipt-deny");
+        receipt.decision.decision = PermissionDecisionKind::DenyOnce;
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_METADATA_KEY.into(),
+            "stale-call".into(),
+        );
+        session.metadata.insert(
+            PERMISSION_REEXECUTE_GENERATION_METADATA_KEY.into(),
+            "stale-generation".into(),
+        );
+        let (_directory, store, repo) = repository(&mut session).await;
+        let old_occurrence = serde_json::to_value(&session.messages[..2]).unwrap();
+        let mut response = input(&session.id);
+        response.user_response = "Approve".into();
+        let guard = acquire_pending_response_guard(&session.id).await;
+        let (_, display_response, _, grants) = submit_pending_permission_response_checked_guarded(
+            &repo,
+            response,
+            Some(request.request_id.clone()),
+            receipt.clone(),
+            &guard,
+        )
+        .await
+        .expect("typed deny accepts display text without granting permission");
+        assert_eq!(display_response, "Approve");
+        assert!(grants.is_empty());
+        let durable = store.load_session(&session.id).await.unwrap().unwrap();
+        let restarted: Session =
+            serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+        assert!(restarted.pending_question.is_none());
+        assert_eq!(
+            serde_json::to_value(&restarted.messages[..2]).unwrap(),
+            old_occurrence
+        );
+        let message = restarted.messages.last().unwrap();
+        assert_eq!(message.id, "result-current");
+        assert_eq!(message.content, "Selected response: Approve");
+        let metadata = message.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata.get("permission_request"),
+            Some(&serde_json::to_value(&request).unwrap())
+        );
+        assert_eq!(
+            metadata.get("permission_decision_receipt"),
+            Some(&serde_json::to_value(&receipt).unwrap())
+        );
+        assert!(!restarted
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+        assert!(!restarted
+            .metadata
+            .contains_key(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn failed_typed_receipt_does_not_publish_a_partial_response() {
+        eprintln!("debug_assertions={}", cfg!(debug_assertions));
+        let (mut session, request, receipt) = pending_permission("receipt-conflict");
+        let current = session.messages.last_mut().unwrap();
+        current.metadata = Some(serde_json::json!({"permission_request": request}));
+        let mut payload: serde_json::Value = serde_json::from_str(&current.content).unwrap();
+        payload["permission_request"]["request_generation"] =
+            "generation-conflicting-payload".into();
+        current.content = payload.to_string();
+        let (_directory, store, repo) = repository(&mut session).await;
+        let durable_before = store.load_session(&session.id).await.unwrap().unwrap();
+        // The real preflight reads metadata A, while display migration will
+        // preserve payload B. This reaches a failed receipt write without a
+        // test-only writer hook or a new storage failure protocol.
+        assert_eq!(
+            permission_request_generation(durable_before.messages.last().unwrap()).as_deref(),
+            Some(receipt.decision.request_generation.as_str())
+        );
+        let cache_before =
+            serde_json::to_value(read_cached_session(repo.cache(), &session.id).unwrap()).unwrap();
+        let durable_before = serde_json::to_value(durable_before).unwrap();
+        let guard = acquire_pending_response_guard(&session.id).await;
+        let result = submit_pending_permission_response_checked_guarded(
+            &repo,
+            input(&session.id),
+            Some(request.request_id),
+            receipt,
+            &guard,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RespondError::InvalidResponse(ref message)) if message.contains("receipt")),
+            "failed receipt persistence must be an explicit response error: {result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(store.load_session(&session.id).await.unwrap().unwrap()).unwrap(),
+            durable_before,
+            "pending question, result and all durable markers stay unchanged"
+        );
+        assert_eq!(
+            serde_json::to_value(read_cached_session(repo.cache(), &session.id).unwrap()).unwrap(),
+            cache_before,
+            "a rejected response must not publish a cache snapshot"
+        );
     }
 }
