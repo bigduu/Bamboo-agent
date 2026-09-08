@@ -240,6 +240,7 @@ fn plan_content_summary(result_payload: &str) -> Option<String> {
 /// `maybe_handle_user_question_tool` sniff path until they too migrate.
 pub(super) async fn suspend_for_pending_question(
     tool_call: &ToolCall,
+    permission_replay_origin: Option<&crate::session_app::approval_replay::PermissionReplayOrigin>,
     pq: bamboo_agent_core::PendingQuestion,
     result: ToolResult,
     session: &mut Session,
@@ -269,7 +270,13 @@ pub(super) async fn suspend_for_pending_question(
     // The tool's own result IS the paired tool_result (carries the rich display
     // payload: conclusion / plan / permission data), kept identical to the
     // pre-Phase-B transcript.
-    append_waiting_tool_result_message(session, tool_call, &result.result, session_id);
+    append_waiting_tool_result_message(
+        session,
+        tool_call,
+        &result.result,
+        session_id,
+        permission_replay_origin,
+    );
 
     send_event_with_metrics(
         event_tx,
@@ -310,6 +317,8 @@ pub(super) async fn suspend_for_pending_question(
 }
 
 pub(super) struct UserQuestionToolContext<'a> {
+    pub(super) permission_replay_origin:
+        Option<&'a crate::session_app::approval_replay::PermissionReplayOrigin>,
     pub(super) tool_call: &'a ToolCall,
     pub(super) result: &'a ToolResult,
     pub(super) session: &'a mut Session,
@@ -322,6 +331,7 @@ pub(super) struct UserQuestionToolContext<'a> {
 
 pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolContext<'_>) -> bool {
     let UserQuestionToolContext {
+        permission_replay_origin,
         tool_call,
         result,
         session,
@@ -361,7 +371,13 @@ pub(super) async fn maybe_handle_user_question_tool(context: UserQuestionToolCon
         None
     };
 
-    append_waiting_tool_result_message(session, tool_call, &result.result, session_id);
+    append_waiting_tool_result_message(
+        session,
+        tool_call,
+        &result.result,
+        session_id,
+        permission_replay_origin,
+    );
 
     send_event_with_metrics(
         event_tx,

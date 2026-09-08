@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use serde_json::Value;
 
-use crate::tools::{BashCompletionSink, ToolSchema};
+use crate::tools::{BashCompletionSink, ToolCall, ToolSchema};
 use crate::{AgentEvent, Session};
 use bamboo_domain::{
     PermissionMode, SessionAuthorityIdentity, SessionKind, SupervisorReference,
@@ -29,7 +29,25 @@ pub struct ExecutingSupervisorObservation {
     incarnation_id: Uuid,
 }
 
+/// Host metadata only; never copied from a tool's result payload.
+const SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY: &str = "permission.executing_supervisor.v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisorPermissionReplayRecord {
+    version: u8,
+    incarnation_id: Uuid,
+    session_id: String,
+    result_message_id: String,
+    request_generation: String,
+    tool_call: ToolCall,
+    execution_name: String,
+}
+
 impl ExecutingSupervisorObservation {
+    pub const PERMISSION_REPLAY_METADATA_KEY: &'static str =
+        SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY;
+
     /// Capture only from the Session actually executing the call, before its
     /// context is queued or transferred. Never call this on a replacement
     /// Session loaded to resolve configuration or replay an old operation.
@@ -56,6 +74,122 @@ impl ExecutingSupervisorObservation {
             session_id: DEFAULT_SUPERVISOR_SESSION_ID.to_string(),
             incarnation_id: self.incarnation_id,
         }
+    }
+
+    /// Encode this already captured observation at the host's waiting-message
+    /// writer. The original operation and actual new result ID are immutable
+    /// bindings, not values to recover from model-visible result JSON.
+    pub fn permission_replay_record(
+        self,
+        session_id: &str,
+        result_message_id: &str,
+        tool_call: &ToolCall,
+        execution_name: &str,
+        request_generation: &str,
+    ) -> Value {
+        serde_json::to_value(SupervisorPermissionReplayRecord {
+            version: 1,
+            incarnation_id: self.incarnation_id,
+            session_id: session_id.to_string(),
+            result_message_id: result_message_id.to_string(),
+            request_generation: request_generation.to_string(),
+            tool_call: tool_call.clone(),
+            execution_name: execution_name.to_string(),
+        })
+        .expect("Supervisor permission binding serializes")
+    }
+
+    /// Narrow host restoration from an exact durable result occurrence. The
+    /// caller must additionally validate the typed request/receipt contract
+    /// before granting permissions or handing this observation to a tool.
+    /// This never captures an identity from the reloaded Session.
+    pub fn restore_permission_replay_record(
+        session: &Session,
+        result_index: usize,
+        tool_call: &ToolCall,
+        execution_name: &str,
+        request_generation: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        let message = session
+            .messages
+            .get(result_index)
+            .ok_or("result occurrence missing")?;
+        if serde_json::from_str::<Value>(&message.content)
+            .ok()
+            .is_some_and(|payload| {
+                payload
+                    .get(SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY)
+                    .is_some()
+            })
+        {
+            return Err("Supervisor authority is not accepted from a result payload");
+        }
+        let Some(value) = message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY))
+        else {
+            return Ok(None);
+        };
+        let record: SupervisorPermissionReplayRecord = serde_json::from_value(value.clone())
+            .map_err(|_| "Supervisor permission binding is malformed")?;
+        let latest_result = session
+            .messages
+            .iter()
+            .rposition(|message| message.tool_call_id.as_deref() == Some(tool_call.id.as_str()));
+        let newer_call = session.messages[result_index + 1..].iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call.id))
+        });
+        let preceding_call = session.messages[..result_index]
+            .iter()
+            .rev()
+            .find(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call.id))
+            });
+        let exact_call = preceding_call.is_some_and(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.tool_calls.as_ref().is_some_and(|calls| {
+                    let matching: Vec<_> = calls
+                        .iter()
+                        .filter(|call| call.id == tool_call.id)
+                        .collect();
+                    matching.len() == 1 && matching[0] == tool_call
+                })
+        });
+        if record.version != 1
+            || record.incarnation_id.is_nil()
+            || session.id != DEFAULT_SUPERVISOR_SESSION_ID
+            || session.kind != SessionKind::Root
+            || session.root_session_id != session.id
+            || session.parent_session_id.is_some()
+            || session.spawn_depth != 0
+            || session.authority_identity
+                != (SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: record.incarnation_id,
+                })
+            || message.role != bamboo_domain::Role::Tool
+            || latest_result != Some(result_index)
+            || newer_call
+            || !exact_call
+            || record.session_id != session.id
+            || record.result_message_id != message.id
+            || record.tool_call != *tool_call
+            || record.execution_name != execution_name
+            || execution_name.trim().is_empty()
+            || record.request_generation.trim().is_empty()
+            || Some(record.request_generation.as_str()) != request_generation
+        {
+            return Err("Supervisor permission binding does not match the current operation");
+        }
+        Ok(Some(Self {
+            incarnation_id: record.incarnation_id,
+        }))
     }
 
     pub(super) fn for_caller(self, session_id: Option<&str>) -> Option<Self> {

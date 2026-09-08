@@ -18,6 +18,7 @@ use bamboo_metrics::MetricsCollector;
 use super::execution_paths;
 use super::loop_state::RoundExecutionState;
 use super::policy;
+use crate::session_app::approval_replay::PermissionReplayOrigin;
 
 fn preview_for_log(value: &str, max_chars: usize) -> String {
     let mut iter = value.chars();
@@ -89,6 +90,7 @@ pub(super) struct ToolExecutionApplyContext<'a> {
 }
 
 pub(super) struct ToolExecutionOutcome {
+    pub permission_replay_origin: Option<PermissionReplayOrigin>,
     pub result: Result<ToolResult, String>,
     /// Set when the tool returned [`ToolOutcome::NeedsHuman`] — the structured
     /// pending question the loop suspends on (its display `result` is carried in
@@ -130,6 +132,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
             ctx.tool_call.function.name,
         );
         return Ok(ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Err(message),
             needs_human: None,
             post_tool_hook_eligible: false,
@@ -162,6 +165,7 @@ async fn execute_tool_call_only_with_execution_name(
             policy_error
         );
         return Ok(ToolExecutionOutcome {
+            permission_replay_origin: None,
             needs_human: None,
             post_tool_hook_eligible: false,
             result: Err(policy_error),
@@ -267,6 +271,7 @@ async fn execute_tool_call_only_with_execution_name(
                 let end_event = emitter.error(reason.clone()).clone();
                 let _ = ctx.event_tx.send(end_event.into_agent_event()).await;
                 return Ok(ToolExecutionOutcome {
+                    permission_replay_origin: None,
                     result: Err(format!("Tool execution denied by hook: {reason}")),
                     needs_human: None,
                     post_tool_hook_eligible: false,
@@ -401,6 +406,9 @@ async fn execute_tool_call_only_with_execution_name(
     );
 
     Ok(ToolExecutionOutcome {
+        permission_replay_origin: ctx.executing_supervisor.map(|observation| {
+            PermissionReplayOrigin::new(observation, ctx.session_id, ctx.tool_call, execution_name)
+        }),
         result: result.map_err(|error| error.to_string()),
         needs_human,
         post_tool_hook_eligible,
@@ -481,6 +489,7 @@ async fn hook_ask_outcome(
             })
             .await;
         return (!approved).then(|| ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Err("Tool execution denied by parent agent review".to_string()),
             needs_human: None,
             post_tool_hook_eligible: false,
@@ -489,6 +498,7 @@ async fn hook_ask_outcome(
     }
 
     Some(ToolExecutionOutcome {
+        permission_replay_origin: None,
         result: Err(
             "Hook requested approval, but no parent-agent reviewer is available; denied"
                 .to_string(),
@@ -623,6 +633,7 @@ pub(super) async fn apply_tool_execution_outcome(
         .await;
         super::clarification::suspend_for_pending_question(
             ctx.tool_call,
+            outcome.permission_replay_origin.as_ref(),
             pending_question,
             display_result,
             ctx.session,
@@ -641,6 +652,7 @@ pub(super) async fn apply_tool_execution_outcome(
                 let r = execution_paths::handle_successful_tool_result(
                     execution_paths::SuccessPathContext {
                         tool_call: ctx.tool_call,
+                        permission_replay_origin: outcome.permission_replay_origin.as_ref(),
                         result: &result,
                         event_tx: ctx.event_tx,
                         metrics_collector: ctx.metrics_collector,
@@ -695,7 +707,15 @@ pub(super) async fn apply_tool_execution_outcome(
         .rev()
         .find(|m| m.tool_call_id.as_deref() == Some(&tool_call_id_for_meta))
     {
-        msg.metadata = Some(metadata_value);
+        let metadata = msg.metadata.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(object) = metadata.as_object_mut() {
+            object.extend(
+                metadata_value
+                    .as_object()
+                    .expect("lifecycle metadata object")
+                    .clone(),
+            );
+        }
     }
 
     if let Some(hook_outcome) = deferred_hook_control {
@@ -1375,6 +1395,7 @@ mod hook_tests {
         let tool_call = probe_call("canonical-tool");
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Ok(ToolResult::text(false, "decision pending")),
             needs_human: Some(bamboo_agent_core::PendingQuestion {
                 tool_call_id: "stale-call".to_string(),
@@ -1703,6 +1724,7 @@ mod hook_tests {
         let tool_call = probe_call("probe");
         let mut session = Session::new("post-feedback", "model");
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Ok(ToolResult::text(true, "raw output")),
             needs_human: None,
             post_tool_hook_eligible: true,
@@ -1746,6 +1768,7 @@ mod hook_tests {
         let tool_call = probe_call("probe");
         let mut session = Session::new("post-error-feedback", "model");
         let outcome = ToolExecutionOutcome {
+            permission_replay_origin: None,
             result: Err("executor exploded".to_string()),
             needs_human: None,
             post_tool_hook_eligible: true,

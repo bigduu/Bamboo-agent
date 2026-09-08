@@ -16,8 +16,8 @@ use bamboo_engine::model_config_helper::{
 };
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization, ApprovalReplayDecision,
-    PermissionReplayTarget,
+    repark_permission_replay, restore_permission_replay_authorization,
+    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
@@ -38,6 +38,10 @@ use crate::handlers::agent::execute::{spawn_agent_execution, spawn_event_forward
 /// `bamboo_engine::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
 pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
+
+#[cfg(test)]
+#[path = "supervisor_approval_tests.rs"]
+pub(crate) mod supervisor_tests;
 
 #[async_trait]
 impl ResumeExecutionPort for AppStateResumeRef {
@@ -290,6 +294,22 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 }
                 let tool_call = replay_target.tool_call().clone();
                 let tool_name = tool_call.function.name.clone();
+                let executor = state.tools_for(crate::tools::ToolSurface::Root);
+                let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
+                    executor.owns_exact_tool(name)
+                })
+                .unwrap_or_else(|| tool_name.clone());
+                let executing_supervisor = match validate_permission_replay_authority(
+                    &session,
+                    &replay_target,
+                    &replay_owner,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
+                        return;
+                    }
+                };
                 let configured_mode = state
                     .permission_checker
                     .permission_config()
@@ -343,6 +363,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             permission_config.as_ref(),
                             &session,
                             &replay_target,
+                            &replay_owner,
                         ) {
                             tracing::error!(
                                 %session_id,
@@ -352,7 +373,6 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             );
                             return;
                         }
-                        let executor = state.tools_for(crate::tools::ToolSurface::Root);
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
                             == bamboo_tools::orchestrator::ToolMutability::Mutating;
 
@@ -370,10 +390,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_with_context(
+                            executor.execute_exact_with_context_outcome(
                                     &tool_call,
+                                    &replay_owner,
                                 bamboo_agent_core::tools::ToolExecutionContext {
-                                    executing_supervisor: None,
+                                    executing_supervisor,
                                     session_id: Some(session.id.as_str()),
                                     root_session_id: Some(
                                         if session.root_session_id.trim().is_empty() {
@@ -394,7 +415,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                 },
                             ),
                         )
-                        .await;
+                        .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
 
                         match exec_result {
                             Ok(tool_result) => {
@@ -402,6 +423,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                     &mut session,
                                     &replay_target,
                                     &tool_result,
+                                    &replay_owner,
                                 ) {
                                     Ok(Some(reparked)) => {
                                         let _ = mpsc_tx
