@@ -87,8 +87,8 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// Re-read and prepare an activation target under the same per-session
 /// persistence lock that commits the generic suspension clear.
 ///
-/// The boolean is false when a specific child/Bash wait is present in the
-/// latest durable snapshot; callers must leave the activation unreserved.
+/// The boolean is false for an unanswered human question or a respected
+/// child/Bash wait in the latest durable snapshot; leave activation unreserved.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -98,6 +98,12 @@ async fn prepare_session_inbox_activation(
     let ready_for_mutation = ready.clone();
     let saved = persistence
         .update_runtime_config(session_id, move |latest| {
+            // Inbox steering never answers a human question. Check under the
+            // same final writer lock, including when an earlier user envelope
+            // has already advanced the prefix's interrupt watermark.
+            if latest.has_pending_question() {
+                return;
+            }
             let mut runtime_state = read_runtime_state(latest);
             let specifically_waiting = runtime_state.waiting_for_children.is_some()
                 || runtime_state.waiting_for_bash.is_some();

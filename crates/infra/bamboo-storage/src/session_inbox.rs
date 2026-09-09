@@ -51,6 +51,8 @@ pub struct FileSessionInbox {
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
+    #[cfg(test)]
+    followup_authority_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl FileSessionInbox {
@@ -59,6 +61,8 @@ impl FileSessionInbox {
             sessions,
             limits,
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            followup_authority_pause: None,
         }
     }
 
@@ -501,25 +505,10 @@ impl FileSessionInbox {
         Ok(None)
     }
 
-    fn validate_claim_name(claim_id: &str) -> Result<(), SessionInboxError> {
-        let path = Path::new(claim_id);
-        if claim_id.is_empty()
-            || path.components().count() != 1
-            || claim_id.contains('/')
-            || claim_id.contains('\\')
-            || !claim_id.ends_with(".json")
-        {
-            return Err(SessionInboxError::InvalidClaim(claim_id.to_string()));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl SessionInboxPort for FileSessionInbox {
-    async fn deliver(
+    async fn deliver_with_lifecycle_held(
         &self,
         envelope: &SessionMessageEnvelope,
+        _lifecycle: &crate::v2::SessionLifecycleReadGuard,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         envelope
             .validate()
@@ -533,7 +522,6 @@ impl SessionInboxPort for FileSessionInbox {
             });
         }
 
-        let _lifecycle = self.lock_lifecycle().await?;
         let dir = self.inbox_dir(&envelope.target_session_id).await?;
         let _guard = self.lock_operation(&dir).await?;
         // Enqueue idempotency is independent from consumer admission dedupe.
@@ -562,6 +550,62 @@ impl SessionInboxPort for FileSessionInbox {
             id: envelope.id.clone(),
             generation,
         })
+    }
+
+    fn validate_claim_name(claim_id: &str) -> Result<(), SessionInboxError> {
+        let path = Path::new(claim_id);
+        if claim_id.is_empty()
+            || path.components().count() != 1
+            || claim_id.contains('/')
+            || claim_id.contains('\\')
+            || !claim_id.ends_with(".json")
+        {
+            return Err(SessionInboxError::InvalidClaim(claim_id.to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SessionInboxPort for FileSessionInbox {
+    async fn deliver(
+        &self,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let lifecycle = self.lock_lifecycle().await?;
+        self.deliver_with_lifecycle_held(envelope, &lifecycle).await
+    }
+
+    async fn deliver_supervisor_followup(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if envelope.source
+            != (SessionMessageSource::Session {
+                session_id: supervisor.session_id.clone(),
+            })
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Supervisor followup requires its own typed Session peer origin".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_supervisor_followup(supervisor, &envelope.target_session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        #[cfg(test)]
+        if let Some((entered, release)) = &self.followup_authority_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        // Never call public deliver here: a queued lifecycle writer would make
+        // that nested shared acquisition deadlock. This is the same adapter,
+        // operation lock, semantic receipt and Maildir transaction as deliver.
+        self.deliver_with_lifecycle_held(envelope, authority.lifecycle())
+            .await
     }
 
     async fn mark_activation_eligible(
@@ -953,6 +997,10 @@ impl SessionInboxPort for FileSessionInbox {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "session_inbox_supervisor_tests.rs"]
+mod supervisor_tests;
 
 #[cfg(test)]
 mod tests {

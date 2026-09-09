@@ -237,6 +237,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("SubAgent"));
     assert!(names.contains("scheduler"));
     assert!(names.contains("session_history"));
+    assert!(names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -293,6 +294,7 @@ async fn child_tools_exclude_scheduler_and_session_history() {
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
     assert!(!names.contains("session_history"));
+    assert!(!names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
@@ -1191,3 +1193,6 @@ mod config_recovery_gate {
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
 }
+
+#[path = "session_control_tests.rs"]
+mod session_control_tests;

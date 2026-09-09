@@ -61,7 +61,70 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
     }
 }
 
+/// One retained instance of the existing authority lock set, never a durable
+/// grant or a second lifecycle protocol. Constructed only by the strict reader.
+pub(crate) struct SupervisorFollowupGuard {
+    lifecycle: SessionLifecycleReadGuard,
+    _task: RuntimeTaskTransactionReadGuard,
+    _sessions: Vec<SessionWriteGuard>,
+}
+
+impl SupervisorFollowupGuard {
+    pub(crate) fn lifecycle(&self) -> &SessionLifecycleReadGuard {
+        &self.lifecycle
+    }
+}
+
+fn link_authorizes_target(
+    state: &SupervisorManagementState,
+    link: &SupervisorManagedLink,
+    target: &Session,
+) -> bool {
+    link.enabled
+        && target_project(target).is_ok_and(|project| {
+            project == link.target_project_id && state.allowed_projects.contains(&project)
+        })
+        && target.created_at == link.target_created_at
+        && target.metadata_version == link.target_metadata_version
+}
+
 impl SessionStoreV2 {
+    /// Acquire in the canonical lifecycle → Task → sorted Session order.
+    /// FileSessionInbox keeps this guard alive until its own receipt commits.
+    pub(crate) async fn lock_supervisor_followup(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<SupervisorFollowupGuard> {
+        reference_is_valid(reference)?;
+        target_id_is_valid(target_id)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(Some(target_id)).await?;
+        let current = self.management_supervisor_locked(reference).await?;
+        let state = current
+            .supervisor_management
+            .unwrap_or_else(|| empty_state(reference.incarnation_id));
+        let link = state
+            .links
+            .get(target_id)
+            .ok_or_else(|| denied("target is not attached to this Supervisor"))?;
+        let target = self
+            .load_root_authority_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("Supervisor followup target does not exist"))?;
+        if !link_authorizes_target(&state, link, &target) {
+            return Err(denied(
+                "Supervisor followup link or target authority is no longer valid",
+            ));
+        }
+        Ok(SupervisorFollowupGuard {
+            lifecycle,
+            _task: task,
+            _sessions: sessions,
+        })
+    }
+
     /// Private loader only: every caller below owns lifecycle, Task and Session
     /// locks. Calling the public authority reader here would re-enter locks.
     async fn management_supervisor_locked(
@@ -278,10 +341,7 @@ impl SessionStoreV2 {
         let mut authorized = false;
         if let Some(link) = link.as_ref().filter(|link| link.enabled) {
             if let Some(target) = self.load_root_authority_unchecked(target_id).await? {
-                authorized = target_project(&target).is_ok_and(|project| {
-                    project == link.target_project_id && state.allowed_projects.contains(&project)
-                }) && target.created_at == link.target_created_at
-                    && target.metadata_version == link.target_metadata_version;
+                authorized = link_authorizes_target(&state, link, &target);
             }
         }
         Ok(SupervisorLinkObservation {

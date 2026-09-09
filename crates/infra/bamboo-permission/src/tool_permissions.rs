@@ -403,6 +403,20 @@ pub fn check_permissions(
                 _ => Ok(None), // list / list_sessions → read-only
             }
         }
+        "session_control" => {
+            let action = required_string_arg(args, "action")?;
+            if action != "followup" {
+                return Err(PermissionError::CheckFailed(
+                    "unsupported session_control action".into(),
+                ));
+            }
+            let target = required_string_arg(args, "target_session_id")?;
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                format!("session_control followup {target}"),
+                "session_control followup: continue an existing independent Root",
+            )]))
+        }
         // Read-only: session_inspector (list / get_meta / read_messages) and the
         // session_history viewer never mutate or spin up compute. #395.
         "session_inspector" | "session_history" => Ok(None),
@@ -577,6 +591,10 @@ mod tests {
             ("cluster", json!({"action": "stop", "node": "n1"})),
             ("SubAgent", json!({"action": "create", "prompt": "x"})),
             ("SubAgent", json!({"action": "run", "session_id": "c1"})),
+            (
+                "session_control",
+                json!({"action": "followup", "target_session_id": "root-a", "operation_id": "op-a", "message": "continue"}),
+            ),
             (
                 "SubAgent",
                 json!({"action": "send_message", "session_id": "c1"}),

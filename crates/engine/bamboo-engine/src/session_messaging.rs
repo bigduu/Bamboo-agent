@@ -12,8 +12,12 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     Session, SessionActivationDisposition, SessionActivationError, SessionActivationPolicy,
     SessionActivationPort, SessionInboxError, SessionInboxPort, SessionInboxReceipt,
-    SessionMessageEnvelope, SessionMessageSource,
+    SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
+    SessionMessageKind, SessionMessageSource, SupervisorReference,
 };
+
+/// A followup is one bounded peer instruction, not a context export or file transfer.
+pub const MAX_SUPERVISOR_FOLLOWUP_BYTES: usize = 16 * 1024;
 
 /// Observable counters for the internal delivery plane.
 #[derive(Debug, Default)]
@@ -146,6 +150,63 @@ impl SessionMessenger {
         &self.metrics
     }
 
+    /// Follow an already-attached Ordinary Root from the original executing
+    /// Supervisor. The concrete inbox revalidates and retains all authority
+    /// locks through durable admission; a prior inspect_link is never a grant.
+    pub async fn supervisor_followup(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        bamboo_domain::validate_supervisor_target_id(target_session_id)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        SessionMessageId::parse(operation_id)
+            .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
+        if message.trim().is_empty() || message.len() > MAX_SUPERVISOR_FOLLOWUP_BYTES {
+            return Err(SessionMessengerError::InvalidEnvelope(format!(
+                "followup message must contain 1..={MAX_SUPERVISOR_FOLLOWUP_BYTES} UTF-8 bytes"
+            )));
+        }
+        let envelope = SessionMessageEnvelope {
+            id: SessionMessageId::stable(
+                "supervisor_followup",
+                &serde_json::json!({
+                    "supervisor": supervisor,
+                    "target_session_id": target_session_id,
+                    "operation_id": operation_id,
+                }),
+            ),
+            source: SessionMessageSource::Session {
+                session_id: supervisor.session_id.clone(),
+            },
+            target_session_id: target_session_id.to_string(),
+            kind: SessionMessageKind::PeerMessage,
+            body: SessionMessageBody::Content(SessionMessageContent::text(message)),
+            created_at: chrono::Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: Some(operation_id.to_string()),
+        };
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_supervisor_followup(supervisor, &envelope)
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        let admission = self.record_admission(envelope, delivery, started);
+        // Followup never answers a permission/clarification or interrupts a
+        // specific child/Bash wait; the existing spawner owns the final check.
+        self.activate_with_policy(&admission, SessionActivationPolicy::RespectSpecificWait)
+            .await
+    }
+
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionMessengerError> {
         self.sessions
             .load_session(id)
@@ -253,16 +314,25 @@ impl SessionMessenger {
                 return Err(error);
             }
         };
+        Ok(self.record_admission(envelope, delivery, started))
+    }
+
+    fn record_admission(
+        &self,
+        envelope: SessionMessageEnvelope,
+        delivery: SessionInboxReceipt,
+        started: Instant,
+    ) -> SessionMessengerAdmission {
         self.metrics.delivered.fetch_add(1, Ordering::Relaxed);
         self.metrics.delivery_latency_micros.fetch_add(
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
-        Ok(SessionMessengerAdmission {
+        SessionMessengerAdmission {
             envelope_id: envelope.id.as_str().to_string(),
             target_session_id: envelope.target_session_id,
             delivery,
-        })
+        }
     }
 
     pub async fn activate(
