@@ -203,7 +203,7 @@ pub(super) fn build_root_tools(
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),
-        session_messenger: Some(session_messenger),
+        session_messenger: Some(session_messenger.clone()),
         scheduler: spawn_scheduler,
         sessions_cache: sessions,
         agent_runners: agent_runners.clone(),
@@ -251,6 +251,13 @@ pub(super) fn build_root_tools(
     let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
         crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
     );
+    let tools_with_control: Arc<dyn ToolExecutor> =
+        Arc::new(crate::tools::OverlayToolExecutor::new(
+            tools_with_inspector,
+            Arc::new(bamboo_server_tools::SessionControlTool::new(
+                session_messenger,
+            )),
+        ));
 
     // When a broker is configured, root agents also get `ask_agent` (command
     // broker-deployed agents, query/steer) and `deploy_agent` (spin up new
@@ -258,7 +265,7 @@ pub(super) fn build_root_tools(
     match broker {
         Some(b) if !b.endpoint.trim().is_empty() => {
             let with_ask: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-                tools_with_inspector,
+                tools_with_control,
                 Arc::new(crate::tools::AskAgentTool::new(
                     b.endpoint.clone(),
                     b.token.clone(),
@@ -286,6 +293,6 @@ pub(super) fn build_root_tools(
                 Arc::new(crate::tools::ClusterTool::new(config, fabric_deployer)),
             ))
         }
-        _ => tools_with_inspector,
+        _ => tools_with_control,
     }
 }

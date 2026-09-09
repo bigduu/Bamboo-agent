@@ -768,6 +768,20 @@ pub trait SessionInboxPort: Send + Sync {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError>;
 
+    /// Admit one typed Supervisor peer message while retaining canonical
+    /// incarnation, relationship, Project and target lifetime authority locks
+    /// through the inbox receipt. An earlier link observation is not a grant.
+    /// Backends without this integrated boundary must fail closed.
+    async fn deliver_supervisor_followup(
+        &self,
+        _supervisor: &super::SupervisorReference,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "Supervisor followup admission is unsupported".into(),
+        ))
+    }
+
     /// Durably authorize execution for the queue prefix through `generation`.
     ///
     /// This is separate from [`deliver`](Self::deliver) so orchestration
