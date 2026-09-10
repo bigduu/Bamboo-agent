@@ -687,7 +687,7 @@ pub async fn set_default_provider_instance(
     let target_id = payload.default_provider_instance_id.clone();
 
     let new_config = app_state
-        .update_config(
+        .update_provider_metadata(
             move |config| {
                 validate_default_target(config, &target_id)?;
                 config.default_provider_instance = Some(target_id.clone());
@@ -1322,6 +1322,170 @@ mod tests {
             validate_default_target(&config, "disabled"),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn set_default_ignores_live_core_drift_and_commits_only_providers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        state.stop_config_watcher_for_test();
+        let app_state = web::Data::new(state);
+
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-default-primary-secret")),
+        )
+        .await
+        .expect("primary provider should be created");
+        let primary_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .next()
+            .cloned()
+            .expect("primary provider exists");
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-default-secondary-secret")),
+        )
+        .await
+        .expect("secondary provider should be created");
+        let secondary_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .find(|id| **id != primary_id)
+            .cloned()
+            .expect("secondary provider exists");
+        let credential_refs = {
+            let config = app_state.config.read().await;
+            [primary_id.clone(), secondary_id.clone()]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        config.provider_instances[&id]
+                            .credential_ref
+                            .clone()
+                            .expect("provider credential reference"),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        let facade = app_state
+            .config_facade
+            .as_ref()
+            .expect("modular config facade");
+        let provider_revision = facade.registry().providers.snapshot().revision;
+        let core_revision = facade.registry().core.snapshot().revision;
+        let core_path = temp_dir.path().join("core.json");
+        let core_before = std::fs::read(&core_path).expect("core section exists");
+
+        // Deterministically reproduce Docker's BAMBOO_BIND overlay without
+        // mutating process-global environment shared by parallel tests.
+        app_state.config.write().await.server.bind = "0.0.0.0".to_string();
+        let event_baseline = app_state.account_sink.latest_seq();
+
+        let response = set_default_provider_instance(
+            app_state.clone(),
+            web::Json(SetDefaultInstanceRequest {
+                default_provider_instance_id: secondary_id.clone(),
+            }),
+        )
+        .await
+        .expect("set-default should ignore unrelated live Core drift");
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let response_body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .expect("response body");
+        let response_json: Value =
+            serde_json::from_slice(&response_body).expect("valid response JSON");
+        assert_eq!(response_json["success"], true);
+        assert_eq!(response_json["default_provider_instance_id"], secondary_id);
+        assert!(!String::from_utf8_lossy(&response_body).contains("sk-default"));
+
+        assert_eq!(
+            std::fs::read(&core_path).expect("core section remains readable"),
+            core_before,
+            "set-default must not persist the live Core overlay"
+        );
+        assert_eq!(
+            facade.registry().core.snapshot().revision,
+            core_revision,
+            "set-default must not advance Core"
+        );
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            provider_revision + 1,
+            "set-default must advance only Providers exactly once"
+        );
+        {
+            let config = app_state.config.read().await;
+            assert_eq!(
+                config.default_provider_instance.as_deref(),
+                Some(secondary_id.as_str())
+            );
+            assert_eq!(config.server.bind, "0.0.0.0");
+            for (id, reference) in &credential_refs {
+                assert_eq!(
+                    config.provider_instances[id].credential_ref.as_ref(),
+                    Some(reference)
+                );
+            }
+        }
+        assert_eq!(
+            app_state
+                .credential_store
+                .resolve(&credential_refs[&primary_id])
+                .expect("primary credential lookup")
+                .expect("primary credential remains configured")
+                .expose(),
+            "sk-default-primary-secret"
+        );
+        assert_eq!(
+            app_state
+                .credential_store
+                .resolve(&credential_refs[&secondary_id])
+                .expect("secondary credential lookup")
+                .expect("secondary credential remains configured")
+                .expose(),
+            "sk-default-secondary-secret"
+        );
+
+        let events = bamboo_engine::events::journal::read_since(
+            app_state.account_sink.events_dir(),
+            event_baseline,
+        )
+        .expect("config events should be journaled");
+        let provider_events = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                    if section == "providers" =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(provider_events, vec![provider_revision + 1]);
+        assert!(events.iter().all(|event| {
+            !matches!(
+                &event.event,
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                    | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                    | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                    if section == "core"
+            )
+        }));
     }
 
     #[test]
