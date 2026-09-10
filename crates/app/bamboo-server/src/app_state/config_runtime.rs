@@ -4982,12 +4982,61 @@ impl AppState {
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
-        if provider_intents.is_empty() && provider_instance_intents.is_empty() {
+        self.update_config_with_provider_credentials_inner(
+            update,
+            provider_intents,
+            provider_instance_intents,
+            effects,
+            false,
+        )
+        .await
+    }
+
+    /// Compatibility provider metadata update pinned to the Providers revision
+    /// selected while holding `config_io_lock`. Modular runtimes commit only
+    /// Providers; legacy runtimes retain the generic compatibility behavior.
+    pub(crate) async fn update_provider_metadata<F>(
+        &self,
+        update: F,
+        effects: ConfigUpdateEffects,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
+        self.update_config_with_provider_credentials_inner(
+            update,
+            BTreeSet::new(),
+            BTreeSet::new(),
+            effects,
+            true,
+        )
+        .await
+    }
+
+    async fn update_config_with_provider_credentials_inner<F>(
+        &self,
+        update: F,
+        provider_intents: BTreeSet<String>,
+        provider_instance_intents: BTreeSet<String>,
+        effects: ConfigUpdateEffects,
+        exact_provider_metadata: bool,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), AppError>,
+    {
+        let exact_provider_metadata = exact_provider_metadata
+            && provider_intents.is_empty()
+            && provider_instance_intents.is_empty()
+            && self.config_facade.is_some();
+        if provider_intents.is_empty()
+            && provider_instance_intents.is_empty()
+            && !exact_provider_metadata
+        {
             return self.update_config(update, effects).await;
         }
         let io = self.config_io_lock.clone().lock_owned().await;
         let config_facade = self.config_facade.clone();
-        let (mut candidate, live_base, enforcement_newly_off) = {
+        let (mut candidate, live_base, enforcement_newly_off, provider_expected_revision) = {
             let cfg = self.config.read().await;
             reject_if_recovery_pending(&cfg)?;
             let was_off = cfg.plugin_trust.enforcement_is_off();
@@ -5035,7 +5084,16 @@ impl AppState {
                 })?;
             }
             let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-            (candidate, live_base, newly_off)
+            let provider_expected_revision = exact_provider_metadata.then(|| {
+                config_facade
+                    .as_ref()
+                    .expect("exact provider metadata requires the modular facade")
+                    .registry()
+                    .providers
+                    .snapshot()
+                    .revision
+            });
+            (candidate, live_base, newly_off, provider_expected_revision)
         };
         let config = self.config.clone();
         let app_data_dir = self.app_data_dir.clone();
@@ -5052,14 +5110,24 @@ impl AppState {
                 let commit_facade = config_facade.clone();
                 let (candidate, commit) = tokio::task::spawn_blocking(move || {
                     let result = if let Some(facade) = commit_facade {
-                        let commit =
+                        let commit = if let Some(expected_revision) = provider_expected_revision {
+                            bamboo_config::persist_provider_credential_transaction_at_revision_with_adoption(
+                                &data_dir,
+                                &mut candidate,
+                                &provider_intents,
+                                &provider_instance_intents,
+                                expected_revision,
+                                facade.as_ref(),
+                            )?
+                        } else {
                             bamboo_config::persist_provider_instance_credential_transaction_with_adoption(
                                 &data_dir,
                                 &mut candidate,
                                 &provider_intents,
                                 &provider_instance_intents,
                                 facade.as_ref(),
-                            )?;
+                            )?
+                        };
                         Ok::<_, ConfigStoreError>((candidate, Some(commit)))
                     } else {
                         bamboo_config::persist_provider_instance_credential_transaction(
@@ -9421,6 +9489,106 @@ for line in sys.stdin:
                 "{file} must remain secret-free"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_metadata_cancellation_after_commit_finishes_publication() {
+        let _key = bamboo_config::encryption::set_test_encryption_key([0x6d; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        stop_config_watcher(&mut state);
+        let state = Arc::new(state);
+        let instance_id = "metadata-cancellation".to_string();
+        let instance_id_for_update = instance_id.clone();
+        state
+            .update_config_with_provider_credentials(
+                move |config| {
+                    let instance = serde_json::from_value(serde_json::json!({
+                        "provider_type": "openai",
+                        "label": "Before cancellation",
+                        "api_key": "metadata-cancellation-secret"
+                    }))?;
+                    config
+                        .provider_instances
+                        .insert(instance_id_for_update.clone(), instance);
+                    config.default_provider_instance = Some(instance_id_for_update.clone());
+                    Ok(())
+                },
+                BTreeSet::new(),
+                BTreeSet::from([instance_id.clone()]),
+                ConfigUpdateEffects::default(),
+            )
+            .await
+            .unwrap();
+
+        let core_path = dir.path().join("core.json");
+        let core_before = std::fs::read(&core_path).unwrap();
+        state.config.write().await.server.bind = "0.0.0.0".to_string();
+        let mut feed = state.account_sink.subscribe();
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        set_generic_before_event_test_hook(dir.path(), move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let operation = {
+            let state = state.clone();
+            let instance_id = instance_id.clone();
+            tokio::spawn(async move {
+                state
+                    .update_provider_metadata(
+                        move |config| {
+                            config
+                                .provider_instances
+                                .get_mut(&instance_id)
+                                .unwrap()
+                                .label = Some("Committed after cancellation".to_string());
+                            Ok(())
+                        },
+                        ConfigUpdateEffects::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .config_facade
+                .as_ref()
+                .unwrap()
+                .registry()
+                .providers
+                .snapshot()
+                .revision,
+            2,
+            "the abort boundary must follow provider metadata adoption"
+        );
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        let converged = tokio::time::timeout(Duration::from_secs(5), state.config_io_lock.lock())
+            .await
+            .expect("detached provider metadata update must finish live publication");
+        drop(converged);
+
+        let live = state.config.read().await;
+        assert_eq!(
+            live.provider_instances[&instance_id].label.as_deref(),
+            Some("Committed after cancellation")
+        );
+        assert_eq!(live.server.bind, "0.0.0.0");
+        drop(live);
+        assert_eq!(std::fs::read(core_path).unwrap(), core_before);
+        assert!(matches!(
+            next_config_event(&mut feed, "providers").await,
+            AgentEvent::ConfigChanged {
+                section,
+                revision: 2
+            } if section == "providers"
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -569,53 +569,54 @@ pub async fn update_provider_instance(
             Value::String(value) => !config_manager::is_masked_api_key(value),
             _ => false,
         });
-    let provider_instance_intents = if has_api_key_intent {
-        std::collections::BTreeSet::from([instance_id.clone()])
-    } else {
-        std::collections::BTreeSet::new()
+    let update = move |config: &mut bamboo_config::Config| {
+        let existing = config
+            .provider_instances
+            .get(&instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::BadRequest(format!("Provider instance '{}' not found", instance_id))
+            })?;
+
+        let updated = apply_instance_update(&existing, &payload_inner)?;
+        // This closure runs under config_io_lock, before either the metadata
+        // or credential transaction can commit. Keep the explicit default
+        // valid instead of failing its reload after publishing a disabled
+        // instance (#1097).
+        if !updated.enabled && config.default_provider_instance.as_deref() == Some(&instance_id) {
+            return Err(AppError::BadRequest(format!(
+                "Cannot disable default provider instance '{instance_id}'; set another enabled provider instance as default first"
+            )));
+        }
+        config
+            .provider_instances
+            .insert(instance_id.clone(), updated);
+        Ok(())
     };
 
-    let new_config = app_state
-        .update_config_with_provider_credentials(
-            move |config| {
-                let existing = config
-                    .provider_instances
-                    .get(&instance_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        AppError::BadRequest(format!(
-                            "Provider instance '{}' not found",
-                            instance_id
-                        ))
-                    })?;
-
-                let updated = apply_instance_update(&existing, &payload_inner)?;
-                // This closure runs under config_io_lock, before either the
-                // metadata or credential transaction can commit. Keep the
-                // explicit default valid instead of failing its reload after
-                // publishing a disabled instance (#1097).
-                if !updated.enabled
-                    && config.default_provider_instance.as_deref() == Some(&instance_id)
-                {
-                    return Err(AppError::BadRequest(format!(
-                        "Cannot disable default provider instance '{instance_id}'; set another enabled provider instance as default first"
-                    )));
-                }
-                config
-                    .provider_instances
-                    .insert(instance_id.clone(), updated);
-                // Ciphertext sync happens centrally in `update_config` via
-                // `Config::refresh_encrypted_secrets` (#515/#516).
-                Ok(())
-            },
-            std::collections::BTreeSet::new(),
-            provider_instance_intents,
-            ConfigUpdateEffects {
-                reload_provider: bamboo_config::patch::ReloadMode::Strict,
-                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
-            },
-        )
-        .await?;
+    let new_config = if has_api_key_intent {
+        app_state
+            .update_config_with_provider_credentials(
+                update,
+                std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::from([instance_id_for_response.clone()]),
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                },
+            )
+            .await?
+    } else {
+        app_state
+            .update_provider_metadata(
+                update,
+                ConfigUpdateEffects {
+                    reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                    reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+                },
+            )
+            .await?
+    };
 
     let updated = new_config
         .provider_instances
@@ -1466,5 +1467,400 @@ mod tests {
             Some("Renamed"),
             "the update itself should still apply"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_updates_ignore_live_core_drift_and_preserve_credentials_after_restart() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        state.stop_config_watcher_for_test();
+        let app_state = web::Data::new(state);
+
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-provider-metadata-secret")),
+        )
+        .await
+        .expect("create should succeed");
+
+        let (instance_id, credential_ref) = {
+            let config = app_state.config.read().await;
+            let (instance_id, instance) = config
+                .provider_instances
+                .iter()
+                .next()
+                .expect("instance exists");
+            (
+                instance_id.clone(),
+                instance
+                    .credential_ref
+                    .clone()
+                    .expect("created credential reference"),
+            )
+        };
+        let facade = app_state
+            .config_facade
+            .as_ref()
+            .expect("modular config facade");
+        let provider_revision = facade.registry().providers.snapshot().revision;
+        let core_revision = facade.registry().core.snapshot().revision;
+        let core_path = temp_dir.path().join("core.json");
+        let core_before = std::fs::read(&core_path).expect("core section exists");
+
+        // Reproduce an environment-materialized Core value that is present in
+        // the process snapshot but does not belong to this Providers request.
+        app_state.config.write().await.server.bind = "0.0.0.0".to_string();
+        let event_baseline = app_state.account_sink.latest_seq();
+
+        update_provider_instance(
+            app_state.clone(),
+            web::Path::from(instance_id.clone()),
+            web::Json(UpdateInstanceRequest {
+                label: Some("Renamed after create".to_string()),
+                enabled: None,
+                config: None,
+            }),
+        )
+        .await
+        .expect("label-only update should ignore Core drift");
+        update_provider_instance(
+            app_state.clone(),
+            web::Path::from(instance_id.clone()),
+            web::Json(UpdateInstanceRequest {
+                label: None,
+                enabled: None,
+                config: Some(serde_json::json!({"model": "custom-model-after-create"})),
+            }),
+        )
+        .await
+        .expect("model-only update should ignore Core drift");
+
+        assert_eq!(
+            std::fs::read(&core_path).expect("core section remains readable"),
+            core_before,
+            "provider metadata updates must not rewrite Core"
+        );
+        assert_eq!(
+            facade.registry().core.snapshot().revision,
+            core_revision,
+            "provider metadata updates must not advance Core"
+        );
+        assert_eq!(
+            facade.registry().providers.snapshot().revision,
+            provider_revision + 2,
+            "each metadata update advances only Providers"
+        );
+        {
+            let config = app_state.config.read().await;
+            let instance = &config.provider_instances[&instance_id];
+            assert_eq!(instance.label.as_deref(), Some("Renamed after create"));
+            assert_eq!(instance.model.as_deref(), Some("custom-model-after-create"));
+            assert_eq!(instance.credential_ref.as_ref(), Some(&credential_ref));
+            assert_eq!(config.server.bind, "0.0.0.0");
+        }
+
+        let events = bamboo_engine::events::journal::read_since(
+            app_state.account_sink.events_dir(),
+            event_baseline,
+        )
+        .expect("config events should be journaled");
+        let provider_revisions = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, revision }
+                | bamboo_agent_core::AgentEvent::ConfigRecovered { section, revision }
+                    if section == "providers" =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_revisions,
+            vec![provider_revision + 1, provider_revision + 2]
+        );
+        assert!(events.iter().all(|event| {
+            !matches!(
+                &event.event,
+                bamboo_agent_core::AgentEvent::ConfigChanged { section, .. }
+                    | bamboo_agent_core::AgentEvent::ConfigRecovered { section, .. }
+                    | bamboo_agent_core::AgentEvent::ConfigInvalid { section, .. }
+                    if section == "core"
+            )
+        }));
+
+        drop(app_state);
+        let restarted = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should restart");
+        let config = restarted.config.read().await;
+        let instance = &config.provider_instances[&instance_id];
+        assert_eq!(instance.label.as_deref(), Some("Renamed after create"));
+        assert_eq!(instance.model.as_deref(), Some("custom-model-after-create"));
+        assert_eq!(instance.credential_ref.as_ref(), Some(&credential_ref));
+        drop(config);
+        assert_eq!(
+            restarted
+                .credential_store
+                .resolve(&credential_ref)
+                .expect("credential lookup")
+                .expect("credential remains configured")
+                .expose(),
+            "sk-provider-metadata-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_metadata_updates_serialize_without_lost_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        state.stop_config_watcher_for_test();
+        let app_state = web::Data::new(state);
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-concurrent-provider-secret")),
+        )
+        .await
+        .expect("create should succeed");
+        let instance_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .next()
+            .cloned()
+            .expect("instance exists");
+        let provider_revision = app_state
+            .config_facade
+            .as_ref()
+            .expect("modular config facade")
+            .registry()
+            .providers
+            .snapshot()
+            .revision;
+
+        let (label_result, model_result) = tokio::join!(
+            update_provider_instance(
+                app_state.clone(),
+                web::Path::from(instance_id.clone()),
+                web::Json(UpdateInstanceRequest {
+                    label: Some("Concurrent label".to_string()),
+                    enabled: None,
+                    config: None,
+                }),
+            ),
+            update_provider_instance(
+                app_state.clone(),
+                web::Path::from(instance_id.clone()),
+                web::Json(UpdateInstanceRequest {
+                    label: None,
+                    enabled: None,
+                    config: Some(serde_json::json!({"model": "concurrent-model"})),
+                }),
+            )
+        );
+        label_result.expect("concurrent label update");
+        model_result.expect("concurrent model update");
+
+        let config = app_state.config.read().await;
+        let instance = &config.provider_instances[&instance_id];
+        assert_eq!(instance.label.as_deref(), Some("Concurrent label"));
+        assert_eq!(instance.model.as_deref(), Some("concurrent-model"));
+        drop(config);
+        assert_eq!(
+            app_state
+                .config_facade
+                .as_ref()
+                .expect("modular config facade")
+                .registry()
+                .providers
+                .snapshot()
+                .revision,
+            provider_revision + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_update_rejects_an_unobserved_external_provider_winner() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        state.stop_config_watcher_for_test();
+        let app_state = web::Data::new(state);
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-provider-cas-secret")),
+        )
+        .await
+        .expect("create should succeed");
+        let instance_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .next()
+            .cloned()
+            .expect("instance exists");
+        let provider_revision = app_state
+            .config_facade
+            .as_ref()
+            .expect("modular config facade")
+            .registry()
+            .providers
+            .snapshot()
+            .revision;
+
+        let external = bamboo_config::ConfigFacade::open(temp_dir.path())
+            .expect("external facade should open");
+        let mut external_candidate = external.effective_config();
+        external_candidate
+            .provider_instances
+            .get_mut(&instance_id)
+            .expect("external instance")
+            .label = Some("External winner".to_string());
+        let external_revision = bamboo_config::persist_provider_credential_transaction_at_revision(
+            temp_dir.path(),
+            &mut external_candidate,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            provider_revision,
+        )
+        .expect("external provider update should win");
+        assert_eq!(external_revision, provider_revision + 1);
+        let providers_path = temp_dir.path().join("providers.json");
+        let external_bytes = std::fs::read(&providers_path).expect("external provider document");
+
+        let error = update_provider_instance(
+            app_state.clone(),
+            web::Path::from(instance_id.clone()),
+            web::Json(UpdateInstanceRequest {
+                label: Some("Stale local loser".to_string()),
+                enabled: None,
+                config: None,
+            }),
+        )
+        .await
+        .expect_err("stale provider metadata update must conflict");
+        assert!(matches!(
+            error,
+            AppError::ConfigConflict { expected, actual }
+                if expected == provider_revision && actual == external_revision
+        ));
+        assert_eq!(
+            std::fs::read(&providers_path).expect("provider document after conflict"),
+            external_bytes,
+            "the stale local writer must not overwrite the external winner"
+        );
+        assert_ne!(
+            app_state.config.read().await.provider_instances[&instance_id]
+                .label
+                .as_deref(),
+            Some("Stale local loser")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_key_replace_and_clear_keep_existing_transaction_semantics() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = AppState::new(temp_dir.path().to_path_buf())
+            .await
+            .expect("app state should initialize");
+        state.stop_config_watcher_for_test();
+        let app_state = web::Data::new(state);
+
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-original-provider-secret")),
+        )
+        .await
+        .expect("first create should succeed");
+        let first_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .next()
+            .cloned()
+            .expect("first instance exists");
+        create_provider_instance(
+            app_state.clone(),
+            web::Json(create_request("sk-secondary-provider-secret")),
+        )
+        .await
+        .expect("second create should succeed");
+        let second_id = app_state
+            .config
+            .read()
+            .await
+            .provider_instances
+            .keys()
+            .find(|id| **id != first_id)
+            .cloned()
+            .expect("second instance exists");
+        set_default_provider_instance(
+            app_state.clone(),
+            web::Json(SetDefaultInstanceRequest {
+                default_provider_instance_id: second_id,
+            }),
+        )
+        .await
+        .expect("secondary instance should become default");
+
+        update_provider_instance(
+            app_state.clone(),
+            web::Path::from(first_id.clone()),
+            web::Json(UpdateInstanceRequest {
+                label: None,
+                enabled: None,
+                config: Some(serde_json::json!({"api_key": "sk-replaced-provider-secret"})),
+            }),
+        )
+        .await
+        .expect("explicit key replacement should succeed");
+        let credential_ref = app_state.config.read().await.provider_instances[&first_id]
+            .credential_ref
+            .clone()
+            .expect("replacement credential reference");
+        assert_eq!(
+            app_state
+                .credential_store
+                .resolve(&credential_ref)
+                .expect("replacement credential lookup")
+                .expect("replacement remains configured")
+                .expose(),
+            "sk-replaced-provider-secret"
+        );
+
+        update_provider_instance(
+            app_state.clone(),
+            web::Path::from(first_id.clone()),
+            web::Json(UpdateInstanceRequest {
+                label: None,
+                enabled: Some(false),
+                config: Some(serde_json::json!({"api_key": null})),
+            }),
+        )
+        .await
+        .expect("explicit key clear should succeed");
+        let config = app_state.config.read().await;
+        let cleared = &config.provider_instances[&first_id];
+        assert!(!cleared.enabled);
+        assert!(cleared.credential_ref.is_none());
+        assert!(cleared.api_key.is_empty());
+        drop(config);
+        assert!(app_state
+            .credential_store
+            .resolve(&credential_ref)
+            .expect("cleared credential lookup")
+            .is_none());
     }
 }
