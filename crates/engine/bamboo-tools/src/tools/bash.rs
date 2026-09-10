@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant};
 
@@ -18,6 +18,27 @@ use super::{bash_runtime, workspace_state};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_CAPTURE_BYTES: usize = 512 * 1024;
+
+/// Read one newline-delimited process output chunk without losing bytes that a
+/// cancelled `read_until` already appended to `pending_bytes`.
+///
+/// `read_until` is cancellation-safe because those bytes remain in the caller's
+/// buffer. A subsequent read at EOF can still return `0`, though, so EOF is only
+/// final when that retained buffer is also empty.
+async fn read_process_line<R>(
+    reader: &mut R,
+    pending_bytes: &mut Vec<u8>,
+) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let bytes_read = reader.read_until(b'\n', pending_bytes).await?;
+    if bytes_read == 0 && pending_bytes.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(decode_process_line_lossy(pending_bytes)))
+}
 
 /// Auto-sync promotion threshold (issue #84, phase 2d). Commands started via the
 /// auto path (`run_in_background` omitted) that are still running after this many
@@ -305,11 +326,10 @@ impl BashTool {
 
             let remaining = effective_deadline.saturating_duration_since(Instant::now());
             tokio::select! {
-                line = stdout_reader.read_until(b'\n', &mut stdout_line_bytes), if !stdout_done => {
+                line = read_process_line(&mut stdout_reader, &mut stdout_line_bytes), if !stdout_done => {
                     match line {
-                        Ok(0) => stdout_done = true,
-                        Ok(_) => {
-                            let line = decode_process_line_lossy(&mut stdout_line_bytes);
+                        Ok(None) => stdout_done = true,
+                        Ok(Some(line)) => {
                             Self::append_capped(&mut stdout_buf, &line, &mut stdout_truncated);
                             if promote_after_ms.is_some() {
                                 Self::push_capped_seed_line(&mut stdout_lines, line.clone());
@@ -321,11 +341,10 @@ impl BashTool {
                         }
                     }
                 }
-                line = stderr_reader.read_until(b'\n', &mut stderr_line_bytes), if !stderr_done => {
+                line = read_process_line(&mut stderr_reader, &mut stderr_line_bytes), if !stderr_done => {
                     match line {
-                        Ok(0) => stderr_done = true,
-                        Ok(_) => {
-                            let line = decode_process_line_lossy(&mut stderr_line_bytes);
+                        Ok(None) => stderr_done = true,
+                        Ok(Some(line)) => {
                             Self::append_capped(&mut stderr_buf, &line, &mut stderr_truncated);
                             if promote_after_ms.is_some() {
                                 Self::push_capped_seed_line(&mut stderr_lines, line.clone());
@@ -666,6 +685,7 @@ mod tests {
     };
     use serde_json::Value;
     use std::collections::HashMap;
+    use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::mpsc;
     use tokio::time::{sleep, Duration, Instant};
 
@@ -720,6 +740,51 @@ mod tests {
             HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
             test_environment_diagnostics(),
         )
+    }
+
+    async fn assert_canceled_partial_line_is_flushed_at_eof(expected: &str) {
+        let (mut writer, reader) = duplex(64);
+        writer.write_all(expected.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut pending_bytes = Vec::new();
+
+        // Poll the read first so it consumes the available non-newline bytes,
+        // then cancel it through the already-ready competing branch while the
+        // writer remains open. This deterministically models the stdout/stderr
+        // select interleaving that exposed #1106.
+        tokio::select! {
+            biased;
+            result = read_process_line(&mut reader, &mut pending_bytes) => {
+                panic!("partial read unexpectedly completed: {result:?}");
+            }
+            _ = std::future::ready(()) => {}
+        }
+
+        assert_eq!(pending_bytes, expected.as_bytes());
+        drop(writer);
+        assert_eq!(
+            read_process_line(&mut reader, &mut pending_bytes)
+                .await
+                .unwrap(),
+            Some(expected.to_string())
+        );
+        assert!(pending_bytes.is_empty());
+        assert_eq!(
+            read_process_line(&mut reader, &mut pending_bytes)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_partial_stdout_is_flushed_when_the_next_read_reaches_eof() {
+        assert_canceled_partial_line_is_flushed_at_eof("stdout-without-newline").await;
+    }
+
+    #[tokio::test]
+    async fn canceled_partial_stderr_is_flushed_when_the_next_read_reaches_eof() {
+        assert_canceled_partial_line_is_flushed_at_eof("stderr-without-newline").await;
     }
 
     #[tokio::test]
@@ -798,6 +863,35 @@ mod tests {
 
         assert!(streamed.iter().any(|line| line.contains("out")));
         assert!(streamed.iter().any(|line| line.contains("err")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn bash_foreground_preserves_stdout_and_stderr_without_trailing_newlines() {
+        let _command_environment = test_command_environment();
+        let tool = BashTool::new();
+        let out = tool
+            .invoke(
+                json!({
+                    "command": "printf 'stdout-without-newline'; printf 'stderr-without-newline' 1>&2",
+                    "run_in_background": false
+                }),
+                ToolCtx::none("t"),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = out else {
+            panic!("expected Completed")
+        };
+
+        assert!(result.success);
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["timed_out"], false);
+        assert_eq!(payload["stdout"], "stdout-without-newline\n");
+        assert_eq!(payload["stderr"], "stderr-without-newline\n");
+        assert_eq!(payload["stdout_truncated"], false);
+        assert_eq!(payload["stderr_truncated"], false);
     }
 
     #[tokio::test]
