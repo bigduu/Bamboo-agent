@@ -37,14 +37,15 @@ jobs:
           node-version: lts/*
 
       - name: Stage frontend package from npm
-        # Embed the published @bigduu/lotus package instead of the committed
-        # crate-owned frontend_package/ zip — the committed copy goes stale
-        # between Lotus releases (the release train passes the exact same-day
-        # version).
+        # Keep the current release-train producer on legacy Lotus until the
+        # independent release-ownership gate in bigduu/Zenith#187 migrates.
+        # The package name is explicit so the repository default can safely be
+        # Lotus Next; remove this override only through that gate.
         # LOTUS_SOURCE=package hard-fails when the npm package is missing, so a
         # fetch failure can never silently fall back to the stale zip.
         env:
           LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
+          LOTUS_PACKAGE_NAME: "@bigduu/lotus"
         run: |
           set -euo pipefail
           npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"

@@ -13,11 +13,9 @@ name: Publish Docker image (GHCR)
 # larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
 # job with docker/setup-qemu-action.)
 #
-# The Lotus frontend is embedded from bamboo-server's crate-owned
-# frontend_package/ directory. Each build job re-stages that directory from
-# the published @bigduu/lotus npm package first, so the image
-# ships the requested (default: newest) frontend instead of whatever zip was
-# last committed — the committed copy goes stale between Lotus releases.
+# The Bamboo repository default is its verified, crate-owned Lotus Next package.
+# The current Docker release producer still stages legacy @bigduu/lotus
+# explicitly until the bigduu/Zenith#187 release-ownership gate is complete.
 
 on:
   workflow_dispatch:
@@ -64,12 +62,14 @@ jobs:
           node-version: lts/*
 
       - name: Stage frontend package from npm
-        # Overwrites the committed crate-owned frontend package in the build
-        # context with a bundle staged from the published npm package. Tag
-        # pushes carry no inputs and stage 'latest'. LOTUS_SOURCE=package
-        # hard-fails when the package is missing instead of falling back.
+        # Preserve the current legacy release producer explicitly while the
+        # repository default moves to the locked Lotus Next artifact. Remove
+        # this override only through bigduu/Zenith#187. Tag pushes carry no
+        # inputs and stage 'latest'. LOTUS_SOURCE=package hard-fails when the
+        # requested package is missing instead of falling back.
         env:
           LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
+          LOTUS_PACKAGE_NAME: "@bigduu/lotus"
         run: |
           set -euo pipefail
           npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
