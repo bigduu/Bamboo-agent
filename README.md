@@ -75,7 +75,7 @@ graph TD
 
 …plus the root `bamboo-agent` binary.
 
-**Place in the Zenith stack:** Bodhi is the Tauri desktop shell that starts or reuses a local `bamboo serve`, waits for `GET /api/v1/health`, and manages the sidecar lifecycle. In packaged builds, Bamboo serves the embedded Lotus frontend. Lotus sends requests over HTTP and receives live events through one shared `/v2/stream` WebSocket by default; the legacy account and session SSE feeds are fallbacks when the v2 transport is explicitly disabled or its initial WebSocket connection cannot be established. Bamboo remains the execution engine. `bodhi-server` is a separate, optional hosted account and provider path; the local Bodhi → Bamboo → Lotus path does not require it.
+**Place in the Zenith stack:** Bodhi is the Tauri desktop shell that starts or reuses a local `bamboo serve`, waits for `GET /api/v1/health`, and manages the sidecar lifecycle. Bamboo now embeds the verified Lotus Next artifact by default; a shell may still provide an explicit external frontend package during the staged migration. Lotus Next sends requests over HTTP and receives live events through one shared `/v2/stream` WebSocket by default; the legacy account and session SSE feeds are fallbacks when the v2 transport is explicitly disabled or its initial WebSocket connection cannot be established. Bamboo remains the execution engine. `bodhi-server` is a separate, optional hosted account and provider path; the local Bodhi → Bamboo → Lotus Next path does not require it.
 
 ---
 
@@ -191,16 +191,38 @@ Arguments supported by `bamboo serve` (all override the config file):
 ### Frontend build contract
 
 Normal Bamboo builds require the staged frontend package owned by
-`crates/app/bamboo-server/frontend_package`. The build validates the sidecar
-manifest, the matching manifest inside the zip, portable archive paths and
-payload integrity, the `index.html` entry, and the manifest hash shape. Missing
-or invalid assets stop the build with an actionable staging instruction instead
-of silently producing an API-only server. Refresh the committed package
-explicitly with:
+`crates/app/bamboo-server/frontend_package`. The repository default is the exact
+`@bigduu/lotus-next` release recorded in `scripts/frontend-package-lock.json`.
+The build validates the sidecar manifest, the matching manifest inside the zip,
+portable archive paths and payload integrity, the `index.html` entry, and the
+manifest hash shape. The staging verifier additionally checks the upstream
+universal manifest, complete resource inventory, per-resource digests, clean
+source revision, and locked package identity. Missing, stale, or invalid assets
+stop the build instead of silently producing an API-only server.
+
+The normal command verifies and reuses those committed bytes without selecting
+an adjacent checkout:
 
 ```bash
 node scripts/frontend-package.cjs stage
 ```
+
+To refresh the lock deliberately, first update and review the lock file, install
+that exact public package, then stage it explicitly:
+
+```bash
+LOTUS_NEXT_VERSION="$(node -p "require('./scripts/frontend-package-lock.json').packageVersion")"
+npm install --no-save --no-package-lock "@bigduu/lotus-next@${LOTUS_NEXT_VERSION}"
+LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
+```
+
+`LOTUS_SOURCE=local` and `stage:prebuilt` remain explicit developer paths for a
+clean, self-identifying Lotus Next build. The crate and Docker release workflows
+temporarily set
+`LOTUS_PACKAGE_NAME=@bigduu/lotus` themselves to preserve the independently
+gated legacy release producer. Remove that compatibility override only through
+the `bigduu/Zenith#187` release-ownership gate; the repository default never
+auto-selects it.
 
 Cargo never runs that staging command implicitly. This removes the previous
 ignored child-process status: explicit local and GitHub Actions callers receive
@@ -222,10 +244,15 @@ $env:BAMBOO_FRONTEND_BUILD_MODE = "api-only"
 cargo build --bin bamboo
 ```
 
-That setting disables only the compiled-in package. Existing runtime frontend
-discovery remains unchanged: `--static-dir`, `BAMBOO_FRONTEND_PACKAGE`, or a
-legacy package candidate beside the working directory/executable can still
-provide a frontend.
+That setting disables only the compiled-in package. At runtime, `--static-dir`
+still has the highest-level static-directory behavior. An explicitly configured
+`BAMBOO_FRONTEND_PACKAGE` takes precedence over the compiled package and fails
+closed when the path, zip, or adjacent sidecar is missing or invalid. Treat that
+variable as the single artifact-level rollback input: it must name a complete,
+known-good Lotus Next zip accompanied by its byte-matching
+`frontend-manifest.json`. Legacy package candidates beside the working directory
+or executable are considered only when no compiled package and no explicit
+package configuration exists.
 
 **Other subcommands** (`bamboo --help` / `bamboo <cmd> --help` for the full list):
 
@@ -432,14 +459,14 @@ cargo build --release
 
 | Module | Role |
 |---|---|
-| [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri desktop shell: starts or reuses Bamboo, waits for health, manages the sidecar lifecycle, and displays Lotus served by Bamboo |
-| [**Lotus**](https://github.com/bigduu/Lotus) | Current React + Vite UI: HTTP requests, shared `/v2/stream` WebSocket by default, legacy SSE fallback |
-| [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | Local-first Rust agent runtime and packaged Lotus host (this repo) |
+| [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri desktop shell: starts or reuses Bamboo, waits for health, manages the sidecar lifecycle, and displays the frontend served by Bamboo |
+| [**Lotus Next**](https://github.com/bigduu/lotus-next) | Canonical React + Vite UI and Bamboo's verified embedded default: HTTP requests, shared `/v2/stream` WebSocket by default, legacy SSE fallback |
+| [**Lotus**](https://github.com/bigduu/Lotus) | Legacy UI retained temporarily as an explicit rollback and release-producer path during the staged migration |
+| [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | Local-first Rust agent runtime and packaged Lotus Next host (this repo) |
 | [**bodhi-server**](https://github.com/bigduu/bodhi-server) | Optional hosted service for accounts, API keys, encrypted provider credentials, model routing, billing/quota, and provider proxy |
 | [**Pavilion**](https://github.com/bigduu/Pavilion) | Official website and documentation surface |
 | [**Jiandu**](https://github.com/bigduu/Jiandu) | Small filesystem-backed shared-memory boundary: Rust library plus stdio MCP server |
 | [**Nova**](https://github.com/bigduu/Nova) | Native computer-use capabilities exposed through MCP |
-| [**Lotus Next**](https://github.com/bigduu/lotus-next) | Experimental next-generation frontend developed alongside Lotus; not the current Bodhi default |
 | [**Magpie**](https://github.com/bigduu/Magpie) | IM connector for Bamboo, available standalone and as a Bamboo service plugin |
 
 **In-module docs:** start at [`docs/README.md`](./docs/README.md) for the full index. Highlights:

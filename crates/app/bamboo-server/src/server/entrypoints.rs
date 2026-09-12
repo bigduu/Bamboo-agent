@@ -17,7 +17,8 @@ use crate::config::{
 };
 use crate::routes::{configure_routes, configure_routes_with_rate_limiting};
 use crate::services::frontend_package::{
-    ensure_current_frontend_dir_in, has_embedded_frontend_package, resolve_frontend_package_path,
+    ensure_current_frontend_dir_in, frontend_package_env_is_configured,
+    has_embedded_frontend_package, resolve_frontend_package_path,
 };
 use bamboo_config::TlsConfig;
 
@@ -64,7 +65,10 @@ fn resolve_runtime_static_dir(
         return Ok(Some(canonicalized));
     }
 
-    if !has_embedded_frontend_package() && resolve_frontend_package_path(None).is_none() {
+    if !has_embedded_frontend_package()
+        && !frontend_package_env_is_configured()
+        && resolve_frontend_package_path(None).is_none()
+    {
         info!("No embedded or sidecar Bamboo frontend package found; starting API-only server");
         return Ok(None);
     }
