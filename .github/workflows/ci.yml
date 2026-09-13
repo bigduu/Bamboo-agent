@@ -43,8 +43,8 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Test frontend artifact verification policy
-        run: node --test scripts/lotus-next-artifact.test.cjs
+      - name: Test frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
         shell: bash
@@ -250,8 +250,8 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Test frontend artifact verification policy
-        run: node --test scripts/lotus-next-artifact.test.cjs
+      - name: Test frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
         shell: bash
