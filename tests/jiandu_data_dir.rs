@@ -71,6 +71,24 @@ fn snapshot_contains(snapshot: &BTreeMap<PathBuf, Vec<u8>>, needle: &[u8]) -> bo
     })
 }
 
+fn strip_ansi_control_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for control in chars.by_ref() {
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 fn seed_auto_permission_mode(data_dir: &Path) {
     let permissions = serde_json::json!({
         "schema_version": 1,
@@ -209,7 +227,7 @@ async fn real_server_writes_only_to_the_explicit_jiandu_root() {
         "the canonical-default sentinel changed despite the explicit override"
     );
 
-    let logs = server.logs();
+    let logs = strip_ansi_control_sequences(&server.logs());
     assert!(logs.contains("selected Jiandu data root"), "{logs}");
     assert!(logs.contains("mode=\"explicit\""), "{logs}");
     assert!(
