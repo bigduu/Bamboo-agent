@@ -218,11 +218,13 @@ LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
 
 `LOTUS_SOURCE=local` and `stage:prebuilt` remain explicit developer paths for a
 clean, self-identifying Lotus Next build. The crate and Docker release workflows
-temporarily set
-`LOTUS_PACKAGE_NAME=@bigduu/lotus` themselves to preserve the independently
-gated legacy release producer. Remove that compatibility override only through
-the `bigduu/Zenith#187` release-ownership gate; the repository default never
-auto-selects it.
+use the same committed Lotus Next lock by default, including tag-triggered
+Docker builds; they never resolve a moving npm `latest` tag. Their
+`frontend_package` input is the single release-time rollback selector. Choosing
+legacy Lotus pins `@bigduu/lotus@2026.8.28`; an unsupported package, `latest`,
+or a version inconsistent with the selected fixed artifact fails before npm
+installation. Remove this transitional legacy choice only after the rollback
+window tracked by `bigduu/Zenith#187` is complete.
 
 Cargo never runs that staging command implicitly. This removes the previous
 ignored child-process status: explicit local and GitHub Actions callers receive
@@ -461,7 +463,7 @@ cargo build --release
 |---|---|
 | [**Bodhi**](https://github.com/bigduu/Bodhi-AI) | Tauri desktop shell: starts or reuses Bamboo, waits for health, manages the sidecar lifecycle, and displays the frontend served by Bamboo |
 | [**Lotus Next**](https://github.com/bigduu/lotus-next) | Canonical React + Vite UI and Bamboo's verified embedded default: HTTP requests, shared `/v2/stream` WebSocket by default, legacy SSE fallback |
-| [**Lotus**](https://github.com/bigduu/Lotus) | Legacy UI retained temporarily as an explicit rollback and release-producer path during the staged migration |
+| [**Lotus**](https://github.com/bigduu/Lotus) | Legacy UI retained temporarily only as an explicit fixed-artifact rollback during the staged migration |
 | [**Bamboo**](https://github.com/bigduu/Bamboo-agent) | Local-first Rust agent runtime and packaged Lotus Next host (this repo) |
 | [**bodhi-server**](https://github.com/bigduu/bodhi-server) | Optional hosted service for accounts, API keys, encrypted provider credentials, model routing, billing/quota, and provider proxy |
 | [**Pavilion**](https://github.com/bigduu/Pavilion) | Official website and documentation surface |

@@ -13,17 +13,25 @@ name: Publish Docker image (GHCR)
 # larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
 # job with docker/setup-qemu-action.)
 #
-# The Bamboo repository default is its verified, crate-owned Lotus Next package.
-# The current Docker release producer still stages legacy @bigduu/lotus
-# explicitly until the bigduu/Zenith#187 release-ownership gate is complete.
+# The Bamboo repository and release producers default to the same verified,
+# crate-owned Lotus Next artifact. Legacy Lotus remains one explicit,
+# fixed-version rollback selection during the bounded migration window.
 
 on:
   workflow_dispatch:
     inputs:
+      frontend_package:
+        description: "Frontend package; legacy Lotus is the explicit fixed-version rollback path"
+        required: true
+        type: choice
+        default: "@bigduu/lotus-next"
+        options:
+          - "@bigduu/lotus-next"
+          - "@bigduu/lotus"
       lotus_version:
-        description: "@bigduu/lotus npm version to embed as the web frontend. 'latest' resolves the newest published version."
+        description: "Exact selected frontend npm version; from_lock uses the committed Lotus Next lock or fixed legacy rollback version"
         required: false
-        default: "latest"
+        default: "from_lock"
         type: string
   push:
     tags:
@@ -61,26 +69,39 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Stage frontend package from npm
-        # Preserve the current legacy release producer explicitly while the
-        # repository default moves to the locked Lotus Next artifact. Remove
-        # this override only through bigduu/Zenith#187. Tag pushes carry no
-        # inputs and stage 'latest'. LOTUS_SOURCE=package hard-fails when the
-        # requested package is missing instead of falling back.
+      - name: Resolve exact release frontend
+        id: frontend
         env:
-          LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
-          LOTUS_PACKAGE_NAME: "@bigduu/lotus"
+          # Tag pushes have no workflow inputs and therefore resolve the
+          # committed Lotus Next lock rather than a moving npm tag.
+          FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
+          FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
+        run: node scripts/release-frontend-policy.cjs
+
+      - name: Stage frontend package from npm
+        # The shared resolver selects the committed Lotus Next lock by default
+        # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
+        # hard-fails when the exact package is missing instead of falling back.
+        env:
+          LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
+          LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
+          EXPECTED_FRONTEND_NAME: ${{ steps.frontend.outputs.frontend_name }}
         run: |
           set -euo pipefail
-          npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
+          npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
           LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
           FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
           test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
           test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
+          EMBEDDED_NAME="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_name")"
           EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
-          echo "Embedded lotus frontend version: ${EMBEDDED}"
-          if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
-            echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"
+          echo "Embedded frontend: ${EMBEDDED_NAME}@${EMBEDDED}"
+          if [ "${EMBEDDED_NAME}" != "${EXPECTED_FRONTEND_NAME}" ]; then
+            echo "::error::Embedded frontend ${EMBEDDED_NAME} does not match expected ${EXPECTED_FRONTEND_NAME}"
+            exit 1
+          fi
+          if [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
+            echo "::error::Embedded frontend version ${EMBEDDED} does not match resolved ${LOTUS_VERSION}"
             exit 1
           fi
 

@@ -13,10 +13,18 @@ on:
         required: false
         default: false
         type: boolean
+      frontend_package:
+        description: "Frontend package; legacy Lotus is the explicit fixed-version rollback path"
+        required: true
+        type: choice
+        default: "@bigduu/lotus-next"
+        options:
+          - "@bigduu/lotus-next"
+          - "@bigduu/lotus"
       lotus_version:
-        description: "@bigduu/lotus npm version to embed as the web frontend (for example: 2026.3.11). 'latest' resolves the newest published version."
+        description: "Exact selected frontend npm version; from_lock uses the committed Lotus Next lock or fixed legacy rollback version"
         required: false
-        default: "latest"
+        default: "from_lock"
         type: string
 
 permissions:
@@ -36,27 +44,38 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Stage frontend package from npm
-        # Keep the current release-train producer on legacy Lotus until the
-        # independent release-ownership gate in bigduu/Zenith#187 migrates.
-        # The package name is explicit so the repository default can safely be
-        # Lotus Next; remove this override only through that gate.
-        # LOTUS_SOURCE=package hard-fails when the npm package is missing, so a
-        # fetch failure can never silently fall back to the stale zip.
+      - name: Resolve exact release frontend
+        id: frontend
         env:
-          LOTUS_VERSION: ${{ github.event.inputs.lotus_version || 'latest' }}
-          LOTUS_PACKAGE_NAME: "@bigduu/lotus"
+          FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
+          FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
+        run: node scripts/release-frontend-policy.cjs
+
+      - name: Stage frontend package from npm
+        # The shared resolver selects the committed Lotus Next lock by default
+        # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
+        # hard-fails when the exact package is missing, so a fetch failure can
+        # never silently fall back to committed or adjacent bytes.
+        env:
+          LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
+          LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
+          EXPECTED_FRONTEND_NAME: ${{ steps.frontend.outputs.frontend_name }}
         run: |
           set -euo pipefail
-          npm install --no-save --no-package-lock "@bigduu/lotus@${LOTUS_VERSION}"
+          npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
           LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
           FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
           test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
           test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
+          EMBEDDED_NAME="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_name")"
           EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
-          echo "Embedded lotus frontend version: ${EMBEDDED}"
-          if [ "${LOTUS_VERSION}" != "latest" ] && [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
-            echo "::error::Embedded lotus version ${EMBEDDED} does not match requested ${LOTUS_VERSION}"
+          echo "Embedded frontend: ${EMBEDDED_NAME}@${EMBEDDED}"
+          if [ "${EMBEDDED_NAME}" != "${EXPECTED_FRONTEND_NAME}" ]; then
+            echo "::error::Embedded frontend ${EMBEDDED_NAME} does not match expected ${EXPECTED_FRONTEND_NAME}"
+            exit 1
+          fi
+          if [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
+            echo "::error::Embedded frontend version ${EMBEDDED} does not match resolved ${LOTUS_VERSION}"
             exit 1
           fi
 
