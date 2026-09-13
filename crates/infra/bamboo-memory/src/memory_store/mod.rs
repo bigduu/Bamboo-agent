@@ -72,7 +72,12 @@ impl MemoryStore {
 
     /// Construct the production store at the independent `~/.jiandu` root.
     pub fn with_defaults() -> Self {
-        Self::new(default_jiandu_data_dir())
+        Self::new(Self::default_data_dir())
+    }
+
+    /// Resolve the canonical production data root used by [`Self::with_defaults`].
+    pub fn default_data_dir() -> PathBuf {
+        dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
     }
 
     /// Bind Project memory to Bamboo's first-class Project identity.
@@ -612,10 +617,6 @@ pub async fn shortlist_relevant_memories(
     .await
 }
 
-fn default_jiandu_data_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +654,7 @@ mod tests {
     fn default_root_is_dot_jiandu_under_home() {
         let expected =
             dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"));
-        assert_eq!(default_jiandu_data_dir(), expected);
+        assert_eq!(MemoryStore::default_data_dir(), expected);
     }
 
     #[tokio::test]
