@@ -138,6 +138,7 @@ bamboo-subagent = { path = "crates/infra/bamboo-subagent" }
 bamboo-broker = { path = "crates/app/bamboo-broker" }
 bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
 bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-memory = { path = "crates/infra/bamboo-memory" }
 bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
 bamboo-tui = { path = "crates/app/bamboo-tui" }
 

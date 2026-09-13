@@ -89,7 +89,7 @@ Jiandu 持有规范持久化、派生索引、词法召回和落盘的 Dream 快
 - **持久记忆** — 原子化的 Global 或一等 Project 事实，包含类型、状态、来源、关系和词法检索元数据。Jiandu 是唯一事实源，不存在 embedding 流水线。
 - **Dream** — 由 Jiandu 持有的 Global 或 Project 派生方向快照，不是规范记忆记录。Bamboo 先抽取事实和 Ledger 候选，再捕获 Jiandu generation、读取规范 `MEMORY.md`、只合成一次，最后请求 Jiandu 通过 compare-and-swap 发布，避免过时任务覆盖新事实。
 
-Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会话和面向未来事项的 Ledger 仍留在 `~/.bamboo`，两套存储不会混在一起。隔离的托管宿主或验收运行可通过 `BAMBOO_JIANDU_DATA_DIR` 为该服务进程指定一个非空绝对路径；无效值会在记忆初始化前终止启动。它只是隔离边界，不是第二种持久化模式或迁移机制，`--data-dir` 仍然只控制 Bamboo 数据。
+Jiandu 默认使用独立的 `~/.jiandu` 数据根目录。Bamboo 配置、会话和面向未来事项的 Ledger 仍留在 `~/.bamboo`，两套存储不会混在一起。隔离的托管宿主或验收运行可通过 `BAMBOO_JIANDU_DATA_DIR` 为服务进程及其生成的每个本地 Bamboo 运行时工作进程指定同一个非空绝对路径；无效值会在服务或工作进程初始化记忆前终止启动。它只是隔离边界，不是第二种持久化模式或迁移机制，`--data-dir` 仍然只控制 Bamboo 数据。
 
 **Gardener（后台园丁）**（`bamboo-engine/src/gardener.rs`）负责拆分多主题 blob 并整合重复项。它有单次运行硬上限，且**当确定性预筛找不到候选时不调用任何 LLM**；只有经过模型审阅的维护决策会产生模型成本。
 

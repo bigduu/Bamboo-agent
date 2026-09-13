@@ -8,36 +8,9 @@ use super::*;
 use crate::tool_event_router::{CombinedToolEventPublisher, ToolEventRouter};
 use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
+#[cfg(not(test))]
+use bamboo_memory::memory_store::{resolve_jiandu_data_root, BAMBOO_JIANDU_DATA_DIR_ENV};
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
-
-const BAMBOO_JIANDU_DATA_DIR_ENV: &str = "BAMBOO_JIANDU_DATA_DIR";
-
-#[derive(Debug, PartialEq, Eq)]
-enum JianduDataRoot {
-    CanonicalDefault,
-    Explicit(PathBuf),
-}
-
-fn resolve_jiandu_data_root(
-    explicit: Option<std::ffi::OsString>,
-) -> Result<JianduDataRoot, String> {
-    let Some(explicit) = explicit else {
-        return Ok(JianduDataRoot::CanonicalDefault);
-    };
-    if explicit.is_empty() {
-        return Err(format!(
-            "{BAMBOO_JIANDU_DATA_DIR_ENV} must be a non-empty absolute path when set"
-        ));
-    }
-
-    let root = PathBuf::from(explicit);
-    if !root.is_absolute() {
-        return Err(format!(
-            "{BAMBOO_JIANDU_DATA_DIR_ENV} must be an absolute path when set"
-        ));
-    }
-    Ok(JianduDataRoot::Explicit(root))
-}
 
 fn default_app_state_memory_store(
     bamboo_home_dir: &std::path::Path,
@@ -58,13 +31,8 @@ fn default_app_state_memory_store(
         let _ = bamboo_home_dir;
         let selection = resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))
             .map_err(|message| AppError::InternalError(anyhow::anyhow!(message)))?;
-        let (mode, root) = match selection {
-            JianduDataRoot::CanonicalDefault => (
-                "default",
-                bamboo_memory::memory_store::MemoryStore::default_data_dir(),
-            ),
-            JianduDataRoot::Explicit(root) => ("explicit", root),
-        };
+        let mode = selection.mode();
+        let root = selection.into_path();
         tracing::info!(
             target: "bamboo.memory",
             mode,
@@ -72,47 +40,6 @@ fn default_app_state_memory_store(
             "selected Jiandu data root"
         );
         Ok(bamboo_memory::memory_store::MemoryStore::new(root))
-    }
-}
-
-#[cfg(test)]
-mod jiandu_data_root_tests {
-    use super::{resolve_jiandu_data_root, JianduDataRoot, BAMBOO_JIANDU_DATA_DIR_ENV};
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-
-    #[test]
-    fn absent_override_selects_the_canonical_default() {
-        assert_eq!(
-            resolve_jiandu_data_root(None).unwrap(),
-            JianduDataRoot::CanonicalDefault
-        );
-    }
-
-    #[test]
-    fn absolute_override_is_preserved_exactly() {
-        let root = std::env::temp_dir().join("bamboo-explicit-jiandu-root");
-        assert!(root.is_absolute());
-        assert_eq!(
-            resolve_jiandu_data_root(Some(root.clone().into_os_string())).unwrap(),
-            JianduDataRoot::Explicit(root)
-        );
-    }
-
-    #[test]
-    fn empty_override_fails_closed() {
-        let error = resolve_jiandu_data_root(Some(OsString::new())).unwrap_err();
-        assert!(error.contains(BAMBOO_JIANDU_DATA_DIR_ENV));
-        assert!(error.contains("non-empty absolute path"));
-    }
-
-    #[test]
-    fn relative_override_fails_closed() {
-        let error =
-            resolve_jiandu_data_root(Some(OsString::from(PathBuf::from("relative/jiandu"))))
-                .unwrap_err();
-        assert!(error.contains(BAMBOO_JIANDU_DATA_DIR_ENV));
-        assert!(error.contains("absolute path"));
     }
 }
 

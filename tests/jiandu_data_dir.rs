@@ -5,12 +5,18 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+
+use bamboo_subagent::discovery::Fabric;
+use bamboo_subagent::provision::{
+    ChildIdentity, ExecutorSpec, ModelRefSpec, ProvisionSpec, ScopedCredential,
+};
 
 const JIANDU_DATA_DIR_ENV: &str = "BAMBOO_JIANDU_DATA_DIR";
 
@@ -233,6 +239,117 @@ async fn real_server_writes_only_to_the_explicit_jiandu_root() {
     assert!(
         logs.contains(&explicit_root.path().display().to_string()),
         "{logs}"
+    );
+}
+
+#[tokio::test]
+async fn real_bamboo_runtime_worker_inherits_the_explicit_jiandu_root() {
+    let run_dir = TempDir::new().expect("isolated worker run directory");
+    let synthetic_home = TempDir::new().expect("synthetic default home");
+    let explicit_root = TempDir::new().expect("explicit Jiandu root");
+    let synthetic_default = synthetic_home.path().join(".jiandu");
+    fs::create_dir_all(&synthetic_default).expect("create synthetic default root");
+    fs::write(synthetic_default.join("sentinel"), b"must-remain-untouched")
+        .expect("write synthetic default sentinel");
+    let default_before = snapshot_files(&synthetic_default);
+
+    let fabric_dir = run_dir.path().join("fabric");
+    let storage_dir = run_dir.path().join("worker-storage");
+    let mut spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: "jiandu-root-worker".to_string(),
+            parent_id: Some("jiandu-root-parent".to_string()),
+            project_key: None,
+            role: "acceptance".to_string(),
+            depth: 0,
+        },
+        ExecutorSpec::BambooRuntime,
+        fabric_dir.to_string_lossy().into_owned(),
+    );
+    spec.storage_dir = Some(storage_dir.to_string_lossy().into_owned());
+    spec.model = Some(ModelRefSpec {
+        provider: "openai".to_string(),
+        model: "synthetic-model".to_string(),
+    });
+    spec.secrets.provider_credentials.push(ScopedCredential {
+        provider: "openai".to_string(),
+        api_key: "not-a-secret".to_string(),
+        base_url: Some("http://127.0.0.1:1/v1".to_string()),
+        provider_type: None,
+        credential_ref: None,
+    });
+
+    let log_path = run_dir.path().join("jiandu-root-worker.log");
+    let stdout = fs::File::create(&log_path).expect("create worker log");
+    let stderr = stdout.try_clone().expect("clone worker log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bamboo"))
+        .arg("subagent-worker")
+        .current_dir(run_dir.path())
+        .env("HOME", synthetic_home.path())
+        .env(JIANDU_DATA_DIR_ENV, explicit_root.path())
+        .env("RUST_LOG", "warn,bamboo.memory=info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn real Bamboo-runtime worker");
+    child
+        .stdin
+        .take()
+        .expect("worker stdin")
+        .write_all(
+            spec.to_json()
+                .expect("serialize worker provision spec")
+                .as_bytes(),
+        )
+        .expect("provision worker over stdin");
+
+    let fabric = Fabric::at(&fabric_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if fabric
+            .resolve("jiandu-root-worker")
+            .await
+            .expect("read worker fabric")
+            .is_some()
+        {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("poll worker") {
+            panic!(
+                "Bamboo-runtime worker exited before registering ({status})\n{}",
+                fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "Bamboo-runtime worker did not register\n{}",
+                fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let logs = strip_ansi_control_sequences(
+        &fs::read_to_string(&log_path).expect("read Bamboo-runtime worker log"),
+    );
+    assert!(
+        logs.contains("selected subagent worker Jiandu data root"),
+        "{logs}"
+    );
+    assert!(logs.contains("mode=\"explicit\""), "{logs}");
+    assert!(
+        logs.contains(&explicit_root.path().display().to_string()),
+        "{logs}"
+    );
+    assert_eq!(
+        snapshot_files(&synthetic_default),
+        default_before,
+        "the worker accessed the canonical-default sentinel despite the explicit override"
     );
 }
 
