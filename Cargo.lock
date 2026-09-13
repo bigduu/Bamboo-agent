@@ -849,6 +849,7 @@ dependencies = [
  "bamboo-infrastructure",
  "bamboo-llm",
  "bamboo-mcp",
+ "bamboo-memory",
  "bamboo-metrics",
  "bamboo-notification",
  "bamboo-projects",

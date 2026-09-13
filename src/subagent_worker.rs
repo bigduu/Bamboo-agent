@@ -28,6 +28,9 @@ use bamboo_domain::{
     SessionRuntimeInstruction,
 };
 use bamboo_llm::{create_provider_by_name, Config, LLMChunk, LLMProvider};
+use bamboo_memory::memory_store::{
+    resolve_jiandu_data_root, MemoryStore, BAMBOO_JIANDU_DATA_DIR_ENV,
+};
 use bamboo_metrics::{MetricsCollector, SqliteMetricsStorage};
 use bamboo_skills::{SkillManager, SkillStoreConfig};
 use bamboo_storage::{LockedSessionStore, SessionStoreV2};
@@ -394,12 +397,41 @@ fn provisioned_permission_resolution(
     capabilities.permission_resolution()
 }
 
+fn bind_worker_session_note(
+    builtin: &bamboo_tools::BuiltinToolExecutor,
+    memory_store: MemoryStore,
+) -> Result<(), String> {
+    if !builtin.registry().unregister("session_note") {
+        return Err("builtin session_note tool is unavailable for Jiandu root binding".to_string());
+    }
+    builtin
+        .register_tool(bamboo_tools::tools::SessionNoteTool::with_memory_store(
+            memory_store,
+        ))
+        .map_err(|error| format!("bind session_note to the worker Jiandu store: {error}"))
+}
+
 impl BambooRuntimeExecutor {
     /// Assemble the isolated runtime: in-memory config + scoped credentials, provider,
     /// isolated storage/skills/metrics, builtin tools — never touching the user's
     /// `~/.bamboo` or persisting any secret.
     pub async fn build(spec: &ProvisionSpec) -> std::result::Result<Self, String> {
         let provisioned_permission = provisioned_permission_resolution(&spec.capabilities)?;
+        // Local actor processes inherit the managed launcher's environment.
+        // Resolve again at the worker boundary, then inject this single store
+        // into both prompt preparation and the worker's session_note tool.
+        let jiandu_selection =
+            resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))?;
+        let jiandu_mode = jiandu_selection.mode();
+        let jiandu_root = jiandu_selection.into_path();
+        tracing::info!(
+            target: "bamboo.memory",
+            worker_id = %spec.identity.child_id,
+            mode = jiandu_mode,
+            root = %jiandu_root.display(),
+            "selected subagent worker Jiandu data root"
+        );
+        let memory_store = MemoryStore::new(jiandu_root);
         let storage_dir = spec.storage_dir.clone().map(PathBuf::from).unwrap_or(
             default_worker_storage_dir(spec.workspace.as_deref(), &spec.identity.child_id).await,
         );
@@ -485,7 +517,7 @@ impl BambooRuntimeExecutor {
 
         let config = Arc::new(tokio::sync::RwLock::new(config));
         let (builtin, permission_config): (
-            Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
+            bamboo_tools::BuiltinToolExecutor,
             Option<Arc<bamboo_tools::permission::PermissionConfig>>,
         ) = if spec.capabilities.enforce_permissions {
             // Phase 6 (#69): enforce permissions so a sub-agent's GATED tools
@@ -517,22 +549,20 @@ impl BambooRuntimeExecutor {
                 ));
             }
             (
-                Arc::new(
-                    bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
-                        config.clone(),
-                        checker,
-                    ),
+                bamboo_tools::BuiltinToolExecutor::new_with_config_and_permissions(
+                    config.clone(),
+                    checker,
                 ),
                 Some(perm_config),
             )
         } else {
             (
-                Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_config(
-                    config.clone(),
-                )),
+                bamboo_tools::BuiltinToolExecutor::new_with_config(config.clone()),
                 None,
             )
         };
+        bind_worker_session_note(&builtin, memory_store.clone())?;
+        let builtin: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(builtin);
         // MCP composition (absent for actor children → builtin-only, unchanged):
         //   1. mcp_proxy set → proxy ALL MCP to the orchestrator over the broker
         //      (it runs the host-bound servers like nova; P2).
@@ -674,6 +704,7 @@ impl BambooRuntimeExecutor {
             .metrics_collector(metrics_collector)
             .config(config)
             .provider(provider)
+            .memory_store(memory_store)
             // Base tools only; the real SubAgent tool is added per-run via
             // `ExecuteRequestBuilder.tools()` (see `run_tools` below) to break
             // the agent→tools→adapter→scheduler→agent construction cycle.
@@ -1830,7 +1861,7 @@ fn build_isolated_config(
 mod tests {
     use super::*;
     use bamboo_agent_core::storage::Storage;
-    use bamboo_agent_core::tools::{ToolCall, ToolError, ToolResult, ToolSchema};
+    use bamboo_agent_core::tools::{ToolCall, ToolCtx, ToolError, ToolResult, ToolSchema};
     use bamboo_subagent::executor::ExecutorControl;
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
@@ -2382,6 +2413,43 @@ mod tests {
             model: m.into(),
         });
         s
+    }
+
+    #[tokio::test]
+    async fn worker_session_note_uses_the_injected_jiandu_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let selected_store = MemoryStore::new(temp.path().join("selected-jiandu"));
+        let builtin = bamboo_tools::BuiltinToolExecutor::new_with_config(Arc::new(
+            tokio::sync::RwLock::new(Config::default()),
+        ));
+        bind_worker_session_note(&builtin, selected_store.clone())
+            .expect("bind worker session_note");
+
+        let tool = builtin
+            .registry()
+            .get("session_note")
+            .expect("bound session_note tool");
+        let mut context = ToolCtx::none("worker-note-call");
+        context.session_id = Some(Arc::from("worker-note-session"));
+        tool.invoke(
+            serde_json::json!({
+                "action": "replace",
+                "topic": "acceptance",
+                "content": "isolated worker note"
+            }),
+            context,
+        )
+        .await
+        .expect("write worker session note");
+
+        assert_eq!(
+            selected_store
+                .read_session_topic("worker-note-session", "acceptance")
+                .await
+                .expect("read injected Jiandu store")
+                .as_deref(),
+            Some("isolated worker note")
+        );
     }
 
     #[test]

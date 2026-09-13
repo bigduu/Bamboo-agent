@@ -1,6 +1,7 @@
 //! Bamboo's narrow native facade over the Jiandu memory store.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 
@@ -49,6 +50,58 @@ pub struct MemoryInspectResult {
     pub topic_paths: Vec<String>,
 }
 
+/// Process-level opt-in used by Bamboo launchers to isolate Jiandu state.
+///
+/// Library callers remain deterministic: [`MemoryStore::with_defaults`] does
+/// not inspect this variable. Process entrypoints must resolve it explicitly
+/// and inject the resulting store into every runtime and tool consumer.
+pub const BAMBOO_JIANDU_DATA_DIR_ENV: &str = "BAMBOO_JIANDU_DATA_DIR";
+
+/// Validated selection of Bamboo's process-wide Jiandu data root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JianduDataRoot {
+    CanonicalDefault,
+    Explicit(PathBuf),
+}
+
+impl JianduDataRoot {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::CanonicalDefault => "default",
+            Self::Explicit(_) => "explicit",
+        }
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        match self {
+            Self::CanonicalDefault => MemoryStore::default_data_dir(),
+            Self::Explicit(root) => root,
+        }
+    }
+}
+
+/// Validate a launcher-provided Jiandu root without reading or mutating the
+/// process environment. An explicitly configured value must be non-empty and
+/// absolute so a managed launch cannot silently escape its run-owned root.
+pub fn resolve_jiandu_data_root(explicit: Option<OsString>) -> Result<JianduDataRoot, String> {
+    let Some(explicit) = explicit else {
+        return Ok(JianduDataRoot::CanonicalDefault);
+    };
+    if explicit.is_empty() {
+        return Err(format!(
+            "{BAMBOO_JIANDU_DATA_DIR_ENV} must be a non-empty absolute path when set"
+        ));
+    }
+
+    let root = PathBuf::from(explicit);
+    if !root.is_absolute() {
+        return Err(format!(
+            "{BAMBOO_JIANDU_DATA_DIR_ENV} must be an absolute path when set"
+        ));
+    }
+    Ok(JianduDataRoot::Explicit(root))
+}
+
 /// Bamboo-facing memory handle. Jiandu remains private so Bamboo callers cannot
 /// bypass the facade's Project identity and inspection extensions.
 #[derive(Debug, Clone)]
@@ -72,7 +125,12 @@ impl MemoryStore {
 
     /// Construct the production store at the independent `~/.jiandu` root.
     pub fn with_defaults() -> Self {
-        Self::new(default_jiandu_data_dir())
+        Self::new(Self::default_data_dir())
+    }
+
+    /// Resolve the canonical production data root used by [`Self::with_defaults`].
+    pub fn default_data_dir() -> PathBuf {
+        dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
     }
 
     /// Bind Project memory to Bamboo's first-class Project identity.
@@ -595,6 +653,47 @@ impl MemoryStore {
     }
 }
 
+#[cfg(test)]
+mod data_root_tests {
+    use super::{resolve_jiandu_data_root, JianduDataRoot, BAMBOO_JIANDU_DATA_DIR_ENV};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn absent_override_selects_the_canonical_default() {
+        assert_eq!(
+            resolve_jiandu_data_root(None).unwrap(),
+            JianduDataRoot::CanonicalDefault
+        );
+    }
+
+    #[test]
+    fn absolute_override_is_preserved_exactly() {
+        let root = std::env::temp_dir().join("bamboo-explicit-jiandu-root");
+        assert!(root.is_absolute());
+        assert_eq!(
+            resolve_jiandu_data_root(Some(root.clone().into_os_string())).unwrap(),
+            JianduDataRoot::Explicit(root)
+        );
+    }
+
+    #[test]
+    fn empty_override_fails_closed() {
+        let error = resolve_jiandu_data_root(Some(OsString::new())).unwrap_err();
+        assert!(error.contains(BAMBOO_JIANDU_DATA_DIR_ENV));
+        assert!(error.contains("non-empty absolute path"));
+    }
+
+    #[test]
+    fn relative_override_fails_closed() {
+        let error =
+            resolve_jiandu_data_root(Some(OsString::from(PathBuf::from("relative/jiandu"))))
+                .unwrap_err();
+        assert!(error.contains(BAMBOO_JIANDU_DATA_DIR_ENV));
+        assert!(error.contains("absolute path"));
+    }
+}
+
 /// Run Jiandu's deterministic lexical shortlist without exposing the composed
 /// store to Bamboo callers.
 pub async fn shortlist_relevant_memories(
@@ -610,10 +709,6 @@ pub async fn shortlist_relevant_memories(
         options,
     )
     .await
-}
-
-fn default_jiandu_data_dir() -> PathBuf {
-    dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
 }
 
 #[cfg(test)]
@@ -653,7 +748,7 @@ mod tests {
     fn default_root_is_dot_jiandu_under_home() {
         let expected =
             dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"));
-        assert_eq!(default_jiandu_data_dir(), expected);
+        assert_eq!(MemoryStore::default_data_dir(), expected);
     }
 
     #[tokio::test]

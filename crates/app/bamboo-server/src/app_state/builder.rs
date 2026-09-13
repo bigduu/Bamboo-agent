@@ -8,19 +8,38 @@ use super::*;
 use crate::tool_event_router::{CombinedToolEventPublisher, ToolEventRouter};
 use crate::tools::OptionalSubagentModelResolver;
 use bamboo_agent_core::storage::Storage;
+#[cfg(not(test))]
+use bamboo_memory::memory_store::{resolve_jiandu_data_root, BAMBOO_JIANDU_DATA_DIR_ENV};
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 
 fn default_app_state_memory_store(
     bamboo_home_dir: &std::path::Path,
-) -> bamboo_memory::memory_store::MemoryStore {
+) -> Result<bamboo_memory::memory_store::MemoryStore, AppError> {
     #[cfg(test)]
     {
-        return bamboo_memory::memory_store::MemoryStore::new(bamboo_home_dir.join("jiandu"));
+        let root = bamboo_home_dir.join("jiandu");
+        tracing::info!(
+            target: "bamboo.memory",
+            mode = "test-isolated",
+            root = %root.display(),
+            "selected Jiandu data root"
+        );
+        Ok(bamboo_memory::memory_store::MemoryStore::new(root))
     }
     #[cfg(not(test))]
     {
         let _ = bamboo_home_dir;
-        bamboo_memory::memory_store::MemoryStore::with_defaults()
+        let selection = resolve_jiandu_data_root(std::env::var_os(BAMBOO_JIANDU_DATA_DIR_ENV))
+            .map_err(|message| AppError::InternalError(anyhow::anyhow!(message)))?;
+        let mode = selection.mode();
+        let root = selection.into_path();
+        tracing::info!(
+            target: "bamboo.memory",
+            mode,
+            root = %root.display(),
+            "selected Jiandu data root"
+        );
+        Ok(bamboo_memory::memory_store::MemoryStore::new(root))
     }
 }
 
@@ -67,7 +86,7 @@ impl AppState {
     /// }
     /// ```
     pub async fn new(bamboo_home_dir: PathBuf) -> Result<Self, AppError> {
-        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
         Self::new_with_memory_store(bamboo_home_dir, memory_store).await
     }
 
@@ -194,7 +213,7 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
-        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
@@ -214,7 +233,7 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
     ) -> Result<Self, AppError> {
-        let memory_store = default_app_state_memory_store(&bamboo_home_dir);
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
