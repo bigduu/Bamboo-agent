@@ -45,6 +45,17 @@ pub(super) fn excerpt_around_match(content: &str, query: &str, max_chars: usize)
     let folded_query = query.to_lowercase();
     let match_char = folded_content
         .find(&folded_query)
+        .or_else(|| {
+            // FTS treats punctuation as token boundaries, so a query such as
+            // `release checklist` can match `release-checklist` without having
+            // one literal span. Anchor on the longest query token in that case
+            // so a long authoritative message still previews the real hit.
+            query
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .max_by_key(|part| part.chars().count())
+                .and_then(|part| folded_content.find(&part.to_lowercase()))
+        })
         .map(|byte| folded_content[..byte].chars().count())
         .unwrap_or(0);
     let query_chars = query.chars().count();

@@ -201,6 +201,14 @@ async fn search_current_validates_queries_and_bounds_the_result_page() {
             "BOUNDED-SEARCH-SENTINEL historical item {index}"
         )));
     }
+    session.add_message(Message::assistant(
+        format!(
+            "{} release-checklist contains the historical deployment steps",
+            "old analysis ".repeat(100)
+        ),
+        None,
+    ));
+    session.add_message(Message::user("Search my prior history now"));
     store.save_session(&session).await.unwrap();
     let tool = SessionInspectorTool::self_only(store.clone(), store);
 
@@ -219,6 +227,20 @@ async fn search_current_validates_queries_and_bounds_the_result_page() {
     assert_eq!(bounded["limit"], 50);
     assert_eq!(bounded["match_count"], 50);
     assert_eq!(bounded["matches"].as_array().unwrap().len(), 50);
+
+    let lexical = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "release checklist"}),
+            context(&session.id, "lexical-preview-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(lexical["match_count"], 1);
+    assert!(lexical["matches"][0]["content_preview"]
+        .as_str()
+        .unwrap()
+        .contains("release-checklist"));
 
     for invalid_query in [String::new(), "x".repeat(513)] {
         let error = tool
