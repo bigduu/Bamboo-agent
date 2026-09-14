@@ -108,7 +108,7 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
     );
 
     assert_eq!(result["session_id"], current.id);
-    assert_eq!(result["searched_before_message_index"], 3);
+    assert_eq!(result["searched_before_message_index"], 4);
     assert_eq!(result["match_count"], 1);
     assert_eq!(
         result["matches"][0]["id"],
@@ -132,6 +132,92 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
         after, before,
         "history search must not mutate compressed flags, events, summary, accounting, or context state"
     );
+}
+
+#[tokio::test]
+async fn search_current_recovers_compressed_messages_from_the_current_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let query = "MID-TURN-COMPRESSED-SENTINEL";
+    let mut session = Session::new("mid-turn-compression-session", "test-model");
+
+    let mut current_request = Message::user(format!("Please recover {query} from this turn"));
+    current_request.id = "mid-turn-current-request".to_string();
+    session.add_message(current_request);
+
+    let mut compressed_assistant = Message::assistant(
+        format!("{query}: exact detail archived by host compression"),
+        Some(vec![ToolCall {
+            id: "mid-turn-other-tool".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: json!({"path": "/tmp/example"}).to_string(),
+            },
+        }]),
+    );
+    compressed_assistant.id = "mid-turn-compressed-assistant".to_string();
+    compressed_assistant.compressed = true;
+    compressed_assistant.compressed_by_event_id = Some("mid-turn-compression-event".to_string());
+    session.add_message(compressed_assistant);
+
+    let mut compressed_tool_result = Message::tool_result(
+        "mid-turn-other-tool",
+        format!("{query}: exact tool detail archived by host compression"),
+    );
+    compressed_tool_result.id = "mid-turn-compressed-tool-result".to_string();
+    compressed_tool_result.compressed = true;
+    compressed_tool_result.compressed_by_event_id = Some("mid-turn-compression-event".to_string());
+    session.add_message(compressed_tool_result);
+
+    let mut current_call =
+        Message::assistant("", Some(vec![history_call("mid-turn-search", query)]));
+    current_call.id = "mid-turn-current-search-call".to_string();
+    session.add_message(current_call);
+    store.save_session(&session).await.unwrap();
+    let before = serde_json::to_value(store.load_session(&session.id).await.unwrap().unwrap())
+        .expect("serialize before state");
+
+    let tool = SessionInspectorTool::self_only(store.clone(), store.clone());
+    let result = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": query}),
+            context(&session.id, "mid-turn-search"),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(result["searched_before_message_index"], 3);
+    assert_eq!(result["match_count"], 2);
+    let matched_ids = result["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        matched_ids,
+        std::collections::HashSet::from([
+            "mid-turn-compressed-assistant",
+            "mid-turn-compressed-tool-result",
+        ])
+    );
+    assert!(result["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["compressed"] == true));
+    assert!(!result.to_string().contains("mid-turn-current-request"));
+    assert!(!result.to_string().contains("mid-turn-current-search-call"));
+
+    let after = serde_json::to_value(store.load_session(&session.id).await.unwrap().unwrap())
+        .expect("serialize after state");
+    assert_eq!(after, before, "mid-turn history search must be read-only");
 }
 
 #[tokio::test]

@@ -27,7 +27,7 @@ fn is_search_current_call(call: &bamboo_agent_core::ToolCall) -> bool {
         })
 }
 
-fn history_search_boundary(session: &Session, tool_call_id: &str) -> usize {
+fn history_search_boundary(session: &Session, tool_call_id: &str) -> (usize, Option<usize>) {
     let Some(call_index) = session.messages.iter().rposition(|message| {
         message
             .tool_calls
@@ -37,21 +37,30 @@ fn history_search_boundary(session: &Session, tool_call_id: &str) -> usize {
         // Standalone tool execution does not persist the generated call in the
         // Session transcript. In that path every stored message is completed
         // history, so do not discard the latest turn.
-        return session.messages.len();
+        return (session.messages.len(), None);
     };
 
-    // The latest User message starts the current turn and commonly repeats the
-    // search terms. The model already has this turn in context, so exclude it
-    // and every current-turn tool exchange from a historical search.
-    session.messages[..call_index]
+    // The latest User message is the current request and commonly repeats the
+    // search terms. Exclude that one message explicitly instead of using it as
+    // the transcript boundary: host compression can archive earlier assistant
+    // and tool messages from the same long-running turn, and those messages
+    // must remain recoverable through self-history search.
+    let current_request_index = session.messages[..call_index]
         .iter()
-        .rposition(|message| message.role == Role::User)
-        .unwrap_or(call_index)
+        .rposition(|message| message.role == Role::User);
+    (call_index, current_request_index)
 }
 
-fn generated_search_message_ids(session: &Session, before: usize) -> Vec<String> {
+fn excluded_search_message_ids(
+    session: &Session,
+    before: usize,
+    current_request_index: Option<usize>,
+) -> Vec<String> {
     let mut call_ids = HashSet::new();
     let mut message_ids = HashSet::new();
+    if let Some(message) = current_request_index.and_then(|index| session.messages.get(index)) {
+        message_ids.insert(message.id.as_str());
+    }
     for message in session.messages.iter().take(before) {
         let generated = message.tool_calls.as_ref().is_some_and(|calls| {
             let mut generated = false;
@@ -131,8 +140,10 @@ pub(super) async fn handle_search_current(
     // and generated-result exclusions. Search authorization itself comes only
     // from `caller_session_id`, which ToolCtx supplied.
     let session = tool.load_session(caller_session_id).await?;
-    let before_message_index = history_search_boundary(&session, current_tool_call_id);
-    let excluded_message_ids = generated_search_message_ids(&session, before_message_index);
+    let (before_message_index, current_request_index) =
+        history_search_boundary(&session, current_tool_call_id);
+    let excluded_message_ids =
+        excluded_search_message_ids(&session, before_message_index, current_request_index);
     let excluded = excluded_message_ids
         .iter()
         .map(String::as_str)
