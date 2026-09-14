@@ -258,7 +258,7 @@ async fn search_current_validates_queries_and_bounds_the_result_page() {
     ));
     session.add_message(Message::user("Search my prior history now"));
     store.save_session(&session).await.unwrap();
-    let tool = SessionInspectorTool::self_only(store.clone(), store);
+    let tool = SessionInspectorTool::self_only(store.clone(), store.clone());
 
     let bounded = completed(
         tool.invoke(
@@ -286,6 +286,26 @@ async fn search_current_validates_queries_and_bounds_the_result_page() {
     );
     assert_eq!(lexical["match_count"], 1);
     assert!(lexical["matches"][0]["content_preview"]
+        .as_str()
+        .unwrap()
+        .contains("release-checklist"));
+
+    store
+        .search_index()
+        .delete_session(&session.id)
+        .await
+        .unwrap();
+    let lexical_fallback = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "release checklist"}),
+            context(&session.id, "lexical-fallback-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(lexical_fallback["search_backend"], "session_json_fallback");
+    assert_eq!(lexical_fallback["match_count"], 1);
+    assert!(lexical_fallback["matches"][0]["content_preview"]
         .as_str()
         .unwrap()
         .contains("release-checklist"));

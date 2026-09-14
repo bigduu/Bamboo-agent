@@ -226,7 +226,7 @@ pub(super) async fn handle_search_current(
             }
             if excluded.contains(message.id.as_str())
                 || seen.contains(&message.id)
-                || !normalize_contains(&message.content, query, false)
+                || !search_content_matches(&message.content, query)
             {
                 continue;
             }
