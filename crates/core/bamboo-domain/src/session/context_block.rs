@@ -79,6 +79,11 @@ pub enum ContextBlockType {
     Base,
     /// Framework-invariant operating directives folded on top of base.
     CoreDirectives,
+    /// Authoritative identity of the Session currently executing the model.
+    ///
+    /// This is model-visible, but never an authorization input: runtime tools
+    /// must continue to scope access from their host-provided execution context.
+    SessionIdentity,
     Workspace,
     /// Per-round Project-shared resource inventory. Project identity itself is
     /// carried by the stable Project marker in the system prompt.
@@ -107,6 +112,7 @@ impl ContextBlockType {
         match self {
             Self::Base => "base",
             Self::CoreDirectives => "core_directives",
+            Self::SessionIdentity => "session_identity",
             Self::Workspace => "workspace",
             Self::ProjectResources => "project_resources",
             Self::InstructionOverlay => "instruction_overlay",

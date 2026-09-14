@@ -516,6 +516,8 @@ impl AppState {
             mcp_manager.clone(),
             skill_manager.clone(),
             session_repo.clone(),
+            session_store.clone(),
+            storage.clone(),
             bamboo_home_dir.clone(),
             notification_service.clone(),
             session_event_senders.clone(),

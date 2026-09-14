@@ -242,6 +242,19 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("session_note"));
+
+    let history = state
+        .tools_for(ToolSurface::Root)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Root history schema");
+    let actions = history.function.parameters["properties"]["action"]["enum"]
+        .as_array()
+        .expect("Root history actions");
+    assert!(actions.contains(&json!("search_current")));
+    assert!(actions.contains(&json!("list")));
+    assert!(actions.contains(&json!("read_messages")));
 }
 
 #[tokio::test]
@@ -279,26 +292,92 @@ async fn root_catalog_classifies_exactly_five_callable_core_functions() {
 }
 
 #[tokio::test]
-async fn child_tools_exclude_scheduler_and_session_history() {
+async fn child_tools_include_only_self_scoped_session_history() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
         .expect("app state should initialize");
-    let names: std::collections::HashSet<String> = state
-        .tools_for(ToolSurface::Child)
-        .list_tools()
-        .into_iter()
-        .map(|schema| schema.function.name)
-        .collect();
+    let tools = state.tools_for(ToolSurface::Child).list_tools();
+    let names = tools
+        .iter()
+        .map(|schema| schema.function.name.clone())
+        .collect::<std::collections::HashSet<_>>();
 
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
-    assert!(!names.contains("session_history"));
+    assert!(names.contains("session_history"));
     assert!(!names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
     assert!(names.contains("read_skill_resource"));
     assert!(names.contains("session_note"));
+
+    let history = tools
+        .iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Child history schema");
+    assert_eq!(
+        history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current"])
+    );
+    assert!(history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
+    let base_history = state
+        .tools_for(ToolSurface::Base)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history")
+        .expect("Base history schema");
+    assert_eq!(
+        base_history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current"])
+    );
+    assert!(base_history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
+
+    let mut child_session = Session::new("child-history-surface", "test-model");
+    child_session.add_message(bamboo_agent_core::Message::user(
+        "CHILD-SELF-HISTORY-SENTINEL",
+    ));
+    child_session.add_message(bamboo_agent_core::Message::assistant(
+        "Stored answer from the prior turn",
+        None,
+    ));
+    child_session.add_message(bamboo_agent_core::Message::user(
+        "Search the prior turn now",
+    ));
+    state
+        .session_store
+        .save_session(&child_session)
+        .await
+        .unwrap();
+    let search_call = make_tool_call(
+        "session_history",
+        json!({"action": "search_current", "query": "CHILD-SELF-HISTORY-SENTINEL"}),
+    );
+    let mut context = ToolExecutionContext::none(&search_call.id);
+    context.session_id = Some(&child_session.id);
+    let result = state
+        .tools_for(ToolSurface::Child)
+        .execute_with_context(&search_call, context)
+        .await
+        .expect("Child self-history search succeeds");
+    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result["session_id"], child_session.id);
+    assert_eq!(result["match_count"], 1);
+
+    let list_call = make_tool_call("session_history", json!({"action": "list"}));
+    let mut context = ToolExecutionContext::none(&list_call.id);
+    context.session_id = Some(&child_session.id);
+    assert!(matches!(
+        state
+            .tools_for(ToolSurface::Child)
+            .execute_with_context(&list_call, context)
+            .await,
+        Err(ToolError::InvalidArguments(message)) if message.contains("only permits")
+    ));
 }
 
 #[tokio::test]
