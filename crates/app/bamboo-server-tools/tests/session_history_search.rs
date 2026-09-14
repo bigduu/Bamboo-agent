@@ -135,6 +135,54 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
 }
 
 #[tokio::test]
+async fn search_current_without_persisted_call_searches_latest_completed_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let query = "LATEST-STANDALONE-SEARCH-SENTINEL";
+    let mut session = Session::new("standalone-search-session", "test-model");
+    let mut latest_user = Message::user(format!("{query}: latest completed user message"));
+    latest_user.id = "latest-completed-user-message".to_string();
+    session.add_message(latest_user);
+    let mut latest_assistant = Message::assistant(
+        format!("{query}: latest completed assistant response"),
+        None,
+    );
+    latest_assistant.id = "latest-completed-assistant-message".to_string();
+    session.add_message(latest_assistant);
+    store.save_session(&session).await.unwrap();
+
+    let tool = SessionInspectorTool::self_only(store.clone(), store);
+    let result = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": query}),
+            context(&session.id, "standalone-call-not-in-transcript"),
+        )
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(result["searched_before_message_index"], 2);
+    assert_eq!(result["match_count"], 2);
+    let matched_ids = result["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        matched_ids,
+        std::collections::HashSet::from([
+            "latest-completed-user-message",
+            "latest-completed-assistant-message",
+        ])
+    );
+}
+
+#[tokio::test]
 async fn self_only_schema_and_invoke_fail_closed_while_full_surface_keeps_root_actions() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(

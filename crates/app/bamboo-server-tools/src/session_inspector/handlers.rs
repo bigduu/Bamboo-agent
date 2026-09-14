@@ -28,16 +28,17 @@ fn is_search_current_call(call: &bamboo_agent_core::ToolCall) -> bool {
 }
 
 fn history_search_boundary(session: &Session, tool_call_id: &str) -> usize {
-    let call_index = session
-        .messages
-        .iter()
-        .rposition(|message| {
-            message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call_id))
-        })
-        .unwrap_or(session.messages.len());
+    let Some(call_index) = session.messages.iter().rposition(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call_id))
+    }) else {
+        // Standalone tool execution does not persist the generated call in the
+        // Session transcript. In that path every stored message is completed
+        // history, so do not discard the latest turn.
+        return session.messages.len();
+    };
 
     // The latest User message starts the current turn and commonly repeats the
     // search terms. The model already has this turn in context, so exclude it
