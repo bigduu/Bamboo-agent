@@ -720,13 +720,24 @@ fn quoted_fts_term(column: &str, value: &str) -> String {
     format!("{column} : \"{escaped}\"")
 }
 
+/// Mirror original-content validation by treating punctuation as a token
+/// boundary and ANDing each safe prefix. Quoting keeps all user input data,
+/// while independent terms avoid narrowing token-AND matches to a phrase.
+fn current_session_unicode_prefix_terms(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("{}*", quoted_fts_term("content", term)))
+        .collect()
+}
+
 fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
     if !query.chars().any(is_cjk_scalar) {
-        let has_indexable_text = query.chars().any(char::is_alphanumeric);
+        let terms = current_session_unicode_prefix_terms(query);
         return SessionMessageQueryPlan {
-            fts_query: has_indexable_text.then(|| build_safe_fts_query(query)),
+            fts_query: (!terms.is_empty()).then(|| terms.join(" AND ")),
             fts_match_source: "fts_unicode",
-            needs_literal_fallback: !has_indexable_text,
+            needs_literal_fallback: terms.is_empty(),
         };
     }
 
@@ -758,11 +769,7 @@ fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
                 );
             }
         } else {
-            unicode_terms.extend(
-                run.split_whitespace()
-                    .filter(|term| term.chars().any(char::is_alphanumeric))
-                    .map(|term| format!("{}*", quoted_fts_term("content", term))),
-            );
+            unicode_terms.extend(current_session_unicode_prefix_terms(&run));
         }
     }
 
@@ -1252,25 +1259,6 @@ fn build_message_fts_query(query: &str) -> String {
     format!("content : ({})", build_fts_query(query))
 }
 
-/// Treat every current-Session search term as data rather than FTS syntax.
-///
-/// This intentionally does not alter the legacy cross-Session search parser.
-fn build_safe_fts_query(query: &str) -> String {
-    let parts = query
-        .split_whitespace()
-        .map(|part| {
-            let escaped = part.replace('"', "\"\"");
-            format!("\"{escaped}\"*")
-        })
-        .collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        "\"\"".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,8 +1313,8 @@ mod tests {
         let mixed = session_message_query_plan("压缩 context-v2");
         let expression = mixed.fts_query.as_deref().unwrap();
         assert!(expression.contains("content_cjk_bigrams : \"压缩\""));
-        assert!(!expression.contains("content : \" context-v2\"*"));
-        assert!(expression.contains("content : \"context-v2\"*"));
+        assert!(expression.contains("content : \"context\"*"));
+        assert!(expression.contains("content : \"v2\"*"));
         assert!(!mixed.needs_literal_fallback);
 
         let single = session_message_query_plan("压");
@@ -1336,8 +1324,9 @@ mod tests {
         let syntax = session_message_query_plan("a OR NEAR(foo) \"quoted\"");
         let syntax = syntax.fts_query.unwrap();
         assert!(syntax.contains("\"OR\"*"));
-        assert!(syntax.contains("\"NEAR(foo)\"*"));
-        assert!(syntax.contains("\"\"quoted\"\"\"*"));
+        assert!(syntax.contains("\"NEAR\"*"));
+        assert!(syntax.contains("\"foo\"*"));
+        assert!(syntax.contains("\"quoted\"*"));
     }
 
     #[tokio::test]
@@ -1386,6 +1375,10 @@ mod tests {
             (
                 "identifier-path",
                 "release_checklist_v2 lives at /tmp/release-checklist.md",
+            ),
+            (
+                "punctuated-token-and",
+                "alpha notes eventually mention marker",
             ),
         ] {
             let mut message = Message::user(content);
@@ -1470,6 +1463,15 @@ mod tests {
             assert_eq!(page.matches[0].match_source, "fts_unicode");
             assert!(!page.used_literal_fallback);
         }
+
+        let punctuated = index
+            .search_messages_in_session(&session.id, "alpha_marker", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(punctuated.matches.len(), 1);
+        assert_eq!(punctuated.matches[0].message_id, "punctuated-token-and");
+        assert_eq!(punctuated.matches[0].match_source, "fts_unicode");
+        assert!(!punctuated.used_literal_fallback);
     }
 
     #[tokio::test]
