@@ -496,12 +496,19 @@ ORDER BY session_messages_search_fts.rank
 LIMIT ?2
 "#;
 
+// The projection FTS is candidate-only. Its helper-token document lengths must
+// never influence relevance, so rank comes from the canonical content-only FTS
+// when the original token-prefix query is representable there. Helper-only
+// substring hits retain a NULL rank and fall through to deterministic recency.
 const SESSION_MESSAGE_SEARCH_SQL: &str = r#"
 SELECT
     m.message_id,
     m.message_index,
     m.role,
-    bm25(session_messages_current_search_fts) AS rank,
+    (SELECT bm25(session_messages_search_fts)
+     FROM session_messages_search_fts
+     WHERE session_messages_search_fts MATCH ?6
+       AND session_messages_search_fts.rowid = m.search_rowid) AS rank,
     m.content,
     m.compressed,
     m.created_at,
@@ -516,7 +523,7 @@ WHERE session_messages_current_search_fts MATCH ?1
   AND m.message_index < ?3
   AND m.history_search_artifact = 0
   AND bamboo_session_match_class(m.content, ?4) > 0
-ORDER BY match_class DESC, session_messages_current_search_fts.rank, m.message_index DESC
+ORDER BY match_class DESC, rank IS NULL, rank, m.message_index DESC
 LIMIT ?5
 "#;
 
@@ -1080,6 +1087,8 @@ fn search_session_messages_snapshot(
     // page with literal hits could otherwise let lower-ranked prefix matches
     // fill LIMIT before a higher-ranked literal match is considered.
     if let (false, Some(fts_query)) = (plan.needs_literal_fallback, &plan.fts_query) {
+        let canonical_rank_query = current_session_unicode_prefix_terms(query).join(" AND ");
+        debug_assert!(!canonical_rank_query.is_empty());
         let mut fts_stmt = conn.prepare(SESSION_MESSAGE_SEARCH_SQL).map_err(|error| {
             to_io_error(format!(
                 "sqlite prepare session-scoped FTS message search failed: {error}"
@@ -1092,7 +1101,8 @@ fn search_session_messages_snapshot(
                     session_id,
                     before_message_index,
                     query,
-                    candidate_limit as i64
+                    candidate_limit as i64,
+                    canonical_rank_query
                 ],
                 |row| {
                     let created_at_raw: String = row.get(6)?;
@@ -1111,7 +1121,7 @@ fn search_session_messages_snapshot(
                         message_id: row.get(0)?,
                         message_index: row.get::<_, i64>(1)?.max(0) as usize,
                         role: row.get(2)?,
-                        rank: Some(row.get(3)?),
+                        rank: row.get(3)?,
                         content_preview: literal_excerpt(&content, query, 600),
                         compressed: row.get::<_, i64>(5)? != 0,
                         created_at,
@@ -2247,7 +2257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_message_rank_excludes_current_session_helper_projection_lengths() {
+    async fn message_rank_excludes_current_session_helper_projection_lengths() {
         let temp = TempDir::new().unwrap();
         let index = SessionSearchIndex::new(temp.path().join("search.db"));
         index.init().await.unwrap();
@@ -2284,6 +2294,17 @@ mod tests {
         let results = index.search("needle", 1).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_id.as_deref(), Some("canonical-short"));
+
+        let current_session = index
+            .search_messages_in_session(&session.id, "needle", usize::MAX, &[], 1)
+            .await
+            .unwrap();
+        assert_eq!(current_session.matches.len(), 1);
+        assert_eq!(
+            current_session.matches[0].message_id, "canonical-short",
+            "current-Session candidates must rank against canonical content, not helper grams"
+        );
+        assert!(current_session.matches[0].rank.is_some());
     }
 
     #[tokio::test]
