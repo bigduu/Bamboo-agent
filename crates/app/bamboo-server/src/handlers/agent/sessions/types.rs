@@ -128,6 +128,12 @@ pub struct SessionSummary {
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
     pub running_child_count: u32,
+    /// Total number of child sessions in this root session's flattened tree.
+    ///
+    /// This lets list clients render an expansion affordance without eagerly
+    /// loading every child summary. Child sessions report zero.
+    #[serde(default)]
+    pub subagent_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gold_config: Option<GoldConfig>,
     /// Compatibility indicator for clients that predate typed permission
@@ -203,6 +209,7 @@ impl SessionSummary {
             plan_mode: entry.plan_mode,
             active_workflow: None,
             running_child_count: 0,
+            subagent_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions
                 || permission_mode != bamboo_domain::SessionPermissionMode::Default,
@@ -224,7 +231,7 @@ pub(crate) fn local_placement() -> SessionPlacement {
 
 /// Query parameters for `GET /api/v1/sessions`.
 ///
-/// Both are optional so existing clients that omit them stay working: the
+/// All fields are optional so existing clients that omit them stay working: the
 /// server applies a bounded default page instead of materializing every session
 /// (the index grows without limit as session count grows forever — #252).
 #[derive(Debug, Default, Deserialize)]
@@ -236,6 +243,12 @@ pub struct ListSessionsQuery {
     /// Number of (newest-first) sessions to skip before this page. Omitted → 0.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Optional session-kind filter, applied before pagination.
+    #[serde(default)]
+    pub kind: Option<bamboo_agent_core::SessionKind>,
+    /// Optional flattened tree-root filter, applied before pagination.
+    #[serde(default)]
+    pub root_session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -635,6 +648,7 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             running_child_count: 0,
+            subagent_count: 0,
             gold_config: None,
         };
 
@@ -686,6 +700,7 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             running_child_count: 0,
+            subagent_count: 0,
             gold_config: None,
         };
 
@@ -824,6 +839,7 @@ mod tests {
             plan_mode: None,
             active_workflow: None,
             running_child_count: 0,
+            subagent_count: 0,
             gold_config: None,
         };
 
