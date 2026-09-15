@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use actix_web::{web, HttpResponse, Result};
+use bamboo_agent_core::SessionKind;
 
 use crate::app_state::AppState;
 
@@ -39,7 +40,15 @@ pub async fn list_sessions(
     // parent's running children may land on a different page, so this count must
     // not be paginated or it would be wrong for parents shown on this page.
     let mut running_child_counts: HashMap<String, u32> = HashMap::new();
+    // Root rows also need the flattened tree size before filtering and
+    // pagination. Clients use this count to decide whether to hydrate a tree.
+    let mut subagent_counts: HashMap<String, u32> = HashMap::new();
     for entry in &entries {
+        if entry.kind == SessionKind::Child {
+            *subagent_counts
+                .entry(entry.root_session_id.clone())
+                .or_insert(0) += 1;
+        }
         if running.contains(&entry.id) {
             if let Some(parent_id) = &entry.parent_session_id {
                 *running_child_counts.entry(parent_id.clone()).or_insert(0) += 1;
@@ -47,14 +56,28 @@ pub async fn list_sessions(
         }
     }
 
-    // Server-enforced pagination bounds the response so the list stays finite as
-    // session count grows (#252). `list_index_entries` is already sorted
-    // newest-first, giving a deterministic page order.
-    let total = entries.len();
+    // Filter before applying the page window. Otherwise a recent child-heavy
+    // tree can consume the page and hide ordinary root conversations.
+    // `list_index_entries` is already newest-first, so retaining matches keeps
+    // the existing deterministic order.
+    let filtered_entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| query.kind.is_none_or(|kind| entry.kind == kind))
+        .filter(|entry| {
+            query
+                .root_session_id
+                .as_deref()
+                .is_none_or(|root_session_id| entry.root_session_id == root_session_id)
+        })
+        .collect();
+
+    // Server-enforced pagination bounds the filtered response so both root and
+    // tree queries stay finite as the session index grows (#252).
+    let total = filtered_entries.len();
     let limit = clamp_page_size(query.limit);
     let offset = query.offset.unwrap_or(0).min(total);
 
-    let sessions: Vec<SessionSummary> = entries
+    let sessions: Vec<SessionSummary> = filtered_entries
         .into_iter()
         .skip(offset)
         .take(limit)
@@ -63,6 +86,7 @@ pub async fn list_sessions(
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count =
                 running_child_counts.get(&summary.id).copied().unwrap_or(0);
+            summary.subagent_count = subagent_counts.get(&summary.id).copied().unwrap_or(0);
             summary
         })
         .collect();
@@ -96,8 +120,15 @@ pub async fn get_session(
                     e.parent_session_id.as_ref() == Some(&session_id) && running.contains(&e.id)
                 })
                 .count() as u32;
+            let subagent_count = all_entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == SessionKind::Child && entry.root_session_id == session_id
+                })
+                .count() as u32;
             let mut summary = SessionSummary::from_entry(entry, is_running);
             summary.running_child_count = running_child_count;
+            summary.subagent_count = subagent_count;
 
             // Load the authoritative session once for both its ETag and the
             // public-safe active Workflow identity. The index deliberately
@@ -306,6 +337,116 @@ mod pagination_http_tests {
         assert_eq!(page2["offset"], 2);
         assert_eq!(page2["sessions"].as_array().unwrap().len(), 1);
         assert!(page2.get("next_offset").is_none() || page2["next_offset"].is_null());
+    }
+
+    /// Kind/tree filters must run before pagination. Recent descendants cannot
+    /// evict roots from a root page, and clients can hydrate one flattened tree
+    /// without loading unrelated child summaries.
+    #[actix_web::test]
+    async fn list_sessions_filters_roots_and_lazy_tree_children_before_pagination() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+
+        for id in ["root-a", "root-b", "root-c"] {
+            let mut root = Session::new(id, "model");
+            state.save_and_cache_session(&mut root).await;
+        }
+
+        let mut child_a = Session::new_child("child-a", "root-a", "model", "Child A");
+        state.save_and_cache_session(&mut child_a).await;
+        let mut child_b = Session::new_child("child-b", "root-b", "model", "Child B");
+        state.save_and_cache_session(&mut child_b).await;
+        let mut grandchild_a =
+            Session::new_child_of("grandchild-a", &child_a, "model", "Grandchild A");
+        state.save_and_cache_session(&mut grandchild_a).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let root_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=root&limit=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root_page["total"], 3);
+        assert_eq!(root_page["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(root_page["next_offset"], 2);
+        assert!(root_page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["kind"] == "root"));
+
+        let all_roots: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=root&limit=10")
+                .to_request(),
+        )
+        .await;
+        let roots = all_roots["sessions"].as_array().unwrap();
+        let root_a = roots
+            .iter()
+            .find(|session| session["id"] == "root-a")
+            .expect("root-a summary");
+        let root_b = roots
+            .iter()
+            .find(|session| session["id"] == "root-b")
+            .expect("root-b summary");
+        let root_c = roots
+            .iter()
+            .find(|session| session["id"] == "root-c")
+            .expect("root-c summary");
+        assert_eq!(root_a["subagent_count"], 2);
+        assert_eq!(root_b["subagent_count"], 1);
+        assert_eq!(root_c["subagent_count"], 0);
+
+        let first_child_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=child&root_session_id=root-a&limit=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first_child_page["total"], 2);
+        assert_eq!(first_child_page["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(first_child_page["next_offset"], 1);
+        assert_eq!(first_child_page["sessions"][0]["root_session_id"], "root-a");
+        assert_eq!(first_child_page["sessions"][0]["kind"], "child");
+        assert_eq!(first_child_page["sessions"][0]["subagent_count"], 0);
+
+        let second_child_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=child&root_session_id=root-a&limit=1&offset=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(second_child_page["sessions"].as_array().unwrap().len(), 1);
+        assert!(
+            second_child_page.get("next_offset").is_none()
+                || second_child_page["next_offset"].is_null()
+        );
+
+        let root_detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/root-a")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root_detail["session"]["subagent_count"], 2);
     }
 
     /// `GET /api/v1/sessions/{id}` on an unknown id must use the canonical
