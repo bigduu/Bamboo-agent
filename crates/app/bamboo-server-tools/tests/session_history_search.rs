@@ -137,7 +137,7 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
 }
 
 #[tokio::test]
-async fn search_current_uses_fresh_cjk_index_for_positive_and_negative_pages() {
+async fn search_current_uses_fresh_index_for_cjk_latin_infix_and_negative_pages() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(
         SessionStoreV2::new(home.path().to_path_buf())
@@ -145,7 +145,10 @@ async fn search_current_uses_fresh_cjk_index_for_positive_and_negative_pages() {
             .unwrap(),
     );
     let mut session = Session::new("fresh-cjk-session", "test-model");
-    let mut valid = Message::assistant("我们要压缩上下文，再用 memory 继续任务", None);
+    let mut valid = Message::assistant(
+        "我们要压缩上下文，再用 memory 继续任务；release notes 保留搜索设计",
+        None,
+    );
     valid.id = "fresh-cjk-valid".to_string();
     valid.compressed = true;
     session.add_message(valid);
@@ -175,6 +178,27 @@ async fn search_current_uses_fresh_cjk_index_for_positive_and_negative_pages() {
     assert_eq!(positive["match_count"], 1);
     assert_eq!(positive["matches"][0]["id"], "fresh-cjk-valid");
     assert_eq!(positive["matches"][0]["match_source"], "fts_cjk_bigram");
+
+    let latin_infix = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "lease", "limit": 20}),
+            context(&session.id, "fresh-cjk-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        latin_infix["search_backend"],
+        "sqlite_fts_unicode+fts_literal_trigram"
+    );
+    assert_eq!(latin_infix["index_fresh"], true);
+    assert_eq!(latin_infix["fallback_scanned_messages"], 0);
+    assert_eq!(latin_infix["match_count"], 1);
+    assert_eq!(latin_infix["matches"][0]["id"], "fresh-cjk-valid");
+    assert_eq!(
+        latin_infix["matches"][0]["match_source"],
+        "fts_literal_trigram"
+    );
 
     let negative = completed(
         tool.invoke(

@@ -27,6 +27,15 @@ fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
         .unwrap()
 }
 
+fn search_semantics_without_rank(path: &Path, query: &str) -> serde_json::Value {
+    let mut snapshot = serde_json::to_value(search_db(path, query, 10).unwrap()).unwrap();
+    for result in snapshot.as_array_mut().unwrap() {
+        let rank = result.as_object_mut().unwrap().remove("rank").unwrap();
+        assert!(rank.as_f64().unwrap().is_finite());
+    }
+    snapshot
+}
+
 fn identity_rows(conn: &Connection) -> BTreeMap<(String, String), i64> {
     conn.prepare("SELECT session_id, message_id, search_rowid FROM session_messages_search")
         .unwrap()
@@ -91,7 +100,7 @@ fn legacy_db(path: &Path) -> Connection {
 }
 
 // Deliberately independent of schema.rs: this is the exact stable-rowid v4
-// shape which shipped before the CJK projection and source revision metadata.
+// shape which shipped before the search projections and source revision metadata.
 fn v4_db(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -130,7 +139,7 @@ fn v4_db(path: &Path) -> Connection {
         "INSERT INTO session_messages_search
          (search_rowid, session_id, message_id, message_index, role, content, compressed,
           created_at)
-         VALUES (41, 'v4', 'v4-message', 0, 'user', '我们要压缩上下文', 1, ?1)",
+         VALUES (41, 'v4', 'v4-message', 0, 'user', '我们要压缩上下文 release notes', 1, ?1)",
         [&now],
     )
     .unwrap();
@@ -177,8 +186,11 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
         "SELECT name, sql FROM sqlite_schema
         WHERE name LIKE 'user_%' OR name='idx_session_messages_search_session_id' ORDER BY name",
     );
-    let before_search = serde_json::to_value(search_db(&path, "quartz", 10).unwrap()).unwrap();
-    let before_session = serde_json::to_value(search_db(&path, "beacon", 10).unwrap()).unwrap();
+    // FTS5 rank magnitudes are implementation-derived and can shift when a
+    // new indexed projection column is added. Preserve the actual contract:
+    // hit identity, order, snippets, and all durable metadata.
+    let before_search = search_semantics_without_rank(&path, "quartz");
+    let before_session = search_semantics_without_rank(&path, "beacon");
     let before_cache =
         serde_json::to_value(read_compressed_cache_db(&path, "legacy", 0, 20, 100).unwrap())
             .unwrap();
@@ -208,11 +220,11 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
             vec![vec![Value::Text("preserve this table".into())]]
         );
         assert_eq!(
-            serde_json::to_value(search_db(&path, "quartz", 10).unwrap()).unwrap(),
+            search_semantics_without_rank(&path, "quartz"),
             before_search
         );
         assert_eq!(
-            serde_json::to_value(search_db(&path, "beacon", 10).unwrap()).unwrap(),
+            search_semantics_without_rank(&path, "beacon"),
             before_session
         );
         assert_eq!(
@@ -239,7 +251,7 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
 }
 
 #[test]
-fn independent_v4_migration_rebuilds_cjk_projection_and_is_idempotent() {
+fn independent_v4_migration_rebuilds_search_projections_and_is_idempotent() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("search.db");
     let conn = v4_db(&path);
@@ -296,12 +308,18 @@ fn independent_v4_migration_rebuilds_cjk_projection_and_is_idempotent() {
         assert_eq!(page.matches[0].message_id, "v4-message");
         assert_eq!(page.matches[0].match_source, "fts_cjk_bigram");
         assert!(!page.used_literal_fallback);
+
+        let page = search_session_messages_db(&path, "v4", "lease", usize::MAX, &[], 10).unwrap();
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].message_id, "v4-message");
+        assert_eq!(page.matches[0].match_source, "fts_literal_trigram");
+        assert!(!page.used_literal_fallback);
     }
 }
 
 #[test]
 #[ignore = "manual synthetic v4-to-v5 migration evidence for #1156"]
-fn benchmark_v4_to_v5_cjk_rebuild() {
+fn benchmark_v4_to_v5_search_projection_rebuild() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -554,14 +572,19 @@ fn v5_rejects_changed_fts_indexing_tokenizer_and_content_mode() {
 }
 
 #[test]
-fn v5_rejects_missing_unindexed_or_retokenized_cjk_projection() {
+fn v5_rejects_missing_unindexed_or_retokenized_message_projections() {
     for definition in [
         "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
          role UNINDEXED, content",
         "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
-         role UNINDEXED, content, content_cjk_bigrams UNINDEXED",
+         role UNINDEXED, content, content_cjk_bigrams",
         "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
-         role UNINDEXED, content, content_cjk_bigrams, tokenize='porter'",
+         role UNINDEXED, content, content_cjk_bigrams UNINDEXED, content_literal_trigrams",
+        "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+         role UNINDEXED, content, content_cjk_bigrams, content_literal_trigrams UNINDEXED",
+        "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+         role UNINDEXED, content, content_cjk_bigrams, content_literal_trigrams,
+         tokenize='porter'",
     ] {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("search.db");
@@ -838,7 +861,8 @@ fn unchanged_projection_repairs_missing_stale_and_null_fts_payloads() {
         "UPDATE sessions_search_fts SET title='corrupt', summary=NULL;
         DELETE FROM session_messages_search_fts WHERE rowid=1;
         UPDATE session_messages_search_fts
-        SET content='stale payload', content_cjk_bigrams='错误 投影', role=NULL, message_index=99
+        SET content='stale payload', content_cjk_bigrams='错误 投影',
+            content_literal_trigrams='stale projection', role=NULL, message_index=99
         WHERE rowid=2;",
     )
     .unwrap();
@@ -903,11 +927,13 @@ fn duplicate_ids_and_fts_payload_failure_leave_entire_snapshot_unchanged() {
     conn.execute_batch(
         "ALTER TABLE session_messages_search_fts RENAME TO saved_fts;
         CREATE TABLE session_messages_search_fts (session_id, message_id, message_index, role,
-            content CHECK(content NOT LIKE '%rejectpayload%'), content_cjk_bigrams);
+            content CHECK(content NOT LIKE '%rejectpayload%'), content_cjk_bigrams,
+            content_literal_trigrams);
         INSERT INTO session_messages_search_fts
-            (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams)
+            (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
+             content_literal_trigrams)
             SELECT rowid, session_id, message_id, message_index, role, content,
-                   content_cjk_bigrams FROM saved_fts;",
+                   content_cjk_bigrams, content_literal_trigrams FROM saved_fts;",
     )
     .unwrap();
     let fts_before = rows(

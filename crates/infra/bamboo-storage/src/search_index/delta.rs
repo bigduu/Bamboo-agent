@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    cjk_bigram_projection, params, session_history_search_artifact_ids, Connection,
-    OptionalExtension, Role, Session, SessionKind,
+    cjk_bigram_projection, literal_trigram_projection, params, session_history_search_artifact_ids,
+    Connection, OptionalExtension, Role, Session, SessionKind,
 };
 
 // Counts come from sqlite3_changes for the top-level statements, excluding
@@ -165,13 +165,15 @@ pub(super) fn sync_session(
         WHERE search_rowid=?1",
     )?;
     let mut fts_read = conn.prepare(
-        "SELECT session_id, message_id, message_index, role, content, content_cjk_bigrams
+        "SELECT session_id, message_id, message_index, role, content, content_cjk_bigrams,
+                content_literal_trigrams
         FROM session_messages_search_fts WHERE rowid=?1",
     )?;
     let mut fts_write = conn.prepare(
         "INSERT OR REPLACE INTO session_messages_search_fts
-        (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
+         content_literal_trigrams)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for (index, message) in session.messages.iter().enumerate() {
         let old = stored.remove(&message.id);
@@ -218,6 +220,7 @@ pub(super) fn sync_session(
         // Compare the point-addressed FTS projection too. Unchanged normal rows
         // must still repair missing/stale FTS during upsert or startup rebuild.
         let cjk_projection = cjk_bigram_projection(&next.content);
+        let literal_projection = literal_trigram_projection(&next.content);
         let fts_matches = fts_read
             .query_row([next.rowid], |row| {
                 Ok(
@@ -226,7 +229,8 @@ pub(super) fn sync_session(
                         && row.get::<_, Option<i64>>(2)? == Some(next.index)
                         && row.get::<_, Option<String>>(3)?.as_deref() == Some(&next.role)
                         && row.get::<_, Option<String>>(4)?.as_deref() == Some(&next.content)
-                        && row.get::<_, Option<String>>(5)?.as_deref() == Some(&cjk_projection),
+                        && row.get::<_, Option<String>>(5)?.as_deref() == Some(&cjk_projection)
+                        && row.get::<_, Option<String>>(6)?.as_deref() == Some(&literal_projection),
                 )
             })
             .optional()?
@@ -239,7 +243,8 @@ pub(super) fn sync_session(
                 next.index,
                 next.role,
                 next.content,
-                cjk_projection
+                cjk_projection,
+                literal_projection
             ])?;
         }
     }

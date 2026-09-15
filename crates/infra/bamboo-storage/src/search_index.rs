@@ -19,7 +19,9 @@ const PURGE_OLDER_THAN_DAYS: i64 = 10;
 const VACUUM_MIN_DB_BYTES: u64 = 256 * 1024 * 1024;
 const VACUUM_MIN_PURGED_ROWS: usize = 500;
 const MAX_CJK_BIGRAMS_PER_TEXT: usize = 131_072;
+const MAX_LITERAL_TRIGRAMS_PER_TEXT: usize = 131_072;
 const CJK_PROJECTION_TRUNCATED_TOKEN: &str = "bamboo_cjk_projection_truncated";
+const LITERAL_PROJECTION_TRUNCATED_TOKEN: &str = "bamboo_literal_projection_truncated";
 const SESSION_MATCH_CLASS_FUNCTION: &str = "bamboo_session_match_class";
 
 /// How long a contended writer waits for the lock before giving up with
@@ -661,6 +663,7 @@ fn search_db(
 struct SessionMessageQueryPlan {
     fts_query: Option<String>,
     fts_match_source: &'static str,
+    has_literal_trigrams: bool,
     needs_literal_fallback: bool,
 }
 
@@ -715,6 +718,39 @@ pub(super) fn cjk_bigram_projection(value: &str) -> String {
     projection
 }
 
+/// Project non-CJK alphanumeric runs into overlapping trigrams. Combined with
+/// prefix terms, this makes the FTS expression a superset of both branches in
+/// `session_content_match_class`: token prefixes and literal infixes. Short
+/// runs remain on the explicit literal path instead of adding high-fanout
+/// unigram or bigram terms for ordinary Latin text.
+pub(super) fn literal_trigram_projection(value: &str) -> String {
+    let mut projection = String::new();
+    let mut previous = [None, None];
+    let mut emitted = 0usize;
+    for character in value.chars() {
+        if is_cjk_scalar(character) || !character.is_alphanumeric() {
+            previous = [None, None];
+            continue;
+        }
+        if let [Some(first), Some(second)] = previous {
+            if emitted > 0 {
+                projection.push(' ');
+            }
+            projection.push(first);
+            projection.push(second);
+            projection.push(character);
+            emitted += 1;
+            if emitted == MAX_LITERAL_TRIGRAMS_PER_TEXT {
+                projection.push(' ');
+                projection.push_str(LITERAL_PROJECTION_TRUNCATED_TOKEN);
+                break;
+            }
+        }
+        previous = [previous[1], Some(character)];
+    }
+    projection
+}
+
 fn quoted_fts_term(column: &str, value: &str) -> String {
     let escaped = value.replace('"', "\"\"");
     format!("{column} : \"{escaped}\"")
@@ -731,19 +767,27 @@ fn current_session_unicode_prefix_terms(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
-    if !query.chars().any(is_cjk_scalar) {
-        let terms = current_session_unicode_prefix_terms(query);
-        return SessionMessageQueryPlan {
-            fts_query: (!terms.is_empty()).then(|| terms.join(" AND ")),
-            fts_match_source: "fts_unicode",
-            needs_literal_fallback: terms.is_empty(),
-        };
+fn has_leading_short_non_cjk_token(value: &str) -> bool {
+    let mut characters = value
+        .chars()
+        .skip_while(|character| !character.is_alphanumeric());
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if is_cjk_scalar(first) || !first.is_alphanumeric() {
+        return false;
     }
+    1 + characters
+        .take_while(|character| character.is_alphanumeric() && !is_cjk_scalar(*character))
+        .count()
+        < 3
+}
 
+fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
     let characters = query.chars().collect::<Vec<_>>();
     let mut cjk_terms = Vec::new();
     let mut unicode_terms = Vec::new();
+    let mut literal_trigram_terms = Vec::new();
     let mut has_single_cjk_run = false;
     let mut has_cjk_bigram = false;
     let mut cursor = 0usize;
@@ -770,24 +814,58 @@ fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
             }
         } else {
             unicode_terms.extend(current_session_unicode_prefix_terms(&run));
+            literal_trigram_terms.extend(
+                literal_trigram_projection(&run)
+                    .split_whitespace()
+                    .filter(|gram| *gram != LITERAL_PROJECTION_TRUNCATED_TOKEN)
+                    .map(|gram| quoted_fts_term("content_literal_trigrams", gram)),
+            );
         }
     }
 
-    let mut terms = Vec::new();
+    let mut prefix_terms = Vec::new();
     if !cjk_terms.is_empty() {
         let truncated = quoted_fts_term("content_cjk_bigrams", CJK_PROJECTION_TRUNCATED_TOKEN);
-        terms.push(format!("({} OR {truncated})", cjk_terms.join(" AND ")));
+        prefix_terms.push(format!("({} OR {truncated})", cjk_terms.join(" AND ")));
     }
-    terms.extend(unicode_terms);
+    prefix_terms.extend(unicode_terms);
+
+    let has_literal_trigrams = !literal_trigram_terms.is_empty();
+    let mut candidate_groups = Vec::new();
+    if !prefix_terms.is_empty() {
+        candidate_groups.push(format!("({})", prefix_terms.join(" AND ")));
+    }
+    if has_literal_trigrams {
+        let mut literal_terms = cjk_terms;
+        literal_terms.extend(literal_trigram_terms);
+        let mut alternatives = vec![format!("({})", literal_terms.join(" AND "))];
+        if has_cjk_bigram {
+            alternatives.push(quoted_fts_term(
+                "content_cjk_bigrams",
+                CJK_PROJECTION_TRUNCATED_TOKEN,
+            ));
+        }
+        alternatives.push(quoted_fts_term(
+            "content_literal_trigrams",
+            LITERAL_PROJECTION_TRUNCATED_TOKEN,
+        ));
+        candidate_groups.push(format!("({})", alternatives.join(" OR ")));
+    }
+
+    let has_short_token = has_leading_short_non_cjk_token(query);
+    let needs_literal_fallback = has_single_cjk_run
+        || has_short_token
+        || (candidate_groups.is_empty() && !has_literal_trigrams);
 
     SessionMessageQueryPlan {
-        fts_query: (!terms.is_empty()).then(|| terms.join(" AND ")),
+        fts_query: (!candidate_groups.is_empty()).then(|| candidate_groups.join(" OR ")),
         fts_match_source: if has_cjk_bigram {
             "fts_cjk_bigram"
         } else {
             "fts_unicode"
         },
-        needs_literal_fallback: has_single_cjk_run || terms.is_empty(),
+        has_literal_trigrams,
+        needs_literal_fallback,
     }
 }
 
@@ -902,15 +980,20 @@ fn search_session_messages_db(
     let plan = session_message_query_plan(query);
 
     if limit == 0 {
+        let indexed_backend = if plan.has_literal_trigrams {
+            format!("{}+fts_literal_trigram", plan.fts_match_source)
+        } else {
+            plan.fts_match_source.to_string()
+        };
         return Ok(SessionMessageSearchPage {
             matches: Vec::new(),
             fts_match_count: 0,
             used_literal_fallback: false,
-            query_backend: plan
-                .fts_query
-                .as_ref()
-                .map_or("literal", |_| plan.fts_match_source)
-                .to_string(),
+            query_backend: if plan.needs_literal_fallback || plan.fts_query.is_none() {
+                "literal".to_string()
+            } else {
+                indexed_backend
+            },
             results_complete: true,
             indexed_source_revision,
             indexed_updated_at,
@@ -933,7 +1016,11 @@ fn search_session_messages_db(
     let mut seen = HashSet::new();
     let mut candidate_cap_reached = false;
 
-    if let Some(fts_query) = &plan.fts_query {
+    // Plans with an unrepresented one-character CJK or leading one/two-char
+    // non-CJK infix use the literal path exclusively. Mixing an incomplete FTS
+    // page with literal hits could otherwise let lower-ranked prefix matches
+    // fill LIMIT before a higher-ranked literal match is considered.
+    if let (false, Some(fts_query)) = (plan.needs_literal_fallback, &plan.fts_query) {
         let mut fts_stmt = conn.prepare(SESSION_MESSAGE_SEARCH_SQL).map_err(|error| {
             to_io_error(format!(
                 "sqlite prepare session-scoped FTS message search failed: {error}"
@@ -960,6 +1047,7 @@ fn search_session_messages_db(
                             )
                         })?;
                     let content: String = row.get(4)?;
+                    let match_class = row.get::<_, i64>(8)?;
                     Ok(SessionMessageSearchMatch {
                         message_id: row.get(0)?,
                         message_index: row.get::<_, i64>(1)?.max(0) as usize,
@@ -969,7 +1057,11 @@ fn search_session_messages_db(
                         compressed: row.get::<_, i64>(5)? != 0,
                         created_at,
                         content_len: row.get::<_, i64>(7)?.max(0) as usize,
-                        match_source: plan.fts_match_source.to_string(),
+                        match_source: if match_class == 2 && plan.has_literal_trigrams {
+                            "fts_literal_trigram".to_string()
+                        } else {
+                            plan.fts_match_source.to_string()
+                        },
                     })
                 },
             )
@@ -998,11 +1090,11 @@ fn search_session_messages_db(
     }
     let fts_match_count = matches.len();
 
-    // A one-character CJK run (or a punctuation-only query) has no bounded
-    // bigram candidate representation. Preserve the explicit Session-scoped
-    // literal path only for those plans; indexed multi-character queries do
+    // One-character CJK, leading one/two-character non-CJK infixes, and
+    // punctuation-only queries have no bounded low-fanout projection. Keep
+    // their explicit Session-scoped literal path; fully projected queries do
     // not scan the ordinary content table merely because a page under-fills.
-    let used_literal_fallback = plan.needs_literal_fallback && matches.len() < limit;
+    let used_literal_fallback = plan.needs_literal_fallback;
     if used_literal_fallback {
         let mut literal_stmt =
             conn.prepare(SESSION_MESSAGE_LITERAL_SEARCH_SQL)
@@ -1069,9 +1161,11 @@ fn search_session_messages_db(
     }
 
     let query_backend = match (&plan.fts_query, used_literal_fallback) {
-        (Some(_), true) => format!("{}+literal", plan.fts_match_source),
+        (_, true) | (None, false) => "literal".to_string(),
+        (Some(_), false) if plan.has_literal_trigrams => {
+            format!("{}+fts_literal_trigram", plan.fts_match_source)
+        }
         (Some(_), false) => plan.fts_match_source.to_string(),
-        (None, _) => "literal".to_string(),
     };
 
     let results_complete = matches.len() == limit || !candidate_cap_reached;
@@ -1253,8 +1347,9 @@ fn build_fts_query(query: &str) -> String {
 }
 
 /// Keep legacy cross-Session message search constrained to canonical content.
-/// The v5 CJK projection is an implementation detail of `search_current` and
-/// must not broaden global search semantics or expose its truncation sentinel.
+/// The v5 CJK and literal projections are implementation details of
+/// `search_current` and must not broaden global search semantics or expose
+/// their truncation sentinels.
 fn build_message_fts_query(query: &str) -> String {
     format!("content : ({})", build_fts_query(query))
 }
@@ -1300,6 +1395,24 @@ mod tests {
     }
 
     #[test]
+    fn literal_trigram_projection_covers_infixes_respects_boundaries_and_is_bounded() {
+        assert_eq!(
+            literal_trigram_projection("release-v2 压缩 café"),
+            "rel ele lea eas ase caf afé"
+        );
+        assert_eq!(literal_trigram_projection("ab-cde/fghi"), "cde fgh ghi");
+
+        let pathological = "a".repeat(MAX_LITERAL_TRIGRAMS_PER_TEXT + 3);
+        let projection = literal_trigram_projection(&pathological);
+        let projected_terms = projection.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(projected_terms.len(), MAX_LITERAL_TRIGRAMS_PER_TEXT + 1);
+        assert_eq!(
+            projected_terms.last().copied(),
+            Some(LITERAL_PROJECTION_TRUNCATED_TOKEN)
+        );
+    }
+
+    #[test]
     fn current_session_query_plan_keeps_fts_syntax_data_and_routes_cjk_runs() {
         let cjk = session_message_query_plan("压缩上下");
         let expression = cjk.fts_query.as_deref().unwrap();
@@ -1308,6 +1421,7 @@ mod tests {
         assert!(expression.contains("content_cjk_bigrams : \"上下\""));
         assert!(expression.contains(CJK_PROJECTION_TRUNCATED_TOKEN));
         assert_eq!(cjk.fts_match_source, "fts_cjk_bigram");
+        assert!(!cjk.has_literal_trigrams);
         assert!(!cjk.needs_literal_fallback);
 
         let mixed = session_message_query_plan("压缩 context-v2");
@@ -1315,7 +1429,23 @@ mod tests {
         assert!(expression.contains("content_cjk_bigrams : \"压缩\""));
         assert!(expression.contains("content : \"context\"*"));
         assert!(expression.contains("content : \"v2\"*"));
+        assert!(expression.contains("content_literal_trigrams : \"con\""));
+        assert!(mixed.has_literal_trigrams);
         assert!(!mixed.needs_literal_fallback);
+
+        let infix = session_message_query_plan("lease");
+        let expression = infix.fts_query.as_deref().unwrap();
+        assert!(expression.contains("content : \"lease\"*"));
+        assert!(expression.contains("content_literal_trigrams : \"lea\""));
+        assert!(expression.contains(LITERAL_PROJECTION_TRUNCATED_TOKEN));
+        assert!(infix.has_literal_trigrams);
+        assert!(!infix.needs_literal_fallback);
+
+        let short_infix = session_message_query_plan("el");
+        assert!(short_infix.fts_query.is_some());
+        assert!(short_infix.needs_literal_fallback);
+        assert!(session_message_query_plan("/el").needs_literal_fallback);
+        assert!(!session_message_query_plan("/tmp").needs_literal_fallback);
 
         let single = session_message_query_plan("压");
         assert!(single.fts_query.is_none());
@@ -1357,6 +1487,29 @@ mod tests {
             index.search("bamboo", 10).await.unwrap().is_empty(),
             "the internal truncation sentinel must not be globally searchable"
         );
+
+        let mut literal_session = Session::new("truncated-literal-projection", "test-model");
+        let content = format!("{}lease", "a".repeat(MAX_LITERAL_TRIGRAMS_PER_TEXT + 3));
+        let mut message = Message::user(content);
+        message.id = "literal-tail-match".to_string();
+        literal_session.add_message(message);
+        index.upsert_session(&literal_session).await.unwrap();
+        let page = index
+            .search_messages_in_session(&literal_session.id, "lease", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].message_id, "literal-tail-match");
+        assert_eq!(page.matches[0].match_source, "fts_literal_trigram");
+        assert!(!page.used_literal_fallback);
+        assert!(
+            index
+                .search("literal_projection_truncated", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the literal truncation sentinel must remain private to current-Session search"
+        );
     }
 
     #[tokio::test]
@@ -1380,6 +1533,7 @@ mod tests {
                 "punctuated-token-and",
                 "alpha notes eventually mention marker",
             ),
+            ("latin-infix", "release notes describe search behavior"),
         ] {
             let mut message = Message::user(content);
             message.id = id.to_string();
@@ -1460,9 +1614,32 @@ mod tests {
                 .unwrap();
             assert_eq!(page.matches.len(), 1, "query={query:?}");
             assert_eq!(page.matches[0].message_id, "identifier-path");
-            assert_eq!(page.matches[0].match_source, "fts_unicode");
+            assert_eq!(page.matches[0].match_source, "fts_literal_trigram");
             assert!(!page.used_literal_fallback);
         }
+
+        let infix = index
+            .search_messages_in_session(&session.id, "lease notes", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(infix.matches.len(), 1);
+        assert_eq!(infix.matches[0].message_id, "latin-infix");
+        assert_eq!(infix.matches[0].match_source, "fts_literal_trigram");
+        assert!(!infix.used_literal_fallback);
+
+        let short_infix = index
+            .search_messages_in_session(&session.id, "el", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert!(short_infix.used_literal_fallback);
+        assert!(short_infix
+            .matches
+            .iter()
+            .any(|hit| hit.message_id == "latin-infix"));
+        assert!(short_infix
+            .matches
+            .iter()
+            .all(|hit| hit.match_source == "literal"));
 
         let punctuated = index
             .search_messages_in_session(&session.id, "alpha_marker", usize::MAX, &[], 10)
@@ -1591,7 +1768,7 @@ mod tests {
 
     #[test]
     #[ignore = "manual synthetic performance evidence for #1156"]
-    fn benchmark_current_session_cjk_query_shape() {
+    fn benchmark_current_session_query_shape() {
         use std::time::Instant;
 
         fn percentile(samples: &[u128], percentile: usize) -> u128 {
@@ -1631,6 +1808,8 @@ mod tests {
                 ("cjk_long_positive", "压缩上下文"),
                 ("cjk_long_negative", "完全不存在"),
                 ("latin_positive", "context"),
+                ("latin_infix_positive", "lease_check"),
+                ("latin_short_infix_positive", "el"),
                 ("identifier_positive", "release_check"),
                 ("path_positive", "/tmp/release-checklist.md"),
                 ("mixed_positive", "压缩 context"),

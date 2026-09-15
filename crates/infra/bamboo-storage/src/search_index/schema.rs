@@ -1,4 +1,7 @@
-use super::{cjk_bigram_projection, params, to_io_error, Connection, OptionalExtension};
+use super::{
+    cjk_bigram_projection, literal_trigram_projection, params, to_io_error, Connection,
+    OptionalExtension,
+};
 
 const VERSION: &str = "5";
 const LEGACY_SESSION_COLUMNS: &str =
@@ -22,7 +25,7 @@ const FTS_SCHEMA: &str = "
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_search_fts USING fts5(
         session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
-        role UNINDEXED, content, content_cjk_bigrams
+        role UNINDEXED, content, content_cjk_bigrams, content_literal_trigrams
     );";
 
 fn sql_error(error: rusqlite::Error) -> std::io::Error {
@@ -37,14 +40,14 @@ fn create_table(conn: &Connection, name: &str, fields: &str) -> std::io::Result<
     .map_err(sql_error)
 }
 
-fn validate_fts_shape(conn: &Connection, cjk_bigrams: bool) -> std::io::Result<()> {
-    let message_columns = if cjk_bigrams {
-        "session_id,message_id,message_index,role,content,content_cjk_bigrams"
+fn validate_fts_shape(conn: &Connection, search_projections: bool) -> std::io::Result<()> {
+    let message_columns = if search_projections {
+        "session_id,message_id,message_index,role,content,content_cjk_bigrams,content_literal_trigrams"
     } else {
         "session_id,message_id,message_index,role,content"
     };
-    let message_definition = if cjk_bigrams {
-        "session_idunindexed,message_idunindexed,message_indexunindexed,roleunindexed,content,content_cjk_bigrams"
+    let message_definition = if search_projections {
+        "session_idunindexed,message_idunindexed,message_indexunindexed,roleunindexed,content,content_cjk_bigrams,content_literal_trigrams"
     } else {
         "session_idunindexed,message_idunindexed,message_indexunindexed,roleunindexed,content"
     };
@@ -235,8 +238,9 @@ fn rebuild_fts(conn: &Connection) -> std::io::Result<()> {
     let mut insert = conn
         .prepare(
             "INSERT INTO session_messages_search_fts
-             (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
+              content_literal_trigrams)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .map_err(sql_error)?;
     while let Some(row) = messages.next().map_err(sql_error)? {
@@ -246,7 +250,8 @@ fn rebuild_fts(conn: &Connection) -> std::io::Result<()> {
         let message_index = row.get::<_, i64>(3).map_err(sql_error)?;
         let role = row.get::<_, String>(4).map_err(sql_error)?;
         let content = row.get::<_, String>(5).map_err(sql_error)?;
-        let projection = cjk_bigram_projection(&content);
+        let cjk_projection = cjk_bigram_projection(&content);
+        let literal_projection = literal_trigram_projection(&content);
         insert
             .execute(params![
                 rowid,
@@ -255,7 +260,8 @@ fn rebuild_fts(conn: &Connection) -> std::io::Result<()> {
                 message_index,
                 role,
                 content,
-                projection
+                cjk_projection,
+                literal_projection
             ])
             .map_err(sql_error)?;
     }
