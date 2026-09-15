@@ -722,31 +722,41 @@ pub(super) fn cjk_bigram_projection(value: &str) -> String {
 /// prefix terms, this makes the FTS expression a superset of both branches in
 /// `session_content_match_class`: token prefixes and literal infixes. Short
 /// runs remain on the explicit literal path instead of adding high-fanout
-/// unigram or bigram terms for ordinary Latin text.
+/// unigram or bigram terms for ordinary Latin text. Rust lowercase mapping is
+/// applied before grams are emitted so indexed and query projections agree
+/// even for mappings newer than SQLite's unicode61 tables.
 pub(super) fn literal_trigram_projection(value: &str) -> String {
     let mut projection = String::new();
     let mut previous = [None, None];
     let mut emitted = 0usize;
-    for character in value.chars() {
+    'input: for character in value.chars() {
         if is_cjk_scalar(character) || !character.is_alphanumeric() {
             previous = [None, None];
             continue;
         }
-        if let [Some(first), Some(second)] = previous {
-            if emitted > 0 {
-                projection.push(' ');
+        for folded in character.to_lowercase() {
+            // A lowercase expansion may contain a combining mark. Ignore that
+            // derived scalar without splitting the original alphanumeric run;
+            // canonical original-content validation still rejects collisions.
+            if is_cjk_scalar(folded) || !folded.is_alphanumeric() {
+                continue;
             }
-            projection.push(first);
-            projection.push(second);
-            projection.push(character);
-            emitted += 1;
-            if emitted == MAX_LITERAL_TRIGRAMS_PER_TEXT {
-                projection.push(' ');
-                projection.push_str(LITERAL_PROJECTION_TRUNCATED_TOKEN);
-                break;
+            if let [Some(first), Some(second)] = previous {
+                if emitted > 0 {
+                    projection.push(' ');
+                }
+                projection.push(first);
+                projection.push(second);
+                projection.push(folded);
+                emitted += 1;
+                if emitted == MAX_LITERAL_TRIGRAMS_PER_TEXT {
+                    projection.push(' ');
+                    projection.push_str(LITERAL_PROJECTION_TRUNCATED_TOKEN);
+                    break 'input;
+                }
             }
+            previous = [previous[1], Some(folded)];
         }
-        previous = [previous[1], Some(character)];
     }
     projection
 }
@@ -1418,6 +1428,11 @@ mod tests {
             literal_trigram_projection("release-v2 压缩 café"),
             "rel ele lea eas ase caf afé"
         );
+        assert_eq!(
+            literal_trigram_projection("ԨԨԨԨ"),
+            literal_trigram_projection("ԩԩԩԩ")
+        );
+        assert_eq!(literal_trigram_projection("ԨԨԨԨ"), "ԩԩԩ ԩԩԩ");
         assert_eq!(literal_trigram_projection("ab-cde/fghi"), "cde fgh ghi");
 
         let pathological = "a".repeat(MAX_LITERAL_TRIGRAMS_PER_TEXT + 3);
@@ -1555,6 +1570,7 @@ mod tests {
             ),
             ("latin-infix", "release notes describe search behavior"),
             ("mixed-short-suffix", "相邻脚本中文a仍然可搜索"),
+            ("unicode-new-case", "ԨԨԨԨ"),
         ] {
             let mut message = Message::user(content);
             message.id = id.to_string();
@@ -1673,6 +1689,18 @@ mod tests {
             "mixed-short-suffix"
         );
         assert_eq!(mixed_short_suffix.matches[0].match_source, "literal");
+
+        let unicode_new_case = index
+            .search_messages_in_session(&session.id, "ԩԩԩ", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert!(!unicode_new_case.used_literal_fallback);
+        assert_eq!(unicode_new_case.matches.len(), 1);
+        assert_eq!(unicode_new_case.matches[0].message_id, "unicode-new-case");
+        assert_eq!(
+            unicode_new_case.matches[0].match_source,
+            "fts_literal_trigram"
+        );
 
         let punctuated = index
             .search_messages_in_session(&session.id, "alpha_marker", usize::MAX, &[], 10)
