@@ -158,9 +158,17 @@ permission knobs before spawn and never relies on the CLI's implicit defaults:
 | Child posture | Effective Codex invocation |
 |---|---|
 | default / restricted | `--sandbox workspace-write --config approval_policy="never"` |
-| read-only / research / guardian | `--sandbox read-only --config approval_policy="never"` |
+| explicitly configured Codex read-only sandbox | `--sandbox read-only --config approval_policy="never"` |
 | bypass parent | `--full-auto`, which remains workspace-sandboxed |
 | workspace network enabled | the workspace-write flags plus `--config sandbox_workspace_write.network_access=true` |
+
+Codex's read-only sandbox prevents filesystem mutation but still exposes
+command execution. It therefore does not satisfy Bamboo's typed read-only
+activation contract, which also prohibits shells, builds, tests, and executable
+helpers. Until Codex provides an enforceable tool allowlist that excludes
+command execution, Bamboo rejects typed read-only activations in both `exec`
+and `app_server` modes before provisioning or dispatch. Use the native Bamboo
+runtime or the Claude Code executor for Plan's read-only inspection child.
 
 `codex_sandbox` can explicitly select `read-only`, `workspace-write`, or
 `danger-full-access`. In exec mode, `codex_approval_policy` accepts only

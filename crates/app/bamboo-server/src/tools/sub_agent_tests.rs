@@ -18,7 +18,7 @@ use bamboo_domain::{
 use bamboo_engine::session_app::child_session;
 
 use crate::app_state::{AgentRunner, AgentStatus};
-use crate::tools::{ChildSessionAdapter, SubAgentTool};
+use crate::tools::{ChildSessionAdapter, PlanTool, SubAgentTool};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
@@ -42,6 +42,18 @@ async fn invoke_completed(
         Ok(ToolOutcome::Completed(result)) => Ok(result),
         Ok(_) => panic!("expected a Completed outcome"),
         Err(e) => Err(e),
+    }
+}
+
+async fn invoke_plan_completed(
+    tool: &PlanTool,
+    args: serde_json::Value,
+    ctx: ToolCtx,
+) -> Result<ToolResult, ToolError> {
+    match tool.invoke(args, ctx).await {
+        Ok(ToolOutcome::Completed(result)) => Ok(result),
+        Ok(_) => panic!("expected a Completed outcome"),
+        Err(error) => Err(error),
     }
 }
 
@@ -394,6 +406,165 @@ async fn build_test_harness_with_storage(
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_wait() {
+    let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
+        Box::pin(async move {
+            assert_eq!(subagent_type, "planner");
+            Some(bamboo_domain::ProviderModelRef::new(
+                "openai",
+                "gpt-planner",
+            ))
+        })
+    });
+    let harness = build_test_harness_with_resolver(Some(resolver)).await;
+
+    // A permissive root is useful regression pressure: Plan must preserve the
+    // root's posture while the child receives an independent read-only overlay.
+    let mut root = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    root.agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+        .set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+    harness.storage.save_session(&root).await.unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&root)
+        .await
+        .unwrap();
+
+    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+    let result = invoke_plan_completed(
+        &tool,
+        json!({
+            "task": "Inspect the session execution path and design a safe migration.",
+            "title": "Plan session migration",
+            "workspace": harness.workspace_path.to_string_lossy(),
+            "fork_last_messages": 2
+        }),
+        subagent_test_ctx(&harness.parent_session_id, "tc_plan_delegate"),
+    )
+    .await
+    .expect("Plan should delegate to one child");
+
+    assert_eq!(
+        result.display_preference.as_deref(),
+        Some("runtime_control:waiting_for_children")
+    );
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(payload["status"], "waiting_for_planner");
+    assert_eq!(payload["runtime_control"], "waiting_for_children");
+    assert_eq!(payload["wait_for"], "all");
+    assert_eq!(payload["subagent_type"], "planner");
+    assert_eq!(payload["model"], "gpt-planner");
+    assert_eq!(payload["read_only"], true);
+    assert!(
+        payload.get("awaiting_user_input").is_none(),
+        "delegated planning must never request a mode-switch response"
+    );
+    assert!(payload["note"]
+        .as_str()
+        .is_some_and(|note| note.contains("resume automatically")));
+    let child_id = payload["child_session_id"]
+        .as_str()
+        .expect("planner child id");
+
+    let child = harness
+        .storage
+        .load_session(child_id)
+        .await
+        .unwrap()
+        .expect("planner child persisted");
+    assert_eq!(child.subagent_type().as_deref(), Some("planner"));
+    assert_eq!(
+        child.metadata.get("runtime.kind").map(String::as_str),
+        Some("external")
+    );
+    assert_eq!(
+        child.metadata.get("external.protocol").map(String::as_str),
+        Some("actor")
+    );
+    assert_eq!(
+        child.metadata.get("external.agent_id").map(String::as_str),
+        Some(bamboo_engine::external_agents::config::LOCAL_ACTOR_AGENT_ID)
+    );
+    let child_runtime = child
+        .agent_runtime_state
+        .as_ref()
+        .expect("typed planner runtime state");
+    assert!(child_runtime.read_only);
+    assert_eq!(
+        child_runtime.effective_permission_mode(),
+        bamboo_domain::SessionPermissionMode::Auto,
+        "requested mode remains auditable even though read-only wins effectively"
+    );
+    assert_eq!(
+        bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+            .expect("planner permission audit")
+            .resolution
+            .effective,
+        bamboo_domain::PermissionMode::Plan
+    );
+    assert!(
+        !child.metadata.contains_key("disabled_tools"),
+        "Plan caller must not be the authority that supplies its own denylist"
+    );
+    assert!(child
+        .metadata
+        .get("assignment_prompt")
+        .is_some_and(|prompt| prompt.contains("do not implement")));
+
+    let parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let root_runtime = parent
+        .agent_runtime_state
+        .as_ref()
+        .expect("root runtime state");
+    assert!(!root_runtime.read_only);
+    assert!(root_runtime.plan_mode.is_none());
+    assert_eq!(
+        root_runtime.effective_permission_mode(),
+        bamboo_domain::SessionPermissionMode::Auto
+    );
+    let wait = root_runtime
+        .waiting_for_children
+        .as_ref()
+        .expect("Plan registered a durable child wait");
+    assert_eq!(wait.child_session_ids, vec![child_id.to_string()]);
+    assert_eq!(
+        wait.registered_by_tool_call_id.as_deref(),
+        Some("tc_plan_delegate")
+    );
+
+    // This harness intentionally persists tool actions through JsonlStorage,
+    // so the independent SessionStoreV2 index does not receive the new child.
+    // The adapter's publication cache does, and lets us prove there was no
+    // hidden second planner creation in the same call.
+    let planner_children = harness
+        .adapter
+        .sessions_cache
+        .iter()
+        .filter(|entry| {
+            let session = entry.value().read();
+            session.parent_session_id.as_deref() == Some(harness.parent_session_id.as_str())
+                && session.subagent_type().as_deref() == Some("planner")
+        })
+        .count();
+    assert_eq!(
+        planner_children, 1,
+        "one Plan call creates exactly one child"
+    );
+}
+
+#[tokio::test]
 async fn child_publication_uses_the_validating_instance_workspace_root() {
     let instance_root = tempfile::tempdir().expect("instance workspace root");
     let canonical_instance_root = instance_root
@@ -431,6 +602,7 @@ async fn child_publication_uses_the_validating_instance_workspace_root() {
             model_override: None,
             model_ref_override: None,
             runtime_metadata: HashMap::new(),
+            read_only: false,
             auto_run: false,
             reasoning_effort: None,
             lifecycle: None,
@@ -497,6 +669,7 @@ async fn supervisor_common_child_constructor_keeps_ordinary_identity_for_all_rol
                     ("authority_identity".into(), "supervisor".into()),
                     ("role".into(), "supervisor".into()),
                 ]),
+                read_only: false,
                 auto_run: false,
                 reasoning_effort: None,
                 lifecycle: lifecycle.map(str::to_string),
@@ -585,6 +758,7 @@ async fn child_resident_and_guardian_reject_cross_project_workspace_without_side
                 model_override: None,
                 model_ref_override: None,
                 runtime_metadata: HashMap::new(),
+                read_only: false,
                 auto_run: false,
                 reasoning_effort: None,
                 lifecycle: lifecycle.map(str::to_string),
@@ -781,6 +955,63 @@ async fn repeated_registration_of_same_child_is_idempotent() {
         .waiting_for_children
         .unwrap();
     assert_eq!(wait.child_session_ids, vec!["dup-child".to_string()]);
+}
+
+#[tokio::test]
+async fn failed_launch_rollback_removes_only_its_child_from_the_parent_wait() {
+    let harness = build_test_harness().await;
+    let adapter = harness.adapter.clone();
+    let parent_id = harness.parent_session_id.clone();
+
+    adapter
+        .register_parent_wait_for_child(&parent_id, "failed-child", Some("tc-failed"))
+        .await
+        .unwrap();
+    adapter
+        .register_parent_wait_for_child(&parent_id, "live-sibling", Some("tc-live"))
+        .await
+        .unwrap();
+
+    adapter
+        .rollback_parent_wait_for_child(&parent_id, "failed-child")
+        .await
+        .expect("rollback should preserve the live sibling");
+
+    let parent = harness
+        .storage
+        .load_session(&parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let wait = parent
+        .agent_runtime_state
+        .expect("runtime state")
+        .waiting_for_children
+        .expect("sibling wait must remain armed");
+    assert_eq!(wait.child_session_ids, vec!["live-sibling".to_string()]);
+    assert_eq!(
+        parent
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str),
+        Some("waiting_for_children")
+    );
+
+    adapter
+        .rollback_parent_wait_for_child(&parent_id, "live-sibling")
+        .await
+        .expect("last-child rollback should clear the wait");
+    let parent = harness
+        .storage
+        .load_session(&parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent
+        .agent_runtime_state
+        .and_then(|state| state.waiting_for_children)
+        .is_none());
+    assert!(!parent.metadata.contains_key("runtime.suspend_reason"));
 }
 
 #[tokio::test]

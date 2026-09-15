@@ -18,7 +18,7 @@
 //! in four steps — see its doc comment for the full state-machine and
 //! `docs/claude-code-executor.md` §4 for the on-disk state file shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -82,6 +82,29 @@ const APPROVAL_RELAY_TIMEOUT: Duration = Duration::from_secs(300);
 /// listed here.
 const ENV_ALLOWLIST: &[&str] = &[
     "HOME", "PATH", "SHELL", "TERM", "LANG", "TMPDIR", "USER", "LOGNAME",
+];
+
+/// Claude's native workspace-inspection tools retained for a Bamboo typed
+/// read-only activation. `--tools` is a positive built-in surface restriction;
+/// MCP tools are denied separately because Claude documents that `--tools`
+/// does not affect them.
+const READ_ONLY_CLAUDE_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+/// Defense-in-depth denies for every Claude execution/mutation/delegation
+/// surface known to overlap Bamboo's typed read-only policy. The positive
+/// [`READ_ONLY_CLAUDE_TOOLS`] surface remains authoritative for built-ins; the
+/// MCP wildcard closes the separate external-tool namespace.
+const READ_ONLY_CLAUDE_DENY_RULES: &[&str] = &[
+    "Agent",
+    "Bash",
+    "Edit",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "mcp__*",
 ];
 
 /// Resolve this actor's stable per-child storage dir, exactly like
@@ -152,11 +175,18 @@ pub struct ClaudeCodeExecutor {
     /// Issue #443: `false` (the default) adds `--strict-mcp-config` and
     /// `--setting-sources project` so the child does NOT load the invoking
     /// user's `~/.claude` MCP servers/skills/settings. `true` omits both
-    /// flags (the old inherit-everything behavior).
+    /// flags (the old inherit-everything behavior). A read-only `plan`
+    /// activation always overrides this with an empty setting-source list so
+    /// repository-controlled hooks cannot execute outside Bamboo's tool gate.
     inherit_user_config: bool,
     /// Issue #443: extra env var NAMES forwarded verbatim from the parent
     /// process env, on top of the fixed [`ENV_ALLOWLIST`].
     forward_env: Vec<String>,
+    /// Parent-provisioned exact tool denies translated to Claude's bare-rule
+    /// CLI form. For typed read-only children this is paired with a positive
+    /// `--tools Read,Glob,Grep` surface and an `mcp__*` deny.
+    disallowed_tools: Vec<String>,
+    read_only_tool_surface: bool,
     /// Issue #443: bound on [`HostBridge::approval_call`] in
     /// [`decide_and_respond`]. Always [`APPROVAL_RELAY_TIMEOUT`] outside
     /// tests; overridable via [`Self::with_relay_timeout_for_test`] so a unit
@@ -187,8 +217,59 @@ impl ClaudeCodeExecutor {
             state_dir,
             inherit_user_config,
             forward_env,
+            disallowed_tools: Vec::new(),
+            read_only_tool_surface: false,
             relay_timeout: APPROVAL_RELAY_TIMEOUT,
         }
+    }
+
+    /// Apply the host-provisioned tool policy to Claude Code's own tool
+    /// surface. `ProvisionSpec.disabled_tools` contains exact schema names,
+    /// not arbitrary Claude permission expressions, so only bare rules are
+    /// forwarded. Typed read-only additionally uses a positive built-in
+    /// allow-surface and denies every MCP tool.
+    pub fn with_provisioned_tool_policy(
+        mut self,
+        disabled_tools: impl IntoIterator<Item = String>,
+        read_only: bool,
+    ) -> Self {
+        let mut rules = disabled_tools
+            .into_iter()
+            .filter_map(|name| {
+                let name = name.trim();
+                if name.is_empty()
+                    || name.starts_with('-')
+                    || name
+                        .chars()
+                        .any(|ch| ch.is_whitespace() || matches!(ch, '(' | ')' | ','))
+                {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        // Bamboo's native names predate Claude's Agent/Skill names. Preserve
+        // exact caller denies while adding the corresponding Claude built-ins.
+        if rules.contains("SubAgent") || rules.contains("Task") {
+            rules.insert("Agent".to_string());
+            rules.insert("Task".to_string());
+        }
+        if rules.contains("SlashCommand") || rules.contains("load_skill") {
+            rules.insert("Skill".to_string());
+        }
+        if read_only {
+            rules.extend(
+                READ_ONLY_CLAUDE_DENY_RULES
+                    .iter()
+                    .map(|rule| rule.to_string()),
+            );
+        }
+
+        self.disallowed_tools = rules.into_iter().collect();
+        self.read_only_tool_surface = read_only;
+        self
     }
 
     pub fn with_provisioned_permission_context(
@@ -363,11 +444,10 @@ impl ClaudeCodeExecutor {
         // engages the local-decide policy in `decide_and_respond` below
         // ("no host bridge -> deny unless bypassPermissions") instead of
         // that policy being unreachable dead code.
-        cmd.arg("--permission-mode").arg(
-            permission_mode_override
-                .or(self.permission_mode.as_deref())
-                .unwrap_or("default"),
-        );
+        let effective_permission_mode = permission_mode_override
+            .or(self.permission_mode.as_deref())
+            .unwrap_or("default");
+        cmd.arg("--permission-mode").arg(effective_permission_mode);
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -380,9 +460,31 @@ impl ClaudeCodeExecutor {
         // from global config for a single `touch`. `inherit_user_config:
         // true` opts back into the CLI's normal (inherit-everything)
         // behavior.
-        if !self.inherit_user_config {
+        let read_only_plan = effective_permission_mode.eq_ignore_ascii_case("plan");
+        if read_only_plan {
+            // An empty setting-source list is the CLI representation of the
+            // Agent SDK's `settingSources: []`: no user/project/local settings,
+            // CLAUDE.md, skills, or hooks. This is authority-bearing for Plan;
+            // `--permission-mode plan` alone does not sandbox hook processes.
+            cmd.arg("--strict-mcp-config");
+            cmd.arg("--setting-sources").arg("");
+        } else if !self.inherit_user_config {
             cmd.arg("--strict-mcp-config");
             cmd.arg("--setting-sources").arg("project");
+        }
+        if self.read_only_tool_surface {
+            // A positive built-in surface avoids depending on Claude's current
+            // inventory: newly-added execution tools remain unavailable until
+            // Bamboo explicitly admits them. Claude's CLI takes this list as a
+            // comma-separated value.
+            cmd.arg("--tools").arg(READ_ONLY_CLAUDE_TOOLS.join(","));
+        }
+        if !self.disallowed_tools.is_empty() {
+            // Keep the variadic deny list last in argv, matching Claude's
+            // documented `--disallowedTools "Bash" "Edit"` shape and avoiding
+            // ambiguity about where its values stop.
+            cmd.arg("--disallowedTools");
+            cmd.args(&self.disallowed_tools);
         }
         // Issue #443: env allowlist. `env_clear()` plus an explicit forward
         // list supersedes the old single `env_remove("CLAUDECODE")`
@@ -1374,6 +1476,138 @@ mod tests {
             args.get(mode_index + 1).map(String::as_str),
             Some("bypassPermissions")
         );
+    }
+
+    #[test]
+    fn typed_read_only_plan_disables_settings_hooks_shell_and_mutation_tools() {
+        for inherit_user_config in [false, true] {
+            let executor = ClaudeCodeExecutor::new(
+                Some("claude".to_string()),
+                None,
+                None,
+                None,
+                None,
+                inherit_user_config,
+                Vec::new(),
+            )
+            .with_provisioned_tool_policy(
+                bamboo_engine::runtime::guardian_state::read_only_child_disabled_tools(),
+                true,
+            );
+            let command = executor.build_command(None, Some("plan"));
+            let args = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+
+            let sources_index = args
+                .iter()
+                .position(|arg| arg == "--setting-sources")
+                .expect("Plan must set an explicit empty source list");
+            assert_eq!(args.get(sources_index + 1).map(String::as_str), Some(""));
+            assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+            assert!(
+                !args.iter().any(|arg| arg == "project"),
+                "Plan must not load repository-controlled settings or hooks"
+            );
+
+            let tools_index = args
+                .iter()
+                .position(|arg| arg == "--tools")
+                .expect("typed read-only Plan must restrict Claude built-ins");
+            assert_eq!(
+                args.get(tools_index + 1).map(String::as_str),
+                Some("Read,Glob,Grep")
+            );
+
+            let denies_index = args
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .expect("typed read-only Plan must pass host-owned deny rules");
+            let denied = &args[denies_index + 1..];
+            for rule in [
+                "Agent",
+                "Bash",
+                "Edit",
+                "NotebookEdit",
+                "Skill",
+                "Task",
+                "WebFetch",
+                "WebSearch",
+                "Write",
+                "mcp__*",
+            ] {
+                assert!(
+                    denied.iter().any(|candidate| candidate == rule),
+                    "typed read-only Plan must deny Claude rule {rule}"
+                );
+            }
+        }
+
+        let normal = ClaudeCodeExecutor::new(
+            Some("claude".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
+        );
+        let args = normal
+            .build_command(None, Some("default"))
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let sources_index = args
+            .iter()
+            .position(|arg| arg == "--setting-sources")
+            .expect("ordinary isolated activations must retain project settings");
+        assert_eq!(
+            args.get(sources_index + 1).map(String::as_str),
+            Some("project")
+        );
+        assert!(!args.iter().any(|arg| arg == "--tools"));
+        assert!(!args.iter().any(|arg| arg == "--disallowedTools"));
+    }
+
+    #[test]
+    fn provisioned_tool_policy_forwards_only_bare_deny_rules() {
+        let executor = ClaudeCodeExecutor::new(
+            Some("claude".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .with_provisioned_tool_policy(
+            [
+                "Write".to_string(),
+                "mcp__server__tool".to_string(),
+                "--model".to_string(),
+                "Bash(rm *)".to_string(),
+                "  ".to_string(),
+            ],
+            false,
+        );
+        let args = executor
+            .build_command(None, Some("default"))
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let denies_index = args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .expect("valid provisioned denies must reach Claude");
+        assert_eq!(
+            &args[denies_index + 1..],
+            &["Write".to_string(), "mcp__server__tool".to_string()]
+        );
+        assert!(!args.iter().any(|arg| arg == "--tools"));
     }
 
     fn msg(role: &str, content: &str) -> Value {

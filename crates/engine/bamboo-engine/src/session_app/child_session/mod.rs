@@ -144,6 +144,10 @@ pub struct CreateChildInput {
     pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
     /// Runtime metadata resolved from subagent routing (e.g. external agent config).
     pub runtime_metadata: std::collections::HashMap<String, String>,
+    /// Hard read-only child authority. Unlike `subagent_type`, this is not a
+    /// cosmetic/routing label: creation persists it into typed runtime state
+    /// and worker provisioning must enforce it even under parent Auto/Bypass.
+    pub read_only: bool,
     /// Whether to immediately enqueue the child for execution.
     /// Defaults to `true`.
     pub auto_run: bool,
@@ -328,14 +332,30 @@ pub trait ChildSessionPort: Send + Sync {
     /// Return live diagnostic info for a running child session, if available.
     async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo>;
 
-    /// Register a durable parent wait for a single enqueued child. Idempotent
-    /// and coalesced per parent (concurrent sibling spawns merge into one write).
+    /// Register a durable parent wait for a single child immediately before it
+    /// is enqueued. Idempotent and coalesced per parent (concurrent sibling
+    /// spawns merge into one write).
     async fn register_parent_wait_for_child(
         &self,
         parent_session_id: &str,
         child_session_id: &str,
         tool_call_id: Option<&str>,
     ) -> Result<(), ChildSessionError>;
+
+    /// Compensate a failed child launch by removing only that child from the
+    /// parent's durable wait. Implementations must preserve concurrently
+    /// registered siblings and clear the suspension marker only when the wait
+    /// becomes empty.
+    async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        let _ = (parent_session_id, child_session_id);
+        Err(ChildSessionError::Execution(
+            "parent-wait rollback is not configured for this runtime".to_string(),
+        ))
+    }
 
     /// Register a durable parent wait over an explicit set of children with a
     /// chosen policy (the `SubAgent.wait` action). Returns the number of

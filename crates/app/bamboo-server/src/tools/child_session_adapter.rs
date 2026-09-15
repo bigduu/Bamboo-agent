@@ -175,7 +175,7 @@ impl ChildSessionAdapter {
         bamboo_engine::external_agents::config::resolve_runtime_metadata(&config, subagent_type)
     }
 
-    /// Register a durable parent wait for an enqueued child session.
+    /// Register a durable parent wait immediately before a child session is enqueued.
     ///
     /// This is intentionally idempotent: repeated registrations for the same
     /// child merge into the existing wait set. The child runner owns timeout
@@ -250,6 +250,79 @@ impl ChildSessionAdapter {
         self.parent_wait_slots
             .remove_if(parent_session_id, |_, slot| slot.pending.lock().is_empty());
 
+        Ok(())
+    }
+
+    /// Remove one failed-to-launch child from the parent's wait without
+    /// disturbing concurrently registered siblings. The coalescing barrier
+    /// first removes any re-queued registration left by an uncertain wait
+    /// persist; the persistence transaction then patches the latest durable
+    /// parent snapshot under its canonical session lock.
+    pub async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        let slot = self
+            .parent_wait_slots
+            .entry(parent_session_id.to_string())
+            .or_default()
+            .clone();
+        let _flush_guard = slot.flush_lock.lock().await;
+        slot.pending
+            .lock()
+            .retain(|(pending_child_id, _)| pending_child_id != child_session_id);
+
+        let child_session_id = child_session_id.to_string();
+        let publish_cache = self.sessions_cache.clone();
+        let updated = self
+            .persistence
+            .update_runtime_config_and_publish(
+                parent_session_id,
+                move |parent| {
+                    let mut runtime_state = read_runtime_state(parent);
+                    let mut clear_wait = false;
+                    let mut changed = false;
+                    if let Some(wait) = runtime_state.waiting_for_children.as_mut() {
+                        let previous_len = wait.child_session_ids.len();
+                        wait.child_session_ids.retain(|id| id != &child_session_id);
+                        changed = wait.child_session_ids.len() != previous_len;
+                        clear_wait = wait.child_session_ids.is_empty();
+                    }
+                    if changed {
+                        if clear_wait {
+                            runtime_state.waiting_for_children = None;
+                            if parent
+                                .metadata
+                                .get("runtime.suspend_reason")
+                                .is_some_and(|reason| reason == "waiting_for_children")
+                            {
+                                parent.metadata.remove("runtime.suspend_reason");
+                            }
+                        }
+                        write_runtime_state(parent, &runtime_state);
+                        parent.updated_at = Utc::now();
+                    }
+                },
+                move |saved| {
+                    publish_cache.insert(
+                        saved.id.clone(),
+                        Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                    );
+                },
+            )
+            .await;
+
+        self.parent_wait_slots
+            .remove_if(parent_session_id, |_, slot| slot.pending.lock().is_empty());
+
+        let updated = updated.map_err(|error| {
+            ChildSessionError::Execution(format!("failed to roll back parent wait state: {error}"))
+        })?;
+
+        if updated.is_none() {
+            return Err(ChildSessionError::NotFound(parent_session_id.to_string()));
+        }
         Ok(())
     }
 
@@ -481,6 +554,7 @@ impl bamboo_engine::GuardianSpawner for ChildSessionAdapter {
             model_override: Some(model),
             model_ref_override: None,
             runtime_metadata: HashMap::new(),
+            read_only: true,
             auto_run: true,
             reasoning_effort: None,
             lifecycle: None,
@@ -953,6 +1027,19 @@ impl ChildSessionPort for ChildSessionAdapter {
             parent_session_id,
             child_session_id,
             tool_call_id,
+        )
+        .await
+    }
+
+    async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        ChildSessionAdapter::rollback_parent_wait_for_child(
+            self,
+            parent_session_id,
+            child_session_id,
         )
         .await
     }

@@ -185,7 +185,11 @@ pub async fn run(args: BrokerAgentArgs) -> Result<(), String> {
                     inherit_user_config.unwrap_or(false),
                     forward_env.clone().unwrap_or_default(),
                 )
-                .with_provisioned_permission_resolution(provisioned_permission),
+                .with_provisioned_permission_resolution(provisioned_permission)
+                .with_provisioned_tool_policy(
+                    spec.disabled_tools.clone().unwrap_or_default(),
+                    spec.capabilities.read_only_enforced(),
+                ),
             ),
             ExecutorSpec::Codex {
                 ref binary,

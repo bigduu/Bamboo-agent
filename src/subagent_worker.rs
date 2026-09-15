@@ -151,7 +151,11 @@ pub async fn run() -> std::result::Result<(), String> {
                 inherit_user_config.unwrap_or(false),
                 forward_env.clone().unwrap_or_default(),
             )
-            .with_provisioned_permission_resolution(provisioned_permission),
+            .with_provisioned_permission_resolution(provisioned_permission)
+            .with_provisioned_tool_policy(
+                spec.disabled_tools.clone().unwrap_or_default(),
+                spec.capabilities.read_only_enforced(),
+            ),
         ),
         ExecutorSpec::Codex {
             binary,
@@ -363,6 +367,9 @@ pub struct BambooRuntimeExecutor {
     /// Exact provision-time requested/effective posture. Per-activation
     /// RunSpec policy replaces it for warm workers.
     provisioned_permission: bamboo_domain::PermissionModeResolution,
+    /// Whether this worker enforces the typed read-only child boundary through
+    /// its host-provisioned tool denylist and ReadOnlyCommandChecker.
+    read_only_child: bool,
     /// Live policy updated from the host at every activation boundary. Keeping
     /// the same Arc as the builtin executor lets warm and remote workers adopt
     /// new durable revisions without rebuilding their tool surface.
@@ -395,6 +402,22 @@ fn provisioned_permission_resolution(
     capabilities: &bamboo_subagent::provision::Capabilities,
 ) -> Result<bamboo_domain::PermissionModeResolution, String> {
     capabilities.permission_resolution()
+}
+
+/// Read-only children use a stricter authorization layer than legacy PlanMode:
+/// mutating and shell tools are absent, while ReadOnlyCommandChecker hard-denies
+/// even an unadvertised/direct shell call. Keep the approval layer in Auto so
+/// dedicated read tools need no human response; the checker's platform hard-deny
+/// executes before Auto/Bypass and remains authoritative.
+fn bamboo_runtime_execution_permission_mode(
+    read_only_child: bool,
+    audited: bamboo_domain::PermissionModeResolution,
+) -> bamboo_domain::PermissionMode {
+    if read_only_child {
+        bamboo_domain::PermissionMode::Auto
+    } else {
+        audited.effective
+    }
 }
 
 fn bind_worker_session_note(
@@ -535,16 +558,13 @@ impl BambooRuntimeExecutor {
             let mut checker: Arc<dyn bamboo_tools::permission::PermissionChecker> = Arc::new(
                 bamboo_tools::permission::ConfigPermissionChecker::new(perm_config.clone()),
             );
-            // #71: a READ-ONLY Guardian reviewer keeps `Bash` so it can fetch
-            // the diff and run tests, but its shell must NOT be able to mutate /
-            // push / exfiltrate. Wrap the checker so any `Bash`/`execute_command`
-            // whose command is not on the read-only allowlist is DENIED (fail
-            // closed — the reviewer has no human approver), while read-only
-            // commands (`cargo test`, `git diff | head`, `rg …`) run WITHOUT a
-            // gate. Other mutating tools are already stripped by the reviewer's
-            // denylist, so they never reach here.
-            if spec.capabilities.guardian_read_only {
-                checker = Arc::new(bamboo_tools::permission::GuardianReadOnlyChecker::new(
+            // A read-only planner or Guardian receives only dedicated read and
+            // search tools. Wrap the checker as a second runtime boundary so an
+            // unadvertised/direct `Bash` or `execute_command` call is hard-denied
+            // before ambient PATH, shell startup, or repository configuration
+            // can resolve an executable. Auto/Bypass cannot widen this boundary.
+            if spec.capabilities.read_only_enforced() {
+                checker = Arc::new(bamboo_tools::permission::ReadOnlyCommandChecker::new(
                     checker,
                 ));
             }
@@ -856,6 +876,7 @@ impl BambooRuntimeExecutor {
             run_tools,
             spawn_depth: spec.identity.depth,
             provisioned_permission,
+            read_only_child: spec.capabilities.read_only_enforced(),
             permission_config,
             no_human_review,
             child_runner,
@@ -1223,7 +1244,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             };
             config.publish_persistent_policy(context.revision, &policy);
-            config.set_mode(permission_resolution.effective);
+            config.set_mode(bamboo_runtime_execution_permission_mode(
+                self.read_only_child,
+                permission_resolution,
+            ));
             policy_revision = context.revision;
             effective_workspace = context.workspace_path.clone().or(effective_workspace);
             session.metadata.insert(
@@ -1231,7 +1255,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 context.inherit_session_grants.to_string(),
             );
         } else if let Some(config) = self.permission_config.as_ref() {
-            config.set_mode(permission_resolution.effective);
+            config.set_mode(bamboo_runtime_execution_permission_mode(
+                self.read_only_child,
+                permission_resolution,
+            ));
         }
         if let Err(error) = bamboo_domain::record_permission_audit(
             &mut session.metadata,
@@ -1246,10 +1273,23 @@ impl ChildExecutor for BambooRuntimeExecutor {
             ));
         }
         session.workspace = effective_workspace;
-        if let (Some(config), Some(workspace)) =
-            (self.permission_config.as_ref(), session.workspace.as_ref())
-        {
-            config.register_session_workspace(session.id.clone(), workspace.clone());
+        if let Some(workspace) = session.workspace.clone() {
+            // The host already resolved and authorized this activation's
+            // workspace. Publish that exact path in the worker process too:
+            // pathless Read/Glob/Grep resolve through this process-local
+            // registry, not through `Session.workspace` or the parent server's
+            // registry. Without this handoff a worker launched from another
+            // directory silently inspects its process cwd instead.
+            let workspace = bamboo_agent_core::workspace_state::publish_resolved_workspace(
+                &session.id,
+                PathBuf::from(workspace),
+            )
+            .to_string_lossy()
+            .into_owned();
+            session.workspace = Some(workspace.clone());
+            if let Some(config) = self.permission_config.as_ref() {
+                config.register_session_workspace(session.id.clone(), workspace);
+            }
         }
         // Phase 6: re-establish this worker's nesting depth on its fresh run
         // session (Session::new starts at 0), so the depth cap accumulates across
@@ -1258,10 +1298,11 @@ impl ChildExecutor for BambooRuntimeExecutor {
         // Phase 6, Part B: re-establish bypass on the fresh run session so the
         // worker's own tools honor it AND create_child_action propagates it to
         // grandchildren (whose forced-ask actions then reach the model-reviewer).
-        session
+        let runtime = session
             .agent_runtime_state
-            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-            .set_permission_mode(permission_resolution.requested);
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.set_permission_mode(permission_resolution.requested);
+        runtime.read_only = self.read_only_child;
         // #73 review (P1): mirror the bypass re-stamp for "no human approver", so
         // create_child_action propagates it to in-process grandchildren. Without
         // this, a depth-2+ child of an unattended run does NOT inherit the flag,
@@ -1862,9 +1903,39 @@ mod tests {
     use super::*;
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCall, ToolCtx, ToolError, ToolResult, ToolSchema};
+    use bamboo_agent_core::Tool;
     use bamboo_subagent::executor::ExecutorControl;
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
+
+    #[test]
+    fn read_only_worker_keeps_plan_audit_but_uses_no_shell_authorization() {
+        for requested in [
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::SessionPermissionMode::Auto,
+            bamboo_domain::SessionPermissionMode::Bypass,
+        ] {
+            let audited = bamboo_domain::resolve_permission_mode_with_read_only(
+                requested,
+                bamboo_domain::PermissionMode::Default,
+                true,
+            );
+            assert_eq!(audited.effective, bamboo_domain::PermissionMode::Plan);
+            assert_eq!(
+                bamboo_runtime_execution_permission_mode(true, audited),
+                bamboo_domain::PermissionMode::Auto
+            );
+        }
+
+        let ordinary = bamboo_domain::resolve_permission_mode(
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::PermissionMode::AcceptEdits,
+        );
+        assert_eq!(
+            bamboo_runtime_execution_permission_mode(false, ordinary),
+            bamboo_domain::PermissionMode::AcceptEdits
+        );
+    }
 
     struct NoTools;
 
@@ -1959,6 +2030,7 @@ mod tests {
                 bamboo_domain::SessionPermissionMode::Default,
                 bamboo_domain::PermissionMode::Default,
             ),
+            read_only_child: false,
             permission_config: None,
             no_human_review: None,
             child_runner: None,
@@ -2115,6 +2187,51 @@ mod tests {
             confirmations.push(confirmation);
         }
         (outcome, confirmations)
+    }
+
+    #[tokio::test]
+    async fn bamboo_runtime_publishes_workspace_for_pathless_inspection_tools() {
+        let provider = Arc::new(RecordingWorkerProvider::default());
+        let (temp, mut executor, _store, _inbox) = worker_protocol_fixture(provider).await;
+        let workspace = temp.path().join("selected-project");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(
+            workspace.join("only-in-selected-workspace.rs"),
+            "fn selected() {}",
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            workspace,
+            "the regression needs a workspace distinct from the worker cwd"
+        );
+        executor.workspace = Some(workspace.to_string_lossy().into_owned());
+
+        let session_id = "pathless-inspection-workspace";
+        let (outcome, _confirmations) =
+            execute_protocol_run(&executor, protocol_run(session_id, "workspace-run", vec![]))
+                .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::workspace_or_process_cwd(Some(session_id)),
+            workspace
+        );
+
+        let mut ctx = ToolCtx::none("pathless-glob");
+        ctx.session_id = Some(Arc::<str>::from(session_id));
+        let result = bamboo_tools::GlobTool::new()
+            .invoke(serde_json::json!({"pattern": "**/*.rs"}), ctx)
+            .await
+            .expect("pathless Glob resolves the activation workspace");
+        let bamboo_agent_core::ToolOutcome::Completed(result) = result else {
+            panic!("pathless Glob should complete")
+        };
+        assert!(
+            result.result.contains("only-in-selected-workspace.rs"),
+            "pathless Glob inspected the wrong directory: {}",
+            result.result
+        );
     }
 
     #[tokio::test]

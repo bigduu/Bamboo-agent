@@ -197,7 +197,9 @@ fn tool_result(value: serde_json::Value) -> Result<ToolResult, ToolError> {
     })
 }
 
-fn waiting_for_children_tool_result(mut value: serde_json::Value) -> Result<ToolResult, ToolError> {
+pub(crate) fn waiting_for_children_tool_result(
+    mut value: serde_json::Value,
+) -> Result<ToolResult, ToolError> {
     if let Some(object) = value.as_object_mut() {
         object.insert("runtime_control".to_string(), json!("waiting_for_children"));
         // Don't clobber a caller-provided policy (e.g. action=wait with
@@ -901,6 +903,7 @@ impl Tool for SubAgentTool {
                                 model_override,
                                 model_ref_override,
                                 runtime_metadata,
+                                read_only: false,
                                 auto_run: should_auto_run,
                                 reasoning_effort,
                                 lifecycle: resident_name.as_ref().map(|_| "resident".to_string()),

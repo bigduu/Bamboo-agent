@@ -311,7 +311,13 @@ enum Commands {
     /// closes the pipe), self-registers into the discovery fabric, and serves
     /// one run over a loopback WebSocket. Not intended for interactive use.
     #[command(name = "subagent-worker", hide = true)]
-    SubagentWorker,
+    SubagentWorker {
+        /// Print the non-secret worker capability document and exit without
+        /// reading a provision spec. Used by a parent before authority-bearing
+        /// typed read-only provisioning.
+        #[arg(long, hide = true)]
+        print_capabilities: bool,
+    },
 
     /// Internal Codex command-auth helper. The token stays in a Bamboo-owned
     /// 0600 file so a long-lived app-server can refresh per-run credentials.
@@ -1057,6 +1063,11 @@ enum BrokerAgentCommands {
         #[arg(long = "spec-stdin")]
         spec_stdin: bool,
 
+        /// Print the non-secret worker capability document and exit before
+        /// reading a provision spec or connecting to the broker.
+        #[arg(long, hide = true)]
+        print_capabilities: bool,
+
         /// Like --spec-stdin, but read the spec from this FILE (a remote deployer
         /// uploads it next to the binary). Takes precedence over --spec-stdin.
         #[arg(long = "spec-file")]
@@ -1316,7 +1327,7 @@ async fn run() {
             // display. Matches the standalone `bamboo-tui` binary, which
             // installs none.
         }
-        Some(Commands::SubagentWorker)
+        Some(Commands::SubagentWorker { .. })
         | Some(Commands::CodexProviderToken { .. })
         | Some(Commands::Actor { .. })
         | Some(Commands::Broker { .. })
@@ -1565,7 +1576,16 @@ async fn run() {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }
 
-        Commands::SubagentWorker => {
+        Commands::SubagentWorker { print_capabilities } => {
+            if print_capabilities {
+                let report = bamboo_subagent::WorkerCapabilityReport::current();
+                println!(
+                    "{}",
+                    serde_json::to_string(&report)
+                        .expect("worker capability report must serialize")
+                );
+                return;
+            }
             let result = bamboo_agent::subagent_worker::run().await;
             if let Err(e) = &result {
                 eprintln!("subagent-worker failed: {e}");
@@ -1752,9 +1772,25 @@ async fn run() {
                 echo,
                 mcp_proxy,
                 spec_stdin,
+                print_capabilities,
                 spec_file,
                 tls_ca_cert,
             } = command;
+            if print_capabilities {
+                if !spec_stdin || spec_file.is_some() {
+                    eprintln!(
+                        "broker-agent capability probe requires --spec-stdin and forbids --spec-file"
+                    );
+                    std::process::exit(2);
+                }
+                let report = bamboo_subagent::WorkerCapabilityReport::current();
+                println!(
+                    "{}",
+                    serde_json::to_string(&report)
+                        .expect("worker capability report must serialize")
+                );
+                return;
+            }
             let token = match token
                 .or_else(|| std::env::var("BAMBOO_BROKER_TOKEN").ok())
                 .filter(|t| !t.is_empty())

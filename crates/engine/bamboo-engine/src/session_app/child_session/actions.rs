@@ -88,10 +88,11 @@ pub async fn create_child_action(
         .as_ref()
         .map(|state| state.effective_permission_mode())
         .unwrap_or_default();
-    child
+    let child_runtime = child
         .agent_runtime_state
-        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .set_permission_mode(inherited_permission_mode);
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+    child_runtime.set_permission_mode(inherited_permission_mode);
+    child_runtime.read_only = input.read_only;
     let parent_audit =
         bamboo_domain::PermissionAuditSnapshot::from_metadata(&input.parent_session.metadata);
     let parent_plan_active = input
@@ -99,7 +100,7 @@ pub async fn create_child_action(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|state| state.plan_mode.is_some());
-    let effective = if parent_plan_active {
+    let effective = if input.read_only || parent_plan_active {
         bamboo_domain::PermissionMode::Plan
     } else {
         parent_audit

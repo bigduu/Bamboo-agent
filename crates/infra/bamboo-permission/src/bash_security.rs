@@ -150,7 +150,7 @@ const FILE_MUTATING_COMMANDS: &[&str] = &["cp", "mv", "tee", "dd", "install", "r
 /// other analyzer gates (VariableAsCommand / substitution warnings) or fall
 /// through to prompting. Over-stripping only ever makes a path MORE likely to be
 /// flagged, which is the safe direction for an auto-approve gate. #392.
-fn shell_unquote(s: &str) -> String {
+pub(crate) fn shell_unquote(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

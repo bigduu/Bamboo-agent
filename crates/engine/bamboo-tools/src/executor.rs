@@ -2047,43 +2047,283 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_never_overrides_guardian_read_only_hard_deny() {
+    async fn read_only_child_checker_denies_every_side_effect_under_auto_and_bypass() {
         let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.set_mode(crate::permission::PermissionMode::Auto);
         let base: Arc<dyn crate::permission::PermissionChecker> = Arc::new(
             crate::permission::ConfigPermissionChecker::new(config.clone()),
         );
-        let checker = Arc::new(crate::permission::GuardianReadOnlyChecker::new(base));
+        let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(base));
         let executor = BuiltinToolExecutorBuilder::new()
             .with_tool(BashTool::new())
             .expect("register Bash tool")
+            .with_tool(WriteTool::new())
+            .expect("register Write tool")
             .with_permission_checker(checker)
             .build();
+
+        // Command-name validation is not an execution boundary: an ambient
+        // PATH can resolve `pwd`, `cat`, or `git` to workspace-owned code.
+        // Therefore even nominal inspection commands stop before Bash under
+        // both zero-prompt modes.
+        for (mode, bypass_permissions, auto_approve_permissions) in
+            [("auto", false, true), ("bypass", true, false)]
+        {
+            for command in ["pwd", "cat Cargo.toml"] {
+                let call = make_tool_call("Bash", json!({"command": command}));
+                let session_id = format!("planner-no-shell-{mode}");
+                let ctx = ToolExecutionContext {
+                    executing_supervisor: None,
+                    session_id: Some(&session_id),
+                    root_session_id: None,
+                    tool_call_id: &call.id,
+                    event_tx: None,
+                    available_tool_schemas: None,
+                    bypass_permissions,
+                    auto_approve_permissions,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                };
+                let error = executor
+                    .execute_with_context(&call, ctx)
+                    .await
+                    .expect_err("read-only children must not enter an ambient shell");
+                assert!(error
+                    .to_string()
+                    .contains("Execute shell commands is disabled"));
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("guardian-mutation.txt");
+        let direct_write_path = dir.path().join("planner-direct-write.txt");
+        for (mode, bypass_permissions, auto_approve_permissions) in
+            [("auto", false, true), ("bypass", true, false)]
+        {
+            let call = make_tool_call(
+                "Write",
+                json!({"file_path": direct_write_path, "content": "blocked"}),
+            );
+            let session_id = format!("planner-direct-write-{mode}");
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some(&session_id),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions,
+                auto_approve_permissions,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err("unadvertised direct writes must remain hard-denied");
+            assert!(error
+                .to_string()
+                .contains("Write files to disk is disabled"));
+            assert!(!direct_write_path.exists());
+        }
+
+        let path = dir.path().join("planner-mutation.txt");
         let command = format!("printf blocked > {}", path.display());
-        let call = make_tool_call("Bash", json!({"command": command}));
-        let ctx = ToolExecutionContext {
-            executing_supervisor: None,
-            session_id: Some("guardian-auto"),
-            root_session_id: None,
-            tool_call_id: &call.id,
-            event_tx: None,
-            available_tool_schemas: None,
-            bypass_permissions: false,
-            auto_approve_permissions: true,
-            plan_read_only: false,
-            can_async_resume: false,
-            bash_completion_sink: None,
-            pre_parsed_args: None,
-        };
+        for (session_id, bypass_permissions, auto_approve_permissions) in [
+            ("planner-auto", false, true),
+            ("planner-bypass", true, false),
+        ] {
+            let call = make_tool_call("Bash", json!({"command": command.clone()}));
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some(session_id),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions,
+                auto_approve_permissions,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
 
-        let error = executor
-            .execute_with_context(&call, ctx)
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err("Auto/Bypass must retain read-only child authority");
+
+            assert!(error.to_string().contains("Read-only child"));
+            assert!(!path.exists());
+        }
+
+        let delete_target = dir.path().join("planner-delete-target");
+        fs::create_dir_all(&delete_target).await.unwrap();
+        fs::write(delete_target.join("keep.txt"), "keep")
             .await
-            .expect_err("Auto must retain Guardian read-only authority");
+            .unwrap();
+        let delete_command = format!("rm -rf {}", delete_target.display());
+        for (session_id, bypass_permissions, auto_approve_permissions) in [
+            ("planner-delete-auto", false, true),
+            ("planner-delete-bypass", true, false),
+        ] {
+            let call = make_tool_call("Bash", json!({"command": delete_command.clone()}));
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some(session_id),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions,
+                auto_approve_permissions,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err("delete operations must remain hard-denied");
+            assert!(error
+                .to_string()
+                .contains("Delete files or directories is disabled"));
+            assert!(delete_target.exists());
+        }
 
-        assert!(error.to_string().contains("Guardian reviewer is read-only"));
-        assert!(!path.exists());
+        let git_output = dir.path().join("planner-git-output.txt");
+        let git_command = format!("git diff --output={}", git_output.display());
+        for (session_id, bypass_permissions, auto_approve_permissions) in [
+            ("planner-git-auto", false, true),
+            ("planner-git-bypass", true, false),
+        ] {
+            let call = make_tool_call("Bash", json!({"command": git_command.clone()}));
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some(session_id),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions,
+                auto_approve_permissions,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err("git output flags must not bypass read-only child authority");
+
+            assert!(error.to_string().contains("Read-only child"));
+            assert!(!git_output.exists());
+        }
+
+        let find_output = dir.path().join("planner-find-output.txt");
+        let denied_commands = [
+            ("cargo", "cargo test --help".to_string(), None),
+            (
+                "git-signature-flag",
+                "git log --no-ext-diff --no-textconv --show-signature -1".to_string(),
+                None,
+            ),
+            (
+                "git-signature-format",
+                "git log --no-ext-diff --no-textconv --no-show-signature --format=%G? -1"
+                    .to_string(),
+                None,
+            ),
+            (
+                "find",
+                format!(
+                    "find {} -fprint0 {}",
+                    dir.path().display(),
+                    find_output.display()
+                ),
+                Some(find_output.as_path()),
+            ),
+        ];
+        for (command_kind, command, output_path) in denied_commands {
+            for (mode, bypass_permissions, auto_approve_permissions) in
+                [("auto", false, true), ("bypass", true, false)]
+            {
+                let call = make_tool_call("Bash", json!({"command": command.clone()}));
+                let session_id = format!("planner-{command_kind}-{mode}");
+                let ctx = ToolExecutionContext {
+                    executing_supervisor: None,
+                    session_id: Some(&session_id),
+                    root_session_id: None,
+                    tool_call_id: &call.id,
+                    event_tx: None,
+                    available_tool_schemas: None,
+                    bypass_permissions,
+                    auto_approve_permissions,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    bash_completion_sink: None,
+                    pre_parsed_args: None,
+                };
+
+                let error = executor
+                    .execute_with_context(&call, ctx)
+                    .await
+                    .expect_err("executable/write-capable commands must remain denied");
+
+                assert!(error.to_string().contains("Read-only child"));
+                if let Some(path) = output_path {
+                    assert!(!path.exists());
+                }
+            }
+        }
+
+        // Bash expands ANSI-C strings before argv reaches `find`; without the
+        // lexical expansion gate this becomes `find <target> -delete` and
+        // mutates the workspace even though the raw token is not `-delete`.
+        let ansi_find_target = dir.path().join("planner-ansi-find-target");
+        fs::create_dir_all(&ansi_find_target).await.unwrap();
+        fs::write(ansi_find_target.join("keep.txt"), "keep")
+            .await
+            .unwrap();
+        let ansi_find_command = format!(r"find {} $'-de'lete", ansi_find_target.display());
+        for (mode, bypass_permissions, auto_approve_permissions) in
+            [("auto", false, true), ("bypass", true, false)]
+        {
+            let call = make_tool_call("Bash", json!({"command": ansi_find_command.clone()}));
+            let session_id = format!("planner-find-ansi-{mode}");
+            let ctx = ToolExecutionContext {
+                executing_supervisor: None,
+                session_id: Some(&session_id),
+                root_session_id: None,
+                tool_call_id: &call.id,
+                event_tx: None,
+                available_tool_schemas: None,
+                bypass_permissions,
+                auto_approve_permissions,
+                plan_read_only: false,
+                can_async_resume: false,
+                bash_completion_sink: None,
+                pre_parsed_args: None,
+            };
+
+            let error = executor
+                .execute_with_context(&call, ctx)
+                .await
+                .expect_err("ANSI-C expansion must remain denied before Bash execution");
+
+            assert!(error.to_string().contains("Read-only child"));
+            assert!(
+                ansi_find_target.exists(),
+                "the rejected command must not delete its target"
+            );
+        }
     }
 
     #[tokio::test]
