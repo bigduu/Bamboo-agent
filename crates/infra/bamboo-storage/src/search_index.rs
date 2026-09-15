@@ -774,13 +774,28 @@ fn has_leading_short_non_cjk_token(value: &str) -> bool {
     let Some(first) = characters.next() else {
         return false;
     };
-    if is_cjk_scalar(first) || !first.is_alphanumeric() {
+    if is_cjk_scalar(first) {
         return false;
     }
     1 + characters
         .take_while(|character| character.is_alphanumeric() && !is_cjk_scalar(*character))
         .count()
         < 3
+}
+
+fn has_short_non_cjk_run(value: &str) -> bool {
+    let mut run_len = 0usize;
+    for character in value.chars() {
+        if character.is_alphanumeric() && !is_cjk_scalar(character) {
+            run_len = run_len.saturating_add(1);
+        } else {
+            if matches!(run_len, 1 | 2) {
+                return true;
+            }
+            run_len = 0;
+        }
+    }
+    matches!(run_len, 1 | 2)
 }
 
 fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
@@ -852,7 +867,8 @@ fn session_message_query_plan(query: &str) -> SessionMessageQueryPlan {
         candidate_groups.push(format!("({})", alternatives.join(" OR ")));
     }
 
-    let has_short_token = has_leading_short_non_cjk_token(query);
+    let has_short_token = has_leading_short_non_cjk_token(query)
+        || ((has_single_cjk_run || has_cjk_bigram) && has_short_non_cjk_run(query));
     let needs_literal_fallback = has_single_cjk_run
         || has_short_token
         || (candidate_groups.is_empty() && !has_literal_trigrams);
@@ -1016,8 +1032,9 @@ fn search_session_messages_db(
     let mut seen = HashSet::new();
     let mut candidate_cap_reached = false;
 
-    // Plans with an unrepresented one-character CJK or leading one/two-char
-    // non-CJK infix use the literal path exclusively. Mixing an incomplete FTS
+    // Plans with an unrepresented one-character CJK, a leading one/two-char
+    // non-CJK infix, or such a run anywhere in a mixed CJK query use the
+    // literal path exclusively. Mixing an incomplete FTS
     // page with literal hits could otherwise let lower-ranked prefix matches
     // fill LIMIT before a higher-ranked literal match is considered.
     if let (false, Some(fts_query)) = (plan.needs_literal_fallback, &plan.fts_query) {
@@ -1090,8 +1107,9 @@ fn search_session_messages_db(
     }
     let fts_match_count = matches.len();
 
-    // One-character CJK, leading one/two-character non-CJK infixes, and
-    // punctuation-only queries have no bounded low-fanout projection. Keep
+    // One-character CJK, leading one/two-character non-CJK runs, short
+    // non-CJK runs in mixed CJK queries, and punctuation-only queries have no
+    // bounded low-fanout projection. Keep
     // their explicit Session-scoped literal path; fully projected queries do
     // not scan the ordinary content table merely because a page under-fills.
     let used_literal_fallback = plan.needs_literal_fallback;
@@ -1431,7 +1449,7 @@ mod tests {
         assert!(expression.contains("content : \"v2\"*"));
         assert!(expression.contains("content_literal_trigrams : \"con\""));
         assert!(mixed.has_literal_trigrams);
-        assert!(!mixed.needs_literal_fallback);
+        assert!(mixed.needs_literal_fallback);
 
         let infix = session_message_query_plan("lease");
         let expression = infix.fts_query.as_deref().unwrap();
@@ -1446,6 +1464,8 @@ mod tests {
         assert!(short_infix.needs_literal_fallback);
         assert!(session_message_query_plan("/el").needs_literal_fallback);
         assert!(!session_message_query_plan("/tmp").needs_literal_fallback);
+        assert!(session_message_query_plan("中文a").needs_literal_fallback);
+        assert!(session_message_query_plan("context中文ab").needs_literal_fallback);
 
         let single = session_message_query_plan("压");
         assert!(single.fts_query.is_none());
@@ -1534,6 +1554,7 @@ mod tests {
                 "alpha notes eventually mention marker",
             ),
             ("latin-infix", "release notes describe search behavior"),
+            ("mixed-short-suffix", "相邻脚本中文a仍然可搜索"),
         ] {
             let mut message = Message::user(content);
             message.id = id.to_string();
@@ -1640,6 +1661,18 @@ mod tests {
             .matches
             .iter()
             .all(|hit| hit.match_source == "literal"));
+
+        let mixed_short_suffix = index
+            .search_messages_in_session(&session.id, "中文a", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert!(mixed_short_suffix.used_literal_fallback);
+        assert_eq!(mixed_short_suffix.matches.len(), 1);
+        assert_eq!(
+            mixed_short_suffix.matches[0].message_id,
+            "mixed-short-suffix"
+        );
+        assert_eq!(mixed_short_suffix.matches[0].match_source, "literal");
 
         let punctuated = index
             .search_messages_in_session(&session.id, "alpha_marker", usize::MAX, &[], 10)
