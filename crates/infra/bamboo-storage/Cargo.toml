@@ -20,7 +20,7 @@ base64 = "0.23"
 dashmap = "6"
 fs2 = "0.4"
 sha2 = { workspace = true }
-rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "functions"] }
 tracing = "0.1"
 
 [features]

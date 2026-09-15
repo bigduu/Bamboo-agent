@@ -1738,6 +1738,34 @@ impl SessionStoreV2 {
         self.search_index_queue.flush().await;
     }
 
+    /// Read the durable source revision paired with a Session's derived search
+    /// snapshot. Callers compare this marker with the revision stored in SQLite
+    /// after a queue flush; absence or mismatch means search completeness is
+    /// unknown and must fail over to canonical Session data.
+    pub async fn search_source_revision(&self, session_id: &str) -> io::Result<Option<String>> {
+        let Some(session_json) = self.session_json_path(session_id).await? else {
+            return Ok(None);
+        };
+        let session_dir = session_json.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "session path has no parent")
+        })?;
+        match fs::read_to_string(session_dir.join(SEARCH_INDEX_REVISION_FILE)).await {
+            Ok(revision) => {
+                let revision = revision.trim();
+                if revision.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "empty search-index revision marker",
+                    ))
+                } else {
+                    Ok(Some(revision.to_string()))
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn persistence_metrics(&self) -> SessionPersistenceMetricsSnapshot {
         self.persistence_metrics.snapshot(
             self.search_index_queue.pending_len(),
@@ -6931,6 +6959,20 @@ mod tests {
         session.updated_at = Utc::now() + chrono::Duration::milliseconds(1);
         storage.save_session(&session).await?;
         storage.flush_search_index().await;
+
+        let published_revision = storage
+            .search_source_revision(&session.id)
+            .await?
+            .expect("saved Session publishes a search revision");
+        let page = storage
+            .search_index()
+            .search_messages_in_session(&session.id, "msg", usize::MAX, &[], 10)
+            .await?;
+        assert_eq!(
+            page.indexed_source_revision.as_deref(),
+            Some(published_revision.as_str())
+        );
+        assert_eq!(page.indexed_updated_at, Some(session.updated_at));
 
         storage
             .search_index()

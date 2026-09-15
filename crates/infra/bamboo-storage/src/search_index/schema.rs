@@ -1,16 +1,24 @@
-use super::{to_io_error, Connection, OptionalExtension};
+use super::{
+    cjk_bigram_projection, literal_trigram_projection, params, to_io_error, Connection,
+    OptionalExtension,
+};
 
-const VERSION: &str = "4";
-const SESSION_COLUMNS: &str =
+const VERSION: &str = "5";
+const LEGACY_SESSION_COLUMNS: &str =
     "session_id, title, kind, root_session_id, parent_session_id, pinned, updated_at, summary";
-const MESSAGE_COLUMNS: &str =
+const SESSION_COLUMNS: &str =
+    "session_id, title, kind, root_session_id, parent_session_id, pinned, updated_at, summary, source_revision";
+const LEGACY_MESSAGE_COLUMNS: &str =
     "session_id, message_id, message_index, role, content, compressed, created_at";
+const MESSAGE_COLUMNS: &str =
+    "session_id, message_id, message_index, role, content, compressed, created_at, history_search_artifact";
 const SESSION_FIELDS: &str = "session_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
     kind TEXT NOT NULL, root_session_id TEXT NOT NULL, parent_session_id TEXT,
-    pinned INTEGER NOT NULL, updated_at TEXT NOT NULL, summary TEXT";
+    pinned INTEGER NOT NULL, updated_at TEXT NOT NULL, summary TEXT, source_revision TEXT";
 const MESSAGE_FIELDS: &str = "session_id TEXT NOT NULL, message_id TEXT NOT NULL,
     message_index INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-    compressed INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(session_id, message_id)";
+    compressed INTEGER NOT NULL, created_at TEXT NOT NULL,
+    history_search_artifact INTEGER NOT NULL DEFAULT 0, UNIQUE(session_id, message_id)";
 const FTS_SCHEMA: &str = "
     CREATE VIRTUAL TABLE IF NOT EXISTS sessions_search_fts USING fts5(
         session_id UNINDEXED, title, summary
@@ -18,6 +26,10 @@ const FTS_SCHEMA: &str = "
     CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_search_fts USING fts5(
         session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
         role UNINDEXED, content
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_current_search_fts USING fts5(
+        session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+        role UNINDEXED, content, content_cjk_bigrams, content_literal_trigrams
     );";
 
 fn sql_error(error: rusqlite::Error) -> std::io::Error {
@@ -32,8 +44,8 @@ fn create_table(conn: &Connection, name: &str, fields: &str) -> std::io::Result<
     .map_err(sql_error)
 }
 
-fn validate_fts(conn: &Connection) -> std::io::Result<()> {
-    for (table, expected, definition) in [
+fn validate_fts_shape(conn: &Connection, search_projections: bool) -> std::io::Result<()> {
+    let mut definitions = vec![
         (
             "sessions_search_fts",
             "session_id,title,summary",
@@ -44,14 +56,24 @@ fn validate_fts(conn: &Connection) -> std::io::Result<()> {
             "session_id,message_id,message_index,role,content",
             "session_idunindexed,message_idunindexed,message_indexunindexed,roleunindexed,content",
         ),
-    ] {
+    ];
+    if search_projections {
+        definitions.push((
+            "session_messages_current_search_fts",
+            "session_id,message_id,message_index,role,content,content_cjk_bigrams,content_literal_trigrams",
+            "session_idunindexed,message_idunindexed,message_indexunindexed,roleunindexed,content,content_cjk_bigrams,content_literal_trigrams",
+        ));
+    }
+    for (table, expected, definition) in definitions {
         let sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",
                 [table],
                 |row| row.get(0),
             )
-            .map_err(sql_error)?;
+            .optional()
+            .map_err(sql_error)?
+            .ok_or_else(|| to_io_error(format!("unsupported search FTS shape: {table}")))?;
         let columns = conn
             .prepare(&format!("PRAGMA table_info({table})"))
             .map_err(sql_error)?
@@ -73,6 +95,10 @@ fn validate_fts(conn: &Connection) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_fts(conn: &Connection) -> std::io::Result<()> {
+    validate_fts_shape(conn, true)
 }
 
 fn validate_columns(
@@ -114,7 +140,7 @@ fn validate_columns(
     }
     for (name, kind, primary_key, not_null) in &actual[offset..] {
         let expected_type = match name.as_str() {
-            "pinned" | "message_index" | "compressed" => "INTEGER",
+            "pinned" | "message_index" | "compressed" | "history_search_artifact" => "INTEGER",
             _ => "TEXT",
         };
         let expected_pk = if stable_ids {
@@ -126,8 +152,11 @@ fn validate_columns(
                 _ => 0,
             }
         };
-        let expected_not_null = !matches!(name.as_str(), "parent_session_id" | "summary")
-            && (stable_ids || table != "sessions_search" || name != "session_id");
+        let expected_not_null =
+            !matches!(
+                name.as_str(),
+                "parent_session_id" | "summary" | "source_revision"
+            ) && (stable_ids || table != "sessions_search" || name != "session_id");
         if !kind.eq_ignore_ascii_case(expected_type)
             || *primary_key != expected_pk
             || *not_null != expected_not_null
@@ -189,9 +218,87 @@ fn validate_columns(
     Ok(())
 }
 
+fn rebuild_fts(conn: &Connection) -> std::io::Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS sessions_search_fts;
+         DROP TABLE IF EXISTS session_messages_search_fts;
+         DROP TABLE IF EXISTS session_messages_current_search_fts;",
+    )
+    .map_err(sql_error)?;
+    conn.execute_batch(FTS_SCHEMA).map_err(sql_error)?;
+    validate_fts(conn)?;
+    conn.execute_batch(
+        "INSERT INTO sessions_search_fts (rowid, session_id, title, summary)
+            SELECT search_rowid, session_id, title, COALESCE(summary, '') FROM sessions_search;",
+    )
+    .map_err(sql_error)?;
+
+    let mut select = conn
+        .prepare(
+            "SELECT search_rowid, session_id, message_id, message_index, role, content
+             FROM session_messages_search ORDER BY search_rowid",
+        )
+        .map_err(sql_error)?;
+    let mut messages = select.query([]).map_err(sql_error)?;
+    let mut insert = conn
+        .prepare(
+            "INSERT INTO session_messages_current_search_fts
+             (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
+              content_literal_trigrams)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .map_err(sql_error)?;
+    let mut canonical_insert = conn
+        .prepare(
+            "INSERT INTO session_messages_search_fts
+             (rowid, session_id, message_id, message_index, role, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(sql_error)?;
+    while let Some(row) = messages.next().map_err(sql_error)? {
+        let rowid = row.get::<_, i64>(0).map_err(sql_error)?;
+        let session_id = row.get::<_, String>(1).map_err(sql_error)?;
+        let message_id = row.get::<_, String>(2).map_err(sql_error)?;
+        let message_index = row.get::<_, i64>(3).map_err(sql_error)?;
+        let role = row.get::<_, String>(4).map_err(sql_error)?;
+        let content = row.get::<_, String>(5).map_err(sql_error)?;
+        let cjk_projection = cjk_bigram_projection(&content);
+        let literal_projection = literal_trigram_projection(&content);
+        insert
+            .execute(params![
+                rowid,
+                session_id,
+                message_id,
+                message_index,
+                role,
+                content,
+                cjk_projection,
+                literal_projection
+            ])
+            .map_err(sql_error)?;
+        canonical_insert
+            .execute(params![
+                rowid,
+                session_id,
+                message_id,
+                message_index,
+                role,
+                content
+            ])
+            .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
 fn migrate_v3(conn: &Connection) -> std::io::Result<()> {
-    validate_columns(conn, "sessions_search", SESSION_COLUMNS, false)?;
-    validate_columns(conn, "session_messages_search", MESSAGE_COLUMNS, false)?;
+    validate_columns(conn, "sessions_search", LEGACY_SESSION_COLUMNS, false)?;
+    validate_columns(
+        conn,
+        "session_messages_search",
+        LEGACY_MESSAGE_COLUMNS,
+        false,
+    )?;
+    validate_fts_shape(conn, false)?;
 
     // DROP TABLE removes its indexes/triggers. Preserve their exact SQL,
     // including user objects; SQLite-owned autoindexes come from constraints.
@@ -222,10 +329,14 @@ fn migrate_v3(conn: &Connection) -> std::io::Result<()> {
         }
     }
     for (table, fields, columns) in [
-        ("sessions_search", SESSION_FIELDS, SESSION_COLUMNS),
-        ("session_messages_search", MESSAGE_FIELDS, MESSAGE_COLUMNS),
+        ("sessions_search", SESSION_FIELDS, LEGACY_SESSION_COLUMNS),
+        (
+            "session_messages_search",
+            MESSAGE_FIELDS,
+            LEGACY_MESSAGE_COLUMNS,
+        ),
     ] {
-        let replacement = format!("{table}_v4");
+        let replacement = format!("{table}_v5");
         create_table(conn, &replacement, fields)?;
         conn.execute_batch(&format!(
             "INSERT INTO {replacement} (search_rowid, {columns})
@@ -239,21 +350,29 @@ fn migrate_v3(conn: &Connection) -> std::io::Result<()> {
         conn.execute_batch(&sql).map_err(sql_error)?;
     }
 
-    // The legacy FTS rowids were independent. Rebuild only this derived cache
-    // once so every FTS row uses the corresponding explicit ordinary-table ID.
-    conn.execute_batch(FTS_SCHEMA).map_err(sql_error)?;
-    validate_fts(conn)?;
+    // The legacy FTS rowids were independent. Rebuild this derived cache once
+    // so every FTS row uses the stable ordinary-table ID and carries the v5 CJK
+    // projection.
+    rebuild_fts(conn)
+}
+
+fn migrate_v4(conn: &Connection) -> std::io::Result<()> {
+    validate_columns(conn, "sessions_search", LEGACY_SESSION_COLUMNS, true)?;
+    validate_columns(
+        conn,
+        "session_messages_search",
+        LEGACY_MESSAGE_COLUMNS,
+        true,
+    )?;
+    validate_fts_shape(conn, false)?;
+    conn.execute_batch("ALTER TABLE sessions_search ADD COLUMN source_revision TEXT;")
+        .map_err(sql_error)?;
     conn.execute_batch(
-        "DELETE FROM sessions_search_fts;
-         INSERT INTO sessions_search_fts (rowid, session_id, title, summary)
-            SELECT search_rowid, session_id, title, COALESCE(summary, '') FROM sessions_search;
-         DELETE FROM session_messages_search_fts;
-         INSERT INTO session_messages_search_fts
-            (rowid, session_id, message_id, message_index, role, content)
-            SELECT search_rowid, session_id, message_id, message_index, role, content
-            FROM session_messages_search;",
+        "ALTER TABLE session_messages_search
+         ADD COLUMN history_search_artifact INTEGER NOT NULL DEFAULT 0;",
     )
-    .map_err(sql_error)
+    .map_err(sql_error)?;
+    rebuild_fts(conn)
 }
 
 pub(super) fn initialize(conn: &mut Connection) -> std::io::Result<()> {
@@ -280,9 +399,13 @@ pub(super) fn initialize(conn: &mut Connection) -> std::io::Result<()> {
     };
     match version.as_deref() {
         Some("3") => migrate_v3(&tx)?,
+        Some("4") => migrate_v4(&tx)?,
         Some(VERSION) => {
             validate_columns(&tx, "sessions_search", SESSION_COLUMNS, true)?;
             validate_columns(&tx, "session_messages_search", MESSAGE_COLUMNS, true)?;
+            // Validate before any IF NOT EXISTS creation so a partial v5
+            // schema is rejected instead of silently creating an empty FTS.
+            validate_fts(&tx)?;
         }
         None => {
             // Never overwrite an unversioned/partial owned schema as a new DB.
@@ -290,7 +413,8 @@ pub(super) fn initialize(conn: &mut Connection) -> std::io::Result<()> {
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
                     ('sessions_search', 'session_messages_search',
-                     'sessions_search_fts', 'session_messages_search_fts'))",
+                     'sessions_search_fts', 'session_messages_search_fts',
+                     'session_messages_current_search_fts'))",
                     [],
                     |row| row.get(0),
                 )
