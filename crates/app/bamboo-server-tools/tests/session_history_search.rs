@@ -115,6 +115,8 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
         "authoritative-compressed-message"
     );
     assert_eq!(result["matches"][0]["compressed"], true);
+    assert_eq!(result["index_fresh"], true);
+    assert_eq!(result["fallback_scanned_messages"], 0);
     assert!(result["matches"][0]["content_preview"]
         .as_str()
         .unwrap()
@@ -132,6 +134,101 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
         after, before,
         "history search must not mutate compressed flags, events, summary, accounting, or context state"
     );
+}
+
+#[tokio::test]
+async fn search_current_uses_fresh_index_for_cjk_latin_infix_and_negative_pages() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut session = Session::new("fresh-cjk-session", "test-model");
+    let mut valid = Message::assistant(
+        "我们要压缩上下文，再用 memory 继续任务；release notes 保留搜索设计",
+        None,
+    );
+    valid.id = "fresh-cjk-valid".to_string();
+    valid.compressed = true;
+    session.add_message(valid);
+    let mut false_candidate = Message::assistant("压缩。缩上。上下并不是连续短语", None);
+    false_candidate.id = "fresh-cjk-false-candidate".to_string();
+    session.add_message(false_candidate);
+    session.add_message(Message::user("请搜索之前的上下文设计"));
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![history_call("fresh-cjk-call", "压缩上下")]),
+    ));
+    store.save_session(&session).await.unwrap();
+
+    let tool = SessionInspectorTool::self_only(store.clone(), store);
+    let positive = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "压缩上下", "limit": 1}),
+            context(&session.id, "fresh-cjk-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(positive["search_backend"], "sqlite_fts_cjk_bigram");
+    assert_eq!(positive["index_fresh"], true);
+    assert_eq!(positive["index_results_complete"], true);
+    assert_eq!(positive["fallback_scanned_messages"], 0);
+    assert_eq!(positive["match_count"], 1);
+    assert_eq!(positive["matches"][0]["id"], "fresh-cjk-valid");
+    assert_eq!(positive["matches"][0]["match_source"], "fts_cjk_bigram");
+
+    let latin_infix = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "lease", "limit": 20}),
+            context(&session.id, "fresh-cjk-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        latin_infix["search_backend"],
+        "sqlite_fts_unicode+fts_literal_trigram"
+    );
+    assert_eq!(latin_infix["index_fresh"], true);
+    assert_eq!(latin_infix["fallback_scanned_messages"], 0);
+    assert_eq!(latin_infix["match_count"], 1);
+    assert_eq!(latin_infix["matches"][0]["id"], "fresh-cjk-valid");
+    assert_eq!(
+        latin_infix["matches"][0]["match_source"],
+        "fts_literal_trigram"
+    );
+
+    let negative = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "完全不存在", "limit": 20}),
+            context(&session.id, "fresh-cjk-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(negative["search_backend"], "sqlite_fts_cjk_bigram");
+    assert_eq!(negative["index_fresh"], true);
+    assert_eq!(negative["match_count"], 0);
+    assert_eq!(negative["fallback_scanned_messages"], 0);
+
+    let single = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": "压", "limit": 20}),
+            context(&session.id, "fresh-cjk-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(single["search_backend"], "sqlite_literal");
+    assert_eq!(single["index_fresh"], true);
+    assert_eq!(single["fallback_scanned_messages"], 0);
+    assert!(single["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["match_source"] == "literal"));
 }
 
 #[tokio::test]
@@ -466,4 +563,40 @@ async fn search_current_rejects_stale_derived_index_content() {
 
     assert_eq!(result["match_count"], 0);
     assert!(result["matches"].as_array().unwrap().is_empty());
+    assert_eq!(result["index_fresh"], false);
+    assert!(result["fallback_scanned_messages"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn search_current_falls_back_when_the_derived_index_query_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let query = "INDEX-ERROR-FALLBACK-SENTINEL";
+    let mut session = Session::new("index-error-session", "test-model");
+    let mut prior = Message::assistant(format!("{query}: canonical content"), None);
+    prior.id = "index-error-match".to_string();
+    session.add_message(prior);
+    session.add_message(Message::user("search earlier history"));
+    store.save_session(&session).await.unwrap();
+    store.flush_search_index().await;
+    std::fs::remove_file(store.search_index().db_path()).unwrap();
+
+    let tool = SessionInspectorTool::self_only(store.clone(), store);
+    let result = completed(
+        tool.invoke(
+            json!({"action": "search_current", "query": query}),
+            context(&session.id, "index-error-call"),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(result["search_backend"], "session_json_fallback");
+    assert_eq!(result["index_fresh"], false);
+    assert_eq!(result["match_count"], 1);
+    assert_eq!(result["matches"][0]["id"], "index-error-match");
+    assert!(result["fallback_scanned_messages"].as_u64().unwrap() > 0);
 }

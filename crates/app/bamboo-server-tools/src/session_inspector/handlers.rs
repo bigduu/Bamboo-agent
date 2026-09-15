@@ -3,7 +3,7 @@
 use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_agent_core::{Message, Role, Session, SessionKind};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::helpers::{
     excerpt_around_match, extract_image_urls, map_index_entry, normalize_contains, role_to_str,
@@ -15,17 +15,6 @@ const SEARCH_CURRENT_DEFAULT_LIMIT: usize = 20;
 const SEARCH_CURRENT_MAX_LIMIT: usize = 50;
 const SEARCH_CURRENT_MAX_QUERY_CHARS: usize = 512;
 const SEARCH_CURRENT_PREVIEW_CHARS: usize = 600;
-
-fn is_search_current_call(call: &bamboo_agent_core::ToolCall) -> bool {
-    if bamboo_domain::canonical_tool_name(&call.function.name) != "session_history" {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-        .ok()
-        .is_some_and(|args| {
-            args.get("action").and_then(serde_json::Value::as_str) == Some("search_current")
-        })
-}
 
 fn history_search_boundary(session: &Session, tool_call_id: &str) -> (usize, Option<usize>) {
     let Some(call_index) = session.messages.iter().rposition(|message| {
@@ -51,67 +40,18 @@ fn history_search_boundary(session: &Session, tool_call_id: &str) -> (usize, Opt
     (call_index, current_request_index)
 }
 
-fn excluded_search_message_ids(
+fn current_request_excluded_message_ids(
     session: &Session,
-    before: usize,
     current_request_index: Option<usize>,
 ) -> Vec<String> {
-    let mut call_ids = HashSet::new();
-    let mut message_ids = HashSet::new();
-    if let Some(message) = current_request_index.and_then(|index| session.messages.get(index)) {
-        message_ids.insert(message.id.as_str());
-    }
-    for message in session.messages.iter().take(before) {
-        let generated = message.tool_calls.as_ref().is_some_and(|calls| {
-            let mut generated = false;
-            for call in calls {
-                if is_search_current_call(call) {
-                    call_ids.insert(call.id.as_str());
-                    generated = true;
-                }
-            }
-            generated
-        });
-        if generated {
-            message_ids.insert(message.id.as_str());
-        }
-    }
-    for message in session.messages.iter().take(before) {
-        if message
-            .tool_call_id
-            .as_deref()
-            .is_some_and(|call_id| call_ids.contains(call_id))
-        {
-            message_ids.insert(message.id.as_str());
-        }
-    }
-    message_ids.into_iter().map(str::to_string).collect()
+    current_request_index
+        .and_then(|index| session.messages.get(index))
+        .map(|message| vec![message.id.clone()])
+        .unwrap_or_default()
 }
 
 fn search_content_matches(content: &str, query: &str) -> bool {
-    if normalize_contains(content, query, false) {
-        return true;
-    }
-
-    // Mirror the safe FTS query's AND-of-prefix-terms semantics closely enough
-    // to validate a derived-index hit against the durable Session snapshot.
-    // Exact punctuation/CJK substrings already take the literal branch above.
-    let content_tokens = content
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
-    let query_tokens = query
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
-    !query_tokens.is_empty()
-        && query_tokens.iter().all(|query_token| {
-            content_tokens
-                .iter()
-                .any(|content_token| content_token.starts_with(query_token))
-        })
+    bamboo_storage::search_index::session_message_content_matches(content, query)
 }
 
 pub(super) async fn handle_search_current(
@@ -136,23 +76,58 @@ pub(super) async fn handle_search_current(
         .unwrap_or(SEARCH_CURRENT_DEFAULT_LIMIT)
         .clamp(1, SEARCH_CURRENT_MAX_LIMIT);
 
+    // Foreground saves enqueue index work. This action is an explicit
+    // read-after-write boundary. Read the durable revision on both sides of
+    // the Session load so a concurrent save cannot make an older/newer index
+    // snapshot look complete for the loaded transcript.
+    tool.session_store.flush_search_index().await;
+    let source_revision_before = match tool
+        .session_store
+        .search_source_revision(caller_session_id)
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            tracing::warn!(
+                session_id = caller_session_id,
+                %error,
+                "cannot read current Session search revision before load"
+            );
+            None
+        }
+    };
+
     // The durable Session is also the source of the current tool-call boundary
     // and generated-result exclusions. Search authorization itself comes only
     // from `caller_session_id`, which ToolCtx supplied.
     let session = tool.load_session(caller_session_id).await?;
+    let source_revision_after = match tool
+        .session_store
+        .search_source_revision(caller_session_id)
+        .await
+    {
+        Ok(revision) => revision,
+        Err(error) => {
+            tracing::warn!(
+                session_id = caller_session_id,
+                %error,
+                "cannot read current Session search revision after load"
+            );
+            None
+        }
+    };
+    let stable_source_revision = source_revision_before
+        .as_ref()
+        .filter(|revision| source_revision_after.as_ref() == Some(*revision));
     let (before_message_index, current_request_index) =
         history_search_boundary(&session, current_tool_call_id);
     let excluded_message_ids =
-        excluded_search_message_ids(&session, before_message_index, current_request_index);
+        current_request_excluded_message_ids(&session, current_request_index);
     let excluded = excluded_message_ids
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
 
-    // Foreground saves enqueue index work. This action is an explicit
-    // read-after-write boundary, matching the existing global search/cache
-    // behavior without charging every Session save the FTS latency.
-    tool.session_store.flush_search_index().await;
     let indexed = tool
         .session_store
         .search_index()
@@ -165,44 +140,35 @@ pub(super) async fn handle_search_current(
         )
         .await;
 
-    // SQLite is a derived acceleration structure. Validate every candidate
-    // against the already-loaded durable Session so a failed/lagged index
-    // update can never resurrect rolled-back or edited message content.
-    let authoritative_messages = session
-        .messages
-        .iter()
-        .enumerate()
-        .take(before_message_index)
-        .map(|(index, message)| (message.id.as_str(), (index, message)))
-        .collect::<HashMap<_, _>>();
     let mut matches = Vec::new();
     let mut seen = HashSet::new();
-    let mut backend = "session_json_fallback";
+    let mut backend = "session_json_fallback".to_string();
+    let mut index_fresh = false;
+    let mut index_results_complete = false;
+    let mut indexed_backend = None;
     match indexed {
         Ok(page) => {
-            backend = if page.used_literal_fallback {
-                if page.fts_match_count == 0 {
-                    "sqlite_literal"
-                } else {
-                    "sqlite_fts+literal"
-                }
-            } else {
-                "sqlite_fts"
-            };
+            indexed_backend = Some(format!("sqlite_{}", page.query_backend));
+            let revision_matches = stable_source_revision.is_some_and(|revision| {
+                Some(revision.as_str()) == page.indexed_source_revision.as_deref()
+            });
+            let timestamp_matches = page.indexed_updated_at == Some(session.updated_at);
+            let mut candidates_valid = true;
             for hit in page.matches {
-                let Some(&(message_index, message)) =
-                    authoritative_messages.get(hit.message_id.as_str())
-                else {
+                let Some(message) = session.messages.get(hit.message_index) else {
+                    candidates_valid = false;
                     continue;
                 };
-                if !search_content_matches(&message.content, query)
+                if message.id != hit.message_id
+                    || !search_content_matches(&message.content, query)
                     || !seen.insert(message.id.clone())
                 {
+                    candidates_valid = false;
                     continue;
                 }
                 matches.push(json!({
                     "id": message.id,
-                    "index": message_index,
+                    "index": hit.message_index,
                     "role": role_to_str(&message.role),
                     "created_at": message.created_at,
                     "compressed": message.compressed,
@@ -212,6 +178,14 @@ pub(super) async fn handle_search_current(
                     "rank": hit.rank,
                 }));
             }
+            index_results_complete = page.results_complete;
+            index_fresh =
+                revision_matches && timestamp_matches && candidates_valid && index_results_complete;
+            if index_fresh {
+                backend = indexed_backend
+                    .clone()
+                    .unwrap_or_else(|| "sqlite_fts_unicode".to_string());
+            }
         }
         Err(error) => tracing::warn!(
             session_id = caller_session_id,
@@ -220,11 +194,19 @@ pub(super) async fn handle_search_current(
         ),
     }
 
-    // Supplement from the authoritative Session snapshot if the derived index
-    // was unavailable or lagged despite the flush. This is read-only and keeps
-    // the externally visible page bounded even though the snapshot is complete.
-    let indexed_count = matches.len();
-    if matches.len() < limit {
+    // Supplement from the authoritative Session snapshot only if revision,
+    // timestamp, candidate validation, or bounded-candidate completeness could
+    // not prove that the derived result is current. A fresh zero/under-filled
+    // page is complete and therefore avoids this O(messages) scan.
+    let mut fallback_scanned_messages = 0usize;
+    if !index_fresh {
+        // A stale page is useful only as diagnostics. Rebuild the visible page
+        // exclusively from canonical content so stale ranking or omissions can
+        // never influence a full result page.
+        matches.clear();
+        seen.clear();
+        let generated_artifacts =
+            bamboo_storage::search_index::session_history_search_artifact_ids(&session);
         for (index, message) in session
             .messages
             .iter()
@@ -235,7 +217,9 @@ pub(super) async fn handle_search_current(
             if matches.len() == limit {
                 break;
             }
+            fallback_scanned_messages += 1;
             if excluded.contains(message.id.as_str())
+                || generated_artifacts.contains(&message.id)
                 || seen.contains(&message.id)
                 || !search_content_matches(&message.content, query)
             {
@@ -254,13 +238,7 @@ pub(super) async fn handle_search_current(
                 "rank": null,
             }));
         }
-    }
-    if matches.len() > indexed_count {
-        backend = if indexed_count == 0 {
-            "session_json_fallback"
-        } else {
-            "sqlite+session_json"
-        };
+        backend = "session_json_fallback".to_string();
     }
 
     Ok(ToolResult {
@@ -271,6 +249,10 @@ pub(super) async fn handle_search_current(
             "limit": limit,
             "searched_before_message_index": before_message_index,
             "search_backend": backend,
+            "index_backend": indexed_backend,
+            "index_fresh": index_fresh,
+            "index_results_complete": index_results_complete,
+            "fallback_scanned_messages": fallback_scanned_messages,
             "match_count": matches.len(),
             "matches": matches,
             "note": "Matches are bounded read-only excerpts from this Session's stored messages. Compressed messages are searched directly; no message is restored and no compressed flag or context epoch is changed."
