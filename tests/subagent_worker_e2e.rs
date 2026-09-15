@@ -45,6 +45,36 @@ impl Drop for ExactPidCleanup {
 }
 
 #[tokio::test]
+async fn real_bamboo_worker_acknowledges_typed_read_only_before_provision() {
+    let bamboo_bin = Path::new(env!("CARGO_BIN_EXE_bamboo"));
+    let dir = TempDir::new().unwrap();
+    let fabric = dir.path().join("agents");
+    let mut spec = ProvisionSpec::new(
+        ChildIdentity {
+            child_id: "real-read-only-capability".into(),
+            parent_id: Some("p1".into()),
+            project_key: None,
+            role: "planner".into(),
+            depth: 0,
+        },
+        ExecutorSpec::Echo,
+        fabric.to_string_lossy().into_owned(),
+    );
+    spec.capabilities.read_only = true;
+
+    let spawned = spawn_worker(
+        bamboo_bin,
+        &["subagent-worker".to_string()],
+        &spec,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("the current Bamboo worker must acknowledge typed read-only authority");
+    assert_eq!(spawned.record.agent_id, "real-read-only-capability");
+    spawned.kill().await;
+}
+
+#[tokio::test]
 async fn real_bamboo_binary_serves_a_subagent_run() {
     let bamboo_bin = Path::new(env!("CARGO_BIN_EXE_bamboo"));
     let dir = TempDir::new().unwrap();

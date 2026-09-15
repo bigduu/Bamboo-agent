@@ -747,22 +747,26 @@ struct TurnOutcome {
 
 // ---- Per-run resource guardrails (issue #221) ----
 
-/// The `SubAgent` tool's name (see `bamboo-server-tools::sub_agent::SubAgentTool`).
-/// Duplicated here as a plain string — the engine has no dependency on the
-/// server-tools crate that owns the tool — purely to COUNT spawn attempts for
-/// the per-run `max_subagents` budget guardrail below; it never affects
-/// dispatch. A tool rename must update both sites.
+/// Child-spawning tool names owned by `bamboo-server-tools`.
+///
+/// Duplicated here as plain strings — the engine has no dependency on the
+/// server-tools crate that owns them — purely to COUNT spawn attempts for the
+/// per-run `max_subagents` budget guardrail below; they never affect dispatch.
+/// A tool rename must update both sites.
 const SUBAGENT_TOOL_NAME: &str = "SubAgent";
+const PLAN_TOOL_NAME: &str = "Plan";
 
-/// True when `call` is a `SubAgent` tool call that creates a NEW child: its
-/// `action` argument is `"create"`, or the argument is absent/unparsable (the
-/// tool's own legacy default — see `SubAgentArgs`'s `#[serde(tag = "action")]`
-/// in `bamboo-server-tools`). Every other action (`wait`/`list`/`get`/
-/// `update`/`run`/`send_message`/`cancel`/`delete`/`list_models`) manages an
-/// EXISTING child and is not counted against the spawn budget.
-fn is_subagent_create_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
-    if call.function.name != SUBAGENT_TOOL_NAME {
-        return false;
+/// True when `call` creates one new child session.
+///
+/// Every `Plan` call creates exactly one one-shot planner child. A `SubAgent`
+/// call counts only when its `action` is `"create"`, or when the action is
+/// absent/unparsable (the tool's legacy create default). All other SubAgent
+/// actions manage existing children and do not consume the spawn budget.
+fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
+    match call.function.name.as_str() {
+        PLAN_TOOL_NAME => return true,
+        SUBAGENT_TOOL_NAME => {}
+        _ => return false,
     }
     serde_json::from_str::<serde_json::Value>(&call.function.arguments)
         .ok()
@@ -824,7 +828,7 @@ impl RoundActivity {
             stream_output
                 .tool_calls
                 .iter()
-                .filter(|call| is_subagent_create_call(call))
+                .filter(|call| is_child_spawn_call(call))
                 .count() as u32,
         );
     }
@@ -3690,7 +3694,7 @@ fn heuristic_complexity(
     use crate::runtime::complexity_classifier::TaskComplexity;
 
     let simple_tools = ["Read", "Glob", "Grep", "Bash"];
-    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
+    let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
         .iter()
@@ -3716,7 +3720,7 @@ mod tests {
         build_openai_client_tool_search_outputs, check_run_budget_exceeded,
         commit_assistant_message, commit_openai_client_tool_search_round,
         commit_sticky_fallback_discovery_round, effective_callable_set_for_round,
-        is_overflow_recoverable, is_subagent_create_call, is_terminal_child_status,
+        is_child_spawn_call, is_overflow_recoverable, is_terminal_child_status,
         map_turn_error_status, maybe_spawn_guardian_review, maybe_suspend_for_orphaned_children,
         maybe_suspend_for_outstanding_bash, scope_discovered_gateway_schema,
         should_retry_turn_error, sticky_fallback_definition_delta, sticky_fallback_tool_result,
@@ -7628,36 +7632,37 @@ mod tests {
     }
 
     #[test]
-    fn is_subagent_create_call_counts_default_and_explicit_create_only() {
-        let call = |arguments: &str| bamboo_agent_core::tools::ToolCall {
+    fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
+        let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
             tool_type: "function".to_string(),
             function: bamboo_agent_core::tools::FunctionCall {
-                name: "SubAgent".to_string(),
+                name: name.to_string(),
                 arguments: arguments.to_string(),
             },
         };
         assert!(
-            is_subagent_create_call(&call(r#"{"action":"create","prompt":"x"}"#)),
+            is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
+            "every Plan call creates one planner child"
+        );
+        assert!(
+            is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
             "explicit action=create counts"
         );
         assert!(
-            is_subagent_create_call(&call(r#"{"prompt":"x"}"#)),
+            is_child_spawn_call(&call("SubAgent", r#"{"prompt":"x"}"#)),
             "missing action defaults to the tool's legacy create behavior"
         );
         assert!(
-            !is_subagent_create_call(&call(r#"{"action":"wait"}"#)),
+            !is_child_spawn_call(&call("SubAgent", r#"{"action":"wait"}"#)),
             "action=wait manages an existing child, not a spawn"
         );
         assert!(
-            !is_subagent_create_call(&call(r#"{"action":"list"}"#)),
+            !is_child_spawn_call(&call("SubAgent", r#"{"action":"list"}"#)),
             "action=list is read-only, not a spawn"
         );
-
-        let mut other_tool = call(r#"{"action":"create"}"#);
-        other_tool.function.name = "Bash".to_string();
         assert!(
-            !is_subagent_create_call(&other_tool),
+            !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),
             "a differently named tool is never counted, regardless of args"
         );
     }

@@ -729,6 +729,35 @@ mod session_flags_tests {
     }
 
     #[test]
+    fn typed_read_only_child_does_not_reactivate_the_legacy_plan_name_gate() {
+        for requested in [SessionPermissionMode::Auto, SessionPermissionMode::Bypass] {
+            let mut session = Session::new("s-read-only-child", "test-model");
+            let runtime = session.agent_runtime_state.get_or_insert_default();
+            runtime.set_permission_mode(requested);
+            runtime.read_only = true;
+
+            // Runtime-enforced read-only children use a host-provisioned
+            // no-shell denylist plus ReadOnlyCommandChecker. Keep the typed
+            // child's exact Auto/Bypass flags here; the checker remains the
+            // non-bypassable authority for every permission-bearing call.
+            let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+                &session,
+                PermissionMode::Auto,
+            );
+
+            assert!(!flags.plan_read_only);
+            assert_eq!(
+                flags.bypass_permissions,
+                requested == SessionPermissionMode::Bypass
+            );
+            assert_eq!(
+                flags.auto_approve_permissions,
+                requested == SessionPermissionMode::Auto
+            );
+        }
+    }
+
+    #[test]
     fn for_dispatch_maps_flags_onto_context() {
         let (tx, _rx) = mpsc::channel(1);
         let ctx = ToolExecutionContext::for_dispatch(

@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 24] = [
     "conclusion_with_options",
     "Bash",
     "BashInput",
@@ -21,6 +21,7 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 23] = [
     "KillShell",
     "session_note",
     "NotebookEdit",
+    "Plan",
     "Read",
     "request_permissions",
     "Sleep",
@@ -258,19 +259,31 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Create or update the shared task list for the current root session tree (root + child sessions share the same task list).",
             "Do not use for trivial one-step requests.",
-            &["ExitPlanMode"],
+            &["Plan"],
             vec![example(
                 "Update shared task statuses",
                 json!({"tasks":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]}),
                 "Keep exactly one item in_progress whenever possible.",
             )],
         )),
+        "Plan" => Some(guide(
+            "Plan",
+            ToolCategory::TaskManagement,
+            "Delegate a complex planning request to one runtime-enforced read-only planner child. The root remains the normal orchestrator and resumes automatically with the planner result.",
+            "Do not use for a trivial lookup or as a substitute for implementation after the approach is already clear; do not call legacy EnterPlanMode when Plan is available.",
+            &["Task", "SubAgent"],
+            vec![example(
+                "Delegate an implementation plan",
+                json!({"task":"Inspect the current authentication flow and return an ordered migration plan with affected files, tests, risks, and explicit non-goals.","title":"Plan authentication migration","fork_last_messages":2}),
+                "The planner runs read-only; the parent waits internally and resumes without a mode-switch question.",
+            )],
+        )),
         "EnterPlanMode" => Some(guide(
             "EnterPlanMode",
             ToolCategory::UserInteraction,
-            "Switch to plan mode for complex tasks requiring exploration and design before implementation.",
-            "Do not use for simple tasks that can be implemented directly.",
-            &["Task", "ExitPlanMode"],
+            "Legacy compatibility tool for hosts where delegated Plan is unavailable.",
+            "Do not call when Plan is available; ordinary server sessions should delegate planning without switching the root mode.",
+            &["Plan", "Task", "ExitPlanMode"],
             vec![example(
                 "Start planning a complex refactor",
                 json!({"reason":"This refactor touches multiple crates and needs careful design"}),

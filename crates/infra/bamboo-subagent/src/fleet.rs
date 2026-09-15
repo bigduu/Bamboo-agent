@@ -1,9 +1,10 @@
 //! Parent-side fleet helpers: spawn an actor subprocess, provision it over stdin, discover it.
 //!
 //! Bootstrap protocol:
-//! 1. spawn the worker binary with **no arguments** (nothing secret in argv/env),
-//! 2. write one [`ProvisionSpec`] JSON document to its stdin and close the pipe,
-//! 3. poll the Tier-1 fabric until the worker self-registers under `identity.child_id`.
+//! 1. for typed read-only work, probe the worker's non-secret capability document,
+//! 2. spawn the worker with only fixed configured arguments (nothing per-child or secret),
+//! 3. write one [`ProvisionSpec`] JSON document to its stdin and close the pipe,
+//! 4. poll the Tier-1 fabric until the worker self-registers under `identity.child_id`.
 //!
 //! The real engine adapter (`SubprocessChildRunner`) builds on these primitives.
 
@@ -14,11 +15,13 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 
 use crate::discovery::Fabric;
 use crate::proto::AgentRecord;
-use crate::provision::{ProvisionSpec, WorkerOwner};
+use crate::provision::{
+    ProvisionSpec, WorkerCapabilityReport, WorkerOwner, TYPED_READ_ONLY_WORKER_CAPABILITY,
+};
 use crate::transport::{TransportError, TransportResult};
 
 fn local_owner_instance_id() -> &'static str {
@@ -37,6 +40,62 @@ fn provision_for_local_spawn(spec: &ProvisionSpec) -> ProvisionSpec {
         spec.identity.parent_id.clone(),
     ));
     provisioned
+}
+
+const WORKER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn validate_worker_capability_report(output: &[u8]) -> TransportResult<()> {
+    let report: WorkerCapabilityReport = serde_json::from_slice(output).map_err(|error| {
+        TransportError::Protocol(format!(
+            "worker capability probe returned invalid JSON: {error}"
+        ))
+    })?;
+    if !report.supports(TYPED_READ_ONLY_WORKER_CAPABILITY) {
+        return Err(TransportError::Protocol(format!(
+            "worker does not acknowledge required capability '{TYPED_READ_ONLY_WORKER_CAPABILITY}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify the worker understands the authority-bearing fields before sending
+/// it a typed read-only provision. An older Bamboo binary exits on the unknown
+/// flag; a custom worker must implement the same explicit acknowledgement.
+async fn require_typed_read_only_worker_capability(
+    worker_bin: &Path,
+    worker_args: &[String],
+) -> TransportResult<()> {
+    let mut probe = Command::new(worker_bin);
+    probe.args(worker_args);
+    probe.arg("--print-capabilities");
+    probe.stdin(Stdio::null());
+    probe.kill_on_drop(true);
+    let output = timeout(WORKER_CAPABILITY_PROBE_TIMEOUT, probe.output())
+        .await
+        .map_err(|_| {
+            TransportError::Protocol(format!(
+                "worker capability probe timed out after {WORKER_CAPABILITY_PROBE_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(TransportError::Io)?;
+    if !output.status.success() {
+        return Err(TransportError::Protocol(format!(
+            "worker capability probe failed with status {}; refusing typed read-only activation",
+            output.status
+        )));
+    }
+    validate_worker_capability_report(&output.stdout)
+}
+
+async fn ensure_provision_capabilities(
+    worker_bin: &Path,
+    worker_args: &[String],
+    spec: &ProvisionSpec,
+) -> TransportResult<()> {
+    if spec.capabilities.read_only_enforced() {
+        require_typed_read_only_worker_capability(worker_bin, worker_args).await?;
+    }
+    Ok(())
 }
 
 /// A launched actor plus its discovered record.
@@ -97,6 +156,7 @@ pub async fn spawn_worker(
     spec: &ProvisionSpec,
     wait: Duration,
 ) -> TransportResult<SpawnedChild> {
+    ensure_provision_capabilities(worker_bin, worker_args, spec).await?;
     let fabric_dir = Path::new(&spec.fabric_dir);
     tokio::fs::create_dir_all(fabric_dir).await.ok();
 
@@ -161,6 +221,7 @@ pub async fn spawn_worker_on_bus(
     worker_args: &[String],
     spec: &ProvisionSpec,
 ) -> TransportResult<SpawnedChild> {
+    ensure_provision_capabilities(worker_bin, worker_args, spec).await?;
     let spec_json = provision_for_local_spawn(spec)
         .to_json()
         .map_err(|e| TransportError::Protocol(format!("provision spec encode: {e}")))?;
@@ -206,6 +267,24 @@ pub async fn spawn_worker_on_bus(
 mod tests {
     use super::*;
     use crate::provision::{ChildIdentity, ExecutorSpec};
+
+    #[test]
+    fn typed_read_only_worker_requires_explicit_capability_acknowledgement() {
+        let accepted = serde_json::to_vec(&WorkerCapabilityReport::current()).unwrap();
+        validate_worker_capability_report(&accepted).unwrap();
+
+        let legacy = serde_json::to_vec(&WorkerCapabilityReport {
+            provision_version: 1,
+            capabilities: Vec::new(),
+        })
+        .unwrap();
+        let error = validate_worker_capability_report(&legacy).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(TYPED_READ_ONLY_WORKER_CAPABILITY));
+
+        assert!(validate_worker_capability_report(b"not-json").is_err());
+    }
 
     #[test]
     fn local_spawn_stamps_current_process_instance_and_parent_session() {

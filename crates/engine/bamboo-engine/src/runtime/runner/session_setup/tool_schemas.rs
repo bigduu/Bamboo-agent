@@ -98,6 +98,29 @@ fn apply_session_tool_schema_overrides(session: &Session, tool_schemas: &mut [To
     }
 }
 
+/// Prefer delegated planning only when the live, post-disable catalog actually
+/// contains `Plan`. A persisted session already inside the legacy PlanMode
+/// state machine keeps `ExitPlanMode` as its recovery path.
+fn prefer_delegated_plan_tool(
+    session: &Session,
+    catalog: &mut std::collections::BTreeMap<String, ClassifiedToolSchema>,
+) {
+    if !catalog.contains_key("Plan") {
+        return;
+    }
+
+    catalog.remove("EnterPlanMode");
+    let legacy_plan_active = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    if legacy_plan_active {
+        catalog.remove("Plan");
+    } else {
+        catalog.remove("ExitPlanMode");
+    }
+}
+
 pub(crate) fn resolve_available_tool_schemas_for_session(
     config: &AgentLoopConfig,
     tools: &dyn ToolExecutor,
@@ -234,6 +257,7 @@ fn resolve_catalog_with_activation(
         })
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
+    prefer_delegated_plan_tool(session, &mut by_execution_name);
 
     let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
     catalog.sort_by(|left, right| {
@@ -256,6 +280,73 @@ mod live_disabled_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        }
+    }
+
+    fn plan_catalog() -> std::collections::BTreeMap<String, ClassifiedToolSchema> {
+        ["Plan", "EnterPlanMode", "ExitPlanMode", "Read"]
+            .into_iter()
+            .map(schema)
+            .filter_map(ClassifiedToolSchema::new)
+            .map(|entry| (entry.execution_name().to_string(), entry))
+            .collect()
+    }
+
+    #[test]
+    fn delegated_plan_replaces_legacy_mode_tools_for_inactive_sessions() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["Plan", "Read"]
+        );
+    }
+
+    #[test]
+    fn delegated_plan_preserves_exit_for_an_active_legacy_session() {
+        let mut session = Session::new("s", "m");
+        let runtime = session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: bamboo_domain::PlanModeStatus::Exploring,
+        });
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["ExitPlanMode", "Read"]
+        );
+    }
+
+    #[test]
+    fn legacy_plan_mode_tools_remain_when_plan_is_not_available() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+        catalog.remove("Plan");
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert!(catalog.contains_key("EnterPlanMode"));
+        assert!(catalog.contains_key("ExitPlanMode"));
+    }
+
     struct TwoTools;
     #[async_trait::async_trait]
     impl ToolExecutor for TwoTools {
@@ -272,14 +363,7 @@ mod live_disabled_tests {
         fn list_tools(&self) -> Vec<ToolSchema> {
             ["alpha_tool", "beta_tool", "load_skill"]
                 .into_iter()
-                .map(|name| ToolSchema {
-                    schema_type: "function".into(),
-                    function: FunctionSchema {
-                        name: name.into(),
-                        description: String::new(),
-                        parameters: serde_json::json!({ "type": "object" }),
-                    },
-                })
+                .map(schema)
                 .collect()
         }
     }
