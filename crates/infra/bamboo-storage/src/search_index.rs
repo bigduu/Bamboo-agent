@@ -501,22 +501,22 @@ SELECT
     m.message_id,
     m.message_index,
     m.role,
-    bm25(session_messages_search_fts) AS rank,
+    bm25(session_messages_current_search_fts) AS rank,
     m.content,
     m.compressed,
     m.created_at,
     length(m.content) AS content_len,
     bamboo_session_match_class(m.content, ?4) AS match_class
-FROM session_messages_search_fts
+FROM session_messages_current_search_fts
 JOIN session_messages_search m
-  ON m.session_id = session_messages_search_fts.session_id
- AND m.message_id = session_messages_search_fts.message_id
-WHERE session_messages_search_fts MATCH ?1
+  ON m.session_id = session_messages_current_search_fts.session_id
+ AND m.message_id = session_messages_current_search_fts.message_id
+WHERE session_messages_current_search_fts MATCH ?1
   AND m.session_id = ?2
   AND m.message_index < ?3
   AND m.history_search_artifact = 0
   AND bamboo_session_match_class(m.content, ?4) > 0
-ORDER BY match_class DESC, session_messages_search_fts.rank, m.message_index DESC
+ORDER BY match_class DESC, session_messages_current_search_fts.rank, m.message_index DESC
 LIMIT ?5
 "#;
 
@@ -1594,8 +1594,8 @@ mod tests {
         let connection = open_db(index.db_path()).unwrap();
         let raw_candidate_count: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM session_messages_search_fts
-                 WHERE session_messages_search_fts MATCH ?1 AND session_id = ?2",
+                "SELECT COUNT(*) FROM session_messages_current_search_fts
+                 WHERE session_messages_current_search_fts MATCH ?1 AND session_id = ?2",
                 params![
                     session_message_query_plan("压缩上下").fts_query.unwrap(),
                     session.id
@@ -2105,6 +2105,46 @@ mod tests {
                 "production FTS ordering must not require a temporary ORDER BY tree: {plan:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn global_message_rank_excludes_current_session_helper_projection_lengths() {
+        let temp = TempDir::new().unwrap();
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.unwrap();
+        let mut session = Session::new("global-rank-projection", "fixture-model");
+        session.title = "background".to_string();
+
+        let mut projection_heavy = Message::user(format!("needle {}", "a".repeat(512)));
+        projection_heavy.id = "canonical-short".to_string();
+        session.add_message(projection_heavy);
+        let long_tail = (0..20)
+            .map(|index| format!("w{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut canonical_long = Message::user(format!("needle {long_tail}"));
+        canonical_long.id = "canonical-long".to_string();
+        session.add_message(canonical_long);
+        index.upsert_session(&session).await.unwrap();
+
+        let connection = open_db(index.db_path()).unwrap();
+        let projected_first: String = connection
+            .query_row(
+                "SELECT message_id FROM session_messages_current_search_fts
+                 WHERE session_messages_current_search_fts MATCH ?1
+                 ORDER BY session_messages_current_search_fts.rank LIMIT 1",
+                [build_message_fts_query("needle")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            projected_first, "canonical-long",
+            "fixture must expose helper-token document-length distortion"
+        );
+
+        let results = index.search("needle", 1).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id.as_deref(), Some("canonical-short"));
     }
 
     #[tokio::test]

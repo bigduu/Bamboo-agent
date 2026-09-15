@@ -5,9 +5,9 @@ use super::{
     Connection, OptionalExtension, Role, Session, SessionKind,
 };
 
-// Counts come from sqlite3_changes for the top-level statements, excluding
-// FTS shadow-table internals. They keep differential-write tests independent of
-// FTS5's internal storage implementation; callers need no public metrics API.
+// Counts track logical ordinary/FTS rows, excluding FTS shadow-table internals.
+// A message FTS change is counted once even though the canonical global row and
+// current-Session projection row share one transactional repair lifecycle.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Changes {
     pub sessions: usize,
@@ -20,7 +20,12 @@ pub(super) const DELETE_SESSION_FTS: &str = "DELETE FROM sessions_search_fts WHE
     (SELECT search_rowid FROM sessions_search WHERE session_id = ?1)";
 pub(super) const DELETE_MESSAGE_FTS: &str = "DELETE FROM session_messages_search_fts WHERE rowid IN
     (SELECT search_rowid FROM session_messages_search WHERE session_id = ?1)";
+pub(super) const DELETE_CURRENT_MESSAGE_FTS: &str =
+    "DELETE FROM session_messages_current_search_fts WHERE rowid IN
+    (SELECT search_rowid FROM session_messages_search WHERE session_id = ?1)";
 const DELETE_MESSAGE_FTS_ROW: &str = "DELETE FROM session_messages_search_fts WHERE rowid = ?1";
+const DELETE_CURRENT_MESSAGE_FTS_ROW: &str =
+    "DELETE FROM session_messages_current_search_fts WHERE rowid = ?1";
 
 #[derive(Debug, PartialEq, Eq)]
 struct MessageRow {
@@ -164,16 +169,25 @@ pub(super) fn sync_session(
             history_search_artifact=?7
         WHERE search_rowid=?1",
     )?;
-    let mut fts_read = conn.prepare(
+    let mut current_fts_read = conn.prepare(
         "SELECT session_id, message_id, message_index, role, content, content_cjk_bigrams,
                 content_literal_trigrams
-        FROM session_messages_search_fts WHERE rowid=?1",
+        FROM session_messages_current_search_fts WHERE rowid=?1",
     )?;
-    let mut fts_write = conn.prepare(
-        "INSERT OR REPLACE INTO session_messages_search_fts
+    let mut current_fts_write = conn.prepare(
+        "INSERT OR REPLACE INTO session_messages_current_search_fts
         (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
          content_literal_trigrams)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    let mut canonical_fts_read = conn.prepare(
+        "SELECT session_id, message_id, message_index, role, content
+        FROM session_messages_search_fts WHERE rowid=?1",
+    )?;
+    let mut canonical_fts_write = conn.prepare(
+        "INSERT OR REPLACE INTO session_messages_search_fts
+        (rowid, session_id, message_id, message_index, role, content)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for (index, message) in session.messages.iter().enumerate() {
         let old = stored.remove(&message.id);
@@ -221,7 +235,7 @@ pub(super) fn sync_session(
         // must still repair missing/stale FTS during upsert or startup rebuild.
         let cjk_projection = cjk_bigram_projection(&next.content);
         let literal_projection = literal_trigram_projection(&next.content);
-        let fts_matches = fts_read
+        let current_fts_matches = current_fts_read
             .query_row([next.rowid], |row| {
                 Ok(
                     row.get::<_, Option<String>>(0)?.as_deref() == Some(&session.id)
@@ -235,8 +249,20 @@ pub(super) fn sync_session(
             })
             .optional()?
             .unwrap_or(false);
-        if !fts_matches {
-            changes.message_fts += fts_write.execute(params![
+        let canonical_fts_matches = canonical_fts_read
+            .query_row([next.rowid], |row| {
+                Ok(
+                    row.get::<_, Option<String>>(0)?.as_deref() == Some(&session.id)
+                        && row.get::<_, Option<String>>(1)?.as_deref() == Some(&message.id)
+                        && row.get::<_, Option<i64>>(2)? == Some(next.index)
+                        && row.get::<_, Option<String>>(3)?.as_deref() == Some(&next.role)
+                        && row.get::<_, Option<String>>(4)?.as_deref() == Some(&next.content),
+                )
+            })
+            .optional()?
+            .unwrap_or(false);
+        if !current_fts_matches {
+            current_fts_write.execute(params![
                 next.rowid,
                 session.id,
                 message.id,
@@ -247,11 +273,27 @@ pub(super) fn sync_session(
                 literal_projection
             ])?;
         }
+        if !canonical_fts_matches {
+            canonical_fts_write.execute(params![
+                next.rowid,
+                session.id,
+                message.id,
+                next.index,
+                next.role,
+                next.content
+            ])?;
+        }
+        if !current_fts_matches || !canonical_fts_matches {
+            changes.message_fts += 1;
+        }
     }
-    let mut fts_delete = conn.prepare(DELETE_MESSAGE_FTS_ROW)?;
+    let mut canonical_fts_delete = conn.prepare(DELETE_MESSAGE_FTS_ROW)?;
+    let mut current_fts_delete = conn.prepare(DELETE_CURRENT_MESSAGE_FTS_ROW)?;
     let mut delete = conn.prepare("DELETE FROM session_messages_search WHERE search_rowid=?1")?;
     for removed in stored.into_values() {
-        changes.message_fts += fts_delete.execute([removed.rowid])?;
+        let canonical_fts_deleted = canonical_fts_delete.execute([removed.rowid])?;
+        let current_fts_deleted = current_fts_delete.execute([removed.rowid])?;
+        changes.message_fts += usize::from(canonical_fts_deleted > 0 || current_fts_deleted > 0);
         changes.messages += delete.execute([removed.rowid])?;
     }
     Ok(changes)
@@ -262,6 +304,7 @@ pub(super) fn delete_session(conn: &Connection, session_id: &str) -> rusqlite::R
     // deleting those ordinary rows. UNINDEXED FTS session_id is never scanned.
     conn.execute(DELETE_SESSION_FTS, [session_id])?;
     conn.execute(DELETE_MESSAGE_FTS, [session_id])?;
+    conn.execute(DELETE_CURRENT_MESSAGE_FTS, [session_id])?;
     conn.execute(
         "DELETE FROM session_messages_search WHERE session_id=?1",
         [session_id],

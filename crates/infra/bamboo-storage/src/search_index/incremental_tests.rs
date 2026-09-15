@@ -27,10 +27,10 @@ fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
         .unwrap()
 }
 
-fn search_semantics_without_rank(path: &Path, query: &str) -> serde_json::Value {
-    let mut snapshot = serde_json::to_value(search_db(path, query, 10).unwrap()).unwrap();
-    for result in snapshot.as_array_mut().unwrap() {
-        let rank = result.as_object_mut().unwrap().remove("rank").unwrap();
+fn search_snapshot(path: &Path, query: &str) -> serde_json::Value {
+    let snapshot = serde_json::to_value(search_db(path, query, 10).unwrap()).unwrap();
+    for result in snapshot.as_array().unwrap() {
+        let rank = result.as_object().unwrap().get("rank").unwrap();
         assert!(rank.as_f64().unwrap().is_finite());
     }
     snapshot
@@ -158,6 +158,10 @@ fn assert_identity_alignment(conn: &Connection) {
     for (normal, fts) in [
         ("sessions_search", "sessions_search_fts"),
         ("session_messages_search", "session_messages_search_fts"),
+        (
+            "session_messages_search",
+            "session_messages_current_search_fts",
+        ),
     ] {
         let mut columns = "session_id".to_string();
         if normal == "session_messages_search" {
@@ -186,11 +190,10 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
         "SELECT name, sql FROM sqlite_schema
         WHERE name LIKE 'user_%' OR name='idx_session_messages_search_session_id' ORDER BY name",
     );
-    // FTS5 rank magnitudes are implementation-derived and can shift when a
-    // new indexed projection column is added. Preserve the actual contract:
-    // hit identity, order, snippets, and all durable metadata.
-    let before_search = search_semantics_without_rank(&path, "quartz");
-    let before_session = search_semantics_without_rank(&path, "beacon");
+    // The canonical global FTS remains content-only, so migration preserves
+    // ranks as well as hit identity, order, snippets, and durable metadata.
+    let before_search = search_snapshot(&path, "quartz");
+    let before_session = search_snapshot(&path, "beacon");
     let before_cache =
         serde_json::to_value(read_compressed_cache_db(&path, "legacy", 0, 20, 100).unwrap())
             .unwrap();
@@ -219,14 +222,8 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
             rows(&conn, "SELECT * FROM unrelated"),
             vec![vec![Value::Text("preserve this table".into())]]
         );
-        assert_eq!(
-            search_semantics_without_rank(&path, "quartz"),
-            before_search
-        );
-        assert_eq!(
-            search_semantics_without_rank(&path, "beacon"),
-            before_session
-        );
+        assert_eq!(search_snapshot(&path, "quartz"), before_search);
+        assert_eq!(search_snapshot(&path, "beacon"), before_session);
         assert_eq!(
             serde_json::to_value(read_compressed_cache_db(&path, "legacy", 0, 20, 100).unwrap())
                 .unwrap(),
@@ -535,6 +532,7 @@ fn assert_shape_rejected_without_mutation(path: &Path, conn: &Connection, reason
             "SELECT rowid, * FROM session_messages_search ORDER BY rowid",
             "SELECT rowid, * FROM sessions_search_fts ORDER BY rowid",
             "SELECT rowid, * FROM session_messages_search_fts ORDER BY rowid",
+            "SELECT rowid, * FROM session_messages_current_search_fts ORDER BY rowid",
         ]
         .map(|sql| rows(conn, sql))
     };
@@ -592,11 +590,52 @@ fn v5_rejects_missing_unindexed_or_retokenized_message_projections() {
         upsert_session_db(&path, &fixture("message-fts-shape"), None).unwrap();
         let conn = open_db(&path).unwrap();
         conn.execute_batch(&format!(
-            "DROP TABLE session_messages_search_fts;
-             CREATE VIRTUAL TABLE session_messages_search_fts USING fts5({definition});"
+            "DROP TABLE session_messages_current_search_fts;
+             CREATE VIRTUAL TABLE session_messages_current_search_fts USING fts5({definition});"
         ))
         .unwrap();
         assert_shape_rejected_without_mutation(&path, &conn, "unsupported search FTS shape");
+    }
+}
+
+#[test]
+fn v5_rejects_changed_or_missing_canonical_message_fts() {
+    for definition in [
+        Some(
+            "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+             role UNINDEXED, content UNINDEXED",
+        ),
+        Some(
+            "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+             role UNINDEXED, content, content_cjk_bigrams",
+        ),
+        Some(
+            "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+             role UNINDEXED, content, tokenize='porter'",
+        ),
+        None,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("search.db");
+        init_db(&path).unwrap();
+        upsert_session_db(&path, &fixture("canonical-message-fts-shape"), None).unwrap();
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch("DROP TABLE session_messages_search_fts;")
+            .unwrap();
+        if let Some(definition) = definition {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE session_messages_search_fts USING fts5({definition});"
+            ))
+            .unwrap();
+        }
+        let before = rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name");
+        let error = init_db(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported search FTS shape"), "{error}");
+        assert_eq!(
+            rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name"),
+            before,
+            "shape rejection must not recreate or mutate the canonical FTS"
+        );
     }
 }
 
@@ -859,11 +898,13 @@ fn unchanged_projection_repairs_missing_stale_and_null_fts_payloads() {
     install_audit(&conn);
     conn.execute_batch(
         "UPDATE sessions_search_fts SET title='corrupt', summary=NULL;
-        DELETE FROM session_messages_search_fts WHERE rowid=1;
-        UPDATE session_messages_search_fts
+        DELETE FROM session_messages_current_search_fts WHERE rowid=1;
+        UPDATE session_messages_current_search_fts
         SET content='stale payload', content_cjk_bigrams='错误 投影',
             content_literal_trigrams='stale projection', role=NULL, message_index=99
-        WHERE rowid=2;",
+        WHERE rowid=2;
+        UPDATE session_messages_search_fts SET content='stale canonical payload'
+        WHERE rowid=3;",
     )
     .unwrap();
     apply_checked(
@@ -871,15 +912,19 @@ fn unchanged_projection_repairs_missing_stale_and_null_fts_payloads() {
         &session,
         delta::Changes {
             session_fts: 1,
-            message_fts: 2,
+            message_fts: 3,
             ..Default::default()
         },
     );
     assert_eq!(search_db(&path, "quartz", 10).unwrap().len(), 3);
     assert!(search_db(&path, "corrupt", 10).unwrap().is_empty());
     assert!(search_db(&path, "stale", 10).unwrap().is_empty());
-    conn.execute_batch("DELETE FROM sessions_search_fts; DELETE FROM session_messages_search_fts;")
-        .unwrap();
+    conn.execute_batch(
+        "DELETE FROM sessions_search_fts;
+         DELETE FROM session_messages_search_fts;
+         DELETE FROM session_messages_current_search_fts;",
+    )
+    .unwrap();
     apply_checked(
         &path,
         &session,
@@ -921,24 +966,26 @@ fn duplicate_ids_and_fts_payload_failure_leave_entire_snapshot_unchanged() {
         titles
     );
 
-    // Substitute a rejecting content table only in this test. The production
-    // FTS INSERT executes after ordinary/session-FTS changes and must fail the
-    // same encompassing transaction; no FTS shadow-table details are involved.
+    // Substitute a rejecting canonical content table only in this test. Its
+    // write runs after the current-Session projection write, so failure must
+    // roll both FTS variants and ordinary/session changes back together.
     conn.execute_batch(
-        "ALTER TABLE session_messages_search_fts RENAME TO saved_fts;
+        "ALTER TABLE session_messages_search_fts RENAME TO saved_canonical_fts;
         CREATE TABLE session_messages_search_fts (session_id, message_id, message_index, role,
-            content CHECK(content NOT LIKE '%rejectpayload%'), content_cjk_bigrams,
-            content_literal_trigrams);
+            content CHECK(content NOT LIKE '%rejectpayload%'));
         INSERT INTO session_messages_search_fts
-            (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams,
-             content_literal_trigrams)
-            SELECT rowid, session_id, message_id, message_index, role, content,
-                   content_cjk_bigrams, content_literal_trigrams FROM saved_fts;",
+            (rowid, session_id, message_id, message_index, role, content)
+            SELECT rowid, session_id, message_id, message_index, role, content
+            FROM saved_canonical_fts;",
     )
     .unwrap();
-    let fts_before = rows(
+    let canonical_fts_before = rows(
         &conn,
         "SELECT rowid, * FROM session_messages_search_fts ORDER BY rowid",
+    );
+    let current_fts_before = rows(
+        &conn,
+        "SELECT rowid, * FROM session_messages_current_search_fts ORDER BY rowid",
     );
     let mut changed = session.clone();
     changed.title = "must rollback".into();
@@ -960,12 +1007,19 @@ fn duplicate_ids_and_fts_payload_failure_leave_entire_snapshot_unchanged() {
             &conn,
             "SELECT rowid, * FROM session_messages_search_fts ORDER BY rowid"
         ),
-        fts_before
+        canonical_fts_before
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT rowid, * FROM session_messages_current_search_fts ORDER BY rowid"
+        ),
+        current_fts_before
     );
     assert!(search_db(&path, "beacon", 1).unwrap()[0].session_title == session.title);
     conn.execute_batch(
         "DROP TABLE session_messages_search_fts;
-        ALTER TABLE saved_fts RENAME TO session_messages_search_fts;",
+        ALTER TABLE saved_canonical_fts RENAME TO session_messages_search_fts;",
     )
     .unwrap();
     assert_eq!(search_db(&path, "quartz", 10).unwrap().len(), 3);
@@ -1029,7 +1083,11 @@ fn deletion_and_pruning_use_keyed_fts_access_among_unrelated_sessions() {
         upsert_session_db(&path, &fixture(&format!("s{index}")), None).unwrap();
     }
     let conn = open_db(&path).unwrap();
-    for sql in [delta::DELETE_SESSION_FTS, delta::DELETE_MESSAGE_FTS] {
+    for sql in [
+        delta::DELETE_SESSION_FTS,
+        delta::DELETE_MESSAGE_FTS,
+        delta::DELETE_CURRENT_MESSAGE_FTS,
+    ] {
         let plan = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap()
