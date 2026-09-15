@@ -2,8 +2,8 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + compact_context)
-//!   └─> root_tools (base + SubAgent + scheduler + session_history)
+//! base_tools (builtin + MCP + memory + skills + compact_context + self-only session_history)
+//!   └─> root_tools (base + SubAgent + scheduler + full session_history)
 //! ```
 
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub(super) fn build_base_tools(
     mcp_manager: Arc<McpServerManager>,
     skill_manager: Arc<SkillManager>,
     session_repo: bamboo_engine::SessionRepository,
+    session_store: Arc<SessionStoreV2>,
+    storage: Arc<dyn Storage>,
     app_data_dir: PathBuf,
     notification_service: Arc<bamboo_notification::NotificationService>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
@@ -169,9 +171,20 @@ pub(super) fn build_base_tools(
         config,
     ));
     let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
-    Arc::new(crate::tools::OverlayToolExecutor::new(
+    let with_notify: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_compact,
         notify_tool,
+    ));
+
+    // Every Session can search only its own authoritative stored messages.
+    // Root replaces this same-name instance with the full viewer below.
+    let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
+        session_store,
+        storage,
+    ));
+    Arc::new(crate::tools::OverlayToolExecutor::new(
+        with_notify,
+        self_history_tool,
     ))
 }
 
@@ -244,6 +257,8 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
     );
 
+    // Intentional same-name overlay replacement: Root keeps every privileged
+    // cross-session action while Base/Child expose only search_current.
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store,
         storage,

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
@@ -67,6 +68,28 @@ pub struct SessionSearchMatch {
     pub message_index: Option<usize>,
     pub role: Option<String>,
     pub content_preview: Option<String>,
+}
+
+/// One bounded message hit from an exact Session-scoped history search.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionMessageSearchMatch {
+    pub message_id: String,
+    pub message_index: usize,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+    pub compressed: bool,
+    pub content_len: usize,
+    pub content_preview: String,
+    pub match_source: String,
+    pub rank: Option<f64>,
+}
+
+/// Results and backend provenance for an exact Session-scoped message search.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionMessageSearchPage {
+    pub matches: Vec<SessionMessageSearchMatch>,
+    pub fts_match_count: usize,
+    pub used_literal_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +207,51 @@ impl SessionSearchIndex {
         task::spawn_blocking(move || search_db(&db_path, &query, limit))
             .await
             .map_err(|error| to_io_error(format!("session search query join error: {error}")))?
+    }
+
+    /// Search message content in exactly one Session.
+    ///
+    /// `before_message_index` is an exclusive transcript boundary supplied by
+    /// the caller so the currently executing search call cannot match itself.
+    /// `excluded_message_ids` removes prior generated history-search calls and
+    /// results. Neither filter changes the indexed or durable Session state.
+    pub async fn search_messages_in_session(
+        &self,
+        session_id: &str,
+        query: &str,
+        before_message_index: usize,
+        excluded_message_ids: &[String],
+        limit: usize,
+    ) -> std::io::Result<SessionMessageSearchPage> {
+        let session_id = session_id.trim();
+        let query = query.trim();
+        if session_id.is_empty() || query.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session_id and query must be non-empty",
+            ));
+        }
+        let db_path = self.db_path.clone();
+        let session_id = session_id.to_string();
+        let query = query.to_string();
+        let excluded_message_ids = excluded_message_ids.to_vec();
+        let limit = limit.min(50);
+        task::spawn_blocking(move || {
+            search_session_messages_db(
+                &db_path,
+                &session_id,
+                &query,
+                before_message_index,
+                &excluded_message_ids,
+                limit,
+            )
+        })
+        .await
+        .map_err(|error| {
+            to_io_error(format!(
+                "session-scoped message search query join error: {error}"
+            ))
+        })?
     }
 
     pub async fn read_compressed_cache(
@@ -406,6 +474,44 @@ ORDER BY session_messages_search_fts.rank
 LIMIT ?2
 "#;
 
+const SESSION_MESSAGE_SEARCH_SQL: &str = r#"
+SELECT
+    m.message_id,
+    m.message_index,
+    m.role,
+    bm25(session_messages_search_fts) AS rank,
+    snippet(session_messages_search_fts, 4, '[', ']', '...', 48) AS snippet,
+    m.compressed,
+    m.created_at,
+    length(m.content) AS content_len
+FROM session_messages_search_fts
+JOIN session_messages_search m
+  ON m.session_id = session_messages_search_fts.session_id
+ AND m.message_id = session_messages_search_fts.message_id
+WHERE session_messages_search_fts MATCH ?1
+  AND m.session_id = ?2
+  AND m.message_index < ?3
+ORDER BY session_messages_search_fts.rank
+LIMIT ?4
+"#;
+
+const SESSION_MESSAGE_LITERAL_SEARCH_SQL: &str = r#"
+SELECT
+    message_id,
+    message_index,
+    role,
+    content,
+    compressed,
+    created_at,
+    length(content) AS content_len
+FROM session_messages_search
+WHERE session_id = ?1
+  AND message_index < ?2
+  AND instr(lower(content), lower(?3)) > 0
+ORDER BY message_index DESC
+LIMIT ?4
+"#;
+
 fn search_db(
     db_path: &Path,
     query: &str,
@@ -524,6 +630,171 @@ fn search_db(
     Ok(matches)
 }
 
+fn search_session_messages_db(
+    db_path: &Path,
+    session_id: &str,
+    query: &str,
+    before_message_index: usize,
+    excluded_message_ids: &[String],
+    limit: usize,
+) -> std::io::Result<SessionMessageSearchPage> {
+    if limit == 0 {
+        return Ok(SessionMessageSearchPage {
+            matches: Vec::new(),
+            fts_match_count: 0,
+            used_literal_fallback: false,
+        });
+    }
+
+    // Fetch a bounded surplus so filtered history-search artifacts do not
+    // consume the caller's visible result limit.
+    const MAX_CANDIDATES: usize = 1_000;
+    let candidate_limit = limit
+        .saturating_add(excluded_message_ids.len())
+        .min(MAX_CANDIDATES)
+        .max(limit);
+    let before_message_index = i64::try_from(before_message_index).unwrap_or(i64::MAX);
+    let excluded = excluded_message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let conn = open_db(db_path)?;
+    let mut matches = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+
+    let mut fts_stmt = conn.prepare(SESSION_MESSAGE_SEARCH_SQL).map_err(|error| {
+        to_io_error(format!(
+            "sqlite prepare session-scoped FTS message search failed: {error}"
+        ))
+    })?;
+    let fts_rows = fts_stmt
+        .query_map(
+            params![
+                build_safe_fts_query(query),
+                session_id,
+                before_message_index,
+                candidate_limit as i64
+            ],
+            |row| {
+                let created_at_raw: String = row.get(6)?;
+                let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let snippet = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+                Ok(SessionMessageSearchMatch {
+                    message_id: row.get(0)?,
+                    message_index: row.get::<_, i64>(1)?.max(0) as usize,
+                    role: row.get(2)?,
+                    rank: Some(row.get(3)?),
+                    content_preview: truncate_chars(&snippet, 600),
+                    compressed: row.get::<_, i64>(5)? != 0,
+                    created_at,
+                    content_len: row.get::<_, i64>(7)?.max(0) as usize,
+                    match_source: "fts".to_string(),
+                })
+            },
+        )
+        .map_err(|error| {
+            to_io_error(format!(
+                "sqlite run session-scoped FTS message search failed: {error}"
+            ))
+        })?;
+    for row in fts_rows {
+        let hit = row.map_err(|error| {
+            to_io_error(format!(
+                "sqlite read session-scoped FTS message match failed: {error}"
+            ))
+        })?;
+        if excluded.contains(hit.message_id.as_str()) || !seen.insert(hit.message_id.clone()) {
+            continue;
+        }
+        matches.push(hit);
+        if matches.len() == limit {
+            break;
+        }
+    }
+    let fts_match_count = matches.len();
+
+    // FTS5's default tokenizer cannot find arbitrary unsegmented CJK
+    // substrings, and punctuation-bearing terms can be tokenized differently
+    // from what the caller typed. Fill any remaining bounded page with a
+    // parameterized literal search over the same exact Session.
+    let used_literal_fallback = matches.len() < limit;
+    if used_literal_fallback {
+        let mut literal_stmt =
+            conn.prepare(SESSION_MESSAGE_LITERAL_SEARCH_SQL)
+                .map_err(|error| {
+                    to_io_error(format!(
+                        "sqlite prepare session-scoped literal message search failed: {error}"
+                    ))
+                })?;
+        let literal_rows = literal_stmt
+            .query_map(
+                params![
+                    session_id,
+                    before_message_index,
+                    query,
+                    candidate_limit as i64
+                ],
+                |row| {
+                    let created_at_raw: String = row.get(5)?;
+                    let created_at = DateTime::parse_from_rfc3339(&created_at_raw)
+                        .map(|value| value.with_timezone(&Utc))
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    let content: String = row.get(3)?;
+                    Ok(SessionMessageSearchMatch {
+                        message_id: row.get(0)?,
+                        message_index: row.get::<_, i64>(1)?.max(0) as usize,
+                        role: row.get(2)?,
+                        content_preview: literal_excerpt(&content, query, 600),
+                        compressed: row.get::<_, i64>(4)? != 0,
+                        created_at,
+                        content_len: row.get::<_, i64>(6)?.max(0) as usize,
+                        match_source: "literal".to_string(),
+                        rank: None,
+                    })
+                },
+            )
+            .map_err(|error| {
+                to_io_error(format!(
+                    "sqlite run session-scoped literal message search failed: {error}"
+                ))
+            })?;
+        for row in literal_rows {
+            let hit = row.map_err(|error| {
+                to_io_error(format!(
+                    "sqlite read session-scoped literal message match failed: {error}"
+                ))
+            })?;
+            if excluded.contains(hit.message_id.as_str()) || !seen.insert(hit.message_id.clone()) {
+                continue;
+            }
+            matches.push(hit);
+            if matches.len() == limit {
+                break;
+            }
+        }
+    }
+
+    Ok(SessionMessageSearchPage {
+        matches,
+        fts_match_count,
+        used_literal_fallback,
+    })
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -632,6 +903,39 @@ fn read_compressed_cache_db(
     })
 }
 
+fn literal_excerpt(content: &str, query: &str, max_chars: usize) -> String {
+    let content_len = content.chars().count();
+    if content_len <= max_chars {
+        return content.to_string();
+    }
+
+    let folded_content = content.to_lowercase();
+    let folded_query = query.to_lowercase();
+    let match_char = folded_content
+        .find(&folded_query)
+        .map(|byte| folded_content[..byte].chars().count())
+        .unwrap_or(0);
+    let query_chars = query.chars().count();
+    let start = match_char.saturating_sub(max_chars / 3);
+    let end = start
+        .saturating_add(max_chars)
+        .max(match_char.saturating_add(query_chars))
+        .min(content_len);
+    let start = end.saturating_sub(max_chars);
+    let mut excerpt = content
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect::<String>();
+    if start > 0 {
+        excerpt.insert_str(0, "...");
+    }
+    if end < content_len {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
 fn build_fts_query(query: &str) -> String {
     let parts = query
         .split_whitespace()
@@ -652,6 +956,25 @@ fn build_fts_query(query: &str) -> String {
 
     if parts.is_empty() {
         query.trim().to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Treat every current-Session search term as data rather than FTS syntax.
+///
+/// This intentionally does not alter the legacy cross-Session search parser.
+fn build_safe_fts_query(query: &str) -> String {
+    let parts = query
+        .split_whitespace()
+        .map(|part| {
+            let escaped = part.replace('"', "\"\"");
+            format!("\"{escaped}\"*")
+        })
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        "\"\"".to_string()
     } else {
         parts.join(" ")
     }
@@ -764,6 +1087,136 @@ mod tests {
         assert!(message_matches
             .iter()
             .any(|m| m.match_type == "message" || m.match_type == "session"));
+    }
+
+    #[tokio::test]
+    async fn session_scoped_search_reads_compressed_and_active_messages_without_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.expect("init");
+
+        let mut target = Session::new("target-session", "test-model");
+        let mut compressed = Message::user(
+            "前置文字：现在可以搜索自己的历史消息；artifact /tmp/release-checklist.md",
+        );
+        compressed.id = "compressed-hit".to_string();
+        compressed.compressed = true;
+        compressed.compressed_by_event_id = Some("compression-event-1".to_string());
+        target.add_message(compressed);
+        let mut active = Message::assistant(
+            format!("ACTIVE-HISTORY-SENTINEL {}", "x".repeat(2_000)),
+            None,
+        );
+        active.id = "active-hit".to_string();
+        target.add_message(active);
+
+        let mut other = Session::new("other-session", "test-model");
+        let mut other_message = Message::user("CROSS-SESSION-ONLY-SENTINEL");
+        other_message.id = "other-hit".to_string();
+        other.add_message(other_message);
+
+        index.upsert_session(&target).await.unwrap();
+        index.upsert_session(&other).await.unwrap();
+        let before = serde_json::to_value(
+            index
+                .read_compressed_cache(&target.id, 0, 10, 2_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let cjk = index
+            .search_messages_in_session(&target.id, "搜索自己的历史", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(cjk.matches.len(), 1);
+        assert_eq!(cjk.matches[0].message_id, "compressed-hit");
+        assert!(cjk.matches[0].compressed);
+        assert_eq!(cjk.matches[0].match_source, "literal");
+        assert!(cjk.matches[0].content_preview.contains("搜索自己的历史"));
+
+        let path = index
+            .search_messages_in_session(
+                &target.id,
+                "/tmp/release-checklist.md",
+                usize::MAX,
+                &[],
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(path.matches.len(), 1);
+        assert_eq!(path.matches[0].message_id, "compressed-hit");
+
+        let active = index
+            .search_messages_in_session(&target.id, "ACTIVE-HISTORY-SENTINEL", usize::MAX, &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(active.matches.len(), 1);
+        assert!(!active.matches[0].compressed);
+        assert!(active.matches[0].content_preview.chars().count() <= 603);
+
+        let cross_session = index
+            .search_messages_in_session(
+                &target.id,
+                "CROSS-SESSION-ONLY-SENTINEL",
+                usize::MAX,
+                &[],
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(cross_session.matches.is_empty());
+
+        let after = serde_json::to_value(
+            index
+                .read_compressed_cache(&target.id, 0, 10, 2_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "search must not mutate compression cache rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_scoped_search_honors_boundary_exclusions_and_safe_fts_terms() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionSearchIndex::new(temp.path().join("search.db"));
+        index.init().await.expect("init");
+
+        let mut session = Session::new("boundary-session", "test-model");
+        for (id, content) in [
+            ("prior", "release-checklist /tmp/release-checklist.md"),
+            ("generated", "release-checklist generated search result"),
+            ("current", "release-checklist current call"),
+            ("future", "release-checklist future result"),
+        ] {
+            let mut message = Message::user(content);
+            message.id = id.to_string();
+            session.add_message(message);
+        }
+        index.upsert_session(&session).await.unwrap();
+
+        let page = index
+            .search_messages_in_session(
+                &session.id,
+                "release-checklist",
+                2,
+                &["generated".to_string()],
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.matches
+                .iter()
+                .map(|hit| hit.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prior"]
+        );
     }
 
     async fn populate_rank_fixture(index: &SessionSearchIndex) -> Vec<Session> {

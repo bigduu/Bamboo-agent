@@ -13,8 +13,8 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
     build_conversation_summary_context_block, build_external_memory_context_block,
     build_goal_context_block, build_instruction_overlay_context_block,
     build_plan_mode_context_block, build_plan_runtime_context_block,
-    build_project_resources_context_block, build_task_list_context_block,
-    build_workspace_context_block,
+    build_project_resources_context_block, build_session_identity_context_block,
+    build_task_list_context_block, build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -555,7 +555,11 @@ fn build_request_envelope_reconciled(
     // Host-owned context (recalled memory, task list, plan state, summary) is
     // reconciled into durable typed events. Initial snapshots lead the real
     // transcript; later changes append after the prior request boundary.
-    let mut context_blocks = Vec::new();
+    // Session identity leads this run so a newly seeded ledger places it
+    // immediately after the invariant tool-guide prefix. It deliberately does
+    // not participate in `build_compression_context_blocks`: a fork/copy must
+    // never inherit a stale Session ID through generated summary text.
+    let mut context_blocks = vec![build_session_identity_context_block(session)];
     let newly_activated = activated_discoverable_tools(session)
         .difference(&activated)
         .cloned()

@@ -1636,7 +1636,9 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
 async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eight_percent() {
     let mut session = Session::new("session-cp-force", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        // Leave room for the fixed host-owned Session identity context while
+        // keeping recorded usage above the 98% emergency threshold.
+        max_context_tokens: 2000,
         max_output_tokens: 0,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -1673,10 +1675,10 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 1078,
-        total_tokens: 1178,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        window_tokens: 1870,
+        total_tokens: 1970,
+        max_context_tokens: 2000,
+        budget_limit: 2000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -2103,7 +2105,11 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
     );
     assert_eq!(prompt.matches("WORKFLOW_PRIVATE_ARG_872").count(), 1);
 
-    let workflow_blocks = build_compression_context_blocks(&session, None)
+    let compression_blocks = build_compression_context_blocks(&session, None);
+    assert!(compression_blocks
+        .iter()
+        .all(|block| block.block_type != ContextBlockType::SessionIdentity));
+    let workflow_blocks = compression_blocks
         .into_iter()
         .filter(|block| block.block_type == ContextBlockType::WorkflowRuntime)
         .collect::<Vec<_>>();
@@ -2220,7 +2226,9 @@ async fn prepare_round_context_auto_compresses_when_context_window_usage_crosses
 async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
     let mut session = Session::new("session-cp-force-context-low", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        // The test exercises the trigger decision, so its synthetic budget
+        // must also accommodate fixed, non-droppable host context.
+        max_context_tokens: 2000,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -2248,15 +2256,15 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
             None,
         ));
     }
-    // context_window = 1200, usage = 62.5%; history content is also intentionally
+    // context_window = 2000, usage = 62.5%; history content is also intentionally
     // kept short so estimated usage stays below trigger (80%).
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 650,
-        total_tokens: 750,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        window_tokens: 1150,
+        total_tokens: 1250,
+        max_context_tokens: 2000,
+        budget_limit: 2000,
         truncation_occurred: true,
         segments_removed: 4,
         prompt_cached_tool_outputs: 0,

@@ -33,6 +33,52 @@ pub(super) fn truncate_string(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Return a bounded excerpt centered around the first literal match when
+/// possible, rather than truncating away the fact the caller searched for.
+pub(super) fn excerpt_around_match(content: &str, query: &str, max_chars: usize) -> String {
+    let content_len = content.chars().count();
+    if content_len <= max_chars {
+        return content.to_string();
+    }
+
+    let folded_content = content.to_lowercase();
+    let folded_query = query.to_lowercase();
+    let match_char = folded_content
+        .find(&folded_query)
+        .or_else(|| {
+            // FTS treats punctuation as token boundaries, so a query such as
+            // `release checklist` can match `release-checklist` without having
+            // one literal span. Anchor on the longest query token in that case
+            // so a long authoritative message still previews the real hit.
+            query
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|part| !part.is_empty())
+                .max_by_key(|part| part.chars().count())
+                .and_then(|part| folded_content.find(&part.to_lowercase()))
+        })
+        .map(|byte| folded_content[..byte].chars().count())
+        .unwrap_or(0);
+    let query_chars = query.chars().count();
+    let start = match_char.saturating_sub(max_chars / 3);
+    let end = start
+        .saturating_add(max_chars)
+        .max(match_char.saturating_add(query_chars))
+        .min(content_len);
+    let start = end.saturating_sub(max_chars);
+    let mut excerpt = content
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect::<String>();
+    if start > 0 {
+        excerpt.insert_str(0, "...");
+    }
+    if end < content_len {
+        excerpt.push_str("...");
+    }
+    excerpt
+}
+
 pub(super) fn map_index_entry(e: &SessionIndexEntry) -> serde_json::Value {
     json!({
         "id": e.id,

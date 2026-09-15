@@ -5,6 +5,13 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(super) enum SessionInspectorArgs {
+    /// Search messages in the authoritative caller Session only.
+    SearchCurrent {
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+
     /// Materialize a bounded, immutable observation of this root or its tree.
     ExportContext { session_id: String },
 

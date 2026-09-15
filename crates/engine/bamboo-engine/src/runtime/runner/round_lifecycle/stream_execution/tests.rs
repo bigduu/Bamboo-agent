@@ -279,6 +279,16 @@ fn expected_system_field(base: &str) -> String {
     )
 }
 
+fn assert_session_identity_message(message: &Message, session_id: &str) {
+    let encoded_session_id =
+        serde_json::to_string(session_id).expect("test Session ID is JSON serializable");
+    assert!(matches!(message.role, Role::User));
+    assert!(message.content.contains("context_type: session_identity"));
+    assert!(message
+        .content
+        .contains(&format!("Current Session ID: {encoded_session_id}")));
+}
+
 #[test]
 fn system_remainder_none_when_persisted_base_absorbed_by_directive_system() {
     // Persisted System message holds the base WITHOUT directives; the assembled
@@ -402,8 +412,9 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 1);
+    assert_eq!(requested_messages.len(), 2);
     assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-1");
     assert_eq!(
         requested_messages[0].content,
         expected_system_field("system")
@@ -1461,19 +1472,20 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 3);
+    assert_eq!(requested_messages.len(), 4);
     assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-task");
     // On the first ledger epoch the full task snapshot is seeded before the
     // real transcript. It is provider-visible but never added to Session.messages.
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
         .content
         .contains("context_type: task_snapshot"));
-    assert!(requested_messages[1]
+    assert!(requested_messages[2]
         .content
         .contains("Implement task block wiring"));
-    assert!(matches!(requested_messages[2].role, Role::User));
-    assert_eq!(requested_messages[2].content, "continue");
+    assert!(matches!(requested_messages[3].role, Role::User));
+    assert_eq!(requested_messages[3].content, "continue");
     assert!(session
         .messages
         .iter()
@@ -1906,13 +1918,14 @@ fn build_request_envelope_seeds_ledger_without_rewriting_old_breakpoints() {
             .ir
             .run(bamboo_llm::SegmentRole::ModelTranscript)
             .len(),
-        2
+        3
     );
     let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
-    assert!(transcript[0]
+    assert_session_identity_message(&transcript[0], "session-cache-plan");
+    assert!(transcript[1]
         .content
         .contains("context_type: task_snapshot"));
-    assert_eq!(transcript[1].content, "continue");
+    assert_eq!(transcript[2].content, "continue");
 
     // A rolling breakpoint would remove an annotation from the former last item
     // on the next round and violate byte-prefix identity. Only stable fixed
@@ -2447,6 +2460,81 @@ fn workspace_prepared_context() -> PreparedContext {
         prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
     }
+}
+
+#[test]
+fn session_identity_is_model_visible_after_invariant_prefix_without_cross_session_drift() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let mut session_a = Session::new("session-identity-a", "test-model");
+    let mut session_b = Session::new("session-identity-b", "test-model");
+    let prepared = workspace_prepared_context();
+
+    let envelope_a = super::build_request_envelope_reconciled(
+        &mut session_a,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let envelope_b = super::build_request_envelope_reconciled(
+        &mut session_b,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+
+    assert_eq!(envelope_a.ir.system_text, envelope_b.ir.system_text);
+    assert_eq!(
+        message_shape(envelope_a.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(envelope_b.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        "per-Session identity must not invalidate the cross-session invariant prefix"
+    );
+    assert!(envelope_a
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
+        .iter()
+        .any(|message| message.content.contains("STABLE_GUIDE_MARKER")));
+
+    let transcript = envelope_a.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let identities = transcript
+        .iter()
+        .filter(|message| message.content.contains("context_type: session_identity"))
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 1);
+    assert!(identities[0].content.contains("session-identity-a"));
+    assert!(identities[0].content.contains("scope: session_stable"));
+    assert!(!envelope_a.ir.system_text.contains("session-identity-a"));
+    assert!(envelope_a
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
+        .iter()
+        .all(|message| !message.content.contains("session-identity-a")));
+    assert!(envelope_b
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .any(|message| message.content.contains("session-identity-b")));
+
+    let retry_a = super::build_request_envelope_reconciled(
+        &mut session_a,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(
+        retry_a
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .iter()
+            .filter(|message| message.content.contains("context_type: session_identity"))
+            .count(),
+        1,
+        "unchanged reconciliation must not duplicate Session identity"
+    );
 }
 
 #[test]
@@ -3457,9 +3545,10 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
         .expect("messages lock")
         .clone();
     // FULL request (no continuation delta): system field + whole conversation.
-    assert_eq!(requested_messages.len(), 4);
+    assert_eq!(requested_messages.len(), 5);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[3].role, Role::Tool));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2");
+    assert!(matches!(requested_messages[4].role, Role::Tool));
     // The stale id is NOT sent to the provider.
     assert_eq!(
         llm.requested_previous_response_id
@@ -3622,14 +3711,15 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
         .clone();
     // First epoch: external memory is seeded before the real transcript. Later
     // revisions append after the then-current transcript boundary.
-    assert_eq!(requested_messages.len(), 5);
+    assert_eq!(requested_messages.len(), 6);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    assert_session_identity_message(&requested_messages[1], "session-stream-2a");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
         .content
         .contains("context_type: external_memory"));
-    assert!(requested_messages[1].content.contains("Session note body"));
-    assert!(matches!(requested_messages[4].role, Role::Tool));
+    assert!(requested_messages[2].content.contains("Session note body"));
+    assert!(matches!(requested_messages[5].role, Role::Tool));
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -3718,21 +3808,22 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
         .clone();
     // Initial snapshots are ordered deterministically by typed context kind,
     // followed by the unchanged real transcript.
-    assert_eq!(requested_messages.len(), 6);
+    assert_eq!(requested_messages.len(), 7);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
-        .content
-        .contains("context_type: plan_mode_state"));
-    assert!(requested_messages[1].content.contains("PLAN MODE ACTIVE"));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2plan");
     assert!(matches!(requested_messages[2].role, Role::User));
     assert!(requested_messages[2]
         .content
+        .contains("context_type: plan_mode_state"));
+    assert!(requested_messages[2].content.contains("PLAN MODE ACTIVE"));
+    assert!(matches!(requested_messages[3].role, Role::User));
+    assert!(requested_messages[3]
+        .content
         .contains("context_type: plan_runtime_state"));
-    assert!(requested_messages[2]
+    assert!(requested_messages[3]
         .content
         .contains("DURABLE PLAN EXECUTION CONTEXT"));
-    assert!(matches!(requested_messages[5].role, Role::Tool));
+    assert!(matches!(requested_messages[6].role, Role::Tool));
 }
 
 #[tokio::test]
@@ -3805,21 +3896,22 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
         .clone();
     // Full request: system field, the summary as dynamic context, then the whole
     // (compressed) conversation window.
-    assert_eq!(requested_messages.len(), 6);
+    assert_eq!(requested_messages.len(), 7);
     assert!(matches!(requested_messages[0].role, Role::System));
-    assert!(matches!(requested_messages[1].role, Role::User));
-    assert!(requested_messages[1]
+    assert_session_identity_message(&requested_messages[1], "session-stream-2b");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
         .content
         .contains("context_type: conversation_summary"));
-    assert!(requested_messages[1]
+    assert!(requested_messages[2]
         .content
         .contains("Older work has been summarized locally."));
-    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(matches!(requested_messages[3].role, Role::User));
     assert_eq!(
-        requested_messages[2].content,
+        requested_messages[3].content,
         "previous work was compressed"
     );
-    assert!(matches!(requested_messages[5].role, Role::Tool));
+    assert!(matches!(requested_messages[6].role, Role::Tool));
     // The stale continuation id was ignored, not forwarded.
     assert_eq!(
         llm.requested_previous_response_id
@@ -3904,8 +3996,9 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
         .lock()
         .expect("messages lock")
         .clone();
-    assert_eq!(requested_messages.len(), 4);
+    assert_eq!(requested_messages.len(), 5);
     assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-3");
     assert_eq!(
         llm.requested_previous_response_id
             .lock()

@@ -32,8 +32,17 @@ own logical root. The target must be that Root or a Child with the same logical
 root, and their optional valid Project identities must match exactly. Assigned
 and Unassigned sessions do not match. Invalid persisted identities fail closed.
 The action accepts only `action` and `session_id`; no caller, grant or output
-path can be supplied. Existing history actions retain their existing behavior.
-Child tool surfaces still exclude `session_history`.
+path can be supplied. Existing Root history actions retain their existing
+behavior. Base and Child surfaces expose the same `session_history` tool name,
+but their schema and invocation path permit only `search_current`, whose scope
+comes from trusted `ToolCtx`; they still cannot list, read, search, or export
+another Session.
+
+The primary model prompt also receives one typed, Session-stable identity block
+containing the current Session ID. It is placed after the cross-Session stable
+prefix so it does not invalidate invariant prompt-cache bytes, and it is not
+fed into rolling compression summaries. This block is model orientation only:
+tool authorization continues to use trusted runtime context.
 
 The exporter requests the control-plane API only; it never calls `load_session`
 or `save_session` itself. With a valid runtime sidecar, SessionStoreV2 reads

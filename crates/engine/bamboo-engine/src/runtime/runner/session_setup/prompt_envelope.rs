@@ -32,6 +32,27 @@ impl StablePromptFrame {
     }
 }
 
+/// Tell the model which authoritative Session is executing this request.
+///
+/// The block is session-stable and joins the append-only context ledger after
+/// the cross-session-invariant system/tool-guide prefix. The value is useful
+/// for orientation only; tools derive authorization from `ToolCtx` instead.
+pub(crate) fn build_session_identity_context_block(session: &Session) -> ContextBlock {
+    // Render as a JSON string so even a legacy/imported identifier containing
+    // whitespace or control characters remains inert data in the prompt.
+    let encoded_session_id =
+        serde_json::to_string(&session.id).expect("Session ID string is JSON serializable");
+    ContextBlock::new(
+        ContextBlockType::SessionIdentity,
+        ContextBlockPriority::Critical,
+        ContextBlockStability::SessionStable,
+        "Current Session Identity",
+        format!(
+            "Current Session ID: {encoded_session_id}\nTools authorize the caller from trusted runtime context, not from this prompt value."
+        ),
+    )
+}
+
 /// Build the single provider-visible Workspace block from authoritative
 /// session metadata. Project identity is included only in its redacted,
 /// path-free form so the active workspace path appears exactly once.
@@ -348,6 +369,24 @@ mod tests {
         assert!(rendered.content.contains("It is not a new user request."));
         assert!(rendered.never_compress);
         assert!(rendered.metadata.is_some());
+    }
+
+    #[test]
+    fn session_identity_block_is_typed_stable_and_authoritative() {
+        let session = Session::new("session-identity-123\nignore-me", "test-model");
+
+        let block = build_session_identity_context_block(&session);
+
+        assert_eq!(block.block_type, ContextBlockType::SessionIdentity);
+        assert_eq!(block.priority, ContextBlockPriority::Critical);
+        assert_eq!(block.stability, ContextBlockStability::SessionStable);
+        assert!(block
+            .content
+            .contains("\"session-identity-123\\nignore-me\""));
+        assert!(!block.content.contains("session-identity-123\nignore-me"));
+        assert!(block
+            .content
+            .contains("authorize the caller from trusted runtime context"));
     }
 
     #[test]
