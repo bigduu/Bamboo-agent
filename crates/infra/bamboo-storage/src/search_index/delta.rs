@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use super::{params, Connection, OptionalExtension, Role, Session, SessionKind};
+use super::{
+    cjk_bigram_projection, params, session_history_search_artifact_ids, Connection,
+    OptionalExtension, Role, Session, SessionKind,
+};
 
 // Counts come from sqlite3_changes for the top-level statements, excluding
 // FTS shadow-table internals. They keep differential-write tests independent of
@@ -27,26 +30,34 @@ struct MessageRow {
     content: String,
     compressed: bool,
     created_at: String,
+    history_search_artifact: bool,
 }
 
-fn sync_session_row(conn: &Connection, session: &Session) -> rusqlite::Result<Changes> {
+fn sync_session_row(
+    conn: &Connection,
+    session: &Session,
+    source_revision: Option<&str>,
+) -> rusqlite::Result<Changes> {
     let summary = session
         .conversation_summary
         .as_ref()
         .map(|summary| summary.content.as_str());
     let sessions = conn.execute(
         "INSERT INTO sessions_search
-            (session_id, title, kind, root_session_id, parent_session_id, pinned, updated_at, summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            (session_id, title, kind, root_session_id, parent_session_id, pinned, updated_at, summary,
+             source_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(session_id) DO UPDATE SET
             title=excluded.title, kind=excluded.kind, root_session_id=excluded.root_session_id,
             parent_session_id=excluded.parent_session_id, pinned=excluded.pinned,
-            updated_at=excluded.updated_at, summary=excluded.summary
+            updated_at=excluded.updated_at, summary=excluded.summary,
+            source_revision=excluded.source_revision
          WHERE title IS NOT excluded.title OR kind IS NOT excluded.kind
             OR root_session_id IS NOT excluded.root_session_id
             OR parent_session_id IS NOT excluded.parent_session_id
             OR pinned IS NOT excluded.pinned OR updated_at IS NOT excluded.updated_at
-            OR summary IS NOT excluded.summary",
+            OR summary IS NOT excluded.summary
+            OR source_revision IS NOT excluded.source_revision",
         params![
             session.id,
             session.title,
@@ -59,6 +70,7 @@ fn sync_session_row(conn: &Connection, session: &Session) -> rusqlite::Result<Ch
             session.pinned,
             session.updated_at.to_rfc3339(),
             summary,
+            source_revision,
         ],
     )?;
     let mut changes = Changes {
@@ -100,7 +112,11 @@ fn sync_session_row(conn: &Connection, session: &Session) -> rusqlite::Result<Ch
     Ok(changes)
 }
 
-pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Result<Changes> {
+pub(super) fn sync_session(
+    conn: &Connection,
+    session: &Session,
+    source_revision: Option<&str>,
+) -> rusqlite::Result<Changes> {
     let mut ids = HashSet::with_capacity(session.messages.len());
     if session
         .messages
@@ -112,10 +128,12 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
             Some("duplicate message ID in search snapshot".to_string()),
         ));
     }
-    let mut changes = sync_session_row(conn, session)?;
+    let mut changes = sync_session_row(conn, session, source_revision)?;
+    let history_search_artifacts = session_history_search_artifact_ids(session);
     let mut stored = conn
         .prepare(
-            "SELECT message_id, search_rowid, message_index, role, content, compressed, created_at
+            "SELECT message_id, search_rowid, message_index, role, content, compressed, created_at,
+                    history_search_artifact
             FROM session_messages_search WHERE session_id = ?1",
         )?
         .query_map([&session.id], |row| {
@@ -128,6 +146,7 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
                     content: row.get(4)?,
                     compressed: row.get(5)?,
                     created_at: row.get(6)?,
+                    history_search_artifact: row.get(7)?,
                 },
             ))
         })?
@@ -135,22 +154,24 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
 
     let mut insert = conn.prepare(
         "INSERT INTO session_messages_search
-        (session_id, message_id, message_index, role, content, compressed, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (session_id, message_id, message_index, role, content, compressed, created_at,
+         history_search_artifact)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     let mut update = conn.prepare(
         "UPDATE session_messages_search
-        SET message_index=?2, role=?3, content=?4, compressed=?5, created_at=?6
+        SET message_index=?2, role=?3, content=?4, compressed=?5, created_at=?6,
+            history_search_artifact=?7
         WHERE search_rowid=?1",
     )?;
     let mut fts_read = conn.prepare(
-        "SELECT session_id, message_id, message_index, role, content
+        "SELECT session_id, message_id, message_index, role, content, content_cjk_bigrams
         FROM session_messages_search_fts WHERE rowid=?1",
     )?;
     let mut fts_write = conn.prepare(
         "INSERT OR REPLACE INTO session_messages_search_fts
-        (rowid, session_id, message_id, message_index, role, content)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
     for (index, message) in session.messages.iter().enumerate() {
         let old = stored.remove(&message.id);
@@ -167,6 +188,7 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
             content: message.content.clone(),
             compressed: message.compressed,
             created_at: message.created_at.to_rfc3339(),
+            history_search_artifact: history_search_artifacts.contains(&message.id),
         };
         if let Some(old) = old {
             if old != next {
@@ -176,7 +198,8 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
                     next.role,
                     next.content,
                     next.compressed,
-                    next.created_at
+                    next.created_at,
+                    next.history_search_artifact
                 ])?;
             }
         } else {
@@ -187,12 +210,14 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
                 next.role,
                 next.content,
                 next.compressed,
-                next.created_at
+                next.created_at,
+                next.history_search_artifact
             ])?;
             next.rowid = conn.last_insert_rowid();
         }
         // Compare the point-addressed FTS projection too. Unchanged normal rows
         // must still repair missing/stale FTS during upsert or startup rebuild.
+        let cjk_projection = cjk_bigram_projection(&next.content);
         let fts_matches = fts_read
             .query_row([next.rowid], |row| {
                 Ok(
@@ -200,7 +225,8 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
                         && row.get::<_, Option<String>>(1)?.as_deref() == Some(&message.id)
                         && row.get::<_, Option<i64>>(2)? == Some(next.index)
                         && row.get::<_, Option<String>>(3)?.as_deref() == Some(&next.role)
-                        && row.get::<_, Option<String>>(4)?.as_deref() == Some(&next.content),
+                        && row.get::<_, Option<String>>(4)?.as_deref() == Some(&next.content)
+                        && row.get::<_, Option<String>>(5)?.as_deref() == Some(&cjk_projection),
                 )
             })
             .optional()?
@@ -212,7 +238,8 @@ pub(super) fn sync_session(conn: &Connection, session: &Session) -> rusqlite::Re
                 message.id,
                 next.index,
                 next.role,
-                next.content
+                next.content,
+                cjk_projection
             ])?;
         }
     }

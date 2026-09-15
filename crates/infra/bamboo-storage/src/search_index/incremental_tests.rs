@@ -90,6 +90,61 @@ fn legacy_db(path: &Path) -> Connection {
     conn
 }
 
+// Deliberately independent of schema.rs: this is the exact stable-rowid v4
+// shape which shipped before the CJK projection and source revision metadata.
+fn v4_db(path: &Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session_search_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO session_search_meta VALUES ('schema_version', '4');
+         CREATE TABLE sessions_search (
+            search_rowid INTEGER PRIMARY KEY, session_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL, kind TEXT NOT NULL, root_session_id TEXT NOT NULL,
+            parent_session_id TEXT, pinned INTEGER NOT NULL, updated_at TEXT NOT NULL,
+            summary TEXT);
+         CREATE TABLE session_messages_search (
+            search_rowid INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL, message_index INTEGER NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, compressed INTEGER NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(session_id, message_id));
+         CREATE INDEX idx_session_messages_search_session_id
+            ON session_messages_search(session_id, message_index);
+         CREATE VIRTUAL TABLE sessions_search_fts USING fts5(
+            session_id UNINDEXED, title, summary);
+         CREATE VIRTUAL TABLE session_messages_search_fts USING fts5(
+            session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+            role UNINDEXED, content);
+         CREATE INDEX user_v4_title_index ON sessions_search(title COLLATE NOCASE);",
+    )
+    .unwrap();
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO sessions_search
+         (search_rowid, session_id, title, kind, root_session_id, parent_session_id,
+          pinned, updated_at, summary)
+         VALUES (17, 'v4', 'v4 history', 'root', 'v4', NULL, 0, ?1, NULL)",
+        [&now],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_messages_search
+         (search_rowid, session_id, message_id, message_index, role, content, compressed,
+          created_at)
+         VALUES (41, 'v4', 'v4-message', 0, 'user', '我们要压缩上下文', 1, ?1)",
+        [&now],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions_search_fts (rowid, session_id, title, summary)
+            VALUES (17, 'v4', 'v4 history', '');
+         INSERT INTO session_messages_search_fts
+            (rowid, session_id, message_id, message_index, role, content)
+            VALUES (41, 'v4', 'v4-message', 0, 'user', '我们要压缩上下文');",
+    )
+    .unwrap();
+    conn
+}
+
 fn assert_identity_alignment(conn: &Connection) {
     for (normal, fts) in [
         ("sessions_search", "sessions_search_fts"),
@@ -139,7 +194,7 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
                 |row| row.get::<_, String>(0)
             )
             .unwrap(),
-            "4"
+            "5"
         );
         assert_identity_alignment(&conn);
         assert_eq!(
@@ -181,6 +236,203 @@ fn independent_v3_migration_preserves_search_cache_and_user_objects() {
             vec![Value::Text("session".into())]
         ]
     );
+}
+
+#[test]
+fn independent_v4_migration_rebuilds_cjk_projection_and_is_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("search.db");
+    let conn = v4_db(&path);
+    let ordinary_before = rows(
+        &conn,
+        "SELECT search_rowid, session_id, message_id, message_index, role, content,
+                compressed, created_at
+         FROM session_messages_search",
+    );
+    drop(conn);
+
+    for _ in 0..3 {
+        init_db(&path).unwrap();
+        let conn = open_db(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM session_search_meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "5"
+        );
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT search_rowid, session_id, message_id, message_index, role, content,
+                        compressed, created_at
+                 FROM session_messages_search"
+            ),
+            ordinary_before
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_revision FROM sessions_search WHERE session_id='v4'",
+                [],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+            None
+        );
+        assert!(conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='user_v4_title_index')",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_identity_alignment(&conn);
+        drop(conn);
+
+        let page = search_session_messages_db(&path, "v4", "压缩", usize::MAX, &[], 10).unwrap();
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].message_id, "v4-message");
+        assert_eq!(page.matches[0].match_source, "fts_cjk_bigram");
+        assert!(!page.used_literal_fallback);
+    }
+}
+
+#[test]
+#[ignore = "manual synthetic v4-to-v5 migration evidence for #1156"]
+fn benchmark_v4_to_v5_cjk_rebuild() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn live_sqlite_bytes(path: &Path) -> u64 {
+        [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ]
+        .into_iter()
+        .filter_map(|file| std::fs::metadata(file).ok().map(|metadata| metadata.len()))
+        .sum()
+    }
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("search.db");
+    let mut conn = v4_db(&path);
+    let now = Utc::now().to_rfc3339();
+    let transaction = conn.transaction().unwrap();
+    {
+        let mut ordinary = transaction
+            .prepare(
+                "INSERT INTO session_messages_search
+                 (search_rowid, session_id, message_id, message_index, role, content,
+                  compressed, created_at)
+                 VALUES (?1, 'v4', ?2, ?3, 'user', ?4, 0, ?5)",
+            )
+            .unwrap();
+        let mut fts = transaction
+            .prepare(
+                "INSERT INTO session_messages_search_fts
+                 (rowid, session_id, message_id, message_index, role, content)
+                 VALUES (?1, 'v4', ?2, ?3, 'user', ?4)",
+            )
+            .unwrap();
+        for index in 1..=5_000i64 {
+            let rowid = 100 + index;
+            let message_id = format!("migration-{index}");
+            let content = if index % 97 == 0 {
+                format!("synthetic migration item {index}: 我们要压缩上下文")
+            } else {
+                format!("synthetic migration item {index}: stable payload")
+            };
+            ordinary
+                .execute(params![rowid, message_id, index, content, now])
+                .unwrap();
+            fts.execute(params![rowid, message_id, index, content])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+    let before_bytes = live_sqlite_bytes(&path);
+    drop(conn);
+
+    let migration_done = Arc::new(AtomicBool::new(false));
+    let migration_done_worker = migration_done.clone();
+    let migration_path = path.clone();
+    let started = Instant::now();
+    let migration = std::thread::spawn(move || {
+        let result = init_db(&migration_path);
+        migration_done_worker.store(true, Ordering::Release);
+        result
+    });
+    let mut sampled_peak_bytes = before_bytes;
+    while !migration_done.load(Ordering::Acquire) {
+        sampled_peak_bytes = sampled_peak_bytes.max(live_sqlite_bytes(&path));
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    migration.join().unwrap().unwrap();
+    let rebuild_us = started.elapsed().as_micros();
+    let live_bytes_after_commit = live_sqlite_bytes(&path);
+    sampled_peak_bytes = sampled_peak_bytes.max(live_bytes_after_commit);
+    let main_db_bytes = std::fs::metadata(&path).unwrap().len();
+    let page = search_session_messages_db(&path, "v4", "压缩", usize::MAX, &[], 20).unwrap();
+    assert_eq!(page.matches.len(), 20);
+    assert!(page
+        .matches
+        .iter()
+        .all(|hit| hit.match_source == "fts_cjk_bigram"));
+    println!(
+        "BENCH migration messages=5001 rebuild_us={rebuild_us} \
+         before_live_bytes={before_bytes} after_live_bytes={live_bytes_after_commit} \
+         main_db_bytes={main_db_bytes} sampled_peak_bytes={sampled_peak_bytes} \
+         peak_sampling_interval_us=100"
+    );
+}
+
+#[test]
+fn v4_migration_failure_rolls_back_projection_revision_column_and_version() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("search.db");
+    let conn = v4_db(&path);
+    conn.execute_batch(
+        "CREATE TRIGGER reject_v5_version BEFORE UPDATE ON session_search_meta BEGIN
+         SELECT RAISE(ABORT, 'injected v5 publication failure'); END;",
+    )
+    .unwrap();
+    let schema_before = rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name");
+    let ordinary_before = rows(&conn, "SELECT rowid, * FROM session_messages_search");
+    let fts_before = rows(&conn, "SELECT rowid, * FROM session_messages_search_fts");
+
+    assert!(init_db(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("injected v5 publication failure"));
+    assert_eq!(
+        rows(&conn, "SELECT name, sql FROM sqlite_schema ORDER BY name"),
+        schema_before
+    );
+    assert_eq!(
+        rows(&conn, "SELECT rowid, * FROM session_messages_search"),
+        ordinary_before
+    );
+    assert_eq!(
+        rows(&conn, "SELECT rowid, * FROM session_messages_search_fts"),
+        fts_before
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM session_search_meta WHERE key='schema_version'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "4"
+    );
+    conn.execute_batch("DROP TRIGGER reject_v5_version")
+        .unwrap();
+    init_db(&path).unwrap();
+    assert_identity_alignment(&conn);
 }
 
 #[test]
@@ -279,7 +531,7 @@ fn assert_shape_rejected_without_mutation(path: &Path, conn: &Connection, reason
 }
 
 #[test]
-fn v4_rejects_changed_fts_indexing_tokenizer_and_content_mode() {
+fn v5_rejects_changed_fts_indexing_tokenizer_and_content_mode() {
     for definition in [
         "session_id, title, summary",
         "session_id UNINDEXED, title, summary, tokenize='porter'",
@@ -302,7 +554,31 @@ fn v4_rejects_changed_fts_indexing_tokenizer_and_content_mode() {
 }
 
 #[test]
-fn v4_rejects_non_alias_primary_key_and_missing_or_invalid_identity_uniqueness() {
+fn v5_rejects_missing_unindexed_or_retokenized_cjk_projection() {
+    for definition in [
+        "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+         role UNINDEXED, content",
+        "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+         role UNINDEXED, content, content_cjk_bigrams UNINDEXED",
+        "session_id UNINDEXED, message_id UNINDEXED, message_index UNINDEXED,
+         role UNINDEXED, content, content_cjk_bigrams, tokenize='porter'",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("search.db");
+        init_db(&path).unwrap();
+        upsert_session_db(&path, &fixture("message-fts-shape"), None).unwrap();
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE session_messages_search_fts;
+             CREATE VIRTUAL TABLE session_messages_search_fts USING fts5({definition});"
+        ))
+        .unwrap();
+        assert_shape_rejected_without_mutation(&path, &conn, "unsupported search FTS shape");
+    }
+}
+
+#[test]
+fn v5_rejects_non_alias_primary_key_and_missing_or_invalid_identity_uniqueness() {
     for (table, from, to, extra_sql, reason) in [
         (
             "sessions_search",
@@ -348,7 +624,7 @@ fn v4_rejects_non_alias_primary_key_and_missing_or_invalid_identity_uniqueness()
         let changed = original.replace(from, to);
         assert_ne!(
             original, changed,
-            "fixture must alter the actual v4 definition"
+            "fixture must alter the actual v5 definition"
         );
         conn.execute_batch(&format!(
             "CREATE TEMP TABLE saved_rows AS SELECT * FROM {table};
@@ -558,9 +834,14 @@ fn unchanged_projection_repairs_missing_stale_and_null_fts_payloads() {
     upsert_session_db(&path, &session, None).unwrap();
     let conn = open_db(&path).unwrap();
     install_audit(&conn);
-    conn.execute_batch("UPDATE sessions_search_fts SET title='corrupt', summary=NULL;
+    conn.execute_batch(
+        "UPDATE sessions_search_fts SET title='corrupt', summary=NULL;
         DELETE FROM session_messages_search_fts WHERE rowid=1;
-        UPDATE session_messages_search_fts SET content='stale payload', role=NULL, message_index=99 WHERE rowid=2;").unwrap();
+        UPDATE session_messages_search_fts
+        SET content='stale payload', content_cjk_bigrams='错误 投影', role=NULL, message_index=99
+        WHERE rowid=2;",
+    )
+    .unwrap();
     apply_checked(
         &path,
         &session,
@@ -619,11 +900,16 @@ fn duplicate_ids_and_fts_payload_failure_leave_entire_snapshot_unchanged() {
     // Substitute a rejecting content table only in this test. The production
     // FTS INSERT executes after ordinary/session-FTS changes and must fail the
     // same encompassing transaction; no FTS shadow-table details are involved.
-    conn.execute_batch("ALTER TABLE session_messages_search_fts RENAME TO saved_fts;
+    conn.execute_batch(
+        "ALTER TABLE session_messages_search_fts RENAME TO saved_fts;
         CREATE TABLE session_messages_search_fts (session_id, message_id, message_index, role,
-            content CHECK(content NOT LIKE '%rejectpayload%'));
-        INSERT INTO session_messages_search_fts (rowid, session_id, message_id, message_index, role, content)
-            SELECT rowid, session_id, message_id, message_index, role, content FROM saved_fts;").unwrap();
+            content CHECK(content NOT LIKE '%rejectpayload%'), content_cjk_bigrams);
+        INSERT INTO session_messages_search_fts
+            (rowid, session_id, message_id, message_index, role, content, content_cjk_bigrams)
+            SELECT rowid, session_id, message_id, message_index, role, content,
+                   content_cjk_bigrams FROM saved_fts;",
+    )
+    .unwrap();
     let fts_before = rows(
         &conn,
         "SELECT rowid, * FROM session_messages_search_fts ORDER BY rowid",
