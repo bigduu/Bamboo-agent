@@ -984,7 +984,39 @@ fn search_session_messages_db(
     excluded_message_ids: &[String],
     limit: usize,
 ) -> std::io::Result<SessionMessageSearchPage> {
-    let conn = open_db(db_path)?;
+    let mut conn = open_db(db_path)?;
+    let transaction = conn.transaction().map_err(|error| {
+        to_io_error(format!(
+            "sqlite begin session-scoped search snapshot failed: {error}"
+        ))
+    })?;
+    let page = search_session_messages_snapshot(
+        &transaction,
+        session_id,
+        query,
+        before_message_index,
+        excluded_message_ids,
+        limit,
+    )?;
+    transaction.commit().map_err(|error| {
+        to_io_error(format!(
+            "sqlite commit session-scoped search snapshot failed: {error}"
+        ))
+    })?;
+    Ok(page)
+}
+
+/// Read freshness metadata and candidate rows from one SQLite snapshot. A
+/// concurrent index commit between those reads must not pair an old revision
+/// with hits (or omissions) from a newer derived snapshot.
+fn search_session_messages_snapshot(
+    conn: &Connection,
+    session_id: &str,
+    query: &str,
+    before_message_index: usize,
+    excluded_message_ids: &[String],
+    limit: usize,
+) -> std::io::Result<SessionMessageSearchPage> {
     let (indexed_source_revision, indexed_updated_at) = conn
         .query_row(
             "SELECT source_revision, updated_at FROM sessions_search WHERE session_id = ?1",
@@ -1754,6 +1786,85 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["cjk-newer", "cjk-older"]
         );
+    }
+
+    #[test]
+    fn session_scoped_search_pairs_freshness_and_hits_from_one_snapshot() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("search.db");
+        let revision_path = temp.path().join("search.revision");
+        init_db(&path).expect("init");
+
+        let mut first = Session::new("snapshot-search", "test-model");
+        let mut first_message = Message::user("the snapshot-needle is still present");
+        first_message.id = "snapshot-message".to_string();
+        first.add_message(first_message);
+        std::fs::write(&revision_path, "revision-1").expect("write first revision");
+        upsert_session_db(
+            &path,
+            &first,
+            Some(&SearchSourceRevision {
+                path: revision_path.clone(),
+                expected: "revision-1".to_string(),
+            }),
+        )
+        .expect("index first snapshot");
+
+        let mut reader = open_db(&path).expect("open snapshot reader");
+        let transaction = reader.transaction().expect("begin read snapshot");
+        let pinned_revision: Option<String> = transaction
+            .query_row(
+                "SELECT source_revision FROM sessions_search WHERE session_id = ?1",
+                [&first.id],
+                |row| row.get(0),
+            )
+            .expect("establish old read snapshot");
+        assert_eq!(pinned_revision.as_deref(), Some("revision-1"));
+
+        let mut second = first.clone();
+        second.updated_at = first.updated_at + Duration::milliseconds(1);
+        second.messages.clear();
+        let mut second_message = Message::user("replacement content without the target");
+        second_message.id = "snapshot-message".to_string();
+        second.add_message(second_message);
+        std::fs::write(&revision_path, "revision-2").expect("write second revision");
+        upsert_session_db(
+            &path,
+            &second,
+            Some(&SearchSourceRevision {
+                path: revision_path.clone(),
+                expected: "revision-2".to_string(),
+            }),
+        )
+        .expect("commit concurrent index snapshot");
+
+        let pinned_page = search_session_messages_snapshot(
+            &transaction,
+            &first.id,
+            "snapshot-needle",
+            usize::MAX,
+            &[],
+            10,
+        )
+        .expect("search pinned snapshot");
+        assert_eq!(
+            pinned_page.indexed_source_revision.as_deref(),
+            Some("revision-1")
+        );
+        assert_eq!(pinned_page.indexed_updated_at, Some(first.updated_at));
+        assert_eq!(pinned_page.matches.len(), 1);
+        assert_eq!(pinned_page.matches[0].message_id, "snapshot-message");
+        transaction.commit().expect("finish read snapshot");
+
+        let current_page =
+            search_session_messages_db(&path, &second.id, "snapshot-needle", usize::MAX, &[], 10)
+                .expect("search current snapshot");
+        assert_eq!(
+            current_page.indexed_source_revision.as_deref(),
+            Some("revision-2")
+        );
+        assert_eq!(current_page.indexed_updated_at, Some(second.updated_at));
+        assert!(current_page.matches.is_empty());
     }
 
     #[test]
