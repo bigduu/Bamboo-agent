@@ -2502,25 +2502,6 @@ mod tests {
         let (endpoint, _dir) = start().await;
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let worker_endpoint = endpoint.clone();
-        let worker = tokio::spawn({
-            let started = started.clone();
-            let release = release.clone();
-            async move {
-                serve_executor_with_lifecycle(
-                    &worker_endpoint,
-                    AgentRef {
-                        session_id: "busy-worker".into(),
-                        role: None,
-                    },
-                    TOKEN,
-                    Arc::new(BlockingEcho { started, release }),
-                    CancellationToken::new(),
-                    Some(Duration::from_millis(100)),
-                )
-                .await
-            }
-        });
         let mut parent = BrokerClient::connect(
             &endpoint,
             AgentRef {
@@ -2534,14 +2515,43 @@ mod tests {
         parent.subscribe().await.unwrap();
         let request = ask("busy-parent", "held open");
         let request_id = request.id.clone();
+
+        // Preload the durable mailbox before the worker's deliberately short
+        // idle deadline is armed. The delivery receipt is the readiness
+        // boundary: startup scheduling can no longer consume the idle window
+        // while the parent is still connecting and enqueueing the run.
         parent.deliver("busy-worker", request).await.unwrap();
+
+        let idle_timeout = Duration::from_millis(100);
+        let worker_endpoint = endpoint.clone();
+        let mut worker = tokio::spawn({
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                serve_executor_with_lifecycle(
+                    &worker_endpoint,
+                    AgentRef {
+                        session_id: "busy-worker".into(),
+                        role: None,
+                    },
+                    TOKEN,
+                    Arc::new(BlockingEcho { started, release }),
+                    CancellationToken::new(),
+                    Some(idle_timeout),
+                )
+                .await
+            }
+        });
+
+        // Handler entry is the admission boundary for the behavior under test.
         tokio::time::timeout(Duration::from_secs(2), started.notified())
             .await
             .expect("run starts");
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(
-            !worker.is_finished(),
+            tokio::time::timeout(idle_timeout * 2, &mut worker)
+                .await
+                .is_err(),
             "true-idle must be disabled while a handler is in flight"
         );
         release.notify_one();
