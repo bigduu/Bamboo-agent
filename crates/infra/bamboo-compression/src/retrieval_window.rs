@@ -58,6 +58,9 @@ pub struct RetrievalWindowCandidatePlan {
     /// Versioned digest of every token-relevant active message field and its
     /// order at planning time.
     pub active_state_sha256: String,
+    /// Versioned digest of the fixed prompt cost and complete provider-prepared
+    /// message token override map used by this exact plan.
+    pub token_accounting_sha256: String,
     /// Active message plus fixed prompt tokens before candidate selection.
     pub active_tokens_before: u32,
     /// Projected active tokens after the candidate messages are removed.
@@ -420,6 +423,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         archive_message_tokens,
         active_message_count,
         active_state_sha256: active_state_sha256(session),
+        token_accounting_sha256: token_accounting_sha256(accounting),
         active_tokens_before,
         projected_active_tokens_after,
         context_window_tokens: budget.max_context_tokens,
@@ -457,15 +461,19 @@ struct ValidatedRetrievalWindowUsage {
 ///
 /// This operation is intentionally separate from [`crate::apply_compression_plan`]:
 /// it never creates a summary or recovery message and performs every fallible
-/// validation before mutating the session.
+/// validation before mutating the session. `current_accounting` must be the
+/// exact provider-prepared snapshot used to build `plan`; the function binds
+/// that snapshot without rerunning provider transforms or attachment I/O.
 pub fn apply_retrieval_window_plan(
     session: &mut Session,
     plan: &RetrievalWindowCandidatePlan,
+    current_accounting: &RetrievalWindowTokenAccounting,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let usage = validate_apply_plan_arithmetic(plan)?;
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
     }
+    validate_current_token_accounting(plan, current_accounting)?;
 
     let candidate_indexes = resolve_candidate_indexes(session, plan)?;
     let active_count = candidate_indexes
@@ -524,6 +532,7 @@ pub fn apply_retrieval_window_plan(
     event.retrieval_active_tokens_before = plan.active_tokens_before;
     event.retrieval_active_message_count_before = plan.active_message_count;
     event.retrieval_active_state_sha256 = Some(plan.active_state_sha256.clone());
+    event.retrieval_token_accounting_sha256 = Some(plan.token_accounting_sha256.clone());
     event.retrieval_active_tokens_after = plan.projected_active_tokens_after;
     event.retrieval_target_tokens = plan.target_tokens;
     event.retrieval_target_usage_percent = plan.target_usage_percent;
@@ -739,6 +748,7 @@ fn usage_percentage(tokens: u32, limit: u32) -> f64 {
 }
 
 const ACTIVE_STATE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.active-state.v1\0";
+const TOKEN_ACCOUNTING_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.token-accounting.v1\0";
 
 fn active_state_sha256(session: &Session) -> String {
     let active_state = session
@@ -769,6 +779,32 @@ fn active_state_sha256(session: &Session) -> String {
     payload.extend_from_slice(ACTIVE_STATE_DIGEST_DOMAIN);
     payload.extend_from_slice(&encoded);
     sha256_hex(&payload)
+}
+
+fn token_accounting_sha256(accounting: &RetrievalWindowTokenAccounting) -> String {
+    let encoded = serde_json::to_vec(&(
+        accounting.fixed_prompt_tokens,
+        &accounting.provider_message_tokens,
+    ))
+    .expect("retrieval-window token accounting must serialize");
+    let mut payload = Vec::with_capacity(TOKEN_ACCOUNTING_DIGEST_DOMAIN.len() + encoded.len());
+    payload.extend_from_slice(TOKEN_ACCOUNTING_DIGEST_DOMAIN);
+    payload.extend_from_slice(&encoded);
+    sha256_hex(&payload)
+}
+
+fn validate_current_token_accounting(
+    plan: &RetrievalWindowCandidatePlan,
+    current_accounting: &RetrievalWindowTokenAccounting,
+) -> Result<(), RetrievalWindowApplyError> {
+    if current_accounting.fixed_prompt_tokens != plan.fixed_prompt_tokens
+        || token_accounting_sha256(current_accounting) != plan.token_accounting_sha256
+    {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "token_accounting_sha256",
+        });
+    }
+    Ok(())
 }
 
 fn validate_active_plan_structure(
@@ -1074,6 +1110,11 @@ fn validate_idempotent_replay(
         event.retrieval_active_state_sha256.as_deref(),
         Some(plan.active_state_sha256.as_str()),
         "retrieval_active_state_sha256"
+    );
+    require_event_evidence!(
+        event.retrieval_token_accounting_sha256.as_deref(),
+        Some(plan.token_accounting_sha256.as_str()),
+        "retrieval_token_accounting_sha256"
     );
     require_event_evidence!(
         event.retrieval_active_tokens_after,
@@ -1563,13 +1604,27 @@ mod tests {
         (session, plan)
     }
 
+    fn accounting_for_plan(plan: &RetrievalWindowCandidatePlan) -> RetrievalWindowTokenAccounting {
+        RetrievalWindowTokenAccounting {
+            fixed_prompt_tokens: plan.fixed_prompt_tokens,
+            ..RetrievalWindowTokenAccounting::default()
+        }
+    }
+
+    fn apply_test_plan(
+        session: &mut Session,
+        plan: &RetrievalWindowCandidatePlan,
+    ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+        apply_retrieval_window_plan(session, plan, &accounting_for_plan(plan))
+    }
+
     fn assert_apply_error_without_mutation(
         session: &mut Session,
         plan: &RetrievalWindowCandidatePlan,
         expected: RetrievalWindowApplyError,
     ) {
         let before = serde_json::to_vec(session).expect("session should serialize");
-        assert_eq!(apply_retrieval_window_plan(session, plan), Err(expected));
+        assert_eq!(apply_test_plan(session, plan), Err(expected));
         assert_eq!(
             serde_json::to_vec(session).expect("session should serialize"),
             before,
@@ -1632,6 +1687,7 @@ mod tests {
         assert_eq!(first.archive_message_tokens, 40);
         assert_eq!(first.active_message_count, 9);
         assert_eq!(first.active_state_sha256.len(), 64);
+        assert_eq!(first.token_accounting_sha256.len(), 64);
         assert_eq!(first.active_tokens_before, 90);
         assert_eq!(first.projected_active_tokens_after, 50);
         assert_eq!(first.context_window_tokens, 100);
@@ -1995,7 +2051,7 @@ mod tests {
             .prefix_epoch;
         let provider_epoch_before = session.provider_transcript.epoch();
 
-        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        let result = apply_test_plan(&mut session, &plan).expect("plan should apply");
 
         assert!(!result.idempotent_replay);
         assert_eq!(result.newly_archived_message_count, 4);
@@ -2031,6 +2087,10 @@ mod tests {
         assert_eq!(
             event.retrieval_active_state_sha256.as_deref(),
             Some(plan.active_state_sha256.as_str())
+        );
+        assert_eq!(
+            event.retrieval_token_accounting_sha256.as_deref(),
+            Some(plan.token_accounting_sha256.as_str())
         );
         assert_eq!(event.retrieval_active_tokens_after, 50);
         assert_eq!(event.retrieval_target_tokens, 50);
@@ -2104,8 +2164,8 @@ mod tests {
             .expect("model context")
             .prefix_epoch;
         let provider_epoch_after_first = session.provider_transcript.epoch();
-        let replay = apply_retrieval_window_plan(&mut session, &plan)
-            .expect("exact replay should be idempotent");
+        let replay =
+            apply_test_plan(&mut session, &plan).expect("exact replay should be idempotent");
         assert!(replay.idempotent_replay);
         assert_eq!(replay.event_id, result.event_id);
         assert_eq!(replay.newly_archived_message_count, 0);
@@ -2130,8 +2190,7 @@ mod tests {
     #[test]
     fn later_plan_archives_additional_groups_without_reassigning_old_messages() {
         let (mut session, first_plan) = basic_session_and_plan();
-        let first = apply_retrieval_window_plan(&mut session, &first_plan)
-            .expect("first plan should apply");
+        let first = apply_test_plan(&mut session, &first_plan).expect("first plan should apply");
         add_turn(&mut session, "t5", 10);
         add_turn(&mut session, "t6", 10);
 
@@ -2140,8 +2199,7 @@ mod tests {
             second_plan.message_ids_to_archive,
             vec!["t3-u", "t3-a", "t4-u", "t4-a"]
         );
-        let second = apply_retrieval_window_plan(&mut session, &second_plan)
-            .expect("second plan should apply");
+        let second = apply_test_plan(&mut session, &second_plan).expect("second plan should apply");
 
         assert_ne!(second.event_id, first.event_id);
         assert_eq!(session.compression_events.len(), 2);
@@ -2306,6 +2364,81 @@ mod tests {
     }
 
     #[test]
+    fn token_accounting_digest_covers_fixed_and_provider_message_costs() {
+        let mut accounting = RetrievalWindowTokenAccounting {
+            fixed_prompt_tokens: 5,
+            ..RetrievalWindowTokenAccounting::default()
+        };
+        accounting
+            .provider_message_tokens
+            .insert("t1-u".to_string(), 10);
+        let original = token_accounting_sha256(&accounting);
+
+        let mut fixed_changed = accounting.clone();
+        fixed_changed.fixed_prompt_tokens += 1;
+        assert_ne!(token_accounting_sha256(&fixed_changed), original);
+
+        let mut override_changed = accounting.clone();
+        override_changed
+            .provider_message_tokens
+            .insert("t1-u".to_string(), 11);
+        assert_ne!(token_accounting_sha256(&override_changed), original);
+
+        let mut override_added = accounting;
+        override_added
+            .provider_message_tokens
+            .insert("t2-u".to_string(), 10);
+        assert_ne!(token_accounting_sha256(&override_added), original);
+    }
+
+    #[test]
+    fn changed_token_accounting_fails_before_mutation() {
+        let mut session = Session::new("retrieval-window-accounting-stale", "test-model");
+        session.add_message(system("system", 5));
+        for turn in 1..=4 {
+            add_turn(&mut session, &format!("t{turn}"), 10);
+        }
+        let mut accounting = RetrievalWindowTokenAccounting {
+            fixed_prompt_tokens: 5,
+            ..RetrievalWindowTokenAccounting::default()
+        };
+        accounting
+            .provider_message_tokens
+            .insert("t1-u".to_string(), 10);
+        let plan = plan_with_counter_and_accounting(&session, 50, 2, &accounting)
+            .expect("provider-prepared plan should build");
+        let before = serde_json::to_vec(&session).expect("session should serialize");
+
+        let mut changed_override = accounting.clone();
+        changed_override
+            .provider_message_tokens
+            .insert("t1-u".to_string(), 11);
+        assert_eq!(
+            apply_retrieval_window_plan(&mut session, &plan, &changed_override),
+            Err(RetrievalWindowApplyError::StalePlan {
+                invariant: "token_accounting_sha256",
+            })
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).expect("session should serialize"),
+            before
+        );
+
+        let mut changed_fixed = accounting;
+        changed_fixed.fixed_prompt_tokens += 1;
+        assert_eq!(
+            apply_retrieval_window_plan(&mut session, &plan, &changed_fixed),
+            Err(RetrievalWindowApplyError::StalePlan {
+                invariant: "token_accounting_sha256",
+            })
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).expect("session should serialize"),
+            before
+        );
+    }
+
+    #[test]
     fn incomplete_tool_and_skill_groups_fail_before_mutation() {
         let (mut session, mut plan) = basic_session_and_plan();
         plan.message_ids_to_archive.remove(1);
@@ -2362,7 +2495,7 @@ mod tests {
         );
 
         let (mut session, plan) = basic_session_and_plan();
-        apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        apply_test_plan(&mut session, &plan).expect("plan should apply");
         session
             .messages
             .iter_mut()
@@ -2376,7 +2509,7 @@ mod tests {
         );
 
         let (mut session, plan) = basic_session_and_plan();
-        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        let result = apply_test_plan(&mut session, &plan).expect("plan should apply");
         session.compression_events[0].kind = CompressionEventKind::Summary;
         assert_apply_error_without_mutation(
             &mut session,
@@ -2387,7 +2520,7 @@ mod tests {
         );
 
         let (mut session, plan) = basic_session_and_plan();
-        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        let result = apply_test_plan(&mut session, &plan).expect("plan should apply");
         session.compression_events.clear();
         assert_apply_error_without_mutation(
             &mut session,
@@ -2398,7 +2531,7 @@ mod tests {
         );
 
         let (mut session, plan) = basic_session_and_plan();
-        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        let result = apply_test_plan(&mut session, &plan).expect("plan should apply");
         session.compression_events[0].retrieval_target_tokens += 1;
         assert_apply_error_without_mutation(
             &mut session,
