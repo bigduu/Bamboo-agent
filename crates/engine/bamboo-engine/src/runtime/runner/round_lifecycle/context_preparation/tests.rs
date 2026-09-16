@@ -212,6 +212,21 @@ fn retrieval_history_tool_schema() -> ToolSchema {
     }
 }
 
+fn load_skill_tool_schema() -> ToolSchema {
+    ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "load_skill".to_string(),
+            description: "Load the explicitly selected workflow".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "skill_id": { "type": "string" } },
+                "required": ["skill_id"]
+            }),
+        },
+    }
+}
+
 fn retrieval_window_session(id: &str) -> Session {
     let mut session = Session::new(id, "test-model");
     session.messages.push(Message::system("retrieval system"));
@@ -2935,6 +2950,52 @@ async fn retrieval_window_missing_history_capability_fails_without_mutating_or_c
 }
 
 #[tokio::test]
+async fn retrieval_window_defers_archival_for_explicit_skill_activation_round() {
+    let mut session = retrieval_window_session("retrieval-skill-activation");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        "[\"review\"]".to_string(),
+    );
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema(), load_skill_tool_schema()];
+    let effective = super::super::stream_execution::effective_tool_schemas(&session, &tool_schemas);
+    assert_eq!(
+        effective
+            .iter()
+            .map(|schema| schema.function.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["load_skill"]
+    );
+    let (llm, model_calls) = recording_llm();
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-skill-activation",
+        &tool_schemas,
+        &llm,
+        None,
+    )
+    .await
+    .expect("the required load_skill setup round must remain dispatchable");
+
+    assert!(
+        crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(&session)
+    );
+    assert!(session.messages.iter().all(|message| !message.compressed));
+    assert!(session.compression_events.is_empty());
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(!prepared.prepared_context.messages.is_empty());
+}
+
+#[tokio::test]
 async fn retrieval_window_below_trigger_does_not_require_history_capability() {
     let mut session = Session::new("retrieval-below-trigger", "test-model");
     session.messages.push(Message::system("retrieval system"));
@@ -3415,7 +3476,7 @@ async fn prepare_round_context_skips_host_auto_compression_below_trigger() {
 async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     let mut session = Session::new("session-cp-overflow-force", "test-model");
     session.token_budget = Some(TokenBudget {
-        max_context_tokens: 1200,
+        max_context_tokens: 10_000,
         max_output_tokens: 200,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -3454,8 +3515,8 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         summary_tokens: 0,
         window_tokens: 780,
         total_tokens: 880,
-        max_context_tokens: 1200,
-        budget_limit: 1200,
+        max_context_tokens: 10_000,
+        budget_limit: 10_000,
         truncation_occurred: false,
         segments_removed: 0,
         prompt_cached_tool_outputs: 0,
@@ -3464,11 +3525,27 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         cache_read_input_tokens: 0,
     });
 
-    let config = AgentLoopConfig {
+    let mut config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
         background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
+    config.context_management.strategy = ContextManagementStrategy::RetrievalWindow;
+    config.context_management.retrieval_window.fallback_strategy =
+        ContextManagementFallbackStrategy::Summary;
+    let budget = session.token_budget.as_ref().expect("configured budget");
+    let exposure = bamboo_compression::estimate_context_compression_exposure(
+        &session,
+        "test-model",
+        Some(budget),
+    );
+    let trigger_percent = (budget.compression_trigger_context_tokens() as f64
+        / budget.max_context_tokens as f64)
+        * 100.0;
+    assert!(
+        exposure.active_usage_percent < trigger_percent,
+        "fixture must stay below the ordinary summary trigger: exposure={exposure:?}"
+    );
     let (llm, _) = recording_llm();
 
     let applied = super::force_overflow_context_recovery(

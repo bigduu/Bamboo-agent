@@ -675,6 +675,19 @@ async fn maybe_prepare_retrieval_window_context(
     budget: &TokenBudget,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<Option<PreparedContext>, AgentError> {
+    // An explicit workflow selection requires the model's first step to be a
+    // lone `load_skill` call. During that setup round the effective callable
+    // catalog intentionally excludes `session_history_current`; defer archival
+    // until activation completes instead of misclassifying the temporary tool
+    // restriction as a missing retrieval capability.
+    if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
+        tracing::debug!(
+            session_id = %session_id,
+            "retrieval-window archival deferred until explicit skill activation completes"
+        );
+        return Ok(None);
+    }
+
     let counter = TiktokenTokenCounter::default();
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
     let preflight = retrieval_window_preflight(
@@ -1489,7 +1502,7 @@ pub(crate) async fn force_overflow_context_recovery(
         &budget,
         event_tx,
         "overflow-recovery",
-        None,
+        Some(CompressionTriggerType::CriticalOverflow),
     )
     .await
 }
