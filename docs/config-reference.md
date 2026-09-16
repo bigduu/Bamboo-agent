@@ -323,6 +323,11 @@ start a new Session or explicitly retain summary fallback. This first runtime
 slice handles automatic pre-turn archival only. Manual
 `compact_context` and critical overflow recovery fail explicitly under
 `fallback_strategy: "none"`; use `summary` only when that fallback is desired.
+Candidate fitting projects the exact post-boundary provider request. Provider-
+native reasoning/tool-search replay and prior model-context ledger bytes that
+the boundary resets count toward trigger pressure, but are reclaimed once (not
+misclassified as permanently fixed prompt cost) when calculating the retained
+target.
 The raw Session transcript remains authoritative. Memory is selective context,
 not a substitute for exact history.
 

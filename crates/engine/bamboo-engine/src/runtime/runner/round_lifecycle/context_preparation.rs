@@ -541,7 +541,7 @@ async fn build_retrieval_window_accounting_frame(
         provider_message_tokens.insert(message.id.clone(), tokens);
     }
 
-    let projected = super::stream_execution::project_request_usage(
+    let current_projected = super::stream_execution::project_request_usage(
         session,
         &prepared,
         config,
@@ -550,20 +550,53 @@ async fn build_retrieval_window_accounting_frame(
         llm,
     )
     .await?;
-    if projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
+
+    // A committed retrieval boundary resets both the model-context ledger and
+    // provider-native replay lane. Plan against that exact post-reset request;
+    // otherwise replayable reasoning/tool-search payloads are misclassified as
+    // permanently fixed prompt cost even though the boundary removes them.
+    let mut post_boundary_session = session.clone();
+    post_boundary_session.reset_model_context_epoch(ModelContextResetReason::Compression);
+    post_boundary_session
+        .metadata
+        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    let post_boundary_projected = super::stream_execution::project_request_usage(
+        &post_boundary_session,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+    if post_boundary_projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
         return Err(AgentError::Budget(format!(
-            "retrieval-window accounting projection exceeds model-context ledger byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
-            projected.ledger_rendered_bytes
+            "retrieval-window post-boundary accounting projection exceeds model-context ledger byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+            post_boundary_projected.ledger_rendered_bytes
         )));
     }
 
     let locally_counted_prepared_tokens = counter.count_messages(&prepared.messages);
-    let late_bound_tool_tokens =
-        late_bound_tool_schema_reserve(session, tool_schemas, &projected, counter)?;
-    let fixed_without_boundary = projected
+    let current_late_bound_tool_tokens =
+        late_bound_tool_schema_reserve(session, tool_schemas, &current_projected, counter)?;
+    let post_boundary_late_bound_tool_tokens = late_bound_tool_schema_reserve(
+        &post_boundary_session,
+        tool_schemas,
+        &post_boundary_projected,
+        counter,
+    )?;
+    let current_projected_tokens = current_projected
+        .input_tokens
+        .saturating_add(current_late_bound_tool_tokens);
+    let post_boundary_projected_tokens = post_boundary_projected
+        .input_tokens
+        .saturating_add(post_boundary_late_bound_tool_tokens);
+    let boundary_reclaimable_tokens =
+        current_projected_tokens.saturating_sub(post_boundary_projected_tokens);
+    let fixed_without_boundary = post_boundary_projected
         .input_tokens
         .saturating_sub(locally_counted_prepared_tokens)
-        .saturating_add(late_bound_tool_tokens);
+        .saturating_add(post_boundary_late_bound_tool_tokens);
     // The block is persisted through the model-context ledger, whose snapshot
     // envelope is larger than the block's direct runtime-context rendering.
     // Reserve the canonical snapshot with maximum-width numeric fields and the
@@ -579,10 +612,12 @@ async fn build_retrieval_window_accounting_frame(
         Some(u64::MAX),
     );
     let boundary_reserve = counter.count_message(&Message::user(boundary_snapshot));
-    let active_tokens_without_boundary =
-        fixed_without_boundary.saturating_add(provider_message_token_total);
+    let active_tokens_without_boundary = fixed_without_boundary
+        .saturating_add(provider_message_token_total)
+        .saturating_add(boundary_reclaimable_tokens);
     let accounting = RetrievalWindowTokenAccounting {
         fixed_prompt_tokens: fixed_without_boundary.saturating_add(boundary_reserve),
+        boundary_reclaimable_tokens,
         provider_message_tokens,
     };
 

@@ -19,10 +19,11 @@ use bamboo_config::{
     RetrievalWindowContextConfig,
 };
 use bamboo_domain::{
-    AgentHookPoint, ContextBlockType, HookPayload, HookResult, ModelContextEvent,
-    ModelContextEventKind, ModelContextResetReason, ModelContextState,
-    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, TaskItem, TaskItemStatus,
-    TaskList,
+    provider_transcript_boundary_sha256, AgentHookPoint, ContextBlockType, HookPayload, HookResult,
+    ModelContextEvent, ModelContextEventKind, ModelContextResetReason, ModelContextState,
+    ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+    ProviderTranscriptOrigin, ProviderTranscriptResetReason, RetrievalWindowCheckpointOutcome,
+    RuntimeSessionPersistence, TaskItem, TaskItemStatus, TaskList,
 };
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{
@@ -265,7 +266,9 @@ impl LLMProvider for ExpandingFootprintProvider {
         _required_tool: Option<&str>,
     ) -> bamboo_llm::provider::Result<ProviderVisibleToolFootprint> {
         let call = self.projection_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(if call <= 1 {
+        // Preflight, current-state accounting, and post-boundary accounting are
+        // stable; the exact retained projection then expands unexpectedly.
+        Ok(if call <= 2 {
             ProviderVisibleToolFootprint::default()
         } else {
             ProviderVisibleToolFootprint {
@@ -2474,6 +2477,116 @@ async fn retrieval_window_pre_turn_checkpoints_before_publication_and_never_summ
         .iter()
         .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
     assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_reclaims_provider_native_transcript_before_candidate_fit() {
+    let mut session = retrieval_window_session("retrieval-native-reclaim");
+    let anchor = session.messages[2].id.clone();
+    let provider_name = "openai-retrieval-test";
+    let provider_type = "openai";
+    let boundary = provider_transcript_boundary_sha256(Some(provider_name), Some(provider_type))
+        .expect("provider boundary should be derived");
+    session
+        .activate_provider_transcript_route(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            &boundary,
+        )
+        .expect("provider route should activate");
+    let reasoning = ProviderTranscriptItem::try_from_payload(
+        ProviderFamily::OpenAi,
+        ProviderProtocol::OpenAiResponsesV1,
+        ProviderTranscriptOrigin::Provider,
+        ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_retrieval_native_reclaim",
+            "status": "completed",
+            "summary": [{
+                "type": "summary_text",
+                "text": "provider native reasoning evidence ".repeat(5_000)
+            }],
+            "encrypted_content": "opaque"
+        }),
+    )
+    .expect("reasoning item should validate");
+    let search_call = ProviderTranscriptItem::try_from_payload(
+        ProviderFamily::OpenAi,
+        ProviderProtocol::OpenAiResponsesV1,
+        ProviderTranscriptOrigin::Provider,
+        ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type": "tool_search_call",
+            "id": "tsc_retrieval_native_reclaim",
+            "execution": "client",
+            "call_id": "search_retrieval_native_reclaim",
+            "status": "completed",
+            "arguments": {"query": "history"}
+        }),
+    )
+    .expect("tool-search item should validate");
+    session
+        .append_provider_transcript_group(&anchor, None, vec![reasoning, search_call])
+        .expect("provider-native group should append");
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config.provider_name = Some(provider_name.to_string());
+    config.provider_type = Some(provider_type.to_string());
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-native-reclaim",
+        &tool_schemas,
+        &llm,
+        None,
+    )
+    .await
+    .expect("native transcript bytes removed by the boundary must not block candidate fit");
+
+    let event = session
+        .compression_events
+        .last()
+        .expect("retrieval-window event should be recorded");
+    assert_eq!(
+        event.kind,
+        bamboo_domain::CompressionEventKind::RetrievalWindow
+    );
+    assert!(event.retrieval_boundary_reclaimed_tokens > 0);
+    assert!(event.retrieval_active_tokens_before > event.retrieval_target_tokens);
+    assert!(event.retrieval_active_tokens_after <= event.retrieval_target_tokens);
+    assert_eq!(
+        session.provider_transcript.last_reset_reason(),
+        Some(ProviderTranscriptResetReason::Compression)
+    );
+    assert!(session
+        .provider_transcript
+        .replayable_groups(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            &boundary,
+        )
+        .is_empty());
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+
+    let projected = super::super::stream_execution::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &tool_schemas,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("committed request should remain projectable");
+    assert!(projected.input_tokens <= event.retrieval_target_tokens);
 }
 
 #[tokio::test]

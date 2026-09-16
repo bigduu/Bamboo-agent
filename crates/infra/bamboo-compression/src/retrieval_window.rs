@@ -34,8 +34,13 @@ pub struct RetrievalWindowPolicy {
 /// replace the complete token cost of any message by its stable message ID.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetrievalWindowTokenAccounting {
-    /// Provider-visible prompt/tool tokens outside `Session.messages`.
+    /// Provider-visible prompt/tool tokens outside `Session.messages` that
+    /// remain after the retrieval boundary resets the model-context epoch.
     pub fixed_prompt_tokens: u32,
+    /// Provider-visible tokens outside `Session.messages` that are present in
+    /// the current request but are deterministically removed when the
+    /// retrieval boundary resets the model-context/provider transcript epoch.
+    pub boundary_reclaimable_tokens: u32,
     /// Complete provider-visible token cost overrides keyed by message ID.
     pub provider_message_tokens: BTreeMap<String, u32>,
 }
@@ -77,6 +82,9 @@ pub struct RetrievalWindowCandidatePlan {
     pub min_recent_user_turns: usize,
     /// Provider-visible prompt/tool tokens outside `Session.messages`.
     pub fixed_prompt_tokens: u32,
+    /// Provider-visible tokens reclaimed once by the committed model-context
+    /// boundary, independently of which ordinary message groups are archived.
+    pub boundary_reclaimable_tokens: u32,
     /// Tokens contributed by active system messages.
     pub system_message_tokens: u32,
     /// Active messages whose complete cost came from provider-aware accounting.
@@ -321,10 +329,13 @@ fn build_retrieval_window_candidate_plan_with_counter(
         group.token_count = count_indexed_messages(&group.messages, accounting, counter)?;
     }
     let group_tokens = checked_sum(groups.iter().map(|group| group.token_count))?;
-    let active_tokens_before = accounting
+    let post_boundary_active_tokens = accounting
         .fixed_prompt_tokens
         .checked_add(system_tokens)
         .and_then(|tokens| tokens.checked_add(group_tokens))
+        .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
+    let active_tokens_before = post_boundary_active_tokens
+        .checked_add(accounting.boundary_reclaimable_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
     let target_tokens = effective_target_tokens(budget, policy.target_usage_percent);
 
@@ -353,11 +364,15 @@ fn build_retrieval_window_candidate_plan_with_counter(
     let mut selected_group_indexes = HashSet::new();
     let mut message_ids_to_archive = Vec::new();
     let mut archive_message_tokens = 0u32;
-    let mut projected_active_tokens_after = active_tokens_before;
+    // Every non-empty retrieval-window commit resets the provider-native and
+    // model-context epochs before dispatch. Account that one-time reclaim
+    // before selecting ordinary message groups, while still requiring at least
+    // one eligible group so the boundary cannot exist without an archive.
+    let mut projected_active_tokens_after = post_boundary_active_tokens;
     let mut archive_user_turn_count = 0usize;
 
     for (group_index, group) in groups.iter().enumerate() {
-        if projected_active_tokens_after <= target_tokens {
+        if projected_active_tokens_after <= target_tokens && !message_ids_to_archive.is_empty() {
             break;
         }
         if group.protected {
@@ -442,6 +457,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         target_usage_percent: policy.target_usage_percent,
         min_recent_user_turns: policy.min_recent_user_turns,
         fixed_prompt_tokens: accounting.fixed_prompt_tokens,
+        boundary_reclaimable_tokens: accounting.boundary_reclaimable_tokens,
         system_message_tokens: system_tokens,
         provider_message_token_override_count: system_messages
             .iter()
@@ -561,6 +577,7 @@ pub fn apply_retrieval_window_plan(
     event.retrieval_archived_group_count = plan.archive_group_count;
     event.retrieval_archived_user_turn_count = plan.archive_user_turn_count;
     event.retrieval_archived_message_tokens = plan.archive_message_tokens;
+    event.retrieval_boundary_reclaimed_tokens = plan.boundary_reclaimable_tokens;
     event.retrieval_system_message_tokens = plan.system_message_tokens;
     event.retrieval_context_window_tokens = plan.context_window_tokens;
     event.retrieval_request_input_limit_tokens = plan.request_input_limit_tokens;
@@ -666,7 +683,8 @@ fn validate_apply_plan_arithmetic(
         || plan.archive_message_tokens == 0
         || plan
             .active_tokens_before
-            .checked_sub(plan.archive_message_tokens)
+            .checked_sub(plan.boundary_reclaimable_tokens)
+            .and_then(|tokens| tokens.checked_sub(plan.archive_message_tokens))
             != Some(plan.projected_active_tokens_after)
     {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
@@ -776,8 +794,8 @@ fn usage_percentage(tokens: u32, limit: u32) -> f64 {
 }
 
 const ACTIVE_STATE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.active-state.v1\0";
-const TOKEN_ACCOUNTING_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.token-accounting.v1\0";
-const PLAN_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.plan-evidence.v1\0";
+const TOKEN_ACCOUNTING_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.token-accounting.v2\0";
+const PLAN_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.plan-evidence.v2\0";
 
 fn active_state_sha256(session: &Session) -> String {
     let active_state = session
@@ -813,6 +831,7 @@ fn active_state_sha256(session: &Session) -> String {
 fn token_accounting_sha256(accounting: &RetrievalWindowTokenAccounting) -> String {
     let encoded = serde_json::to_vec(&(
         accounting.fixed_prompt_tokens,
+        accounting.boundary_reclaimable_tokens,
         &accounting.provider_message_tokens,
     ))
     .expect("retrieval-window token accounting must serialize");
@@ -1222,6 +1241,11 @@ fn validate_idempotent_replay(
         event.retrieval_archived_message_tokens,
         plan.archive_message_tokens,
         "retrieval_archived_message_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_boundary_reclaimed_tokens,
+        plan.boundary_reclaimable_tokens,
+        "retrieval_boundary_reclaimed_tokens"
     );
     require_event_evidence!(
         event.retrieval_system_message_tokens,
@@ -1689,6 +1713,7 @@ mod tests {
     fn accounting_for_plan(plan: &RetrievalWindowCandidatePlan) -> RetrievalWindowTokenAccounting {
         RetrievalWindowTokenAccounting {
             fixed_prompt_tokens: plan.fixed_prompt_tokens,
+            boundary_reclaimable_tokens: plan.boundary_reclaimable_tokens,
             ..RetrievalWindowTokenAccounting::default()
         }
     }
@@ -1971,6 +1996,44 @@ mod tests {
     }
 
     #[test]
+    fn boundary_reclaim_is_subtracted_once_and_still_commits_an_archive_group() {
+        let mut session = Session::new("retrieval-window-boundary-reclaim", "test-model");
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "old", 10);
+        add_turn(&mut session, "recent", 10);
+        let accounting = RetrievalWindowTokenAccounting {
+            fixed_prompt_tokens: 5,
+            boundary_reclaimable_tokens: 40,
+            ..RetrievalWindowTokenAccounting::default()
+        };
+
+        let plan = plan_with_counter_and_accounting(&session, 50, 1, &accounting)
+            .expect("one archive group should commit the boundary reclaim");
+
+        assert_eq!(plan.active_tokens_before, 90);
+        assert_eq!(plan.boundary_reclaimable_tokens, 40);
+        assert_eq!(plan.message_ids_to_archive, vec!["old-u", "old-a"]);
+        assert_eq!(plan.archive_message_tokens, 20);
+        assert_eq!(plan.projected_active_tokens_after, 30);
+
+        apply_retrieval_window_plan(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &budget(100),
+            &accounting,
+        )
+        .expect("boundary-aware plan should apply");
+        let event = session
+            .compression_events
+            .last()
+            .expect("retrieval event should be recorded");
+        assert_eq!(event.retrieval_boundary_reclaimed_tokens, 40);
+        assert_eq!(event.retrieval_active_tokens_after, 30);
+        assert_eq!(session.token_usage.as_ref().unwrap().total_tokens, 30);
+    }
+
+    #[test]
     fn stored_assistant_reasoning_counts_with_its_logical_group() {
         let mut session = Session::new("retrieval-window-reasoning", "test-model");
         session.add_message(system("system", 5));
@@ -2191,6 +2254,7 @@ mod tests {
         assert_eq!(event.retrieval_active_tokens_after, 50);
         assert_eq!(event.retrieval_target_tokens, 50);
         assert_eq!(event.retrieval_archived_message_tokens, 40);
+        assert_eq!(event.retrieval_boundary_reclaimed_tokens, 0);
         assert_eq!(event.retrieval_system_message_tokens, 5);
         assert_eq!(event.retrieval_context_window_tokens, 100);
         assert_eq!(event.retrieval_request_input_limit_tokens, 100);
@@ -2486,7 +2550,7 @@ mod tests {
     }
 
     #[test]
-    fn token_accounting_digest_covers_fixed_and_provider_message_costs() {
+    fn token_accounting_digest_covers_fixed_boundary_and_provider_message_costs() {
         let mut accounting = RetrievalWindowTokenAccounting {
             fixed_prompt_tokens: 5,
             ..RetrievalWindowTokenAccounting::default()
@@ -2499,6 +2563,10 @@ mod tests {
         let mut fixed_changed = accounting.clone();
         fixed_changed.fixed_prompt_tokens += 1;
         assert_ne!(token_accounting_sha256(&fixed_changed), original);
+
+        let mut boundary_changed = accounting.clone();
+        boundary_changed.boundary_reclaimable_tokens += 1;
+        assert_ne!(token_accounting_sha256(&boundary_changed), original);
 
         let mut override_changed = accounting.clone();
         override_changed
@@ -2542,6 +2610,25 @@ mod tests {
                 policy_for_plan(&plan),
                 &budget(100),
                 &changed_override,
+            ),
+            Err(RetrievalWindowApplyError::StalePlan {
+                invariant: "token_accounting_sha256",
+            })
+        );
+        assert_eq!(
+            serde_json::to_vec(&session).expect("session should serialize"),
+            before
+        );
+
+        let mut changed_boundary = accounting.clone();
+        changed_boundary.boundary_reclaimable_tokens += 1;
+        assert_eq!(
+            apply_retrieval_window_plan(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &changed_boundary,
             ),
             Err(RetrievalWindowApplyError::StalePlan {
                 invariant: "token_accounting_sha256",
