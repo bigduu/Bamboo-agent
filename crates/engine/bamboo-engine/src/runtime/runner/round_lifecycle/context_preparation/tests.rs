@@ -129,6 +129,69 @@ impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
     }
 }
 
+struct DurableBaseCheckingPersistence {
+    durable: Arc<Mutex<Session>>,
+    runtime_checkpoints: Arc<AtomicUsize>,
+    retrieval_checkpoints: Arc<AtomicUsize>,
+}
+
+struct DurableBaseCheckingFixture {
+    persistence: Arc<dyn RuntimeSessionPersistence>,
+    durable: Arc<Mutex<Session>>,
+    runtime_checkpoints: Arc<AtomicUsize>,
+    retrieval_checkpoints: Arc<AtomicUsize>,
+}
+
+impl DurableBaseCheckingPersistence {
+    fn fixture(durable: Session) -> DurableBaseCheckingFixture {
+        let durable = Arc::new(Mutex::new(durable));
+        let runtime_checkpoints = Arc::new(AtomicUsize::new(0));
+        let retrieval_checkpoints = Arc::new(AtomicUsize::new(0));
+        DurableBaseCheckingFixture {
+            persistence: Arc::new(Self {
+                durable: Arc::clone(&durable),
+                runtime_checkpoints: Arc::clone(&runtime_checkpoints),
+                retrieval_checkpoints: Arc::clone(&retrieval_checkpoints),
+            }),
+            durable,
+            runtime_checkpoints,
+            retrieval_checkpoints,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeSessionPersistence for DurableBaseCheckingPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        self.checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        self.runtime_checkpoints.fetch_add(1, Ordering::SeqCst);
+        *self.durable.lock().expect("durable Session lock") = session.clone();
+        Ok(())
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.retrieval_checkpoints.fetch_add(1, Ordering::SeqCst);
+        let mut durable = self.durable.lock().expect("durable Session lock");
+        let expected_messages = serde_json::to_vec(&expected_base.messages)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let durable_messages = serde_json::to_vec(&durable.messages)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if expected_messages != durable_messages {
+            *staged = durable.clone();
+            return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+        }
+        *durable = staged.clone();
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+}
+
 struct RebaseOnceRetrievalPersistence {
     calls: Arc<AtomicUsize>,
     checkpoints: Arc<Mutex<Vec<Session>>>,
@@ -4601,8 +4664,8 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
          <!-- BAMBOO_SKILL_CONTEXT_START -->\nskill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\
          <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->"
         .to_string();
-    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
-    let config = retrieval_window_config(persistence);
+    let fixture = DurableBaseCheckingPersistence::fixture(session.clone());
+    let config = retrieval_window_config(Arc::clone(&fixture.persistence));
     let llm = noop_llm();
     let (event_tx, mut event_rx) = mpsc::channel(16);
 
@@ -4623,7 +4686,8 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
     assert!(!prompt.contains("BAMBOO_TOOL_GUIDE"));
     assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
     assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
-    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_eq!(fixture.runtime_checkpoints.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.retrieval_checkpoints.load(Ordering::SeqCst), 1);
     assert_eq!(
         session
             .compression_events
@@ -4632,6 +4696,17 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
             .trigger_type,
         CompressionTriggerType::CriticalOverflow
     );
+    let durable = fixture.durable.lock().expect("durable Session lock");
+    assert_eq!(
+        durable
+            .compression_events
+            .last()
+            .expect("durable forced archive event")
+            .trigger_type,
+        CompressionTriggerType::CriticalOverflow
+    );
+    assert!(!system_prompt(&durable).contains("BAMBOO_TOOL_GUIDE"));
+    drop(durable);
 
     drop(event_tx);
     let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
@@ -4649,6 +4724,36 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
     assert!(events
         .iter()
         .any(|event| matches!(event, AgentEvent::ContextArchived { .. })));
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_degradation_checkpoint_failure_is_transactional() {
+    let mut session = retrieval_window_session("retrieval-overflow-degrade-checkpoint-failure");
+    session.messages[0].content = "Base prompt\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->"
+        .to_string();
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::failing();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let error = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-overflow-degrade-checkpoint-failure",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("failed degradation checkpoint must leave overflow recovery retryable");
+
+    assert!(error
+        .to_string()
+        .contains("prompt degradation checkpoint failed"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
 }
 
 #[tokio::test]

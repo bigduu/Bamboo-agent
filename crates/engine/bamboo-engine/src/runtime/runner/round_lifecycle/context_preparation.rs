@@ -359,6 +359,37 @@ fn degrade_prompt_context_sections_for_overflow(session: &mut Session) -> Option
     None
 }
 
+async fn checkpoint_retrieval_overflow_prompt_degradation(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+) -> Result<Vec<&'static str>, AgentError> {
+    let mut staged = session.clone();
+    let mut degraded_sections = Vec::new();
+    while let Some(section) = degrade_prompt_context_sections_for_overflow(&mut staged) {
+        degraded_sections.push(section);
+    }
+    if degraded_sections.is_empty() {
+        return Ok(degraded_sections);
+    }
+
+    let Some(persistence) = config.persistence.as_ref() else {
+        return Err(AgentError::Budget(
+            "retrieval-window overflow recovery requires RuntimeSessionPersistence to durably checkpoint prompt degradation before archive planning"
+                .to_string(),
+        ));
+    };
+    persistence
+        .checkpoint_runtime_session(&mut staged)
+        .await
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "retrieval-window prompt degradation checkpoint failed; overflow recovery remains retryable: {error}"
+            ))
+        })?;
+    *session = staged;
+    Ok(degraded_sections)
+}
+
 fn build_compression_context_blocks(
     session: &Session,
     app_data_dir: Option<&std::path::Path>,
@@ -1682,23 +1713,31 @@ pub(crate) async fn force_overflow_context_recovery(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<bool, AgentError> {
-    let mut degraded_prompt = false;
-    while let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
-        degraded_prompt = true;
+    let degraded_sections =
+        if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
+            checkpoint_retrieval_overflow_prompt_degradation(session, config).await?
+        } else {
+            degrade_prompt_context_sections_for_overflow(session)
+                .into_iter()
+                .collect()
+        };
+    let degraded_prompt = !degraded_sections.is_empty();
+    for degraded_section in degraded_sections {
         tracing::info!(
             "[{}] Overflow recovery pre-pass degraded prompt section: {}",
             session_id,
             degraded_section,
         );
         emit_context_compression_status(event_tx, "overflow-recovery", "degraded_sections").await;
+    }
 
-        // Summary mode preserves the existing one-section-per-recovery
-        // behavior. Retrieval-window recovery has only one provider retry, so
-        // it must finish the bounded degradation pass and reach forced archive
-        // planning during this same invocation.
-        if config.context_management.strategy != ContextManagementStrategy::RetrievalWindow {
-            return Ok(true);
-        }
+    // Summary mode preserves the existing one-section-per-recovery behavior.
+    // Retrieval-window recovery checkpointed every bounded degradation above
+    // and must now reach forced archive planning during this same invocation.
+    if degraded_prompt
+        && config.context_management.strategy != ContextManagementStrategy::RetrievalWindow
+    {
+        return Ok(true);
     }
 
     if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
