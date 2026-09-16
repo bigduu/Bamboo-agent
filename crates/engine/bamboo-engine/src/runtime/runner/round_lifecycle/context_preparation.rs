@@ -372,6 +372,15 @@ async fn checkpoint_retrieval_overflow_prompt_degradation(
         return Ok(degraded_sections);
     }
 
+    // Prompt degradation rewrites provider-visible history even when forced
+    // archival later proves unnecessary. Fence every native replay lane at the
+    // same durable checkpoint so a degradation-only recovery cannot reuse a
+    // continuation anchored to the pre-degradation prompt.
+    staged
+        .metadata
+        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    staged.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+
     let Some(persistence) = config.persistence.as_ref() else {
         return Err(AgentError::Budget(
             "retrieval-window overflow recovery requires RuntimeSessionPersistence to durably checkpoint prompt degradation before archive planning"
@@ -1760,6 +1769,13 @@ pub(crate) async fn force_overflow_context_recovery(
 
         match retrieval_result {
             Ok(RetrievalWindowPreparationOutcome::Archived(_)) => return Ok(true),
+            Ok(RetrievalWindowPreparationOutcome::Deferred) if degraded_prompt => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "retrieval-window archival was deferred after durable prompt degradation; retrying the provider with the degraded prompt"
+                );
+                return Ok(true);
+            }
             Ok(RetrievalWindowPreparationOutcome::Deferred) => {
                 return Err(AgentError::Budget(
                     "retrieval-window critical overflow recovery was deferred by a required setup boundary"
@@ -1780,6 +1796,14 @@ pub(crate) async fn force_overflow_context_recovery(
                     "retrieval-window critical overflow recovery could not reduce context because the provider-prepared request is already at or below the configured archive target"
                         .to_string(),
                 ));
+            }
+            Err(error) if degraded_prompt && !retrieval_window_fallback_is_summary(config) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "retrieval-window archival failed after durable prompt degradation; retrying the provider with the degraded prompt"
+                );
+                return Ok(true);
             }
             Err(error) if !retrieval_window_fallback_is_summary(config) => return Err(error),
             Ok(RetrievalWindowPreparationOutcome::NotNeeded) => {

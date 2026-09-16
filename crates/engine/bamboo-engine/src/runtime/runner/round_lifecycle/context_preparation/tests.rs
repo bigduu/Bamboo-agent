@@ -4757,6 +4757,118 @@ async fn retrieval_window_overflow_degradation_checkpoint_failure_is_transaction
 }
 
 #[tokio::test]
+async fn retrieval_window_overflow_degradation_only_resets_provider_epoch_durably() {
+    let mut session = Session::new("retrieval-overflow-degradation-only", "test-model");
+    session.add_message(Message::system(
+        "Base prompt\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->",
+    ));
+    session.add_message(Message::user("small request"));
+    session.add_message(Message::assistant("small response", None));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        100_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp-before-degradation".to_string(),
+    );
+    session.model_context_state = Some(ModelContextState {
+        prefix_epoch: 4,
+        cache_scope_sha256: Some("a".repeat(64)),
+        ..ModelContextState::default()
+    });
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-overflow-degradation-only",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("durable prompt degradation alone should permit one provider retry");
+
+    assert!(applied);
+    assert!(session.compression_events.is_empty());
+    assert!(!system_prompt(&session).contains("BAMBOO_TOOL_GUIDE"));
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+    let state = session
+        .model_context_state
+        .as_ref()
+        .expect("prompt rewrite must reset the model-context epoch");
+    assert_eq!(state.prefix_epoch, 5);
+    assert_eq!(
+        state.last_reset_reason,
+        Some(ModelContextResetReason::ExplicitHistoryRewrite)
+    );
+    let checkpoints = checkpoints.lock().expect("checkpoint list lock");
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(
+        checkpoints[0]
+            .model_context_state
+            .as_ref()
+            .and_then(|state| state.last_reset_reason),
+        Some(ModelContextResetReason::ExplicitHistoryRewrite)
+    );
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_retries_degraded_prompt_when_target_is_protected() {
+    let mut session = Session::new("retrieval-overflow-degraded-protected", "test-model");
+    session.add_message(Message::system(
+        "Base prompt\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->",
+    ));
+    session.add_message(Message::user("old eligible turn"));
+    session.add_message(Message::assistant("old eligible response", None));
+    session.add_message(Message::user("protected latest evidence ".repeat(4_000)));
+    session.add_message(Message::assistant(
+        "protected latest response ".repeat(4_000),
+        None,
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        0,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let llm = noop_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-overflow-degraded-protected",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("durable degradation should still permit the single provider retry");
+
+    assert!(applied);
+    assert!(session.compression_events.is_empty());
+    assert!(!system_prompt(&session).contains("BAMBOO_TOOL_GUIDE"));
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
 async fn degradation_returns_none_when_all_sections_already_stripped() {
     let mut session = Session::new("session-degrade-none", "test-model");
     session
