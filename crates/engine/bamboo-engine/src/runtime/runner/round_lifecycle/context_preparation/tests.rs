@@ -20,8 +20,9 @@ use bamboo_config::{
 };
 use bamboo_domain::{
     AgentHookPoint, ContextBlockType, HookPayload, HookResult, ModelContextEvent,
-    ModelContextEventKind, ModelContextResetReason, ModelContextState, RuntimeSessionPersistence,
-    TaskItem, TaskItemStatus, TaskList,
+    ModelContextEventKind, ModelContextResetReason, ModelContextState,
+    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, TaskItem, TaskItemStatus,
+    TaskList,
 };
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{
@@ -104,6 +105,87 @@ impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
             .expect("checkpoint list lock should not be poisoned")
             .push(session.clone());
         Ok(())
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        _expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        if self.fail {
+            return Err(io::Error::other("injected retrieval checkpoint failure"));
+        }
+        self.checkpoints
+            .lock()
+            .expect("checkpoint list lock should not be poisoned")
+            .push(staged.clone());
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+}
+
+struct RebaseOnceRetrievalPersistence {
+    calls: Arc<AtomicUsize>,
+    checkpoints: Arc<Mutex<Vec<Session>>>,
+    first_archive_event_id: Arc<Mutex<Option<String>>>,
+}
+
+struct RebaseOnceRetrievalFixture {
+    persistence: Arc<dyn RuntimeSessionPersistence>,
+    calls: Arc<AtomicUsize>,
+    checkpoints: Arc<Mutex<Vec<Session>>>,
+    first_archive_event_id: Arc<Mutex<Option<String>>>,
+}
+
+impl RebaseOnceRetrievalPersistence {
+    fn fixture() -> RebaseOnceRetrievalFixture {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        let first_archive_event_id = Arc::new(Mutex::new(None));
+        RebaseOnceRetrievalFixture {
+            persistence: Arc::new(Self {
+                calls: Arc::clone(&calls),
+                checkpoints: Arc::clone(&checkpoints),
+                first_archive_event_id: Arc::clone(&first_archive_event_id),
+            }),
+            calls,
+            checkpoints,
+            first_archive_event_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeSessionPersistence for RebaseOnceRetrievalPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            *self
+                .first_archive_event_id
+                .lock()
+                .expect("event id lock should not be poisoned") = staged
+                .compression_events
+                .last()
+                .map(|event| event.id.clone());
+            let mut rebased = expected_base.clone();
+            let mut concurrent = Message::user("CONCURRENT_DURABLE_SUFFIX");
+            concurrent.id = "concurrent-durable-suffix".to_string();
+            rebased.add_message(concurrent);
+            *staged = rebased;
+            return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+        }
+
+        self.checkpoints
+            .lock()
+            .expect("checkpoint list lock should not be poisoned")
+            .push(staged.clone());
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 }
 
@@ -2392,6 +2474,122 @@ async fn retrieval_window_pre_turn_checkpoints_before_publication_and_never_summ
         .iter()
         .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
     assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_replans_after_concurrent_durable_suffix_before_dispatch() {
+    let mut session = retrieval_window_session("retrieval-rebase");
+    let fixture = RebaseOnceRetrievalPersistence::fixture();
+    let config = retrieval_window_config(Arc::clone(&fixture.persistence));
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-rebase",
+        &tool_schemas,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("a concurrent suffix should be rebased and replanned");
+
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.id == "concurrent-durable-suffix" && !message.compressed));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| message.id == "concurrent-durable-suffix"));
+    assert_eq!(
+        session
+            .compression_events
+            .iter()
+            .filter(|event| event.kind == bamboo_domain::CompressionEventKind::RetrievalWindow)
+            .count(),
+        1
+    );
+    let discarded_event_id = fixture
+        .first_archive_event_id
+        .lock()
+        .expect("event id lock should not be poisoned")
+        .clone()
+        .expect("first staged archive should have an event id");
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| message.compressed_by_event_id.as_deref()
+            != Some(discarded_event_id.as_str())));
+    let checkpoints = fixture
+        .checkpoints
+        .lock()
+        .expect("checkpoint list lock should not be poisoned");
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&checkpoints[0]).unwrap(),
+        serde_json::to_value(&session).unwrap()
+    );
+    drop(checkpoints);
+
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ContextArchived { .. }))
+            .count(),
+        1
+    );
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_rejects_a_preexisting_summary_before_pressure_or_side_effects() {
+    let mut session = Session::new("retrieval-existing-summary", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    session.messages.push(Message::user("small active request"));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "legacy durable summary",
+        4,
+        80,
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-existing-summary",
+        &[],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect_err("strategy transition must reject an existing summary immediately");
+
+    assert!(error
+        .to_string()
+        .contains("already has a conversation summary"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
 }
 
 #[tokio::test]

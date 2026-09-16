@@ -39,7 +39,8 @@ use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::Storage;
 use bamboo_domain::{
     latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
-    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY,
+    CONSUMED_RESPONSE_OCCURRENCES_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -751,6 +752,43 @@ impl LockedSessionStore {
         result
     }
 
+    /// Commit a retrieval-window rewrite without passing its message mutations
+    /// through the ordinary append-only reconciliation path.
+    ///
+    /// A concurrent durable transcript change returns a clean rebased Session
+    /// without writing. The engine must replan from that value before retrying.
+    pub async fn checkpoint_retrieval_window_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_retrieval_window_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = rebase_retrieval_window_base(expected_base, latest);
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
     /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
@@ -1276,6 +1314,15 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         LockedSessionStore::checkpoint_runtime_session(self, session).await
     }
 
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_retrieval_window_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
@@ -1371,6 +1418,204 @@ fn ensure_model_context_checkpoint_is_current(
         ));
     }
     Ok(())
+}
+
+fn message_matches_retrieval_window_base(
+    expected: &bamboo_domain::Message,
+    durable: &bamboo_domain::Message,
+) -> std::io::Result<bool> {
+    if durable.image_ocr.is_some() && durable.image_ocr != expected.image_ocr {
+        return Ok(false);
+    }
+    let mut expected = expected.clone();
+    let mut durable = durable.clone();
+    // A staged OCR cache may legitimately be newer than disk and is committed
+    // with the archive. Every other message field must still describe the exact
+    // durable prefix used for planning.
+    expected.image_ocr = None;
+    durable.image_ocr = None;
+    let expected = serde_json::to_vec(&expected)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let durable = serde_json::to_vec(&durable)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(expected == durable)
+}
+
+fn invalid_retrieval_window_checkpoint(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_staged_retrieval_window_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint Session IDs differ",
+        ));
+    }
+    if expected.conversation_summary.is_some() || staged.conversation_summary.is_some() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint cannot contain a conversation summary",
+        ));
+    }
+    if expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint must preserve the message array",
+        ));
+    }
+    if staged.compression_events.len() != expected.compression_events.len().saturating_add(1) {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint must append exactly one compression event",
+        ));
+    }
+
+    let expected_events = serde_json::to_vec(&expected.compression_events)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged_prefix =
+        serde_json::to_vec(&staged.compression_events[..expected.compression_events.len()])
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if expected_events != staged_prefix {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint rewrote an existing compression event",
+        ));
+    }
+
+    let event = staged
+        .compression_events
+        .last()
+        .expect("length check guarantees a staged compression event");
+    if event.kind != bamboo_domain::CompressionEventKind::RetrievalWindow
+        || event.id.is_empty()
+        || expected
+            .compression_events
+            .iter()
+            .any(|existing| existing.id == event.id)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint has an invalid archive event",
+        ));
+    }
+
+    let mut newly_archived = 0usize;
+    for (before, after) in expected.messages.iter().zip(&staged.messages) {
+        if before.id != after.id {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint reordered or replaced a message",
+            ));
+        }
+
+        let is_new_archive = !before.compressed && after.compressed;
+        if is_new_archive {
+            if before.compressed_by_event_id.is_some()
+                || after.compressed_by_event_id.as_deref() != Some(event.id.as_str())
+            {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "retrieval-window checkpoint has an invalid message correlation",
+                ));
+            }
+            newly_archived = newly_archived.saturating_add(1);
+        } else if before.compressed != after.compressed
+            || before.compressed_by_event_id != after.compressed_by_event_id
+        {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint contains an unsupported archive mutation",
+            ));
+        }
+
+        let mut normalized_after = after.clone();
+        normalized_after.compressed = before.compressed;
+        normalized_after
+            .compressed_by_event_id
+            .clone_from(&before.compressed_by_event_id);
+        let before = serde_json::to_vec(before)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let after = serde_json::to_vec(&normalized_after)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if before != after {
+            return Err(invalid_retrieval_window_checkpoint(
+                "retrieval-window checkpoint mutated message content",
+            ));
+        }
+    }
+
+    if newly_archived == 0 || newly_archived != event.messages_compressed {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint event count does not match message correlations",
+        ));
+    }
+    if staged
+        .model_context_state
+        .as_ref()
+        .and_then(|state| state.last_reset_reason)
+        != Some(bamboo_domain::ModelContextResetReason::Compression)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "retrieval-window checkpoint is missing its model-context reset",
+        ));
+    }
+
+    Ok(())
+}
+
+fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::io::Result<bool> {
+    if expected.id != durable.id || durable.messages.len() > expected.messages.len() {
+        return Ok(false);
+    }
+    for (durable_message, expected_message) in durable.messages.iter().zip(expected.messages.iter())
+    {
+        if !message_matches_retrieval_window_base(expected_message, durable_message)? {
+            return Ok(false);
+        }
+    }
+
+    if durable.compression_events.len() > expected.compression_events.len() {
+        return Ok(false);
+    }
+    for (durable_event, expected_event) in durable
+        .compression_events
+        .iter()
+        .zip(expected.compression_events.iter())
+    {
+        let durable_event = serde_json::to_vec(durable_event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let expected_event = serde_json::to_vec(expected_event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if durable_event != expected_event {
+            return Ok(false);
+        }
+    }
+
+    let summary_matches = serde_json::to_vec(&expected.conversation_summary)
+        .and_then(|expected| {
+            serde_json::to_vec(&durable.conversation_summary).map(|durable| expected == durable)
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !summary_matches {
+        return Ok(false);
+    }
+
+    Ok(ensure_model_context_checkpoint_is_current(expected, durable).is_ok())
+}
+
+fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Session {
+    let mut rebased = expected.clone();
+    bamboo_domain::append_missing_runtime_messages(&mut rebased, durable);
+    bamboo_domain::merge_session_inbox_admission(&mut rebased, durable);
+    rebased
+        .conversation_summary
+        .clone_from(&durable.conversation_summary);
+    rebased
+        .compression_events
+        .clone_from(&durable.compression_events);
+    rebased.token_usage.clone_from(&durable.token_usage);
+    rebased
+        .model_context_state
+        .clone_from(&durable.model_context_state);
+    if durable.updated_at > rebased.updated_at {
+        rebased.updated_at = durable.updated_at;
+    }
+    rebased
 }
 
 /// Adopt the on-disk typed permission posture into the session about to be
@@ -2319,6 +2564,28 @@ mod tests {
 
     fn fresh(id: &str) -> Session {
         Session::new(id.to_string(), "test-model".to_string())
+    }
+
+    fn stage_retrieval_window_archive(expected: &Session, message_index: usize) -> Session {
+        let mut staged = expected.clone();
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            80.0,
+            60.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        let event_id = event.id.clone();
+        staged.messages[message_index].compressed = true;
+        staged.messages[message_index].compressed_by_event_id = Some(event_id);
+        staged.compression_events.push(event);
+        staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        staged
     }
 
     fn typed_permission_result(
@@ -3481,6 +3748,94 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_preserves_staged_archive_flags() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "retrieval-checkpoint-archive-flags";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive me"));
+        expected.add_message(Message::assistant("retain me", None));
+        storage.save_session(&expected).await.unwrap();
+        let mut staged = stage_retrieval_window_archive(&expected, 0);
+        let event_id = staged.compression_events[0].id.clone();
+        let published = Arc::new(std::sync::Mutex::new(None));
+        let published_clone = Arc::clone(&published);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, move |saved| {
+                *published_clone.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert!(saved.messages[0].compressed);
+        assert_eq!(
+            saved.messages[0].compressed_by_event_id.as_deref(),
+            Some(event_id.as_str())
+        );
+        assert!(!saved.messages[1].compressed);
+        assert_eq!(saved.compression_events.len(), 1);
+        assert_eq!(
+            saved.compression_events[0].kind,
+            bamboo_domain::CompressionEventKind::RetrievalWindow
+        );
+        assert_eq!(
+            serde_json::to_value(published.lock().unwrap().as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_rebases_concurrent_suffix_without_writing() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "retrieval-checkpoint-concurrent-suffix";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive candidate"));
+        storage.save_session(&expected).await.unwrap();
+        let mut staged = stage_retrieval_window_archive(&expected, 0);
+
+        let mut durable = expected.clone();
+        let mut concurrent = Message::user("concurrent durable suffix");
+        concurrent.id = "concurrent-durable-suffix".to_string();
+        durable.add_message(concurrent);
+        storage.save_session(&durable).await.unwrap();
+        let published = Arc::new(AtomicBool::new(false));
+        let published_clone = Arc::clone(&published);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, move |_| {
+                published_clone.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert!(!published.load(Ordering::SeqCst));
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap(),
+            "a conflict must not write the staged archive"
+        );
+        assert_eq!(staged.messages.len(), 2);
+        assert_eq!(staged.messages[1].id, "concurrent-durable-suffix");
+        assert!(staged.messages.iter().all(|message| !message.compressed));
+        assert!(staged.compression_events.is_empty());
+        assert!(staged.model_context_state.is_none());
     }
 
     #[tokio::test]

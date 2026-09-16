@@ -22,8 +22,9 @@ use bamboo_compression::{
 };
 use bamboo_config::{ContextManagementFallbackStrategy, ContextManagementStrategy};
 use bamboo_domain::{
-    AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason, TokenUsageBreakdown,
-    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason,
+    RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
+    MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::LLMProvider;
 use std::collections::{BTreeMap, HashSet};
@@ -42,6 +43,7 @@ mod transforms;
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
 const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
+const MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES: usize = 2;
 
 /// Session-metadata key holding the last emitted context-pressure level, so
 /// `ContextPressureNotification` is deduplicated across rounds on a per-level-
@@ -618,11 +620,6 @@ async fn maybe_prepare_retrieval_window_context(
 ) -> Result<Option<PreparedContext>, AgentError> {
     let counter = TiktokenTokenCounter::default();
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
-    let effective_tool_schemas =
-        super::stream_execution::effective_tool_schemas(session, tool_schemas);
-    let history_tool_available = effective_tool_schemas.iter().any(|schema| {
-        bamboo_domain::canonical_tool_name(&schema.function.name) == "session_history_current"
-    });
     let preflight = retrieval_window_preflight(
         session,
         config,
@@ -636,40 +633,6 @@ async fn maybe_prepare_retrieval_window_context(
     if !preflight.has_provider_native_image && preflight.active_tokens < trigger_tokens {
         return Ok(None);
     }
-    if !history_tool_available {
-        return Err(AgentError::Budget(
-            "retrieval-window requires the effective callable tool session_history_current before archiving any messages"
-                .to_string(),
-        ));
-    }
-
-    // OCR caching is an existing durable Session side effect. Populate it only
-    // on the staged candidate so a retrieval failure leaves live state intact
-    // and a success commits the derived cache with the archive boundary.
-    let mut staged = session.clone();
-    ocr_cache::cache_ocr_results_in_session(&mut staged, config).await;
-
-    let frame = build_retrieval_window_accounting_frame(
-        &staged,
-        config,
-        model_name,
-        session_id,
-        tool_schemas,
-        llm,
-        budget,
-        &counter,
-    )
-    .await?;
-    if frame.active_tokens_without_boundary < trigger_tokens {
-        return Ok(None);
-    }
-    let Some(persistence) = config.persistence.as_ref() else {
-        return Err(AgentError::Budget(
-            "retrieval-window requires RuntimeSessionPersistence for a durable pre-dispatch checkpoint"
-                .to_string(),
-        ));
-    };
-
     let policy = RetrievalWindowPolicy {
         min_recent_user_turns: config
             .context_management
@@ -677,154 +640,216 @@ async fn maybe_prepare_retrieval_window_context(
             .min_recent_user_turns,
         target_usage_percent: config.context_management.retrieval_target_usage_percent(),
     };
-    let plan = build_retrieval_window_candidate_plan_with_token_accounting(
-        &staged,
-        budget,
-        policy,
-        &frame.accounting,
-    )
-    .map_err(|error| {
-        AgentError::Budget(format!(
-            "retrieval-window candidate planning failed: {error}"
-        ))
-    })?;
+    let mut candidate_base = session.clone();
 
-    let applied =
-        apply_retrieval_window_plan(&mut staged, &plan, policy, budget, &frame.accounting)
-            .map_err(|error| {
-                AgentError::Budget(format!(
-                    "retrieval-window staged application failed: {error}"
-                ))
-            })?;
-    if applied.idempotent_replay {
-        return Err(AgentError::Budget(
-            "retrieval-window automatic route unexpectedly produced an idempotent replay"
-                .to_string(),
-        ));
-    }
-    // A retrieval boundary rewrites the provider-visible transcript. Bind the
-    // Responses continuation invalidation to the same staged checkpoint so a
-    // future stateful policy cannot reference an upstream turn from the
-    // pre-archive epoch.
-    staged
-        .metadata
-        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+        let effective_tool_schemas =
+            super::stream_execution::effective_tool_schemas(&candidate_base, tool_schemas);
+        let history_tool_available = effective_tool_schemas.iter().any(|schema| {
+            bamboo_domain::canonical_tool_name(&schema.function.name) == "session_history_current"
+        });
+        if !history_tool_available {
+            return Err(AgentError::Budget(
+                "retrieval-window requires the effective callable tool session_history_current before archiving any messages"
+                    .to_string(),
+            ));
+        }
 
-    let mut retained = prepare_hybrid_context_with_fixed_tokens(
-        &staged,
-        budget,
-        &counter,
-        plan.fixed_prompt_tokens,
-    )
-    .map_err(|error| {
-        AgentError::Budget(format!(
-            "retrieval-window retained context preparation failed: {error}"
-        ))
-    })?;
-    if retained.truncation_occurred || !retained.compressed_message_ids.is_empty() {
-        return Err(AgentError::Budget(format!(
-            "retrieval-window retained context required an additional transient hard-limit fit (removed_segments={}, removed_messages={})",
-            retained.segments_removed,
-            retained.compressed_message_ids.len()
-        )));
-    }
-    transforms::apply_message_transforms(config, &mut retained, llm, session_id).await?;
-    let projected = super::stream_execution::project_request_usage(
-        &staged,
-        &retained,
-        config,
-        tool_schemas,
-        model_name,
-        llm,
-    )
-    .await?;
-    let late_bound_tool_tokens =
-        late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, &counter)?;
-    let retained_supplemental_tokens =
-        retained
-            .messages
-            .iter()
-            .try_fold(0u32, |total, message| -> Result<u32, AgentError> {
-                let complete = provider_prepared_message_tokens(message, &counter)?;
-                Ok(total.saturating_add(complete.saturating_sub(counter.count_message(message))))
-            })?;
-    let projected_input_tokens = projected
-        .input_tokens
-        .saturating_add(late_bound_tool_tokens)
-        .saturating_add(retained_supplemental_tokens);
-    if projected_input_tokens > plan.target_tokens
-        || projected_input_tokens > budget.max_request_input_tokens()
-        || projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
-    {
-        return Err(AgentError::Budget(format!(
-            "retrieval-window exact retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
-            plan.target_tokens,
-            budget.max_request_input_tokens(),
-            projected.ledger_rendered_bytes,
-        )));
-    }
+        // OCR caching is an existing durable Session side effect. Populate it
+        // only on the candidate base so a failure leaves live state intact and
+        // a successful archive commits it in the same transaction.
+        ocr_cache::cache_ocr_results_in_session(&mut candidate_base, config).await;
+        let frame = build_retrieval_window_accounting_frame(
+            &candidate_base,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            budget,
+            &counter,
+        )
+        .await?;
+        if frame.active_tokens_without_boundary < trigger_tokens {
+            // A rebase is authoritative durable state. Publish it to the live
+            // runner even when it removes the need for an archive so the
+            // ordinary preparation path cannot dispatch the stale snapshot.
+            if attempt > 0 {
+                *session = candidate_base;
+            }
+            return Ok(None);
+        }
+        let Some(persistence) = config.persistence.as_ref() else {
+            return Err(AgentError::Budget(
+                "retrieval-window requires RuntimeSessionPersistence for a durable pre-dispatch checkpoint"
+                    .to_string(),
+            ));
+        };
 
-    persistence
-        .checkpoint_runtime_session(&mut staged)
-        .await
+        // The exact post-OCR base is the optimistic compare value. All archive
+        // mutations and provider preparation happen on a separate staged clone.
+        let expected_base = candidate_base;
+        let mut staged = expected_base.clone();
+        let plan = build_retrieval_window_candidate_plan_with_token_accounting(
+            &staged,
+            budget,
+            policy,
+            &frame.accounting,
+        )
         .map_err(|error| {
             AgentError::Budget(format!(
-                "retrieval-window durable checkpoint failed before provider dispatch: {error}"
+                "retrieval-window candidate planning failed: {error}"
             ))
         })?;
 
-    let (model_context_epoch, reset_reason) = staged
-        .model_context_state
-        .as_ref()
-        .map(|state| {
-            (
-                state.prefix_epoch,
-                state
-                    .last_reset_reason
-                    .map(ModelContextResetReason::as_str)
-                    .unwrap_or("unknown")
+        let applied =
+            apply_retrieval_window_plan(&mut staged, &plan, policy, budget, &frame.accounting)
+                .map_err(|error| {
+                    AgentError::Budget(format!(
+                        "retrieval-window staged application failed: {error}"
+                    ))
+                })?;
+        if applied.idempotent_replay {
+            return Err(AgentError::Budget(
+                "retrieval-window automatic route unexpectedly produced an idempotent replay"
                     .to_string(),
-            )
-        })
-        .unwrap_or_else(|| (0, "unknown".to_string()));
+            ));
+        }
+        // A retrieval boundary rewrites the provider-visible transcript. Bind
+        // Responses continuation invalidation to the same staged checkpoint.
+        staged
+            .metadata
+            .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
 
-    // The live Session becomes visible only after the durable checkpoint. Every
-    // fallible planning/transform/projection/persistence step above operated on
-    // immutable input or the staged clone.
-    *session = staged;
+        let mut retained = prepare_hybrid_context_with_fixed_tokens(
+            &staged,
+            budget,
+            &counter,
+            plan.fixed_prompt_tokens,
+        )
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "retrieval-window retained context preparation failed: {error}"
+            ))
+        })?;
+        if retained.truncation_occurred || !retained.compressed_message_ids.is_empty() {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window retained context required an additional transient hard-limit fit (removed_segments={}, removed_messages={})",
+                retained.segments_removed,
+                retained.compressed_message_ids.len()
+            )));
+        }
+        transforms::apply_message_transforms(config, &mut retained, llm, session_id).await?;
+        let projected = super::stream_execution::project_request_usage(
+            &staged,
+            &retained,
+            config,
+            tool_schemas,
+            model_name,
+            llm,
+        )
+        .await?;
+        let late_bound_tool_tokens =
+            late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, &counter)?;
+        let retained_supplemental_tokens = retained.messages.iter().try_fold(
+            0u32,
+            |total, message| -> Result<u32, AgentError> {
+                let complete = provider_prepared_message_tokens(message, &counter)?;
+                Ok(total.saturating_add(complete.saturating_sub(counter.count_message(message))))
+            },
+        )?;
+        let projected_input_tokens = projected
+            .input_tokens
+            .saturating_add(late_bound_tool_tokens)
+            .saturating_add(retained_supplemental_tokens);
+        if projected_input_tokens > plan.target_tokens
+            || projected_input_tokens > budget.max_request_input_tokens()
+            || projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+        {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window exact retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                plan.target_tokens,
+                budget.max_request_input_tokens(),
+                projected.ledger_rendered_bytes,
+            )));
+        }
 
-    if let Some(tx) = event_tx {
-        let _ = tx
-            .send(AgentEvent::ContextArchived {
-                archive_event_id: applied.event_id,
-                trigger_type: "auto".to_string(),
-                messages_archived: plan.archive_message_count,
-                groups_archived: plan.archive_group_count,
-                user_turns_archived: plan.archive_user_turn_count,
-                active_tokens_before: plan.active_tokens_before,
-                active_tokens_after: plan.projected_active_tokens_after,
-                target_tokens: plan.target_tokens,
-                retained_recent_user_turns: plan.retained_recent_user_turn_count,
-                oldest_retained_message_id: plan.oldest_retained_message_id,
-                oldest_retained_user_message_id: plan.oldest_retained_user_message_id,
-                model_context_epoch,
-                reset_reason,
+        match persistence
+            .checkpoint_retrieval_window(&expected_base, &mut staged)
+            .await
+            .map_err(|error| {
+                AgentError::Budget(format!(
+                    "retrieval-window durable checkpoint failed before provider dispatch: {error}"
+                ))
+            })? {
+            RetrievalWindowCheckpointOutcome::Rebased => {
+                if attempt == MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+                    return Err(AgentError::Budget(format!(
+                        "retrieval-window durable checkpoint could not stabilize after {} attempts with concurrent transcript changes",
+                        MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES + 1
+                    )));
+                }
+                candidate_base = staged;
+                continue;
+            }
+            RetrievalWindowCheckpointOutcome::Committed => {}
+        }
+
+        let (model_context_epoch, reset_reason) = staged
+            .model_context_state
+            .as_ref()
+            .map(|state| {
+                (
+                    state.prefix_epoch,
+                    state
+                        .last_reset_reason
+                        .map(ModelContextResetReason::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
             })
-            .await;
+            .unwrap_or_else(|| (0, "unknown".to_string()));
+
+        // Publish only the exact candidate that persistence committed. Every
+        // fallible step above operated on an immutable base or staged clone.
+        *session = staged;
+
+        if let Some(tx) = event_tx {
+            let _ = tx
+                .send(AgentEvent::ContextArchived {
+                    archive_event_id: applied.event_id,
+                    trigger_type: "auto".to_string(),
+                    messages_archived: plan.archive_message_count,
+                    groups_archived: plan.archive_group_count,
+                    user_turns_archived: plan.archive_user_turn_count,
+                    active_tokens_before: plan.active_tokens_before,
+                    active_tokens_after: plan.projected_active_tokens_after,
+                    target_tokens: plan.target_tokens,
+                    retained_recent_user_turns: plan.retained_recent_user_turn_count,
+                    oldest_retained_message_id: plan.oldest_retained_message_id,
+                    oldest_retained_user_message_id: plan.oldest_retained_user_message_id,
+                    model_context_epoch,
+                    reset_reason,
+                })
+                .await;
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            archive_event_id = %session.compression_events.last().map(|event| event.id.as_str()).unwrap_or("unknown"),
+            messages_archived = plan.archive_message_count,
+            groups_archived = plan.archive_group_count,
+            active_tokens_before = plan.active_tokens_before,
+            active_tokens_after = plan.projected_active_tokens_after,
+            target_tokens = plan.target_tokens,
+            checkpoint_attempt = attempt + 1,
+            "retrieval-window context boundary durably committed"
+        );
+
+        return Ok(Some(retained));
     }
 
-    tracing::info!(
-        session_id = %session_id,
-        archive_event_id = %session.compression_events.last().map(|event| event.id.as_str()).unwrap_or("unknown"),
-        messages_archived = plan.archive_message_count,
-        groups_archived = plan.archive_group_count,
-        active_tokens_before = plan.active_tokens_before,
-        active_tokens_after = plan.projected_active_tokens_after,
-        target_tokens = plan.target_tokens,
-        "retrieval-window context boundary durably committed"
-    );
-
-    Ok(Some(retained))
+    unreachable!("bounded retrieval-window checkpoint loop must return")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1419,6 +1444,15 @@ pub(super) async fn prepare_round_context(
 ) -> Result<PreparedRoundContext, AgentError> {
     let retrieval_window_enabled =
         config.context_management.strategy == ContextManagementStrategy::RetrievalWindow;
+    if retrieval_window_enabled
+        && session.conversation_summary.is_some()
+        && !retrieval_window_fallback_is_summary(config)
+    {
+        return Err(AgentError::Budget(
+            "retrieval-window cannot start for a Session that already has a conversation summary; configure fallback_strategy=summary or start a new Session"
+                .to_string(),
+        ));
+    }
     if !retrieval_window_enabled {
         // Preserve the legacy summary/default ordering exactly.
         ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;

@@ -313,8 +313,14 @@ the active provider window, and directs the model to
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
 
 Retrieval-window commits require runtime persistence and are checkpointed before
-the archived state is published or a provider request is sent. This first
-runtime slice handles automatic pre-turn archival only. Manual
+the archived state is published or a provider request is sent. The checkpoint
+compares the exact pre-archive base while holding the Session write lock; a
+concurrent durable transcript change performs no archive write and causes the
+engine to rebase, re-account, replan, and rebuild the provider request before a
+bounded retry. Selecting `retrieval_window` with `fallback_strategy: "none"`
+for a Session that already has a conversation summary is rejected immediately;
+start a new Session or explicitly retain summary fallback. This first runtime
+slice handles automatic pre-turn archival only. Manual
 `compact_context` and critical overflow recovery fail explicitly under
 `fallback_strategy: "none"`; use `summary` only when that fallback is desired.
 The raw Session transcript remains authoritative. Memory is selective context,
