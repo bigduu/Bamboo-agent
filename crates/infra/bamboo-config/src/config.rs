@@ -1448,6 +1448,165 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
     })
 }
 
+/// Host strategy used when the active model context approaches its input limit.
+///
+/// `Summary` remains the compatibility default. `RetrievalWindow` is opt-in and
+/// archives old exact messages only after the runtime has verified that the
+/// current-session history capability is callable and the boundary can be
+/// durably checkpointed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementStrategy {
+    #[default]
+    Summary,
+    RetrievalWindow,
+}
+
+/// Explicit fallback used when retrieval-window cannot satisfy a runtime
+/// precondition. There is deliberately no implicit summary fallback.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementFallbackStrategy {
+    #[default]
+    None,
+    Summary,
+}
+
+fn default_retrieval_window_min_recent_user_turns() -> usize {
+    3
+}
+
+fn default_retrieval_window_trigger_usage_ratio() -> f64 {
+    0.80
+}
+
+fn default_retrieval_window_target_usage_ratio() -> f64 {
+    0.60
+}
+
+fn default_history_tool_required() -> bool {
+    true
+}
+
+/// Selection and safety policy for the opt-in retrieval-window strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RetrievalWindowContextConfig {
+    #[serde(default = "default_retrieval_window_min_recent_user_turns")]
+    pub min_recent_user_turns: usize,
+    #[serde(default = "default_retrieval_window_trigger_usage_ratio")]
+    pub trigger_usage_ratio: f64,
+    #[serde(default = "default_retrieval_window_target_usage_ratio")]
+    pub target_usage_ratio: f64,
+    #[serde(default = "default_history_tool_required")]
+    pub history_tool_required: bool,
+    #[serde(default)]
+    pub fallback_strategy: ContextManagementFallbackStrategy,
+}
+
+impl Default for RetrievalWindowContextConfig {
+    fn default() -> Self {
+        Self {
+            min_recent_user_turns: default_retrieval_window_min_recent_user_turns(),
+            trigger_usage_ratio: default_retrieval_window_trigger_usage_ratio(),
+            target_usage_ratio: default_retrieval_window_target_usage_ratio(),
+            history_tool_required: default_history_tool_required(),
+            fallback_strategy: ContextManagementFallbackStrategy::None,
+        }
+    }
+}
+
+/// Backward-compatible context-management configuration snapshot.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ContextManagementConfig {
+    pub strategy: ContextManagementStrategy,
+    pub retrieval_window: RetrievalWindowContextConfig,
+}
+
+impl Default for ContextManagementConfig {
+    fn default() -> Self {
+        Self {
+            strategy: ContextManagementStrategy::Summary,
+            retrieval_window: RetrievalWindowContextConfig::default(),
+        }
+    }
+}
+
+impl ContextManagementConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let policy = &self.retrieval_window;
+        if policy.min_recent_user_turns == 0 {
+            return Err(
+                "context_management.retrieval_window.min_recent_user_turns must be greater than zero"
+                    .to_string(),
+            );
+        }
+        if !policy.target_usage_ratio.is_finite()
+            || !policy.trigger_usage_ratio.is_finite()
+            || policy.target_usage_ratio <= 0.0
+            || policy.target_usage_ratio >= policy.trigger_usage_ratio
+            || policy.trigger_usage_ratio > 1.0
+        {
+            return Err(
+                "context_management retrieval ratios must satisfy 0 < target_usage_ratio < trigger_usage_ratio <= 1"
+                    .to_string(),
+            );
+        }
+        if self.strategy == ContextManagementStrategy::RetrievalWindow
+            && !policy.history_tool_required
+        {
+            return Err(
+                "retrieval_window requires history_tool_required=true in this release".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Planner policy is intentionally percent-based in the domain primitive.
+    /// Flooring keeps fractional configuration conservative rather than
+    /// archiving less history than the configured target permits. The planner's
+    /// minimum representable positive target is one percent.
+    pub fn retrieval_target_usage_percent(&self) -> u8 {
+        ((self.retrieval_window.target_usage_ratio * 100.0).floor() as u8).max(1)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextManagementConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Wire {
+            strategy: ContextManagementStrategy,
+            retrieval_window: RetrievalWindowContextConfig,
+        }
+
+        impl Default for Wire {
+            fn default() -> Self {
+                let defaults = ContextManagementConfig::default();
+                Self {
+                    strategy: defaults.strategy,
+                    retrieval_window: defaults.retrieval_window,
+                }
+            }
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let config = Self {
+            strategy: wire.strategy,
+            retrieval_window: wire.retrieval_window,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
+        Ok(config)
+    }
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -1578,6 +1737,10 @@ pub struct ConfigValues {
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
 
+    /// Host-owned strategy for bounding provider-visible conversation context.
+    #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
+    pub context_management: ContextManagementConfig,
+
     /// Remote Cluster Fabric: operator-managed nodes & clusters for deploying
     /// `broker-agent` workers locally or over SSH. Additive/back-compat: absent
     /// ⇒ empty. SSH secrets are encrypted at rest (see [`crate::cluster_fabric`]).
@@ -1634,6 +1797,7 @@ impl Default for ConfigValues {
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             stream_timeout: StreamTimeoutConfig::default(),
+            context_management: ContextManagementConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
             provider_instances: HashMap::new(),
@@ -1745,6 +1909,8 @@ struct ExecutionConfigSection {
     run_budget: RunBudgetConfig,
     #[serde(default)]
     stream_timeout: StreamTimeoutConfig,
+    #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
+    context_management: ContextManagementConfig,
     #[serde(
         default,
         skip_serializing_if = "crate::cluster_fabric::ClusterFabricConfig::is_empty"
@@ -1857,6 +2023,7 @@ impl From<ConfigValues> for ConfigRoot {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
             mcp,
             notifications,
@@ -1898,6 +2065,7 @@ impl From<ConfigValues> for ConfigRoot {
                 features,
                 run_budget,
                 stream_timeout,
+                context_management,
                 cluster_fabric,
             },
             integrations: IntegrationConfigSection {
@@ -1957,6 +2125,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
         } = execution;
         let IntegrationConfigSection {
@@ -1990,6 +2159,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
             mcp,
             notifications,
@@ -4508,6 +4678,7 @@ impl Config {
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 stream_timeout: StreamTimeoutConfig::default(),
+                context_management: ContextManagementConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
                 provider: default_provider(),
                 provider_instances: HashMap::new(),
@@ -5596,6 +5767,88 @@ mod tests {
                 semantic_idle_timeout_secs: 300,
             }
         );
+    }
+
+    #[test]
+    fn context_management_defaults_to_summary_and_is_omitted() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            config.context_management.strategy,
+            ContextManagementStrategy::Summary
+        );
+        assert_eq!(
+            config
+                .context_management
+                .retrieval_window
+                .min_recent_user_turns,
+            3
+        );
+        assert_eq!(
+            config.context_management.retrieval_target_usage_percent(),
+            60
+        );
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("context_management").is_none());
+    }
+
+    #[test]
+    fn retrieval_window_context_management_round_trips() {
+        let json = serde_json::json!({
+            "context_management": {
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "min_recent_user_turns": 4,
+                    "trigger_usage_ratio": 0.82,
+                    "target_usage_ratio": 0.61,
+                    "history_tool_required": true,
+                    "fallback_strategy": "summary"
+                }
+            }
+        });
+        let root: ConfigRoot = serde_json::from_value(json).unwrap();
+        let values = ConfigValues::from(root);
+        assert_eq!(
+            values.context_management.strategy,
+            ContextManagementStrategy::RetrievalWindow
+        );
+        assert_eq!(
+            values.context_management.retrieval_window.fallback_strategy,
+            ContextManagementFallbackStrategy::Summary
+        );
+
+        let persisted = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(
+            persisted["context_management"]["retrieval_window"]["min_recent_user_turns"],
+            4
+        );
+        assert_eq!(
+            persisted["context_management"]["strategy"],
+            "retrieval_window"
+        );
+    }
+
+    #[test]
+    fn retrieval_window_context_management_rejects_unsafe_policy() {
+        for invalid in [
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {"min_recent_user_turns": 0}
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "target_usage_ratio": 0.8,
+                    "trigger_usage_ratio": 0.8
+                }
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {"history_tool_required": false}
+            }),
+        ] {
+            serde_json::from_value::<ContextManagementConfig>(invalid)
+                .expect_err("unsafe retrieval-window policy must fail closed");
+        }
     }
 
     #[test]

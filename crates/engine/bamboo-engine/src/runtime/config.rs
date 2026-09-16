@@ -426,6 +426,9 @@ pub struct AgentLoopConfig {
     /// Desired final summary size relative to the raw source tokens represented
     /// by it. Values are normalized at the compression boundary.
     pub(crate) summary_target_ratio: f64,
+    /// Frozen host context-management strategy for this run. Missing public
+    /// configuration resolves to the legacy summary behavior.
+    pub(crate) context_management: bamboo_config::ContextManagementConfig,
     /// Safe request ceiling as a percentage of the selected summarization
     /// model's context window.
     pub(crate) summary_safe_window_percent: u8,
@@ -586,6 +589,7 @@ impl Default for AgentLoopConfig {
             search_model_name: None,
             compression_instructions: None,
             summary_target_ratio: 0.20,
+            context_management: bamboo_config::ContextManagementConfig::default(),
             summary_safe_window_percent: 80,
             summarization_model_name: None,
             background_model_provider: None,

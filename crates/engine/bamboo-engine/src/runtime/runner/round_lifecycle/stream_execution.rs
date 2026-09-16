@@ -11,10 +11,11 @@ use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
-    build_goal_context_block, build_instruction_overlay_context_block,
-    build_plan_mode_context_block, build_plan_runtime_context_block,
-    build_project_resources_context_block, build_session_identity_context_block,
-    build_task_list_context_block, build_workspace_context_block,
+    build_goal_context_block, build_history_boundary_context_block,
+    build_instruction_overlay_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_project_resources_context_block,
+    build_session_identity_context_block, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -56,7 +57,8 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
 
-const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+pub(super) const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str =
+    "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
@@ -631,6 +633,9 @@ fn build_request_envelope_reconciled(
         context_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
+        context_blocks.push(block);
+    }
+    if let Some(block) = build_history_boundary_context_block(session) {
         context_blocks.push(block);
     }
 

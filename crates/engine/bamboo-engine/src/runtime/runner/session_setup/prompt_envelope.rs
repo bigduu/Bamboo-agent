@@ -325,6 +325,77 @@ pub(crate) fn build_project_resources_context_block(session: &Session) -> Option
     ))
 }
 
+fn history_boundary_content(
+    archive_boundaries: usize,
+    archived_messages: usize,
+    retained_recent_user_turns: usize,
+) -> String {
+    format!(
+        "Earlier Session messages are stored exactly but omitted from the active model context.\n\
+         Archive boundaries: {archive_boundaries}. Archived messages: {archived_messages}. \
+         Recent complete user turns retained at the latest boundary: {retained_recent_user_turns}.\n\
+         Use session_history_current with search_current to locate exact evidence, then \
+         read_around or read_current for bounded raw history. Raw Session history is the \
+         transcript authority. Memory is selective and may be stale; do not guess."
+    )
+}
+
+fn history_boundary_block(
+    archive_boundaries: usize,
+    archived_messages: usize,
+    retained_recent_user_turns: usize,
+) -> ContextBlock {
+    ContextBlock::new(
+        ContextBlockType::HistoryBoundary,
+        ContextBlockPriority::High,
+        ContextBlockStability::RoundDynamic,
+        "Archived Session History Boundary",
+        history_boundary_content(
+            archive_boundaries,
+            archived_messages,
+            retained_recent_user_turns,
+        ),
+    )
+}
+
+/// Build a non-semantic recovery marker from durable retrieval-window evidence.
+pub(crate) fn build_history_boundary_context_block(session: &Session) -> Option<ContextBlock> {
+    let retrieval_events = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == bamboo_domain::CompressionEventKind::RetrievalWindow)
+        .collect::<Vec<_>>();
+    let latest = retrieval_events.last()?;
+    let event_ids = retrieval_events
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let archived_messages = session
+        .messages
+        .iter()
+        .filter(|message| message.compressed)
+        .filter(|message| {
+            message
+                .compressed_by_event_id
+                .as_deref()
+                .is_some_and(|event_id| event_ids.contains(event_id))
+        })
+        .count();
+
+    Some(history_boundary_block(
+        retrieval_events.len(),
+        archived_messages,
+        latest.retrieval_retained_recent_user_turn_count,
+    ))
+}
+
+/// Conservative fixed-token reservation used before the first archive event
+/// exists. Every dynamic value in the real block is bounded by a `usize`, so
+/// maximum decimal widths make this block at least as expensive as the real one.
+pub(crate) fn build_history_boundary_reservation_context_block() -> ContextBlock {
+    history_boundary_block(usize::MAX, usize::MAX, usize::MAX)
+}
+
 pub(crate) fn build_conversation_summary_context_block(session: &Session) -> Option<ContextBlock> {
     let summary = session.conversation_summary.as_ref()?;
     let trimmed = summary.content.trim();
@@ -573,5 +644,59 @@ mod tests {
         assert_eq!(block.priority, ContextBlockPriority::Medium);
         assert!(block.content.contains("compressed historical context"));
         assert!(block.content.contains("Older work was compressed."));
+    }
+
+    #[test]
+    fn history_boundary_rehydrates_without_raw_history_content() {
+        let mut session = Session::new("session-history-boundary", "model");
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            82.0,
+            58.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        event.retrieval_retained_recent_user_turn_count = 3;
+        let event_id = event.id.clone();
+        let mut archived = Message::user("private archived transcript body");
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some(event_id);
+        session.messages.push(archived);
+        session.compression_events.push(event);
+
+        let block = build_history_boundary_context_block(&session).expect("history boundary");
+        assert_eq!(block.block_type, ContextBlockType::HistoryBoundary);
+        assert_eq!(block.stability, ContextBlockStability::RoundDynamic);
+        assert!(block.content.contains("Archived messages: 1"));
+        assert!(block.content.contains("session_history_current"));
+        assert!(block
+            .content
+            .contains("Memory is selective and may be stale"));
+        assert!(!block.content.contains("private archived transcript body"));
+
+        let bytes = serde_json::to_vec(&session).unwrap();
+        let restored: Session = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            build_history_boundary_context_block(&restored)
+                .expect("boundary after reload")
+                .content,
+            block.content
+        );
+        assert!(
+            build_history_boundary_reservation_context_block()
+                .content
+                .len()
+                >= block.content.len()
+        );
+    }
+
+    #[test]
+    fn history_boundary_is_absent_without_retrieval_event() {
+        assert!(build_history_boundary_context_block(&Session::new("plain", "model")).is_none());
     }
 }

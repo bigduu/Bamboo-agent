@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
@@ -12,13 +14,20 @@ use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
 use bamboo_compression::{BudgetStrategy, TiktokenTokenCounter, TokenBudget, TokenCounter};
+use bamboo_config::{
+    ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
+    RetrievalWindowContextConfig,
+};
 use bamboo_domain::{
     AgentHookPoint, ContextBlockType, HookPayload, HookResult, ModelContextEvent,
-    ModelContextEventKind, ModelContextResetReason, ModelContextState, TaskItem, TaskItemStatus,
-    TaskList,
+    ModelContextEventKind, ModelContextResetReason, ModelContextState, RuntimeSessionPersistence,
+    TaskItem, TaskItemStatus, TaskList,
 };
 use bamboo_llm::models::{ContentPart, ImageUrl};
-use bamboo_llm::provider::{LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo};
+use bamboo_llm::provider::{
+    LLMProvider, LLMRequestOptions, LLMStream, ProviderModelInfo, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
+};
 use bamboo_llm::{LLMChunk, LLMError};
 use futures::stream;
 use tokio::sync::mpsc;
@@ -48,6 +57,153 @@ impl LLMProvider for NoopLlmProvider {
 
 fn noop_llm() -> Arc<dyn LLMProvider> {
     Arc::new(NoopLlmProvider)
+}
+
+#[derive(Clone)]
+struct RetrievalCheckpointPersistence {
+    checkpoints: Arc<Mutex<Vec<Session>>>,
+    fail: bool,
+}
+
+impl RetrievalCheckpointPersistence {
+    fn succeeding() -> (Arc<dyn RuntimeSessionPersistence>, Arc<Mutex<Vec<Session>>>) {
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                checkpoints: Arc::clone(&checkpoints),
+                fail: false,
+            }),
+            checkpoints,
+        )
+    }
+
+    fn failing() -> (Arc<dyn RuntimeSessionPersistence>, Arc<Mutex<Vec<Session>>>) {
+        let checkpoints = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                checkpoints: Arc::clone(&checkpoints),
+                fail: true,
+            }),
+            checkpoints,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        self.checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        if self.fail {
+            return Err(io::Error::other("injected retrieval checkpoint failure"));
+        }
+        self.checkpoints
+            .lock()
+            .expect("checkpoint list lock should not be poisoned")
+            .push(session.clone());
+        Ok(())
+    }
+}
+
+fn retrieval_history_tool_schema() -> ToolSchema {
+    ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "session_history_current".to_string(),
+            description: "Search or read exact messages in the current Session".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string" },
+                    "query": { "type": "string" }
+                },
+                "required": ["action"]
+            }),
+        },
+    }
+}
+
+fn retrieval_window_session(id: &str) -> Session {
+    let mut session = Session::new(id, "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    for index in 0..10 {
+        session.messages.push(Message::user(format!(
+            "user-{index} {}",
+            "exact historical user evidence ".repeat(350)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "assistant-{index} {}",
+                "exact historical assistant evidence ".repeat(350)
+            ),
+            None,
+        ));
+    }
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session
+}
+
+fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> AgentLoopConfig {
+    AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("retrieval system".to_string()),
+        persistence: Some(persistence),
+        context_management: ContextManagementConfig {
+            strategy: ContextManagementStrategy::RetrievalWindow,
+            retrieval_window: RetrievalWindowContextConfig {
+                min_recent_user_turns: 2,
+                trigger_usage_ratio: 0.45,
+                target_usage_ratio: 0.30,
+                history_tool_required: true,
+                fallback_strategy: ContextManagementFallbackStrategy::None,
+            },
+        },
+        ..Default::default()
+    }
+}
+
+struct ExpandingFootprintProvider {
+    projection_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for ExpandingFootprintProvider {
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &bamboo_llm::prompt_ir::PromptIR,
+        _tools: &[ToolSchema],
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> bamboo_llm::provider::Result<ProviderVisibleToolFootprint> {
+        let call = self.projection_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if call <= 1 {
+            ProviderVisibleToolFootprint::default()
+        } else {
+            ProviderVisibleToolFootprint {
+                segments: vec![ProviderVisibleToolSegment {
+                    kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                    serialized: "late expanded provider schema ".repeat(20_000),
+                }],
+            }
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        panic!("retrieval preparation must fail before provider dispatch")
+    }
 }
 
 fn system_prompt(session: &Session) -> String {
@@ -2128,6 +2284,394 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn retrieval_window_pre_turn_checkpoints_before_publication_and_never_summarizes() {
+    let mut session = retrieval_window_session("retrieval-success");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp-before-archive".to_string(),
+    );
+    let active_before = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .count();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-success",
+        &tool_schemas,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("retrieval-window preparation should succeed");
+
+    assert!(session.conversation_summary.is_none());
+    assert!(
+        !session
+            .metadata
+            .contains_key("responses.previous_response_id"),
+        "the durable archive boundary must invalidate pre-archive Responses continuation"
+    );
+    assert_eq!(
+        session
+            .compression_events
+            .iter()
+            .filter(|event| event.kind == bamboo_domain::CompressionEventKind::RetrievalWindow)
+            .count(),
+        1
+    );
+    let archived_ids = session
+        .messages
+        .iter()
+        .filter(|message| message.compressed)
+        .map(|message| message.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(!archived_ids.is_empty());
+    assert!(archived_ids.len() < active_before);
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .all(|message| !archived_ids.contains(message.id.as_str())));
+    assert!(prepared.prepared_context.compressed_message_ids.is_empty());
+    assert!(
+        crate::runtime::runner::session_setup::prompt_envelope::build_history_boundary_context_block(
+            &session
+        )
+        .is_some()
+    );
+    let state = session
+        .model_context_state
+        .as_ref()
+        .expect("archive should create a model-context reset boundary");
+    assert_eq!(
+        state.last_reset_reason,
+        Some(ModelContextResetReason::Compression)
+    );
+    assert!(state.prefix_epoch > 0);
+
+    let captured = checkpoints
+        .lock()
+        .expect("checkpoint list lock should not be poisoned");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&captured[0]).unwrap(),
+        serde_json::to_value(&session).unwrap(),
+        "live publication must equal the durably checkpointed candidate"
+    );
+    drop(captured);
+
+    drop(event_tx);
+    let events: Vec<AgentEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    let archived_events = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ContextArchived {
+                messages_archived,
+                reset_reason,
+                ..
+            } => Some((*messages_archived, reset_reason.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(archived_events.len(), 1);
+    assert_eq!(archived_events[0].0, archived_ids.len());
+    assert_eq!(archived_events[0].1, "compression");
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_missing_history_capability_fails_without_mutating_or_checkpointing() {
+    let mut session = retrieval_window_session("retrieval-missing-history");
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-missing-history",
+        &[],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect_err("missing exact history capability must fail closed");
+
+    assert!(error.to_string().contains("session_history_current"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retrieval_window_below_trigger_does_not_require_history_capability() {
+    let mut session = Session::new("retrieval-below-trigger", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    session.messages.push(Message::user("small active request"));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-below-trigger",
+        &[],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("below-trigger requests must not require retrieval capability");
+
+    assert!(!prepared.prepared_context.truncation_occurred);
+    assert!(prepared.prepared_context.compressed_message_ids.is_empty());
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retrieval_window_missing_history_capability_precedes_vision_fallback_dispatch() {
+    let mut session = retrieval_window_session("retrieval-missing-history-image");
+    session.messages.push(Message::user_with_parts(
+        "latest image evidence",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/latest.png".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config.image_fallback = Some(ImageFallbackConfig {
+        mode: ImageFallbackMode::Vision,
+        vision_model: Some("vision-test".to_string()),
+    });
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-missing-history-image",
+        &[],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect_err("capability preflight must fail before vision fallback dispatch");
+
+    assert!(error.to_string().contains("session_history_current"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retrieval_window_checkpoint_failure_leaves_live_session_byte_identical() {
+    let mut session = retrieval_window_session("retrieval-checkpoint-failure");
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::failing();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-checkpoint-failure",
+        &tool_schemas,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect_err("checkpoint failure must fail closed");
+
+    assert!(error.to_string().contains("durable checkpoint failed"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retrieval_window_post_archive_projection_failure_discards_staged_state() {
+    let mut session = retrieval_window_session("retrieval-projection-failure");
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let llm: Arc<dyn LLMProvider> = Arc::new(ExpandingFootprintProvider {
+        projection_calls: AtomicUsize::new(0),
+    });
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-projection-failure",
+        &tool_schemas,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect_err("expanded retained request must fail before checkpoint");
+
+    assert!(error.to_string().contains("exact retained request exceeds"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(event_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn retrieval_window_native_image_without_complete_cost_fails_before_mutation() {
+    let mut session = retrieval_window_session("retrieval-image-cost");
+    session.messages.push(Message::user_with_parts(
+        "latest image evidence",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,AA==".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-image-cost",
+        &tool_schemas,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("provider-native image cost must fail closed");
+
+    assert!(error.to_string().contains("active image message"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_manual_and_overflow_routes_do_not_silently_summarize() {
+    let mut session = retrieval_window_session("retrieval-unsupported-routes");
+    session.force_manual_compression = Some("preserve evidence".to_string());
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let (llm, model_calls) = recording_llm();
+
+    let manual_error = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-unsupported-routes",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect_err("manual summary tool must be rejected");
+    assert!(manual_error.to_string().contains("compact_context"));
+    assert!(session.force_manual_compression.is_none());
+
+    let overflow_error = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-unsupported-routes",
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("overflow recovery must be explicit in retrieval v1");
+    assert!(overflow_error
+        .to_string()
+        .contains("critical overflow recovery"));
+    assert!(session.conversation_summary.is_none());
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_uses_summary_only_when_fallback_is_explicit() {
+    let mut session = retrieval_window_session("retrieval-explicit-fallback");
+    session.force_manual_compression = Some("preserve exact decisions".to_string());
+    let (persistence, _checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config.context_management.retrieval_window.fallback_strategy =
+        ContextManagementFallbackStrategy::Summary;
+    config.background_model_name = Some("summary-model".to_string());
+    let (llm, model_calls) = recording_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-explicit-fallback",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect("explicit summary fallback should preserve the legacy path");
+
+    assert!(applied);
+    assert!(session.conversation_summary.is_some());
+    assert!(session
+        .compression_events
+        .iter()
+        .all(|event| event.kind == bamboo_domain::CompressionEventKind::Summary));
+    assert!(!model_calls.lock().expect("model call lock").is_empty());
 }
 
 #[tokio::test]
