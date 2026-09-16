@@ -5,7 +5,7 @@
 //! may archive after capability and persistence invariants have been verified.
 
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
-use bamboo_domain::{Message, Role, Session};
+use bamboo_domain::{canonical_tool_name, Message, Role, Session};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -509,10 +509,8 @@ fn mark_protected_groups(groups: &mut [LogicalGroup<'_>], min_recent_user_turns:
             || group.messages.iter().any(|indexed| {
                 indexed.message.tool_calls.as_ref().is_some_and(|calls| {
                     calls.iter().any(|call| {
-                        matches!(
-                            call.function.name.as_str(),
-                            "load_skill" | "read_skill_resource"
-                        )
+                        let tool_name = canonical_tool_name(&call.function.name);
+                        matches!(tool_name.as_str(), "load_skill" | "read_skill_resource")
                     })
                 })
             });
@@ -886,7 +884,7 @@ mod tests {
         let mut session = Session::new("retrieval-window-skill", "test-model");
         session.add_message(system("system", 5));
         session.add_message(user("skill-u", 5));
-        session.add_message(tool_call("skill-call", "load", 5, "load_skill"));
+        session.add_message(tool_call("skill-call", "load", 5, "default::LoAd_SkIlL"));
         session.add_message(tool_result("skill-result", "load", 5));
         session.add_message(assistant("skill-final", 5));
         add_turn(&mut session, "eligible", 10);
