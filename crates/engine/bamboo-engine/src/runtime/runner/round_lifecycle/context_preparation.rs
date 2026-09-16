@@ -728,9 +728,9 @@ async fn maybe_prepare_retrieval_window_context(
         )
         .await?;
         if frame.active_tokens_without_boundary < trigger_tokens {
-            // A rebase is authoritative durable state. Publish it to the live
-            // runner even when it removes the need for an archive so the
-            // ordinary preparation path cannot dispatch the stale snapshot.
+            // A rebase is authoritative durable state. Publish the fully
+            // prepared candidate too so OCR caching performed on the retry is
+            // not lost when the new suffix removes the need for an archive.
             if attempt > 0 {
                 *session = candidate_base;
             }
@@ -840,13 +840,19 @@ async fn maybe_prepare_retrieval_window_context(
                 ))
             })? {
             RetrievalWindowCheckpointOutcome::Rebased => {
+                // `staged` is no longer the speculative archive candidate here:
+                // the persistence boundary replaced it with the latest durable
+                // Session. Publish that authority immediately so any later
+                // planning error or explicit summary fallback cannot operate on
+                // the runner's stale pre-rebase snapshot.
+                candidate_base = staged;
+                *session = candidate_base.clone();
                 if attempt == MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
                     return Err(AgentError::Budget(format!(
                         "retrieval-window durable checkpoint could not stabilize after {} attempts with concurrent transcript changes",
                         MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES + 1
                     )));
                 }
-                candidate_base = staged;
                 continue;
             }
             RetrievalWindowCheckpointOutcome::Committed => {}

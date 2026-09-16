@@ -258,6 +258,7 @@ fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> A
 
 struct ExpandingFootprintProvider {
     projection_calls: AtomicUsize,
+    expanding_projection_call: usize,
 }
 
 #[async_trait::async_trait]
@@ -272,15 +273,15 @@ impl LLMProvider for ExpandingFootprintProvider {
         let call = self.projection_calls.fetch_add(1, Ordering::SeqCst);
         // Preflight, current-state accounting, and post-boundary accounting are
         // stable; the exact retained projection then expands unexpectedly.
-        Ok(if call <= 2 {
-            ProviderVisibleToolFootprint::default()
-        } else {
+        Ok(if call == self.expanding_projection_call {
             ProviderVisibleToolFootprint {
                 segments: vec![ProviderVisibleToolSegment {
                     kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
                     serialized: "late expanded provider schema ".repeat(20_000),
                 }],
             }
+        } else {
+            ProviderVisibleToolFootprint::default()
         })
     }
 
@@ -2807,6 +2808,62 @@ async fn retrieval_window_replans_after_concurrent_durable_suffix_before_dispatc
 }
 
 #[tokio::test]
+async fn retrieval_window_summary_fallback_uses_latest_rebased_session() {
+    let mut session = retrieval_window_session("retrieval-rebase-fallback");
+    let fixture = RebaseOnceRetrievalPersistence::fixture();
+    let mut config = retrieval_window_config(Arc::clone(&fixture.persistence));
+    config.context_management.retrieval_window.fallback_strategy =
+        ContextManagementFallbackStrategy::Summary;
+    config.background_model_name = Some("summary-model".to_string());
+    let (summary_llm, summary_calls) = recording_llm();
+    config.background_model_provider = Some(summary_llm);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let llm: Arc<dyn LLMProvider> = Arc::new(ExpandingFootprintProvider {
+        projection_calls: AtomicUsize::new(0),
+        // Preflight plus the first and rebased attempts make this the second
+        // attempt's exact retained-request projection.
+        expanding_projection_call: 6,
+    });
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-rebase-fallback",
+        &tool_schemas,
+        &llm,
+        None,
+    )
+    .await
+    .expect("summary fallback should use the authoritative rebased Session");
+
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert!(fixture
+        .checkpoints
+        .lock()
+        .expect("checkpoint list lock should not be poisoned")
+        .is_empty());
+    assert!(session
+        .messages
+        .iter()
+        .any(|message| message.id == "concurrent-durable-suffix"));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .any(|message| message.id == "concurrent-durable-suffix"));
+    assert!(session.conversation_summary.is_some());
+    assert!(session
+        .compression_events
+        .iter()
+        .all(|event| event.kind == bamboo_domain::CompressionEventKind::Summary));
+    assert!(!summary_calls
+        .lock()
+        .expect("model call lock should not be poisoned")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn retrieval_window_rejects_a_preexisting_summary_before_pressure_or_side_effects() {
     let mut session = Session::new("retrieval-existing-summary", "test-model");
     session.messages.push(Message::system("retrieval system"));
@@ -2996,6 +3053,7 @@ async fn retrieval_window_post_archive_projection_failure_discards_staged_state(
     let tool_schemas = vec![retrieval_history_tool_schema()];
     let llm: Arc<dyn LLMProvider> = Arc::new(ExpandingFootprintProvider {
         projection_calls: AtomicUsize::new(0),
+        expanding_projection_call: 3,
     });
     let (event_tx, mut event_rx) = mpsc::channel(16);
 
