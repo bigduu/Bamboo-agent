@@ -28,8 +28,8 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_domain::{
-    provider_transcript_boundary_sha256, ModelContextResetReason, ProviderFamily, ProviderProtocol,
-    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    provider_transcript_boundary_sha256, ModelContextEventKind, ModelContextResetReason,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
@@ -379,6 +379,9 @@ pub(super) struct ProjectedRequestUsage {
     pub tool_schema_segment_count: usize,
     pub tool_schema_late_bound_segment_count: usize,
     pub ledger_rendered_bytes: usize,
+    /// Complete token cost of model-context snapshot messages that carry the
+    /// current archived-history boundary.
+    pub history_boundary_input_tokens: u32,
 }
 
 fn measure_request_usage(
@@ -388,6 +391,23 @@ fn measure_request_usage(
 ) -> ProjectedRequestUsage {
     let counter = TiktokenTokenCounter::default();
     let messages = envelope.ir.flatten();
+    let history_boundary_event_ids = session
+        .model_context_state
+        .as_ref()
+        .into_iter()
+        .flat_map(|state| state.events.iter())
+        .filter(|event| {
+            event.block_type == ContextBlockType::HistoryBoundary
+                && event.kind == ModelContextEventKind::Snapshot
+        })
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let history_boundary_input_tokens = messages
+        .iter()
+        .filter(|message| history_boundary_event_ids.contains(message.id.as_str()))
+        .fold(0u32, |total, message| {
+            total.saturating_add(counter.count_message(message))
+        });
     let mut message_input_tokens = counter.count_messages(&messages);
     let mut replaced_anchors = HashSet::new();
     for group in &envelope.ir.provider_transcript_groups {
@@ -446,6 +466,7 @@ fn measure_request_usage(
         tool_schema_segment_count,
         tool_schema_late_bound_segment_count,
         ledger_rendered_bytes,
+        history_boundary_input_tokens,
     }
 }
 

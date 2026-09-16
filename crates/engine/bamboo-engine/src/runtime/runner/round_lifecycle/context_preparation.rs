@@ -423,6 +423,12 @@ fn late_bound_tool_schema_reserve(
 struct RetrievalWindowAccountingFrame {
     accounting: RetrievalWindowTokenAccounting,
     active_tokens_without_boundary: u32,
+    #[cfg(test)]
+    existing_history_boundary_tokens: u32,
+    #[cfg(test)]
+    fixed_prompt_tokens_before_boundary_reserve: u32,
+    #[cfg(test)]
+    history_boundary_reserve_tokens: u32,
 }
 
 struct RetrievalWindowPreflight {
@@ -616,11 +622,17 @@ async fn build_retrieval_window_accounting_frame(
         Some(u64::MAX),
     );
     let boundary_reserve = counter.count_message(&Message::user(boundary_snapshot));
+    // The post-reset projection already contains the current HistoryBoundary
+    // on every archive after the first. Reserve only enough to grow that
+    // replacement snapshot to the maximum-width form; adding the whole block
+    // again would double-count it and could archive an extra complete turn.
+    let boundary_reserve_increment =
+        boundary_reserve.saturating_sub(post_boundary_projected.history_boundary_input_tokens);
     let active_tokens_without_boundary = fixed_without_boundary
         .saturating_add(provider_message_token_total)
         .saturating_add(boundary_reclaimable_tokens);
     let accounting = RetrievalWindowTokenAccounting {
-        fixed_prompt_tokens: fixed_without_boundary.saturating_add(boundary_reserve),
+        fixed_prompt_tokens: fixed_without_boundary.saturating_add(boundary_reserve_increment),
         boundary_reclaimable_tokens,
         provider_message_tokens,
     };
@@ -628,6 +640,12 @@ async fn build_retrieval_window_accounting_frame(
     Ok(RetrievalWindowAccountingFrame {
         accounting,
         active_tokens_without_boundary,
+        #[cfg(test)]
+        existing_history_boundary_tokens: post_boundary_projected.history_boundary_input_tokens,
+        #[cfg(test)]
+        fixed_prompt_tokens_before_boundary_reserve: fixed_without_boundary,
+        #[cfg(test)]
+        history_boundary_reserve_tokens: boundary_reserve,
     })
 }
 

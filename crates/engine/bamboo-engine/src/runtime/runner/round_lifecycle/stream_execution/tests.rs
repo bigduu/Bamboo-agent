@@ -3014,6 +3014,7 @@ fn plan_llm_request_model_transcript_path_records_observability() {
         tool_schema_segment_count: 2,
         tool_schema_late_bound_segment_count: 1,
         ledger_rendered_bytes: 64,
+        history_boundary_input_tokens: 0,
     };
     let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None, usage);
 

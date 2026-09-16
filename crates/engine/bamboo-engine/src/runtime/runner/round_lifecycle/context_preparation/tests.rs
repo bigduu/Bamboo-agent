@@ -4,16 +4,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
-    build_compression_context_blocks, emit_context_pressure_notification,
-    enforce_model_context_ledger_retention, maybe_apply_host_context_compression,
-    prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
+    build_compression_context_blocks, build_retrieval_window_accounting_frame,
+    emit_context_pressure_notification, enforce_model_context_ledger_retention,
+    maybe_apply_host_context_compression, prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
-use bamboo_compression::{BudgetStrategy, TiktokenTokenCounter, TokenBudget, TokenCounter};
+use bamboo_compression::{
+    build_retrieval_window_candidate_plan_with_token_accounting, BudgetStrategy,
+    RetrievalWindowPlanError, RetrievalWindowPolicy, TiktokenTokenCounter, TokenBudget,
+    TokenCounter,
+};
 use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
     RetrievalWindowContextConfig,
@@ -2368,6 +2372,146 @@ async fn pre_turn_host_context_compression_includes_available_context_blocks_in_
             .matches("WORKFLOW_PRIVATE_ARG_872")
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn retrieval_window_second_boundary_reserves_only_incremental_marker_growth() {
+    let mut session = Session::new("retrieval-second-boundary", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+
+    let mut prior_event = bamboo_domain::CompressionEvent::new(
+        1,
+        1,
+        80.0,
+        30.0,
+        0,
+        CompressionTriggerType::Auto,
+        0.0,
+        None,
+        0,
+    );
+    prior_event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+    prior_event.retrieval_retained_recent_user_turn_count = 1;
+    let mut archived = Message::user("exact archived evidence");
+    archived.compressed = true;
+    archived.compressed_by_event_id = Some(prior_event.id.clone());
+    session.messages.push(archived);
+    session.compression_events.push(prior_event);
+
+    for index in 0..4 {
+        session.messages.push(Message::user(format!(
+            "second-boundary-user-{index} {}",
+            "bounded evidence ".repeat(24)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "second-boundary-assistant-{index} {}",
+                "bounded response ".repeat(24)
+            ),
+            None,
+        ));
+    }
+
+    let (persistence, _) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, _) = recording_llm();
+    let counter = TiktokenTokenCounter::default();
+    let accounting_budget =
+        TokenBudget::with_safety_margin(100_000, 0, BudgetStrategy::default(), 0);
+    let frame = build_retrieval_window_accounting_frame(
+        &session,
+        &config,
+        "test-model",
+        &session.id,
+        &tool_schemas,
+        &llm,
+        &accounting_budget,
+        &counter,
+    )
+    .await
+    .expect("a second retrieval boundary should be account-able");
+
+    assert!(frame.existing_history_boundary_tokens > 0);
+    let incremental_reserve = frame
+        .history_boundary_reserve_tokens
+        .saturating_sub(frame.existing_history_boundary_tokens);
+    assert!(incremental_reserve < frame.history_boundary_reserve_tokens);
+    assert_eq!(
+        frame.accounting.fixed_prompt_tokens,
+        frame
+            .fixed_prompt_tokens_before_boundary_reserve
+            .saturating_add(incremental_reserve),
+        "the current boundary is already in the provider projection and must not be reserved twice"
+    );
+
+    let policy = RetrievalWindowPolicy {
+        min_recent_user_turns: 1,
+        target_usage_percent: 100,
+    };
+    let unlimited_budget =
+        TokenBudget::with_safety_margin(u32::MAX, 0, BudgetStrategy::default(), 0);
+    let active_tokens_before = match build_retrieval_window_candidate_plan_with_token_accounting(
+        &session,
+        &unlimited_budget,
+        policy,
+        &frame.accounting,
+    ) {
+        Err(RetrievalWindowPlanError::TargetAlreadySatisfied { active_tokens, .. }) => {
+            active_tokens
+        }
+        other => panic!("unlimited target should expose active token accounting: {other:?}"),
+    };
+    let one_group_probe_budget = TokenBudget::with_safety_margin(
+        active_tokens_before.saturating_sub(1),
+        0,
+        BudgetStrategy::default(),
+        0,
+    );
+    let one_group_probe = build_retrieval_window_candidate_plan_with_token_accounting(
+        &session,
+        &one_group_probe_budget,
+        policy,
+        &frame.accounting,
+    )
+    .expect("one complete old group should satisfy a target just below current usage");
+    assert_eq!(one_group_probe.archive_group_count, 1);
+
+    let exact_one_group_budget = TokenBudget::with_safety_margin(
+        one_group_probe.projected_active_tokens_after,
+        0,
+        BudgetStrategy::default(),
+        0,
+    );
+    let exact_plan = build_retrieval_window_candidate_plan_with_token_accounting(
+        &session,
+        &exact_one_group_budget,
+        policy,
+        &frame.accounting,
+    )
+    .expect("the incremental boundary reserve should keep the one-group plan exact");
+    assert_eq!(exact_plan.archive_group_count, 1);
+
+    let mut double_counted = frame.accounting.clone();
+    double_counted.fixed_prompt_tokens = double_counted
+        .fixed_prompt_tokens
+        .saturating_add(frame.existing_history_boundary_tokens);
+    let double_counted_plan = build_retrieval_window_candidate_plan_with_token_accounting(
+        &session,
+        &exact_one_group_budget,
+        policy,
+        &double_counted,
+    );
+    assert!(
+        matches!(
+            &double_counted_plan,
+            Ok(plan) if plan.archive_group_count > exact_plan.archive_group_count
+        ) || matches!(
+            &double_counted_plan,
+            Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget { .. })
+        ),
+        "double-counting the existing boundary must demonstrably over-archive or reject this exact target"
     );
 }
 
