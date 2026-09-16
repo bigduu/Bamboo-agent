@@ -69,6 +69,7 @@ pub(super) fn requires_session_context(tool_name: &str) -> bool {
             | "scheduler"
             | "schedule_tasks"
             | "session_history"
+            | "session_history_current"
             | "recall"
             | "session_inspector"
     )

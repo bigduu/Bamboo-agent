@@ -151,6 +151,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "session_note",
     "memory_note",
     "session_history",
+    "session_history_current",
     "recall",
     "session_inspector",
     "compact_context",

@@ -381,7 +381,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Store durable session-scoped notes and retrieve them across turns. Use it for local context, user preferences, constraints, and compression-resistant reminders within the current workstream.",
             "Do not store secrets/tokens, one-turn scratch text, or use it as the primary long-term knowledge base.",
-            &["Task", "session_history"],
+            &["Task", "session_history_current"],
             vec![
                 example(
                     "Persist a durable session constraint",
@@ -400,7 +400,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Use Session memory for current-session continuity, Project memory for durable project facts and decisions, and Global memory for cross-project user context. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing; store one confirmed atomic fact with a few useful keywords, entities, and tags.",
             "Do not store secrets, unverified claims, live state that you can inspect directly, embeddings, or unrelated facts in one memory. Treat canonical Project memory as trusted durable project authority but verify live state before acting; treat Dream as a low-trust derived orientation snapshot. Do not increase the query limit or get every hit by default, and merge or consolidate only the same confirmed fact.",
-            &["session_note", "session_history", "Task"],
+            &["session_note", "session_history_current", "Task"],
             vec![
                 example(
                     "Read the current session note topic",
@@ -560,14 +560,15 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Use when the loaded instructions point to additional files.",
             )],
         )),
-        "session_history" | "recall" | "session_inspector" => Some(guide(
+        "session_history_current" | "session_history" | "recall" | "session_inspector" => Some(guide(
             match tool_name {
                 "session_inspector" => "session_inspector",
                 "recall" => "recall",
+                "session_history_current" => "session_history_current",
                 _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Search your current Bamboo Session with search_current, then recover the hit's complete turn and nearby context with read_around or page exact bounded evidence with read_current, including history already compressed out of the model window. The host preserves complete logical turns and tool-call/result chains. Root schemas may additionally offer list/get_meta, privileged bounded reads, global search, and same-tree export_context. When export_context is present, Read its returned status/brief paths with bounded offset/limit and keep the returned revision fixed across continuation reads; exports are last persisted observations, not verified live progress. Raw Session history is transcript authority; memory is selective durable knowledge and may be stale.",
+            "Use the always-resident session_history_current identity to search your current Bamboo Session with search_current, then recover the hit's complete turn and nearby context with read_around or page exact bounded evidence with read_current, including history already compressed out of the model window. The host preserves complete logical turns and tool-call/result chains. The legacy session_history name remains compatible; Root schemas may additionally offer list/get_meta, privileged bounded reads, global search, and same-tree export_context only under that separate legacy identity. When export_context is present, Read its returned status/brief paths with bounded offset/limit and keep the returned revision fixed across continuation reads; exports are last persisted observations, not verified live progress. Raw Session history is transcript authority; memory is selective durable knowledge and may be stale.",
             "Do not pass a Session ID, boundary, or compressed-state mutation to current-Session actions: the host derives identity and the current-call boundary. Treat cursors only as opaque continuations and reuse them unchanged. Do not use history as a broad substitute for code search. Privileged cross-session actions exist only when the supplied schema lists them, and export quota/corruption errors do not authorize deleting snapshots.",
             &["session_note", "Read", "Task"],
             vec![
@@ -760,6 +761,26 @@ mod tests {
                 .and_then(|value| value.as_str())
                 == Some("merge")
         }));
+    }
+
+    #[test]
+    fn current_history_guide_teaches_exact_retrieval_and_authority_boundaries() {
+        let guide = builtin_guide_spec("session_history_current")
+            .expect("current-history guide should exist");
+        assert_eq!(guide.tool_name, "session_history_current");
+        for action in ["search_current", "read_current", "read_around"] {
+            assert!(guide.examples.iter().any(|example| {
+                example
+                    .parameters
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    == Some(action)
+            }));
+        }
+        assert!(guide.when_to_use.contains("always-resident"));
+        assert!(guide.when_to_use.contains("transcript authority"));
+        assert!(guide.when_to_use.contains("memory is selective"));
+        assert!(guide.when_not_to_use.contains("Session ID"));
     }
 
     #[test]

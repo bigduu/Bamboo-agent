@@ -185,6 +185,20 @@ fn validate_session_context_requirement_rejects_missing_session_for_session_hist
 }
 
 #[test]
+fn validate_session_context_requirement_rejects_missing_session_for_current_history() {
+    let error = validate_session_context_requirement("session_history_current", None)
+        .expect_err("expected missing-session validation error");
+
+    match error {
+        AppError::BadRequest(message) => {
+            assert!(message.contains("requires session_id"));
+            assert!(message.contains("session_history_current"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn build_tool_call_serializes_arguments() {
     let args = parse_arguments(vec![ToolParameter {
         name: "path".to_string(),

@@ -2,8 +2,9 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + compact_context + self-only session_history)
-//!   └─> root_tools (base + Plan + SubAgent + scheduler + full session_history)
+//! base_tools (builtin + MCP + memory + skills + compact_context + legacy self-only
+//!             session_history + exact self-only session_history_current)
+//!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
 //! ```
 
 use std::collections::HashMap;
@@ -176,15 +177,26 @@ pub(super) fn build_base_tools(
         notify_tool,
     ));
 
-    // Every Session can inspect only its own authoritative stored messages.
-    // Root replaces this same-name instance with the full viewer below.
+    // Preserve the legacy self-only name for Base/Child compatibility. Root
+    // replaces only this exact name with the full viewer below.
     let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
+        session_store.clone(),
+        storage.clone(),
+    ));
+    let with_legacy_history: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(with_notify, self_history_tool),
+    );
+
+    // A distinct exact identity keeps the least-privilege schema Core under
+    // Progressive and StickyFallback loading. It is not an alias for the broad
+    // Root viewer and therefore cannot inherit cross-Session actions.
+    let current_history_tool = Arc::new(crate::tools::SessionInspectorTool::current(
         session_store,
         storage,
     ));
     Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_notify,
-        self_history_tool,
+        with_legacy_history,
+        current_history_tool,
     ))
 }
 

@@ -237,6 +237,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("SubAgent"));
     assert!(names.contains("scheduler"));
     assert!(names.contains("session_history"));
+    assert!(names.contains("session_history_current"));
     assert!(names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
@@ -257,10 +258,24 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(actions.contains(&json!("read_around")));
     assert!(actions.contains(&json!("list")));
     assert!(actions.contains(&json!("read_messages")));
+
+    let current_history = state
+        .tools_for(ToolSurface::Root)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Root current-history schema");
+    assert_eq!(
+        current_history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current", "read_current", "read_around"])
+    );
+    assert!(current_history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
 }
 
 #[tokio::test]
-async fn root_catalog_classifies_exactly_five_callable_core_functions() {
+async fn root_catalog_keeps_only_current_history_in_the_six_core_functions() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -284,7 +299,14 @@ async fn root_catalog_classifies_exactly_five_callable_core_functions() {
             "Grep".to_string(),
             "Read".to_string(),
             "Write".to_string(),
+            "session_history_current".to_string(),
         ])
+    );
+    let broad_history = bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_history")
+        .expect("broad history identity");
+    assert_eq!(
+        broad_history.loading_class(),
+        bamboo_domain::CapabilityLoadingClass::Deferred
     );
     assert_eq!(
         bamboo_domain::DISCOVERY_CONTROL_GATEWAY.logical_name(),
@@ -308,6 +330,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
     assert!(names.contains("session_history"));
+    assert!(names.contains("session_history_current"));
     assert!(!names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
@@ -338,6 +361,24 @@ async fn child_tools_include_only_self_scoped_session_history() {
     assert!(base_history.function.parameters["properties"]
         .get("session_id")
         .is_none());
+    let child_current_history = tools
+        .iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Child current-history schema");
+    assert_eq!(
+        child_current_history.function.parameters, history.function.parameters,
+        "the exact Core identity must expose only the same least-privilege schema"
+    );
+    let base_current_history = state
+        .tools_for(ToolSurface::Base)
+        .list_tools()
+        .into_iter()
+        .find(|schema| schema.function.name == "session_history_current")
+        .expect("Base current-history schema");
+    assert_eq!(
+        base_current_history.function.parameters,
+        base_history.function.parameters
+    );
     let mut child_session = Session::new("child-history-surface", "test-model");
     child_session.add_message(bamboo_agent_core::Message::user(
         "CHILD-SELF-HISTORY-SENTINEL",
@@ -355,7 +396,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .await
         .unwrap();
     let search_call = make_tool_call(
-        "session_history",
+        "session_history_current",
         json!({"action": "search_current", "query": "CHILD-SELF-HISTORY-SENTINEL"}),
     );
     let mut context = ToolExecutionContext::none(&search_call.id);
@@ -369,7 +410,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
     assert_eq!(result["session_id"], child_session.id);
     assert_eq!(result["match_count"], 1);
 
-    let list_call = make_tool_call("session_history", json!({"action": "list"}));
+    let list_call = make_tool_call("session_history_current", json!({"action": "list"}));
     let mut context = ToolExecutionContext::none(&list_call.id);
     context.session_id = Some(&child_session.id);
     assert!(matches!(
@@ -378,6 +419,114 @@ async fn child_tools_include_only_self_scoped_session_history() {
             .execute_with_context(&list_call, context)
             .await,
         Err(ToolError::InvalidArguments(message)) if message.contains("only permits")
+    ));
+
+    let legacy_search_call = make_tool_call(
+        "session_history",
+        json!({"action": "search_current", "query": "CHILD-SELF-HISTORY-SENTINEL"}),
+    );
+    let mut context = ToolExecutionContext::none(&legacy_search_call.id);
+    context.session_id = Some(&child_session.id);
+    assert!(
+        state
+            .tools_for(ToolSurface::Child)
+            .execute_with_context(&legacy_search_call, context)
+            .await
+            .expect("legacy self-history name remains compatible")
+            .success
+    );
+}
+
+#[tokio::test]
+async fn current_history_survives_app_state_restart_with_archived_messages() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let data_dir = temp_dir.path().to_path_buf();
+    let session_id = "restart-current-history";
+
+    {
+        let state = AppState::new(data_dir.clone())
+            .await
+            .expect("initial app state should initialize");
+        let mut session = Session::new(session_id, "test-model");
+        let mut archived_user = bamboo_agent_core::Message::user(
+            "ARCHIVED-CURRENT-HISTORY-SENTINEL exact prior decision",
+        );
+        archived_user.compressed = true;
+        let mut archived_assistant = bamboo_agent_core::Message::assistant(
+            "The exact archived decision remains authoritative",
+            None,
+        );
+        archived_assistant.compressed = true;
+        session.add_message(archived_user);
+        session.add_message(archived_assistant);
+        session.add_message(bamboo_agent_core::Message::user(
+            "Recover the earlier exact decision",
+        ));
+        state
+            .session_store
+            .save_session(&session)
+            .await
+            .expect("archived Session should persist");
+        state.session_store.flush_search_index().await;
+    }
+
+    let restarted = AppState::new(data_dir)
+        .await
+        .expect("restarted app state should initialize");
+    for surface in [ToolSurface::Base, ToolSurface::Child, ToolSurface::Root] {
+        let schema = restarted
+            .tools_for(surface)
+            .list_tools()
+            .into_iter()
+            .find(|schema| schema.function.name == "session_history_current")
+            .unwrap_or_else(|| panic!("{surface:?} must retain current history after restart"));
+        let identity =
+            bamboo_domain::ClassifiedToolIdentity::from_schema_name(&schema.function.name)
+                .expect("registered current-history identity");
+        assert_eq!(
+            identity.loading_class(),
+            bamboo_domain::CapabilityLoadingClass::Core
+        );
+        assert_eq!(
+            schema.function.parameters["properties"]["action"]["enum"],
+            json!(["search_current", "read_current", "read_around"])
+        );
+    }
+
+    let search_call = make_tool_call(
+        "session_history_current",
+        json!({
+            "action": "search_current",
+            "query": "ARCHIVED-CURRENT-HISTORY-SENTINEL"
+        }),
+    );
+    let mut context = ToolExecutionContext::none(&search_call.id);
+    context.session_id = Some(session_id);
+    let result = restarted
+        .tools_for(ToolSurface::Root)
+        .execute_with_context(&search_call, context)
+        .await
+        .expect("restarted exact current-history search should succeed");
+    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result["match_count"], 1);
+    assert_eq!(result["matches"][0]["compressed"], true);
+
+    let override_call = make_tool_call(
+        "session_history_current",
+        json!({
+            "action": "search_current",
+            "query": "sentinel",
+            "session_id": "another-session"
+        }),
+    );
+    let mut context = ToolExecutionContext::none(&override_call.id);
+    context.session_id = Some(session_id);
+    assert!(matches!(
+        restarted
+            .tools_for(ToolSurface::Root)
+            .execute_with_context(&override_call, context)
+            .await,
+        Err(ToolError::InvalidArguments(message)) if message.contains("only accepts")
     ));
 }
 
@@ -407,6 +556,18 @@ async fn overlay_tools_require_session_context() {
     assert!(matches!(
         inspector_result,
         Err(ToolError::Execution(msg)) if msg.contains("session_id")
+    ));
+
+    let current_history_result = state
+        .tools_for(ToolSurface::Root)
+        .execute(&make_tool_call(
+            "session_history_current",
+            json!({ "action": "read_current" }),
+        ))
+        .await;
+    assert!(matches!(
+        current_history_result,
+        Err(ToolError::Execution(msg)) if msg.contains("session_history_current") && msg.contains("session_id")
     ));
 
     let memory_result = state
