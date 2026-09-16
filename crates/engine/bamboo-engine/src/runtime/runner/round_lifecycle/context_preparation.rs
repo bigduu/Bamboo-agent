@@ -108,12 +108,15 @@ fn pending_manual_archive_request(session: &Session) -> Option<ResponseOccurrenc
                 let Some(is_archive_context) = current_batch.remove(call_id) else {
                     continue;
                 };
-                if is_archive_context && message.tool_success != Some(false) {
-                    latest_completed = Some(ResponseOccurrence {
-                        tool_call_id: call_id.to_string(),
-                        tool_result_message_id: message.id.clone(),
-                        permission_generation: None,
-                    });
+                if is_archive_context {
+                    latest_completed = Some((
+                        ResponseOccurrence {
+                            tool_call_id: call_id.to_string(),
+                            tool_result_message_id: message.id.clone(),
+                            permission_generation: None,
+                        },
+                        message.tool_success != Some(false),
+                    ));
                 }
             }
             Role::User | Role::System => {}
@@ -122,7 +125,9 @@ fn pending_manual_archive_request(session: &Session) -> Option<ResponseOccurrenc
     // The newest completed request is the ordering fence. If it is already
     // consumed, every older request in this turn is older than the durable
     // fence and must not be replayed.
-    latest_completed.filter(|occurrence| last_consumed.as_ref() != Some(occurrence))
+    latest_completed.and_then(|(occurrence, successful)| {
+        (successful && last_consumed.as_ref() != Some(&occurrence)).then_some(occurrence)
+    })
 }
 
 fn mark_manual_archive_request_consumed(

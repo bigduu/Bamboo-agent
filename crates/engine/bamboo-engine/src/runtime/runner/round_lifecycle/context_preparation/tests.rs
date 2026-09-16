@@ -7,8 +7,8 @@ use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
     emit_context_pressure_notification, enforce_model_context_ledger_retention,
     mark_manual_archive_request_consumed, maybe_apply_host_context_compression,
-    pending_manual_archive_request, prepare_round_context, LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY,
-    LAST_PRESSURE_LEVEL_KEY,
+    pending_manual_archive_request, prepare_round_context, surface_manual_archive_rejection,
+    LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -457,6 +457,30 @@ fn manual_archive_consumption_tracks_result_occurrence_when_call_id_is_reused() 
     mark_manual_archive_request_consumed(&mut session, &second).expect("consume second request");
     let restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
         .expect("occurrence marker survives restart");
+    assert!(pending_manual_archive_request(&restarted).is_none());
+}
+
+#[test]
+fn rejected_newest_manual_archive_remains_the_ordering_fence() {
+    let mut session = Session::new("manual-archive-rejected-fence", "test-model");
+    session.add_message(Message::user("try two archive requests in this turn"));
+
+    append_archive_context_request(&mut session, "first-archive-call");
+    let first = pending_manual_archive_request(&session).expect("first request");
+    mark_manual_archive_request_consumed(&mut session, &first).expect("consume first request");
+
+    append_archive_context_request(&mut session, "second-archive-call");
+    let second = pending_manual_archive_request(&session).expect("second request");
+    surface_manual_archive_rejection(&mut session, &second, "permanent rejection")
+        .expect("surface second rejection");
+    mark_manual_archive_request_consumed(&mut session, &second).expect("consume second request");
+
+    assert!(
+        pending_manual_archive_request(&session).is_none(),
+        "the rejected newest occurrence must prevent the older call from replaying"
+    );
+    let restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
+        .expect("rejection fence survives restart");
     assert!(pending_manual_archive_request(&restarted).is_none());
 }
 
