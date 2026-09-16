@@ -370,6 +370,24 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// Atomically consume one successful no-op `archive_context` request.
+    ///
+    /// This boundary permits only the correlated consumed-occurrence marker.
+    /// Implementations compare `expected_base` under their per-session lock
+    /// and return `Rebased` without writing when any durable transcript,
+    /// metadata, runtime metadata, or execution-profile field changed. The
+    /// caller must then restage the marker from the returned durable snapshot.
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support manual archive-consumption checkpoints",
+        ))
+    }
+
     /// Load the latest runtime-visible session snapshot when the persistence
     /// implementation can coordinate reads. Tools may update a repository-owned
     /// clone while an agent loop holds its own live Session; the loop uses this
@@ -519,6 +537,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<RetrievalWindowCheckpointOutcome> {
         (**self)
             .checkpoint_manual_archive_rejection(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_manual_archive_consumption(expected_base, staged)
             .await
     }
 

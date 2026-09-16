@@ -148,6 +148,15 @@ impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
         self.checkpoint_retrieval_window(expected_base, staged)
             .await
     }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_retrieval_window(expected_base, staged)
+            .await
+    }
 }
 
 struct DurableBaseCheckingPersistence {
@@ -155,6 +164,7 @@ struct DurableBaseCheckingPersistence {
     runtime_checkpoints: Arc<AtomicUsize>,
     prompt_checkpoints: Arc<AtomicUsize>,
     retrieval_checkpoints: Arc<AtomicUsize>,
+    manual_consumption_checkpoints: Arc<AtomicUsize>,
 }
 
 struct DurableBaseCheckingFixture {
@@ -163,6 +173,7 @@ struct DurableBaseCheckingFixture {
     runtime_checkpoints: Arc<AtomicUsize>,
     prompt_checkpoints: Arc<AtomicUsize>,
     retrieval_checkpoints: Arc<AtomicUsize>,
+    manual_consumption_checkpoints: Arc<AtomicUsize>,
 }
 
 impl DurableBaseCheckingPersistence {
@@ -171,17 +182,20 @@ impl DurableBaseCheckingPersistence {
         let runtime_checkpoints = Arc::new(AtomicUsize::new(0));
         let prompt_checkpoints = Arc::new(AtomicUsize::new(0));
         let retrieval_checkpoints = Arc::new(AtomicUsize::new(0));
+        let manual_consumption_checkpoints = Arc::new(AtomicUsize::new(0));
         DurableBaseCheckingFixture {
             persistence: Arc::new(Self {
                 durable: Arc::clone(&durable),
                 runtime_checkpoints: Arc::clone(&runtime_checkpoints),
                 prompt_checkpoints: Arc::clone(&prompt_checkpoints),
                 retrieval_checkpoints: Arc::clone(&retrieval_checkpoints),
+                manual_consumption_checkpoints: Arc::clone(&manual_consumption_checkpoints),
             }),
             durable,
             runtime_checkpoints,
             prompt_checkpoints,
             retrieval_checkpoints,
+            manual_consumption_checkpoints,
         }
     }
 }
@@ -242,6 +256,26 @@ impl RuntimeSessionPersistence for DurableBaseCheckingPersistence {
         staged: &mut Session,
     ) -> io::Result<RetrievalWindowCheckpointOutcome> {
         self.checkpoint_prompt_rewrite(expected_base, staged).await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.manual_consumption_checkpoints
+            .fetch_add(1, Ordering::SeqCst);
+        let mut durable = self.durable.lock().expect("durable Session lock");
+        if serde_json::to_vec(expected_base)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            != serde_json::to_vec(&*durable)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        {
+            *staged = durable.clone();
+            return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+        }
+        *durable = staged.clone();
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 }
 
@@ -3745,6 +3779,70 @@ async fn retrieval_window_manual_noop_is_consumed_durably_once() {
     .await
     .expect("consumed no-op must not replay");
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
+async fn retrieval_window_manual_noop_rebases_before_consuming_concurrent_metadata() {
+    let mut session = Session::new("retrieval-manual-noop-rebase", "test-model");
+    session.add_message(Message::system("retrieval system"));
+    session.add_message(Message::user("small request"));
+    session.add_message(Message::assistant("small response", None));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        100_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    append_archive_context_request(&mut session, "call-manual-noop-rebase");
+    let fixture = DurableBaseCheckingPersistence::fixture(session.clone());
+    fixture
+        .durable
+        .lock()
+        .expect("durable Session lock")
+        .set_pending_injected_messages(vec![serde_json::json!({
+            "id": "bash-1",
+            "status": "completed",
+        })]);
+    let config = retrieval_window_config(Arc::clone(&fixture.persistence));
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-noop-rebase",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect("no-op consumption should rebase and retry from concurrent metadata");
+
+    assert_eq!(fixture.runtime_checkpoints.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .manual_consumption_checkpoints
+            .load(Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        session.pending_injected_messages(),
+        Some(vec![serde_json::json!({
+            "id": "bash-1",
+            "status": "completed",
+        })])
+    );
+    assert!(pending_manual_archive_request(&session).is_none());
+    let durable = fixture.durable.lock().expect("durable Session lock");
+    assert_eq!(
+        durable.pending_injected_messages(),
+        Some(vec![serde_json::json!({
+            "id": "bash-1",
+            "status": "completed",
+        })])
+    );
+    assert!(pending_manual_archive_request(&durable).is_none());
 }
 
 #[tokio::test]

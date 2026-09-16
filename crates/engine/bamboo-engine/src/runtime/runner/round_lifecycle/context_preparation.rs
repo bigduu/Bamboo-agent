@@ -233,18 +233,59 @@ fn checkpoint_manual_archive_outcome<'a>(
         ));
         };
         let Some(reason) = rejection_reason else {
-            let mut staged = session.clone();
-            mark_manual_archive_request_consumed(&mut staged, request)?;
-            persistence
-                .checkpoint_runtime_session(&mut staged)
-                .await
-                .map_err(|error| {
-                    AgentError::Budget(format!(
-                    "archive_context outcome checkpoint failed; request remains retryable: {error}"
-                ))
-                })?;
-            *session = staged;
-            return Ok(());
+            let mut candidate_base = session.clone();
+            for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+                if attempt > 0
+                    && pending_manual_archive_request(&candidate_base).as_ref() != Some(request)
+                {
+                    let already_committed = candidate_base
+                        .metadata
+                        .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+                        .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok())
+                        .as_ref()
+                        == Some(request);
+                    *session = candidate_base;
+                    if already_committed {
+                        return Ok(());
+                    }
+                    return Err(AgentError::Budget(
+                        "archive_context consumption checkpoint observed a newer durable outcome; the stale request was not overwritten"
+                            .to_string(),
+                    ));
+                }
+
+                let expected_base = candidate_base;
+                let mut staged = expected_base.clone();
+                mark_manual_archive_request_consumed(&mut staged, request)?;
+                match persistence
+                    .checkpoint_manual_archive_consumption(&expected_base, &mut staged)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Budget(format!(
+                            "archive_context outcome checkpoint failed; request remains retryable: {error}"
+                        ))
+                    })? {
+                    RetrievalWindowCheckpointOutcome::Committed => {
+                        *session = staged;
+                        return Ok(());
+                    }
+                    RetrievalWindowCheckpointOutcome::Rebased
+                        if attempt < MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES =>
+                    {
+                        candidate_base = staged;
+                        *session = candidate_base.clone();
+                    }
+                    RetrievalWindowCheckpointOutcome::Rebased => {
+                        *session = staged;
+                        return Err(AgentError::Budget(format!(
+                            "archive_context consumption checkpoint could not stabilize after {} durable rebase retries",
+                            MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES
+                        )));
+                    }
+                }
+            }
+
+            unreachable!("bounded archive_context consumption checkpoint loop must return")
         };
 
         let mut candidate_base = session.clone();

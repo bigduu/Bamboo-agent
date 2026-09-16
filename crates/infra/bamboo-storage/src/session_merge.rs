@@ -864,6 +864,44 @@ impl LockedSessionStore {
         Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 
+    /// Commit the consumed marker for a successful no-op `archive_context`.
+    ///
+    /// The marker is a metadata rewrite, so the append-safe runtime checkpoint
+    /// is insufficient: it could full-save stale open metadata after a
+    /// concurrent runtime writer. Fence the complete retrieval base and let the
+    /// engine restage from the latest durable snapshot on any conflict.
+    pub async fn checkpoint_manual_archive_consumption_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_manual_archive_consumption_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = latest.clone();
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
     /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
@@ -1416,6 +1454,15 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             .await
     }
 
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_manual_archive_consumption_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
@@ -1536,6 +1583,83 @@ fn message_matches_retrieval_window_base(
 
 fn invalid_retrieval_window_checkpoint(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_staged_manual_archive_consumption_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let occurrence = staged
+        .metadata
+        .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-consumption checkpoint is missing its consumed occurrence",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<ResponseOccurrence>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-consumption checkpoint has an invalid consumed occurrence: {error}"
+                ))
+            })
+        })?;
+    let result_index = expected
+        .messages
+        .iter()
+        .position(|message| {
+            message.id == occurrence.tool_result_message_id
+                && message.tool_call_id.as_deref() == Some(occurrence.tool_call_id.as_str())
+                && matches!(message.role, bamboo_domain::Role::Tool)
+        })
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-consumption checkpoint occurrence does not identify a Tool result",
+            )
+        })?;
+    let correlated_archive_call = expected.messages[..result_index]
+        .iter()
+        .rev()
+        .find(|message| !matches!(message.role, bamboo_domain::Role::Tool))
+        .filter(|message| matches!(message.role, bamboo_domain::Role::Assistant))
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|call| {
+            call.id == occurrence.tool_call_id
+                && bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
+        });
+    if !correlated_archive_call {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint is not correlated to the current archive_context batch",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    canonical.metadata.insert(
+        LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+        staged
+            .metadata
+            .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+            .expect("validated occurrence metadata")
+            .clone(),
+    );
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-consumption checkpoint contains mutations outside the correlated consumed marker",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_manual_archive_rejection_transition(
@@ -4424,6 +4548,99 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&saved).unwrap(),
             serde_json::to_value(&staged).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_archive_consumption_checkpoint_rebases_concurrent_open_metadata() {
+        use bamboo_domain::{FunctionCall, Message, ToolCall};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "manual-archive-consumption-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive older context"));
+        let mut assistant = Message::assistant("", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "archive-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "archive_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        expected.add_message(assistant);
+        let mut result = Message::tool_result("archive-call", "Retrieval-window archive requested");
+        result.id = "archive-result".to_string();
+        result.tool_success = Some(true);
+        expected.add_message(result);
+        storage.save_session(&expected).await.unwrap();
+
+        let occurrence = ResponseOccurrence {
+            tool_call_id: "archive-call".to_string(),
+            tool_result_message_id: "archive-result".to_string(),
+            permission_generation: None,
+        };
+        let stage_consumption = |base: &Session| {
+            let mut staged = base.clone();
+            staged.metadata.insert(
+                LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+                serde_json::to_string(&occurrence).unwrap(),
+            );
+            staged
+        };
+
+        let mut staged = stage_consumption(&expected);
+        let mut durable = expected.clone();
+        durable.metadata.insert(
+            "concurrent.workflow_index".to_string(),
+            "workflow-42".to_string(),
+        );
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "id": "bash-1",
+            "status": "completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_manual_archive_consumption_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&unchanged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+
+        expected = staged;
+        let mut staged = stage_consumption(&expected);
+        let outcome = store
+            .checkpoint_manual_archive_consumption_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.metadata.get("concurrent.workflow_index"),
+            Some(&"workflow-42".to_string())
+        );
+        assert_eq!(
+            saved.pending_injected_messages(),
+            Some(vec![serde_json::json!({
+                "id": "bash-1",
+                "status": "completed",
+            })])
+        );
+        assert_eq!(
+            saved.metadata.get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY),
+            Some(&serde_json::to_string(&occurrence).unwrap())
         );
     }
 
