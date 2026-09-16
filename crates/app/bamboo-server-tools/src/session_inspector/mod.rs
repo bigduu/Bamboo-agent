@@ -81,10 +81,10 @@ impl Tool for SessionInspectorTool {
     fn description(&self) -> &str {
         match self.access {
             SessionHistoryAccess::SelfOnly => {
-                "Read-only search and bounded exact-turn pagination over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller."
+                "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller."
             }
             SessionHistoryAccess::Full => {
-                "Read-only viewer over local session history. Search/page the current Session directly (including compressed messages), or list sessions, inspect metadata, read bounded message slices/compressed history, and search prior conversations. A Root caller can use export_context for itself or a same-tree, same-Project target: it materializes bounded immutable status/brief files for Read offset/limit, without changing session state. Exported status is a last persisted observation, not verified live progress. This viewer has no runtime control. Distinct from memory, which manages durable cross-session knowledge."
+                "Read-only viewer over local session history. Search/page/read around the current Session directly (including compressed messages), or list sessions, inspect metadata, read bounded message slices/compressed history, and search prior conversations. A Root caller can use export_context for itself or a same-tree, same-Project target: it materializes bounded immutable status/brief files for Read offset/limit, without changing session state. Exported status is a last persisted observation, not verified live progress. This viewer has no runtime control. Distinct from memory, which manages durable cross-session knowledge."
             }
         }
     }
@@ -96,8 +96,8 @@ impl Tool for SessionInspectorTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["search_current", "read_current"],
-                        "description": "Search or page complete logical turns in the current Session only."
+                        "enum": ["search_current", "read_current", "read_around"],
+                        "description": "Search, page, or recover complete logical turns around a hit in the current Session only."
                     },
                     "query": {
                         "type": "string",
@@ -109,7 +109,10 @@ impl Tool for SessionInspectorTool {
                     "cursor": { "type": "string", "maxLength": 4096, "description": "Opaque continuation cursor returned by read_current." },
                     "direction": { "type": "string", "enum": ["backward", "forward"], "description": "Pagination direction for read_current (default backward)." },
                     "max_chars": { "type": "integer", "minimum": 1, "maximum": 20000, "description": "Hard character budget for exact content and tool arguments (default 12000)." },
-                    "archived_only": { "type": "boolean", "description": "For read_current, select only logical turns containing archived messages while retaining active companion messages needed for turn/tool-chain atomicity." }
+                    "archived_only": { "type": "boolean", "description": "For read_current, select only logical turns containing archived messages while retaining active companion messages needed for turn/tool-chain atomicity." },
+                    "message_id": { "type": "string", "minLength": 1, "maxLength": 512, "description": "Message ID returned by search_current to anchor read_around." },
+                    "before_turns": { "type": "integer", "minimum": 0, "maximum": 5, "description": "Complete turns before the anchor (default 1)." },
+                    "after_turns": { "type": "integer", "minimum": 0, "maximum": 5, "description": "Complete turns after the anchor (default 1)." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -122,7 +125,7 @@ impl Tool for SessionInspectorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search_current", "read_current", "list", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
+                    "enum": ["search_current", "read_current", "read_around", "list", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
                     "description": "Which inspection action to perform."
                 },
                 "query": { "type": "string", "description": "Search string (search_current/list/search)." },
@@ -134,8 +137,11 @@ impl Tool for SessionInspectorTool {
                 "limit": { "type": "number", "description": "Max items/messages to return (search_current/list/read_messages)." },
                 "cursor": { "type": "string", "description": "Opaque continuation cursor returned by read_current." },
                 "direction": { "type": "string", "enum": ["backward", "forward"] },
-                "max_chars": { "type": "number", "description": "Hard total content budget for read_current." },
+                "max_chars": { "type": "number", "description": "Hard total content budget for read_current/read_around." },
                 "archived_only": { "type": "boolean", "description": "Select logical turns containing archived messages for read_current." },
+                "message_id": { "type": "string", "description": "Current-Session message ID returned by search_current (read_around)." },
+                "before_turns": { "type": "number", "description": "Complete turns before the read_around anchor." },
+                "after_turns": { "type": "number", "description": "Complete turns after the read_around anchor." },
                 "offset": { "type": "number", "description": "Offset (list/read_messages)." },
                 "session_id": { "type": "string", "description": "Target session id. export_context requires a persisted Root caller and a target in its own tree with the same optional Project identity; output paths are runtime-owned." },
                 "from_end": { "type": "boolean", "description": "Read from end (read_messages)." },
@@ -172,10 +178,13 @@ impl Tool for SessionInspectorTool {
 
         let action = args.get("action").and_then(serde_json::Value::as_str);
         if self.access == SessionHistoryAccess::SelfOnly
-            && !matches!(action, Some("search_current" | "read_current"))
+            && !matches!(
+                action,
+                Some("search_current" | "read_current" | "read_around")
+            )
         {
             return Err(ToolError::InvalidArguments(
-                "this session_history surface only permits search_current and read_current for the caller's own Session"
+                "this session_history surface only permits search_current, read_current, and read_around for the caller's own Session"
                     .to_string(),
             ));
         }
@@ -203,6 +212,21 @@ impl Tool for SessionInspectorTool {
         {
             return Err(ToolError::InvalidArguments(
                 "read_current only accepts action, cursor, direction, limit, max_chars, and archived_only; Session scope and history boundary are runtime-derived"
+                    .to_string(),
+            ));
+        }
+        if action == Some("read_around")
+            && args.as_object().is_some_and(|fields| {
+                fields.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "action" | "message_id" | "before_turns" | "after_turns" | "max_chars"
+                    )
+                })
+            })
+        {
+            return Err(ToolError::InvalidArguments(
+                "read_around only accepts action, message_id, before_turns, after_turns, and max_chars; Session scope and history boundary are runtime-derived"
                     .to_string(),
             ));
         }
@@ -248,6 +272,23 @@ impl Tool for SessionInspectorTool {
                     limit,
                     max_chars,
                     archived_only,
+                )
+                .await
+            }
+            SessionInspectorArgs::ReadAround {
+                message_id,
+                before_turns,
+                after_turns,
+                max_chars,
+            } => {
+                self_history::handle_read_around(
+                    self,
+                    caller_session_id,
+                    ctx.tool_call_id.as_ref(),
+                    message_id,
+                    before_turns,
+                    after_turns,
+                    max_chars,
                 )
                 .await
             }

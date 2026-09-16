@@ -219,6 +219,21 @@ async fn read_current_pages_exact_atomic_turns_with_a_cursor_stable_across_retri
     session.add_message(identified(
         Message::assistant(
             "",
+            Some(vec![call(
+                "between-pages-around",
+                "session_history",
+                json!({"action":"read_around","message_id":"turn-one-result"}),
+            )]),
+        ),
+        "between-pages-around-call",
+    ));
+    session.add_message(identified(
+        Message::tool_result("between-pages-around", "GENERATED-AROUND-RESULT"),
+        "between-pages-around-result",
+    ));
+    session.add_message(identified(
+        Message::assistant(
+            "",
             Some(vec![history_call(
                 "read-page-two",
                 "session_history",
@@ -240,6 +255,7 @@ async fn read_current_pages_exact_atomic_turns_with_a_cursor_stable_across_retri
     assert_eq!(second["complete"], true);
     assert_eq!(second["next_cursor"], Value::Null);
     assert_eq!(second["returned_turn_count"], 1);
+    assert!(!second.to_string().contains("GENERATED-AROUND-RESULT"));
     assert_eq!(second["turns"][0]["contains_archived"], true);
     assert_eq!(
         returned_message_ids(&second),
@@ -791,7 +807,11 @@ async fn self_history_schema_rejects_authority_overrides() {
         .collect::<HashSet<_>>();
     assert_eq!(
         actions,
-        HashSet::from([json!("search_current"), json!("read_current")])
+        HashSet::from([
+            json!("search_current"),
+            json!("read_current"),
+            json!("read_around"),
+        ])
     );
     assert!(self_tool.parameters_schema()["properties"]
         .get("session_id")
@@ -807,6 +827,20 @@ async fn self_history_schema_rejects_authority_overrides() {
                 .invoke(forbidden, context(&session.id, "strict-call"))
                 .await
                 .expect_err("authority-bearing overrides are rejected");
+            assert!(matches!(
+                error,
+                ToolError::InvalidArguments(message) if message.contains("runtime-derived")
+            ));
+        }
+        for forbidden in [
+            json!({"action":"read_around","message_id":"anchor","session_id":"other"}),
+            json!({"action":"read_around","message_id":"anchor","boundary":999}),
+            json!({"action":"read_around","message_id":"anchor","compressed":false}),
+        ] {
+            let error = tool
+                .invoke(forbidden, context(&session.id, "strict-call"))
+                .await
+                .expect_err("read_around authority-bearing overrides are rejected");
             assert!(matches!(
                 error,
                 ToolError::InvalidArguments(message) if message.contains("runtime-derived")

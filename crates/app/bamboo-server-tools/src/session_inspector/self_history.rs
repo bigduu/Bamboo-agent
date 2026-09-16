@@ -21,6 +21,9 @@ const HISTORY_READ_MAX_TURNS: usize = 20;
 const HISTORY_READ_DEFAULT_CHARS: usize = 12_000;
 const HISTORY_READ_MAX_CHARS: usize = 20_000;
 const HISTORY_READ_MAX_MESSAGES: usize = 100;
+const HISTORY_AROUND_DEFAULT_ADJACENT_TURNS: usize = 1;
+const HISTORY_AROUND_MAX_ADJACENT_TURNS: usize = 5;
+const HISTORY_ANCHOR_ID_MAX_CHARS: usize = 512;
 const HISTORY_CURSOR_VERSION: u8 = 1;
 const HISTORY_CURSOR_PREFIX: &str = "bsh1";
 const HISTORY_CURSOR_MAX_CHARS: usize = 4096;
@@ -101,6 +104,21 @@ impl HistoryTurn<'_> {
 struct HistoryProjection<'a> {
     turns: Vec<HistoryTurn<'a>>,
     excluded_incomplete_protocol_messages: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AroundSide {
+    Before,
+    After,
+}
+
+impl AroundSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
 }
 
 /// Locate the current tool call and the User request that owns it.
@@ -303,6 +321,253 @@ pub(super) async fn handle_read_current(
         "turns": returned_turns,
         "note": "Messages are exact bounded content from the authoritative current Session. System context, the current User request, generated history-retrieval artifacts, provider reasoning/signatures, and image bytes are not replayed. Tool calls and results are returned only as complete protocol chains."
     })))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_read_around(
+    tool: &SessionInspectorTool,
+    caller_session_id: &str,
+    current_tool_call_id: &str,
+    message_id: String,
+    before_turns: Option<usize>,
+    after_turns: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<ToolResult, ToolError> {
+    if message_id.is_empty() || message_id.chars().count() > HISTORY_ANCHOR_ID_MAX_CHARS {
+        return Err(ToolError::InvalidArguments(format!(
+            "message_id must contain between 1 and {HISTORY_ANCHOR_ID_MAX_CHARS} characters"
+        )));
+    }
+    let before_turns = bounded_value(
+        "before_turns",
+        before_turns,
+        HISTORY_AROUND_DEFAULT_ADJACENT_TURNS,
+        0,
+        HISTORY_AROUND_MAX_ADJACENT_TURNS,
+    )?;
+    let after_turns = bounded_value(
+        "after_turns",
+        after_turns,
+        HISTORY_AROUND_DEFAULT_ADJACENT_TURNS,
+        0,
+        HISTORY_AROUND_MAX_ADJACENT_TURNS,
+    )?;
+    let max_chars = bounded_value(
+        "max_chars",
+        max_chars,
+        HISTORY_READ_DEFAULT_CHARS,
+        1,
+        HISTORY_READ_MAX_CHARS,
+    )?;
+
+    let session = tool.load_session(caller_session_id).await?;
+    let (before_message_index, current_request_index) =
+        current_history_boundary(&session, current_tool_call_id);
+    let projection =
+        build_history_projection(&session, before_message_index, current_request_index);
+
+    // IDs are expected to be unique. Fail closed with the same unavailable
+    // result for both no match and an ambiguous/corrupt duplicate.
+    let mut anchor = None;
+    for (turn_index, turn) in projection.turns.iter().enumerate() {
+        for message in &turn.messages {
+            if message.message.id != message_id {
+                continue;
+            }
+            if anchor.is_some() {
+                return Ok(unavailable_around_result());
+            }
+            anchor = Some((turn_index, message.index));
+        }
+    }
+    let Some((anchor_turn_index, anchor_message_index)) = anchor else {
+        return Ok(unavailable_around_result());
+    };
+
+    let anchor_turn = &projection.turns[anchor_turn_index];
+    let anchor_chars = anchor_turn.char_count();
+    let anchor_messages = anchor_turn.messages.len();
+    let candidate_before_turns = before_turns.min(anchor_turn_index);
+    let candidate_after_turns = after_turns.min(
+        projection
+            .turns
+            .len()
+            .saturating_sub(anchor_turn_index.saturating_add(1)),
+    );
+    let current_request_message_id = current_request_index
+        .and_then(|index| session.messages.get(index))
+        .map(|message| message.id.as_str());
+
+    if anchor_chars > max_chars || anchor_messages > HISTORY_READ_MAX_MESSAGES {
+        let reason = if anchor_chars > max_chars {
+            "anchor_exceeds_max_chars"
+        } else {
+            "anchor_exceeds_max_messages"
+        };
+        return Ok(history_result(json!({
+            "contract_version": 1,
+            "action": "read_around",
+            "available": true,
+            "session_id": caller_session_id,
+            "read_before_message_index": before_message_index,
+            "current_request_message_id": current_request_message_id,
+            "anchor_message_id": message_id,
+            "anchor_message_index": anchor_message_index,
+            "anchor_turn_id": anchor_turn.messages.first().map(|message| message.message.id.as_str()),
+            "before_turns": before_turns,
+            "after_turns": after_turns,
+            "max_chars": max_chars,
+            "max_messages": HISTORY_READ_MAX_MESSAGES,
+            "candidate_before_turn_count": candidate_before_turns,
+            "candidate_after_turn_count": candidate_after_turns,
+            "returned_before_turn_count": 0,
+            "returned_after_turn_count": 0,
+            "returned_turn_count": 0,
+            "returned_message_count": 0,
+            "returned_char_count": 0,
+            "omitted_before_turn_count": candidate_before_turns,
+            "omitted_after_turn_count": candidate_after_turns,
+            "excluded_incomplete_protocol_message_count": projection.excluded_incomplete_protocol_messages,
+            "complete": false,
+            "truncated": true,
+            "truncation_reason": reason,
+            "oversized_anchor": {
+                "required_chars": anchor_chars,
+                "required_messages": anchor_messages,
+                "exceeds_max_chars": anchor_chars > max_chars,
+                "exceeds_max_messages": anchor_messages > HISTORY_READ_MAX_MESSAGES,
+            },
+            "omitted_adjacent": [],
+            "turns": [],
+            "note": "The anchor is valid, but its complete logical turn exceeds a hard response budget. No partial turn or tool protocol chain was returned."
+        })));
+    }
+
+    let mut returned_chars = anchor_chars;
+    let mut returned_messages = anchor_messages;
+    let mut returned_before_turns = 0usize;
+    let mut returned_after_turns = 0usize;
+    let mut before_open = true;
+    let mut after_open = true;
+    let mut truncation_reason = None;
+    let mut omitted_adjacent = Vec::new();
+
+    // Expand by distance from the anchor. At equal distance the older side is
+    // the stable tie-breaker. If the nearest turn on one side cannot fit, that
+    // side closes so a farther turn can never leap over an omitted neighbor.
+    for distance in 1..=candidate_before_turns.max(candidate_after_turns) {
+        for side in [AroundSide::Before, AroundSide::After] {
+            let (requested, open, turn_index) = match side {
+                AroundSide::Before => (
+                    candidate_before_turns,
+                    before_open,
+                    anchor_turn_index.saturating_sub(distance),
+                ),
+                AroundSide::After => (
+                    candidate_after_turns,
+                    after_open,
+                    anchor_turn_index.saturating_add(distance),
+                ),
+            };
+            if distance > requested || !open {
+                continue;
+            }
+
+            let turn = &projection.turns[turn_index];
+            let turn_chars = turn.char_count();
+            let turn_messages = turn.messages.len();
+            let required_total_chars = returned_chars.saturating_add(turn_chars);
+            let required_total_messages = returned_messages.saturating_add(turn_messages);
+            let exceeds_max_chars = required_total_chars > max_chars;
+            let exceeds_max_messages = required_total_messages > HISTORY_READ_MAX_MESSAGES;
+            if exceeds_max_chars || exceeds_max_messages {
+                let reason = if exceeds_max_chars {
+                    "max_chars"
+                } else {
+                    "max_messages"
+                };
+                truncation_reason.get_or_insert(reason);
+                omitted_adjacent.push(json!({
+                    "side": side.as_str(),
+                    "nearest_omitted_distance": distance,
+                    "omitted_turn_count": requested.saturating_sub(distance).saturating_add(1),
+                    "reason": reason,
+                    "turn_required_chars": turn_chars,
+                    "turn_required_messages": turn_messages,
+                    "required_total_chars": required_total_chars,
+                    "required_total_messages": required_total_messages,
+                    "exceeds_max_chars": exceeds_max_chars,
+                    "exceeds_max_messages": exceeds_max_messages,
+                }));
+                match side {
+                    AroundSide::Before => before_open = false,
+                    AroundSide::After => after_open = false,
+                }
+                continue;
+            }
+
+            returned_chars = required_total_chars;
+            returned_messages = required_total_messages;
+            match side {
+                AroundSide::Before => returned_before_turns += 1,
+                AroundSide::After => returned_after_turns += 1,
+            }
+        }
+    }
+
+    let first_turn = anchor_turn_index.saturating_sub(returned_before_turns);
+    let last_turn = anchor_turn_index.saturating_add(returned_after_turns);
+    let returned_turns = projection.turns[first_turn..=last_turn]
+        .iter()
+        .map(HistoryTurn::to_json)
+        .collect::<Vec<_>>();
+    let omitted_before_turns = candidate_before_turns.saturating_sub(returned_before_turns);
+    let omitted_after_turns = candidate_after_turns.saturating_sub(returned_after_turns);
+    let truncated = omitted_before_turns > 0 || omitted_after_turns > 0;
+
+    Ok(history_result(json!({
+        "contract_version": 1,
+        "action": "read_around",
+        "available": true,
+        "session_id": caller_session_id,
+        "read_before_message_index": before_message_index,
+        "current_request_message_id": current_request_message_id,
+        "anchor_message_id": message_id,
+        "anchor_message_index": anchor_message_index,
+        "anchor_turn_id": anchor_turn.messages.first().map(|message| message.message.id.as_str()),
+        "before_turns": before_turns,
+        "after_turns": after_turns,
+        "max_chars": max_chars,
+        "max_messages": HISTORY_READ_MAX_MESSAGES,
+        "candidate_before_turn_count": candidate_before_turns,
+        "candidate_after_turn_count": candidate_after_turns,
+        "returned_before_turn_count": returned_before_turns,
+        "returned_after_turn_count": returned_after_turns,
+        "returned_turn_count": returned_turns.len(),
+        "returned_message_count": returned_messages,
+        "returned_char_count": returned_chars,
+        "omitted_before_turn_count": omitted_before_turns,
+        "omitted_after_turn_count": omitted_after_turns,
+        "excluded_incomplete_protocol_message_count": projection.excluded_incomplete_protocol_messages,
+        "complete": !truncated,
+        "truncated": truncated,
+        "truncation_reason": truncation_reason,
+        "oversized_anchor": null,
+        "omitted_adjacent": omitted_adjacent,
+        "turns": returned_turns,
+        "note": "Messages are exact bounded content from the authoritative current Session. Turns are ordered chronologically. The anchor is always complete; adjacent expansion is nearest-first with the older side as the stable tie-breaker and never crosses an omitted turn."
+    })))
+}
+
+fn unavailable_around_result() -> ToolResult {
+    history_result(json!({
+        "contract_version": 1,
+        "action": "read_around",
+        "available": false,
+        "unavailable_reason": "message_unavailable",
+        "turns": [],
+        "note": "The requested message is not available as current-Session history. Missing, cross-Session, current-request, generated-retrieval, System, ambiguous, and incomplete-protocol anchors intentionally share this result."
+    }))
 }
 
 fn resolve_snapshot(
