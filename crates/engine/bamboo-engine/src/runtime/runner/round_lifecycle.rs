@@ -58,6 +58,22 @@ fn request_tool_schemas_for_loading_mode<'a>(
     Cow::Owned(projected)
 }
 
+/// Resolve the exact top-level tool catalog for one provider request.
+///
+/// Overflow recovery must account against the same capability-loading shape
+/// as the request that overflowed. Keeping this selection in one helper avoids
+/// accidentally projecting the full deferred catalog for StickyFallback.
+pub(crate) async fn request_tool_schemas_for_session<'a>(
+    session: &Session,
+    llm: &Arc<dyn LLMProvider>,
+    model_name: &str,
+    tool_schemas: &'a [ToolSchema],
+) -> Cow<'a, [ToolSchema]> {
+    let required_tool = required_tool_for_session(session);
+    let capability_loading_mode = llm.capability_loading_mode(model_name, required_tool).await;
+    request_tool_schemas_for_loading_mode(tool_schemas, capability_loading_mode)
+}
+
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,
@@ -127,10 +143,8 @@ pub(crate) async fn execute_llm_round(
     tool_schemas: &[ToolSchema],
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
-    let required_tool = required_tool_for_session(session);
-    let capability_loading_mode = llm.capability_loading_mode(model_name, required_tool).await;
     let request_tool_schemas =
-        request_tool_schemas_for_loading_mode(tool_schemas, capability_loading_mode);
+        request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
     let prepared = context_preparation::prepare_round_context(
         session,
@@ -231,7 +245,9 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_llm_round, is_openai_client_tool_search_boundary};
+    use super::{
+        execute_llm_round, is_openai_client_tool_search_boundary, request_tool_schemas_for_session,
+    };
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
     use bamboo_agent_core::{AgentEvent, Message, Session};
@@ -323,6 +339,35 @@ mod tests {
                 parameters: json!({"type":"object","properties":{}}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn sticky_overflow_projection_uses_core_plus_discovery_catalog() {
+        let provider = Arc::new(StickyCapturingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let llm: Arc<dyn LLMProvider> = provider;
+        let session = Session::new("sticky-overflow-tools", "chat-model");
+        let tools = vec![
+            schema("Read"),
+            schema("ReadArchive"),
+            schema("Workspace"),
+            schema("Bash"),
+        ];
+
+        let request_tools =
+            request_tool_schemas_for_session(&session, &llm, "chat-model", &tools).await;
+
+        assert_eq!(
+            request_tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "Bash", "discover_capabilities"]
+        );
+        assert!(request_tools.iter().all(|tool| {
+            tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
+        }));
     }
 
     #[tokio::test]

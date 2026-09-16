@@ -778,6 +778,20 @@ async fn maybe_prepare_retrieval_window_context(
     trigger_type: CompressionTriggerType,
     manual_archive_call_id: Option<&str>,
 ) -> Result<RetrievalWindowPreparationOutcome, AgentError> {
+    // A retrieval boundary cannot be layered on top of summary-owned history.
+    // This is a permanent precondition failure for this specific manual call,
+    // even when summary fallback is explicitly allowed for other routes. Consume
+    // it durably so restart cannot trap the Session in the same rejected call.
+    // Checkpoint failures still return before publication and remain retryable.
+    if let Some(call_id) = manual_archive_call_id.filter(|_| session.conversation_summary.is_some())
+    {
+        checkpoint_manual_archive_noop(session, config, call_id).await?;
+        return Err(AgentError::Budget(
+            "archive_context cannot create a retrieval-window boundary for a Session that already has a conversation summary; the rejected request was durably consumed"
+                .to_string(),
+        ));
+    }
+
     // An explicit workflow selection requires the model's first step to be a
     // lone `load_skill` call. During that setup round the effective callable
     // catalog intentionally excludes `session_history_current`; defer archival
@@ -1752,8 +1766,11 @@ pub(super) async fn prepare_round_context(
             ));
         }
     }
+    // Let a pending manual call reach the dedicated rejection path so its
+    // permanent precondition failure is durably consumed instead of replayed.
     if retrieval_window_enabled
         && session.conversation_summary.is_some()
+        && manual_archive_call_id.is_none()
         && !retrieval_window_fallback_is_summary(config)
     {
         return Err(AgentError::Budget(

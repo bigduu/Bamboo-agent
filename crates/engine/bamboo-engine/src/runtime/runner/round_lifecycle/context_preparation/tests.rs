@@ -3544,6 +3544,112 @@ async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
 }
 
 #[tokio::test]
+async fn archive_context_with_existing_summary_is_permanently_rejected_and_consumed() {
+    let mut session = retrieval_window_session("retrieval-summary-rejects-archive");
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "existing summary",
+        4,
+        120,
+    ));
+    append_archive_context_request(&mut session, "call-existing-summary-archive");
+    let before = serde_json::to_vec(&session).unwrap();
+    let (failing_persistence, failed_checkpoints) = RetrievalCheckpointPersistence::failing();
+    let mut failing_config = retrieval_window_config(failing_persistence);
+    failing_config
+        .context_management
+        .retrieval_window
+        .fallback_strategy = bamboo_config::ContextManagementFallbackStrategy::Summary;
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    let checkpoint_error = prepare_round_context(
+        &mut session,
+        &failing_config,
+        "test-model",
+        "retrieval-summary-rejects-archive",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("failed rejection checkpoint must leave the request retryable");
+    assert!(checkpoint_error.to_string().contains("checkpoint failed"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert_eq!(
+        pending_manual_archive_call_id(&session).as_deref(),
+        Some("call-existing-summary-archive")
+    );
+    assert!(failed_checkpoints
+        .lock()
+        .expect("checkpoint list lock")
+        .is_empty());
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config.context_management.retrieval_window.fallback_strategy =
+        bamboo_config::ContextManagementFallbackStrategy::Summary;
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-summary-rejects-archive",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("a retrieval boundary cannot be layered over a summary");
+
+    assert!(error
+        .to_string()
+        .contains("already has a conversation summary"));
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(session.compression_events.is_empty());
+    assert_eq!(
+        session
+            .conversation_summary
+            .as_ref()
+            .map(|summary| summary.content.as_str()),
+        Some("existing summary")
+    );
+}
+
+#[tokio::test]
+async fn archive_context_existing_summary_is_consumed_before_no_fallback_gate() {
+    let mut session = retrieval_window_session("retrieval-summary-no-fallback-archive");
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "existing summary",
+        4,
+        120,
+    ));
+    append_archive_context_request(&mut session, "call-summary-no-fallback");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-summary-no-fallback-archive",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("manual rejection must run before the general summary gate");
+
+    assert!(error
+        .to_string()
+        .contains("rejected request was durably consumed"));
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(session.compression_events.is_empty());
+}
+
+#[tokio::test]
 async fn retrieval_window_critical_overflow_rejects_oversized_latest_turn_transactionally() {
     let mut session = Session::new("retrieval-oversized-latest", "test-model");
     session.add_message(Message::system("retrieval system"));
