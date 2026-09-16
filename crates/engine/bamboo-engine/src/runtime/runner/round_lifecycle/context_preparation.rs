@@ -1333,45 +1333,43 @@ pub(super) async fn maybe_apply_host_context_compression(
     phase_label: &str,
 ) -> Result<bool, AgentError> {
     if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
-        if retrieval_window_fallback_is_summary(config) {
-            let manual_fallback_requested = session.force_manual_compression.is_some();
-            let budget = super::token_budget::resolve_token_budget(
-                session,
-                config,
-                model_name,
-                llm.as_ref(),
-            )
-            .await;
-            let applied = maybe_apply_summary_context_compression_with_budget(
-                session,
-                config,
-                model_name,
-                session_id,
-                llm,
-                &budget,
-                event_tx,
-                phase_label,
-                None,
-            )
-            .await?;
-            if manual_fallback_requested && !applied {
-                return Err(AgentError::Budget(
-                    "explicit summary fallback could not satisfy the compact_context request"
-                        .to_string(),
-                ));
-            }
-            return Ok(applied);
+        if session.force_manual_compression.is_none() {
+            // Retrieval-window v1 commits only at the ordinary pre-turn
+            // boundary. Explicit summary fallback is not an alternate
+            // automatic policy: a mid-turn pressure check must defer until an
+            // actual retrieval failure or overflow recovery requests it.
+            return Ok(false);
         }
-        if session.force_manual_compression.is_some() {
+        if !retrieval_window_fallback_is_summary(config) {
             session.force_manual_compression = None;
             return Err(AgentError::Budget(
                 "compact_context requests summary compression, which is unsupported while context_management.strategy=retrieval_window; configure fallback_strategy=summary to opt into summary fallback"
                     .to_string(),
             ));
         }
-        // Retrieval-window v1 commits only at the ordinary pre-turn boundary.
-        // A mid-turn automatic check can safely defer to that next boundary.
-        return Ok(false);
+
+        let budget =
+            super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref())
+                .await;
+        let applied = maybe_apply_summary_context_compression_with_budget(
+            session,
+            config,
+            model_name,
+            session_id,
+            llm,
+            &budget,
+            event_tx,
+            phase_label,
+            None,
+        )
+        .await?;
+        if !applied {
+            return Err(AgentError::Budget(
+                "explicit summary fallback could not satisfy the compact_context request"
+                    .to_string(),
+            ));
+        }
+        return Ok(true);
     }
 
     let budget =

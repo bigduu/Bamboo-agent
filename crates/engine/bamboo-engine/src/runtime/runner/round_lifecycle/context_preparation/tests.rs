@@ -2840,6 +2840,59 @@ async fn retrieval_window_manual_and_overflow_routes_do_not_silently_summarize()
 }
 
 #[tokio::test]
+async fn retrieval_window_summary_fallback_does_not_replace_automatic_mid_turn_deferral() {
+    let mut session = retrieval_window_session("retrieval-fallback-deferral");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config.context_management.retrieval_window.fallback_strategy =
+        ContextManagementFallbackStrategy::Summary;
+    config.background_model_name = Some("summary-model".to_string());
+    let tool_schemas = vec![retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-fallback-deferral",
+        &tool_schemas,
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect("automatic mid-turn pressure should defer to retrieval pre-turn");
+
+    assert!(!applied);
+    assert!(session.conversation_summary.is_none());
+    assert!(session.compression_events.is_empty());
+    assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-fallback-deferral",
+        &tool_schemas,
+        &llm,
+        None,
+    )
+    .await
+    .expect("the next pre-turn boundary should use retrieval-window");
+
+    assert!(session.conversation_summary.is_none());
+    assert!(session
+        .compression_events
+        .iter()
+        .any(|event| { event.kind == bamboo_domain::CompressionEventKind::RetrievalWindow }));
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(!prepared.prepared_context.messages.is_empty());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
 async fn retrieval_window_uses_summary_only_when_fallback_is_explicit() {
     let mut session = retrieval_window_session("retrieval-explicit-fallback");
     session.force_manual_compression = Some("preserve exact decisions".to_string());
