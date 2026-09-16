@@ -1378,7 +1378,9 @@ pub fn build_summary_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall};
+    use bamboo_domain::{
+        CompressionEventKind, FunctionCall, TaskItem, TaskItemStatus, TaskList, ToolCall,
+    };
     use bamboo_domain::{ModelContextResetReason, ModelContextState, TokenBudgetUsage};
     use chrono::Utc;
 
@@ -2137,6 +2139,14 @@ mod tests {
 
         let compressed_count = apply_compression_plan(&mut session, plan);
         assert!(compressed_count > 0);
+        assert_eq!(
+            session
+                .compression_events
+                .last()
+                .expect("summary compression event")
+                .kind,
+            CompressionEventKind::Summary
+        );
 
         // Verify recovery message was injected
         let has_recovery = session.messages.iter().any(|m| {

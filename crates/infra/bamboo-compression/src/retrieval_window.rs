@@ -5,7 +5,11 @@
 //! may archive after capability and persistence invariants have been verified.
 
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
-use bamboo_domain::{canonical_tool_name, Message, MessagePart, Role, Session};
+use bamboo_domain::{
+    canonical_tool_name, CompressionEvent, CompressionEventKind, CompressionTriggerType, Message,
+    MessagePart, ModelContextResetReason, Role, Session, TokenBudgetUsage,
+};
+use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
@@ -40,24 +44,32 @@ pub struct RetrievalWindowTokenAccounting {
 pub struct RetrievalWindowCandidatePlan {
     /// Message IDs to archive, in authoritative session order.
     pub message_ids_to_archive: Vec<String>,
+    /// Number of messages selected for archival.
+    pub archive_message_count: usize,
     /// Number of complete logical groups selected, including a preamble group.
     pub archive_group_count: usize,
     /// Number of selected groups anchored by a user message.
     pub archive_user_turn_count: usize,
     /// Tokens represented by `message_ids_to_archive`.
     pub archive_message_tokens: u32,
+    /// Number of active messages observed before candidate selection.
+    pub active_message_count: usize,
     /// Active message plus fixed prompt tokens before candidate selection.
     pub active_tokens_before: u32,
     /// Projected active tokens after the candidate messages are removed.
     pub projected_active_tokens_after: u32,
     /// Provider context-window size used for the plan.
     pub context_window_tokens: u32,
+    /// Effective provider request-input limit after output and safety reserves.
+    pub request_input_limit_tokens: u32,
     /// Effective token target after output/safety reserves are respected.
     pub target_tokens: u32,
     /// Requested target percentage retained for observability.
     pub target_usage_percent: u8,
     /// Provider-visible prompt/tool tokens outside `Session.messages`.
     pub fixed_prompt_tokens: u32,
+    /// Tokens contributed by active system messages.
+    pub system_message_tokens: u32,
     /// Active messages whose complete cost came from provider-aware accounting.
     pub provider_message_token_override_count: usize,
     /// Active message tokens that cannot be selected by this plan.
@@ -120,6 +132,66 @@ pub enum RetrievalWindowPlanError {
         fixed_prompt_tokens: u32,
         incomplete_protocol_group_count: usize,
     },
+}
+
+/// Result of committing a retrieval-window boundary to an in-memory session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalWindowApplyResult {
+    pub event_id: String,
+    pub newly_archived_message_count: usize,
+    pub idempotent_replay: bool,
+}
+
+/// Structured reason why a retrieval-window plan could not be committed.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RetrievalWindowApplyError {
+    #[error("retrieval-window plan has no candidate messages")]
+    EmptyCandidateSet,
+    #[error("retrieval-window plan candidate at index {index} has an empty message ID")]
+    EmptyCandidateId { index: usize },
+    #[error("retrieval-window plan repeats candidate message ID {message_id}")]
+    DuplicateCandidateId { message_id: String },
+    #[error("retrieval-window candidate message {message_id} is missing from the session")]
+    MissingCandidateMessage { message_id: String },
+    #[error("retrieval-window candidate message ID {message_id} is not unique in the session")]
+    DuplicateSessionMessageId { message_id: String },
+    #[error("retrieval-window candidate message {message_id} is out of session order")]
+    CandidateOrderMismatch { message_id: String },
+    #[error("retrieval-window plan evidence is inconsistent: {field}")]
+    InconsistentPlan { field: &'static str },
+    #[error("session already has a conversation summary")]
+    PreExistingConversationSummary,
+    #[error("retrieval-window plan was only partially applied")]
+    PartialApplication,
+    #[error("active candidate message {message_id} is already correlated to an archive event")]
+    ActiveCandidateAlreadyCorrelated { message_id: String },
+    #[error("retrieval-window candidate message {message_id} is a system message")]
+    SystemMessageCandidate { message_id: String },
+    #[error("retrieval-window candidate message {message_id} is marked never_compress")]
+    NeverCompressCandidate { message_id: String },
+    #[error("retrieval-window candidates do not cover a complete logical group")]
+    IncompleteLogicalGroup,
+    #[error("retrieval-window candidates contain an unsafe tool call/result chain")]
+    UnsafeToolProtocol,
+    #[error("retrieval-window candidates contain a protected Skill-loading chain")]
+    ProtectedSkillChain,
+    #[error("retrieval-window candidates include a retained recent user turn")]
+    RecentUserTurnProtected,
+    #[error("retrieval-window plan is stale: {invariant}")]
+    StalePlan { invariant: &'static str },
+    #[error("retrieval-window replay candidates refer to different archive events")]
+    MixedArchiveEvents,
+    #[error("retrieval-window replay event {event_id} is missing or duplicated")]
+    MissingOrDuplicateArchiveEvent { event_id: String },
+    #[error("archive event {event_id} was produced by a different compression strategy")]
+    ArchiveEventKindConflict { event_id: String },
+    #[error("retrieval-window replay evidence does not match event {event_id}: {field}")]
+    ArchiveEventEvidenceMismatch {
+        event_id: String,
+        field: &'static str,
+    },
+    #[error("token accounting overflow while applying retrieval-window plan")]
+    TokenAccountingOverflow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -338,15 +410,19 @@ fn build_retrieval_window_candidate_plan_with_counter(
         .count();
 
     Ok(RetrievalWindowCandidatePlan {
+        archive_message_count: message_ids_to_archive.len(),
         archive_group_count: selected_group_indexes.len(),
         archive_user_turn_count,
         archive_message_tokens,
+        active_message_count,
         active_tokens_before,
         projected_active_tokens_after,
         context_window_tokens: budget.max_context_tokens,
+        request_input_limit_tokens: budget.max_request_input_tokens(),
         target_tokens,
         target_usage_percent: policy.target_usage_percent,
         fixed_prompt_tokens: accounting.fixed_prompt_tokens,
+        system_message_tokens: system_tokens,
         provider_message_token_override_count: system_messages
             .iter()
             .chain(groups.iter().flat_map(|group| group.messages.iter()))
@@ -364,6 +440,699 @@ fn build_retrieval_window_candidate_plan_with_counter(
         incomplete_protocol_group_count,
         message_ids_to_archive,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedRetrievalWindowUsage {
+    system_tokens: u32,
+    window_tokens: u32,
+}
+
+/// Atomically commit one validated summary-free retrieval-window boundary.
+///
+/// This operation is intentionally separate from [`crate::apply_compression_plan`]:
+/// it never creates a summary or recovery message and performs every fallible
+/// validation before mutating the session.
+pub fn apply_retrieval_window_plan(
+    session: &mut Session,
+    plan: &RetrievalWindowCandidatePlan,
+) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+    let usage = validate_apply_plan_arithmetic(plan)?;
+    if session.conversation_summary.is_some() {
+        return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
+    }
+
+    let candidate_indexes = resolve_candidate_indexes(session, plan)?;
+    let active_count = candidate_indexes
+        .iter()
+        .filter(|index| !session.messages[**index].compressed)
+        .count();
+    let archived_count = candidate_indexes.len().saturating_sub(active_count);
+
+    if active_count > 0 && archived_count > 0 {
+        return Err(RetrievalWindowApplyError::PartialApplication);
+    }
+    if archived_count == candidate_indexes.len() {
+        return validate_idempotent_replay(session, plan, &candidate_indexes);
+    }
+
+    for index in &candidate_indexes {
+        let message = &session.messages[*index];
+        if message.compressed_by_event_id.is_some() {
+            return Err(
+                RetrievalWindowApplyError::ActiveCandidateAlreadyCorrelated {
+                    message_id: message.id.clone(),
+                },
+            );
+        }
+        if matches!(message.role, Role::System) {
+            return Err(RetrievalWindowApplyError::SystemMessageCandidate {
+                message_id: message.id.clone(),
+            });
+        }
+        if message.never_compress {
+            return Err(RetrievalWindowApplyError::NeverCompressCandidate {
+                message_id: message.id.clone(),
+            });
+        }
+    }
+
+    validate_active_plan_structure(session, plan)?;
+
+    let mut event = CompressionEvent::new(
+        plan.archive_message_count,
+        plan.archive_group_count,
+        usage_percentage(plan.active_tokens_before, plan.context_window_tokens),
+        usage_percentage(
+            plan.projected_active_tokens_after,
+            plan.context_window_tokens,
+        ),
+        0,
+        CompressionTriggerType::Auto,
+        0.0,
+        None,
+        0,
+    );
+    event.kind = CompressionEventKind::RetrievalWindow;
+    event.source_tokens = plan.archive_message_tokens;
+    event.fixed_prompt_tokens = plan.fixed_prompt_tokens;
+    event.retrieval_active_tokens_before = plan.active_tokens_before;
+    event.retrieval_active_message_count_before = plan.active_message_count;
+    event.retrieval_active_tokens_after = plan.projected_active_tokens_after;
+    event.retrieval_target_tokens = plan.target_tokens;
+    event.retrieval_target_usage_percent = plan.target_usage_percent;
+    event.retrieval_archived_group_count = plan.archive_group_count;
+    event.retrieval_archived_user_turn_count = plan.archive_user_turn_count;
+    event.retrieval_archived_message_tokens = plan.archive_message_tokens;
+    event.retrieval_system_message_tokens = plan.system_message_tokens;
+    event.retrieval_context_window_tokens = plan.context_window_tokens;
+    event.retrieval_request_input_limit_tokens = plan.request_input_limit_tokens;
+    event.retrieval_retained_recent_user_turn_count = plan.retained_recent_user_turn_count;
+    event.retrieval_retained_user_turn_count = plan.retained_user_turn_count;
+    event
+        .retrieval_oldest_retained_message_id
+        .clone_from(&plan.oldest_retained_message_id);
+    event
+        .retrieval_oldest_retained_user_message_id
+        .clone_from(&plan.oldest_retained_user_message_id);
+    event.retrieval_provider_message_token_override_count =
+        plan.provider_message_token_override_count;
+    event.retrieval_protected_active_tokens = plan.protected_active_tokens;
+    event.retrieval_incomplete_protocol_group_count = plan.incomplete_protocol_group_count;
+    let event_id = event.id.clone();
+
+    for index in candidate_indexes {
+        session.messages[index].compressed = true;
+        session.messages[index].compressed_by_event_id = Some(event_id.clone());
+    }
+    session.compression_events.push(event);
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: usage.system_tokens,
+        summary_tokens: 0,
+        window_tokens: usage.window_tokens,
+        total_tokens: plan.projected_active_tokens_after,
+        max_context_tokens: plan.context_window_tokens,
+        budget_limit: plan.request_input_limit_tokens,
+        truncation_occurred: false,
+        segments_removed: plan.archive_group_count,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+    });
+    session.reset_model_context_epoch(ModelContextResetReason::Compression);
+    session.updated_at = Utc::now();
+
+    Ok(RetrievalWindowApplyResult {
+        event_id,
+        newly_archived_message_count: plan.archive_message_count,
+        idempotent_replay: false,
+    })
+}
+
+fn validate_apply_plan_arithmetic(
+    plan: &RetrievalWindowCandidatePlan,
+) -> Result<ValidatedRetrievalWindowUsage, RetrievalWindowApplyError> {
+    if plan.message_ids_to_archive.is_empty() {
+        return Err(RetrievalWindowApplyError::EmptyCandidateSet);
+    }
+    if plan.archive_message_count != plan.message_ids_to_archive.len() {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "archive_message_count",
+        });
+    }
+    if plan.archive_group_count == 0 || plan.archive_group_count > plan.archive_message_count {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "archive_group_count",
+        });
+    }
+    if plan.archive_user_turn_count > plan.archive_group_count {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "archive_user_turn_count",
+        });
+    }
+    if plan.active_message_count < plan.archive_message_count {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "active_message_count",
+        });
+    }
+    if !(1..=100).contains(&plan.target_usage_percent) {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "target_usage_percent",
+        });
+    }
+    if plan.context_window_tokens == 0
+        || plan.request_input_limit_tokens == 0
+        || plan.request_input_limit_tokens > plan.context_window_tokens
+    {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "request_input_limit_tokens",
+        });
+    }
+    let expected_target =
+        ((u64::from(plan.context_window_tokens) * u64::from(plan.target_usage_percent)) / 100)
+            .max(1) as u32;
+    let expected_target = expected_target.min(plan.request_input_limit_tokens);
+    if plan.target_tokens != expected_target {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "target_tokens",
+        });
+    }
+    if plan.active_tokens_before <= plan.target_tokens
+        || plan.projected_active_tokens_after > plan.target_tokens
+        || plan.archive_message_tokens == 0
+        || plan
+            .active_tokens_before
+            .checked_sub(plan.archive_message_tokens)
+            != Some(plan.projected_active_tokens_after)
+    {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "active_token_arithmetic",
+        });
+    }
+    if plan.retained_recent_user_turn_count > plan.retained_user_turn_count {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "retained_recent_user_turn_count",
+        });
+    }
+    if plan.protected_active_tokens < plan.system_message_tokens {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "protected_active_tokens",
+        });
+    }
+
+    let system_tokens = plan
+        .fixed_prompt_tokens
+        .checked_add(plan.system_message_tokens)
+        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
+    let protected_with_fixed = plan
+        .fixed_prompt_tokens
+        .checked_add(plan.protected_active_tokens)
+        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
+    if system_tokens > plan.projected_active_tokens_after
+        || protected_with_fixed > plan.projected_active_tokens_after
+    {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "projected_active_tokens_after",
+        });
+    }
+    let window_tokens = plan
+        .projected_active_tokens_after
+        .checked_sub(system_tokens)
+        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
+
+    Ok(ValidatedRetrievalWindowUsage {
+        system_tokens,
+        window_tokens,
+    })
+}
+
+fn resolve_candidate_indexes(
+    session: &Session,
+    plan: &RetrievalWindowCandidatePlan,
+) -> Result<Vec<usize>, RetrievalWindowApplyError> {
+    let mut candidate_ids = HashSet::new();
+    for (index, message_id) in plan.message_ids_to_archive.iter().enumerate() {
+        if message_id.is_empty() {
+            return Err(RetrievalWindowApplyError::EmptyCandidateId { index });
+        }
+        if !candidate_ids.insert(message_id.as_str()) {
+            return Err(RetrievalWindowApplyError::DuplicateCandidateId {
+                message_id: message_id.clone(),
+            });
+        }
+    }
+
+    let mut indexes_by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, message) in session.messages.iter().enumerate() {
+        if candidate_ids.contains(message.id.as_str()) {
+            indexes_by_id
+                .entry(message.id.as_str())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut indexes = Vec::with_capacity(plan.archive_message_count);
+    let mut previous_index = None;
+    for message_id in &plan.message_ids_to_archive {
+        let matches = indexes_by_id
+            .get(message_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let index = match matches {
+            [] => {
+                return Err(RetrievalWindowApplyError::MissingCandidateMessage {
+                    message_id: message_id.clone(),
+                });
+            }
+            [index] => *index,
+            _ => {
+                return Err(RetrievalWindowApplyError::DuplicateSessionMessageId {
+                    message_id: message_id.clone(),
+                });
+            }
+        };
+        if previous_index.is_some_and(|previous| previous >= index) {
+            return Err(RetrievalWindowApplyError::CandidateOrderMismatch {
+                message_id: message_id.clone(),
+            });
+        }
+        previous_index = Some(index);
+        indexes.push(index);
+    }
+    Ok(indexes)
+}
+
+fn usage_percentage(tokens: u32, limit: u32) -> f64 {
+    if limit == 0 {
+        0.0
+    } else {
+        (f64::from(tokens) / f64::from(limit)) * 100.0
+    }
+}
+
+fn validate_active_plan_structure(
+    session: &Session,
+    plan: &RetrievalWindowCandidatePlan,
+) -> Result<(), RetrievalWindowApplyError> {
+    let candidate_ids = plan
+        .message_ids_to_archive
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let (_, mut groups, active_message_count) = build_logical_groups(session);
+    if active_message_count != plan.active_message_count {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "active_message_count",
+        });
+    }
+    if plan.provider_message_token_override_count > active_message_count {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "provider_message_token_override_count",
+        });
+    }
+
+    mark_protocol_safety(&mut groups);
+    let incomplete_protocol_group_count =
+        groups.iter().filter(|group| !group.protocol_safe).count();
+
+    let total_user_turn_count = groups
+        .iter()
+        .filter(|group| group.user_message_id.is_some())
+        .count();
+    if (total_user_turn_count > 0 && plan.retained_recent_user_turn_count == 0)
+        || plan.retained_recent_user_turn_count > total_user_turn_count
+    {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "retained_recent_user_turn_count",
+        });
+    }
+    mark_protected_groups(&mut groups, plan.retained_recent_user_turn_count);
+
+    let mut selected_group_indexes = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        let selected_message_count = group
+            .messages
+            .iter()
+            .filter(|indexed| candidate_ids.contains(indexed.message.id.as_str()))
+            .count();
+        if selected_message_count == 0 {
+            continue;
+        }
+        if selected_message_count != group.messages.len() {
+            return Err(RetrievalWindowApplyError::IncompleteLogicalGroup);
+        }
+        if !group.protocol_safe {
+            return Err(RetrievalWindowApplyError::UnsafeToolProtocol);
+        }
+        if logical_group_has_protected_skill(group) {
+            return Err(RetrievalWindowApplyError::ProtectedSkillChain);
+        }
+        if group.protected {
+            return Err(RetrievalWindowApplyError::RecentUserTurnProtected);
+        }
+        selected_group_indexes.push(group_index);
+    }
+
+    if incomplete_protocol_group_count != plan.incomplete_protocol_group_count {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "incomplete_protocol_group_count",
+        });
+    }
+
+    if selected_group_indexes.len() != plan.archive_group_count {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "archive_group_count",
+        });
+    }
+    let selected_group_index_set = selected_group_indexes
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let selected_ids_in_session_order = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected_group_index_set.contains(index))
+        .flat_map(|(_, group)| group.messages.iter())
+        .map(|indexed| indexed.message.id.as_str())
+        .collect::<Vec<_>>();
+    if selected_ids_in_session_order
+        != plan
+            .message_ids_to_archive
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "candidate_group_order",
+        });
+    }
+
+    let Some(last_selected_group_index) = selected_group_indexes.last().copied() else {
+        return Err(RetrievalWindowApplyError::IncompleteLogicalGroup);
+    };
+    if groups
+        .iter()
+        .enumerate()
+        .take(last_selected_group_index + 1)
+        .any(|(index, group)| !group.protected && !selected_group_index_set.contains(&index))
+    {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "oldest_first_selection",
+        });
+    }
+
+    let archive_user_turn_count = selected_group_indexes
+        .iter()
+        .filter(|index| groups[**index].user_message_id.is_some())
+        .count();
+    if archive_user_turn_count != plan.archive_user_turn_count {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "archive_user_turn_count",
+        });
+    }
+    let retained_user_turn_count = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, group)| {
+            !selected_group_index_set.contains(index) && group.user_message_id.is_some()
+        })
+        .count();
+    if retained_user_turn_count != plan.retained_user_turn_count {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "retained_user_turn_count",
+        });
+    }
+
+    let oldest_retained_message_id = groups
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected_group_index_set.contains(index))
+        .flat_map(|(_, group)| group.messages.iter())
+        .min_by_key(|indexed| indexed.session_index)
+        .map(|indexed| indexed.message.id.as_str());
+    if oldest_retained_message_id != plan.oldest_retained_message_id.as_deref() {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "oldest_retained_message_id",
+        });
+    }
+    let oldest_retained_user_message_id = groups
+        .iter()
+        .enumerate()
+        .find(|(index, group)| {
+            !selected_group_index_set.contains(index) && group.user_message_id.is_some()
+        })
+        .and_then(|(_, group)| group.user_message_id.as_deref());
+    if oldest_retained_user_message_id != plan.oldest_retained_user_message_id.as_deref() {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "oldest_retained_user_message_id",
+        });
+    }
+    Ok(())
+}
+
+fn validate_idempotent_replay(
+    session: &Session,
+    plan: &RetrievalWindowCandidatePlan,
+    candidate_indexes: &[usize],
+) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+    let Some(event_id) = candidate_indexes
+        .first()
+        .and_then(|index| session.messages[*index].compressed_by_event_id.as_deref())
+    else {
+        return Err(RetrievalWindowApplyError::MixedArchiveEvents);
+    };
+    if candidate_indexes
+        .iter()
+        .any(|index| session.messages[*index].compressed_by_event_id.as_deref() != Some(event_id))
+    {
+        return Err(RetrievalWindowApplyError::MixedArchiveEvents);
+    }
+
+    let matching_events = session
+        .compression_events
+        .iter()
+        .filter(|event| event.id == event_id)
+        .collect::<Vec<_>>();
+    let [event] = matching_events.as_slice() else {
+        return Err(RetrievalWindowApplyError::MissingOrDuplicateArchiveEvent {
+            event_id: event_id.to_string(),
+        });
+    };
+    if event.kind != CompressionEventKind::RetrievalWindow {
+        return Err(RetrievalWindowApplyError::ArchiveEventKindConflict {
+            event_id: event_id.to_string(),
+        });
+    }
+
+    let correlated_message_ids = session
+        .messages
+        .iter()
+        .filter(|message| message.compressed_by_event_id.as_deref() == Some(event_id))
+        .map(|message| message.id.as_str())
+        .collect::<Vec<_>>();
+    if correlated_message_ids
+        != plan
+            .message_ids_to_archive
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    {
+        return Err(replay_evidence_mismatch(event_id, "message_correlation"));
+    }
+
+    macro_rules! require_event_evidence {
+        ($actual:expr, $expected:expr, $field:literal) => {
+            if $actual != $expected {
+                return Err(replay_evidence_mismatch(event_id, $field));
+            }
+        };
+    }
+
+    require_event_evidence!(
+        event.messages_compressed,
+        plan.archive_message_count,
+        "messages_compressed"
+    );
+    require_event_evidence!(
+        event.segments_removed,
+        plan.archive_group_count,
+        "segments_removed"
+    );
+    require_event_evidence!(event.summary_tokens, 0, "summary_tokens");
+    require_event_evidence!(event.actual_summary_tokens, 0, "actual_summary_tokens");
+    require_event_evidence!(
+        event.trigger_type,
+        CompressionTriggerType::Auto,
+        "trigger_type"
+    );
+    require_event_evidence!(
+        event.compression_ratio.to_bits(),
+        0.0f64.to_bits(),
+        "compression_ratio"
+    );
+    require_event_evidence!(event.model_used.as_ref(), None, "model_used");
+    require_event_evidence!(event.latency_ms, 0, "latency_ms");
+    require_event_evidence!(
+        event.source_tokens,
+        plan.archive_message_tokens,
+        "source_tokens"
+    );
+    require_event_evidence!(
+        event.fixed_prompt_tokens,
+        plan.fixed_prompt_tokens,
+        "fixed_prompt_tokens"
+    );
+    require_event_evidence!(event.target_summary_tokens, 0, "target_summary_tokens");
+    require_event_evidence!(
+        event.summary_target_ratio.to_bits(),
+        0.0f64.to_bits(),
+        "summary_target_ratio"
+    );
+    require_event_evidence!(
+        event.actual_summary_ratio.to_bits(),
+        0.0f64.to_bits(),
+        "actual_summary_ratio"
+    );
+    require_event_evidence!(
+        event.summary_budget_clamped,
+        false,
+        "summary_budget_clamped"
+    );
+    require_event_evidence!(
+        event.summary_budget_clamp_reason.as_ref(),
+        None,
+        "summary_budget_clamp_reason"
+    );
+    require_event_evidence!(event.summarization_map_calls, 0, "summarization_map_calls");
+    require_event_evidence!(
+        event.summarization_reduce_calls,
+        0,
+        "summarization_reduce_calls"
+    );
+    require_event_evidence!(
+        event.summarization_fallback_used,
+        false,
+        "summarization_fallback_used"
+    );
+    require_event_evidence!(
+        event.retrieval_active_tokens_before,
+        plan.active_tokens_before,
+        "retrieval_active_tokens_before"
+    );
+    require_event_evidence!(
+        event.retrieval_active_message_count_before,
+        plan.active_message_count,
+        "retrieval_active_message_count_before"
+    );
+    require_event_evidence!(
+        event.retrieval_active_tokens_after,
+        plan.projected_active_tokens_after,
+        "retrieval_active_tokens_after"
+    );
+    require_event_evidence!(
+        event.retrieval_target_tokens,
+        plan.target_tokens,
+        "retrieval_target_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_target_usage_percent,
+        plan.target_usage_percent,
+        "retrieval_target_usage_percent"
+    );
+    require_event_evidence!(
+        event.retrieval_archived_group_count,
+        plan.archive_group_count,
+        "retrieval_archived_group_count"
+    );
+    require_event_evidence!(
+        event.retrieval_archived_user_turn_count,
+        plan.archive_user_turn_count,
+        "retrieval_archived_user_turn_count"
+    );
+    require_event_evidence!(
+        event.retrieval_archived_message_tokens,
+        plan.archive_message_tokens,
+        "retrieval_archived_message_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_system_message_tokens,
+        plan.system_message_tokens,
+        "retrieval_system_message_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_context_window_tokens,
+        plan.context_window_tokens,
+        "retrieval_context_window_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_request_input_limit_tokens,
+        plan.request_input_limit_tokens,
+        "retrieval_request_input_limit_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_retained_recent_user_turn_count,
+        plan.retained_recent_user_turn_count,
+        "retrieval_retained_recent_user_turn_count"
+    );
+    require_event_evidence!(
+        event.retrieval_retained_user_turn_count,
+        plan.retained_user_turn_count,
+        "retrieval_retained_user_turn_count"
+    );
+    require_event_evidence!(
+        event.retrieval_oldest_retained_message_id.as_ref(),
+        plan.oldest_retained_message_id.as_ref(),
+        "retrieval_oldest_retained_message_id"
+    );
+    require_event_evidence!(
+        event.retrieval_oldest_retained_user_message_id.as_ref(),
+        plan.oldest_retained_user_message_id.as_ref(),
+        "retrieval_oldest_retained_user_message_id"
+    );
+    require_event_evidence!(
+        event.retrieval_provider_message_token_override_count,
+        plan.provider_message_token_override_count,
+        "retrieval_provider_message_token_override_count"
+    );
+    require_event_evidence!(
+        event.retrieval_protected_active_tokens,
+        plan.protected_active_tokens,
+        "retrieval_protected_active_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_incomplete_protocol_group_count,
+        plan.incomplete_protocol_group_count,
+        "retrieval_incomplete_protocol_group_count"
+    );
+    require_event_evidence!(
+        event.usage_before_percent.to_bits(),
+        usage_percentage(plan.active_tokens_before, plan.context_window_tokens).to_bits(),
+        "usage_before_percent"
+    );
+    require_event_evidence!(
+        event.usage_after_percent.to_bits(),
+        usage_percentage(
+            plan.projected_active_tokens_after,
+            plan.context_window_tokens
+        )
+        .to_bits(),
+        "usage_after_percent"
+    );
+
+    Ok(RetrievalWindowApplyResult {
+        event_id: event_id.to_string(),
+        newly_archived_message_count: 0,
+        idempotent_replay: true,
+    })
+}
+
+fn replay_evidence_mismatch(event_id: &str, field: &'static str) -> RetrievalWindowApplyError {
+    RetrievalWindowApplyError::ArchiveEventEvidenceMismatch {
+        event_id: event_id.to_string(),
+        field,
+    }
 }
 
 fn validate_inputs(
@@ -612,6 +1381,17 @@ fn mark_protocol_safety(groups: &mut [LogicalGroup<'_>]) {
     }
 }
 
+fn logical_group_has_protected_skill(group: &LogicalGroup<'_>) -> bool {
+    group.messages.iter().any(|indexed| {
+        indexed.message.tool_calls.as_ref().is_some_and(|calls| {
+            calls.iter().any(|call| {
+                let tool_name = canonical_tool_name(&call.function.name);
+                matches!(tool_name.as_str(), "load_skill" | "read_skill_resource")
+            })
+        })
+    })
+}
+
 fn mark_protected_groups(groups: &mut [LogicalGroup<'_>], min_recent_user_turns: usize) {
     for group in groups.iter_mut() {
         group.protected = !group.protocol_safe
@@ -619,14 +1399,7 @@ fn mark_protected_groups(groups: &mut [LogicalGroup<'_>], min_recent_user_turns:
                 .messages
                 .iter()
                 .any(|indexed| indexed.message.never_compress)
-            || group.messages.iter().any(|indexed| {
-                indexed.message.tool_calls.as_ref().is_some_and(|calls| {
-                    calls.iter().any(|call| {
-                        let tool_name = canonical_tool_name(&call.function.name);
-                        matches!(tool_name.as_str(), "load_skill" | "read_skill_resource")
-                    })
-                })
-            });
+            || logical_group_has_protected_skill(group);
     }
 
     let user_group_indexes = groups
@@ -645,7 +1418,10 @@ fn mark_protected_groups(groups: &mut [LogicalGroup<'_>], min_recent_user_turns:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{FunctionCall, ToolCall};
+    use bamboo_domain::{
+        provider_transcript_boundary_sha256, ConversationSummary, FunctionCall, ModelContextState,
+        ProviderFamily, ProviderProtocol, ProviderTranscriptResetReason, ToolCall,
+    };
 
     #[derive(Debug)]
     struct CharacterTokenCounter;
@@ -714,6 +1490,44 @@ mod tests {
         session.add_message(assistant(&format!("{prefix}-a"), tokens_per_message));
     }
 
+    fn basic_session_and_plan() -> (Session, RetrievalWindowCandidatePlan) {
+        let mut session = Session::new("retrieval-window-apply", "test-model");
+        session.add_message(system("system", 5));
+        for turn in 1..=4 {
+            add_turn(&mut session, &format!("t{turn}"), 10);
+        }
+        let plan = plan_with_counter(&session, 50, 2, 5).expect("plan should build");
+        (session, plan)
+    }
+
+    fn safe_tool_session_and_plan() -> (Session, RetrievalWindowCandidatePlan) {
+        let mut session = Session::new("retrieval-window-apply-tool", "test-model");
+        session.add_message(system("system", 5));
+        session.add_message(user("old-u", 5));
+        session.add_message(tool_call("old-call-1", "call-1", 5, "Read"));
+        session.add_message(tool_result("old-result-1", "call-1", 5));
+        session.add_message(tool_call("old-call-2", "call-2", 5, "Grep"));
+        session.add_message(tool_result("old-result-2", "call-2", 5));
+        session.add_message(assistant("old-final", 5));
+        add_turn(&mut session, "recent", 10);
+        let plan = plan_with_counter(&session, 50, 1, 0).expect("tool plan should build");
+        (session, plan)
+    }
+
+    fn assert_apply_error_without_mutation(
+        session: &mut Session,
+        plan: &RetrievalWindowCandidatePlan,
+        expected: RetrievalWindowApplyError,
+    ) {
+        let before = serde_json::to_vec(session).expect("session should serialize");
+        assert_eq!(apply_retrieval_window_plan(session, plan), Err(expected));
+        assert_eq!(
+            serde_json::to_vec(session).expect("session should serialize"),
+            before,
+            "failed application must not mutate durable session state"
+        );
+    }
+
     fn plan_with_counter(
         session: &Session,
         target_usage_percent: u8,
@@ -763,12 +1577,17 @@ mod tests {
             first.message_ids_to_archive,
             vec!["t1-u", "t1-a", "t2-u", "t2-a"]
         );
+        assert_eq!(first.archive_message_count, 4);
         assert_eq!(first.archive_group_count, 2);
         assert_eq!(first.archive_user_turn_count, 2);
         assert_eq!(first.archive_message_tokens, 40);
+        assert_eq!(first.active_message_count, 9);
         assert_eq!(first.active_tokens_before, 90);
         assert_eq!(first.projected_active_tokens_after, 50);
+        assert_eq!(first.context_window_tokens, 100);
+        assert_eq!(first.request_input_limit_tokens, 100);
         assert_eq!(first.fixed_prompt_tokens, 5);
+        assert_eq!(first.system_message_tokens, 5);
         assert_eq!(first.protected_active_tokens, 45);
         assert_eq!(first.retained_recent_user_turn_count, 2);
         assert_eq!(first.retained_user_turn_count, 2);
@@ -1086,6 +1905,412 @@ mod tests {
                 active_tokens: 45,
                 target_tokens: 50,
             })
+        );
+    }
+
+    #[test]
+    fn applies_summary_free_boundary_and_exact_replay_is_a_noop() {
+        let (mut session, plan) = basic_session_and_plan();
+        let transcript_before = session
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.id.clone(),
+                    message.role.clone(),
+                    message.content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        session.model_context_state = Some(ModelContextState {
+            prefix_epoch: 7,
+            cache_scope_sha256: Some("prepared-scope".to_string()),
+            ..ModelContextState::default()
+        });
+        let provider_boundary =
+            provider_transcript_boundary_sha256(Some("provider-a"), Some("openai"))
+                .expect("provider boundary");
+        session
+            .activate_provider_transcript_route(
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                &provider_boundary,
+            )
+            .expect("route should activate");
+        let model_epoch_before = session
+            .model_context_state
+            .as_ref()
+            .expect("model context")
+            .prefix_epoch;
+        let provider_epoch_before = session.provider_transcript.epoch();
+
+        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+
+        assert!(!result.idempotent_replay);
+        assert_eq!(result.newly_archived_message_count, 4);
+        assert_eq!(session.messages.len(), transcript_before.len());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.id.clone(),
+                        message.role.clone(),
+                        message.content.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            transcript_before,
+            "archive flags must not rewrite authoritative transcript content or order"
+        );
+        assert!(session.conversation_summary.is_none());
+        assert_eq!(session.compression_events.len(), 1);
+
+        let event = &session.compression_events[0];
+        assert_eq!(event.id, result.event_id);
+        assert_eq!(event.kind, CompressionEventKind::RetrievalWindow);
+        assert_eq!(event.messages_compressed, 4);
+        assert_eq!(event.segments_removed, 2);
+        assert_eq!(event.summary_tokens, 0);
+        assert_eq!(event.actual_summary_tokens, 0);
+        assert!(event.model_used.is_none());
+        assert_eq!(event.retrieval_active_tokens_before, 90);
+        assert_eq!(event.retrieval_active_message_count_before, 9);
+        assert_eq!(event.retrieval_active_tokens_after, 50);
+        assert_eq!(event.retrieval_target_tokens, 50);
+        assert_eq!(event.retrieval_archived_message_tokens, 40);
+        assert_eq!(event.retrieval_system_message_tokens, 5);
+        assert_eq!(event.retrieval_context_window_tokens, 100);
+        assert_eq!(event.retrieval_request_input_limit_tokens, 100);
+
+        let archived_ids = plan
+            .message_ids_to_archive
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for message in &session.messages {
+            if archived_ids.contains(message.id.as_str()) {
+                assert!(message.compressed);
+                assert_eq!(
+                    message.compressed_by_event_id.as_deref(),
+                    Some(result.event_id.as_str())
+                );
+            } else {
+                assert!(!message.compressed);
+                assert!(message.compressed_by_event_id.is_none());
+            }
+        }
+
+        let usage = session.token_usage.as_ref().expect("token usage snapshot");
+        assert_eq!(usage.system_tokens, 10);
+        assert_eq!(usage.summary_tokens, 0);
+        assert_eq!(usage.window_tokens, 40);
+        assert_eq!(usage.total_tokens, 50);
+        assert_eq!(usage.max_context_tokens, 100);
+        assert_eq!(usage.budget_limit, 100);
+        assert_eq!(usage.segments_removed, 2);
+
+        assert_eq!(
+            session
+                .model_context_state
+                .as_ref()
+                .expect("model context")
+                .prefix_epoch,
+            model_epoch_before + 1
+        );
+        assert_eq!(
+            session.provider_transcript.epoch(),
+            provider_epoch_before + 1
+        );
+        assert_eq!(
+            session.provider_transcript.last_reset_reason(),
+            Some(ProviderTranscriptResetReason::Compression)
+        );
+
+        let round_trip: Session = serde_json::from_slice(
+            &serde_json::to_vec(&session).expect("session should serialize"),
+        )
+        .expect("session should deserialize");
+        assert_eq!(
+            round_trip.compression_events[0].kind,
+            CompressionEventKind::RetrievalWindow
+        );
+        assert_eq!(
+            round_trip.compression_events[0].retrieval_active_tokens_after,
+            50
+        );
+
+        let serialized_after_first =
+            serde_json::to_vec(&session).expect("session should serialize");
+        let model_epoch_after_first = session
+            .model_context_state
+            .as_ref()
+            .expect("model context")
+            .prefix_epoch;
+        let provider_epoch_after_first = session.provider_transcript.epoch();
+        let replay = apply_retrieval_window_plan(&mut session, &plan)
+            .expect("exact replay should be idempotent");
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.event_id, result.event_id);
+        assert_eq!(replay.newly_archived_message_count, 0);
+        assert_eq!(
+            serde_json::to_vec(&session).expect("session should serialize"),
+            serialized_after_first
+        );
+        assert_eq!(
+            session
+                .model_context_state
+                .as_ref()
+                .expect("model context")
+                .prefix_epoch,
+            model_epoch_after_first
+        );
+        assert_eq!(
+            session.provider_transcript.epoch(),
+            provider_epoch_after_first
+        );
+    }
+
+    #[test]
+    fn later_plan_archives_additional_groups_without_reassigning_old_messages() {
+        let (mut session, first_plan) = basic_session_and_plan();
+        let first = apply_retrieval_window_plan(&mut session, &first_plan)
+            .expect("first plan should apply");
+        add_turn(&mut session, "t5", 10);
+        add_turn(&mut session, "t6", 10);
+
+        let second_plan = plan_with_counter(&session, 50, 2, 5).expect("second plan should build");
+        assert_eq!(
+            second_plan.message_ids_to_archive,
+            vec!["t3-u", "t3-a", "t4-u", "t4-a"]
+        );
+        let second = apply_retrieval_window_plan(&mut session, &second_plan)
+            .expect("second plan should apply");
+
+        assert_ne!(second.event_id, first.event_id);
+        assert_eq!(session.compression_events.len(), 2);
+        for message_id in &first_plan.message_ids_to_archive {
+            let message = session
+                .messages
+                .iter()
+                .find(|message| &message.id == message_id)
+                .expect("first message remains exact");
+            assert_eq!(
+                message.compressed_by_event_id.as_deref(),
+                Some(first.event_id.as_str())
+            );
+        }
+        for message_id in &second_plan.message_ids_to_archive {
+            let message = session
+                .messages
+                .iter()
+                .find(|message| &message.id == message_id)
+                .expect("second message remains exact");
+            assert_eq!(
+                message.compressed_by_event_id.as_deref(),
+                Some(second.event_id.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn missing_duplicate_system_and_never_compress_candidates_fail_transactionally() {
+        let (mut session, mut plan) = basic_session_and_plan();
+        plan.message_ids_to_archive[0] = "missing".to_string();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::MissingCandidateMessage {
+                message_id: "missing".to_string(),
+            },
+        );
+
+        let (mut session, mut plan) = basic_session_and_plan();
+        plan.message_ids_to_archive[1] = plan.message_ids_to_archive[0].clone();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::DuplicateCandidateId {
+                message_id: "t1-u".to_string(),
+            },
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "t4-a")
+            .expect("retained message")
+            .id = "t1-u".to_string();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::DuplicateSessionMessageId {
+                message_id: "t1-u".to_string(),
+            },
+        );
+
+        let (mut session, mut plan) = basic_session_and_plan();
+        plan.message_ids_to_archive[0] = "system".to_string();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::SystemMessageCandidate {
+                message_id: "system".to_string(),
+            },
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "t1-u")
+            .expect("candidate message")
+            .never_compress = true;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::NeverCompressCandidate {
+                message_id: "t1-u".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn inconsistent_summary_and_stale_plans_fail_before_mutation() {
+        let (mut session, mut plan) = basic_session_and_plan();
+        plan.archive_message_tokens += 1;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::InconsistentPlan {
+                field: "active_token_arithmetic",
+            },
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        session.conversation_summary = Some(ConversationSummary::new("existing", 1, 1));
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::PreExistingConversationSummary,
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        add_turn(&mut session, "newer", 10);
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::StalePlan {
+                invariant: "active_message_count",
+            },
+        );
+    }
+
+    #[test]
+    fn incomplete_tool_and_skill_groups_fail_before_mutation() {
+        let (mut session, mut plan) = basic_session_and_plan();
+        plan.message_ids_to_archive.remove(1);
+        plan.archive_message_count -= 1;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::IncompleteLogicalGroup,
+        );
+
+        let (mut session, plan) = safe_tool_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "old-result-1")
+            .expect("tool result")
+            .tool_call_id = Some("wrong-call".to_string());
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::UnsafeToolProtocol,
+        );
+
+        let (mut session, plan) = safe_tool_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "old-call-1")
+            .and_then(|message| message.tool_calls.as_mut())
+            .and_then(|calls| calls.first_mut())
+            .expect("tool call")
+            .function
+            .name = "namespace::load_skill".to_string();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::ProtectedSkillChain,
+        );
+    }
+
+    #[test]
+    fn partial_mixed_and_wrong_strategy_replays_are_typed_conflicts() {
+        let (mut session, plan) = basic_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "t1-u")
+            .expect("candidate")
+            .compressed = true;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::PartialApplication,
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "t1-a")
+            .expect("candidate")
+            .compressed_by_event_id = Some("different-event".to_string());
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::MixedArchiveEvents,
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        session.compression_events[0].kind = CompressionEventKind::Summary;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::ArchiveEventKindConflict {
+                event_id: result.event_id,
+            },
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        session.compression_events.clear();
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::MissingOrDuplicateArchiveEvent {
+                event_id: result.event_id,
+            },
+        );
+
+        let (mut session, plan) = basic_session_and_plan();
+        let result = apply_retrieval_window_plan(&mut session, &plan).expect("plan should apply");
+        session.compression_events[0].retrieval_target_tokens += 1;
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::ArchiveEventEvidenceMismatch {
+                event_id: result.event_id,
+                field: "retrieval_target_tokens",
+            },
         );
     }
 

@@ -135,6 +135,14 @@ fn is_zero(value: &u8) -> bool {
     *value == 0
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
@@ -458,11 +466,25 @@ pub enum CompressionTriggerType {
     CriticalOverflow,
 }
 
+/// Durable strategy that produced a context-compression event.
+///
+/// `Summary` is the compatibility default for events written before the
+/// discriminator existed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionEventKind {
+    #[default]
+    Summary,
+    RetrievalWindow,
+}
+
 /// Persistent context-compression event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressionEvent {
     pub id: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub kind: CompressionEventKind,
     pub messages_compressed: usize,
     pub segments_removed: usize,
     #[serde(default)]
@@ -511,6 +533,46 @@ pub struct CompressionEvent {
     pub summarization_reduce_calls: u32,
     #[serde(default)]
     pub summarization_fallback_used: bool,
+    /// Exact active input tokens before a summary-free retrieval-window
+    /// boundary. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_active_tokens_before: u32,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_active_message_count_before: usize,
+    /// Exact active input tokens after a summary-free retrieval-window
+    /// boundary. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_active_tokens_after: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_target_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retrieval_target_usage_percent: u8,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_archived_group_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_archived_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_archived_message_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_system_message_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_context_window_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_request_input_limit_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_retained_recent_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_retained_user_turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_oldest_retained_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_oldest_retained_user_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_provider_message_token_override_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_protected_active_tokens: u32,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_incomplete_protocol_group_count: usize,
 }
 
 impl CompressionEvent {
@@ -529,6 +591,7 @@ impl CompressionEvent {
         Self {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now(),
+            kind: CompressionEventKind::Summary,
             messages_compressed,
             segments_removed,
             usage_before_percent,
@@ -549,6 +612,24 @@ impl CompressionEvent {
             summarization_map_calls: 0,
             summarization_reduce_calls: 0,
             summarization_fallback_used: false,
+            retrieval_active_tokens_before: 0,
+            retrieval_active_message_count_before: 0,
+            retrieval_active_tokens_after: 0,
+            retrieval_target_tokens: 0,
+            retrieval_target_usage_percent: 0,
+            retrieval_archived_group_count: 0,
+            retrieval_archived_user_turn_count: 0,
+            retrieval_archived_message_tokens: 0,
+            retrieval_system_message_tokens: 0,
+            retrieval_context_window_tokens: 0,
+            retrieval_request_input_limit_tokens: 0,
+            retrieval_retained_recent_user_turn_count: 0,
+            retrieval_retained_user_turn_count: 0,
+            retrieval_oldest_retained_message_id: None,
+            retrieval_oldest_retained_user_message_id: None,
+            retrieval_provider_message_token_override_count: 0,
+            retrieval_protected_active_tokens: 0,
+            retrieval_incomplete_protocol_group_count: 0,
         }
     }
 }
@@ -1634,6 +1715,9 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: CompressionEvent = serde_json::from_str(&json).unwrap();
 
+        assert!(json.contains("\"kind\":\"summary\""));
+        assert!(!json.contains("retrieval_"));
+        assert_eq!(back.kind, CompressionEventKind::Summary);
         assert_eq!(back.messages_compressed, 42);
         assert_eq!(back.segments_removed, 10);
         assert!((back.usage_before_percent - 92.5).abs() < 0.01);
@@ -1690,9 +1774,79 @@ mod tests {
         }"#;
         let event: CompressionEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.trigger_type, CompressionTriggerType::Auto); // default
+        assert_eq!(event.kind, CompressionEventKind::Summary); // default
         assert_eq!(event.compression_ratio, 0.0); // default
         assert!(event.model_used.is_none()); // default
         assert_eq!(event.latency_ms, 0); // default
+        assert_eq!(event.retrieval_active_tokens_before, 0);
+        assert_eq!(event.retrieval_request_input_limit_tokens, 0);
+        assert!(event.retrieval_oldest_retained_message_id.is_none());
+    }
+
+    #[test]
+    fn retrieval_window_compression_event_roundtrips_with_distinct_kind() {
+        let mut event = CompressionEvent::new(
+            4,
+            2,
+            80.0,
+            40.0,
+            0,
+            CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = CompressionEventKind::RetrievalWindow;
+        event.source_tokens = 400;
+        event.fixed_prompt_tokens = 50;
+        event.retrieval_active_tokens_before = 1_000;
+        event.retrieval_active_message_count_before = 8;
+        event.retrieval_active_tokens_after = 600;
+        event.retrieval_target_tokens = 640;
+        event.retrieval_target_usage_percent = 50;
+        event.retrieval_archived_group_count = 2;
+        event.retrieval_archived_user_turn_count = 2;
+        event.retrieval_archived_message_tokens = 400;
+        event.retrieval_system_message_tokens = 100;
+        event.retrieval_context_window_tokens = 1_280;
+        event.retrieval_request_input_limit_tokens = 1_024;
+        event.retrieval_retained_recent_user_turn_count = 1;
+        event.retrieval_retained_user_turn_count = 1;
+        event.retrieval_oldest_retained_message_id = Some("user-3".to_string());
+        event.retrieval_oldest_retained_user_message_id = Some("user-3".to_string());
+        event.retrieval_provider_message_token_override_count = 1;
+        event.retrieval_protected_active_tokens = 300;
+        event.retrieval_incomplete_protocol_group_count = 1;
+
+        let json = serde_json::to_string(&event).unwrap();
+        let back: CompressionEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.kind, CompressionEventKind::RetrievalWindow);
+        assert_eq!(back.summary_tokens, 0);
+        assert_eq!(back.retrieval_active_tokens_before, 1_000);
+        assert_eq!(back.retrieval_active_message_count_before, 8);
+        assert_eq!(back.retrieval_active_tokens_after, 600);
+        assert_eq!(back.retrieval_target_tokens, 640);
+        assert_eq!(back.retrieval_target_usage_percent, 50);
+        assert_eq!(back.retrieval_archived_group_count, 2);
+        assert_eq!(back.retrieval_archived_user_turn_count, 2);
+        assert_eq!(back.retrieval_archived_message_tokens, 400);
+        assert_eq!(back.retrieval_system_message_tokens, 100);
+        assert_eq!(back.retrieval_context_window_tokens, 1_280);
+        assert_eq!(back.retrieval_request_input_limit_tokens, 1_024);
+        assert_eq!(back.retrieval_retained_recent_user_turn_count, 1);
+        assert_eq!(back.retrieval_retained_user_turn_count, 1);
+        assert_eq!(
+            back.retrieval_oldest_retained_message_id.as_deref(),
+            Some("user-3")
+        );
+        assert_eq!(
+            back.retrieval_oldest_retained_user_message_id.as_deref(),
+            Some("user-3")
+        );
+        assert_eq!(back.retrieval_provider_message_token_override_count, 1);
+        assert_eq!(back.retrieval_protected_active_tokens, 300);
+        assert_eq!(back.retrieval_incomplete_protocol_group_count, 1);
     }
 
     #[test]
