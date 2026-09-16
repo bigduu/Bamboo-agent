@@ -352,6 +352,24 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// Atomically commit one permanently rejected `archive_context` result.
+    ///
+    /// This boundary permits only the correlated Tool result rewrite, the
+    /// bounded consumed/rejection metadata, and the provider/model-context
+    /// reset required to make that rewrite visible. Implementations compare
+    /// `expected_base` under their per-session lock and return `Rebased`
+    /// without writing when the durable transcript changed concurrently.
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support manual archive-rejection checkpoints",
+        ))
+    }
+
     /// Load the latest runtime-visible session snapshot when the persistence
     /// implementation can coordinate reads. Tools may update a repository-owned
     /// clone while an agent loop holds its own live Session; the loop uses this
@@ -491,6 +509,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<RetrievalWindowCheckpointOutcome> {
         (**self)
             .checkpoint_prompt_rewrite(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_manual_archive_rejection(expected_base, staged)
             .await
     }
 

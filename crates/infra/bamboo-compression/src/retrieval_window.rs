@@ -306,6 +306,32 @@ pub fn build_retrieval_window_candidate_plan_with_token_accounting(
         budget,
         policy,
         accounting,
+        false,
+        &TiktokenTokenCounter::default(),
+    )
+}
+
+/// Build an emergency plan after the provider has already rejected the
+/// request for overflowing its context window.
+///
+/// Provider tokenization and hidden request overhead can make that rejection
+/// authoritative even when Bamboo's local projection is below the configured
+/// target. In that case, lower the one-shot target just enough to require at
+/// least one otherwise-eligible oldest group. The configured percentage is
+/// still recorded for observability; `target_tokens` records the actual
+/// emergency target used by this plan.
+pub fn build_retrieval_window_critical_overflow_plan_with_token_accounting(
+    session: &Session,
+    budget: &TokenBudget,
+    policy: RetrievalWindowPolicy,
+    accounting: &RetrievalWindowTokenAccounting,
+) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
+    build_retrieval_window_candidate_plan_with_counter(
+        session,
+        budget,
+        policy,
+        accounting,
+        true,
         &TiktokenTokenCounter::default(),
     )
 }
@@ -315,6 +341,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
     accounting: &RetrievalWindowTokenAccounting,
+    force_archive_after_provider_overflow: bool,
     counter: &impl TokenCounter,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
     validate_inputs(budget, policy)?;
@@ -337,8 +364,15 @@ fn build_retrieval_window_candidate_plan_with_counter(
     let active_tokens_before = post_boundary_active_tokens
         .checked_add(accounting.boundary_reclaimable_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
-    let target_tokens =
+    let configured_target_tokens =
         effective_retrieval_window_target_tokens(budget, policy.target_usage_percent);
+    let target_tokens = if force_archive_after_provider_overflow
+        && active_tokens_before <= configured_target_tokens
+    {
+        active_tokens_before.saturating_sub(1)
+    } else {
+        configured_target_tokens
+    };
 
     if active_tokens_before <= target_tokens {
         return Err(RetrievalWindowPlanError::TargetAlreadySatisfied {
@@ -696,7 +730,11 @@ fn validate_apply_plan_arithmetic(
         plan.request_input_limit_tokens,
         plan.target_usage_percent,
     );
-    if plan.target_tokens != expected_target {
+    // Critical provider-overflow recovery may use a lower one-shot target to
+    // force removal of one eligible old group when provider-side accounting
+    // has already disproved the local estimate. It may never relax the
+    // configured target.
+    if plan.target_tokens > expected_target {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_tokens",
         });
@@ -1821,6 +1859,7 @@ mod tests {
             &budget(100),
             policy(min_recent_user_turns, target_usage_percent),
             accounting,
+            false,
             &CharacterTokenCounter,
         )
     }
@@ -2189,6 +2228,7 @@ mod tests {
                 &budget(100),
                 policy(0, 50),
                 &RetrievalWindowTokenAccounting::default(),
+                false,
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidRecentUserTurnFloor)
@@ -2199,6 +2239,7 @@ mod tests {
                 &budget(100),
                 policy(1, 0),
                 &RetrievalWindowTokenAccounting::default(),
+                false,
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidTargetUsagePercent {
@@ -2212,6 +2253,39 @@ mod tests {
                 target_tokens: 50,
             })
         );
+    }
+
+    #[test]
+    fn critical_provider_overflow_forces_one_old_group_below_configured_target() {
+        let mut session = Session::new("retrieval-window-provider-overflow", "test-model");
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "one", 10);
+        add_turn(&mut session, "two", 10);
+
+        let plan = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(100),
+            policy(1, 50),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect("provider overflow must override a locally satisfied target");
+
+        assert_eq!(plan.active_tokens_before, 45);
+        assert_eq!(plan.target_tokens, 44);
+        assert_eq!(plan.archive_group_count, 1);
+        assert!(plan.projected_active_tokens_after <= plan.target_tokens);
+        let mut committed = session;
+        apply_retrieval_window_plan(
+            &mut committed,
+            &plan,
+            policy(1, 50),
+            &budget(100),
+            &RetrievalWindowTokenAccounting::default(),
+        )
+        .expect("the sealed emergency target must remain valid at application");
+        assert!(committed.messages.iter().any(|message| message.compressed));
     }
 
     #[test]

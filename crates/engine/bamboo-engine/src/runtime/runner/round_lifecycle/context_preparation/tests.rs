@@ -16,9 +16,9 @@ use bamboo_agent_core::{
     AgentEvent, AgentHook, CompressionTriggerType, Message, Role, Session, TokenBudgetUsage,
 };
 use bamboo_compression::{
-    build_retrieval_window_candidate_plan_with_token_accounting, BudgetStrategy,
-    RetrievalWindowPlanError, RetrievalWindowPolicy, TiktokenTokenCounter, TokenBudget,
-    TokenCounter,
+    build_retrieval_window_candidate_plan_with_token_accounting,
+    effective_retrieval_window_target_tokens, BudgetStrategy, RetrievalWindowPlanError,
+    RetrievalWindowPolicy, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
 use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
@@ -138,6 +138,15 @@ impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
         self.checkpoint_retrieval_window(expected_base, staged)
             .await
     }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_retrieval_window(expected_base, staged)
+            .await
+    }
 }
 
 struct DurableBaseCheckingPersistence {
@@ -224,6 +233,14 @@ impl RuntimeSessionPersistence for DurableBaseCheckingPersistence {
         }
         *durable = staged.clone();
         Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_prompt_rewrite(expected_base, staged).await
     }
 }
 
@@ -4566,6 +4583,73 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     );
     assert!(!session.compression_events.is_empty());
     assert!(session.messages.iter().any(|m| m.compressed));
+}
+
+#[tokio::test]
+async fn retrieval_window_provider_overflow_archives_below_local_target_without_fallback() {
+    let mut session = Session::new("retrieval-provider-overflow-below-target", "test-model");
+    session.messages.push(Message::system("retrieval system"));
+    for index in 0..4 {
+        session.messages.push(Message::user(format!(
+            "old user turn {index} {}",
+            "small historical evidence ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "old assistant turn {index} {}",
+                "small historical response ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        200_000,
+        0,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    config
+        .context_management
+        .retrieval_window
+        .target_usage_ratio = 0.90;
+    config.context_management.retrieval_window.fallback_strategy =
+        ContextManagementFallbackStrategy::None;
+    let (llm, _) = recording_llm();
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-provider-overflow-below-target",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect("an actual provider overflow must force one retrieval archive");
+
+    assert!(applied);
+    assert_eq!(checkpoints.lock().expect("checkpoint list").len(), 1);
+    let event = session
+        .compression_events
+        .last()
+        .expect("critical retrieval boundary");
+    let configured_target = effective_retrieval_window_target_tokens(
+        session.token_budget.as_ref().expect("budget"),
+        config.context_management.retrieval_target_usage_percent(),
+    );
+    assert!(event.retrieval_active_tokens_before <= configured_target);
+    assert!(event.retrieval_target_tokens < event.retrieval_active_tokens_before);
+    assert_eq!(event.retrieval_archived_group_count, 1);
+    assert_eq!(event.trigger_type, CompressionTriggerType::CriticalOverflow);
+    assert!(session.messages.iter().any(|message| message.compressed));
+    assert!(session.conversation_summary.is_none());
 }
 
 /// Integration test: multi-round compress → build pressure → re-expose → compress again.

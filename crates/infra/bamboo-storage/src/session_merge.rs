@@ -68,6 +68,11 @@ const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
 ];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
+const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
+    "context_management.last_manual_archive_occurrence.v1";
+const MANUAL_ARCHIVE_REJECTIONS_KEY: &str = "context_management.manual_archive_rejections.v1";
+const MAX_MANUAL_ARCHIVE_REJECTIONS: usize = 64;
+const RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
 
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
@@ -823,6 +828,42 @@ impl LockedSessionStore {
         Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 
+    /// Commit one bounded `archive_context` rejection rewrite.
+    ///
+    /// Unlike the append-safe runtime checkpoint, this preserves the staged
+    /// Tool result content while fencing the write with the exact durable base.
+    pub async fn checkpoint_manual_archive_rejection_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_manual_archive_rejection_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = latest.clone();
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
     /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
@@ -1366,6 +1407,15 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             .await
     }
 
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_manual_archive_rejection_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
@@ -1486,6 +1536,167 @@ fn message_matches_retrieval_window_base(
 
 fn invalid_retrieval_window_checkpoint(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_staged_manual_archive_rejection_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let occurrence = staged
+        .metadata
+        .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint is missing its consumed occurrence",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<ResponseOccurrence>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-rejection checkpoint has an invalid consumed occurrence: {error}"
+                ))
+            })
+        })?;
+    let result_index = expected
+        .messages
+        .iter()
+        .position(|message| {
+            message.id == occurrence.tool_result_message_id
+                && message.tool_call_id.as_deref() == Some(occurrence.tool_call_id.as_str())
+                && matches!(message.role, bamboo_domain::Role::Tool)
+        })
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint occurrence does not identify a Tool result",
+            )
+        })?;
+    let before = &expected.messages[result_index];
+    let after = &staged.messages[result_index];
+    let rejection_reason = after
+        .content
+        .strip_prefix("archive_context rejected: ")
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint has an invalid Tool result message",
+            )
+        })?;
+    if after.tool_success != Some(false)
+        || (before.content == after.content && before.tool_success == after.tool_success)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint did not reject the Tool result",
+        ));
+    }
+
+    let correlated_archive_call = expected.messages[..result_index]
+        .iter()
+        .rev()
+        .find(|message| !matches!(message.role, bamboo_domain::Role::Tool))
+        .filter(|message| matches!(message.role, bamboo_domain::Role::Assistant))
+        .and_then(|message| message.tool_calls.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|call| {
+            call.id == occurrence.tool_call_id
+                && bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
+        });
+    if !correlated_archive_call {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint is not correlated to the current archive_context batch",
+        ));
+    }
+
+    let staged_rejections = staged
+        .metadata
+        .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+        .ok_or_else(|| {
+            invalid_retrieval_window_checkpoint(
+                "manual archive-rejection checkpoint is missing its rejection ledger",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_str::<Vec<serde_json::Value>>(value).map_err(|error| {
+                invalid_retrieval_window_checkpoint(format!(
+                    "manual archive-rejection checkpoint has an invalid rejection ledger: {error}"
+                ))
+            })
+        })?;
+    let occurrence_value = serde_json::to_value(&occurrence)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some(last_rejection) = staged_rejections.last() else {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint has an empty rejection ledger",
+        ));
+    };
+    if last_rejection.get("occurrence") != Some(&occurrence_value)
+        || last_rejection
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            != Some(rejection_reason)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint ledger does not match its Tool result",
+        ));
+    }
+    let mut expected_rejections = expected
+        .metadata
+        .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+        .and_then(|value| serde_json::from_str::<Vec<serde_json::Value>>(value).ok())
+        .unwrap_or_default();
+    expected_rejections.retain(|rejection| rejection.get("occurrence") != Some(&occurrence_value));
+    expected_rejections.push(last_rejection.clone());
+    if expected_rejections.len() > MAX_MANUAL_ARCHIVE_REJECTIONS {
+        expected_rejections.drain(..expected_rejections.len() - MAX_MANUAL_ARCHIVE_REJECTIONS);
+    }
+    if expected_rejections != staged_rejections {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint rewrote unrelated rejection-ledger entries",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    canonical.messages[result_index]
+        .content
+        .clone_from(&after.content);
+    canonical.messages[result_index].tool_success = Some(false);
+    canonical.metadata.insert(
+        LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+        staged
+            .metadata
+            .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+            .expect("validated occurrence metadata")
+            .clone(),
+    );
+    canonical.metadata.insert(
+        MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
+        staged
+            .metadata
+            .get(MANUAL_ARCHIVE_REJECTIONS_KEY)
+            .expect("validated rejection metadata")
+            .clone(),
+    );
+    canonical
+        .metadata
+        .remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    canonical
+        .reset_model_context_epoch(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "manual archive-rejection checkpoint contains mutations outside the correlated Tool result, bounded metadata, and provider reset",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_prompt_rewrite_transition(
@@ -3934,6 +4145,103 @@ mod tests {
         assert_eq!(staged.messages[0].content, expected.messages[0].content);
         assert_eq!(staged.messages[1].id, "prompt-rewrite-concurrent-suffix");
         assert!(staged.model_context_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_archive_rejection_checkpoint_persists_the_rewritten_tool_result() {
+        use bamboo_domain::{FunctionCall, Message, ToolCall};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "manual-archive-rejection-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::user("archive older context"));
+        let mut assistant = Message::assistant("", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "archive-call".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "archive_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        expected.add_message(assistant);
+        let mut result = Message::tool_result("archive-call", "Retrieval-window archive requested");
+        result.id = "archive-result".to_string();
+        result.tool_success = Some(true);
+        expected.add_message(result);
+        expected.metadata.insert(
+            RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+            "response-before-rejection".to_string(),
+        );
+        storage.save_session(&expected).await.unwrap();
+
+        let occurrence = ResponseOccurrence {
+            tool_call_id: "archive-call".to_string(),
+            tool_result_message_id: "archive-result".to_string(),
+            permission_generation: None,
+        };
+        let reason = "no eligible active logical group can be archived";
+        let mut staged = expected.clone();
+        let staged_result = staged
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "archive-result")
+            .unwrap();
+        staged_result.tool_success = Some(false);
+        staged_result.content = format!("archive_context rejected: {reason}");
+        staged.metadata.insert(
+            LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+            serde_json::to_string(&occurrence).unwrap(),
+        );
+        staged.metadata.insert(
+            MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
+            serde_json::to_string(&vec![serde_json::json!({
+                "occurrence": occurrence,
+                "reason": reason,
+            })])
+            .unwrap(),
+        );
+        staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let outcome = store
+            .checkpoint_manual_archive_rejection_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        let saved_result = saved
+            .messages
+            .iter()
+            .find(|message| message.id == "archive-result")
+            .unwrap();
+        assert_eq!(saved_result.tool_success, Some(false));
+        assert_eq!(
+            saved_result.content,
+            "archive_context rejected: no eligible active logical group can be archived"
+        );
+        assert!(saved
+            .metadata
+            .contains_key(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY));
+        assert!(saved.metadata.contains_key(MANUAL_ARCHIVE_REJECTIONS_KEY));
+        assert!(!saved
+            .metadata
+            .contains_key(RESPONSES_PREVIOUS_RESPONSE_ID_KEY));
+        assert_eq!(
+            saved
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
+        );
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&staged).unwrap()
+        );
     }
 
     #[tokio::test]

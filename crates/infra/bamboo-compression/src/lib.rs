@@ -45,6 +45,7 @@ pub use retrieval_window::{
     apply_retrieval_window_plan, apply_retrieval_window_plan_with_trigger,
     build_retrieval_window_candidate_plan, build_retrieval_window_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
+    build_retrieval_window_critical_overflow_plan_with_token_accounting,
     effective_retrieval_window_target_tokens, RetrievalWindowApplyError,
     RetrievalWindowApplyResult, RetrievalWindowCandidatePlan, RetrievalWindowPlanError,
     RetrievalWindowPolicy, RetrievalWindowTokenAccounting,

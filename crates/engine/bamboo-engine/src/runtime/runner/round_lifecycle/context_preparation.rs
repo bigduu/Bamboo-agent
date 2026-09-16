@@ -15,6 +15,7 @@ use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
     build_forced_compression_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
+    build_retrieval_window_critical_overflow_plan_with_token_accounting,
     effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
@@ -205,25 +206,84 @@ async fn checkpoint_manual_archive_outcome(
                 .to_string(),
         ));
     };
-    let mut staged = session.clone();
-    if let Some(reason) = rejection_reason {
+    let Some(reason) = rejection_reason else {
+        let mut staged = session.clone();
+        mark_manual_archive_request_consumed(&mut staged, request)?;
+        persistence
+            .checkpoint_runtime_session(&mut staged)
+            .await
+            .map_err(|error| {
+                AgentError::Budget(format!(
+                    "archive_context outcome checkpoint failed; request remains retryable: {error}"
+                ))
+            })?;
+        *session = staged;
+        return Ok(());
+    };
+
+    let mut candidate_base = session.clone();
+    for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+        if attempt > 0 && pending_manual_archive_request(&candidate_base).as_ref() != Some(request)
+        {
+            let already_committed = candidate_base
+                .metadata
+                .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+                .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok())
+                .as_ref()
+                == Some(request)
+                && candidate_base.messages.iter().any(|message| {
+                    message.id == request.tool_result_message_id
+                        && message.tool_call_id.as_deref() == Some(request.tool_call_id.as_str())
+                        && message.tool_success == Some(false)
+                        && message.content == format!("archive_context rejected: {reason}")
+                });
+            *session = candidate_base;
+            if already_committed {
+                return Ok(());
+            }
+            return Err(AgentError::Budget(
+                "archive_context rejection checkpoint observed a newer durable outcome; the stale request was not overwritten"
+                    .to_string(),
+            ));
+        }
+
+        let expected_base = candidate_base;
+        let mut staged = expected_base.clone();
         surface_manual_archive_rejection(&mut staged, request, reason)?;
+        mark_manual_archive_request_consumed(&mut staged, request)?;
+        staged
+            .metadata
+            .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        staged.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+        match persistence
+            .checkpoint_manual_archive_rejection(&expected_base, &mut staged)
+            .await
+            .map_err(|error| {
+                AgentError::Budget(format!(
+                    "archive_context rejection checkpoint failed; request remains retryable: {error}"
+                ))
+            })? {
+            RetrievalWindowCheckpointOutcome::Committed => {
+                *session = staged;
+                return Ok(());
+            }
+            RetrievalWindowCheckpointOutcome::Rebased
+                if attempt < MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES =>
+            {
+                candidate_base = staged;
+                *session = candidate_base.clone();
+            }
+            RetrievalWindowCheckpointOutcome::Rebased => {
+                *session = staged;
+                return Err(AgentError::Budget(format!(
+                    "archive_context rejection checkpoint could not stabilize after {} durable rebase retries",
+                    MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES
+                )));
+            }
+        }
     }
-    mark_manual_archive_request_consumed(&mut staged, request)?;
-    persistence
-        .checkpoint_runtime_session(&mut staged)
-        .await
-        .map_err(|error| {
-            AgentError::Budget(format!(
-                "archive_context outcome checkpoint failed; request remains retryable: {error}"
-            ))
-        })?;
-    *session = staged;
-    if rejection_reason.is_some() {
-        let rejections = manual_archive_rejections(session);
-        apply_manual_archive_rejection_overlays(&rejections, &mut session.messages);
-    }
-    Ok(())
+
+    unreachable!("bounded archive_context rejection checkpoint loop must return")
 }
 
 #[derive(Debug)]
@@ -979,6 +1039,7 @@ async fn maybe_prepare_retrieval_window_context(
         config.context_management.retrieval_target_usage_percent(),
     );
     let forced = trigger_type != CompressionTriggerType::Auto;
+    let critical_overflow = matches!(&trigger_type, CompressionTriggerType::CriticalOverflow);
     let preflight = retrieval_window_preflight(
         session,
         config,
@@ -989,7 +1050,9 @@ async fn maybe_prepare_retrieval_window_context(
         &counter,
     )
     .await?;
-    let below_boundary = if forced {
+    let below_boundary = if critical_overflow {
+        false
+    } else if forced {
         preflight.active_tokens <= target_tokens
     } else {
         preflight.active_tokens < trigger_tokens
@@ -1034,7 +1097,9 @@ async fn maybe_prepare_retrieval_window_context(
             &counter,
         )
         .await?;
-        let below_boundary = if forced {
+        let below_boundary = if critical_overflow {
+            false
+        } else if forced {
             frame.active_tokens_without_boundary <= target_tokens
         } else {
             frame.active_tokens_without_boundary < trigger_tokens
@@ -1059,12 +1124,22 @@ async fn maybe_prepare_retrieval_window_context(
         // mutations and provider preparation happen on a separate staged clone.
         let expected_base = candidate_base;
         let mut staged = expected_base.clone();
-        let plan = match build_retrieval_window_candidate_plan_with_token_accounting(
-            &staged,
-            budget,
-            policy,
-            &frame.accounting,
-        ) {
+        let plan_result = if critical_overflow {
+            build_retrieval_window_critical_overflow_plan_with_token_accounting(
+                &staged,
+                budget,
+                policy,
+                &frame.accounting,
+            )
+        } else {
+            build_retrieval_window_candidate_plan_with_token_accounting(
+                &staged,
+                budget,
+                policy,
+                &frame.accounting,
+            )
+        };
+        let plan = match plan_result {
             Ok(plan) => plan,
             Err(error)
                 if manual_archive_request.is_some()
@@ -1749,6 +1824,10 @@ pub(super) async fn maybe_apply_host_context_compression(
             } else {
                 surface_manual_archive_rejection(session, request, reason)?;
                 mark_manual_archive_request_consumed(session, request)?;
+                session
+                    .metadata
+                    .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+                session.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
             }
             return Err(AgentError::Budget(format!("archive_context {reason}")));
         }
@@ -1984,6 +2063,10 @@ pub(super) async fn prepare_round_context(
             } else {
                 surface_manual_archive_rejection(session, request, reason)?;
                 mark_manual_archive_request_consumed(session, request)?;
+                session
+                    .metadata
+                    .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+                session.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
             }
             return Err(AgentError::Budget(format!("archive_context {reason}")));
         }
