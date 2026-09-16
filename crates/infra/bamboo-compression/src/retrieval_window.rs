@@ -41,7 +41,7 @@ pub struct RetrievalWindowTokenAccounting {
 }
 
 /// Immutable evidence describing a safe retrieval-window archive candidate set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RetrievalWindowCandidatePlan {
     /// Message IDs to archive, in authoritative session order.
     pub message_ids_to_archive: Vec<String>,
@@ -91,6 +91,14 @@ pub struct RetrievalWindowCandidatePlan {
     pub oldest_retained_user_message_id: Option<String>,
     /// Unsafe protocol groups that constrained selection.
     pub incomplete_protocol_group_count: usize,
+    /// Private integrity seal over every caller-visible evidence field.
+    ///
+    /// The public fields remain inspectable for lifecycle decisions and
+    /// observability, but safe external callers cannot update this seal after
+    /// mutating a cloned plan. Application verifies it immediately before any
+    /// session mutation.
+    #[serde(skip)]
+    evidence_sha256: String,
 }
 
 /// Structured reason why retrieval-window planning could not produce a plan.
@@ -416,7 +424,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         .filter(|group| group.user_message_id.is_some())
         .count();
 
-    Ok(RetrievalWindowCandidatePlan {
+    let mut plan = RetrievalWindowCandidatePlan {
         archive_message_count: message_ids_to_archive.len(),
         archive_group_count: selected_group_indexes.len(),
         archive_user_turn_count,
@@ -448,7 +456,10 @@ fn build_retrieval_window_candidate_plan_with_counter(
         oldest_retained_user_message_id,
         incomplete_protocol_group_count,
         message_ids_to_archive,
-    })
+        evidence_sha256: String::new(),
+    };
+    plan.evidence_sha256 = plan_evidence_sha256(&plan);
+    Ok(plan)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -489,6 +500,7 @@ pub fn apply_retrieval_window_plan(
         return Err(RetrievalWindowApplyError::PartialApplication);
     }
     if archived_count == candidate_indexes.len() {
+        validate_plan_evidence(plan)?;
         return validate_idempotent_replay(session, plan, &candidate_indexes);
     }
 
@@ -514,6 +526,7 @@ pub fn apply_retrieval_window_plan(
     }
 
     validate_active_plan_structure(session, plan)?;
+    validate_plan_evidence(plan)?;
 
     let mut event = CompressionEvent::new(
         plan.archive_message_count,
@@ -752,6 +765,7 @@ fn usage_percentage(tokens: u32, limit: u32) -> f64 {
 
 const ACTIVE_STATE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.active-state.v1\0";
 const TOKEN_ACCOUNTING_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.token-accounting.v1\0";
+const PLAN_EVIDENCE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.plan-evidence.v1\0";
 
 fn active_state_sha256(session: &Session) -> String {
     let active_state = session
@@ -794,6 +808,26 @@ fn token_accounting_sha256(accounting: &RetrievalWindowTokenAccounting) -> Strin
     payload.extend_from_slice(TOKEN_ACCOUNTING_DIGEST_DOMAIN);
     payload.extend_from_slice(&encoded);
     sha256_hex(&payload)
+}
+
+fn plan_evidence_sha256(plan: &RetrievalWindowCandidatePlan) -> String {
+    let encoded =
+        serde_json::to_vec(plan).expect("retrieval-window candidate plan evidence must serialize");
+    let mut payload = Vec::with_capacity(PLAN_EVIDENCE_DIGEST_DOMAIN.len() + encoded.len());
+    payload.extend_from_slice(PLAN_EVIDENCE_DIGEST_DOMAIN);
+    payload.extend_from_slice(&encoded);
+    sha256_hex(&payload)
+}
+
+fn validate_plan_evidence(
+    plan: &RetrievalWindowCandidatePlan,
+) -> Result<(), RetrievalWindowApplyError> {
+    if plan_evidence_sha256(plan) != plan.evidence_sha256 {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "plan_evidence_sha256",
+        });
+    }
+    Ok(())
 }
 
 fn validate_current_token_accounting(
@@ -2350,6 +2384,31 @@ mod tests {
             &plan,
             RetrievalWindowApplyError::StalePlan {
                 invariant: "active_state_sha256",
+            },
+        );
+    }
+
+    #[test]
+    fn authenticated_plan_rejects_self_consistent_candidate_token_tampering() {
+        let (mut session, mut plan) = basic_session_and_plan();
+
+        // Keep only the first selected group while preserving the original
+        // archived-token total and adjusting every structural field that the
+        // active session can independently verify. Without the private plan
+        // seal this would underreport the retained request by one full turn.
+        plan.message_ids_to_archive.truncate(2);
+        plan.archive_message_count = 2;
+        plan.archive_group_count = 1;
+        plan.archive_user_turn_count = 1;
+        plan.retained_user_turn_count = 3;
+        plan.oldest_retained_message_id = Some("t2-u".to_string());
+        plan.oldest_retained_user_message_id = Some("t2-u".to_string());
+
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::StalePlan {
+                invariant: "plan_evidence_sha256",
             },
         );
     }
