@@ -32,6 +32,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -199,68 +201,74 @@ fn apply_manual_archive_rejection_overlays(
     }
 }
 
-async fn checkpoint_manual_archive_outcome(
-    session: &mut Session,
-    config: &AgentLoopConfig,
-    request: &ResponseOccurrence,
-    rejection_reason: Option<&str>,
-) -> Result<(), AgentError> {
-    let Some(persistence) = config.persistence.as_ref() else {
-        return Err(AgentError::Budget(
+fn checkpoint_manual_archive_outcome<'a>(
+    session: &'a mut Session,
+    config: &'a AgentLoopConfig,
+    request: &'a ResponseOccurrence,
+    rejection_reason: Option<&'a str>,
+) -> Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send + 'a>> {
+    // This path carries multiple complete Session snapshots across persistence
+    // awaits. Keep that state on the heap so merely compiling the manual
+    // archive branch does not inflate every ordinary agent-run stack frame.
+    Box::pin(async move {
+        let Some(persistence) = config.persistence.as_ref() else {
+            return Err(AgentError::Budget(
             "archive_context requires RuntimeSessionPersistence to durably consume a retrieval-window request"
                 .to_string(),
         ));
-    };
-    let Some(reason) = rejection_reason else {
-        let mut staged = session.clone();
-        mark_manual_archive_request_consumed(&mut staged, request)?;
-        persistence
-            .checkpoint_runtime_session(&mut staged)
-            .await
-            .map_err(|error| {
-                AgentError::Budget(format!(
+        };
+        let Some(reason) = rejection_reason else {
+            let mut staged = session.clone();
+            mark_manual_archive_request_consumed(&mut staged, request)?;
+            persistence
+                .checkpoint_runtime_session(&mut staged)
+                .await
+                .map_err(|error| {
+                    AgentError::Budget(format!(
                     "archive_context outcome checkpoint failed; request remains retryable: {error}"
                 ))
-            })?;
-        *session = staged;
-        return Ok(());
-    };
+                })?;
+            *session = staged;
+            return Ok(());
+        };
 
-    let mut candidate_base = session.clone();
-    for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
-        if attempt > 0 && pending_manual_archive_request(&candidate_base).as_ref() != Some(request)
-        {
-            let already_committed = candidate_base
-                .metadata
-                .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
-                .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok())
-                .as_ref()
-                == Some(request)
-                && candidate_base.messages.iter().any(|message| {
-                    message.id == request.tool_result_message_id
-                        && message.tool_call_id.as_deref() == Some(request.tool_call_id.as_str())
-                        && message.tool_success == Some(false)
-                        && message.content == format!("archive_context rejected: {reason}")
-                });
-            *session = candidate_base;
-            if already_committed {
-                return Ok(());
-            }
-            return Err(AgentError::Budget(
+        let mut candidate_base = session.clone();
+        for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+            if attempt > 0
+                && pending_manual_archive_request(&candidate_base).as_ref() != Some(request)
+            {
+                let already_committed = candidate_base
+                    .metadata
+                    .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+                    .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok())
+                    .as_ref()
+                    == Some(request)
+                    && candidate_base.messages.iter().any(|message| {
+                        message.id == request.tool_result_message_id
+                            && message.tool_call_id.as_deref()
+                                == Some(request.tool_call_id.as_str())
+                            && message.tool_success == Some(false)
+                            && message.content == format!("archive_context rejected: {reason}")
+                    });
+                *session = candidate_base;
+                if already_committed {
+                    return Ok(());
+                }
+                return Err(AgentError::Budget(
                 "archive_context rejection checkpoint observed a newer durable outcome; the stale request was not overwritten"
                     .to_string(),
             ));
-        }
+            }
 
-        let expected_base = candidate_base;
-        let mut staged = expected_base.clone();
-        surface_manual_archive_rejection(&mut staged, request, reason)?;
-        mark_manual_archive_request_consumed(&mut staged, request)?;
-        staged
-            .metadata
-            .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
-        staged.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
-        match persistence
+            let expected_base = candidate_base;
+            let mut staged = expected_base.clone();
+            surface_manual_archive_rejection(&mut staged, request, reason)?;
+            mark_manual_archive_request_consumed(&mut staged, request)?;
+            staged
+                .metadata
+                .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            staged.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+            match persistence
             .checkpoint_manual_archive_rejection(&expected_base, &mut staged)
             .await
             .map_err(|error| {
@@ -286,9 +294,10 @@ async fn checkpoint_manual_archive_outcome(
                 )));
             }
         }
-    }
+        }
 
-    unreachable!("bounded archive_context rejection checkpoint loop must return")
+        unreachable!("bounded archive_context rejection checkpoint loop must return")
+    })
 }
 
 #[derive(Debug)]
