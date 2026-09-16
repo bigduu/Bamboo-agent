@@ -1905,11 +1905,13 @@ fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::
         return Ok(false);
     }
 
-    // Legacy background-completion delivery is a separately locked runtime
-    // writer. A prompt/archive rewrite planned before that writer queued a
-    // notification must rebase instead of full-saving the stale queue state.
-    if expected.has_pending_injected_messages() != durable.has_pending_injected_messages()
-        || expected.pending_injected_messages() != durable.pending_injected_messages()
+    // Narrow runtime writers commit arbitrary metadata keys under the same
+    // per-session lock (for example pending background-completion injections,
+    // workflow indexes, or skill activation state). A prompt/archive rewrite
+    // planned before any such commit must rebase instead of full-saving its
+    // stale open-ended or typed metadata snapshot.
+    if expected.metadata != durable.metadata
+        || expected.runtime_metadata != durable.runtime_metadata
     {
         return Ok(false);
     }
@@ -1920,6 +1922,10 @@ fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::
 fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Session {
     let mut rebased = expected.clone();
     bamboo_domain::append_missing_runtime_messages(&mut rebased, durable);
+    rebased.metadata.clone_from(&durable.metadata);
+    rebased
+        .runtime_metadata
+        .clone_from(&durable.runtime_metadata);
     bamboo_domain::merge_session_inbox_admission(&mut rebased, durable);
     rebased
         .conversation_summary
@@ -1931,12 +1937,6 @@ fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Sessio
     rebased
         .model_context_state
         .clone_from(&durable.model_context_state);
-    if durable.has_pending_injected_messages() {
-        rebased
-            .set_pending_injected_messages(durable.pending_injected_messages().unwrap_or_default());
-    } else {
-        rebased.clear_pending_injected_messages();
-    }
     if durable.updated_at > rebased.updated_at {
         rebased.updated_at = durable.updated_at;
     }
@@ -4202,6 +4202,52 @@ mod tests {
             durable.pending_injected_messages()
         );
         assert!(staged.model_context_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_concurrent_open_runtime_metadata() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-open-runtime-metadata";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.metadata.insert(
+            "concurrent.runtime.marker".to_string(),
+            "latest".to_string(),
+        );
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            staged
+                .metadata
+                .get("concurrent.runtime.marker")
+                .map(String::as_str),
+            Some("latest")
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert!(staged.model_context_state.is_none());
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
     }
 
     #[tokio::test]
