@@ -314,14 +314,14 @@ pub fn build_retrieval_window_candidate_plan_with_token_accounting(
 /// Build an emergency plan after the provider has already rejected the
 /// request for overflowing its context window.
 ///
-/// Provider tokenization and hidden request overhead can make that rejection
-/// authoritative even when Bamboo's local projection is below the configured
-/// target. In that case, archive every otherwise-eligible old group in one
-/// bounded pass. The provider/local accounting gap is unknown after a real
-/// rejection, so removing only one group could make the sole retry overflow
-/// again even though more safe history was available. The configured
-/// percentage is still recorded for observability; `target_tokens` records the
-/// minimum active footprint allowed by the recent-turn floor.
+/// Provider tokenization and hidden request overhead make that rejection
+/// authoritative regardless of Bamboo's local projection. Archive every
+/// otherwise-eligible old group in one bounded pass: the provider/local
+/// accounting gap is unknown after a real rejection, so stopping at the normal
+/// target could make the sole retry overflow again even though more safe
+/// history was available. The configured percentage is still recorded for
+/// observability; `target_tokens` records the minimum active footprint allowed
+/// by the recent-turn floor.
 pub fn build_retrieval_window_critical_overflow_plan_with_token_accounting(
     session: &Session,
     budget: &TokenBudget,
@@ -382,13 +382,22 @@ fn build_retrieval_window_candidate_plan_with_counter(
         groups.iter().filter(|group| !group.protocol_safe).count();
     let configured_target_tokens =
         effective_retrieval_window_target_tokens(budget, policy.target_usage_percent);
-    let emergency_full_archive =
-        force_archive_after_provider_overflow && active_tokens_before <= configured_target_tokens;
     let minimum_projected_active_tokens = accounting
         .fixed_prompt_tokens
         .checked_add(protected_active_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
-    let target_tokens = if emergency_full_archive {
+    if force_archive_after_provider_overflow
+        && minimum_projected_active_tokens > budget.max_request_input_tokens()
+    {
+        return Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget {
+            projected_tokens: minimum_projected_active_tokens,
+            target_tokens: budget.max_request_input_tokens(),
+            protected_active_tokens,
+            fixed_prompt_tokens: accounting.fixed_prompt_tokens,
+            incomplete_protocol_group_count,
+        });
+    }
+    let target_tokens = if force_archive_after_provider_overflow {
         minimum_projected_active_tokens
     } else {
         configured_target_tokens
@@ -735,11 +744,19 @@ fn validate_apply_plan_arithmetic(
         plan.request_input_limit_tokens,
         plan.target_usage_percent,
     );
-    // Critical provider-overflow recovery may use a lower one-shot target to
-    // force removal of one eligible old group when provider-side accounting
-    // has already disproved the local estimate. It may never relax the
-    // configured target.
-    if plan.target_tokens > expected_target {
+    // Critical provider-overflow recovery seals its one-shot target at the
+    // minimum protected footprint. That floor can exceed the configured target
+    // when recent protected content is already large, but a successful plan
+    // must still remove every otherwise-eligible group and land exactly on the
+    // protected floor. Ordinary plans may never relax the configured target.
+    let protected_with_fixed = plan
+        .fixed_prompt_tokens
+        .checked_add(plan.protected_active_tokens)
+        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
+    let sealed_provider_overflow_plan = protected_with_fixed <= plan.request_input_limit_tokens
+        && plan.target_tokens == protected_with_fixed
+        && plan.projected_active_tokens_after == protected_with_fixed;
+    if plan.target_tokens > expected_target && !sealed_provider_overflow_plan {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_tokens",
         });
@@ -771,10 +788,6 @@ fn validate_apply_plan_arithmetic(
     let system_tokens = plan
         .fixed_prompt_tokens
         .checked_add(plan.system_message_tokens)
-        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
-    let protected_with_fixed = plan
-        .fixed_prompt_tokens
-        .checked_add(plan.protected_active_tokens)
         .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
     if system_tokens > plan.projected_active_tokens_after
         || protected_with_fixed > plan.projected_active_tokens_after
@@ -2294,6 +2307,85 @@ mod tests {
         )
         .expect("the sealed emergency target must remain valid at application");
         assert!(committed.messages.iter().any(|message| message.compressed));
+    }
+
+    #[test]
+    fn critical_provider_overflow_archives_every_eligible_group_above_configured_target() {
+        let mut session = Session::new("retrieval-window-provider-overflow-above", "test-model");
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "one", 10);
+        add_turn(&mut session, "two", 10);
+        add_turn(&mut session, "three", 10);
+        add_turn(&mut session, "four", 10);
+
+        // The protected recent-turn floor (25 tokens) is itself above the
+        // configured 20-token target. A provider overflow still needs to
+        // archive all three eligible old groups before its sole retry.
+        let plan = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(100),
+            policy(1, 20),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect("provider overflow must maximize safe headroom above the local target");
+
+        assert_eq!(plan.active_tokens_before, 85);
+        assert_eq!(plan.target_tokens, 25);
+        assert_eq!(plan.projected_active_tokens_after, 25);
+        assert_eq!(plan.archive_group_count, 3);
+        assert_eq!(plan.retained_user_turn_count, 1);
+        let mut committed = session;
+        apply_retrieval_window_plan_with_trigger(
+            &mut committed,
+            &plan,
+            policy(1, 20),
+            &budget(100),
+            &RetrievalWindowTokenAccounting::default(),
+            CompressionTriggerType::CriticalOverflow,
+        )
+        .expect("the sealed protected-floor target must remain valid at application");
+        assert_eq!(
+            committed
+                .compression_events
+                .last()
+                .expect("critical overflow event")
+                .retrieval_archived_group_count,
+            3
+        );
+    }
+
+    #[test]
+    fn critical_provider_overflow_rejects_a_protected_floor_above_the_hard_input_limit() {
+        let mut session = Session::new(
+            "retrieval-window-provider-overflow-hard-limit",
+            "test-model",
+        );
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "old", 10);
+        add_turn(&mut session, "recent", 30);
+
+        let error = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(50),
+            policy(1, 20),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect_err("a provider retry cannot fit protected content beyond the hard input limit");
+
+        assert_eq!(
+            error,
+            RetrievalWindowPlanError::ProtectedContentExceedsTarget {
+                projected_tokens: 65,
+                target_tokens: 50,
+                protected_active_tokens: 65,
+                fixed_prompt_tokens: 0,
+                incomplete_protocol_group_count: 0,
+            }
+        );
     }
 
     #[test]
