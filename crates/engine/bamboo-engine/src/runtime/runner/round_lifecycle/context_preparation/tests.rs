@@ -4777,7 +4777,11 @@ async fn retrieval_window_provider_overflow_archives_below_local_target_without_
     );
     assert!(event.retrieval_active_tokens_before <= configured_target);
     assert!(event.retrieval_target_tokens < event.retrieval_active_tokens_before);
-    assert_eq!(event.retrieval_archived_group_count, 1);
+    assert_eq!(
+        event.retrieval_archived_group_count, 3,
+        "an authoritative provider overflow must use the maximum safe one-shot headroom"
+    );
+    assert_eq!(event.retrieval_retained_user_turn_count, 1);
     assert_eq!(event.trigger_type, CompressionTriggerType::CriticalOverflow);
     assert!(session.messages.iter().any(|message| message.compressed));
     assert!(session.conversation_summary.is_none());

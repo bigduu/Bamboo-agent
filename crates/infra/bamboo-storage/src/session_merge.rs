@@ -1907,11 +1907,16 @@ fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::
 
     // Narrow runtime writers commit arbitrary metadata keys under the same
     // per-session lock (for example pending background-completion injections,
-    // workflow indexes, or skill activation state). A prompt/archive rewrite
-    // planned before any such commit must rebase instead of full-saving its
-    // stale open-ended or typed metadata snapshot.
+    // workflow indexes, or skill activation state). Authoritative PATCHes also
+    // change execution-profile fields under `metadata_version`. A
+    // prompt/archive rewrite planned before either commit must rebase instead
+    // of full-saving its stale metadata or model configuration snapshot.
     if expected.metadata != durable.metadata
         || expected.runtime_metadata != durable.runtime_metadata
+        || expected.metadata_version != durable.metadata_version
+        || expected.model != durable.model
+        || expected.model_ref != durable.model_ref
+        || expected.reasoning_effort != durable.reasoning_effort
     {
         return Ok(false);
     }
@@ -1926,6 +1931,9 @@ fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Sessio
     rebased
         .runtime_metadata
         .clone_from(&durable.runtime_metadata);
+    rebased.model.clone_from(&durable.model);
+    rebased.model_ref.clone_from(&durable.model_ref);
+    rebased.reasoning_effort = durable.reasoning_effort;
     bamboo_domain::merge_session_inbox_admission(&mut rebased, durable);
     rebased
         .conversation_summary
@@ -4241,6 +4249,45 @@ mod tests {
                 .map(String::as_str),
             Some("latest")
         );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert!(staged.model_context_state.is_none());
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_concurrent_reasoning_update() {
+        use bamboo_domain::{reasoning::ReasoningEffort, session::types::Message};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-reasoning-update";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.reasoning_effort = Some(ReasoningEffort::High);
+        durable.metadata_version = 1;
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(staged.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(staged.metadata_version, 1);
         assert_eq!(staged.messages[0].content, expected.messages[0].content);
         assert!(staged.model_context_state.is_none());
         let saved = storage.load_session(session_id).await.unwrap().unwrap();
