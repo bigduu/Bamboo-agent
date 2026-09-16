@@ -6,7 +6,7 @@
 
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_domain::{canonical_tool_name, Message, MessagePart, Role, Session};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 
 /// Internal policy used while retrieval-window remains an opt-in engine seam.
@@ -19,6 +19,20 @@ pub struct RetrievalWindowPolicy {
     pub min_recent_user_turns: usize,
     /// Desired percentage of the provider context window after archiving.
     pub target_usage_percent: u8,
+}
+
+/// Provider-aware token accounting supplied to the pure planner.
+///
+/// Most persisted text messages can be estimated directly. Messages containing
+/// images cannot: attachment references are resolved and image token costs are
+/// provider-specific. Callers that have prepared the provider request can
+/// replace the complete token cost of any message by its stable message ID.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrievalWindowTokenAccounting {
+    /// Provider-visible prompt/tool tokens outside `Session.messages`.
+    pub fixed_prompt_tokens: u32,
+    /// Complete provider-visible token cost overrides keyed by message ID.
+    pub provider_message_tokens: BTreeMap<String, u32>,
 }
 
 /// Immutable evidence describing a safe retrieval-window archive candidate set.
@@ -44,6 +58,8 @@ pub struct RetrievalWindowCandidatePlan {
     pub target_usage_percent: u8,
     /// Provider-visible prompt/tool tokens outside `Session.messages`.
     pub fixed_prompt_tokens: u32,
+    /// Active messages whose complete cost came from provider-aware accounting.
+    pub provider_message_token_override_count: usize,
     /// Active message tokens that cannot be selected by this plan.
     pub protected_active_tokens: u32,
     /// Number of groups retained specifically by the recent-turn floor.
@@ -74,6 +90,8 @@ pub enum RetrievalWindowPlanError {
     },
     #[error("token accounting overflow while planning retrieval-window archive candidates")]
     TokenAccountingOverflow,
+    #[error("provider-aware token accounting is required for image message {message_id}")]
+    MissingProviderMessageTokenEstimate { message_id: String },
     #[error("no active messages are available for retrieval-window planning")]
     NoActiveMessages,
     #[error(
@@ -147,7 +165,12 @@ pub fn build_retrieval_window_candidate_plan(
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
-    build_retrieval_window_candidate_plan_with_fixed_tokens(session, budget, policy, 0)
+    build_retrieval_window_candidate_plan_with_token_accounting(
+        session,
+        budget,
+        policy,
+        &RetrievalWindowTokenAccounting::default(),
+    )
 }
 
 /// Build a pure retrieval-window plan while accounting for prompt blocks and
@@ -158,11 +181,34 @@ pub fn build_retrieval_window_candidate_plan_with_fixed_tokens(
     policy: RetrievalWindowPolicy,
     fixed_prompt_tokens: u32,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
+    build_retrieval_window_candidate_plan_with_token_accounting(
+        session,
+        budget,
+        policy,
+        &RetrievalWindowTokenAccounting {
+            fixed_prompt_tokens,
+            ..RetrievalWindowTokenAccounting::default()
+        },
+    )
+}
+
+/// Build a pure retrieval-window plan with provider-aware message costs.
+///
+/// An override replaces the complete locally estimated cost of its message. It
+/// must therefore be computed after provider-visible transformations such as
+/// attachment resolution and image fallback. Any active image message without
+/// an override fails closed rather than underestimating the request.
+pub fn build_retrieval_window_candidate_plan_with_token_accounting(
+    session: &Session,
+    budget: &TokenBudget,
+    policy: RetrievalWindowPolicy,
+    accounting: &RetrievalWindowTokenAccounting,
+) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
     build_retrieval_window_candidate_plan_with_counter(
         session,
         budget,
         policy,
-        fixed_prompt_tokens,
+        accounting,
         &TiktokenTokenCounter::default(),
     )
 }
@@ -171,7 +217,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
     session: &Session,
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
-    fixed_prompt_tokens: u32,
+    accounting: &RetrievalWindowTokenAccounting,
     counter: &impl TokenCounter,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
     validate_inputs(budget, policy)?;
@@ -181,12 +227,13 @@ fn build_retrieval_window_candidate_plan_with_counter(
         return Err(RetrievalWindowPlanError::NoActiveMessages);
     }
 
-    let system_tokens = count_indexed_messages(&system_messages, counter)?;
+    let system_tokens = count_indexed_messages(&system_messages, accounting, counter)?;
     for group in &mut groups {
-        group.token_count = count_indexed_messages(&group.messages, counter)?;
+        group.token_count = count_indexed_messages(&group.messages, accounting, counter)?;
     }
     let group_tokens = checked_sum(groups.iter().map(|group| group.token_count))?;
-    let active_tokens_before = fixed_prompt_tokens
+    let active_tokens_before = accounting
+        .fixed_prompt_tokens
         .checked_add(system_tokens)
         .and_then(|tokens| tokens.checked_add(group_tokens))
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
@@ -259,7 +306,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
             projected_tokens: projected_active_tokens_after,
             target_tokens,
             protected_active_tokens,
-            fixed_prompt_tokens,
+            fixed_prompt_tokens: accounting.fixed_prompt_tokens,
             incomplete_protocol_group_count,
         });
     }
@@ -299,7 +346,16 @@ fn build_retrieval_window_candidate_plan_with_counter(
         context_window_tokens: budget.max_context_tokens,
         target_tokens,
         target_usage_percent: policy.target_usage_percent,
-        fixed_prompt_tokens,
+        fixed_prompt_tokens: accounting.fixed_prompt_tokens,
+        provider_message_token_override_count: system_messages
+            .iter()
+            .chain(groups.iter().flat_map(|group| group.messages.iter()))
+            .filter(|indexed| {
+                accounting
+                    .provider_message_tokens
+                    .contains_key(&indexed.message.id)
+            })
+            .count(),
         protected_active_tokens,
         retained_recent_user_turn_count: total_user_turn_count.min(policy.min_recent_user_turns),
         retained_user_turn_count,
@@ -349,12 +405,14 @@ fn checked_sum(values: impl IntoIterator<Item = u32>) -> Result<u32, RetrievalWi
 
 fn count_indexed_messages(
     messages: &[IndexedMessage<'_>],
+    accounting: &RetrievalWindowTokenAccounting,
     counter: &impl TokenCounter,
 ) -> Result<u32, RetrievalWindowPlanError> {
     messages.iter().try_fold(0u32, |total, indexed| {
         total
             .checked_add(count_provider_visible_message_tokens(
                 indexed.message,
+                accounting,
                 counter,
             )?)
             .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)
@@ -363,8 +421,13 @@ fn count_indexed_messages(
 
 fn count_provider_visible_message_tokens(
     message: &Message,
+    accounting: &RetrievalWindowTokenAccounting,
     counter: &impl TokenCounter,
 ) -> Result<u32, RetrievalWindowPlanError> {
+    if let Some(provider_tokens) = accounting.provider_message_tokens.get(&message.id) {
+        return Ok(*provider_tokens);
+    }
+
     let mut tokens = counter.count_message(message);
 
     // Reasoning replay is provider- and request-dependent. This pure planner
@@ -383,24 +446,20 @@ fn count_provider_visible_message_tokens(
     }
 
     // Provider lowering differs by role: some adapters replace `content` with
-    // these parts, while tool-result adapters can expose both. Counting both
-    // here is intentionally conservative and, crucially, keeps text/image cost
-    // attached to the group whose archival removes those provider-visible
-    // parts. Image URLs include data URLs when the image is stored inline.
+    // these parts, while tool-result adapters can expose both. Text can be
+    // counted conservatively here. Image cost depends on provider preparation
+    // and attachment resolution, so it must come from a complete message-level
+    // override rather than the persisted URL text.
     if let Some(parts) = message.content_parts.as_deref() {
         for part in parts {
             let part_tokens = match part {
                 MessagePart::Text { text } => counter.count_text(text),
-                MessagePart::ImageUrl { image_url } => {
-                    let url_tokens = counter.count_text(&image_url.url);
-                    let detail_tokens = image_url
-                        .detail
-                        .as_deref()
-                        .map(|detail| counter.count_text(detail))
-                        .unwrap_or(0);
-                    url_tokens
-                        .checked_add(detail_tokens)
-                        .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?
+                MessagePart::ImageUrl { .. } => {
+                    return Err(
+                        RetrievalWindowPlanError::MissingProviderMessageTokenEstimate {
+                            message_id: message.id.clone(),
+                        },
+                    );
                 }
             };
             tokens = tokens
@@ -661,11 +720,28 @@ mod tests {
         min_recent_user_turns: usize,
         fixed_prompt_tokens: u32,
     ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
+        plan_with_counter_and_accounting(
+            session,
+            target_usage_percent,
+            min_recent_user_turns,
+            &RetrievalWindowTokenAccounting {
+                fixed_prompt_tokens,
+                ..RetrievalWindowTokenAccounting::default()
+            },
+        )
+    }
+
+    fn plan_with_counter_and_accounting(
+        session: &Session,
+        target_usage_percent: u8,
+        min_recent_user_turns: usize,
+        accounting: &RetrievalWindowTokenAccounting,
+    ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
         build_retrieval_window_candidate_plan_with_counter(
             session,
             &budget(100),
             policy(min_recent_user_turns, target_usage_percent),
-            fixed_prompt_tokens,
+            accounting,
             &CharacterTokenCounter,
         )
     }
@@ -894,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_parts_count_with_their_logical_group() {
+    fn provider_prepared_multimodal_cost_counts_with_its_logical_group() {
         let mut session = Session::new("retrieval-window-multimodal", "test-model");
         session.add_message(system("system", 5));
         let mut multimodal = user("old-u", 0);
@@ -913,13 +989,44 @@ mod tests {
         session.add_message(assistant("old-a", 5));
         add_turn(&mut session, "recent", 10);
 
-        let plan = plan_with_counter(&session, 50, 1, 0)
+        let mut accounting = RetrievalWindowTokenAccounting::default();
+        accounting
+            .provider_message_tokens
+            .insert("old-u".to_string(), 44);
+
+        let plan = plan_with_counter_and_accounting(&session, 50, 1, &accounting)
             .expect("provider-visible multimodal parts should exceed the target");
 
         assert_eq!(plan.active_tokens_before, 74);
         assert_eq!(plan.message_ids_to_archive, vec!["old-u", "old-a"]);
         assert_eq!(plan.archive_message_tokens, 49);
         assert_eq!(plan.projected_active_tokens_after, 25);
+        assert_eq!(plan.provider_message_token_override_count, 1);
+    }
+
+    #[test]
+    fn image_without_provider_prepared_cost_fails_closed() {
+        let mut session = Session::new("retrieval-window-attachment", "test-model");
+        session.add_message(system("system", 5));
+        let mut image = user("old-u", 0);
+        image.content_parts = Some(vec![MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: "bamboo-attachment://retrieval-window-attachment/image-1".to_string(),
+                detail: Some("high".to_string()),
+            },
+        }]);
+        session.add_message(image);
+        session.add_message(assistant("old-a", 5));
+        add_turn(&mut session, "recent", 10);
+
+        assert_eq!(
+            plan_with_counter(&session, 50, 1, 0),
+            Err(
+                RetrievalWindowPlanError::MissingProviderMessageTokenEstimate {
+                    message_id: "old-u".to_string(),
+                }
+            )
+        );
     }
 
     #[test]
@@ -956,7 +1063,7 @@ mod tests {
                 &session,
                 &budget(100),
                 policy(0, 50),
-                0,
+                &RetrievalWindowTokenAccounting::default(),
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidRecentUserTurnFloor)
@@ -966,7 +1073,7 @@ mod tests {
                 &session,
                 &budget(100),
                 policy(1, 0),
-                0,
+                &RetrievalWindowTokenAccounting::default(),
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidTargetUsagePercent {

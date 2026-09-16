@@ -43,7 +43,8 @@ pub use preparation::{
 };
 pub use retrieval_window::{
     build_retrieval_window_candidate_plan, build_retrieval_window_candidate_plan_with_fixed_tokens,
-    RetrievalWindowCandidatePlan, RetrievalWindowPlanError, RetrievalWindowPolicy,
+    build_retrieval_window_candidate_plan_with_token_accounting, RetrievalWindowCandidatePlan,
+    RetrievalWindowPlanError, RetrievalWindowPolicy, RetrievalWindowTokenAccounting,
 };
 pub use segmenter::MessageSegmenter;
 pub use summarizer::{HeuristicSummarizer, Summarizer, SummaryManager, SummaryTrigger};
