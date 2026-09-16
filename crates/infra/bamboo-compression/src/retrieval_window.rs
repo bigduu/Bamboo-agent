@@ -6,8 +6,9 @@
 
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
 use bamboo_domain::{
-    canonical_tool_name, CompressionEvent, CompressionEventKind, CompressionTriggerType, Message,
-    MessagePart, ModelContextResetReason, Role, Session, TokenBudgetUsage,
+    canonical_tool_name, sha256_hex, CompressionEvent, CompressionEventKind,
+    CompressionTriggerType, Message, MessagePart, ModelContextResetReason, Role, Session,
+    TokenBudgetUsage,
 };
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -54,6 +55,9 @@ pub struct RetrievalWindowCandidatePlan {
     pub archive_message_tokens: u32,
     /// Number of active messages observed before candidate selection.
     pub active_message_count: usize,
+    /// Versioned digest of every token-relevant active message field and its
+    /// order at planning time.
+    pub active_state_sha256: String,
     /// Active message plus fixed prompt tokens before candidate selection.
     pub active_tokens_before: u32,
     /// Projected active tokens after the candidate messages are removed.
@@ -415,6 +419,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         archive_user_turn_count,
         archive_message_tokens,
         active_message_count,
+        active_state_sha256: active_state_sha256(session),
         active_tokens_before,
         projected_active_tokens_after,
         context_window_tokens: budget.max_context_tokens,
@@ -518,6 +523,7 @@ pub fn apply_retrieval_window_plan(
     event.fixed_prompt_tokens = plan.fixed_prompt_tokens;
     event.retrieval_active_tokens_before = plan.active_tokens_before;
     event.retrieval_active_message_count_before = plan.active_message_count;
+    event.retrieval_active_state_sha256 = Some(plan.active_state_sha256.clone());
     event.retrieval_active_tokens_after = plan.projected_active_tokens_after;
     event.retrieval_target_tokens = plan.target_tokens;
     event.retrieval_target_usage_percent = plan.target_usage_percent;
@@ -732,6 +738,39 @@ fn usage_percentage(tokens: u32, limit: u32) -> f64 {
     }
 }
 
+const ACTIVE_STATE_DIGEST_DOMAIN: &[u8] = b"bamboo.retrieval-window.active-state.v1\0";
+
+fn active_state_sha256(session: &Session) -> String {
+    let active_state = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .map(|message| {
+            serde_json::json!([
+                message.id,
+                message.role,
+                message.content,
+                message.reasoning,
+                message.reasoning_signature,
+                message.content_parts,
+                message.image_ocr,
+                message.phase,
+                message.tool_calls,
+                message.tool_call_id,
+                message.tool_success,
+                message.never_compress,
+                message.compression_level,
+            ])
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&active_state)
+        .expect("token-relevant retrieval-window message state must serialize");
+    let mut payload = Vec::with_capacity(ACTIVE_STATE_DIGEST_DOMAIN.len() + encoded.len());
+    payload.extend_from_slice(ACTIVE_STATE_DIGEST_DOMAIN);
+    payload.extend_from_slice(&encoded);
+    sha256_hex(&payload)
+}
+
 fn validate_active_plan_structure(
     session: &Session,
     plan: &RetrievalWindowCandidatePlan,
@@ -889,6 +928,11 @@ fn validate_active_plan_structure(
             invariant: "oldest_retained_user_message_id",
         });
     }
+    if active_state_sha256(session) != plan.active_state_sha256 {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "active_state_sha256",
+        });
+    }
     Ok(())
 }
 
@@ -1025,6 +1069,11 @@ fn validate_idempotent_replay(
         event.retrieval_active_message_count_before,
         plan.active_message_count,
         "retrieval_active_message_count_before"
+    );
+    require_event_evidence!(
+        event.retrieval_active_state_sha256.as_deref(),
+        Some(plan.active_state_sha256.as_str()),
+        "retrieval_active_state_sha256"
     );
     require_event_evidence!(
         event.retrieval_active_tokens_after,
@@ -1582,6 +1631,7 @@ mod tests {
         assert_eq!(first.archive_user_turn_count, 2);
         assert_eq!(first.archive_message_tokens, 40);
         assert_eq!(first.active_message_count, 9);
+        assert_eq!(first.active_state_sha256.len(), 64);
         assert_eq!(first.active_tokens_before, 90);
         assert_eq!(first.projected_active_tokens_after, 50);
         assert_eq!(first.context_window_tokens, 100);
@@ -1978,6 +2028,10 @@ mod tests {
         assert!(event.model_used.is_none());
         assert_eq!(event.retrieval_active_tokens_before, 90);
         assert_eq!(event.retrieval_active_message_count_before, 9);
+        assert_eq!(
+            event.retrieval_active_state_sha256.as_deref(),
+            Some(plan.active_state_sha256.as_str())
+        );
         assert_eq!(event.retrieval_active_tokens_after, 50);
         assert_eq!(event.retrieval_target_tokens, 50);
         assert_eq!(event.retrieval_archived_message_tokens, 40);
@@ -2207,6 +2261,48 @@ mod tests {
                 invariant: "active_message_count",
             },
         );
+
+        let (mut session, plan) = basic_session_and_plan();
+        session
+            .messages
+            .iter_mut()
+            .find(|message| message.id == "t1-u")
+            .expect("candidate message")
+            .content
+            .push_str("changed-after-planning");
+        assert_apply_error_without_mutation(
+            &mut session,
+            &plan,
+            RetrievalWindowApplyError::StalePlan {
+                invariant: "active_state_sha256",
+            },
+        );
+    }
+
+    #[test]
+    fn active_state_digest_covers_provider_visible_message_fields() {
+        let (session, _) = safe_tool_session_and_plan();
+        let original = active_state_sha256(&session);
+
+        let mut reasoning_changed = session.clone();
+        reasoning_changed.messages[1].reasoning = Some("new reasoning".to_string());
+        assert_ne!(active_state_sha256(&reasoning_changed), original);
+
+        let mut parts_changed = session.clone();
+        parts_changed.messages[1].content_parts = Some(vec![MessagePart::Text {
+            text: "provider-visible part".to_string(),
+        }]);
+        assert_ne!(active_state_sha256(&parts_changed), original);
+
+        let mut tool_arguments_changed = session;
+        tool_arguments_changed.messages[2]
+            .tool_calls
+            .as_mut()
+            .and_then(|calls| calls.first_mut())
+            .expect("tool call")
+            .function
+            .arguments = "{\"changed\":true}".to_string();
+        assert_ne!(active_state_sha256(&tool_arguments_changed), original);
     }
 
     #[test]

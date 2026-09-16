@@ -539,6 +539,10 @@ pub struct CompressionEvent {
     pub retrieval_active_tokens_before: u32,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub retrieval_active_message_count_before: usize,
+    /// Versioned digest of the token-relevant active message state accepted by
+    /// the retrieval-window planner. Absent for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_active_state_sha256: Option<String>,
     /// Exact active input tokens after a summary-free retrieval-window
     /// boundary. Zero for summary events and legacy data.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -614,6 +618,7 @@ impl CompressionEvent {
             summarization_fallback_used: false,
             retrieval_active_tokens_before: 0,
             retrieval_active_message_count_before: 0,
+            retrieval_active_state_sha256: None,
             retrieval_active_tokens_after: 0,
             retrieval_target_tokens: 0,
             retrieval_target_usage_percent: 0,
@@ -1780,6 +1785,7 @@ mod tests {
         assert_eq!(event.latency_ms, 0); // default
         assert_eq!(event.retrieval_active_tokens_before, 0);
         assert_eq!(event.retrieval_request_input_limit_tokens, 0);
+        assert!(event.retrieval_active_state_sha256.is_none());
         assert!(event.retrieval_oldest_retained_message_id.is_none());
     }
 
@@ -1801,6 +1807,7 @@ mod tests {
         event.fixed_prompt_tokens = 50;
         event.retrieval_active_tokens_before = 1_000;
         event.retrieval_active_message_count_before = 8;
+        event.retrieval_active_state_sha256 = Some("a".repeat(64));
         event.retrieval_active_tokens_after = 600;
         event.retrieval_target_tokens = 640;
         event.retrieval_target_usage_percent = 50;
@@ -1825,6 +1832,10 @@ mod tests {
         assert_eq!(back.summary_tokens, 0);
         assert_eq!(back.retrieval_active_tokens_before, 1_000);
         assert_eq!(back.retrieval_active_message_count_before, 8);
+        assert_eq!(
+            back.retrieval_active_state_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(back.retrieval_active_tokens_after, 600);
         assert_eq!(back.retrieval_target_tokens, 640);
         assert_eq!(back.retrieval_target_usage_percent, 50);
