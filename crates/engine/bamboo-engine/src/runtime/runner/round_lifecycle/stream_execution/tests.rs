@@ -373,7 +373,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let llm = mock_llm(vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -704,8 +704,8 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
     .expect("retry checkpoints the same deterministic ledger before dispatch");
     assert_eq!(
         persistence.0.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "retry must not bypass the failed durable checkpoint"
+        3,
+        "retry must persist both the restored candidate and its stable reprepare after the injected failure"
     );
     assert!(*llm.ir_invoked.lock().expect("ir_invoked lock"));
     assert_eq!(
@@ -713,6 +713,93 @@ async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
             .await
             .recall_outcome,
         bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+    );
+}
+
+#[tokio::test]
+async fn append_safe_ledger_checkpoint_reprepares_from_merged_durable_suffix() {
+    struct ConcurrentAppendPersistence {
+        durable: Mutex<Session>,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for ConcurrentAppendPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.durable.lock().expect("durable lock") = session.clone();
+            Ok(())
+        }
+
+        async fn load_runtime_session(
+            &self,
+            _session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            Ok(Some(self.durable.lock().expect("durable lock").clone()))
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "session-ledger-concurrent-append";
+    let original = Message::user("original request");
+    let concurrent = Message::user("concurrent child completion");
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(original.clone());
+    let mut durable = session.clone();
+    durable.add_message(concurrent.clone());
+
+    let persistence = Arc::new(ConcurrentAppendPersistence {
+        durable: Mutex::new(durable),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), original],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("checkpoint merge must trigger a fresh bounded request");
+
+    let requested_messages = llm.requested_messages.lock().expect("messages lock");
+    assert!(
+        requested_messages
+            .iter()
+            .any(|message| message.id == concurrent.id),
+        "the dispatched request must include the suffix merged by the append-safe checkpoint"
+    );
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the merged suffix needs one replacement ledger checkpoint before the rebuilt envelope stabilizes"
     );
 }
 
@@ -959,7 +1046,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         })
         .collect::<Vec<_>>();
 
-    let (stream_output, _) = execute_llm_stream(
+    let (stream_output, _, _) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -1352,7 +1439,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -1445,7 +1532,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
     let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -3518,7 +3605,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -3683,7 +3770,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -3780,7 +3867,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -3868,7 +3955,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -3970,7 +4057,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4081,7 +4168,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
