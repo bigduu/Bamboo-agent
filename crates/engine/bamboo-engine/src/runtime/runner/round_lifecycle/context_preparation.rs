@@ -1840,12 +1840,20 @@ pub(super) async fn maybe_apply_host_context_compression(
                 llm.as_ref(),
             )
             .await;
+            // Mid-turn tool execution owns the complete eligible catalog, but
+            // the next provider request may expose only Core plus discovery
+            // (StickyFallback). Account against that exact request catalog so
+            // a manual boundary cannot over-archive for deferred schemas that
+            // will not be sent.
+            let request_tool_schemas =
+                super::request_tool_schemas_for_session(session, llm, model_name, tool_schemas)
+                    .await;
             return match Box::pin(maybe_prepare_retrieval_window_context(
                 session,
                 config,
                 model_name,
                 session_id,
-                tool_schemas,
+                request_tool_schemas.as_ref(),
                 llm,
                 &budget,
                 event_tx,

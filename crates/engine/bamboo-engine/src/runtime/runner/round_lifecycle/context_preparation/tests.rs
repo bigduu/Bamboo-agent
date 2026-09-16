@@ -26,11 +26,12 @@ use bamboo_config::{
 };
 use bamboo_domain::ResponseOccurrence;
 use bamboo_domain::{
-    provider_transcript_boundary_sha256, AgentHookPoint, ContextBlockType, HookPayload, HookResult,
-    ModelContextEvent, ModelContextEventKind, ModelContextResetReason, ModelContextState,
-    ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
-    ProviderTranscriptOrigin, ProviderTranscriptResetReason, RetrievalWindowCheckpointOutcome,
-    RuntimeSessionPersistence, TaskItem, TaskItemStatus, TaskList,
+    provider_transcript_boundary_sha256, AgentHookPoint, CapabilityLoadingMode, ContextBlockType,
+    HookPayload, HookResult, ModelContextEvent, ModelContextEventKind, ModelContextResetReason,
+    ModelContextState, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptItem, ProviderTranscriptOrigin, ProviderTranscriptResetReason,
+    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, TaskItem, TaskItemStatus,
+    TaskList,
 };
 use bamboo_llm::models::{ContentPart, ImageUrl};
 use bamboo_llm::provider::{
@@ -569,6 +570,52 @@ fn historical_ledger_tokens_start_a_bounded_retention_epoch_below_event_cap() {
 struct RecordingLlmProvider {
     models: Arc<Mutex<Vec<String>>>,
     response: String,
+}
+
+struct StickyFallbackCatalogProvider {
+    catalogs: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for StickyFallbackCatalogProvider {
+    async fn capability_loading_mode(
+        &self,
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        CapabilityLoadingMode::StickyFallback
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        _ir: &bamboo_llm::prompt_ir::PromptIR,
+        tools: &[ToolSchema],
+        _model: &str,
+        _required_tool: Option<&str>,
+    ) -> bamboo_llm::provider::Result<ProviderVisibleToolFootprint> {
+        self.catalogs.lock().expect("catalog lock").push(
+            tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect(),
+        );
+        Ok(ProviderVisibleToolFootprint {
+            segments: vec![ProviderVisibleToolSegment {
+                kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                serialized: serde_json::to_string(tools).expect("tool schemas serialize"),
+            }],
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        panic!("manual retrieval preparation must not dispatch a model request")
+    }
 }
 
 #[async_trait::async_trait]
@@ -3583,6 +3630,48 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
     assert!(!events
         .iter()
         .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
+}
+
+#[tokio::test]
+async fn retrieval_window_mid_turn_manual_archive_uses_sticky_request_catalog() {
+    let mut session = retrieval_window_session("retrieval-manual-sticky-catalog");
+    append_archive_context_request(&mut session, "call-manual-sticky-catalog");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let catalogs = Arc::new(Mutex::new(Vec::new()));
+    let llm: Arc<dyn LLMProvider> = Arc::new(StickyFallbackCatalogProvider {
+        catalogs: Arc::clone(&catalogs),
+    });
+    let mut deferred = retrieval_history_tool_schema();
+    deferred.function.name = "Glob".to_string();
+    deferred.function.description = "deferred schema body ".repeat(20_000);
+    let tools = vec![retrieval_history_tool_schema(), deferred];
+
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-sticky-catalog",
+        &tools,
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect("manual archive must account against the actual StickyFallback request catalog");
+
+    assert!(applied);
+    assert_eq!(checkpoints.lock().expect("checkpoint list").len(), 1);
+    let catalogs = catalogs.lock().expect("catalog lock");
+    assert!(!catalogs.is_empty());
+    assert!(catalogs.iter().all(|catalog| {
+        catalog
+            == &vec![
+                "session_history_current".to_string(),
+                "discover_capabilities".to_string(),
+            ]
+    }));
+    assert!(session.messages.iter().any(|message| message.compressed));
 }
 
 #[tokio::test]
