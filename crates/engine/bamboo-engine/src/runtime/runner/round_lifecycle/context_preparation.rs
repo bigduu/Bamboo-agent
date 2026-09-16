@@ -18,8 +18,9 @@ use bamboo_compression::{
     effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
-    prepare_hybrid_context_with_fixed_tokens, PreparedContext, RetrievalWindowPolicy,
-    RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget, TokenCounter,
+    prepare_hybrid_context_with_fixed_tokens, PreparedContext, RetrievalWindowPlanError,
+    RetrievalWindowPolicy, RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget,
+    TokenCounter,
 };
 use bamboo_config::{ContextManagementFallbackStrategy, ContextManagementStrategy};
 use bamboo_domain::{
@@ -892,17 +893,34 @@ async fn maybe_prepare_retrieval_window_context(
         // mutations and provider preparation happen on a separate staged clone.
         let expected_base = candidate_base;
         let mut staged = expected_base.clone();
-        let plan = build_retrieval_window_candidate_plan_with_token_accounting(
+        let plan = match build_retrieval_window_candidate_plan_with_token_accounting(
             &staged,
             budget,
             policy,
             &frame.accounting,
-        )
-        .map_err(|error| {
-            AgentError::Budget(format!(
-                "retrieval-window candidate planning failed: {error}"
-            ))
-        })?;
+        ) {
+            Ok(plan) => plan,
+            Err(error)
+                if manual_archive_call_id.is_some()
+                    && matches!(
+                        &error,
+                        RetrievalWindowPlanError::NothingToArchive { .. }
+                            | RetrievalWindowPlanError::ProtectedContentExceedsTarget { .. }
+                    ) =>
+            {
+                let call_id = manual_archive_call_id
+                    .expect("guarded manual archive call ID must remain available");
+                checkpoint_manual_archive_noop(session, config, call_id).await?;
+                return Err(AgentError::Budget(format!(
+                    "retrieval-window candidate planning permanently rejected archive_context: {error}; the rejected request was durably consumed"
+                )));
+            }
+            Err(error) => {
+                return Err(AgentError::Budget(format!(
+                    "retrieval-window candidate planning failed: {error}"
+                )));
+            }
+        };
 
         let applied = apply_retrieval_window_plan_with_trigger(
             &mut staged,
@@ -1664,14 +1682,23 @@ pub(crate) async fn force_overflow_context_recovery(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<bool, AgentError> {
-    if let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
+    let mut degraded_prompt = false;
+    while let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
+        degraded_prompt = true;
         tracing::info!(
             "[{}] Overflow recovery pre-pass degraded prompt section: {}",
             session_id,
             degraded_section,
         );
         emit_context_compression_status(event_tx, "overflow-recovery", "degraded_sections").await;
-        return Ok(true);
+
+        // Summary mode preserves the existing one-section-per-recovery
+        // behavior. Retrieval-window recovery has only one provider retry, so
+        // it must finish the bounded degradation pass and reach forced archive
+        // planning during this same invocation.
+        if config.context_management.strategy != ContextManagementStrategy::RetrievalWindow {
+            return Ok(true);
+        }
     }
 
     if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
@@ -1699,6 +1726,13 @@ pub(crate) async fn force_overflow_context_recovery(
                     "retrieval-window critical overflow recovery was deferred by a required setup boundary"
                         .to_string(),
                 ));
+            }
+            Ok(RetrievalWindowPreparationOutcome::NotNeeded) if degraded_prompt => {
+                tracing::info!(
+                    session_id = %session_id,
+                    "retrieval-window critical recovery needed prompt degradation only"
+                );
+                return Ok(true);
             }
             Ok(RetrievalWindowPreparationOutcome::NotNeeded)
                 if !retrieval_window_fallback_is_summary(config) =>

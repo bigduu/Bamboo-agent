@@ -3650,6 +3650,126 @@ async fn archive_context_existing_summary_is_consumed_before_no_fallback_gate() 
 }
 
 #[tokio::test]
+async fn archive_context_protected_target_failure_is_consumed_after_retryable_checkpoint() {
+    let mut session = Session::new("retrieval-manual-protected-reject", "test-model");
+    session.add_message(Message::system("retrieval system"));
+    session.add_message(Message::user("old eligible turn"));
+    session.add_message(Message::assistant("old eligible response", None));
+    session.add_message(Message::user("protected latest evidence ".repeat(4_000)));
+    session.add_message(Message::assistant(
+        "protected latest response ".repeat(4_000),
+        None,
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        0,
+        BudgetStrategy::default(),
+        0,
+    ));
+    append_archive_context_request(&mut session, "call-protected-reject");
+    let before = serde_json::to_vec(&session).unwrap();
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    let (failing_persistence, failed_checkpoints) = RetrievalCheckpointPersistence::failing();
+    let mut failing_config = retrieval_window_config(failing_persistence);
+    failing_config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let checkpoint_error = prepare_round_context(
+        &mut session,
+        &failing_config,
+        "test-model",
+        "retrieval-manual-protected-reject",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("failed rejection checkpoint must keep the manual request retryable");
+    assert!(checkpoint_error.to_string().contains("checkpoint failed"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert_eq!(
+        pending_manual_archive_call_id(&session).as_deref(),
+        Some("call-protected-reject")
+    );
+    assert!(failed_checkpoints
+        .lock()
+        .expect("checkpoint list lock")
+        .is_empty());
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-protected-reject",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("protected newest content must permanently reject this manual request");
+
+    assert!(error.to_string().contains("protected active content"));
+    assert!(error.to_string().contains("durably consumed"));
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(session.compression_events.is_empty());
+}
+
+#[tokio::test]
+async fn archive_context_nothing_to_archive_failure_is_consumed_once() {
+    let mut session = Session::new("retrieval-manual-no-candidate", "test-model");
+    session.add_message(Message::system("retrieval system"));
+    session.add_message(Message::user("only protected user turn ".repeat(4_000)));
+    session.add_message(Message::assistant(
+        "only protected assistant turn ".repeat(4_000),
+        None,
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        0,
+        BudgetStrategy::default(),
+        0,
+    ));
+    append_archive_context_request(&mut session, "call-no-candidate");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let llm = noop_llm();
+
+    let error = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-no-candidate",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("a fully protected window has no permanent archive candidate");
+
+    assert!(error
+        .to_string()
+        .contains("no eligible active logical group"));
+    assert!(error.to_string().contains("durably consumed"));
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(session.compression_events.is_empty());
+}
+
+#[tokio::test]
 async fn retrieval_window_critical_overflow_rejects_oversized_latest_turn_transactionally() {
     let mut session = Session::new("retrieval-oversized-latest", "test-model");
     session.add_message(Message::system("retrieval system"));
@@ -4471,6 +4591,64 @@ async fn degradation_strips_system_sections_in_order() {
     assert!(prompt.contains("BAMBOO_EXTERNAL_MEMORY"));
     assert!(prompt.contains("BAMBOO_TASK_LIST"));
     assert!(prompt.contains("Base prompt"));
+}
+
+#[tokio::test]
+async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_recovery() {
+    let mut session = retrieval_window_session("retrieval-overflow-degrade-and-archive");
+    session.messages[0].content = "Base prompt\n\
+         <!-- BAMBOO_ENV_CONTEXT_START -->\nenv info\n<!-- BAMBOO_ENV_CONTEXT_END -->\n\
+         <!-- BAMBOO_SKILL_CONTEXT_START -->\nskill details\n<!-- BAMBOO_SKILL_CONTEXT_END -->\n\
+         <!-- BAMBOO_TOOL_GUIDE_START -->\nguide details\n<!-- BAMBOO_TOOL_GUIDE_END -->"
+        .to_string();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let llm = noop_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let applied = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-overflow-degrade-and-archive",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("one retrieval recovery must finish degradation and forced archival");
+
+    assert!(applied);
+    let prompt = system_prompt(&session);
+    assert!(!prompt.contains("BAMBOO_TOOL_GUIDE"));
+    assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
+    assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_eq!(
+        session
+            .compression_events
+            .last()
+            .expect("forced archive event")
+            .trigger_type,
+        CompressionTriggerType::CriticalOverflow
+    );
+
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ContextCompressionStatus { status, .. }
+                    if status == "degraded_sections"
+            ))
+            .count(),
+        3
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ContextArchived { .. })));
 }
 
 #[tokio::test]
