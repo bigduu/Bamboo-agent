@@ -351,11 +351,30 @@ fn count_indexed_messages(
     messages: &[IndexedMessage<'_>],
     counter: &impl TokenCounter,
 ) -> Result<u32, RetrievalWindowPlanError> {
-    checked_sum(
-        messages
-            .iter()
-            .map(|indexed| counter.count_message(indexed.message)),
-    )
+    messages.iter().try_fold(0u32, |total, indexed| {
+        let message = indexed.message;
+        let message_tokens = counter.count_message(message);
+        // Reasoning replay is provider- and request-dependent. This pure
+        // planner cannot safely assume stored assistant reasoning will be
+        // omitted, so account for it as potentially provider-visible. Keeping
+        // the cost with its logical group also means archiving that group
+        // removes the same cost from the projected active total.
+        let reasoning_tokens = if matches!(message.role, Role::Assistant) {
+            message
+                .reasoning
+                .as_deref()
+                .filter(|reasoning| !reasoning.is_empty())
+                .map(|reasoning| counter.count_text(reasoning))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        total
+            .checked_add(message_tokens)
+            .and_then(|tokens| tokens.checked_add(reasoning_tokens))
+            .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)
+    })
 }
 
 fn build_logical_groups(
@@ -817,6 +836,26 @@ mod tests {
                 incomplete_protocol_group_count: 0,
             }
         );
+    }
+
+    #[test]
+    fn stored_assistant_reasoning_counts_with_its_logical_group() {
+        let mut session = Session::new("retrieval-window-reasoning", "test-model");
+        session.add_message(system("system", 5));
+        session.add_message(user("old-u", 5));
+        let mut reasoned = assistant("old-a", 5);
+        reasoned.reasoning = Some("r".repeat(40));
+        reasoned.reasoning_signature = Some("provider-signature".to_string());
+        session.add_message(reasoned);
+        add_turn(&mut session, "recent", 10);
+
+        let plan = plan_with_counter(&session, 50, 1, 0)
+            .expect("provider-visible reasoning should put the session over target");
+
+        assert_eq!(plan.active_tokens_before, 75);
+        assert_eq!(plan.message_ids_to_archive, vec!["old-u", "old-a"]);
+        assert_eq!(plan.archive_message_tokens, 50);
+        assert_eq!(plan.projected_active_tokens_after, 25);
     }
 
     #[test]
