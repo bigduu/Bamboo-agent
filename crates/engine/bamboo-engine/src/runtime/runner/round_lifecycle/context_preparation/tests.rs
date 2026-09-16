@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
     emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    maybe_apply_host_context_compression, pending_manual_archive_call_id, prepare_round_context,
-    LAST_MANUAL_ARCHIVE_CALL_ID_KEY, LAST_PRESSURE_LEVEL_KEY,
+    mark_manual_archive_request_consumed, maybe_apply_host_context_compression,
+    pending_manual_archive_request, prepare_round_context, LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY,
+    LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -23,6 +24,7 @@ use bamboo_config::{
     ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
     RetrievalWindowContextConfig,
 };
+use bamboo_domain::ResponseOccurrence;
 use bamboo_domain::{
     provider_transcript_boundary_sha256, AgentHookPoint, ContextBlockType, HookPayload, HookResult,
     ModelContextEvent, ModelContextEventKind, ModelContextResetReason, ModelContextState,
@@ -347,8 +349,46 @@ fn append_archive_context_request(session: &mut Session, call_id: &str) {
     }]);
     session.add_message(assistant);
     let mut result = Message::tool_result(call_id, "Retrieval-window archive requested");
+    result.id = format!("result-{call_id}-{}", session.messages.len());
     result.tool_success = Some(true);
     session.add_message(result);
+}
+
+fn assert_archive_rejection_visible(session: &Session, call_id: &str, expected: &str) {
+    let result = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+        .expect("archive_context result");
+    assert_eq!(result.tool_success, Some(false));
+    assert!(result.content.starts_with("archive_context rejected:"));
+    assert!(
+        result.content.contains(expected),
+        "expected rejection content to contain {expected:?}, got {:?}",
+        result.content
+    );
+}
+
+#[test]
+fn manual_archive_consumption_tracks_result_occurrence_when_call_id_is_reused() {
+    let mut session = Session::new("manual-archive-reused-id", "test-model");
+    session.add_message(Message::user("archive twice in separate model rounds"));
+
+    append_archive_context_request(&mut session, "reused-call-id");
+    let first = pending_manual_archive_request(&session).expect("first request");
+    mark_manual_archive_request_consumed(&mut session, &first).expect("consume first request");
+    assert!(pending_manual_archive_request(&session).is_none());
+
+    append_archive_context_request(&mut session, "reused-call-id");
+    let second = pending_manual_archive_request(&session).expect("second request");
+    assert_eq!(second.tool_call_id, first.tool_call_id);
+    assert_ne!(second.tool_result_message_id, first.tool_result_message_id);
+
+    mark_manual_archive_request_consumed(&mut session, &second).expect("consume second request");
+    let restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
+        .expect("occurrence marker survives restart");
+    assert!(pending_manual_archive_request(&restarted).is_none());
 }
 
 struct ExpandingFootprintProvider {
@@ -3349,6 +3389,12 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
         "resp-before-manual-archive".to_string(),
     );
     append_archive_context_request(&mut session, "call-manual-archive");
+    let manual_result_id = session
+        .messages
+        .last()
+        .expect("manual archive result")
+        .id
+        .clone();
     let raw_before = session
         .messages
         .iter()
@@ -3399,9 +3445,13 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
     assert_eq!(
         session
             .metadata
-            .get(LAST_MANUAL_ARCHIVE_CALL_ID_KEY)
-            .map(String::as_str),
-        Some("call-manual-archive")
+            .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
+            .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok()),
+        Some(ResponseOccurrence {
+            tool_call_id: "call-manual-archive".to_string(),
+            tool_result_message_id: manual_result_id,
+            permission_generation: None,
+        })
     );
     assert!(!session
         .metadata
@@ -3434,7 +3484,7 @@ async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_id
     let serialized = serde_json::to_vec(&session).expect("session serializes");
     let mut restarted: Session =
         serde_json::from_slice(&serialized).expect("session should reload exactly");
-    assert!(pending_manual_archive_call_id(&restarted).is_none());
+    assert!(pending_manual_archive_request(&restarted).is_none());
     let before_restart_pass = restarted.compression_events.len();
     prepare_round_context(
         &mut restarted,
@@ -3498,7 +3548,7 @@ async fn retrieval_window_manual_noop_is_consumed_durably_once() {
     .expect("already-at-target manual archive should be a durable no-op");
     assert!(session.compression_events.is_empty());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
 
     let mut restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
         .expect("no-op marker should survive restart");
@@ -3540,7 +3590,9 @@ async fn retrieval_window_manual_checkpoint_failure_remains_retryable() {
     assert!(error.to_string().contains("durable checkpoint failed"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert_eq!(
-        pending_manual_archive_call_id(&session).as_deref(),
+        pending_manual_archive_request(&session)
+            .as_ref()
+            .map(|request| request.tool_call_id.as_str()),
         Some("call-manual-retry")
     );
     assert!(failed_checkpoints
@@ -3562,7 +3614,7 @@ async fn retrieval_window_manual_checkpoint_failure_remains_retryable() {
     .await
     .expect("the same request should succeed at the next safe boundary");
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(
         session
             .compression_events
@@ -3600,8 +3652,43 @@ async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
     assert!(error
         .to_string()
         .contains("requires context_management.strategy=retrieval_window"));
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_archive_rejection_visible(
+        &session,
+        "call-summary-archive",
+        "requires context_management.strategy=retrieval_window",
+    );
+    let durable_result = session
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-summary-archive"))
+        .expect("durable archive_context result");
+    durable_result.tool_success = Some(true);
+    durable_result.content = "Retrieval-window archive requested".to_string();
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "summary-rejects-archive",
+        &[],
+        &llm,
+        None,
+    )
+    .await
+    .expect("a consumed rejection must allow the next model round");
+    let visible_result = prepared
+        .prepared_context
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some("call-summary-archive"))
+        .expect("provider-visible archive_context result");
+    assert_eq!(visible_result.tool_success, Some(false));
+    assert!(visible_result
+        .content
+        .contains("requires context_management.strategy=retrieval_window"));
     assert!(session.compression_events.is_empty());
     assert!(session.conversation_summary.is_none());
 }
@@ -3639,7 +3726,9 @@ async fn archive_context_with_existing_summary_is_permanently_rejected_and_consu
     assert!(checkpoint_error.to_string().contains("checkpoint failed"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert_eq!(
-        pending_manual_archive_call_id(&session).as_deref(),
+        pending_manual_archive_request(&session)
+            .as_ref()
+            .map(|request| request.tool_call_id.as_str()),
         Some("call-existing-summary-archive")
     );
     assert!(failed_checkpoints
@@ -3667,8 +3756,13 @@ async fn archive_context_with_existing_summary_is_permanently_rejected_and_consu
     assert!(error
         .to_string()
         .contains("already has a conversation summary"));
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_archive_rejection_visible(
+        &session,
+        "call-existing-summary-archive",
+        "already has a conversation summary",
+    );
     assert!(session.compression_events.is_empty());
     assert_eq!(
         session
@@ -3706,9 +3800,14 @@ async fn archive_context_existing_summary_is_consumed_before_no_fallback_gate() 
 
     assert!(error
         .to_string()
-        .contains("rejected request was durably consumed"));
-    assert!(pending_manual_archive_call_id(&session).is_none());
+        .contains("rejected request was surfaced and durably consumed"));
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_archive_rejection_visible(
+        &session,
+        "call-summary-no-fallback",
+        "already has a conversation summary",
+    );
     assert!(session.compression_events.is_empty());
 }
 
@@ -3754,7 +3853,9 @@ async fn archive_context_protected_target_failure_is_consumed_after_retryable_ch
     assert!(checkpoint_error.to_string().contains("checkpoint failed"));
     assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert_eq!(
-        pending_manual_archive_call_id(&session).as_deref(),
+        pending_manual_archive_request(&session)
+            .as_ref()
+            .map(|request| request.tool_call_id.as_str()),
         Some("call-protected-reject")
     );
     assert!(failed_checkpoints
@@ -3782,8 +3883,13 @@ async fn archive_context_protected_target_failure_is_consumed_after_retryable_ch
 
     assert!(error.to_string().contains("protected active content"));
     assert!(error.to_string().contains("durably consumed"));
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_archive_rejection_visible(
+        &session,
+        "call-protected-reject",
+        "protected active content",
+    );
     assert!(session.compression_events.is_empty());
 }
 
@@ -3827,8 +3933,13 @@ async fn archive_context_nothing_to_archive_failure_is_consumed_once() {
         .to_string()
         .contains("no eligible active logical group"));
     assert!(error.to_string().contains("durably consumed"));
-    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert!(pending_manual_archive_request(&session).is_none());
     assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert_archive_rejection_visible(
+        &session,
+        "call-no-candidate",
+        "no eligible active logical group",
+    );
     assert!(session.compression_events.is_empty());
 }
 
@@ -4686,8 +4797,8 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
     assert!(!prompt.contains("BAMBOO_TOOL_GUIDE"));
     assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
     assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
-    assert_eq!(fixture.runtime_checkpoints.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.retrieval_checkpoints.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.runtime_checkpoints.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.retrieval_checkpoints.load(Ordering::SeqCst), 2);
     assert_eq!(
         session
             .compression_events
