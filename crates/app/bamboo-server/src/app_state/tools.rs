@@ -176,7 +176,7 @@ pub(super) fn build_base_tools(
         notify_tool,
     ));
 
-    // Every Session can search only its own authoritative stored messages.
+    // Every Session can inspect only its own authoritative stored messages.
     // Root replaces this same-name instance with the full viewer below.
     let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
         session_store,
@@ -267,7 +267,7 @@ pub(super) fn build_root_tools(
     );
 
     // Intentional same-name overlay replacement: Root keeps every privileged
-    // cross-session action while Base/Child expose only search_current.
+    // cross-session action while Base/Child expose only current-Session reads.
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store,
         storage,

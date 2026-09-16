@@ -253,6 +253,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
         .as_array()
         .expect("Root history actions");
     assert!(actions.contains(&json!("search_current")));
+    assert!(actions.contains(&json!("read_current")));
     assert!(actions.contains(&json!("list")));
     assert!(actions.contains(&json!("read_messages")));
 }
@@ -318,7 +319,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .expect("Child history schema");
     assert_eq!(
         history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current"])
+        json!(["search_current", "read_current"])
     );
     assert!(history.function.parameters["properties"]
         .get("session_id")
@@ -331,12 +332,11 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .expect("Base history schema");
     assert_eq!(
         base_history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current"])
+        json!(["search_current", "read_current"])
     );
     assert!(base_history.function.parameters["properties"]
         .get("session_id")
         .is_none());
-
     let mut child_session = Session::new("child-history-surface", "test-model");
     child_session.add_message(bamboo_agent_core::Message::user(
         "CHILD-SELF-HISTORY-SENTINEL",

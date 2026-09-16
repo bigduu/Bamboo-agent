@@ -9,15 +9,15 @@ use bamboo_agent_core::tools::ToolExecutor;
 
 /// Tool surface variants for different session types.
 ///
-/// | Surface  | Base + self history | +SubAgent | +scheduler | full history |
-/// |----------|---------------------|-----------|------------|--------------|
-/// | Base     | ✓                   |           |            |              |
-/// | Child    | ✓                   |           |            |              |
-/// | WithTask | ✓                   | ✓         |            |              |
-/// | Root     | ✓                   | ✓         | ✓          | ✓            |
+/// | Surface  | Base + current history | +SubAgent | +scheduler | full history |
+/// |----------|------------------------|-----------|------------|--------------|
+/// | Base     | ✓                      |           |            |              |
+/// | Child    | ✓                      |           |            |              |
+/// | WithTask | ✓                      | ✓         |            |              |
+/// | Root     | ✓                      | ✓         | ✓          | ✓            |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSurface {
-    /// Base tool set: builtin + MCP + memory + skills + self-history search.
+    /// Base tool set: builtin + MCP + memory + skills + self-history retrieval.
     /// Used by the agent runtime as default_tools.
     Base,
     /// Same as Base — child sessions cannot recursively spawn.

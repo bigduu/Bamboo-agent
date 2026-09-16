@@ -234,7 +234,7 @@ impl SessionSearchIndex {
     ///
     /// `before_message_index` is an exclusive transcript boundary supplied by
     /// the caller so the currently executing search call cannot match itself.
-    /// `excluded_message_ids` removes prior generated history-search calls and
+    /// `excluded_message_ids` removes prior generated self-history calls and
     /// results. Neither filter changes the indexed or durable Session state.
     pub async fn search_messages_in_session(
         &self,
@@ -942,9 +942,12 @@ pub fn session_message_content_matches(content: &str, query: &str) -> bool {
     session_content_match_class(content, query) > 0
 }
 
-/// Identify generated `session_history.search_current` call/result messages so
-/// the derived current-Session query can exclude self-reinforcing search
-/// artifacts without rescanning the canonical transcript on every read.
+/// Identify generated self-history call/result messages so derived current-
+/// Session reads can exclude self-reinforcing retrieval artifacts without
+/// treating them as conversation evidence.
+///
+/// The persisted column retains its v5 compatibility name
+/// `history_search_artifact`, but it covers both bounded self-history actions.
 pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String> {
     let mut call_ids = HashSet::new();
     let mut message_ids = HashSet::new();
@@ -952,15 +955,17 @@ pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String>
         let generated = message.tool_calls.as_ref().is_some_and(|calls| {
             let mut generated = false;
             for call in calls {
-                let is_history_search = bamboo_domain::canonical_tool_name(&call.function.name)
+                let is_history_retrieval = bamboo_domain::canonical_tool_name(&call.function.name)
                     == "session_history"
                     && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
                         .ok()
                         .is_some_and(|arguments| {
-                            arguments.get("action").and_then(serde_json::Value::as_str)
-                                == Some("search_current")
+                            matches!(
+                                arguments.get("action").and_then(serde_json::Value::as_str),
+                                Some("search_current" | "read_current")
+                            )
                         });
-                if is_history_search {
+                if is_history_retrieval {
                     call_ids.insert(call.id.as_str());
                     generated = true;
                 }
@@ -1427,7 +1432,8 @@ fn build_message_fts_query(query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bamboo_domain::{ConversationSummary, Message};
+    use bamboo_domain::{ConversationSummary, FunctionCall, Message, ToolCall};
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn sample_session() -> Session {
@@ -1440,6 +1446,62 @@ mod tests {
             None,
         ));
         session
+    }
+
+    #[test]
+    fn self_history_artifacts_cover_search_and_bounded_pagination_actions() {
+        let mut session = Session::new("history-artifacts", "test-model");
+        let mut expected = HashSet::new();
+        for (index, (tool_name, action)) in [
+            ("session_history", "search_current"),
+            ("session_history", "read_current"),
+            ("recall", "read_current"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call_id = format!("history-call-{index}");
+            let call_message_id = format!("history-call-message-{index}");
+            let result_message_id = format!("history-result-message-{index}");
+            let mut call_message = Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: call_id.clone(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: tool_name.to_string(),
+                        arguments: json!({"action":action}).to_string(),
+                    },
+                }]),
+            );
+            call_message.id = call_message_id.clone();
+            let mut result_message = Message::tool_result(&call_id, "generated result");
+            result_message.id = result_message_id.clone();
+            session.add_message(call_message);
+            session.add_message(result_message);
+            expected.insert(call_message_id);
+            expected.insert(result_message_id);
+        }
+
+        let ordinary_call_id = "root-read-messages";
+        let mut ordinary_call = Message::assistant(
+            "ordinary root viewer call",
+            Some(vec![ToolCall {
+                id: ordinary_call_id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "session_history".to_string(),
+                    arguments: json!({"action":"read_messages","session_id":"target"}).to_string(),
+                },
+            }]),
+        );
+        ordinary_call.id = "ordinary-call-message".to_string();
+        let mut ordinary_result = Message::tool_result(ordinary_call_id, "ordinary result");
+        ordinary_result.id = "ordinary-result-message".to_string();
+        session.add_message(ordinary_call);
+        session.add_message(ordinary_result);
+
+        assert_eq!(session_history_search_artifact_ids(&session), expected);
     }
 
     #[test]
