@@ -9,7 +9,7 @@ use crate::runtime::runner::session_setup::prompt_envelope::{
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
     AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Message, MessagePart, Role,
-    Session,
+    Session, ToolResult,
 };
 use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
@@ -201,11 +201,26 @@ fn apply_manual_archive_rejection_overlays(
     }
 }
 
+async fn emit_manual_archive_rejection_correction(
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+    request: &ResponseOccurrence,
+    reason: &str,
+) {
+    let Some(tx) = event_tx else { return };
+    let _ = tx
+        .send(AgentEvent::ToolComplete {
+            tool_call_id: request.tool_call_id.clone(),
+            result: ToolResult::text(false, format!("archive_context rejected: {reason}")),
+        })
+        .await;
+}
+
 fn checkpoint_manual_archive_outcome<'a>(
     session: &'a mut Session,
     config: &'a AgentLoopConfig,
     request: &'a ResponseOccurrence,
     rejection_reason: Option<&'a str>,
+    event_tx: Option<&'a mpsc::Sender<AgentEvent>>,
 ) -> Pin<Box<dyn Future<Output = Result<(), AgentError>> + Send + 'a>> {
     // This path carries multiple complete Session snapshots across persistence
     // awaits. Keep that state on the heap so merely compiling the manual
@@ -252,6 +267,7 @@ fn checkpoint_manual_archive_outcome<'a>(
                     });
                 *session = candidate_base;
                 if already_committed {
+                    emit_manual_archive_rejection_correction(event_tx, request, reason).await;
                     return Ok(());
                 }
                 return Err(AgentError::Budget(
@@ -278,6 +294,7 @@ fn checkpoint_manual_archive_outcome<'a>(
             })? {
             RetrievalWindowCheckpointOutcome::Committed => {
                 *session = staged;
+                emit_manual_archive_rejection_correction(event_tx, request, reason).await;
                 return Ok(());
             }
             RetrievalWindowCheckpointOutcome::Rebased
@@ -1027,7 +1044,7 @@ async fn maybe_prepare_retrieval_window_context(
     if let Some(request) = manual_archive_request.filter(|_| session.conversation_summary.is_some())
     {
         let reason = "cannot create a retrieval-window boundary for a Session that already has a conversation summary";
-        checkpoint_manual_archive_outcome(session, config, request, Some(reason)).await?;
+        checkpoint_manual_archive_outcome(session, config, request, Some(reason), event_tx).await?;
         return Err(AgentError::Budget(format!(
             "archive_context {reason}; the rejected request was surfaced and durably consumed"
         )));
@@ -1166,7 +1183,14 @@ async fn maybe_prepare_retrieval_window_context(
                 let request = manual_archive_request
                     .expect("guarded manual archive request must remain available");
                 let reason = format!("retrieval-window candidate planning failed: {error}");
-                checkpoint_manual_archive_outcome(session, config, request, Some(&reason)).await?;
+                checkpoint_manual_archive_outcome(
+                    session,
+                    config,
+                    request,
+                    Some(&reason),
+                    event_tx,
+                )
+                .await?;
                 return Err(AgentError::Budget(format!(
                     "retrieval-window candidate planning permanently rejected archive_context: {error}; the rejected request was surfaced and durably consumed"
                 )));
@@ -1828,7 +1852,13 @@ pub(super) async fn maybe_apply_host_context_compression(
         if let Some(request) = manual_archive_request.as_ref() {
             let reason = "requires context_management.strategy=retrieval_window; compact_context remains the manual control for summary strategy";
             if config.persistence.is_some() {
-                checkpoint_manual_archive_outcome(session, config, request, Some(reason))
+                checkpoint_manual_archive_outcome(
+                    session,
+                    config,
+                    request,
+                    Some(reason),
+                    event_tx,
+                )
                     .await
                     .map_err(|error| {
                         AgentError::Budget(format!(
@@ -1842,6 +1872,7 @@ pub(super) async fn maybe_apply_host_context_compression(
                     .metadata
                     .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
                 session.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+                emit_manual_archive_rejection_correction(event_tx, request, reason).await;
             }
             return Err(AgentError::Budget(format!("archive_context {reason}")));
         }
@@ -1878,7 +1909,8 @@ pub(super) async fn maybe_apply_host_context_compression(
             {
                 RetrievalWindowPreparationOutcome::Archived(_) => Ok(true),
                 RetrievalWindowPreparationOutcome::NotNeeded => {
-                    checkpoint_manual_archive_outcome(session, config, request, None).await?;
+                    checkpoint_manual_archive_outcome(session, config, request, None, event_tx)
+                        .await?;
                     Ok(false)
                 }
                 RetrievalWindowPreparationOutcome::Deferred => Ok(false),
@@ -2081,7 +2113,8 @@ pub(super) async fn prepare_round_context(
         if let Some(request) = manual_archive_request.as_ref() {
             let reason = "requires context_management.strategy=retrieval_window; compact_context remains the manual control for summary strategy";
             if config.persistence.is_some() {
-                checkpoint_manual_archive_outcome(session, config, request, Some(reason)).await?;
+                checkpoint_manual_archive_outcome(session, config, request, Some(reason), event_tx)
+                    .await?;
             } else {
                 surface_manual_archive_rejection(session, request, reason)?;
                 mark_manual_archive_request_consumed(session, request)?;
@@ -2089,6 +2122,7 @@ pub(super) async fn prepare_round_context(
                     .metadata
                     .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
                 session.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+                emit_manual_archive_rejection_correction(event_tx, request, reason).await;
             }
             return Err(AgentError::Budget(format!("archive_context {reason}")));
         }
@@ -2159,7 +2193,8 @@ pub(super) async fn prepare_round_context(
                     retrieval_prepared = Some(prepared)
                 }
                 RetrievalWindowPreparationOutcome::NotNeeded => {
-                    checkpoint_manual_archive_outcome(session, config, request, None).await?;
+                    checkpoint_manual_archive_outcome(session, config, request, None, event_tx)
+                        .await?;
                     ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
                 }
                 RetrievalWindowPreparationOutcome::Deferred => {

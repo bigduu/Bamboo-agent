@@ -1905,6 +1905,15 @@ fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::
         return Ok(false);
     }
 
+    // Legacy background-completion delivery is a separately locked runtime
+    // writer. A prompt/archive rewrite planned before that writer queued a
+    // notification must rebase instead of full-saving the stale queue state.
+    if expected.has_pending_injected_messages() != durable.has_pending_injected_messages()
+        || expected.pending_injected_messages() != durable.pending_injected_messages()
+    {
+        return Ok(false);
+    }
+
     Ok(ensure_model_context_checkpoint_is_current(expected, durable).is_ok())
 }
 
@@ -1922,6 +1931,12 @@ fn rebase_retrieval_window_base(expected: &Session, durable: &Session) -> Sessio
     rebased
         .model_context_state
         .clone_from(&durable.model_context_state);
+    if durable.has_pending_injected_messages() {
+        rebased
+            .set_pending_injected_messages(durable.pending_injected_messages().unwrap_or_default());
+    } else {
+        rebased.clear_pending_injected_messages();
+    }
     if durable.updated_at > rebased.updated_at {
         rebased.updated_at = durable.updated_at;
     }
@@ -4148,6 +4163,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_a_concurrent_pending_injection() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-pending-injection";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "content": "background shell completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert_eq!(
+            staged.pending_injected_messages(),
+            durable.pending_injected_messages()
+        );
+        assert!(staged.model_context_state.is_none());
+    }
+
+    #[tokio::test]
     async fn manual_archive_rejection_checkpoint_persists_the_rewritten_tool_result() {
         use bamboo_domain::{FunctionCall, Message, ToolCall};
 
@@ -4182,30 +4239,59 @@ mod tests {
             permission_generation: None,
         };
         let reason = "no eligible active logical group can be archived";
-        let mut staged = expected.clone();
-        let staged_result = staged
-            .messages
-            .iter_mut()
-            .find(|message| message.id == "archive-result")
+        let stage_rejection = |base: &Session| {
+            let mut staged = base.clone();
+            let staged_result = staged
+                .messages
+                .iter_mut()
+                .find(|message| message.id == "archive-result")
+                .unwrap();
+            staged_result.tool_success = Some(false);
+            staged_result.content = format!("archive_context rejected: {reason}");
+            staged.metadata.insert(
+                LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
+                serde_json::to_string(&occurrence).unwrap(),
+            );
+            staged.metadata.insert(
+                MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
+                serde_json::to_string(&vec![serde_json::json!({
+                    "occurrence": occurrence.clone(),
+                    "reason": reason,
+                })])
+                .unwrap(),
+            );
+            staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            staged.reset_model_context_epoch(
+                bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+            );
+            staged
+        };
+
+        let mut staged = stage_rejection(&expected);
+        let mut durable = expected.clone();
+        durable.set_pending_injected_messages(vec![serde_json::json!({
+            "content": "background shell completed",
+        })]);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_manual_archive_rejection_and_publish(&expected, &mut staged, |_| {})
+            .await
             .unwrap();
-        staged_result.tool_success = Some(false);
-        staged_result.content = format!("archive_context rejected: {reason}");
-        staged.metadata.insert(
-            LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY.to_string(),
-            serde_json::to_string(&occurrence).unwrap(),
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        assert_eq!(
+            staged.pending_injected_messages(),
+            durable.pending_injected_messages()
         );
-        staged.metadata.insert(
-            MANUAL_ARCHIVE_REJECTIONS_KEY.to_string(),
-            serde_json::to_string(&vec![serde_json::json!({
-                "occurrence": occurrence,
-                "reason": reason,
-            })])
-            .unwrap(),
+        let unchanged = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&unchanged).unwrap(),
+            serde_json::to_value(&durable).unwrap()
         );
-        staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
-        staged.reset_model_context_epoch(
-            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
-        );
+
+        expected = staged;
+        let mut staged = stage_rejection(&expected);
 
         let outcome = store
             .checkpoint_manual_archive_rejection_and_publish(&expected, &mut staged, |_| {})
@@ -4231,6 +4317,10 @@ mod tests {
         assert!(!saved
             .metadata
             .contains_key(RESPONSES_PREVIOUS_RESPONSE_ID_KEY));
+        assert_eq!(
+            saved.pending_injected_messages(),
+            durable.pending_injected_messages()
+        );
         assert_eq!(
             saved
                 .model_context_state

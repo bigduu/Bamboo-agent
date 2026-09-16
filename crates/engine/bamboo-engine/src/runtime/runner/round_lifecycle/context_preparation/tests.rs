@@ -3817,6 +3817,7 @@ async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
         ..Default::default()
     };
     let llm = noop_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(4);
 
     let error = maybe_apply_host_context_compression(
         &mut session,
@@ -3825,7 +3826,7 @@ async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
         "summary-rejects-archive",
         &[],
         &llm,
-        None,
+        Some(&event_tx),
         "mid-turn",
     )
     .await
@@ -3840,6 +3841,23 @@ async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
         "call-summary-archive",
         "requires context_management.strategy=retrieval_window",
     );
+    let correction = event_rx
+        .recv()
+        .await
+        .expect("the already-emitted tool success must receive a correction");
+    match correction {
+        AgentEvent::ToolComplete {
+            tool_call_id,
+            result,
+        } => {
+            assert_eq!(tool_call_id, "call-summary-archive");
+            assert!(!result.success);
+            assert!(result
+                .result
+                .contains("requires context_management.strategy=retrieval_window"));
+        }
+        other => panic!("unexpected archive rejection correction: {other:?}"),
+    }
     let durable_result = session
         .messages
         .iter_mut()
