@@ -308,7 +308,7 @@ the active provider window, and directs the model to
 | `strategy` | `summary` | `summary` preserves the current summarizer path; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` | Provider-prepared input ratio that starts automatic archival. |
-| `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0 < target < trigger <= 1`. |
+| `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0.01 <= target < trigger <= 1` because the planner uses whole percentages. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
 

@@ -1547,12 +1547,12 @@ impl ContextManagementConfig {
         }
         if !policy.target_usage_ratio.is_finite()
             || !policy.trigger_usage_ratio.is_finite()
-            || policy.target_usage_ratio <= 0.0
+            || policy.target_usage_ratio < 0.01
             || policy.target_usage_ratio >= policy.trigger_usage_ratio
             || policy.trigger_usage_ratio > 1.0
         {
             return Err(
-                "context_management retrieval ratios must satisfy 0 < target_usage_ratio < trigger_usage_ratio <= 1"
+                "context_management retrieval ratios must satisfy 0.01 <= target_usage_ratio < trigger_usage_ratio <= 1"
                     .to_string(),
             );
         }
@@ -5839,6 +5839,13 @@ mod tests {
                 "retrieval_window": {
                     "target_usage_ratio": 0.8,
                     "trigger_usage_ratio": 0.8
+                }
+            }),
+            serde_json::json!({
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "target_usage_ratio": 0.005,
+                    "trigger_usage_ratio": 0.006
                 }
             }),
             serde_json::json!({
