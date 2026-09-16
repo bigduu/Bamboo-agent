@@ -461,18 +461,21 @@ struct ValidatedRetrievalWindowUsage {
 ///
 /// This operation is intentionally separate from [`crate::apply_compression_plan`]:
 /// it never creates a summary or recovery message and performs every fallible
-/// validation before mutating the session. `current_accounting` must be the
-/// exact provider-prepared snapshot used to build `plan`; the function binds
-/// that snapshot without rerunning provider transforms or attachment I/O.
+/// validation before mutating the session. `current_budget` and
+/// `current_accounting` must describe the provider request that will follow the
+/// commit. The function binds those prepared inputs without rerunning provider
+/// transforms or attachment I/O.
 pub fn apply_retrieval_window_plan(
     session: &mut Session,
     plan: &RetrievalWindowCandidatePlan,
+    current_budget: &TokenBudget,
     current_accounting: &RetrievalWindowTokenAccounting,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let usage = validate_apply_plan_arithmetic(plan)?;
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
     }
+    validate_current_token_budget(plan, current_budget)?;
     validate_current_token_accounting(plan, current_accounting)?;
 
     let candidate_indexes = resolve_candidate_indexes(session, plan)?;
@@ -802,6 +805,20 @@ fn validate_current_token_accounting(
     {
         return Err(RetrievalWindowApplyError::StalePlan {
             invariant: "token_accounting_sha256",
+        });
+    }
+    Ok(())
+}
+
+fn validate_current_token_budget(
+    plan: &RetrievalWindowCandidatePlan,
+    current_budget: &TokenBudget,
+) -> Result<(), RetrievalWindowApplyError> {
+    if current_budget.max_context_tokens != plan.context_window_tokens
+        || current_budget.max_request_input_tokens() != plan.request_input_limit_tokens
+    {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "token_budget",
         });
     }
     Ok(())
@@ -1615,7 +1632,7 @@ mod tests {
         session: &mut Session,
         plan: &RetrievalWindowCandidatePlan,
     ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
-        apply_retrieval_window_plan(session, plan, &accounting_for_plan(plan))
+        apply_retrieval_window_plan(session, plan, &budget(100), &accounting_for_plan(plan))
     }
 
     fn assert_apply_error_without_mutation(
@@ -2414,7 +2431,7 @@ mod tests {
             .provider_message_tokens
             .insert("t1-u".to_string(), 11);
         assert_eq!(
-            apply_retrieval_window_plan(&mut session, &plan, &changed_override),
+            apply_retrieval_window_plan(&mut session, &plan, &budget(100), &changed_override),
             Err(RetrievalWindowApplyError::StalePlan {
                 invariant: "token_accounting_sha256",
             })
@@ -2427,7 +2444,7 @@ mod tests {
         let mut changed_fixed = accounting;
         changed_fixed.fixed_prompt_tokens += 1;
         assert_eq!(
-            apply_retrieval_window_plan(&mut session, &plan, &changed_fixed),
+            apply_retrieval_window_plan(&mut session, &plan, &budget(100), &changed_fixed),
             Err(RetrievalWindowApplyError::StalePlan {
                 invariant: "token_accounting_sha256",
             })
@@ -2436,6 +2453,32 @@ mod tests {
             serde_json::to_vec(&session).expect("session should serialize"),
             before
         );
+    }
+
+    #[test]
+    fn changed_token_budget_fails_before_mutation() {
+        let (mut session, plan) = basic_session_and_plan();
+        let accounting = accounting_for_plan(&plan);
+        let before = serde_json::to_vec(&session).expect("session should serialize");
+
+        let smaller_context = budget(64);
+        let mut larger_output_reserve = budget(100);
+        larger_output_reserve.max_output_tokens = 10;
+        let mut larger_safety_margin = budget(100);
+        larger_safety_margin.safety_margin = 5;
+
+        for current_budget in [smaller_context, larger_output_reserve, larger_safety_margin] {
+            assert_eq!(
+                apply_retrieval_window_plan(&mut session, &plan, &current_budget, &accounting),
+                Err(RetrievalWindowApplyError::StalePlan {
+                    invariant: "token_budget",
+                })
+            );
+            assert_eq!(
+                serde_json::to_vec(&session).expect("session should serialize"),
+                before
+            );
+        }
     }
 
     #[test]
