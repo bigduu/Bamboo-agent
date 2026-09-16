@@ -5,7 +5,7 @@
 //! may archive after capability and persistence invariants have been verified.
 
 use crate::{TiktokenTokenCounter, TokenBudget, TokenCounter};
-use bamboo_domain::{canonical_tool_name, Message, Role, Session};
+use bamboo_domain::{canonical_tool_name, Message, MessagePart, Role, Session};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -352,29 +352,64 @@ fn count_indexed_messages(
     counter: &impl TokenCounter,
 ) -> Result<u32, RetrievalWindowPlanError> {
     messages.iter().try_fold(0u32, |total, indexed| {
-        let message = indexed.message;
-        let message_tokens = counter.count_message(message);
-        // Reasoning replay is provider- and request-dependent. This pure
-        // planner cannot safely assume stored assistant reasoning will be
-        // omitted, so account for it as potentially provider-visible. Keeping
-        // the cost with its logical group also means archiving that group
-        // removes the same cost from the projected active total.
-        let reasoning_tokens = if matches!(message.role, Role::Assistant) {
-            message
-                .reasoning
-                .as_deref()
-                .filter(|reasoning| !reasoning.is_empty())
-                .map(|reasoning| counter.count_text(reasoning))
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
         total
-            .checked_add(message_tokens)
-            .and_then(|tokens| tokens.checked_add(reasoning_tokens))
+            .checked_add(count_provider_visible_message_tokens(
+                indexed.message,
+                counter,
+            )?)
             .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)
     })
+}
+
+fn count_provider_visible_message_tokens(
+    message: &Message,
+    counter: &impl TokenCounter,
+) -> Result<u32, RetrievalWindowPlanError> {
+    let mut tokens = counter.count_message(message);
+
+    // Reasoning replay is provider- and request-dependent. This pure planner
+    // cannot safely assume stored assistant reasoning will be omitted, so
+    // account for it as potentially provider-visible.
+    if matches!(message.role, Role::Assistant) {
+        if let Some(reasoning) = message
+            .reasoning
+            .as_deref()
+            .filter(|reasoning| !reasoning.is_empty())
+        {
+            tokens = tokens
+                .checked_add(counter.count_text(reasoning))
+                .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
+        }
+    }
+
+    // Provider lowering differs by role: some adapters replace `content` with
+    // these parts, while tool-result adapters can expose both. Counting both
+    // here is intentionally conservative and, crucially, keeps text/image cost
+    // attached to the group whose archival removes those provider-visible
+    // parts. Image URLs include data URLs when the image is stored inline.
+    if let Some(parts) = message.content_parts.as_deref() {
+        for part in parts {
+            let part_tokens = match part {
+                MessagePart::Text { text } => counter.count_text(text),
+                MessagePart::ImageUrl { image_url } => {
+                    let url_tokens = counter.count_text(&image_url.url);
+                    let detail_tokens = image_url
+                        .detail
+                        .as_deref()
+                        .map(|detail| counter.count_text(detail))
+                        .unwrap_or(0);
+                    url_tokens
+                        .checked_add(detail_tokens)
+                        .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?
+                }
+            };
+            tokens = tokens
+                .checked_add(part_tokens)
+                .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
+        }
+    }
+
+    Ok(tokens)
 }
 
 fn build_logical_groups(
@@ -855,6 +890,35 @@ mod tests {
         assert_eq!(plan.active_tokens_before, 75);
         assert_eq!(plan.message_ids_to_archive, vec!["old-u", "old-a"]);
         assert_eq!(plan.archive_message_tokens, 50);
+        assert_eq!(plan.projected_active_tokens_after, 25);
+    }
+
+    #[test]
+    fn multimodal_parts_count_with_their_logical_group() {
+        let mut session = Session::new("retrieval-window-multimodal", "test-model");
+        session.add_message(system("system", 5));
+        let mut multimodal = user("old-u", 0);
+        multimodal.content_parts = Some(vec![
+            MessagePart::Text {
+                text: "t".repeat(20),
+            },
+            MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: "i".repeat(20),
+                    detail: Some("high".to_string()),
+                },
+            },
+        ]);
+        session.add_message(multimodal);
+        session.add_message(assistant("old-a", 5));
+        add_turn(&mut session, "recent", 10);
+
+        let plan = plan_with_counter(&session, 50, 1, 0)
+            .expect("provider-visible multimodal parts should exceed the target");
+
+        assert_eq!(plan.active_tokens_before, 74);
+        assert_eq!(plan.message_ids_to_archive, vec!["old-u", "old-a"]);
+        assert_eq!(plan.archive_message_tokens, 49);
         assert_eq!(plan.projected_active_tokens_after, 25);
     }
 
