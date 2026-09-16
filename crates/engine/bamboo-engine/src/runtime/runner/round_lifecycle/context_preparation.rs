@@ -461,12 +461,6 @@ async fn checkpoint_retrieval_overflow_prompt_degradation(
     session: &mut Session,
     config: &AgentLoopConfig,
 ) -> Result<Vec<&'static str>, AgentError> {
-    let Some(persistence) = config.persistence.as_ref() else {
-        return Err(AgentError::Budget(
-            "retrieval-window overflow recovery requires RuntimeSessionPersistence to durably checkpoint prompt degradation before archive planning"
-                .to_string(),
-        ));
-    };
     let mut candidate_base = session.clone();
     let mut observed_sections = Vec::new();
 
@@ -494,6 +488,12 @@ async fn checkpoint_retrieval_overflow_prompt_degradation(
             .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
         staged.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
 
+        let Some(persistence) = config.persistence.as_ref() else {
+            return Err(AgentError::Budget(
+                "retrieval-window overflow recovery requires RuntimeSessionPersistence to durably checkpoint prompt degradation before archive planning"
+                    .to_string(),
+            ));
+        };
         match persistence
             .checkpoint_retrieval_window(&expected_base, &mut staged)
             .await
