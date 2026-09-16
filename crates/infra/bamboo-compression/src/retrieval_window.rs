@@ -337,7 +337,8 @@ fn build_retrieval_window_candidate_plan_with_counter(
     let active_tokens_before = post_boundary_active_tokens
         .checked_add(accounting.boundary_reclaimable_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
-    let target_tokens = effective_target_tokens(budget, policy.target_usage_percent);
+    let target_tokens =
+        effective_retrieval_window_target_tokens(budget, policy.target_usage_percent);
 
     if active_tokens_before <= target_tokens {
         return Err(RetrievalWindowPlanError::TargetAlreadySatisfied {
@@ -669,10 +670,11 @@ fn validate_apply_plan_arithmetic(
             field: "request_input_limit_tokens",
         });
     }
-    let expected_target =
-        ((u64::from(plan.context_window_tokens) * u64::from(plan.target_usage_percent)) / 100)
-            .max(1) as u32;
-    let expected_target = expected_target.min(plan.request_input_limit_tokens);
+    let expected_target = effective_target_tokens(
+        plan.context_window_tokens,
+        plan.request_input_limit_tokens,
+        plan.target_usage_percent,
+    );
     if plan.target_tokens != expected_target {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_tokens",
@@ -1353,11 +1355,31 @@ fn validate_inputs(
     Ok(())
 }
 
-fn effective_target_tokens(budget: &TokenBudget, target_usage_percent: u8) -> u32 {
+/// Resolve the planner's configured target against the provider's actual
+/// request-input limit.
+///
+/// Runtime trigger routing uses the same value so integer rounding and the
+/// request-input cap cannot make the first archive attempt target an already
+/// satisfied token count.
+pub fn effective_retrieval_window_target_tokens(
+    budget: &TokenBudget,
+    target_usage_percent: u8,
+) -> u32 {
+    effective_target_tokens(
+        budget.max_context_tokens,
+        budget.max_request_input_tokens(),
+        target_usage_percent,
+    )
+}
+
+fn effective_target_tokens(
+    context_window_tokens: u32,
+    request_input_limit_tokens: u32,
+    target_usage_percent: u8,
+) -> u32 {
     let percentage_target =
-        ((u64::from(budget.max_context_tokens) * u64::from(target_usage_percent)) / 100).max(1)
-            as u32;
-    percentage_target.min(budget.max_request_input_tokens())
+        ((u64::from(context_window_tokens) * u64::from(target_usage_percent)) / 100).max(1) as u32;
+    percentage_target.min(request_input_limit_tokens)
 }
 
 fn checked_sum(values: impl IntoIterator<Item = u32>) -> Result<u32, RetrievalWindowPlanError> {

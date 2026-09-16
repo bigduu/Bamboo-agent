@@ -3032,6 +3032,31 @@ async fn retrieval_window_below_trigger_does_not_require_history_capability() {
     assert!(event_rx.try_recv().is_err());
 }
 
+#[test]
+fn retrieval_window_capped_trigger_stays_above_capped_target() {
+    let budget = TokenBudget::with_safety_margin(1_000, 200, BudgetStrategy::default(), 0);
+    assert_eq!(budget.max_request_input_tokens(), 800);
+
+    let mut config = AgentLoopConfig::default();
+    config.context_management = ContextManagementConfig {
+        strategy: ContextManagementStrategy::RetrievalWindow,
+        retrieval_window: RetrievalWindowContextConfig {
+            target_usage_ratio: 0.90,
+            trigger_usage_ratio: 0.95,
+            ..Default::default()
+        },
+    };
+
+    assert_eq!(
+        config.context_management.retrieval_target_usage_percent(),
+        90
+    );
+    assert_eq!(
+        super::retrieval_window_trigger_tokens(&config, &budget),
+        801
+    );
+}
+
 #[tokio::test]
 async fn retrieval_window_missing_history_capability_precedes_vision_fallback_dispatch() {
     let mut session = retrieval_window_session("retrieval-missing-history-image");

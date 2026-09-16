@@ -15,6 +15,7 @@ use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan,
     build_forced_compression_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
+    effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
     prepare_hybrid_context_with_fixed_tokens, PreparedContext, RetrievalWindowPolicy,
@@ -650,13 +651,25 @@ async fn build_retrieval_window_accounting_frame(
 }
 
 fn retrieval_window_trigger_tokens(config: &AgentLoopConfig, budget: &TokenBudget) -> u32 {
-    let trigger = (f64::from(budget.max_context_tokens)
+    let configured_trigger = (f64::from(budget.max_context_tokens)
         * config
             .context_management
             .retrieval_window
             .trigger_usage_ratio)
         .floor() as u32;
-    trigger.min(budget.max_request_input_tokens()).max(1)
+    let capped_trigger = configured_trigger
+        .min(budget.max_request_input_tokens())
+        .max(1);
+    let target_tokens = effective_retrieval_window_target_tokens(
+        budget,
+        config.context_management.retrieval_target_usage_percent(),
+    );
+
+    // A provider request-input cap or integer rounding can collapse two valid
+    // configured ratios onto the same token count. Route the first archive at
+    // least one token above the planner target so an exactly-at-limit request
+    // remains dispatchable instead of failing with TargetAlreadySatisfied.
+    capped_trigger.max(target_tokens.saturating_add(1))
 }
 
 fn retrieval_window_fallback_is_summary(config: &AgentLoopConfig) -> bool {
