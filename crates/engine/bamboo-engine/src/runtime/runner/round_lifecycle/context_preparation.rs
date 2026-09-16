@@ -555,7 +555,11 @@ async fn build_retrieval_window_accounting_frame(
     // provider-native replay lane. Plan against that exact post-reset request;
     // otherwise replayable reasoning/tool-search payloads are misclassified as
     // permanently fixed prompt cost even though the boundary removes them.
-    let mut post_boundary_session = session.clone();
+    // Keep the second shadow session off the async state machine's stack. A
+    // `Session` is intentionally rich, and retaining an inline clone across
+    // the projection await can overflow callers with otherwise ordinary test
+    // thread stacks.
+    let mut post_boundary_session = Box::new(session.clone());
     post_boundary_session.reset_model_context_epoch(ModelContextResetReason::Compression);
     post_boundary_session
         .metadata
@@ -1522,7 +1526,10 @@ pub(super) async fn prepare_round_context(
                 session_id
             );
         } else {
-            match maybe_prepare_retrieval_window_context(
+            // Retrieval preparation carries shadow sessions and provider
+            // projections across awaits. Heap-box this opt-in branch so its
+            // future does not inflate every ordinary agent run's stack frame.
+            match Box::pin(maybe_prepare_retrieval_window_context(
                 session,
                 config,
                 model_name,
@@ -1531,7 +1538,7 @@ pub(super) async fn prepare_round_context(
                 llm,
                 &budget,
                 event_tx,
-            )
+            ))
             .await
             {
                 Ok(Some(prepared)) => retrieval_prepared = Some(prepared),
