@@ -15,6 +15,7 @@ mod self_history;
 use args::SessionInspectorArgs;
 
 const SESSION_HISTORY_TOOL_NAME: &str = "session_history";
+const SESSION_HISTORY_CURRENT_TOOL_NAME: &str = "session_history_current";
 
 /// The history capability granted to one tool surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub struct SessionInspectorTool {
     pub(super) session_store: Arc<SessionStoreV2>,
     pub(super) storage: Arc<dyn Storage>,
     access: SessionHistoryAccess,
+    tool_name: &'static str,
 }
 
 impl SessionInspectorTool {
@@ -44,6 +46,7 @@ impl SessionInspectorTool {
             session_store,
             storage,
             access: SessionHistoryAccess::Full,
+            tool_name: SESSION_HISTORY_TOOL_NAME,
         }
     }
 
@@ -53,6 +56,20 @@ impl SessionInspectorTool {
             session_store,
             storage,
             access: SessionHistoryAccess::SelfOnly,
+            tool_name: SESSION_HISTORY_TOOL_NAME,
+        }
+    }
+
+    /// Construct the exact, always-resident current-Session identity.
+    ///
+    /// This is intentionally not an alias for `session_history`: exact tool
+    /// registration is the capability-loading and authorization boundary.
+    pub fn current(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
+        Self {
+            session_store,
+            storage,
+            access: SessionHistoryAccess::SelfOnly,
+            tool_name: SESSION_HISTORY_CURRENT_TOOL_NAME,
         }
     }
 
@@ -75,13 +92,13 @@ impl SessionInspectorTool {
 #[async_trait]
 impl Tool for SessionInspectorTool {
     fn name(&self) -> &str {
-        SESSION_HISTORY_TOOL_NAME
+        self.tool_name
     }
 
     fn description(&self) -> &str {
         match self.access {
             SessionHistoryAccess::SelfOnly => {
-                "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller."
+                "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller. Use search_current, then read_around or read_current; raw Session history is transcript authority while memory is selective and may be stale."
             }
             SessionHistoryAccess::Full => {
                 "Read-only viewer over local session history. Search/page/read around the current Session directly (including compressed messages), or list sessions, inspect metadata, read bounded message slices/compressed history, and search prior conversations. A Root caller can use export_context for itself or a same-tree, same-Project target: it materializes bounded immutable status/brief files for Read offset/limit, without changing session state. Exported status is a last persisted observation, not verified live progress. This viewer has no runtime control. Distinct from memory, which manages durable cross-session knowledge."
@@ -171,9 +188,10 @@ impl Tool for SessionInspectorTool {
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
         let caller_session_id = ctx.session_id().ok_or_else(|| {
-            ToolError::Execution(
-                "session_history requires a session_id in tool context".to_string(),
-            )
+            ToolError::Execution(format!(
+                "{} requires a session_id in tool context",
+                self.name()
+            ))
         })?;
 
         let action = args.get("action").and_then(serde_json::Value::as_str);
@@ -184,8 +202,10 @@ impl Tool for SessionInspectorTool {
             )
         {
             return Err(ToolError::InvalidArguments(
-                "this session_history surface only permits search_current, read_current, and read_around for the caller's own Session"
-                    .to_string(),
+                format!(
+                    "this {} surface only permits search_current, read_current, and read_around for the caller's own Session",
+                    self.name()
+                ),
             ));
         }
         if action == Some("search_current")
@@ -242,7 +262,7 @@ impl Tool for SessionInspectorTool {
             ));
         }
         let parsed: SessionInspectorArgs = serde_json::from_value(args).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid session_history args: {e}"))
+            ToolError::InvalidArguments(format!("Invalid {} args: {e}", self.name()))
         })?;
 
         match parsed {

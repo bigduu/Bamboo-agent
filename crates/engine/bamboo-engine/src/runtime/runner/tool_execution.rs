@@ -1488,6 +1488,7 @@ mod tests {
             "Workspace",
             "BashOutput",
             "session_history",
+            "session_history_current",
             "Sleep",
         ];
         for name in &parallel_tools {
@@ -1666,6 +1667,7 @@ mod tests {
             "WebSearch",
             "BashOutput",
             "session_history",
+            "session_history_current",
             "Sleep",
         ];
         for name in read_only_tools {

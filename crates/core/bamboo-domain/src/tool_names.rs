@@ -99,12 +99,13 @@ pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 33] = [
     ("scheduleTasks", "schedule_tasks"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 10] = [
+pub const SERVER_TOOL_NAMES: [&str; 11] = [
     "Plan",
     "SubAgent",
     "compact_context",
     "scheduler",
     "session_history",
+    "session_history_current",
     "session_control",
     "memory",
     "ledger",
@@ -116,7 +117,7 @@ pub const SERVER_TOOL_NAMES: [&str; 10] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 16] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 17] = [
     "Plan",
     "SubAgent",
     "Project",
@@ -132,6 +133,7 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 16] = [
     "scheduler",
     "session_control",
     "session_history",
+    "session_history_current",
     "workflow_run",
 ];
 
@@ -340,6 +342,15 @@ mod tests {
         assert_eq!(canonical_tool_name("DEFAULT::read"), "Read");
         assert_eq!(canonical_tool_name("default::set_workspace"), "Workspace");
         assert_eq!(canonical_tool_name("DEFAULT::WORKFLOW_RUN"), "workflow_run");
+        assert_eq!(
+            canonical_tool_name("DEFAULT::SESSION_HISTORY_CURRENT"),
+            "session_history_current"
+        );
+        assert_eq!(
+            normalize_tool_ref("session_history_current"),
+            Some("session_history_current".to_string())
+        );
+        assert_eq!(resolve_alias("session_history_current"), None);
     }
 
     #[test]

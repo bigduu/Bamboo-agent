@@ -39,7 +39,19 @@ pub enum CapabilityLoadingMode {
 }
 
 /// The complete and intentionally small always-resident function surface.
-pub const CORE_TOOL_NAMES: [&str; 5] = ["Bash", "Read", "Grep", "Edit", "Write"];
+///
+/// `session_history_current` is a distinct least-privilege identity. Keeping it
+/// Core guarantees exact current-Session recall after older activation traces
+/// leave the active context without making the broad Root `session_history`
+/// viewer Core.
+pub const CORE_TOOL_NAMES: [&str; 6] = [
+    "Bash",
+    "Read",
+    "Grep",
+    "Edit",
+    "Write",
+    "session_history_current",
+];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
 pub const HOST_ONLY_TOOL_NAMES: [&str; 3] = [
@@ -437,7 +449,17 @@ mod tests {
 
     #[test]
     fn locks_exact_core_and_separate_discovery_gateway() {
-        assert_eq!(CORE_TOOL_NAMES, ["Bash", "Read", "Grep", "Edit", "Write"]);
+        assert_eq!(
+            CORE_TOOL_NAMES,
+            [
+                "Bash",
+                "Read",
+                "Grep",
+                "Edit",
+                "Write",
+                "session_history_current"
+            ]
+        );
         for name in CORE_TOOL_NAMES {
             assert_eq!(
                 capability_loading_class_for_reference(name),
@@ -508,12 +530,22 @@ mod tests {
             );
         }
         for name in SERVER_CAPABILITY_NAMES {
+            let expected = if name == "session_history_current" {
+                CapabilityLoadingClass::Core
+            } else {
+                CapabilityLoadingClass::Deferred
+            };
             assert_eq!(
                 capability_loading_class_for_reference(name),
-                CapabilityLoadingClass::Deferred,
-                "server overlay {name} must not become Core"
+                expected,
+                "server overlay {name} has the wrong loading class"
             );
         }
+        assert_eq!(
+            capability_loading_class_for_reference("session_history"),
+            CapabilityLoadingClass::Deferred,
+            "the privileged Root-compatible identity must remain Deferred"
+        );
     }
 
     #[test]
@@ -616,6 +648,19 @@ mod tests {
                 .expect("canonical builtin")
                 .loading_class(),
             CapabilityLoadingClass::Core
+        );
+        assert_eq!(
+            ClassifiedToolIdentity::from_schema_name("session_history_current")
+                .expect("canonical current-history capability")
+                .loading_class(),
+            CapabilityLoadingClass::Core
+        );
+        assert_eq!(
+            ClassifiedToolIdentity::from_schema_name("Session_History_Current")
+                .expect("case-variant custom registration")
+                .loading_class(),
+            CapabilityLoadingClass::Deferred,
+            "only the exact registered framework identity may inherit Core policy"
         );
     }
 
@@ -784,6 +829,30 @@ mod tests {
         assert!(!sticky.contains_execution_name("custom_tool"));
         assert!(!sticky.contains_execution_name("Workspace"));
         assert!(!sticky.contains_execution_name("unknown_tool"));
+    }
+
+    #[test]
+    fn self_history_current_is_core_without_activating_broad_history() {
+        let catalog = classified_catalog(&["Read", "session_history", "session_history_current"]);
+
+        for mode in [
+            CapabilityLoadingMode::Progressive,
+            CapabilityLoadingMode::StickyFallback,
+        ] {
+            let effective =
+                EffectiveCallableSet::from_catalog(&catalog, mode, std::iter::empty::<&str>());
+            assert!(effective.contains_execution_name("Read"));
+            assert!(effective.contains_execution_name("session_history_current"));
+            assert!(!effective.contains_execution_name("session_history"));
+            assert_eq!(
+                effective.resolve_callable_reference("session_history_current"),
+                Some("session_history_current".to_string())
+            );
+            assert_eq!(
+                effective.resolve_callable_reference("session_history"),
+                None
+            );
+        }
     }
 
     #[test]

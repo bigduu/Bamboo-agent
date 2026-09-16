@@ -417,9 +417,10 @@ pub fn check_permissions(
                 "session_control followup: continue an existing independent Root",
             )]))
         }
-        // Read-only: session_inspector (list / get_meta / read_messages) and the
-        // session_history viewer never mutate or spin up compute. #395.
-        "session_inspector" | "session_history" => Ok(None),
+        // Read-only: session_inspector (list / get_meta / read_messages), the
+        // legacy session_history viewer, and exact self-only current history
+        // never mutate or spin up compute. #395.
+        "session_inspector" | "session_history" | "session_history_current" => Ok(None),
         // `notify` fires an outbound OS popup / push notification but mutates
         // nothing in the session or workspace, so it is explicitly ungated
         // (auto-approved) by design: a reminder/alert tool that itself
@@ -681,6 +682,10 @@ mod tests {
             (
                 "session_inspector",
                 json!({"action": "read_messages", "session_id": "x"}),
+            ),
+            (
+                "session_history_current",
+                json!({"action": "read_current", "limit": 5}),
             ),
         ] {
             assert!(

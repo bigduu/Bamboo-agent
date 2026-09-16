@@ -955,9 +955,12 @@ pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String>
         let generated = message.tool_calls.as_ref().is_some_and(|calls| {
             let mut generated = false;
             for call in calls {
-                let is_history_retrieval = bamboo_domain::canonical_tool_name(&call.function.name)
-                    == "session_history"
-                    && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                let canonical_name = bamboo_domain::canonical_tool_name(&call.function.name);
+                let is_history_retrieval =
+                    matches!(
+                        canonical_name.as_str(),
+                        "session_history" | "session_history_current"
+                    ) && serde_json::from_str::<serde_json::Value>(&call.function.arguments)
                         .ok()
                         .is_some_and(|arguments| {
                             matches!(
@@ -1457,6 +1460,9 @@ mod tests {
             ("session_history", "read_current"),
             ("session_history", "read_around"),
             ("recall", "read_current"),
+            ("session_history_current", "search_current"),
+            ("session_history_current", "read_current"),
+            ("session_history_current", "read_around"),
         ]
         .into_iter()
         .enumerate()
