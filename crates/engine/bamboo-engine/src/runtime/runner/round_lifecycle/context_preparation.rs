@@ -12,7 +12,7 @@ use bamboo_agent_core::{
     Session,
 };
 use bamboo_compression::{
-    active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan,
+    active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
     build_forced_compression_candidate_plan_with_fixed_tokens,
     build_retrieval_window_candidate_plan_with_token_accounting,
     effective_retrieval_window_target_tokens,
@@ -45,11 +45,85 @@ const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
 const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
 const MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES: usize = 2;
+const LAST_MANUAL_ARCHIVE_CALL_ID_KEY: &str = "context_management.last_manual_archive_call_id";
 
 /// Session-metadata key holding the last emitted context-pressure level, so
 /// `ContextPressureNotification` is deduplicated across rounds on a per-level-
 /// transition basis (mirrors the prefix-drift `session.metadata` key style).
 const LAST_PRESSURE_LEVEL_KEY: &str = "context_pressure_last_level";
+
+fn pending_manual_archive_call_id(session: &Session) -> Option<String> {
+    let last_consumed = session
+        .metadata
+        .get(LAST_MANUAL_ARCHIVE_CALL_ID_KEY)
+        .map(String::as_str);
+    let mut completed_tool_calls = HashSet::new();
+
+    // A manual request belongs to the current user-anchored turn. Walking only
+    // that tail keeps restart recovery bounded by the per-round tool-call cap,
+    // even when the authoritative Session contains a very large history.
+    for message in session.messages.iter().rev() {
+        match message.role {
+            Role::Tool => {
+                if message.tool_success != Some(false) {
+                    if let Some(call_id) = message.tool_call_id.as_deref() {
+                        completed_tool_calls.insert(call_id);
+                    }
+                }
+            }
+            Role::Assistant => {
+                let Some(call) = message.tool_calls.as_deref().and_then(|calls| {
+                    calls.iter().rev().find(|call| {
+                        bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
+                            && completed_tool_calls.contains(call.id.as_str())
+                    })
+                }) else {
+                    continue;
+                };
+                // The newest completed request is the ordering fence. If it is
+                // already consumed, every older request in this turn is older
+                // than the durable fence and must not be replayed.
+                return (last_consumed != Some(call.id.as_str())).then(|| call.id.clone());
+            }
+            Role::User => break,
+            Role::System => {}
+        }
+    }
+
+    None
+}
+
+fn mark_manual_archive_call_consumed(session: &mut Session, call_id: &str) {
+    session.metadata.insert(
+        LAST_MANUAL_ARCHIVE_CALL_ID_KEY.to_string(),
+        call_id.to_string(),
+    );
+}
+
+async fn checkpoint_manual_archive_noop(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    call_id: &str,
+) -> Result<(), AgentError> {
+    let Some(persistence) = config.persistence.as_ref() else {
+        return Err(AgentError::Budget(
+            "archive_context requires RuntimeSessionPersistence to durably consume a retrieval-window request"
+                .to_string(),
+        ));
+    };
+    let mut staged = session.clone();
+    mark_manual_archive_call_consumed(&mut staged, call_id);
+    persistence
+        .checkpoint_runtime_session(&mut staged)
+        .await
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "archive_context no-op checkpoint failed; request remains retryable: {error}"
+            ))
+        })?;
+    *session = staged;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(super) struct PreparedRoundContext {
@@ -437,6 +511,20 @@ struct RetrievalWindowPreflight {
     has_provider_native_image: bool,
 }
 
+enum RetrievalWindowPreparationOutcome {
+    Archived(PreparedContext),
+    NotNeeded,
+    Deferred,
+}
+
+fn retrieval_trigger_label(trigger_type: &CompressionTriggerType) -> &'static str {
+    match trigger_type {
+        CompressionTriggerType::Auto => "auto",
+        CompressionTriggerType::Manual => "manual",
+        CompressionTriggerType::CriticalOverflow => "critical_overflow",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn retrieval_window_preflight(
     session: &Session,
@@ -687,7 +775,9 @@ async fn maybe_prepare_retrieval_window_context(
     llm: &Arc<dyn LLMProvider>,
     budget: &TokenBudget,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
-) -> Result<Option<PreparedContext>, AgentError> {
+    trigger_type: CompressionTriggerType,
+    manual_archive_call_id: Option<&str>,
+) -> Result<RetrievalWindowPreparationOutcome, AgentError> {
     // An explicit workflow selection requires the model's first step to be a
     // lone `load_skill` call. During that setup round the effective callable
     // catalog intentionally excludes `session_history_current`; defer archival
@@ -698,11 +788,16 @@ async fn maybe_prepare_retrieval_window_context(
             session_id = %session_id,
             "retrieval-window archival deferred until explicit skill activation completes"
         );
-        return Ok(None);
+        return Ok(RetrievalWindowPreparationOutcome::Deferred);
     }
 
     let counter = TiktokenTokenCounter::default();
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
+    let target_tokens = effective_retrieval_window_target_tokens(
+        budget,
+        config.context_management.retrieval_target_usage_percent(),
+    );
+    let forced = trigger_type != CompressionTriggerType::Auto;
     let preflight = retrieval_window_preflight(
         session,
         config,
@@ -713,8 +808,13 @@ async fn maybe_prepare_retrieval_window_context(
         &counter,
     )
     .await?;
-    if !preflight.has_provider_native_image && preflight.active_tokens < trigger_tokens {
-        return Ok(None);
+    let below_boundary = if forced {
+        preflight.active_tokens <= target_tokens
+    } else {
+        preflight.active_tokens < trigger_tokens
+    };
+    if !preflight.has_provider_native_image && below_boundary {
+        return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
     }
     let policy = RetrievalWindowPolicy {
         min_recent_user_turns: config
@@ -753,14 +853,19 @@ async fn maybe_prepare_retrieval_window_context(
             &counter,
         )
         .await?;
-        if frame.active_tokens_without_boundary < trigger_tokens {
+        let below_boundary = if forced {
+            frame.active_tokens_without_boundary <= target_tokens
+        } else {
+            frame.active_tokens_without_boundary < trigger_tokens
+        };
+        if below_boundary {
             // A rebase is authoritative durable state. Publish the fully
             // prepared candidate too so OCR caching performed on the retry is
             // not lost when the new suffix removes the need for an archive.
             if attempt > 0 {
                 *session = candidate_base;
             }
-            return Ok(None);
+            return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
         }
         let Some(persistence) = config.persistence.as_ref() else {
             return Err(AgentError::Budget(
@@ -785,13 +890,19 @@ async fn maybe_prepare_retrieval_window_context(
             ))
         })?;
 
-        let applied =
-            apply_retrieval_window_plan(&mut staged, &plan, policy, budget, &frame.accounting)
-                .map_err(|error| {
-                    AgentError::Budget(format!(
-                        "retrieval-window staged application failed: {error}"
-                    ))
-                })?;
+        let applied = apply_retrieval_window_plan_with_trigger(
+            &mut staged,
+            &plan,
+            policy,
+            budget,
+            &frame.accounting,
+            trigger_type.clone(),
+        )
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "retrieval-window staged application failed: {error}"
+            ))
+        })?;
         if applied.idempotent_replay {
             return Err(AgentError::Budget(
                 "retrieval-window automatic route unexpectedly produced an idempotent replay"
@@ -803,6 +914,9 @@ async fn maybe_prepare_retrieval_window_context(
         staged
             .metadata
             .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        if let Some(call_id) = manual_archive_call_id {
+            mark_manual_archive_call_consumed(&mut staged, call_id);
+        }
 
         let mut retained = prepare_hybrid_context_with_fixed_tokens(
             &staged,
@@ -907,7 +1021,7 @@ async fn maybe_prepare_retrieval_window_context(
             let _ = tx
                 .send(AgentEvent::ContextArchived {
                     archive_event_id: applied.event_id,
-                    trigger_type: "auto".to_string(),
+                    trigger_type: retrieval_trigger_label(&trigger_type).to_string(),
                     messages_archived: plan.archive_message_count,
                     groups_archived: plan.archive_group_count,
                     user_turns_archived: plan.archive_user_turn_count,
@@ -935,7 +1049,7 @@ async fn maybe_prepare_retrieval_window_context(
             "retrieval-window context boundary durably committed"
         );
 
-        return Ok(Some(retained));
+        return Ok(RetrievalWindowPreparationOutcome::Archived(retained));
     }
 
     unreachable!("bounded retrieval-window checkpoint loop must return")
@@ -1416,12 +1530,62 @@ pub(super) async fn maybe_apply_host_context_compression(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
-    _tool_schemas: &[ToolSchema],
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
-    if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
+    let manual_archive_call_id = pending_manual_archive_call_id(session);
+    if config.context_management.strategy != ContextManagementStrategy::RetrievalWindow {
+        if let Some(call_id) = manual_archive_call_id.as_deref() {
+            if config.persistence.is_some() {
+                checkpoint_manual_archive_noop(session, config, call_id)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Budget(format!(
+                            "archive_context requires context_management.strategy=retrieval_window; failed to persist the rejected request marker: {error}"
+                        ))
+                    })?;
+            } else {
+                mark_manual_archive_call_consumed(session, call_id);
+            }
+            return Err(AgentError::Budget(
+                "archive_context requires context_management.strategy=retrieval_window; compact_context remains the manual control for summary strategy"
+                    .to_string(),
+            ));
+        }
+    } else {
+        if let Some(call_id) = manual_archive_call_id.as_deref() {
+            let budget = super::token_budget::resolve_token_budget(
+                session,
+                config,
+                model_name,
+                llm.as_ref(),
+            )
+            .await;
+            return match Box::pin(maybe_prepare_retrieval_window_context(
+                session,
+                config,
+                model_name,
+                session_id,
+                tool_schemas,
+                llm,
+                &budget,
+                event_tx,
+                CompressionTriggerType::Manual,
+                Some(call_id),
+            ))
+            .await?
+            {
+                RetrievalWindowPreparationOutcome::Archived(_) => Ok(true),
+                RetrievalWindowPreparationOutcome::NotNeeded => {
+                    checkpoint_manual_archive_noop(session, config, call_id).await?;
+                    Ok(false)
+                }
+                RetrievalWindowPreparationOutcome::Deferred => Ok(false),
+            };
+        }
+
         if session.force_manual_compression.is_none() {
             // Retrieval-window v1 commits only at the ordinary pre-turn
             // boundary. Explicit summary fallback is not an alternate
@@ -1482,18 +1646,10 @@ pub(crate) async fn force_overflow_context_recovery(
     config: &AgentLoopConfig,
     model_name: &str,
     session_id: &str,
+    tool_schemas: &[ToolSchema],
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<bool, AgentError> {
-    if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow
-        && !retrieval_window_fallback_is_summary(config)
-    {
-        return Err(AgentError::Budget(
-            "critical overflow recovery is unsupported while context_management.strategy=retrieval_window in this release; configure fallback_strategy=summary to opt into summary recovery"
-                .to_string(),
-        ));
-    }
-
     if let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
         tracing::info!(
             "[{}] Overflow recovery pre-pass degraded prompt section: {}",
@@ -1502,6 +1658,57 @@ pub(crate) async fn force_overflow_context_recovery(
         );
         emit_context_compression_status(event_tx, "overflow-recovery", "degraded_sections").await;
         return Ok(true);
+    }
+
+    if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
+        let budget =
+            super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref())
+                .await;
+        let retrieval_result = Box::pin(maybe_prepare_retrieval_window_context(
+            session,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            &budget,
+            event_tx,
+            CompressionTriggerType::CriticalOverflow,
+            None,
+        ))
+        .await;
+
+        match retrieval_result {
+            Ok(RetrievalWindowPreparationOutcome::Archived(_)) => return Ok(true),
+            Ok(RetrievalWindowPreparationOutcome::Deferred) => {
+                return Err(AgentError::Budget(
+                    "retrieval-window critical overflow recovery was deferred by a required setup boundary"
+                        .to_string(),
+                ));
+            }
+            Ok(RetrievalWindowPreparationOutcome::NotNeeded)
+                if !retrieval_window_fallback_is_summary(config) =>
+            {
+                return Err(AgentError::Budget(
+                    "retrieval-window critical overflow recovery could not reduce context because the provider-prepared request is already at or below the configured archive target"
+                        .to_string(),
+                ));
+            }
+            Err(error) if !retrieval_window_fallback_is_summary(config) => return Err(error),
+            Ok(RetrievalWindowPreparationOutcome::NotNeeded) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "retrieval-window critical recovery found no archive candidate; applying explicitly configured summary fallback"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "retrieval-window critical recovery failed; applying explicitly configured summary fallback"
+                );
+            }
+        }
     }
 
     let budget =
@@ -1531,6 +1738,20 @@ pub(super) async fn prepare_round_context(
 ) -> Result<PreparedRoundContext, AgentError> {
     let retrieval_window_enabled =
         config.context_management.strategy == ContextManagementStrategy::RetrievalWindow;
+    let manual_archive_call_id = pending_manual_archive_call_id(session);
+    if !retrieval_window_enabled {
+        if let Some(call_id) = manual_archive_call_id.as_deref() {
+            if config.persistence.is_some() {
+                checkpoint_manual_archive_noop(session, config, call_id).await?;
+            } else {
+                mark_manual_archive_call_consumed(session, call_id);
+            }
+            return Err(AgentError::Budget(
+                "archive_context requires context_management.strategy=retrieval_window; compact_context remains the manual control for summary strategy"
+                    .to_string(),
+            ));
+        }
+    }
     if retrieval_window_enabled
         && session.conversation_summary.is_some()
         && !retrieval_window_fallback_is_summary(config)
@@ -1575,6 +1796,32 @@ pub(super) async fn prepare_round_context(
                 "[{}] Recomputing prepared context after explicit summary fallback",
                 session_id
             );
+        } else if let Some(call_id) = manual_archive_call_id.as_deref() {
+            match Box::pin(maybe_prepare_retrieval_window_context(
+                session,
+                config,
+                model_name,
+                session_id,
+                tool_schemas,
+                llm,
+                &budget,
+                event_tx,
+                CompressionTriggerType::Manual,
+                Some(call_id),
+            ))
+            .await?
+            {
+                RetrievalWindowPreparationOutcome::Archived(prepared) => {
+                    retrieval_prepared = Some(prepared)
+                }
+                RetrievalWindowPreparationOutcome::NotNeeded => {
+                    checkpoint_manual_archive_noop(session, config, call_id).await?;
+                    ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+                }
+                RetrievalWindowPreparationOutcome::Deferred => {
+                    ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+                }
+            }
         } else {
             // Retrieval preparation carries shadow sessions and provider
             // projections across awaits. Heap-box this opt-in branch so its
@@ -1588,11 +1835,18 @@ pub(super) async fn prepare_round_context(
                 llm,
                 &budget,
                 event_tx,
+                CompressionTriggerType::Auto,
+                None,
             ))
             .await
             {
-                Ok(Some(prepared)) => retrieval_prepared = Some(prepared),
-                Ok(None) => {
+                Ok(RetrievalWindowPreparationOutcome::Archived(prepared)) => {
+                    retrieval_prepared = Some(prepared)
+                }
+                Ok(
+                    RetrievalWindowPreparationOutcome::NotNeeded
+                    | RetrievalWindowPreparationOutcome::Deferred,
+                ) => {
                     // OCR caching is an existing durable side effect. Delay it
                     // until retrieval preflight has established there is no
                     // archive transaction, so retrieval failures leave the live

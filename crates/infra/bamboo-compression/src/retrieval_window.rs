@@ -504,6 +504,27 @@ pub fn apply_retrieval_window_plan(
     current_budget: &TokenBudget,
     current_accounting: &RetrievalWindowTokenAccounting,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+    apply_retrieval_window_plan_with_trigger(
+        session,
+        plan,
+        current_policy,
+        current_budget,
+        current_accounting,
+        CompressionTriggerType::Auto,
+    )
+}
+
+/// Apply a validated retrieval-window plan while preserving the runtime
+/// trigger that caused this boundary. The legacy wrapper above remains an
+/// automatic trigger for backward-compatible callers.
+pub fn apply_retrieval_window_plan_with_trigger(
+    session: &mut Session,
+    plan: &RetrievalWindowCandidatePlan,
+    current_policy: RetrievalWindowPolicy,
+    current_budget: &TokenBudget,
+    current_accounting: &RetrievalWindowTokenAccounting,
+    trigger_type: CompressionTriggerType,
+) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let usage = validate_apply_plan_arithmetic(plan)?;
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
@@ -524,7 +545,7 @@ pub fn apply_retrieval_window_plan(
     }
     if archived_count == candidate_indexes.len() {
         validate_plan_evidence(plan)?;
-        return validate_idempotent_replay(session, plan, &candidate_indexes);
+        return validate_idempotent_replay(session, plan, &candidate_indexes, &trigger_type);
     }
 
     for index in &candidate_indexes {
@@ -560,7 +581,7 @@ pub fn apply_retrieval_window_plan(
             plan.context_window_tokens,
         ),
         0,
-        CompressionTriggerType::Auto,
+        trigger_type,
         0.0,
         None,
         0,
@@ -1074,6 +1095,7 @@ fn validate_idempotent_replay(
     session: &Session,
     plan: &RetrievalWindowCandidatePlan,
     candidate_indexes: &[usize],
+    trigger_type: &CompressionTriggerType,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let Some(event_id) = candidate_indexes
         .first()
@@ -1140,11 +1162,7 @@ fn validate_idempotent_replay(
     );
     require_event_evidence!(event.summary_tokens, 0, "summary_tokens");
     require_event_evidence!(event.actual_summary_tokens, 0, "actual_summary_tokens");
-    require_event_evidence!(
-        event.trigger_type,
-        CompressionTriggerType::Auto,
-        "trigger_type"
-    );
+    require_event_evidence!(&event.trigger_type, trigger_type, "trigger_type");
     require_event_evidence!(
         event.compression_ratio.to_bits(),
         0.0f64.to_bits(),
@@ -1638,7 +1656,8 @@ mod tests {
     use super::*;
     use bamboo_domain::{
         provider_transcript_boundary_sha256, ConversationSummary, FunctionCall, ModelContextState,
-        ProviderFamily, ProviderProtocol, ProviderTranscriptResetReason, ToolCall,
+        ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+        ProviderTranscriptOrigin, ProviderTranscriptResetReason, ToolCall,
     };
 
     #[derive(Debug)]
@@ -2368,6 +2387,185 @@ mod tests {
             session.provider_transcript.epoch(),
             provider_epoch_after_first
         );
+    }
+
+    #[test]
+    fn trigger_aware_boundary_resets_provider_replay_across_family_restart_matrix() {
+        let routes = [
+            (
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                "openai",
+            ),
+            (
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                "anthropic",
+            ),
+            (
+                ProviderFamily::Copilot,
+                ProviderProtocol::OpenAiResponsesV1,
+                "copilot",
+            ),
+        ];
+
+        for (family, protocol, provider_type) in routes {
+            let (mut session, plan) = basic_session_and_plan();
+            let boundary = provider_transcript_boundary_sha256(
+                Some(&format!("{provider_type}-retrieval-test")),
+                Some(provider_type),
+            )
+            .expect("provider boundary");
+            session
+                .activate_provider_transcript_route(family, protocol, &boundary)
+                .expect("provider route should activate");
+            let items = if family == ProviderFamily::Anthropic {
+                vec![
+                    ProviderTranscriptItem::try_from_payload(
+                        family,
+                        protocol,
+                        ProviderTranscriptOrigin::Provider,
+                        ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"server_tool_use",
+                            "id":"srvtoolu_archive_matrix",
+                            "name":"tool_search_tool_regex",
+                            "input":{"pattern":"history"}
+                        }),
+                    )
+                    .expect("anthropic search call"),
+                    ProviderTranscriptItem::try_from_payload(
+                        family,
+                        protocol,
+                        ProviderTranscriptOrigin::Provider,
+                        ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_tool_result",
+                            "tool_use_id":"srvtoolu_archive_matrix",
+                            "content":{
+                                "type":"tool_search_tool_search_result",
+                                "tool_references":[{
+                                    "type":"tool_reference",
+                                    "tool_name":"session_history_current"
+                                }]
+                            }
+                        }),
+                    )
+                    .expect("anthropic search result"),
+                ]
+            } else {
+                vec![ProviderTranscriptItem::try_from_payload(
+                    family,
+                    protocol,
+                    ProviderTranscriptOrigin::Provider,
+                    ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"tool_search_call",
+                        "id":"tsc_archive_matrix",
+                        "execution":"client",
+                        "call_id":"search_archive_matrix",
+                        "status":"completed",
+                        "arguments":{"query":"history"}
+                    }),
+                )
+                .expect("OpenAI-family search call")]
+            };
+            session
+                .append_provider_transcript_group("t4-a", None, items)
+                .expect("provider-native group should append");
+            assert_eq!(
+                session
+                    .provider_transcript
+                    .replayable_groups(family, protocol, &boundary)
+                    .len(),
+                1
+            );
+            let provider_epoch_before = session.provider_transcript.epoch();
+
+            apply_retrieval_window_plan_with_trigger(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &accounting_for_plan(&plan),
+                CompressionTriggerType::CriticalOverflow,
+            )
+            .expect("trigger-aware boundary should apply");
+
+            assert_eq!(
+                session
+                    .compression_events
+                    .last()
+                    .expect("retrieval event")
+                    .trigger_type,
+                CompressionTriggerType::CriticalOverflow
+            );
+            assert_eq!(
+                session.provider_transcript.epoch(),
+                provider_epoch_before + 1
+            );
+            assert!(session
+                .provider_transcript
+                .replayable_groups(family, protocol, &boundary)
+                .is_empty());
+
+            let restarted: Session = serde_json::from_slice(
+                &serde_json::to_vec(&session).expect("session should serialize"),
+            )
+            .expect("session should reload");
+            assert_eq!(
+                restarted.provider_transcript.last_reset_reason(),
+                Some(ProviderTranscriptResetReason::Compression)
+            );
+            assert!(restarted
+                .provider_transcript
+                .replayable_groups(family, protocol, &boundary)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn trigger_aware_idempotent_replay_requires_the_original_trigger() {
+        let (mut session, plan) = basic_session_and_plan();
+        let first = apply_retrieval_window_plan_with_trigger(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &budget(100),
+            &accounting_for_plan(&plan),
+            CompressionTriggerType::Manual,
+        )
+        .expect("manual boundary should apply");
+        assert_eq!(
+            session.compression_events[0].trigger_type,
+            CompressionTriggerType::Manual
+        );
+
+        let replay = apply_retrieval_window_plan_with_trigger(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &budget(100),
+            &accounting_for_plan(&plan),
+            CompressionTriggerType::Manual,
+        )
+        .expect("the same manual request should be idempotent");
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.event_id, first.event_id);
+
+        assert!(matches!(
+            apply_retrieval_window_plan(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &accounting_for_plan(&plan),
+            ),
+            Err(RetrievalWindowApplyError::ArchiveEventEvidenceMismatch {
+                field: "trigger_type",
+                ..
+            })
+        ));
     }
 
     #[test]

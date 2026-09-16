@@ -99,9 +99,10 @@ pub const LEGACY_TOOL_NAME_ALIASES: [(&str, &str); 33] = [
     ("scheduleTasks", "schedule_tasks"),
 ];
 
-pub const SERVER_TOOL_NAMES: [&str; 11] = [
+pub const SERVER_TOOL_NAMES: [&str; 12] = [
     "Plan",
     "SubAgent",
+    "archive_context",
     "compact_context",
     "scheduler",
     "session_history",
@@ -117,10 +118,11 @@ pub const SERVER_TOOL_NAMES: [&str; 11] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 17] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 18] = [
     "Plan",
     "SubAgent",
     "Project",
+    "archive_context",
     "ask_agent",
     "cluster",
     "compact_context",

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
     emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    maybe_apply_host_context_compression, prepare_round_context, LAST_PRESSURE_LEVEL_KEY,
+    maybe_apply_host_context_compression, pending_manual_archive_call_id, prepare_round_context,
+    LAST_MANUAL_ARCHIVE_CALL_ID_KEY, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -269,6 +270,22 @@ fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> A
         },
         ..Default::default()
     }
+}
+
+fn append_archive_context_request(session: &mut Session, call_id: &str) {
+    let mut assistant = Message::assistant("", None);
+    assistant.tool_calls = Some(vec![ToolCall {
+        id: call_id.to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "archive_context".to_string(),
+            arguments: "{}".to_string(),
+        },
+    }]);
+    session.add_message(assistant);
+    let mut result = Message::tool_result(call_id, "Retrieval-window archive requested");
+    result.tool_success = Some(true);
+    session.add_message(result);
 }
 
 struct ExpandingFootprintProvider {
@@ -1187,6 +1204,7 @@ async fn force_overflow_context_recovery_degrades_tool_guide_before_skill_contex
         &config,
         "test-model",
         "session-cp-overflow-degrade",
+        &[],
         &llm,
         None,
     )
@@ -3200,21 +3218,22 @@ async fn retrieval_window_native_image_without_complete_cost_fails_before_mutati
 }
 
 #[tokio::test]
-async fn retrieval_window_manual_and_overflow_routes_do_not_silently_summarize() {
-    let mut session = retrieval_window_session("retrieval-unsupported-routes");
+async fn retrieval_window_compact_stays_summary_specific_while_critical_overflow_archives() {
+    let mut session = retrieval_window_session("retrieval-critical-route");
     session.force_manual_compression = Some("preserve evidence".to_string());
     let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
     let config = retrieval_window_config(persistence);
     let (llm, model_calls) = recording_llm();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
 
     let manual_error = maybe_apply_host_context_compression(
         &mut session,
         &config,
         "test-model",
-        "retrieval-unsupported-routes",
+        "retrieval-critical-route",
         &[retrieval_history_tool_schema()],
         &llm,
-        None,
+        Some(&event_tx),
         "mid-turn",
     )
     .await
@@ -3222,22 +3241,527 @@ async fn retrieval_window_manual_and_overflow_routes_do_not_silently_summarize()
     assert!(manual_error.to_string().contains("compact_context"));
     assert!(session.force_manual_compression.is_none());
 
-    let overflow_error = super::force_overflow_context_recovery(
+    let applied = super::force_overflow_context_recovery(
         &mut session,
         &config,
         "test-model",
-        "retrieval-unsupported-routes",
+        "retrieval-critical-route",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("critical overflow should use the retrieval archive boundary");
+    assert!(applied);
+    assert!(session.conversation_summary.is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    let event = session
+        .compression_events
+        .last()
+        .expect("critical archive event");
+    assert_eq!(event.trigger_type, CompressionTriggerType::CriticalOverflow);
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ContextArchived { trigger_type, .. } if trigger_type == "critical_overflow"
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_manual_archive_bypasses_auto_trigger_and_is_restart_idempotent() {
+    let mut session = retrieval_window_session("retrieval-manual-archive");
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        100_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp-before-manual-archive".to_string(),
+    );
+    append_archive_context_request(&mut session, "call-manual-archive");
+    let raw_before = session
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.id.clone(),
+                message.role.clone(),
+                message.content.clone(),
+                message.tool_calls.clone(),
+                message.tool_call_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .trigger_usage_ratio = 0.90;
+    config
+        .context_management
+        .retrieval_window
+        .target_usage_ratio = 0.30;
+    let (llm, model_calls) = recording_llm();
+    let tools = vec![retrieval_history_tool_schema()];
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+
+    let prepared = prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-archive",
+        &tools,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("manual archive should apply below the automatic trigger");
+
+    let archive = session
+        .compression_events
+        .last()
+        .expect("manual archive event");
+    assert_eq!(archive.trigger_type, CompressionTriggerType::Manual);
+    assert!(archive.retrieval_active_tokens_before < 90_000);
+    assert!(archive.retrieval_active_tokens_before > archive.retrieval_target_tokens);
+    assert_eq!(
+        session
+            .metadata
+            .get(LAST_MANUAL_ARCHIVE_CALL_ID_KEY)
+            .map(String::as_str),
+        Some("call-manual-archive")
+    );
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+    assert!(prepared
+        .prepared_context
+        .messages
+        .iter()
+        .all(|message| !message.compressed));
+    let raw_after = session
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.id.clone(),
+                message.role.clone(),
+                message.content.clone(),
+                message.tool_calls.clone(),
+                message.tool_call_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw_after, raw_before,
+        "manual archive must preserve raw messages"
+    );
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(model_calls.lock().expect("model call lock").is_empty());
+
+    let serialized = serde_json::to_vec(&session).expect("session serializes");
+    let mut restarted: Session =
+        serde_json::from_slice(&serialized).expect("session should reload exactly");
+    assert!(pending_manual_archive_call_id(&restarted).is_none());
+    let before_restart_pass = restarted.compression_events.len();
+    prepare_round_context(
+        &mut restarted,
+        &config,
+        "test-model",
+        "retrieval-manual-archive",
+        &tools,
+        &llm,
+        Some(&event_tx),
+    )
+    .await
+    .expect("a consumed manual request must not replay after restart");
+    assert_eq!(restarted.compression_events.len(), before_restart_pass);
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ContextArchived { trigger_type, .. } if trigger_type == "manual"
+            ))
+            .count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ContextSummarized { .. })));
+}
+
+#[tokio::test]
+async fn retrieval_window_manual_noop_is_consumed_durably_once() {
+    let mut session = Session::new("retrieval-manual-noop", "test-model");
+    session.add_message(Message::system("retrieval system"));
+    session.add_message(Message::user("small request"));
+    session.add_message(Message::assistant("small response", None));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        100_000,
+        512,
+        BudgetStrategy::default(),
+        0,
+    ));
+    append_archive_context_request(&mut session, "call-manual-noop");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-noop",
+        &tools,
         &llm,
         None,
     )
     .await
-    .expect_err("overflow recovery must be explicit in retrieval v1");
-    assert!(overflow_error
+    .expect("already-at-target manual archive should be a durable no-op");
+    assert!(session.compression_events.is_empty());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(pending_manual_archive_call_id(&session).is_none());
+
+    let mut restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
+        .expect("no-op marker should survive restart");
+    prepare_round_context(
+        &mut restarted,
+        &config,
+        "test-model",
+        "retrieval-manual-noop",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect("consumed no-op must not replay");
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+}
+
+#[tokio::test]
+async fn retrieval_window_manual_checkpoint_failure_remains_retryable() {
+    let mut session = retrieval_window_session("retrieval-manual-retry");
+    append_archive_context_request(&mut session, "call-manual-retry");
+    let before = serde_json::to_vec(&session).unwrap();
+    let (failing_persistence, failed_checkpoints) = RetrievalCheckpointPersistence::failing();
+    let failing_config = retrieval_window_config(failing_persistence);
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    let error = prepare_round_context(
+        &mut session,
+        &failing_config,
+        "test-model",
+        "retrieval-manual-retry",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("failed checkpoint must not consume the manual request");
+    assert!(error.to_string().contains("durable checkpoint failed"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert_eq!(
+        pending_manual_archive_call_id(&session).as_deref(),
+        Some("call-manual-retry")
+    );
+    assert!(failed_checkpoints
+        .lock()
+        .expect("checkpoint list lock")
+        .is_empty());
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-manual-retry",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect("the same request should succeed at the next safe boundary");
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(
+        session
+            .compression_events
+            .last()
+            .expect("retry archive event")
+            .trigger_type,
+        CompressionTriggerType::Manual
+    );
+}
+
+#[tokio::test]
+async fn archive_context_is_rejected_and_consumed_under_summary_strategy() {
+    let mut session = Session::new("summary-rejects-archive", "test-model");
+    session.add_message(Message::user("ordinary summary-mode turn"));
+    append_archive_context_request(&mut session, "call-summary-archive");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = AgentLoopConfig {
+        persistence: Some(persistence),
+        ..Default::default()
+    };
+    let llm = noop_llm();
+
+    let error = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "summary-rejects-archive",
+        &[],
+        &llm,
+        None,
+        "mid-turn",
+    )
+    .await
+    .expect_err("archive_context must not become a summary control");
+    assert!(error
         .to_string()
-        .contains("critical overflow recovery"));
+        .contains("requires context_management.strategy=retrieval_window"));
+    assert!(pending_manual_archive_call_id(&session).is_none());
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 1);
+    assert!(session.compression_events.is_empty());
     assert!(session.conversation_summary.is_none());
+}
+
+#[tokio::test]
+async fn retrieval_window_critical_overflow_rejects_oversized_latest_turn_transactionally() {
+    let mut session = Session::new("retrieval-oversized-latest", "test-model");
+    session.add_message(Message::system("retrieval system"));
+    session.add_message(Message::user("old compactible turn"));
+    session.add_message(Message::assistant("old response", None));
+    session.add_message(Message::user("protected latest evidence ".repeat(4_000)));
+    session.add_message(Message::assistant(
+        "protected latest response ".repeat(4_000),
+        None,
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        0,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let before = serde_json::to_vec(&session).unwrap();
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let mut config = retrieval_window_config(persistence);
+    config
+        .context_management
+        .retrieval_window
+        .min_recent_user_turns = 1;
+    let (llm, model_calls) = recording_llm();
+
+    let error = super::force_overflow_context_recovery(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-oversized-latest",
+        &[retrieval_history_tool_schema()],
+        &llm,
+        None,
+    )
+    .await
+    .expect_err("the newest protected turn cannot be split to satisfy the target");
+    assert!(error.to_string().contains("protected active content"));
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
     assert!(checkpoints.lock().expect("checkpoint list lock").is_empty());
     assert!(model_calls.lock().expect("model call lock").is_empty());
+}
+
+#[tokio::test]
+async fn retrieval_window_repeated_archive_survives_restart_and_preserves_prior_correlations() {
+    let mut session = retrieval_window_session("retrieval-repeat-restart");
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tools = vec![retrieval_history_tool_schema()];
+    let llm = noop_llm();
+
+    prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "retrieval-repeat-restart",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect("first automatic boundary should commit");
+    let first_event = serde_json::to_value(
+        session
+            .compression_events
+            .first()
+            .expect("first retrieval event"),
+    )
+    .unwrap();
+    let first_correlations = session
+        .messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .compressed_by_event_id
+                .as_ref()
+                .map(|event_id| (message.id.clone(), event_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let first_epoch = session
+        .model_context_state
+        .as_ref()
+        .expect("first model-context boundary")
+        .prefix_epoch;
+    let first_provider_epoch = session.provider_transcript.epoch();
+    let first_boundary =
+        crate::runtime::runner::session_setup::prompt_envelope::build_history_boundary_context_block(
+            &session,
+        )
+        .expect("first history boundary")
+        .content;
+
+    let mut restarted: Session = serde_json::from_slice(&serde_json::to_vec(&session).unwrap())
+        .expect("first boundary should survive serialization");
+    assert_eq!(
+        crate::runtime::runner::session_setup::prompt_envelope::build_history_boundary_context_block(
+            &restarted,
+        )
+        .expect("restarted history boundary")
+        .content,
+        first_boundary
+    );
+    // Simulate the successful provider request between the two boundaries.
+    // Seeding the pending model-context epoch is what makes a later archive a
+    // distinct observable prefix epoch instead of a coalesced pre-dispatch
+    // rewrite.
+    let first_request_transcript = restarted
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .cloned()
+        .collect::<Vec<_>>();
+    super::super::context_ledger::reconcile_model_context(
+        &mut restarted,
+        Vec::new(),
+        &first_request_transcript,
+        "retrieval-repeat-scope".to_string(),
+        false,
+    );
+    let provider_boundary =
+        provider_transcript_boundary_sha256(Some("openai-repeat"), Some("openai"))
+            .expect("provider boundary");
+    restarted
+        .activate_provider_transcript_route(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            &provider_boundary,
+        )
+        .expect("provider route should activate");
+    let provider_item = ProviderTranscriptItem::try_from_payload(
+        ProviderFamily::OpenAi,
+        ProviderProtocol::OpenAiResponsesV1,
+        ProviderTranscriptOrigin::Provider,
+        ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type": "tool_search_call",
+            "id": "tsc_between_retrieval_boundaries",
+            "execution": "client",
+            "call_id": "search_between_retrieval_boundaries",
+            "status": "completed",
+            "arguments": {"query": "older evidence"}
+        }),
+    )
+    .expect("provider item should validate");
+    let provider_anchor = restarted
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !message.compressed)
+        .expect("active provider anchor")
+        .id
+        .clone();
+    restarted
+        .append_provider_transcript_group(&provider_anchor, None, vec![provider_item])
+        .expect("provider group should append");
+    for index in 0..6 {
+        restarted.add_message(Message::user(format!(
+            "new-user-{index} {}",
+            "new exact evidence ".repeat(450)
+        )));
+        restarted.add_message(Message::assistant(
+            format!(
+                "new-assistant-{index} {}",
+                "new exact response ".repeat(450)
+            ),
+            None,
+        ));
+    }
+    restarted.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp-between-boundaries".to_string(),
+    );
+
+    prepare_round_context(
+        &mut restarted,
+        &config,
+        "test-model",
+        "retrieval-repeat-restart",
+        &tools,
+        &llm,
+        None,
+    )
+    .await
+    .expect("second post-restart boundary should commit");
+
+    assert_eq!(restarted.compression_events.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&restarted.compression_events[0]).unwrap(),
+        first_event,
+        "a repeated boundary must not rewrite prior evidence"
+    );
+    for (message_id, event_id) in &first_correlations {
+        let message = restarted
+            .messages
+            .iter()
+            .find(|message| &message.id == message_id)
+            .expect("prior raw message remains present");
+        assert_eq!(message.compressed_by_event_id.as_ref(), Some(event_id));
+    }
+    assert!(restarted.messages.iter().any(|message| {
+        message.compressed_by_event_id.as_deref()
+            == restarted
+                .compression_events
+                .get(1)
+                .map(|event| event.id.as_str())
+    }));
+    assert!(
+        restarted
+            .model_context_state
+            .as_ref()
+            .expect("second model-context boundary")
+            .prefix_epoch
+            > first_epoch
+    );
+    assert!(restarted.provider_transcript.epoch() > first_provider_epoch);
+    assert!(!restarted
+        .metadata
+        .contains_key("responses.previous_response_id"));
+    assert_eq!(checkpoints.lock().expect("checkpoint list lock").len(), 2);
 }
 
 #[tokio::test]
@@ -3578,6 +4102,7 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
         &config,
         "test-model",
         "session-cp-overflow-force",
+        &[],
         &llm,
         None,
     )
@@ -3793,6 +4318,7 @@ async fn degradation_strips_system_sections_in_order() {
         &config,
         "test-model",
         "session-5-level-degrade",
+        &[],
         &llm,
         None,
     )
@@ -3809,6 +4335,7 @@ async fn degradation_strips_system_sections_in_order() {
         &config,
         "test-model",
         "session-5-level-degrade",
+        &[],
         &llm,
         None,
     )
@@ -3826,6 +4353,7 @@ async fn degradation_strips_system_sections_in_order() {
         &config,
         "test-model",
         "session-5-level-degrade",
+        &[],
         &llm,
         None,
     )
@@ -3860,6 +4388,7 @@ async fn degradation_returns_none_when_all_sections_already_stripped() {
         &config,
         "test-model",
         "session-degrade-none",
+        &[],
         &llm,
         None,
     )
@@ -3891,6 +4420,7 @@ async fn degradation_skips_missing_sections() {
         &config,
         "test-model",
         "session-degrade-skip",
+        &[],
         &llm,
         None,
     )

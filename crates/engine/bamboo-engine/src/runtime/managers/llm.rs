@@ -41,6 +41,7 @@ pub trait LlmManager: Send + Sync {
         session: &mut Session,
         config: &AgentLoopConfig,
         session_id: &str,
+        tool_schemas: &[ToolSchema],
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<bool, AgentError>;
 }

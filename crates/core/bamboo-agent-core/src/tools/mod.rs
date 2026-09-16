@@ -154,6 +154,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "session_history_current",
     "recall",
     "session_inspector",
+    "archive_context",
     "compact_context",
     "Sleep",
     // The goal self-report tool records a status only; the durable goal-state
@@ -194,6 +195,7 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
             "ExitPlanMode",
             "request_permissions",
             "conclusion_with_options",
+            "archive_context",
             "compact_context",
         ]
         .iter()
@@ -207,6 +209,12 @@ mod tests {
     #[test]
     fn classify_compact_context_as_read_only() {
         assert_eq!(classify_tool("compact_context"), ToolMutability::ReadOnly);
+    }
+
+    #[test]
+    fn classify_archive_context_as_read_only() {
+        assert_eq!(classify_tool("archive_context"), ToolMutability::ReadOnly);
+        assert!(plan_mode_allows_tool("ARCHIVE_CONTEXT"));
     }
 
     #[test]

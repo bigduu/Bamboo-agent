@@ -10,10 +10,11 @@
 
 // Re-export framework-agnostic tools from the bamboo-server-tools crate.
 pub use bamboo_server_tools::{
-    AskAgentTool, ClusterTool, CompactContextTool, DeployAgentTool, DeployedRegistry,
-    LedgerScheduleBridge, LedgerTool, LoadSkillTool, MemoryTool, NotificationDispatcher,
-    NotifyTool, OverlayToolExecutor, PlanTool, ProjectTool, ProjectWorkspaceTool,
-    ReadSkillResourceTool, SessionInspectorTool, SubAgentTool, ToolSurface, ToolSurfaceFactory,
+    ArchiveContextTool, AskAgentTool, ClusterTool, CompactContextTool, DeployAgentTool,
+    DeployedRegistry, LedgerScheduleBridge, LedgerTool, LoadSkillTool, MemoryTool,
+    NotificationDispatcher, NotifyTool, OverlayToolExecutor, PlanTool, ProjectTool,
+    ProjectWorkspaceTool, ReadSkillResourceTool, SessionInspectorTool, SubAgentTool, ToolSurface,
+    ToolSurfaceFactory,
 };
 
 pub mod child_session_adapter;

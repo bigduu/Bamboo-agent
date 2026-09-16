@@ -2,7 +2,7 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + skills + compact_context + legacy self-only
+//! base_tools (builtin + MCP + memory + skills + context controls + legacy self-only
 //!             session_history + exact self-only session_history_current)
 //!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
 //! ```
@@ -161,6 +161,12 @@ pub(super) fn build_base_tools(
         compact_tool,
     ));
 
+    // archive_context is a distinct summary-free retrieval-window control.
+    let archive_tool = Arc::new(crate::tools::ArchiveContextTool);
+    let with_context_controls: Arc<dyn ToolExecutor> = Arc::new(
+        crate::tools::OverlayToolExecutor::new(with_compact, archive_tool),
+    );
+
     // notify is available to all sessions (including headless/scheduled runs
     // with no live subscriber — that's the whole point of proactively
     // alerting the owner) for proactively surfacing something outside the
@@ -173,7 +179,7 @@ pub(super) fn build_base_tools(
     ));
     let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
     let with_notify: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_compact,
+        with_context_controls,
         notify_tool,
     ));
 

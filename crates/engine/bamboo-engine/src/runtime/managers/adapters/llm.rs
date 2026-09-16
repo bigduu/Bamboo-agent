@@ -80,6 +80,7 @@ impl LlmManager for DefaultLlmManager {
         session: &mut Session,
         config: &AgentLoopConfig,
         session_id: &str,
+        tool_schemas: &[ToolSchema],
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<bool, AgentError> {
         let model_name = config.model_name.as_deref().unwrap_or("unknown");
@@ -89,6 +90,7 @@ impl LlmManager for DefaultLlmManager {
             config,
             model_name,
             session_id,
+            tool_schemas,
             &self.llm,
             Some(event_tx),
         )

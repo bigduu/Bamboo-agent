@@ -320,9 +320,14 @@ engine to rebase, re-account, replan, and rebuild the provider request before a
 bounded retry. Selecting `retrieval_window` with `fallback_strategy: "none"`
 for a Session that already has a conversation summary is rejected immediately;
 start a new Session or explicitly retain summary fallback. This first runtime
-slice handles automatic pre-turn archival only. Manual
-`compact_context` and critical overflow recovery fail explicitly under
-`fallback_strategy: "none"`; use `summary` only when that fallback is desired.
+slice supports automatic pre-turn archival, explicit model-requested archival
+through the argument-free `archive_context` tool, and critical overflow
+recovery through the same summary-free boundary. `compact_context` remains a
+summary-specific control: under `retrieval_window`, it fails closed unless
+`fallback_strategy: "summary"` explicitly opts into the legacy summarizer.
+Manual requests that are already at or below the target are durably consumed as
+no-ops so they do not loop after restart. Failed archive checkpoints remain
+retryable and never publish partially archived state.
 Candidate fitting projects the exact post-boundary provider request. Provider-
 native reasoning/tool-search replay and prior model-context ledger bytes that
 the boundary resets count toward trigger pressure, but are reclaimed once (not

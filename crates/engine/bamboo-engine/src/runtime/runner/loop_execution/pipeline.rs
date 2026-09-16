@@ -2816,6 +2816,7 @@ async fn run_pipeline_inner(
                                 config,
                                 &state.model_name,
                                 &state.session_id,
+                                &tool_schemas,
                                 &llm,
                                 Some(event_tx),
                             )
