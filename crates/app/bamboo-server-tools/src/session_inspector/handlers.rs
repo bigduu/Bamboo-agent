@@ -16,30 +16,6 @@ const SEARCH_CURRENT_MAX_LIMIT: usize = 50;
 const SEARCH_CURRENT_MAX_QUERY_CHARS: usize = 512;
 const SEARCH_CURRENT_PREVIEW_CHARS: usize = 600;
 
-fn history_search_boundary(session: &Session, tool_call_id: &str) -> (usize, Option<usize>) {
-    let Some(call_index) = session.messages.iter().rposition(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call_id))
-    }) else {
-        // Standalone tool execution does not persist the generated call in the
-        // Session transcript. In that path every stored message is completed
-        // history, so do not discard the latest turn.
-        return (session.messages.len(), None);
-    };
-
-    // The latest User message is the current request and commonly repeats the
-    // search terms. Exclude that one message explicitly instead of using it as
-    // the transcript boundary: host compression can archive earlier assistant
-    // and tool messages from the same long-running turn, and those messages
-    // must remain recoverable through self-history search.
-    let current_request_index = session.messages[..call_index]
-        .iter()
-        .rposition(|message| message.role == Role::User);
-    (call_index, current_request_index)
-}
-
 fn current_request_excluded_message_ids(
     session: &Session,
     current_request_index: Option<usize>,
@@ -120,7 +96,7 @@ pub(super) async fn handle_search_current(
         .as_ref()
         .filter(|revision| source_revision_after.as_ref() == Some(*revision));
     let (before_message_index, current_request_index) =
-        history_search_boundary(&session, current_tool_call_id);
+        super::self_history::current_history_boundary(&session, current_tool_call_id);
     let excluded_message_ids =
         current_request_excluded_message_ids(&session, current_request_index);
     let excluded = excluded_message_ids

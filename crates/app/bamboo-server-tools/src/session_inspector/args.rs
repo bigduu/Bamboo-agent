@@ -1,6 +1,22 @@
 //! Deserialization types for the session inspector tool arguments.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HistoryReadDirection {
+    Backward,
+    Forward,
+}
+
+impl HistoryReadDirection {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Backward => "backward",
+            Self::Forward => "forward",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -10,6 +26,20 @@ pub(super) enum SessionInspectorArgs {
         query: String,
         #[serde(default)]
         limit: Option<usize>,
+    },
+
+    /// Page complete logical turns in the authoritative caller Session only.
+    ReadCurrent {
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        direction: Option<HistoryReadDirection>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        max_chars: Option<usize>,
+        #[serde(default)]
+        archived_only: Option<bool>,
     },
 
     /// Materialize a bounded, immutable observation of this root or its tree.
