@@ -823,6 +823,7 @@ impl AgentRuntime {
                 .as_ref()
                 .map(|memory| memory.summary_target_ratio)
                 .unwrap_or(0.20),
+            context_management: config.context_management.clone(),
             summary_safe_window_percent: config
                 .memory()
                 .as_ref()

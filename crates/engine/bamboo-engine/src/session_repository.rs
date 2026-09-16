@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::Session;
+use bamboo_domain::RetrievalWindowCheckpointOutcome;
 use bamboo_storage::LockedSessionStore;
 
 use crate::{read_cached_session, SessionCache};
@@ -568,6 +569,23 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_retrieval_window_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_retrieval_window", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.try_load(session_id).await
     }
@@ -734,6 +752,27 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn staged_retrieval_window_archive(expected: &Session) -> Session {
+        let mut staged = expected.clone();
+        let mut event = bamboo_domain::CompressionEvent::new(
+            1,
+            1,
+            80.0,
+            60.0,
+            0,
+            bamboo_domain::CompressionTriggerType::Auto,
+            0.0,
+            None,
+            0,
+        );
+        event.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+        staged.messages[0].compressed = true;
+        staged.messages[0].compressed_by_event_id = Some(event.id.clone());
+        staged.compression_events.push(event);
+        staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+        staged
     }
 
     #[tokio::test]
@@ -1895,6 +1934,48 @@ mod tests {
             "previous",
             "checkpoint must publish only after a durable commit"
         );
+    }
+
+    #[tokio::test]
+    async fn retrieval_window_checkpoint_publishes_the_exact_archived_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().to_path_buf())
+                .await
+                .expect("SessionStoreV2"),
+        );
+        let repo = test_repo(storage.clone());
+        let id = "retrieval-window-repository-checkpoint";
+        let mut expected = Session::new(id, "model");
+        expected.add_message(bamboo_agent_core::Message::user("archive candidate"));
+        expected.add_message(bamboo_agent_core::Message::assistant("retain", None));
+        storage.save_session(&expected).await.unwrap();
+        cache_put(&repo, &expected);
+        let mut staged = staged_retrieval_window_archive(&expected);
+
+        let outcome = bamboo_domain::RuntimeSessionPersistence::checkpoint_retrieval_window(
+            &repo,
+            &expected,
+            &mut staged,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let durable = storage.load_session(id).await.unwrap().unwrap();
+        let cached = read_cached_session(repo.cache(), id).expect("cached archived Session");
+        for (tier, saved) in [("durable", durable), ("cache", cached)] {
+            assert!(saved.messages[0].compressed, "tier={tier}");
+            assert_eq!(
+                saved.messages[0].compressed_by_event_id, staged.messages[0].compressed_by_event_id,
+                "tier={tier}"
+            );
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&staged).unwrap(),
+                "tier={tier}"
+            );
+        }
     }
 
     #[tokio::test]

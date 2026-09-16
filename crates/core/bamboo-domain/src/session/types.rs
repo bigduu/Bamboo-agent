@@ -562,6 +562,11 @@ pub struct CompressionEvent {
     pub retrieval_archived_user_turn_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retrieval_archived_message_tokens: u32,
+    /// Provider-visible tokens outside `Session.messages` that the committed
+    /// retrieval boundary reclaimed by resetting the model-context/provider
+    /// transcript epoch. Zero for summary events and legacy data.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retrieval_boundary_reclaimed_tokens: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retrieval_system_message_tokens: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -636,6 +641,7 @@ impl CompressionEvent {
             retrieval_archived_group_count: 0,
             retrieval_archived_user_turn_count: 0,
             retrieval_archived_message_tokens: 0,
+            retrieval_boundary_reclaimed_tokens: 0,
             retrieval_system_message_tokens: 0,
             retrieval_context_window_tokens: 0,
             retrieval_request_input_limit_tokens: 0,
@@ -1797,6 +1803,7 @@ mod tests {
         assert_eq!(event.latency_ms, 0); // default
         assert_eq!(event.retrieval_active_tokens_before, 0);
         assert_eq!(event.retrieval_request_input_limit_tokens, 0);
+        assert_eq!(event.retrieval_boundary_reclaimed_tokens, 0);
         assert_eq!(event.retrieval_min_recent_user_turns, 0);
         assert!(event.retrieval_active_state_sha256.is_none());
         assert!(event.retrieval_token_accounting_sha256.is_none());
@@ -1829,6 +1836,7 @@ mod tests {
         event.retrieval_archived_group_count = 2;
         event.retrieval_archived_user_turn_count = 2;
         event.retrieval_archived_message_tokens = 400;
+        event.retrieval_boundary_reclaimed_tokens = 75;
         event.retrieval_system_message_tokens = 100;
         event.retrieval_context_window_tokens = 1_280;
         event.retrieval_request_input_limit_tokens = 1_024;
@@ -1862,6 +1870,7 @@ mod tests {
         assert_eq!(back.retrieval_archived_group_count, 2);
         assert_eq!(back.retrieval_archived_user_turn_count, 2);
         assert_eq!(back.retrieval_archived_message_tokens, 400);
+        assert_eq!(back.retrieval_boundary_reclaimed_tokens, 75);
         assert_eq!(back.retrieval_system_message_tokens, 100);
         assert_eq!(back.retrieval_context_window_tokens, 1_280);
         assert_eq!(back.retrieval_request_input_limit_tokens, 1_024);

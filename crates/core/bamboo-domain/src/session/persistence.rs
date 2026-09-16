@@ -5,6 +5,17 @@ use crate::session::task::TaskList;
 use crate::session::types::Session;
 use crate::session::PermissionAuditSeed;
 
+/// Result of the retrieval-window-specific execute-boundary checkpoint.
+///
+/// `Rebased` means persistence observed a newer durable transcript, made no
+/// write, and replaced the caller's staged value with a clean reconciled base
+/// that must be planned and prepared again before dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalWindowCheckpointOutcome {
+    Committed,
+    Rebased,
+}
+
 /// Merge messages from a live runner snapshot into an already-durable
 /// transcript without ever removing or rewriting a durable message.
 ///
@@ -297,6 +308,31 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Atomically commit a staged retrieval-window transcript rewrite.
+    ///
+    /// `expected_base` is the exact pre-archive Session used for planning.
+    /// Implementations must compare it with the latest durable transcript while
+    /// holding their per-session serialization lock. If a concurrent append or
+    /// rewrite is present, they must perform no save, rebase `staged` onto that
+    /// durable snapshot, and return [`RetrievalWindowCheckpointOutcome::Rebased`].
+    /// Otherwise they must preserve the staged message archive flags and commit
+    /// them with the compression event and model-context reset.
+    ///
+    /// There is no safe fallback through the ordinary append-only checkpoint,
+    /// because that path deliberately restores durable message clones and would
+    /// erase the new archive flags. Custom persisters therefore fail closed
+    /// until they implement this boundary explicitly.
+    async fn checkpoint_retrieval_window(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support retrieval-window checkpoints",
+        ))
+    }
+
     /// Load the latest runtime-visible session snapshot when the persistence
     /// implementation can coordinate reads. Tools may update a repository-owned
     /// clone while an agent loop holds its own live Session; the loop uses this
@@ -417,6 +453,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_retrieval_window(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_retrieval_window(expected_base, staged)
+            .await
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> io::Result<Option<Session>> {

@@ -78,6 +78,7 @@ fn default_title_generated() -> bool {
 /// - `TokenBudgetUpdated` - Context budget changed
 /// - `ContextCompressionStatus` - Context compression lifecycle progress
 /// - `ContextSummarized` - Old messages summarized
+/// - `ContextArchived` - Exact old messages excluded from the active window
 ///
 /// ## Sub-agents (Async Spawn)
 /// - `SubAgentStarted` - A child session is created and scheduled to run
@@ -369,6 +370,27 @@ pub enum AgentEvent {
         /// What triggered the compression: "auto" | "manual" | "critical"
         #[serde(default)]
         trigger_type: String,
+    },
+
+    /// Emitted after a retrieval-window boundary is durably checkpointed.
+    /// Contains structural evidence only; raw message and memory content must
+    /// never enter this event.
+    ContextArchived {
+        archive_event_id: String,
+        trigger_type: String,
+        messages_archived: usize,
+        groups_archived: usize,
+        user_turns_archived: usize,
+        active_tokens_before: u32,
+        active_tokens_after: u32,
+        target_tokens: u32,
+        retained_recent_user_turns: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_retained_message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_retained_user_message_id: Option<String>,
+        model_context_epoch: u64,
+        reset_reason: String,
     },
 
     /// Emitted when context pressure reaches warning or critical levels.
@@ -1052,6 +1074,44 @@ mod tests {
         assert!(value.get("task_list").is_some());
         assert_eq!(value["version"], 7);
         assert!(value.get("todo_list").is_none());
+    }
+
+    #[test]
+    fn context_archived_serializes_structural_evidence_without_history_content() {
+        let event = AgentEvent::ContextArchived {
+            archive_event_id: "compression-event-1".to_string(),
+            trigger_type: "auto".to_string(),
+            messages_archived: 8,
+            groups_archived: 4,
+            user_turns_archived: 4,
+            active_tokens_before: 9_000,
+            active_tokens_after: 5_000,
+            target_tokens: 6_000,
+            retained_recent_user_turns: 3,
+            oldest_retained_message_id: Some("message-9".to_string()),
+            oldest_retained_user_message_id: Some("message-9".to_string()),
+            model_context_epoch: 2,
+            reset_reason: "compression".to_string(),
+        };
+
+        let value = serde_json::to_value(&event).expect("archive event should serialize");
+        assert_eq!(value["type"], "context_archived");
+        assert_eq!(value["messages_archived"], 8);
+        assert_eq!(value["active_tokens_after"], 5_000);
+        assert_eq!(value["reset_reason"], "compression");
+        let wire = serde_json::to_string(&value).unwrap();
+        assert!(!wire.contains("summary"));
+        assert!(!wire.contains("raw_message"));
+        assert!(!wire.contains("tool_result"));
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(value).unwrap(),
+            AgentEvent::ContextArchived {
+                archive_event_id,
+                messages_archived: 8,
+                model_context_epoch: 2,
+                ..
+            } if archive_event_id == "compression-event-1"
+        ));
     }
 
     #[test]

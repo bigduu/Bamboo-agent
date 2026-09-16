@@ -13,7 +13,7 @@ use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
-use token_estimation::{estimate_completion_tokens, estimate_prompt_tokens};
+use token_estimation::estimate_completion_tokens;
 
 mod context_ledger;
 mod context_preparation;
@@ -162,7 +162,7 @@ pub(crate) async fn execute_llm_round(
         prompt_memory_exposure,
     };
 
-    let (stream_output, llm_duration) = stream_execution::execute_llm_stream(
+    let (stream_output, llm_duration, prompt_tokens) = stream_execution::execute_llm_stream(
         session,
         config,
         llm,
@@ -184,7 +184,6 @@ pub(crate) async fn execute_llm_round(
             response_id: stream_output.response_id.clone(),
         });
 
-    let prompt_tokens = estimate_prompt_tokens(&prepared.prepared_context.messages);
     let completion_tokens =
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
     let attempt_usage = canonical_attempt_usage(&stream_output, prompt_tokens, completion_tokens);

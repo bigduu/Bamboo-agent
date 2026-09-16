@@ -2,25 +2,33 @@ use crate::llm_summarizer::{LlmSummarizer, SummaryRequestBudget};
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_external_memory_context_block,
-    build_plan_mode_context_block, build_plan_runtime_context_block,
-    build_project_resources_context_block, build_task_list_context_block,
+    build_history_boundary_reservation_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_project_resources_context_block,
+    build_task_list_context_block,
 };
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{
-    AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Role, Session,
+    AgentError, AgentEvent, CompressionTriggerType, ContextBlock, Message, MessagePart, Role,
+    Session,
 };
 use bamboo_compression::{
-    apply_compression_plan, build_forced_compression_candidate_plan_with_fixed_tokens,
+    active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan,
+    build_forced_compression_candidate_plan_with_fixed_tokens,
+    build_retrieval_window_candidate_plan_with_token_accounting,
+    effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
-    prepare_hybrid_context_with_fixed_tokens, PreparedContext, TiktokenTokenCounter, TokenBudget,
-    TokenCounter,
+    prepare_hybrid_context_with_fixed_tokens, PreparedContext, RetrievalWindowPolicy,
+    RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
+use bamboo_config::{ContextManagementFallbackStrategy, ContextManagementStrategy};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason,
-    MAX_MODEL_CONTEXT_EVENTS, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
+    MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::LLMProvider;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -36,12 +44,14 @@ mod transforms;
 const FORCE_CONTEXT_COMPRESSION_PERCENT: f64 = 98.0;
 const MODEL_CONTEXT_RETENTION_PERCENT: u32 = 25;
 const MAX_PROJECTED_REQUEST_REFIT_PASSES: usize = 3;
+const MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES: usize = 2;
 
 /// Session-metadata key holding the last emitted context-pressure level, so
 /// `ContextPressureNotification` is deduplicated across rounds on a per-level-
 /// transition basis (mirrors the prefix-drift `session.metadata` key style).
 const LAST_PRESSURE_LEVEL_KEY: &str = "context_pressure_last_level";
 
+#[derive(Debug)]
 pub(super) struct PreparedRoundContext {
     pub prepared_context: PreparedContext,
     pub budget: TokenBudget,
@@ -324,8 +334,615 @@ fn merge_compression_instructions(
     })
 }
 
+fn all_active_prepared_context(
+    session: &Session,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> PreparedContext {
+    let messages = active_messages_for_budget(session);
+    let system_tokens = messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::System))
+        .fold(0u32, |total, message| {
+            total.saturating_add(counter.count_message(message))
+        });
+    let window_tokens = messages
+        .iter()
+        .filter(|message| !matches!(message.role, Role::System))
+        .fold(0u32, |total, message| {
+            total.saturating_add(counter.count_message(message))
+        });
+    PreparedContext {
+        messages,
+        token_usage: TokenUsageBreakdown {
+            system_tokens,
+            summary_tokens: 0,
+            window_tokens,
+            total_tokens: system_tokens.saturating_add(window_tokens),
+            budget_limit: budget.max_request_input_tokens(),
+        },
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    }
+}
+
+fn provider_prepared_message_tokens(
+    message: &Message,
+    counter: &dyn TokenCounter,
+) -> Result<u32, AgentError> {
+    let mut tokens = counter.count_message(message);
+    if let Some(reasoning) = message.reasoning.as_deref() {
+        tokens = tokens.saturating_add(counter.count_text(reasoning));
+    }
+    if let Some(signature) = message.reasoning_signature.as_deref() {
+        tokens = tokens.saturating_add(counter.count_text(signature));
+    }
+    if let Some(parts) = message.content_parts.as_deref() {
+        for part in parts {
+            match part {
+                MessagePart::Text { text } => {
+                    // Some provider adapters prefer content parts over the
+                    // legacy text field. Counting both is deliberately
+                    // conservative when a caller populated both views.
+                    tokens = tokens.saturating_add(counter.count_text(text));
+                }
+                MessagePart::ImageUrl { .. } => {
+                    return Err(AgentError::Budget(format!(
+                        "retrieval-window cannot determine the complete provider token cost for active image message {}",
+                        message.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn late_bound_tool_schema_reserve(
+    session: &Session,
+    tool_schemas: &[ToolSchema],
+    projected: &super::stream_execution::ProjectedRequestUsage,
+    counter: &dyn TokenCounter,
+) -> Result<u32, AgentError> {
+    if projected.tool_schema_late_bound_segment_count == 0 {
+        return Ok(0);
+    }
+    let effective = super::stream_execution::effective_tool_schemas(session, tool_schemas);
+    let serialized = serde_json::to_string(effective.as_ref()).map_err(|error| {
+        AgentError::Budget(format!(
+            "retrieval-window could not serialize late-bound effective tool schemas: {error}"
+        ))
+    })?;
+    Ok(counter
+        .count_text(&serialized)
+        .saturating_add((effective.len() as u32).saturating_mul(4)))
+}
+
+struct RetrievalWindowAccountingFrame {
+    accounting: RetrievalWindowTokenAccounting,
+    active_tokens_without_boundary: u32,
+    #[cfg(test)]
+    existing_history_boundary_tokens: u32,
+    #[cfg(test)]
+    fixed_prompt_tokens_before_boundary_reserve: u32,
+    #[cfg(test)]
+    history_boundary_reserve_tokens: u32,
+}
+
+struct RetrievalWindowPreflight {
+    active_tokens: u32,
+    has_provider_native_image: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn maybe_apply_host_context_compression_with_budget(
+async fn retrieval_window_preflight(
+    session: &Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> Result<RetrievalWindowPreflight, AgentError> {
+    // This projection deliberately performs no image fallback: it is the
+    // mutation-free/no-model-call gate used before capability validation. For
+    // text-only messages the extra fields below make it conservative; native
+    // images remain explicitly unknown and therefore cannot prove that usage is
+    // below the trigger.
+    let prepared = all_active_prepared_context(session, budget, counter);
+    let projected = super::stream_execution::project_request_usage(
+        session,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+    let mut extra_tokens = 0u32;
+    let mut has_provider_native_image = false;
+    for message in &prepared.messages {
+        if let Some(reasoning) = message.reasoning.as_deref() {
+            extra_tokens = extra_tokens.saturating_add(counter.count_text(reasoning));
+        }
+        if let Some(signature) = message.reasoning_signature.as_deref() {
+            extra_tokens = extra_tokens.saturating_add(counter.count_text(signature));
+        }
+        if let Some(parts) = message.content_parts.as_deref() {
+            for part in parts {
+                match part {
+                    MessagePart::Text { text } => {
+                        extra_tokens = extra_tokens.saturating_add(counter.count_text(text));
+                    }
+                    MessagePart::ImageUrl { .. } => has_provider_native_image = true,
+                }
+            }
+        }
+    }
+    let late_bound_tool_tokens =
+        late_bound_tool_schema_reserve(session, tool_schemas, &projected, counter)?;
+    Ok(RetrievalWindowPreflight {
+        active_tokens: projected
+            .input_tokens
+            .saturating_add(extra_tokens)
+            .saturating_add(late_bound_tool_tokens),
+        has_provider_native_image,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_retrieval_window_accounting_frame(
+    session: &Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> Result<RetrievalWindowAccountingFrame, AgentError> {
+    let active_messages = active_messages_for_budget(session);
+    let mut active_ids = HashSet::new();
+    for message in &active_messages {
+        if message.id.is_empty() || !active_ids.insert(message.id.clone()) {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window requires unique non-empty active message IDs (invalid ID: {:?})",
+                message.id
+            )));
+        }
+    }
+
+    let mut prepared = all_active_prepared_context(session, budget, counter);
+    transforms::apply_message_transforms(config, &mut prepared, llm, session_id).await?;
+
+    let mut transformed_by_id = BTreeMap::new();
+    for message in &prepared.messages {
+        if !active_ids.contains(&message.id) {
+            continue;
+        }
+        if transformed_by_id
+            .insert(message.id.clone(), message)
+            .is_some()
+        {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window provider preparation duplicated active message ID {}",
+                message.id
+            )));
+        }
+    }
+
+    let mut provider_message_tokens = BTreeMap::new();
+    let mut provider_message_token_total = 0u32;
+    for message in &active_messages {
+        let tokens = match transformed_by_id.get(&message.id) {
+            Some(prepared_message) => provider_prepared_message_tokens(prepared_message, counter)?,
+            // Tool-chain normalization may remove an orphan result. It is not
+            // provider-visible in this accounting frame, so its complete
+            // provider cost is exactly zero.
+            None => 0,
+        };
+        provider_message_token_total = provider_message_token_total.saturating_add(tokens);
+        provider_message_tokens.insert(message.id.clone(), tokens);
+    }
+
+    let current_projected = super::stream_execution::project_request_usage(
+        session,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+
+    // A committed retrieval boundary resets both the model-context ledger and
+    // provider-native replay lane. Plan against that exact post-reset request;
+    // otherwise replayable reasoning/tool-search payloads are misclassified as
+    // permanently fixed prompt cost even though the boundary removes them.
+    // Keep the second shadow session off the async state machine's stack. A
+    // `Session` is intentionally rich, and retaining an inline clone across
+    // the projection await can overflow callers with otherwise ordinary test
+    // thread stacks.
+    let mut post_boundary_session = Box::new(session.clone());
+    post_boundary_session.reset_model_context_epoch(ModelContextResetReason::Compression);
+    post_boundary_session
+        .metadata
+        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    let post_boundary_projected = super::stream_execution::project_request_usage(
+        &post_boundary_session,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+    if post_boundary_projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES {
+        return Err(AgentError::Budget(format!(
+            "retrieval-window post-boundary accounting projection exceeds model-context ledger byte limit: ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+            post_boundary_projected.ledger_rendered_bytes
+        )));
+    }
+
+    let locally_counted_prepared_tokens = counter.count_messages(&prepared.messages);
+    let current_late_bound_tool_tokens =
+        late_bound_tool_schema_reserve(session, tool_schemas, &current_projected, counter)?;
+    let post_boundary_late_bound_tool_tokens = late_bound_tool_schema_reserve(
+        &post_boundary_session,
+        tool_schemas,
+        &post_boundary_projected,
+        counter,
+    )?;
+    let current_projected_tokens = current_projected
+        .input_tokens
+        .saturating_add(current_late_bound_tool_tokens);
+    let post_boundary_projected_tokens = post_boundary_projected
+        .input_tokens
+        .saturating_add(post_boundary_late_bound_tool_tokens);
+    let boundary_reclaimable_tokens =
+        current_projected_tokens.saturating_sub(post_boundary_projected_tokens);
+    let fixed_without_boundary = post_boundary_projected
+        .input_tokens
+        .saturating_sub(locally_counted_prepared_tokens)
+        .saturating_add(post_boundary_late_bound_tool_tokens);
+    // The block is persisted through the model-context ledger, whose snapshot
+    // envelope is larger than the block's direct runtime-context rendering.
+    // Reserve the canonical snapshot with maximum-width numeric fields and the
+    // fixed-length deterministic event ID so the first archive cannot add an
+    // unaccounted wrapper after planning.
+    let boundary_reservation_block = build_history_boundary_reservation_context_block();
+    let boundary_snapshot = bamboo_domain::render_model_context_snapshot(
+        &format!("ctx_{}", "0".repeat(64)),
+        u64::MAX,
+        u64::MAX,
+        &boundary_reservation_block,
+        u64::MAX,
+        Some(u64::MAX),
+    );
+    let boundary_reserve = counter.count_message(&Message::user(boundary_snapshot));
+    // The post-reset projection already contains the current HistoryBoundary
+    // on every archive after the first. Reserve only enough to grow that
+    // replacement snapshot to the maximum-width form; adding the whole block
+    // again would double-count it and could archive an extra complete turn.
+    let boundary_reserve_increment =
+        boundary_reserve.saturating_sub(post_boundary_projected.history_boundary_input_tokens);
+    let active_tokens_without_boundary = fixed_without_boundary
+        .saturating_add(provider_message_token_total)
+        .saturating_add(boundary_reclaimable_tokens);
+    let accounting = RetrievalWindowTokenAccounting {
+        fixed_prompt_tokens: fixed_without_boundary.saturating_add(boundary_reserve_increment),
+        boundary_reclaimable_tokens,
+        provider_message_tokens,
+    };
+
+    Ok(RetrievalWindowAccountingFrame {
+        accounting,
+        active_tokens_without_boundary,
+        #[cfg(test)]
+        existing_history_boundary_tokens: post_boundary_projected.history_boundary_input_tokens,
+        #[cfg(test)]
+        fixed_prompt_tokens_before_boundary_reserve: fixed_without_boundary,
+        #[cfg(test)]
+        history_boundary_reserve_tokens: boundary_reserve,
+    })
+}
+
+fn retrieval_window_trigger_tokens(config: &AgentLoopConfig, budget: &TokenBudget) -> u32 {
+    let configured_trigger = (f64::from(budget.max_context_tokens)
+        * config
+            .context_management
+            .retrieval_window
+            .trigger_usage_ratio)
+        .floor() as u32;
+    let capped_trigger = configured_trigger
+        .min(budget.max_request_input_tokens())
+        .max(1);
+    let target_tokens = effective_retrieval_window_target_tokens(
+        budget,
+        config.context_management.retrieval_target_usage_percent(),
+    );
+
+    // A provider request-input cap or integer rounding can collapse two valid
+    // configured ratios onto the same token count. Route the first archive at
+    // least one token above the planner target so an exactly-at-limit request
+    // remains dispatchable instead of failing with TargetAlreadySatisfied.
+    capped_trigger.max(target_tokens.saturating_add(1))
+}
+
+fn retrieval_window_fallback_is_summary(config: &AgentLoopConfig) -> bool {
+    config.context_management.retrieval_window.fallback_strategy
+        == ContextManagementFallbackStrategy::Summary
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_prepare_retrieval_window_context(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    budget: &TokenBudget,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<Option<PreparedContext>, AgentError> {
+    // An explicit workflow selection requires the model's first step to be a
+    // lone `load_skill` call. During that setup round the effective callable
+    // catalog intentionally excludes `session_history_current`; defer archival
+    // until activation completes instead of misclassifying the temporary tool
+    // restriction as a missing retrieval capability.
+    if crate::runtime::runner::session_setup::skill_context::explicit_activation_pending(session) {
+        tracing::debug!(
+            session_id = %session_id,
+            "retrieval-window archival deferred until explicit skill activation completes"
+        );
+        return Ok(None);
+    }
+
+    let counter = TiktokenTokenCounter::default();
+    let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
+    let preflight = retrieval_window_preflight(
+        session,
+        config,
+        model_name,
+        tool_schemas,
+        llm,
+        budget,
+        &counter,
+    )
+    .await?;
+    if !preflight.has_provider_native_image && preflight.active_tokens < trigger_tokens {
+        return Ok(None);
+    }
+    let policy = RetrievalWindowPolicy {
+        min_recent_user_turns: config
+            .context_management
+            .retrieval_window
+            .min_recent_user_turns,
+        target_usage_percent: config.context_management.retrieval_target_usage_percent(),
+    };
+    let mut candidate_base = session.clone();
+
+    for attempt in 0..=MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+        let effective_tool_schemas =
+            super::stream_execution::effective_tool_schemas(&candidate_base, tool_schemas);
+        let history_tool_available = effective_tool_schemas.iter().any(|schema| {
+            bamboo_domain::canonical_tool_name(&schema.function.name) == "session_history_current"
+        });
+        if !history_tool_available {
+            return Err(AgentError::Budget(
+                "retrieval-window requires the effective callable tool session_history_current before archiving any messages"
+                    .to_string(),
+            ));
+        }
+
+        // OCR caching is an existing durable Session side effect. Populate it
+        // only on the candidate base so a failure leaves live state intact and
+        // a successful archive commits it in the same transaction.
+        ocr_cache::cache_ocr_results_in_session(&mut candidate_base, config).await;
+        let frame = build_retrieval_window_accounting_frame(
+            &candidate_base,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            budget,
+            &counter,
+        )
+        .await?;
+        if frame.active_tokens_without_boundary < trigger_tokens {
+            // A rebase is authoritative durable state. Publish the fully
+            // prepared candidate too so OCR caching performed on the retry is
+            // not lost when the new suffix removes the need for an archive.
+            if attempt > 0 {
+                *session = candidate_base;
+            }
+            return Ok(None);
+        }
+        let Some(persistence) = config.persistence.as_ref() else {
+            return Err(AgentError::Budget(
+                "retrieval-window requires RuntimeSessionPersistence for a durable pre-dispatch checkpoint"
+                    .to_string(),
+            ));
+        };
+
+        // The exact post-OCR base is the optimistic compare value. All archive
+        // mutations and provider preparation happen on a separate staged clone.
+        let expected_base = candidate_base;
+        let mut staged = expected_base.clone();
+        let plan = build_retrieval_window_candidate_plan_with_token_accounting(
+            &staged,
+            budget,
+            policy,
+            &frame.accounting,
+        )
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "retrieval-window candidate planning failed: {error}"
+            ))
+        })?;
+
+        let applied =
+            apply_retrieval_window_plan(&mut staged, &plan, policy, budget, &frame.accounting)
+                .map_err(|error| {
+                    AgentError::Budget(format!(
+                        "retrieval-window staged application failed: {error}"
+                    ))
+                })?;
+        if applied.idempotent_replay {
+            return Err(AgentError::Budget(
+                "retrieval-window automatic route unexpectedly produced an idempotent replay"
+                    .to_string(),
+            ));
+        }
+        // A retrieval boundary rewrites the provider-visible transcript. Bind
+        // Responses continuation invalidation to the same staged checkpoint.
+        staged
+            .metadata
+            .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+
+        let mut retained = prepare_hybrid_context_with_fixed_tokens(
+            &staged,
+            budget,
+            &counter,
+            plan.fixed_prompt_tokens,
+        )
+        .map_err(|error| {
+            AgentError::Budget(format!(
+                "retrieval-window retained context preparation failed: {error}"
+            ))
+        })?;
+        if retained.truncation_occurred || !retained.compressed_message_ids.is_empty() {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window retained context required an additional transient hard-limit fit (removed_segments={}, removed_messages={})",
+                retained.segments_removed,
+                retained.compressed_message_ids.len()
+            )));
+        }
+        transforms::apply_message_transforms(config, &mut retained, llm, session_id).await?;
+        let projected = super::stream_execution::project_request_usage(
+            &staged,
+            &retained,
+            config,
+            tool_schemas,
+            model_name,
+            llm,
+        )
+        .await?;
+        let late_bound_tool_tokens =
+            late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, &counter)?;
+        let retained_supplemental_tokens = retained.messages.iter().try_fold(
+            0u32,
+            |total, message| -> Result<u32, AgentError> {
+                let complete = provider_prepared_message_tokens(message, &counter)?;
+                Ok(total.saturating_add(complete.saturating_sub(counter.count_message(message))))
+            },
+        )?;
+        let projected_input_tokens = projected
+            .input_tokens
+            .saturating_add(late_bound_tool_tokens)
+            .saturating_add(retained_supplemental_tokens);
+        if projected_input_tokens > plan.target_tokens
+            || projected_input_tokens > budget.max_request_input_tokens()
+            || projected.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+        {
+            return Err(AgentError::Budget(format!(
+                "retrieval-window exact retained request exceeds its committed limits: input_tokens={projected_input_tokens}, target_tokens={}, input_limit={}, late_bound_tool_tokens={late_bound_tool_tokens}, supplemental_message_tokens={retained_supplemental_tokens}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                plan.target_tokens,
+                budget.max_request_input_tokens(),
+                projected.ledger_rendered_bytes,
+            )));
+        }
+
+        match persistence
+            .checkpoint_retrieval_window(&expected_base, &mut staged)
+            .await
+            .map_err(|error| {
+                AgentError::Budget(format!(
+                    "retrieval-window durable checkpoint failed before provider dispatch: {error}"
+                ))
+            })? {
+            RetrievalWindowCheckpointOutcome::Rebased => {
+                // `staged` is no longer the speculative archive candidate here:
+                // the persistence boundary replaced it with the latest durable
+                // Session. Publish that authority immediately so any later
+                // planning error or explicit summary fallback cannot operate on
+                // the runner's stale pre-rebase snapshot.
+                candidate_base = staged;
+                *session = candidate_base.clone();
+                if attempt == MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES {
+                    return Err(AgentError::Budget(format!(
+                        "retrieval-window durable checkpoint could not stabilize after {} attempts with concurrent transcript changes",
+                        MAX_RETRIEVAL_WINDOW_CHECKPOINT_REBASE_RETRIES + 1
+                    )));
+                }
+                continue;
+            }
+            RetrievalWindowCheckpointOutcome::Committed => {}
+        }
+
+        let (model_context_epoch, reset_reason) = staged
+            .model_context_state
+            .as_ref()
+            .map(|state| {
+                (
+                    state.prefix_epoch,
+                    state
+                        .last_reset_reason
+                        .map(ModelContextResetReason::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                )
+            })
+            .unwrap_or_else(|| (0, "unknown".to_string()));
+
+        // Publish only the exact candidate that persistence committed. Every
+        // fallible step above operated on an immutable base or staged clone.
+        *session = staged;
+
+        if let Some(tx) = event_tx {
+            let _ = tx
+                .send(AgentEvent::ContextArchived {
+                    archive_event_id: applied.event_id,
+                    trigger_type: "auto".to_string(),
+                    messages_archived: plan.archive_message_count,
+                    groups_archived: plan.archive_group_count,
+                    user_turns_archived: plan.archive_user_turn_count,
+                    active_tokens_before: plan.active_tokens_before,
+                    active_tokens_after: plan.projected_active_tokens_after,
+                    target_tokens: plan.target_tokens,
+                    retained_recent_user_turns: plan.retained_recent_user_turn_count,
+                    oldest_retained_message_id: plan.oldest_retained_message_id,
+                    oldest_retained_user_message_id: plan.oldest_retained_user_message_id,
+                    model_context_epoch,
+                    reset_reason,
+                })
+                .await;
+        }
+
+        tracing::info!(
+            session_id = %session_id,
+            archive_event_id = %session.compression_events.last().map(|event| event.id.as_str()).unwrap_or("unknown"),
+            messages_archived = plan.archive_message_count,
+            groups_archived = plan.archive_group_count,
+            active_tokens_before = plan.active_tokens_before,
+            active_tokens_after = plan.projected_active_tokens_after,
+            target_tokens = plan.target_tokens,
+            checkpoint_attempt = attempt + 1,
+            "retrieval-window context boundary durably committed"
+        );
+
+        return Ok(Some(retained));
+    }
+
+    unreachable!("bounded retrieval-window checkpoint loop must return")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_apply_summary_context_compression_with_budget(
     session: &mut Session,
     config: &AgentLoopConfig,
     model_name: &str,
@@ -334,6 +951,7 @@ async fn maybe_apply_host_context_compression_with_budget(
     budget: &TokenBudget,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
+    forced_trigger_type: Option<CompressionTriggerType>,
 ) -> Result<bool, AgentError> {
     let counter = TiktokenTokenCounter::default();
     let ledger_usage = enforce_model_context_ledger_retention(session, budget, &counter);
@@ -350,9 +968,22 @@ async fn maybe_apply_host_context_compression_with_budget(
     } else {
         0.0
     };
-    let host_auto_requested = usage_percent >= auto_threshold;
-    let critical_fallback_requested = usage_percent >= FORCE_CONTEXT_COMPRESSION_PERCENT;
-    let manual_requested = session.force_manual_compression.is_some();
+    let forced_requested = forced_trigger_type.is_some();
+    let host_auto_requested = usage_percent >= auto_threshold
+        || matches!(
+            forced_trigger_type.as_ref(),
+            Some(CompressionTriggerType::Auto)
+        );
+    let critical_fallback_requested = usage_percent >= FORCE_CONTEXT_COMPRESSION_PERCENT
+        || matches!(
+            forced_trigger_type.as_ref(),
+            Some(CompressionTriggerType::CriticalOverflow)
+        );
+    let manual_requested = session.force_manual_compression.is_some()
+        || matches!(
+            forced_trigger_type.as_ref(),
+            Some(CompressionTriggerType::Manual)
+        );
     if !host_auto_requested && !critical_fallback_requested && !manual_requested {
         return Ok(false);
     }
@@ -364,6 +995,7 @@ async fn maybe_apply_host_context_compression_with_budget(
     if host_auto_requested
         && !critical_fallback_requested
         && !manual_requested
+        && !forced_requested
         && session
             .task_list
             .as_ref()
@@ -384,7 +1016,8 @@ async fn maybe_apply_host_context_compression_with_budget(
     // For auto-triggered (non-critical, non-manual) compression, try lightweight
     // prompt section degradation first. If a section can be stripped, skip the
     // expensive LLM summarization pass entirely.
-    if host_auto_requested && !critical_fallback_requested && !manual_requested {
+    if host_auto_requested && !critical_fallback_requested && !manual_requested && !forced_requested
+    {
         if let Some(degraded) = degrade_prompt_context_sections_for_overflow(session) {
             tracing::info!(
                 "[{}] {} pre-summarization degradation stripped: {}, skipping LLM summarization",
@@ -400,7 +1033,8 @@ async fn maybe_apply_host_context_compression_with_budget(
     // Microcompact-first: estimate how many tokens prompt cache compaction would save.
     // If projected usage drops below the trigger threshold, skip LLM summarization —
     // the cheaper prompt-side compaction in prepare_hybrid_context will handle it.
-    if host_auto_requested && !critical_fallback_requested && !manual_requested {
+    if host_auto_requested && !critical_fallback_requested && !manual_requested && !forced_requested
+    {
         let summary_tokens = session
             .conversation_summary
             .as_ref()
@@ -430,7 +1064,9 @@ async fn maybe_apply_host_context_compression_with_budget(
         }
     }
 
-    let trigger_type = if manual_requested {
+    let trigger_type = if let Some(forced) = forced_trigger_type {
+        forced
+    } else if manual_requested {
         CompressionTriggerType::Manual
     } else if critical_fallback_requested {
         CompressionTriggerType::CriticalOverflow
@@ -785,9 +1421,49 @@ pub(super) async fn maybe_apply_host_context_compression(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
 ) -> Result<bool, AgentError> {
+    if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow {
+        if session.force_manual_compression.is_none() {
+            // Retrieval-window v1 commits only at the ordinary pre-turn
+            // boundary. Explicit summary fallback is not an alternate
+            // automatic policy: a mid-turn pressure check must defer until an
+            // actual retrieval failure or overflow recovery requests it.
+            return Ok(false);
+        }
+        if !retrieval_window_fallback_is_summary(config) {
+            session.force_manual_compression = None;
+            return Err(AgentError::Budget(
+                "compact_context requests summary compression, which is unsupported while context_management.strategy=retrieval_window; configure fallback_strategy=summary to opt into summary fallback"
+                    .to_string(),
+            ));
+        }
+
+        let budget =
+            super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref())
+                .await;
+        let applied = maybe_apply_summary_context_compression_with_budget(
+            session,
+            config,
+            model_name,
+            session_id,
+            llm,
+            &budget,
+            event_tx,
+            phase_label,
+            None,
+        )
+        .await?;
+        if !applied {
+            return Err(AgentError::Budget(
+                "explicit summary fallback could not satisfy the compact_context request"
+                    .to_string(),
+            ));
+        }
+        return Ok(true);
+    }
+
     let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
-    maybe_apply_host_context_compression_with_budget(
+    maybe_apply_summary_context_compression_with_budget(
         session,
         config,
         model_name,
@@ -796,6 +1472,7 @@ pub(super) async fn maybe_apply_host_context_compression(
         &budget,
         event_tx,
         phase_label,
+        None,
     )
     .await
 }
@@ -808,6 +1485,15 @@ pub(crate) async fn force_overflow_context_recovery(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<bool, AgentError> {
+    if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow
+        && !retrieval_window_fallback_is_summary(config)
+    {
+        return Err(AgentError::Budget(
+            "critical overflow recovery is unsupported while context_management.strategy=retrieval_window in this release; configure fallback_strategy=summary to opt into summary recovery"
+                .to_string(),
+        ));
+    }
+
     if let Some(degraded_section) = degrade_prompt_context_sections_for_overflow(session) {
         tracing::info!(
             "[{}] Overflow recovery pre-pass degraded prompt section: {}",
@@ -820,7 +1506,7 @@ pub(crate) async fn force_overflow_context_recovery(
 
     let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
-    maybe_apply_host_context_compression_with_budget(
+    maybe_apply_summary_context_compression_with_budget(
         session,
         config,
         model_name,
@@ -829,6 +1515,7 @@ pub(crate) async fn force_overflow_context_recovery(
         &budget,
         event_tx,
         "overflow-recovery",
+        Some(CompressionTriggerType::CriticalOverflow),
     )
     .await
 }
@@ -842,15 +1529,110 @@ pub(super) async fn prepare_round_context(
     llm: &Arc<dyn LLMProvider>,
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<PreparedRoundContext, AgentError> {
-    ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+    let retrieval_window_enabled =
+        config.context_management.strategy == ContextManagementStrategy::RetrievalWindow;
+    if retrieval_window_enabled
+        && session.conversation_summary.is_some()
+        && !retrieval_window_fallback_is_summary(config)
+    {
+        return Err(AgentError::Budget(
+            "retrieval-window cannot start for a Session that already has a conversation summary; configure fallback_strategy=summary or start a new Session"
+                .to_string(),
+        ));
+    }
+    if !retrieval_window_enabled {
+        // Preserve the legacy summary/default ordering exactly.
+        ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+    }
 
     let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
 
     let counter = TiktokenTokenCounter::default();
+    let mut retrieval_prepared = None;
 
-    if maybe_apply_host_context_compression_with_budget(
-        session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn",
+    if retrieval_window_enabled {
+        if session.force_manual_compression.is_some() {
+            if !retrieval_window_fallback_is_summary(config) {
+                session.force_manual_compression = None;
+                return Err(AgentError::Budget(
+                    "compact_context requests summary compression, which is unsupported while context_management.strategy=retrieval_window; configure fallback_strategy=summary to opt into summary fallback"
+                        .to_string(),
+                ));
+            }
+            ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+            let fallback_applied = maybe_apply_summary_context_compression_with_budget(
+                session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn", None,
+            )
+            .await?;
+            if !fallback_applied {
+                return Err(AgentError::Budget(
+                    "explicit summary fallback could not satisfy the compact_context request"
+                        .to_string(),
+                ));
+            }
+            tracing::debug!(
+                "[{}] Recomputing prepared context after explicit summary fallback",
+                session_id
+            );
+        } else {
+            // Retrieval preparation carries shadow sessions and provider
+            // projections across awaits. Heap-box this opt-in branch so its
+            // future does not inflate every ordinary agent run's stack frame.
+            match Box::pin(maybe_prepare_retrieval_window_context(
+                session,
+                config,
+                model_name,
+                session_id,
+                tool_schemas,
+                llm,
+                &budget,
+                event_tx,
+            ))
+            .await
+            {
+                Ok(Some(prepared)) => retrieval_prepared = Some(prepared),
+                Ok(None) => {
+                    // OCR caching is an existing durable side effect. Delay it
+                    // until retrieval preflight has established there is no
+                    // archive transaction, so retrieval failures leave the live
+                    // Session byte-identical.
+                    ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+                }
+                Err(error) if retrieval_window_fallback_is_summary(config) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %error,
+                        "retrieval-window pre-turn route failed; applying explicitly configured summary fallback"
+                    );
+                    ocr_cache::maybe_cache_ocr_results(session, config, session_id).await;
+                    let fallback_applied = maybe_apply_summary_context_compression_with_budget(
+                        session,
+                        config,
+                        model_name,
+                        session_id,
+                        llm,
+                        &budget,
+                        event_tx,
+                        "pre-turn-retrieval-fallback",
+                        Some(CompressionTriggerType::Auto),
+                    )
+                    .await?;
+                    if !fallback_applied {
+                        return Err(AgentError::Budget(format!(
+                            "retrieval-window pre-turn route failed ({error}); explicitly configured summary fallback did not apply"
+                        )));
+                    }
+                    tracing::debug!(
+                        "[{}] Recomputing prepared context after automatic summary fallback",
+                        session_id
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    } else if maybe_apply_summary_context_compression_with_budget(
+        session, config, model_name, session_id, llm, &budget, event_tx, "pre-turn", None,
     )
     .await?
     {
@@ -866,10 +1648,19 @@ pub(super) async fn prepare_round_context(
     let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
     let request_input_limit = budget.max_request_input_tokens();
     let mut refit_pass = 0usize;
-    let mut prepared_context =
-        prepare_hybrid_context_with_fixed_tokens(session, &budget, &counter, ledger_usage.tokens)
-            .map_err(|error| AgentError::Budget(error.to_string()))?;
-    transforms::apply_message_transforms(config, &mut prepared_context, llm, session_id).await?;
+    let mut prepared_context = if let Some(prepared) = retrieval_prepared {
+        prepared
+    } else {
+        let mut prepared = prepare_hybrid_context_with_fixed_tokens(
+            session,
+            &budget,
+            &counter,
+            ledger_usage.tokens,
+        )
+        .map_err(|error| AgentError::Budget(error.to_string()))?;
+        transforms::apply_message_transforms(config, &mut prepared, llm, session_id).await?;
+        prepared
+    };
 
     loop {
         // Reconciliation may append snapshots that did not exist when the

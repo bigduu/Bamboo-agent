@@ -21,12 +21,13 @@ use crate::credential_store::{CredentialDocumentLkg, CredentialMutation};
 use crate::{
     AccessControlConfig, AnthropicModelMapping, AtomicFileStore, AtomicJsonStore,
     BrokerClientConfig, ClusterFabricConfig, Config, ConfigSectionEvent, ConfigStoreResult,
-    ConfigValues, ConnectConfig, CredentialRef, CredentialSource, CredentialStatus,
-    CredentialStore, CredentialStoreHealth, DefaultWorkAreaConfig, DefaultsConfig, EnvVarEntry,
-    FeatureFlags, GeminiModelMapping, HooksConfig, KeywordMaskingConfig, LifecycleHooksConfig,
-    LiveSection, MemoryConfig, NotificationsConfig, PluginTrustConfig, ProviderConfigs,
-    ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus,
-    ServerConfig, SkillsConfig, StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
+    ConfigValues, ConnectConfig, ContextManagementConfig, CredentialRef, CredentialSource,
+    CredentialStatus, CredentialStore, CredentialStoreHealth, DefaultWorkAreaConfig,
+    DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping, HooksConfig,
+    KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig, NotificationsConfig,
+    PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
+    SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
+    SubagentsConfig, ToolsConfig,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -186,7 +187,7 @@ impl SectionId {
 /// `proxy_auth` and `proxy_auth_encrypted` remain compatibility read fields,
 /// but their owner is still core; section serialization always drops them in
 /// favour of `proxy_auth_credential_ref`.
-pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 30] = [
+pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 31] = [
     ("http_proxy", SectionId::Core),
     ("https_proxy", SectionId::Core),
     ("proxy_auth", SectionId::Core),
@@ -211,6 +212,7 @@ pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 30] = [
     ("features", SectionId::Providers),
     ("run_budget", SectionId::Core),
     ("stream_timeout", SectionId::Core),
+    ("context_management", SectionId::Core),
     ("cluster_fabric", SectionId::ClusterFabric),
     ("mcp", SectionId::Mcp),
     ("notifications", SectionId::Notifications),
@@ -237,6 +239,8 @@ pub struct CoreSection {
     pub run_budget: RunBudgetConfig,
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
+    #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
+    pub context_management: ContextManagementConfig,
     /// Only genuinely unclassified root keys live here.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -490,6 +494,7 @@ impl SectionProjection {
             features,
             run_budget,
             stream_timeout,
+            context_management,
             cluster_fabric,
             mcp,
             notifications,
@@ -510,6 +515,7 @@ impl SectionProjection {
                 default_work_area,
                 run_budget,
                 stream_timeout,
+                context_management,
                 extra,
             },
             providers: ProvidersSection {
@@ -575,6 +581,7 @@ impl SectionProjection {
             default_work_area,
             run_budget,
             stream_timeout,
+            context_management,
             extra,
         } = core;
         let ProvidersSection {
@@ -628,6 +635,7 @@ impl SectionProjection {
                 features,
                 run_budget,
                 stream_timeout,
+                context_management,
                 cluster_fabric: cluster_fabric.0,
                 mcp: mcp.0,
                 notifications,
@@ -1778,6 +1786,7 @@ fn validate_json_serializable<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn validate_core(value: &CoreSection) -> Result<(), String> {
     value.stream_timeout.validate()?;
+    value.context_management.validate()?;
     validate_secret_free_http_url("HTTP proxy", &value.http_proxy, true)?;
     validate_secret_free_http_url("HTTPS proxy", &value.https_proxy, true)?;
     validate_json_serializable(value)
@@ -3537,7 +3546,8 @@ fn project_legacy_raw_sections(
             | "server"
             | "default_work_area"
             | "run_budget"
-            | "stream_timeout" => {
+            | "stream_timeout"
+            | "context_management" => {
                 core.insert(key.clone(), value.clone());
             }
             "provider"
@@ -7250,6 +7260,7 @@ mod tests {
             "default_work_area",
             "run_budget",
             "stream_timeout",
+            "context_management",
             "lifecycle_hooks",
         ] {
             assert!(names.contains(required), "missing owner for {required}");
@@ -7280,6 +7291,16 @@ mod tests {
                 "transport_idle_timeout_secs": 30,
                 "first_semantic_timeout_secs": 45,
                 "semantic_idle_timeout_secs": 60
+            },
+            "context_management": {
+                "strategy": "retrieval_window",
+                "retrieval_window": {
+                    "min_recent_user_turns": 4,
+                    "trigger_usage_ratio": 0.82,
+                    "target_usage_ratio": 0.61,
+                    "history_tool_required": true,
+                    "fallback_strategy": "none"
+                }
             },
             "notifications": {"desktop": {"enabled": true}},
             "connect": {"platforms": []},
@@ -7320,6 +7341,11 @@ mod tests {
         assert_eq!(value["skills"]["future_skill_config"]["nested"], "kept");
         assert_eq!(value["default_work_area"]["path"], "/workspace");
         assert_eq!(value["run_budget"]["max_tool_calls"], 4);
+        assert_eq!(value["context_management"]["strategy"], "retrieval_window");
+        assert_eq!(
+            value["context_management"]["retrieval_window"]["min_recent_user_turns"],
+            4
+        );
         assert_eq!(value["plugin_trust"]["enforcement"], "off");
         assert_eq!(value["lifecycle_hooks"]["enabled"], true);
         assert_eq!(
@@ -14373,7 +14399,8 @@ fn reconciliation_root_sections(root: &Value) -> ReconciliationRootSectionsResul
             | "server"
             | "default_work_area"
             | "run_budget"
-            | "stream_timeout" => object(SectionId::Core, key, value, &mut object_sections),
+            | "stream_timeout"
+            | "context_management" => object(SectionId::Core, key, value, &mut object_sections),
             "provider"
             | "defaults"
             | "provider_instances"

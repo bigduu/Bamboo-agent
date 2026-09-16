@@ -11,10 +11,11 @@ use crate::runtime::runner::prompt_context::append_core_agent_directives;
 use crate::runtime::runner::session_setup::prompt_envelope::{
     build_active_workflow_context_block, build_agent_hook_context_block,
     build_conversation_summary_context_block, build_external_memory_context_block,
-    build_goal_context_block, build_instruction_overlay_context_block,
-    build_plan_mode_context_block, build_plan_runtime_context_block,
-    build_project_resources_context_block, build_session_identity_context_block,
-    build_task_list_context_block, build_workspace_context_block,
+    build_goal_context_block, build_history_boundary_context_block,
+    build_instruction_overlay_context_block, build_plan_mode_context_block,
+    build_plan_runtime_context_block, build_project_resources_context_block,
+    build_session_identity_context_block, build_task_list_context_block,
+    build_workspace_context_block,
 };
 use crate::runtime::runner::session_setup::prompt_setup::{
     build_stable_prompt_frame_with_sections, StablePrefixSection,
@@ -27,8 +28,8 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{PreparedContext, TiktokenTokenCounter, TokenCounter};
 use bamboo_domain::{
-    provider_transcript_boundary_sha256, ModelContextResetReason, ProviderFamily, ProviderProtocol,
-    ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
+    provider_transcript_boundary_sha256, ModelContextEventKind, ModelContextResetReason,
+    ProviderFamily, ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
 use bamboo_llm::provider::ResponsesRequestOptions;
 use bamboo_llm::{
@@ -56,11 +57,13 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub prompt_memory_exposure: Option<PromptMemoryExposureFrame<'a>>,
 }
 
-const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str = "responses.previous_response_id";
+pub(super) const SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY: &str =
+    "responses.previous_response_id";
 const CONVERSATION_SUMMARY_START_MARKER: &str = "<!-- CONVERSATION_SUMMARY_START -->";
 const INTERRUPTED_ASSISTANT_OUTPUT_KIND: &str = "interrupted_assistant_output";
 const AGENT_LOOP_REQUEST_PURPOSE: &str = "agent_loop";
 const PROMPT_CACHE_KEY_DOMAIN: &[u8] = b"bamboo/openai/responses/prompt-cache-key/v1\0";
+const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
 
 fn interruption_kind(error: &AgentError) -> &'static str {
     match error {
@@ -377,6 +380,9 @@ pub(super) struct ProjectedRequestUsage {
     pub tool_schema_segment_count: usize,
     pub tool_schema_late_bound_segment_count: usize,
     pub ledger_rendered_bytes: usize,
+    /// Complete token cost of model-context snapshot messages that carry the
+    /// current archived-history boundary.
+    pub history_boundary_input_tokens: u32,
 }
 
 fn measure_request_usage(
@@ -386,6 +392,23 @@ fn measure_request_usage(
 ) -> ProjectedRequestUsage {
     let counter = TiktokenTokenCounter::default();
     let messages = envelope.ir.flatten();
+    let history_boundary_event_ids = session
+        .model_context_state
+        .as_ref()
+        .into_iter()
+        .flat_map(|state| state.events.iter())
+        .filter(|event| {
+            event.block_type == ContextBlockType::HistoryBoundary
+                && event.kind == ModelContextEventKind::Snapshot
+        })
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let history_boundary_input_tokens = messages
+        .iter()
+        .filter(|message| history_boundary_event_ids.contains(message.id.as_str()))
+        .fold(0u32, |total, message| {
+            total.saturating_add(counter.count_message(message))
+        });
     let mut message_input_tokens = counter.count_messages(&messages);
     let mut replaced_anchors = HashSet::new();
     for group in &envelope.ir.provider_transcript_groups {
@@ -444,6 +467,7 @@ fn measure_request_usage(
         tool_schema_segment_count,
         tool_schema_late_bound_segment_count,
         ledger_rendered_bytes,
+        history_boundary_input_tokens,
     }
 }
 
@@ -631,6 +655,9 @@ fn build_request_envelope_reconciled(
         context_blocks.push(block);
     }
     if let Some(block) = build_conversation_summary_context_block(session) {
+        context_blocks.push(block);
+    }
+    if let Some(block) = build_history_boundary_context_block(session) {
         context_blocks.push(block);
     }
 
@@ -1064,12 +1091,19 @@ pub(super) async fn execute_llm_stream(
     prepared_context: &PreparedContext,
     tool_schemas: &[ToolSchema],
     frame: &LlmStreamFrame<'_>,
-) -> Result<(crate::runtime::stream::handler::StreamHandlingOutput, u128), AgentError> {
+) -> Result<
+    (
+        crate::runtime::stream::handler::StreamHandlingOutput,
+        u128,
+        u64,
+    ),
+    AgentError,
+> {
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let cancel_token = frame.cancel_token;
-    let max_context_tokens = frame.max_context_tokens;
-    let max_output_tokens = frame.max_output_tokens;
+    let mut max_context_tokens = frame.max_context_tokens;
+    let mut max_output_tokens = frame.max_output_tokens;
     let model = frame.model;
     let provider_name = frame.provider_name;
     let provider_type = frame.provider_type;
@@ -1077,82 +1111,124 @@ pub(super) async fn execute_llm_stream(
     let session_id = frame.session_id;
 
     let llm_started_at = std::time::Instant::now();
-    let required_tool = required_tool_for_session(session);
-    let effective_tool_schemas = effective_tool_schemas(session, tool_schemas);
-    let tool_schemas = effective_tool_schemas.as_ref();
+    let base_tool_schemas = tool_schemas;
+    let mut prepared_context = prepared_context.clone();
+    let mut required_tool = required_tool_for_session(session);
+    let mut effective_schemas = effective_tool_schemas(session, base_tool_schemas);
     // Stateful chaining is gated on the request policy: a `store=false` turn is
     // never persisted upstream, so its id must not be sent back (it would 400
     // with `previous_response_not_found`) nor kept in session metadata.
     let responses_policy = engine_responses_policy();
     let continuation_enabled = responses_continuation_enabled(&responses_policy, provider_type);
-    // Owned (not borrowed) so the immutable borrow of `session` ends here and the
-    // drift diagnostic below can take `&mut session`.
-    let previous_response_id = if continuation_enabled {
-        session_previous_response_id(session).map(str::to_string)
-    } else {
-        None
-    };
-
-    let previous_model_context_state = session.model_context_state.clone();
-    let previous_provider_transcript = session.provider_transcript.clone();
-    let mut prepared_envelope =
-        build_request_envelope_reconciled(session, prepared_context, config, tool_schemas, model);
-    // `prepare_round_context` reserves the already-durable ledger history. The
-    // reconciliation above can append a new host-state snapshot, so verify the
-    // exact final IR again before checkpoint/provider dispatch. Failing closed
-    // preserves the context-window contract without committing an unsendable
-    // ledger candidate.
-    let tool_footprint = match llm
-        .provider_visible_tool_footprint(&prepared_envelope.ir, tool_schemas, model, required_tool)
-        .await
-    {
-        Ok(footprint) => footprint,
-        Err(error) => {
-            session.model_context_state = previous_model_context_state;
-            session.provider_transcript = previous_provider_transcript;
-            return Err(AgentError::LLM(format!(
-                "provider-visible tool footprint projection failed before dispatch: {error}"
-            )));
-        }
-    };
-    let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
-    let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
-    if final_usage.input_tokens > request_input_limit
-        || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
-    {
-        session.model_context_state = previous_model_context_state;
-        session.provider_transcript = previous_provider_transcript;
-        return Err(AgentError::Budget(format!(
-            "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
-            final_usage.message_input_tokens,
-            final_usage.tool_schema_input_tokens,
-            final_usage.input_tokens,
-            final_usage.tool_schema_segment_count,
-            final_usage.tool_schema_late_bound_segment_count,
-            final_usage.tool_schema_serialized_bytes,
-            final_usage.tool_schema_serialized_chars,
-            final_usage.ledger_rendered_bytes,
-        )));
-    }
-    // Reconciliation changes the next outbound model transcript. It must become
-    // durable before any provider request is attempted, otherwise a crash/retry
-    // could allocate a different event sequence. Fail closed on checkpoint
-    // failure instead of sending an unrepeatable request.
-    if prepared_envelope.ledger_changed {
-        if let Some(persistence) = config.persistence.as_ref() {
-            if let Err(error) = persistence.checkpoint_runtime_session(session).await {
-                // Reconciliation is an in-memory transaction until its durable
-                // checkpoint succeeds. Restore the prior state so an in-process
-                // retry cannot mistake the failed candidate for a committed
-                // ledger and bypass persistence on its next attempt.
+    let mut checkpoint_reprepares = 0usize;
+    let (mut prepared_envelope, previous_response_id, final_usage) = loop {
+        let tool_schemas = effective_schemas.as_ref();
+        // Owned (not borrowed) so the immutable borrow of `session` ends here and
+        // the drift diagnostic below can take `&mut session`.
+        let previous_response_id = if continuation_enabled {
+            session_previous_response_id(session).map(str::to_string)
+        } else {
+            None
+        };
+        let previous_model_context_state = session.model_context_state.clone();
+        let previous_provider_transcript = session.provider_transcript.clone();
+        let prepared_envelope = build_request_envelope_reconciled(
+            session,
+            &prepared_context,
+            config,
+            tool_schemas,
+            model,
+        );
+        // `prepare_round_context` reserves the already-durable ledger history. The
+        // reconciliation above can append a new host-state snapshot, so verify the
+        // exact final IR again before checkpoint/provider dispatch. Failing closed
+        // preserves the context-window contract without committing an unsendable
+        // ledger candidate.
+        let tool_footprint = match llm
+            .provider_visible_tool_footprint(
+                &prepared_envelope.ir,
+                tool_schemas,
+                model,
+                required_tool,
+            )
+            .await
+        {
+            Ok(footprint) => footprint,
+            Err(error) => {
                 session.model_context_state = previous_model_context_state;
                 session.provider_transcript = previous_provider_transcript;
                 return Err(AgentError::LLM(format!(
-                    "model-context ledger checkpoint failed before provider dispatch: {error}"
+                    "provider-visible tool footprint projection failed before dispatch: {error}"
                 )));
             }
+        };
+        let final_usage = measure_request_usage(session, &prepared_envelope, &tool_footprint);
+        let request_input_limit = max_context_tokens.saturating_sub(max_output_tokens);
+        if final_usage.input_tokens > request_input_limit
+            || final_usage.ledger_rendered_bytes > MAX_MODEL_CONTEXT_RENDERED_BYTES
+        {
+            session.model_context_state = previous_model_context_state;
+            session.provider_transcript = previous_provider_transcript;
+            return Err(AgentError::Budget(format!(
+                "final known provider-visible request exceeds ledger-safe limits: message_input_tokens={}, tool_schema_input_tokens={}, input_tokens={}, input_limit={request_input_limit}, tool_schema_known_segments={}, tool_schema_late_bound_segments={}, tool_schema_bytes={}, tool_schema_chars={}, ledger_bytes={}, ledger_byte_limit={MAX_MODEL_CONTEXT_RENDERED_BYTES}",
+                final_usage.message_input_tokens,
+                final_usage.tool_schema_input_tokens,
+                final_usage.input_tokens,
+                final_usage.tool_schema_segment_count,
+                final_usage.tool_schema_late_bound_segment_count,
+                final_usage.tool_schema_serialized_bytes,
+                final_usage.tool_schema_serialized_chars,
+                final_usage.ledger_rendered_bytes,
+            )));
         }
-    }
+        // Reconciliation changes the next outbound model transcript. It must become
+        // durable before any provider request is attempted, otherwise a crash/retry
+        // could allocate a different event sequence. The append-safe checkpoint can
+        // itself merge a concurrent durable suffix into `session`; after every
+        // successful checkpoint, rebuild the bounded context and final envelope from
+        // that reconciled Session instead of dispatching the stale candidate.
+        if prepared_envelope.ledger_changed {
+            if let Some(persistence) = config.persistence.as_ref() {
+                if checkpoint_reprepares >= MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES {
+                    session.model_context_state = previous_model_context_state;
+                    session.provider_transcript = previous_provider_transcript;
+                    return Err(AgentError::LLM(format!(
+                        "model-context request could not stabilize after {MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES} append-safe checkpoint reprepares"
+                    )));
+                }
+                if let Err(error) = persistence.checkpoint_runtime_session(session).await {
+                    // Reconciliation is an in-memory transaction until its durable
+                    // checkpoint succeeds. Restore the prior state so an in-process
+                    // retry cannot mistake the failed candidate for a committed
+                    // ledger and bypass persistence on its next attempt.
+                    session.model_context_state = previous_model_context_state;
+                    session.provider_transcript = previous_provider_transcript;
+                    return Err(AgentError::LLM(format!(
+                        "model-context ledger checkpoint failed before provider dispatch: {error}"
+                    )));
+                }
+                checkpoint_reprepares += 1;
+                required_tool = required_tool_for_session(session);
+                effective_schemas = effective_tool_schemas(session, base_tool_schemas);
+                let reprepared = Box::pin(super::context_preparation::prepare_round_context(
+                    session,
+                    config,
+                    model,
+                    session_id,
+                    effective_schemas.as_ref(),
+                    llm,
+                    Some(event_tx),
+                ))
+                .await?;
+                max_context_tokens = reprepared.budget.max_context_tokens;
+                max_output_tokens = reprepared.budget.max_output_tokens;
+                prepared_context = reprepared.prepared_context;
+                continue;
+            }
+        }
+        break (prepared_envelope, previous_response_id, final_usage);
+    };
+    let tool_schemas = effective_schemas.as_ref();
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -1437,8 +1513,9 @@ pub(super) async fn execute_llm_stream(
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
+    let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
 
-    Ok((stream_output, llm_duration))
+    Ok((stream_output, llm_duration, prompt_tokens))
 }
 
 #[cfg(test)]

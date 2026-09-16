@@ -27,6 +27,7 @@ wins; please file an issue.
 - [Server](#server)
 - [Tools, skills, hooks](#tools-skills-hooks)
 - [LLM stream timeouts](#llm-stream-timeouts)
+- [Context management](#context-management)
 - [Memory / auto-dream / gardener](#memory--auto-dream--gardener)
 - [Sub-agents + external CLI executors](#sub-agents--external-cli-executors)
 - [MCP servers](#mcp-servers)
@@ -76,6 +77,7 @@ default. The full field list of `Config`:
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
 | `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
+| `context_management` | `ContextManagementConfig` | Selects legacy summary compression or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
 | `subagents` | `SubagentsConfig` | Sub-agent execution + the `claude_code` executor. See below. |
 | `cluster_fabric` | `ClusterFabricConfig` | Operator-managed remote nodes for deploying `broker-agent` workers over SSH; empty by default. SSH secrets encrypted at rest. |
@@ -276,6 +278,58 @@ transport timeout. If a proxy cannot emit heartbeats during long upstream
 reasoning gaps, configure `transport_idle_timeout_secs` at least as high as the
 intended semantic wait instead; disabling the bounded transport watchdog is
 not recommended.
+
+## Context management
+
+`context_management` defaults to `{"strategy":"summary"}`. Missing
+configuration therefore keeps the existing model-generated conversation
+summary behavior. The alternative `retrieval_window` strategy keeps exact raw
+messages in the Session store, removes eligible older complete turns only from
+the active provider window, and directs the model to
+`session_history_current` when it needs earlier evidence.
+
+```json
+{
+  "context_management": {
+    "strategy": "retrieval_window",
+    "retrieval_window": {
+      "min_recent_user_turns": 3,
+      "trigger_usage_ratio": 0.8,
+      "target_usage_ratio": 0.6,
+      "history_tool_required": true,
+      "fallback_strategy": "none"
+    }
+  }
+}
+```
+
+| Field | Default | What it does |
+|---|---|---|
+| `strategy` | `summary` | `summary` preserves the current summarizer path; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
+| `retrieval_window.trigger_usage_ratio` | `0.80` | Provider-prepared input ratio that starts automatic archival. |
+| `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0.01 <= target < trigger <= 1` because the planner uses whole percentages. |
+| `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
+| `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
+
+Retrieval-window commits require runtime persistence and are checkpointed before
+the archived state is published or a provider request is sent. The checkpoint
+compares the exact pre-archive base while holding the Session write lock; a
+concurrent durable transcript change performs no archive write and causes the
+engine to rebase, re-account, replan, and rebuild the provider request before a
+bounded retry. Selecting `retrieval_window` with `fallback_strategy: "none"`
+for a Session that already has a conversation summary is rejected immediately;
+start a new Session or explicitly retain summary fallback. This first runtime
+slice handles automatic pre-turn archival only. Manual
+`compact_context` and critical overflow recovery fail explicitly under
+`fallback_strategy: "none"`; use `summary` only when that fallback is desired.
+Candidate fitting projects the exact post-boundary provider request. Provider-
+native reasoning/tool-search replay and prior model-context ledger bytes that
+the boundary resets count toward trigger pressure, but are reclaimed once (not
+misclassified as permanently fixed prompt cost) when calculating the retained
+target.
+The raw Session transcript remains authoritative. Memory is selective context,
+not a substitute for exact history.
 
 ## Memory / auto-dream / gardener
 
