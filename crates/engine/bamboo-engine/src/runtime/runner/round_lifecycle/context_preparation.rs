@@ -76,50 +76,52 @@ fn pending_manual_archive_request(session: &Session) -> Option<ResponseOccurrenc
         .metadata
         .get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY)
         .and_then(|value| serde_json::from_str::<ResponseOccurrence>(value).ok());
-    let mut completed_tool_calls = HashMap::new();
+    let mut current_batch = HashMap::new();
+    let mut latest_completed = None;
 
-    // A manual request belongs to the current user-anchored turn. Walking only
-    // that tail keeps restart recovery bounded by the per-round tool-call cap,
-    // even when the authoritative Session contains a very large history.
-    for message in session.messages.iter().rev() {
+    // A manual request belongs to the current user-anchored turn. Each
+    // assistant message starts a new result-correlation batch: provider call
+    // IDs may be reused in later rounds, including by a different tool, so a
+    // result must never match an older assistant batch merely by ID.
+    let tail_start = session
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::User)
+        .map_or(0, |index| index + 1);
+    for message in &session.messages[tail_start..] {
         match message.role {
-            Role::Tool => {
-                if message.tool_success != Some(false) {
-                    if let Some(call_id) = message.tool_call_id.as_deref() {
-                        completed_tool_calls
-                            .entry(call_id)
-                            .or_insert_with(|| message.id.as_str());
-                    }
+            Role::Assistant => {
+                current_batch.clear();
+                for call in message.tool_calls.iter().flatten() {
+                    current_batch.insert(
+                        call.id.clone(),
+                        bamboo_domain::canonical_tool_name(&call.function.name)
+                            == "archive_context",
+                    );
                 }
             }
-            Role::Assistant => {
-                let Some(call) = message.tool_calls.as_deref().and_then(|calls| {
-                    calls.iter().rev().find(|call| {
-                        bamboo_domain::canonical_tool_name(&call.function.name) == "archive_context"
-                            && completed_tool_calls.contains_key(call.id.as_str())
-                    })
-                }) else {
+            Role::Tool => {
+                let Some(call_id) = message.tool_call_id.as_deref() else {
                     continue;
                 };
-                let occurrence = ResponseOccurrence {
-                    tool_call_id: call.id.clone(),
-                    tool_result_message_id: completed_tool_calls
-                        .get(call.id.as_str())
-                        .expect("completed call must retain its result message")
-                        .to_string(),
-                    permission_generation: None,
+                let Some(is_archive_context) = current_batch.remove(call_id) else {
+                    continue;
                 };
-                // The newest completed request is the ordering fence. If it is
-                // already consumed, every older request in this turn is older
-                // than the durable fence and must not be replayed.
-                return (last_consumed.as_ref() != Some(&occurrence)).then_some(occurrence);
+                if is_archive_context && message.tool_success != Some(false) {
+                    latest_completed = Some(ResponseOccurrence {
+                        tool_call_id: call_id.to_string(),
+                        tool_result_message_id: message.id.clone(),
+                        permission_generation: None,
+                    });
+                }
             }
-            Role::User => break,
-            Role::System => {}
+            Role::User | Role::System => {}
         }
     }
-
-    None
+    // The newest completed request is the ordering fence. If it is already
+    // consumed, every older request in this turn is older than the durable
+    // fence and must not be replayed.
+    latest_completed.filter(|occurrence| last_consumed.as_ref() != Some(occurrence))
 }
 
 fn mark_manual_archive_request_consumed(
@@ -495,7 +497,7 @@ async fn checkpoint_retrieval_overflow_prompt_degradation(
             ));
         };
         match persistence
-            .checkpoint_retrieval_window(&expected_base, &mut staged)
+            .checkpoint_prompt_rewrite(&expected_base, &mut staged)
             .await
             .map_err(|error| {
                 AgentError::Budget(format!(

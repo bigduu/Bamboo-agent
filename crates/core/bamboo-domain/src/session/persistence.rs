@@ -333,6 +333,25 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         ))
     }
 
+    /// Atomically commit a provider-visible System-prompt rewrite.
+    ///
+    /// This is deliberately separate from both the append-safe runtime
+    /// checkpoint (which must restore durable message content) and the
+    /// retrieval-window archive checkpoint (which requires a new archive
+    /// event). Implementations compare `expected_base` under their per-session
+    /// lock, return `Rebased` without writing on conflict, and accept only the
+    /// bounded prompt rewrite plus its provider/model-context reset.
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        _expected_base: &Session,
+        _staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime persistence does not support prompt-rewrite checkpoints",
+        ))
+    }
+
     /// Load the latest runtime-visible session snapshot when the persistence
     /// implementation can coordinate reads. Tools may update a repository-owned
     /// clone while an agent loop holds its own live Session; the loop uses this
@@ -462,6 +481,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<RetrievalWindowCheckpointOutcome> {
         (**self)
             .checkpoint_retrieval_window(expected_base, staged)
+            .await
+    }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        (**self)
+            .checkpoint_prompt_rewrite(expected_base, staged)
             .await
     }
 

@@ -129,11 +129,21 @@ impl RuntimeSessionPersistence for RetrievalCheckpointPersistence {
             .push(staged.clone());
         Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_retrieval_window(expected_base, staged)
+            .await
+    }
 }
 
 struct DurableBaseCheckingPersistence {
     durable: Arc<Mutex<Session>>,
     runtime_checkpoints: Arc<AtomicUsize>,
+    prompt_checkpoints: Arc<AtomicUsize>,
     retrieval_checkpoints: Arc<AtomicUsize>,
 }
 
@@ -141,6 +151,7 @@ struct DurableBaseCheckingFixture {
     persistence: Arc<dyn RuntimeSessionPersistence>,
     durable: Arc<Mutex<Session>>,
     runtime_checkpoints: Arc<AtomicUsize>,
+    prompt_checkpoints: Arc<AtomicUsize>,
     retrieval_checkpoints: Arc<AtomicUsize>,
 }
 
@@ -148,15 +159,18 @@ impl DurableBaseCheckingPersistence {
     fn fixture(durable: Session) -> DurableBaseCheckingFixture {
         let durable = Arc::new(Mutex::new(durable));
         let runtime_checkpoints = Arc::new(AtomicUsize::new(0));
+        let prompt_checkpoints = Arc::new(AtomicUsize::new(0));
         let retrieval_checkpoints = Arc::new(AtomicUsize::new(0));
         DurableBaseCheckingFixture {
             persistence: Arc::new(Self {
                 durable: Arc::clone(&durable),
                 runtime_checkpoints: Arc::clone(&runtime_checkpoints),
+                prompt_checkpoints: Arc::clone(&prompt_checkpoints),
                 retrieval_checkpoints: Arc::clone(&retrieval_checkpoints),
             }),
             durable,
             runtime_checkpoints,
+            prompt_checkpoints,
             retrieval_checkpoints,
         }
     }
@@ -180,6 +194,25 @@ impl RuntimeSessionPersistence for DurableBaseCheckingPersistence {
         staged: &mut Session,
     ) -> io::Result<RetrievalWindowCheckpointOutcome> {
         self.retrieval_checkpoints.fetch_add(1, Ordering::SeqCst);
+        let mut durable = self.durable.lock().expect("durable Session lock");
+        let expected_messages = serde_json::to_vec(&expected_base.messages)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let durable_messages = serde_json::to_vec(&durable.messages)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if expected_messages != durable_messages {
+            *staged = durable.clone();
+            return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+        }
+        *durable = staged.clone();
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> io::Result<RetrievalWindowCheckpointOutcome> {
+        self.prompt_checkpoints.fetch_add(1, Ordering::SeqCst);
         let mut durable = self.durable.lock().expect("durable Session lock");
         let expected_messages = serde_json::to_vec(&expected_base.messages)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -379,6 +412,24 @@ fn manual_archive_consumption_tracks_result_occurrence_when_call_id_is_reused() 
     let first = pending_manual_archive_request(&session).expect("first request");
     mark_manual_archive_request_consumed(&mut session, &first).expect("consume first request");
     assert!(pending_manual_archive_request(&session).is_none());
+
+    let mut unrelated = Message::assistant("", None);
+    unrelated.tool_calls = Some(vec![ToolCall {
+        id: "reused-call-id".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"README.md"}"#.to_string(),
+        },
+    }]);
+    session.add_message(unrelated);
+    let mut unrelated_result = Message::tool_result("reused-call-id", "unrelated result");
+    unrelated_result.id = "result-unrelated-reused-id".to_string();
+    session.add_message(unrelated_result);
+    assert!(
+        pending_manual_archive_request(&session).is_none(),
+        "a later non-archive result reusing the ID must not revive the older archive request"
+    );
 
     append_archive_context_request(&mut session, "reused-call-id");
     let second = pending_manual_archive_request(&session).expect("second request");
@@ -4798,7 +4849,8 @@ async fn retrieval_window_overflow_degrades_all_sections_and_archives_in_one_rec
     assert!(!prompt.contains("BAMBOO_SKILL_CONTEXT"));
     assert!(!prompt.contains("BAMBOO_ENV_CONTEXT"));
     assert_eq!(fixture.runtime_checkpoints.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.retrieval_checkpoints.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.prompt_checkpoints.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.retrieval_checkpoints.load(Ordering::SeqCst), 1);
     assert_eq!(
         session
             .compression_events

@@ -789,6 +789,40 @@ impl LockedSessionStore {
         Ok(RetrievalWindowCheckpointOutcome::Committed)
     }
 
+    /// Commit a bounded System-prompt rewrite without routing it through the
+    /// append-safe checkpoint or pretending that an archive event occurred.
+    pub async fn checkpoint_prompt_rewrite_and_publish<F>(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+        publish: F,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome>
+    where
+        F: FnOnce(&Session) + Send,
+    {
+        validate_staged_prompt_rewrite_transition(expected_base, staged)?;
+        let _guard = self.acquire_lock(&staged.id).await;
+        let latest = self.storage.load_session(&staged.id).await?;
+
+        if let Some(latest) = latest.as_ref() {
+            if !retrieval_window_base_matches(expected_base, latest)? {
+                *staged = rebase_retrieval_window_base(expected_base, latest);
+                apply_authoritative_metadata(staged, latest);
+                adopt_fresher_disk_permission_posture(staged, latest);
+                return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+
+            ensure_model_context_checkpoint_is_current(staged, latest)?;
+            bamboo_domain::merge_session_inbox_admission(staged, latest);
+            apply_authoritative_metadata(staged, latest);
+            adopt_fresher_disk_permission_posture(staged, latest);
+        }
+
+        self.save_session_rebasing_task_conflicts(staged).await?;
+        publish(staged);
+        Ok(RetrievalWindowCheckpointOutcome::Committed)
+    }
+
     /// Like [`Self::merge_save_runtime`] but does NOT adopt the on-disk
     /// permission mode — the caller's in-memory value is authoritative and
     /// persists as-is.
@@ -1323,6 +1357,15 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             .await
     }
 
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.checkpoint_prompt_rewrite_and_publish(expected_base, staged, |_| {})
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.storage.load_session(session_id).await
     }
@@ -1443,6 +1486,62 @@ fn message_matches_retrieval_window_base(
 
 fn invalid_retrieval_window_checkpoint(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_staged_prompt_rewrite_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint must preserve the Session ID and message array length",
+        ));
+    }
+
+    let mut canonical = expected.clone();
+    let mut rewrote_system_prompt = false;
+    for ((before, after), canonical_message) in expected
+        .messages
+        .iter()
+        .zip(&staged.messages)
+        .zip(&mut canonical.messages)
+    {
+        if before.id != after.id {
+            return Err(invalid_retrieval_window_checkpoint(
+                "prompt-rewrite checkpoint reordered or replaced a message",
+            ));
+        }
+        if before.content != after.content {
+            if !matches!(before.role, bamboo_domain::Role::System)
+                || !matches!(after.role, bamboo_domain::Role::System)
+            {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "prompt-rewrite checkpoint changed non-System message content",
+                ));
+            }
+            canonical_message.content.clone_from(&after.content);
+            rewrote_system_prompt = true;
+        }
+    }
+    if !rewrote_system_prompt {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint did not change System message content",
+        ));
+    }
+
+    canonical.metadata.remove("responses.previous_response_id");
+    canonical
+        .reset_model_context_epoch(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "prompt-rewrite checkpoint contains mutations outside the System prompt and provider reset",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_retrieval_window_transition(
@@ -3748,6 +3847,93 @@ mod tests {
         assert_eq!(runner_snapshot.messages[2].id, saved.messages[2].id);
         assert_eq!(saved.messages[1].content, "concurrent injected message");
         assert_eq!(saved.messages[2].content, "partial runner output");
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_commits_without_an_archive_event() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-checkpoint";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        expected.add_message(Message::user("continue"));
+        expected.metadata.insert(
+            "responses.previous_response_id".to_string(),
+            "response-before-rewrite".to_string(),
+        );
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.metadata.remove("responses.previous_response_id");
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(saved.messages[0].content, "Base");
+        assert!(saved.compression_events.is_empty());
+        assert!(!saved
+            .metadata
+            .contains_key("responses.previous_response_id"));
+        assert_eq!(
+            saved
+                .model_context_state
+                .as_ref()
+                .and_then(|state| state.last_reset_reason),
+            Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
+        );
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rewrite_checkpoint_rebases_a_concurrent_suffix_without_writing() {
+        use bamboo_domain::session::types::Message;
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let session_id = "prompt-rewrite-rebase";
+        let mut expected = fresh(session_id);
+        expected.add_message(Message::system("Base\n\nDEGRADABLE TOOL GUIDE"));
+        storage.save_session(&expected).await.unwrap();
+
+        let mut staged = expected.clone();
+        staged.messages[0].content = "Base".to_string();
+        staged.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        let mut durable = expected.clone();
+        let mut concurrent = Message::user("concurrent durable suffix");
+        concurrent.id = "prompt-rewrite-concurrent-suffix".to_string();
+        durable.add_message(concurrent);
+        storage.save_session(&durable).await.unwrap();
+
+        let outcome = store
+            .checkpoint_prompt_rewrite_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+        let saved = storage.load_session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&durable).unwrap()
+        );
+        assert_eq!(staged.messages[0].content, expected.messages[0].content);
+        assert_eq!(staged.messages[1].id, "prompt-rewrite-concurrent-suffix");
+        assert!(staged.model_context_state.is_none());
     }
 
     #[tokio::test]
