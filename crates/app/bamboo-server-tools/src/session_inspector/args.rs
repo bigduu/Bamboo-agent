@@ -42,6 +42,17 @@ pub(super) enum SessionInspectorArgs {
         archived_only: Option<bool>,
     },
 
+    /// Read one complete logical turn and bounded adjacent turns around a hit.
+    ReadAround {
+        message_id: String,
+        #[serde(default)]
+        before_turns: Option<usize>,
+        #[serde(default)]
+        after_turns: Option<usize>,
+        #[serde(default)]
+        max_chars: Option<usize>,
+    },
+
     /// Materialize a bounded, immutable observation of this root or its tree.
     ExportContext { session_id: String },
 

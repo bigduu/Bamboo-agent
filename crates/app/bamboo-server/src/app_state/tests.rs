@@ -254,6 +254,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
         .expect("Root history actions");
     assert!(actions.contains(&json!("search_current")));
     assert!(actions.contains(&json!("read_current")));
+    assert!(actions.contains(&json!("read_around")));
     assert!(actions.contains(&json!("list")));
     assert!(actions.contains(&json!("read_messages")));
 }
@@ -319,7 +320,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .expect("Child history schema");
     assert_eq!(
         history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current"])
+        json!(["search_current", "read_current", "read_around"])
     );
     assert!(history.function.parameters["properties"]
         .get("session_id")
@@ -332,7 +333,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .expect("Base history schema");
     assert_eq!(
         base_history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current"])
+        json!(["search_current", "read_current", "read_around"])
     );
     assert!(base_history.function.parameters["properties"]
         .get("session_id")

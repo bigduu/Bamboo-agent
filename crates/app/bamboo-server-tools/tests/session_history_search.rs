@@ -41,6 +41,17 @@ fn history_read_call(id: &str) -> ToolCall {
     }
 }
 
+fn history_around_call(id: &str, message_id: &str) -> ToolCall {
+    ToolCall {
+        id: id.to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "session_history".to_string(),
+            arguments: json!({"action":"read_around","message_id":message_id}).to_string(),
+        },
+    }
+}
+
 fn completed(outcome: ToolOutcome) -> Value {
     let ToolOutcome::Completed(result) = outcome else {
         panic!("expected completed tool outcome")
@@ -99,6 +110,21 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
     );
     previous_read_result.id = "previous-read-result-message".to_string();
     current.add_message(previous_read_result);
+    let mut previous_around = Message::assistant(
+        "",
+        Some(vec![history_around_call(
+            "previous-around",
+            "authoritative-compressed-message",
+        )]),
+    );
+    previous_around.id = "previous-around-call-message".to_string();
+    current.add_message(previous_around);
+    let mut previous_around_result = Message::tool_result(
+        "previous-around",
+        json!({"turns":[{"content":query}]}).to_string(),
+    );
+    previous_around_result.id = "previous-around-result-message".to_string();
+    current.add_message(previous_around_result);
     let mut current_request = Message::user(format!("Please look up {query} in prior history"));
     current_request.id = "current-user-request-message".to_string();
     current.add_message(current_request);
@@ -128,7 +154,7 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
     );
 
     assert_eq!(result["session_id"], current.id);
-    assert_eq!(result["searched_before_message_index"], 6);
+    assert_eq!(result["searched_before_message_index"], 8);
     assert_eq!(result["match_count"], 1);
     assert_eq!(
         result["matches"][0]["id"],
@@ -146,6 +172,9 @@ async fn search_current_is_self_scoped_reads_compressed_history_and_never_mutate
         .to_string()
         .contains("previous-search-result-message"));
     assert!(!result.to_string().contains("previous-read-result-message"));
+    assert!(!result
+        .to_string()
+        .contains("previous-around-result-message"));
     assert!(!result.to_string().contains("current-search-call-message"));
     assert!(!result.to_string().contains("current-user-request-message"));
 
@@ -401,7 +430,7 @@ async fn self_only_schema_and_invoke_fail_closed_while_full_surface_keeps_root_a
     let self_schema = self_only.parameters_schema();
     assert_eq!(
         self_schema["properties"]["action"]["enum"],
-        json!(["search_current", "read_current"])
+        json!(["search_current", "read_current", "read_around"])
     );
     assert!(self_schema["properties"].get("session_id").is_none());
     assert_eq!(self_schema["additionalProperties"], false);
@@ -435,6 +464,7 @@ async fn self_only_schema_and_invoke_fail_closed_while_full_surface_keeps_root_a
         .clone();
     assert!(actions.contains(&json!("search_current")));
     assert!(actions.contains(&json!("read_current")));
+    assert!(actions.contains(&json!("read_around")));
     assert!(actions.contains(&json!("list")));
     assert!(actions.contains(&json!("read_messages")));
     assert!(actions.contains(&json!("export_context")));

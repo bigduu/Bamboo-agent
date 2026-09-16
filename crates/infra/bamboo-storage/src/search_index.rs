@@ -947,7 +947,7 @@ pub fn session_message_content_matches(content: &str, query: &str) -> bool {
 /// treating them as conversation evidence.
 ///
 /// The persisted column retains its v5 compatibility name
-/// `history_search_artifact`, but it covers both bounded self-history actions.
+/// `history_search_artifact`, but it covers every self-history retrieval action.
 pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String> {
     let mut call_ids = HashSet::new();
     let mut message_ids = HashSet::new();
@@ -962,7 +962,7 @@ pub fn session_history_search_artifact_ids(session: &Session) -> HashSet<String>
                         .is_some_and(|arguments| {
                             matches!(
                                 arguments.get("action").and_then(serde_json::Value::as_str),
-                                Some("search_current" | "read_current")
+                                Some("search_current" | "read_current" | "read_around")
                             )
                         });
                 if is_history_retrieval {
@@ -1449,12 +1449,13 @@ mod tests {
     }
 
     #[test]
-    fn self_history_artifacts_cover_search_and_bounded_pagination_actions() {
+    fn self_history_artifacts_cover_all_current_retrieval_actions() {
         let mut session = Session::new("history-artifacts", "test-model");
         let mut expected = HashSet::new();
         for (index, (tool_name, action)) in [
             ("session_history", "search_current"),
             ("session_history", "read_current"),
+            ("session_history", "read_around"),
             ("recall", "read_current"),
         ]
         .into_iter()

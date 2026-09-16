@@ -567,7 +567,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 _ => "session_history",
             },
             ToolCategory::FileReading,
-            "Search your current Bamboo Session with search_current, then page exact bounded evidence with read_current, including history already compressed out of the model window. The host preserves complete logical turns and tool-call/result chains. Root schemas may additionally offer list/get_meta, privileged bounded reads, global search, and same-tree export_context. When export_context is present, Read its returned status/brief paths with bounded offset/limit and keep the returned revision fixed across continuation reads; exports are last persisted observations, not verified live progress. Raw Session history is transcript authority; memory is selective durable knowledge and may be stale.",
+            "Search your current Bamboo Session with search_current, then recover the hit's complete turn and nearby context with read_around or page exact bounded evidence with read_current, including history already compressed out of the model window. The host preserves complete logical turns and tool-call/result chains. Root schemas may additionally offer list/get_meta, privileged bounded reads, global search, and same-tree export_context. When export_context is present, Read its returned status/brief paths with bounded offset/limit and keep the returned revision fixed across continuation reads; exports are last persisted observations, not verified live progress. Raw Session history is transcript authority; memory is selective durable knowledge and may be stale.",
             "Do not pass a Session ID, boundary, or compressed-state mutation to current-Session actions: the host derives identity and the current-call boundary. Treat cursors only as opaque continuations and reuse them unchanged. Do not use history as a broad substitute for code search. Privileged cross-session actions exist only when the supplied schema lists them, and export quota/corruption errors do not authorize deleting snapshots.",
             &["session_note", "Read", "Task"],
             vec![
@@ -580,6 +580,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                     "Page older exact turns",
                     json!({"action":"read_current","direction":"backward","limit":10,"max_chars":12000,"archived_only":true}),
                     "Follow next_cursor unchanged when more bounded turns remain.",
+                ),
+                example(
+                    "Recover a search hit in context",
+                    json!({"action":"read_around","message_id":"message-id-from-search","before_turns":1,"after_turns":1,"max_chars":12000}),
+                    "The anchor and returned neighbors are complete logical turns; unavailable anchors do not reveal why they were excluded.",
                 ),
             ],
         )),
