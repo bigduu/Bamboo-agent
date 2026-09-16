@@ -73,6 +73,8 @@ pub struct RetrievalWindowCandidatePlan {
     pub target_tokens: u32,
     /// Requested target percentage retained for observability.
     pub target_usage_percent: u8,
+    /// Configured minimum number of newest user turns that must remain active.
+    pub min_recent_user_turns: usize,
     /// Provider-visible prompt/tool tokens outside `Session.messages`.
     pub fixed_prompt_tokens: u32,
     /// Tokens contributed by active system messages.
@@ -438,6 +440,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         request_input_limit_tokens: budget.max_request_input_tokens(),
         target_tokens,
         target_usage_percent: policy.target_usage_percent,
+        min_recent_user_turns: policy.min_recent_user_turns,
         fixed_prompt_tokens: accounting.fixed_prompt_tokens,
         system_message_tokens: system_tokens,
         provider_message_token_override_count: system_messages
@@ -474,11 +477,13 @@ struct ValidatedRetrievalWindowUsage {
 /// it never creates a summary or recovery message and performs every fallible
 /// validation before mutating the session. `current_budget` and
 /// `current_accounting` must describe the provider request that will follow the
-/// commit. The function binds those prepared inputs without rerunning provider
-/// transforms or attachment I/O.
+/// commit. `current_policy` must be the live strategy snapshot that will govern
+/// the following request. The function binds those inputs without rerunning
+/// provider transforms or attachment I/O.
 pub fn apply_retrieval_window_plan(
     session: &mut Session,
     plan: &RetrievalWindowCandidatePlan,
+    current_policy: RetrievalWindowPolicy,
     current_budget: &TokenBudget,
     current_accounting: &RetrievalWindowTokenAccounting,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
@@ -486,6 +491,7 @@ pub fn apply_retrieval_window_plan(
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
     }
+    validate_current_policy(plan, current_policy)?;
     validate_current_token_budget(plan, current_budget)?;
     validate_current_token_accounting(plan, current_accounting)?;
 
@@ -558,6 +564,7 @@ pub fn apply_retrieval_window_plan(
     event.retrieval_system_message_tokens = plan.system_message_tokens;
     event.retrieval_context_window_tokens = plan.context_window_tokens;
     event.retrieval_request_input_limit_tokens = plan.request_input_limit_tokens;
+    event.retrieval_min_recent_user_turns = plan.min_recent_user_turns;
     event.retrieval_retained_recent_user_turn_count = plan.retained_recent_user_turn_count;
     event.retrieval_retained_user_turn_count = plan.retained_user_turn_count;
     event
@@ -630,6 +637,11 @@ fn validate_apply_plan_arithmetic(
     if !(1..=100).contains(&plan.target_usage_percent) {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_usage_percent",
+        });
+    }
+    if plan.min_recent_user_turns == 0 {
+        return Err(RetrievalWindowApplyError::InconsistentPlan {
+            field: "min_recent_user_turns",
         });
     }
     if plan.context_window_tokens == 0
@@ -844,6 +856,20 @@ fn validate_current_token_accounting(
     Ok(())
 }
 
+fn validate_current_policy(
+    plan: &RetrievalWindowCandidatePlan,
+    current_policy: RetrievalWindowPolicy,
+) -> Result<(), RetrievalWindowApplyError> {
+    if current_policy.min_recent_user_turns != plan.min_recent_user_turns
+        || current_policy.target_usage_percent != plan.target_usage_percent
+    {
+        return Err(RetrievalWindowApplyError::StalePlan {
+            invariant: "retrieval_window_policy",
+        });
+    }
+    Ok(())
+}
+
 fn validate_current_token_budget(
     plan: &RetrievalWindowCandidatePlan,
     current_budget: &TokenBudget,
@@ -887,14 +913,14 @@ fn validate_active_plan_structure(
         .iter()
         .filter(|group| group.user_message_id.is_some())
         .count();
-    if (total_user_turn_count > 0 && plan.retained_recent_user_turn_count == 0)
-        || plan.retained_recent_user_turn_count > total_user_turn_count
-    {
+    let expected_retained_recent_user_turn_count =
+        total_user_turn_count.min(plan.min_recent_user_turns);
+    if plan.retained_recent_user_turn_count != expected_retained_recent_user_turn_count {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "retained_recent_user_turn_count",
         });
     }
-    mark_protected_groups(&mut groups, plan.retained_recent_user_turn_count);
+    mark_protected_groups(&mut groups, plan.min_recent_user_turns);
 
     let mut selected_group_indexes = Vec::new();
     for (group_index, group) in groups.iter().enumerate() {
@@ -1211,6 +1237,11 @@ fn validate_idempotent_replay(
         event.retrieval_request_input_limit_tokens,
         plan.request_input_limit_tokens,
         "retrieval_request_input_limit_tokens"
+    );
+    require_event_evidence!(
+        event.retrieval_min_recent_user_turns,
+        plan.min_recent_user_turns,
+        "retrieval_min_recent_user_turns"
     );
     require_event_evidence!(
         event.retrieval_retained_recent_user_turn_count,
@@ -1662,11 +1693,24 @@ mod tests {
         }
     }
 
+    fn policy_for_plan(plan: &RetrievalWindowCandidatePlan) -> RetrievalWindowPolicy {
+        RetrievalWindowPolicy {
+            min_recent_user_turns: plan.min_recent_user_turns,
+            target_usage_percent: plan.target_usage_percent,
+        }
+    }
+
     fn apply_test_plan(
         session: &mut Session,
         plan: &RetrievalWindowCandidatePlan,
     ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
-        apply_retrieval_window_plan(session, plan, &budget(100), &accounting_for_plan(plan))
+        apply_retrieval_window_plan(
+            session,
+            plan,
+            policy_for_plan(plan),
+            &budget(100),
+            &accounting_for_plan(plan),
+        )
     }
 
     fn assert_apply_error_without_mutation(
@@ -1743,6 +1787,7 @@ mod tests {
         assert_eq!(first.projected_active_tokens_after, 50);
         assert_eq!(first.context_window_tokens, 100);
         assert_eq!(first.request_input_limit_tokens, 100);
+        assert_eq!(first.min_recent_user_turns, 2);
         assert_eq!(first.fixed_prompt_tokens, 5);
         assert_eq!(first.system_message_tokens, 5);
         assert_eq!(first.protected_active_tokens, 45);
@@ -2149,6 +2194,7 @@ mod tests {
         assert_eq!(event.retrieval_system_message_tokens, 5);
         assert_eq!(event.retrieval_context_window_tokens, 100);
         assert_eq!(event.retrieval_request_input_limit_tokens, 100);
+        assert_eq!(event.retrieval_min_recent_user_turns, 2);
 
         let archived_ids = plan
             .message_ids_to_archive
@@ -2490,7 +2536,13 @@ mod tests {
             .provider_message_tokens
             .insert("t1-u".to_string(), 11);
         assert_eq!(
-            apply_retrieval_window_plan(&mut session, &plan, &budget(100), &changed_override),
+            apply_retrieval_window_plan(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &changed_override,
+            ),
             Err(RetrievalWindowApplyError::StalePlan {
                 invariant: "token_accounting_sha256",
             })
@@ -2503,7 +2555,13 @@ mod tests {
         let mut changed_fixed = accounting;
         changed_fixed.fixed_prompt_tokens += 1;
         assert_eq!(
-            apply_retrieval_window_plan(&mut session, &plan, &budget(100), &changed_fixed),
+            apply_retrieval_window_plan(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &changed_fixed,
+            ),
             Err(RetrievalWindowApplyError::StalePlan {
                 invariant: "token_accounting_sha256",
             })
@@ -2512,6 +2570,42 @@ mod tests {
             serde_json::to_vec(&session).expect("session should serialize"),
             before
         );
+    }
+
+    #[test]
+    fn changed_retrieval_window_policy_fails_before_mutation() {
+        let (mut session, plan) = basic_session_and_plan();
+        let accounting = accounting_for_plan(&plan);
+        let before = serde_json::to_vec(&session).expect("session should serialize");
+        let changed_policies = [
+            RetrievalWindowPolicy {
+                min_recent_user_turns: plan.min_recent_user_turns + 1,
+                target_usage_percent: plan.target_usage_percent,
+            },
+            RetrievalWindowPolicy {
+                min_recent_user_turns: plan.min_recent_user_turns,
+                target_usage_percent: plan.target_usage_percent - 1,
+            },
+        ];
+
+        for current_policy in changed_policies {
+            assert_eq!(
+                apply_retrieval_window_plan(
+                    &mut session,
+                    &plan,
+                    current_policy,
+                    &budget(100),
+                    &accounting,
+                ),
+                Err(RetrievalWindowApplyError::StalePlan {
+                    invariant: "retrieval_window_policy",
+                })
+            );
+            assert_eq!(
+                serde_json::to_vec(&session).expect("session should serialize"),
+                before
+            );
+        }
     }
 
     #[test]
@@ -2528,7 +2622,13 @@ mod tests {
 
         for current_budget in [smaller_context, larger_output_reserve, larger_safety_margin] {
             assert_eq!(
-                apply_retrieval_window_plan(&mut session, &plan, &current_budget, &accounting),
+                apply_retrieval_window_plan(
+                    &mut session,
+                    &plan,
+                    policy_for_plan(&plan),
+                    &current_budget,
+                    &accounting,
+                ),
                 Err(RetrievalWindowApplyError::StalePlan {
                     invariant: "token_budget",
                 })

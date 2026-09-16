@@ -1844,7 +1844,7 @@ mod tests {
             },
         }]);
         session.add_message(call);
-        let mut result = Message::tool_result("tc-gen", &"search result payload ".repeat(20));
+        let mut result = Message::tool_result("tc-gen", "search result payload ".repeat(20));
         result.tool_success = Some(true);
         session.add_message(result);
 

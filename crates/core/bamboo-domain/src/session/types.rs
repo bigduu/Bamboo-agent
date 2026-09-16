@@ -568,6 +568,11 @@ pub struct CompressionEvent {
     pub retrieval_context_window_tokens: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retrieval_request_input_limit_tokens: u32,
+    /// Configured recent-turn floor accepted by the retrieval-window planner.
+    /// This remains distinct from the actual retained count when the Session
+    /// contains fewer user turns than the configured floor.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub retrieval_min_recent_user_turns: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub retrieval_retained_recent_user_turn_count: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -634,6 +639,7 @@ impl CompressionEvent {
             retrieval_system_message_tokens: 0,
             retrieval_context_window_tokens: 0,
             retrieval_request_input_limit_tokens: 0,
+            retrieval_min_recent_user_turns: 0,
             retrieval_retained_recent_user_turn_count: 0,
             retrieval_retained_user_turn_count: 0,
             retrieval_oldest_retained_message_id: None,
@@ -1791,6 +1797,7 @@ mod tests {
         assert_eq!(event.latency_ms, 0); // default
         assert_eq!(event.retrieval_active_tokens_before, 0);
         assert_eq!(event.retrieval_request_input_limit_tokens, 0);
+        assert_eq!(event.retrieval_min_recent_user_turns, 0);
         assert!(event.retrieval_active_state_sha256.is_none());
         assert!(event.retrieval_token_accounting_sha256.is_none());
         assert!(event.retrieval_oldest_retained_message_id.is_none());
@@ -1825,6 +1832,7 @@ mod tests {
         event.retrieval_system_message_tokens = 100;
         event.retrieval_context_window_tokens = 1_280;
         event.retrieval_request_input_limit_tokens = 1_024;
+        event.retrieval_min_recent_user_turns = 3;
         event.retrieval_retained_recent_user_turn_count = 1;
         event.retrieval_retained_user_turn_count = 1;
         event.retrieval_oldest_retained_message_id = Some("user-3".to_string());
@@ -1857,6 +1865,7 @@ mod tests {
         assert_eq!(back.retrieval_system_message_tokens, 100);
         assert_eq!(back.retrieval_context_window_tokens, 1_280);
         assert_eq!(back.retrieval_request_input_limit_tokens, 1_024);
+        assert_eq!(back.retrieval_min_recent_user_turns, 3);
         assert_eq!(back.retrieval_retained_recent_user_turn_count, 1);
         assert_eq!(back.retrieval_retained_user_turn_count, 1);
         assert_eq!(
