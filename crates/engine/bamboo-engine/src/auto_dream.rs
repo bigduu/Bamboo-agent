@@ -64,7 +64,7 @@ const EXTRACTION_CHECKPOINT_VERSION: u32 = 2;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v2";
 const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 2;
 const HISTORY_REWRITE_STATE_VERSION: u32 = 1;
-const HISTORY_REWRITE_PLAN_VERSION: u32 = 2;
+const HISTORY_REWRITE_PLAN_VERSION: u32 = 3;
 const HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS: usize = 64;
 const AUTO_DREAM_MEMORY_ACTOR: &str = "background-fast-model";
 const GARDENER_MEMORY_ACTORS: [&str; 2] = ["memory-gardener", "memory-dedup-gardener"];
@@ -867,23 +867,28 @@ async fn collect_candidate_sessions(
 async fn resolve_session_project_id(
     ctx: &AutoDreamContext,
     session_id: &str,
-) -> Option<bamboo_domain::ProjectId> {
+) -> Result<Option<bamboo_domain::ProjectId>, String> {
     ctx.storage
         .load_session(session_id)
         .await
-        .ok()
-        .flatten()
-        .and_then(|session| ProjectContextResolver::memory_read_identity_for_session(&session))
+        .map_err(|error| {
+            format!("failed to load candidate Project Session '{session_id}': {error}")
+        })
+        .map(|session| {
+            session.and_then(|session| {
+                ProjectContextResolver::memory_read_identity_for_session(&session)
+            })
+        })
 }
 
 async fn collect_candidate_sessions_for_project(
     ctx: &AutoDreamContext,
     project_key: &str,
     since: DateTime<Utc>,
-) -> Vec<(SessionIndexEntry, Option<String>)> {
+) -> Result<Vec<(SessionIndexEntry, Option<String>)>, String> {
     let mut out = Vec::new();
     for (entry, summary) in collect_candidate_sessions(ctx, since).await {
-        let Some(project_id) = resolve_session_project_id(ctx, &entry.id).await else {
+        let Some(project_id) = resolve_session_project_id(ctx, &entry.id).await? else {
             continue;
         };
         if project_id.as_str() != project_key {
@@ -894,14 +899,14 @@ async fn collect_candidate_sessions_for_project(
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 async fn collect_candidate_session_contexts_from_sessions(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
-) -> Vec<CandidateSessionContext> {
+) -> Result<Vec<CandidateSessionContext>, String> {
     let mut out = Vec::new();
     for (entry, _) in sessions {
         let extraction_watermark = match memory.read_session_state(&entry.id).await {
@@ -924,13 +929,10 @@ async fn collect_candidate_session_contexts_from_sessions(
             Ok(Some(session)) => session,
             Ok(None) => continue,
             Err(error) => {
-                tracing::warn!(
-                    target: DREAM_TRACING_TARGET,
-                    event = "session_extraction_source_load_failed",
-                    session_id = %entry.id,
-                    "Could not load the canonical Session after reading its Jiandu extraction watermark; keeping the source retryable: {error}"
-                );
-                continue;
+                return Err(format!(
+                    "failed to load canonical AutoDream extraction Session '{}': {error}",
+                    entry.id
+                ));
             }
         };
         let is_retrieval_window = session
@@ -1059,7 +1061,7 @@ async fn collect_candidate_session_contexts_from_sessions(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn sanitized_session_topics(topics: Vec<(String, String)>) -> Vec<(String, String)> {
@@ -1090,6 +1092,7 @@ async fn collect_candidate_session_contexts(
         collect_candidate_sessions(ctx, since).await,
     )
     .await
+    .expect("test candidate Sessions should load")
 }
 
 /// Counts of records persisted from one extraction response: durable memory
@@ -1166,6 +1169,10 @@ struct HistoryRewritePlan {
     history_revision: String,
     source_updated_at: String,
     replacement_targets: Vec<MemoryReplacementTarget>,
+    /// Exact non-Session lineage branches that must become active again before
+    /// a mixed gardener descendant can be superseded safely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memory_reactivation_targets: Vec<MemoryReplacementTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     preservation_session_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1749,6 +1756,20 @@ async fn read_history_rewrite_plan(
                     && target.project_key.as_deref().is_none_or(str::is_empty))
                 || (target.scope != MemoryScope::Project && target.project_key.is_some())
         })
+        || plan
+            .memory_reactivation_targets
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != plan.memory_reactivation_targets.len()
+        || plan.memory_reactivation_targets.iter().any(|target| {
+            target.id.trim().is_empty()
+                || target.scope == MemoryScope::Session
+                || (target.scope == MemoryScope::Project
+                    && target.project_key.as_deref().is_none_or(str::is_empty))
+                || (target.scope != MemoryScope::Project && target.project_key.is_some())
+                || plan.replacement_targets.contains(target)
+        })
         || plan.ledger_replacement_targets.iter().any(|target| {
             target.id.trim().is_empty()
                 || (target.scope == LedgerScope::Project
@@ -1825,9 +1846,58 @@ fn collect_memory_lineage_session_sources<'a>(
     sources
 }
 
+fn collect_memory_lineage_preservation_targets<'a>(
+    document: &'a DurableMemoryDocument,
+    documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
+    rewritten_session_id: &str,
+    visited: &mut HashSet<&'a str>,
+    preservation_session_ids: &mut HashSet<String>,
+    memory_reactivation_targets: &mut HashSet<MemoryReplacementTarget>,
+) {
+    if !visited.insert(document.frontmatter.id.as_str()) {
+        return;
+    }
+    for ancestor in document
+        .frontmatter
+        .relations
+        .supersedes
+        .iter()
+        .filter_map(|id| documents_by_id.get(id.as_str()).copied())
+    {
+        let lineage_session_ids =
+            collect_memory_lineage_session_sources(ancestor, documents_by_id, &mut HashSet::new());
+        preservation_session_ids.extend(
+            lineage_session_ids
+                .iter()
+                .filter(|source_id| source_id.as_str() != rewritten_session_id)
+                .cloned(),
+        );
+        if lineage_session_ids.is_empty() {
+            // A manual/API lineage branch has no canonical Session to replay.
+            // Preserve its exact already-sanitized durable document instead of
+            // asking the extraction model to reconstruct content it never saw.
+            memory_reactivation_targets.insert(MemoryReplacementTarget {
+                id: ancestor.frontmatter.id.clone(),
+                scope: ancestor.frontmatter.scope,
+                project_key: ancestor.frontmatter.project_key.clone(),
+            });
+            continue;
+        }
+        collect_memory_lineage_preservation_targets(
+            ancestor,
+            documents_by_id,
+            rewritten_session_id,
+            visited,
+            preservation_session_ids,
+            memory_reactivation_targets,
+        );
+    }
+}
+
 #[derive(Debug)]
 struct HistoryRewriteMemoryTargets {
     replacement_targets: Vec<MemoryReplacementTarget>,
+    memory_reactivation_targets: Vec<MemoryReplacementTarget>,
     preservation_session_ids: Vec<String>,
 }
 
@@ -1867,6 +1937,7 @@ async fn collect_history_rewrite_replacement_targets(
 
     let mut targets = HashSet::new();
     let mut preservation_session_ids = HashSet::new();
+    let mut memory_reactivation_targets = HashSet::new();
     for (store, scope, project_key) in scopes {
         let documents = store
             .list_memory_documents(scope, project_key.as_deref())
@@ -1898,10 +1969,16 @@ async fn collect_history_rewrite_replacement_targets(
                     project_key: document.frontmatter.project_key.clone(),
                 });
                 if is_gardener_descendant {
-                    preservation_session_ids.extend(
-                        lineage_session_ids
-                            .into_iter()
-                            .filter(|source_id| source_id != &session.session_id),
+                    preservation_session_ids.extend(lineage_session_ids.iter().filter_map(
+                        |source_id| (source_id != &session.session_id).then_some(source_id.clone()),
+                    ));
+                    collect_memory_lineage_preservation_targets(
+                        document,
+                        &documents_by_id,
+                        &session.session_id,
+                        &mut HashSet::new(),
+                        &mut preservation_session_ids,
+                        &mut memory_reactivation_targets,
                     );
                 }
             }
@@ -1924,8 +2001,18 @@ async fn collect_history_rewrite_replacement_targets(
             HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS
         ));
     }
+    let mut memory_reactivation_targets =
+        memory_reactivation_targets.into_iter().collect::<Vec<_>>();
+    memory_reactivation_targets.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.project_key.cmp(&right.project_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(HistoryRewriteMemoryTargets {
         replacement_targets: targets,
+        memory_reactivation_targets,
         preservation_session_ids,
     })
 }
@@ -1990,6 +2077,7 @@ async fn load_or_create_history_rewrite_plan(
         history_revision: history_revision.to_string(),
         source_updated_at: source_updated_at.to_string(),
         replacement_targets: memory_targets.replacement_targets,
+        memory_reactivation_targets: memory_targets.memory_reactivation_targets,
         preservation_session_ids: memory_targets.preservation_session_ids,
         ledger_replacement_targets,
     };
@@ -2083,26 +2171,56 @@ async fn build_history_rewrite_preservation_contexts(
     Ok(contexts)
 }
 
+fn history_rewrite_target_store(
+    ctx: &AutoDreamContext,
+    target: &MemoryReplacementTarget,
+) -> Result<MemoryStore, String> {
+    match target.scope {
+        MemoryScope::Global => Ok(ctx.memory.clone()),
+        MemoryScope::Project => {
+            let project_key = target.project_key.as_deref().ok_or_else(|| {
+                "history-rewrite Project target is missing project identity".to_string()
+            })?;
+            let project_id = bamboo_domain::ProjectId::parse(project_key.to_string())
+                .map_err(|error| format!("invalid replacement Project identity: {error}"))?;
+            Ok(ctx.memory.for_project(&project_id))
+        }
+        MemoryScope::Session => {
+            Err("history-rewrite plan unexpectedly contains Session memory".to_string())
+        }
+    }
+}
+
 async fn supersede_history_rewrite_targets(
     ctx: &AutoDreamContext,
     ledger: &LedgerStore,
     plan: &HistoryRewritePlan,
 ) -> Result<(), String> {
+    for target in &plan.memory_reactivation_targets {
+        let store = history_rewrite_target_store(ctx, target)?;
+        let restored = store
+            .archive_memory(
+                &target.id,
+                target.project_key.as_deref(),
+                DurableMemoryStatus::Active,
+                Some("reactivated while replacing a mixed-lineage gardener memory"),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to reactivate preserved memory '{}' after history rewrite: {error}",
+                    target.id
+                )
+            })?;
+        if restored.is_none() {
+            return Err(format!(
+                "preserved memory '{}' disappeared before history rewrite completion",
+                target.id
+            ));
+        }
+    }
     for target in &plan.replacement_targets {
-        let store = match target.scope {
-            MemoryScope::Global => ctx.memory.clone(),
-            MemoryScope::Project => {
-                let project_key = target.project_key.as_deref().ok_or_else(|| {
-                    "history-rewrite Project target is missing project identity".to_string()
-                })?;
-                let project_id = bamboo_domain::ProjectId::parse(project_key.to_string())
-                    .map_err(|error| format!("invalid replacement Project identity: {error}"))?;
-                ctx.memory.for_project(&project_id)
-            }
-            MemoryScope::Session => {
-                return Err("history-rewrite plan unexpectedly contains Session memory".to_string())
-            }
-        };
+        let store = history_rewrite_target_store(ctx, target)?;
         store
             .archive_memory(
                 &target.id,
@@ -3713,7 +3831,7 @@ async fn run_auto_dream_once_for_scope(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
-            collect_candidate_sessions_for_project(ctx, project_key, since).await
+            collect_candidate_sessions_for_project(ctx, project_key, since).await?
         }
         MemoryScope::Session => {
             return Err("session-scoped Dream generation is not supported".to_string())
@@ -3798,7 +3916,7 @@ async fn run_auto_dream_once_for_scope(
     // sessions marked extracted. Dream synthesis must observe this completed
     // canonical state, never the pre-extraction MEMORY view.
     let extraction_sessions =
-        collect_candidate_session_contexts_from_sessions(ctx, memory, sessions.clone()).await;
+        collect_candidate_session_contexts_from_sessions(ctx, memory, sessions.clone()).await?;
     let ledger = ledger_store_for_context(ctx);
     let extraction_writes = extract_and_persist_durable_candidates_with_project_resolver(
         ctx,
@@ -4014,7 +4132,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -4232,6 +4350,32 @@ mod tests {
                 .await
                 .expect("create test blocker");
             Ok(stream)
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToggleLoadStorage {
+        inner: Arc<dyn Storage>,
+        fail_loads: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Storage for ToggleLoadStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+
+        async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
+            if self.fail_loads.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other(format!(
+                    "injected load failure for {session_id}"
+                )));
+            }
+            self.inner.load_session(session_id).await
+        }
+
+        async fn delete_session(&self, session_id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(session_id).await
         }
     }
 
@@ -5666,19 +5810,39 @@ mod tests {
             )
             .await
             .expect("seed region memory");
+        let manual_memory = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Deployment runbook",
+                "The manual rollback runbook remains authoritative.",
+                &["runbook".to_string()],
+                None,
+                "user",
+                false,
+                None,
+            )
+            .await
+            .expect("seed manual memory without a Session source");
         let consolidated = memory
             .consolidate_memories(
                 &[
                     database_memory.frontmatter.id.clone(),
                     region_memory.frontmatter.id.clone(),
+                    manual_memory.frontmatter.id.clone(),
                 ],
                 None,
                 &bamboo_memory::memory_store::MemorySplitPiece {
                     title: "Deployment database and region".to_string(),
                     r#type: Some(DurableMemoryType::Project),
-                    content: "The database is PostgreSQL and the deployment region is eu-west-1."
+                    content: "The database is PostgreSQL, the deployment region is eu-west-1, and the manual rollback runbook remains authoritative."
                         .to_string(),
-                    tags: vec!["database".to_string(), "region".to_string()],
+                    tags: vec![
+                        "database".to_string(),
+                        "region".to_string(),
+                        "runbook".to_string(),
+                    ],
                 },
                 Some("__memory_gardener__"),
                 "memory-dedup-gardener",
@@ -5787,7 +5951,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(active_bodies.contains(&"The database is SQLite."));
         assert!(active_bodies.contains(&"The deployment region is eu-west-1."));
+        assert!(active_bodies.contains(&"The manual rollback runbook remains authoritative."));
         assert!(!active_bodies.iter().any(|body| body.contains("PostgreSQL")));
+        let manual_memory = documents
+            .iter()
+            .find(|document| document.frontmatter.id == manual_memory.frontmatter.id)
+            .expect("manual ancestor remains auditable");
+        assert_eq!(
+            manual_memory.frontmatter.status,
+            DurableMemoryStatus::Active
+        );
 
         let region_state = memory
             .read_session_state(&region_session.id)
@@ -8127,6 +8300,84 @@ Model: gpt-5-mini
             1,
             "the durable extraction must not repeat when only Dream publication retries"
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_session_load_failure_aborts_dream_cursor_and_remains_retryable() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let canonical_storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("dream-load-retry", "model");
+        session.title = "Dream load retry".to_string();
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "A durable fact must survive a transient Session read failure.",
+            2,
+            80,
+        ));
+        session.add_message(Message::user("Remember the retry boundary."));
+        canonical_storage
+            .save_session(&session)
+            .await
+            .expect("save candidate Session");
+
+        let fail_loads = Arc::new(AtomicBool::new(true));
+        let storage: Arc<dyn Storage> = Arc::new(ToggleLoadStorage {
+            inner: canonical_storage,
+            fail_loads: fail_loads.clone(),
+        });
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![
+            serde_json::json!({
+                "candidates": [],
+                "ledger_candidates": [],
+                "source_exhausted": true
+            })
+            .to_string(),
+            "## Current durable context\n- Retry completed\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- Preserve failed candidates\n\n## Open risks or questions\n- None".to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider,
+            config: Arc::new(RwLock::new(config_with_memory(
+                bamboo_config::MemoryConfig {
+                    background_model: Some("fast-model".to_string()),
+                    auto_dream_enabled: true,
+                    ..bamboo_config::MemoryConfig::default()
+                },
+            ))),
+            provider_registry: test_registry(),
+        };
+
+        let error = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect_err("a candidate Session read failure must abort the whole Dream run");
+        assert!(
+            error.contains("failed to load canonical AutoDream extraction Session"),
+            "{error}"
+        );
+        assert!(sequence_provider.recorded_prompts().is_empty());
+        assert!(
+            read_test_dream(&memory, MemoryScope::Global, None)
+                .await
+                .is_none(),
+            "a failed candidate read must not publish a later consolidation cursor"
+        );
+
+        fail_loads.store(false, Ordering::SeqCst);
+        let result = run_auto_dream_once_with_store(&context, &memory)
+            .await
+            .expect("the unchanged candidate remains retryable")
+            .expect("the retry publishes Dream");
+        assert_eq!(result.session_count, 1);
+        assert_eq!(sequence_provider.recorded_prompts().len(), 2);
     }
 
     #[tokio::test]
