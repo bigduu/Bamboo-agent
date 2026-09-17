@@ -1,4 +1,5 @@
 use actix_web::{web, HttpResponse, Result};
+use chrono::Utc;
 
 use super::shared::{
     clear_derived_context_state, ensure_session_not_running, load_session_or_404,
@@ -63,6 +64,7 @@ pub async fn patch_message(
     }
 
     message.content = content;
+    message.mark_content_updated_at(Utc::now());
 
     // Editing history invalidates derived context state.
     clear_derived_context_state(&mut session);
@@ -85,6 +87,7 @@ mod tests {
 
     use crate::routes::configure_routes;
     use crate::AppState;
+    use bamboo_agent_core::{Message, Session};
 
     async fn new_state() -> web::Data<AppState> {
         let temp_dir = tempdir().expect("tempdir");
@@ -149,5 +152,55 @@ mod tests {
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["error"]["type"], "api_error");
         assert_eq!(body["error"]["message"], "content must not be empty");
+    }
+
+    #[actix_web::test]
+    async fn patch_message_persists_content_revision_without_rewriting_creation_time() {
+        let state = new_state().await;
+        let mut session = Session::new("edited-session", "model");
+        let message = Message::assistant("before", None);
+        let message_id = message.id.clone();
+        let created_at = message.created_at;
+        session.messages.push(message);
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("seed Session");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!(
+                    "/api/v1/sessions/edited-session/messages/{message_id}"
+                ))
+                .set_json(serde_json::json!({ "content": "after" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = state
+            .storage
+            .load_session("edited-session")
+            .await
+            .expect("load Session")
+            .expect("saved Session");
+        let edited = saved
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .expect("edited Message");
+        assert_eq!(edited.content, "after");
+        assert_eq!(edited.created_at, created_at);
+        assert!(edited
+            .content_updated_at()
+            .is_some_and(|updated_at| updated_at >= created_at));
     }
 }

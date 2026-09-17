@@ -144,6 +144,42 @@ fn is_zero_usize(value: &usize) -> bool {
 }
 
 impl Message {
+    const CONTENT_UPDATED_AT_METADATA_KEY: &'static str = "content_updated_at";
+
+    /// Timestamp of the latest explicit content edit, when one has occurred.
+    ///
+    /// This lives in the existing additive metadata object so historical
+    /// Message JSON and downstream struct literals remain compatible. It is
+    /// distinct from `created_at`: editing an old turn must not rewrite its
+    /// original position in the conversation.
+    pub fn content_updated_at(&self) -> Option<DateTime<Utc>> {
+        self.metadata
+            .as_ref()?
+            .as_object()?
+            .get(Self::CONTENT_UPDATED_AT_METADATA_KEY)?
+            .as_str()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+    }
+
+    /// Record an authoritative explicit content edit without disturbing other
+    /// structured Message metadata.
+    pub fn mark_content_updated_at(&mut self, updated_at: DateTime<Utc>) {
+        let metadata = self
+            .metadata
+            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !metadata.is_object() {
+            *metadata = serde_json::Value::Object(serde_json::Map::new());
+        }
+        metadata
+            .as_object_mut()
+            .expect("Message metadata was normalized to an object")
+            .insert(
+                Self::CONTENT_UPDATED_AT_METADATA_KEY.to_string(),
+                serde_json::Value::String(updated_at.to_rfc3339()),
+            );
+    }
+
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -1655,6 +1691,22 @@ mod tests {
             !json.contains("never_compress"),
             "false should be omitted: {json}"
         );
+    }
+
+    #[test]
+    fn message_content_revision_timestamp_is_additive_and_round_trips() {
+        let mut message = Message::assistant("corrected", None);
+        let original_created_at = message.created_at;
+        let updated_at = original_created_at + chrono::Duration::seconds(5);
+        message.mark_content_updated_at(updated_at);
+
+        assert_eq!(message.created_at, original_created_at);
+        assert_eq!(message.content_updated_at(), Some(updated_at));
+        let json = serde_json::to_string(&message).expect("serialize Message");
+        assert!(json.contains("content_updated_at"));
+        let restored: Message = serde_json::from_str(&json).expect("deserialize Message");
+        assert_eq!(restored.created_at, original_created_at);
+        assert_eq!(restored.content_updated_at(), Some(updated_at));
     }
 
     #[test]

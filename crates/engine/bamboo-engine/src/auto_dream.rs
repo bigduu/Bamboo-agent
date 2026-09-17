@@ -152,7 +152,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp|key))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -271,7 +271,18 @@ fn session_extraction_sources(
     retrieval_source_acknowledged: bool,
 ) -> Vec<Option<String>> {
     if let Some(summary) = session.conversation_summary.as_ref() {
-        return vec![Some(sanitize_extraction_source(&summary.content))];
+        let summary = sanitize_extraction_source(&summary.content);
+        let mut sources = vec![Some(summary.clone())];
+        sources.extend(
+            build_message_revision_extraction_batches(
+                session,
+                extraction_watermark,
+                Some(&summary),
+            )
+            .into_iter()
+            .map(Some),
+        );
+        return sources;
     }
     if session
         .compression_events
@@ -289,7 +300,19 @@ fn session_extraction_sources(
             batches.into_iter().map(Some).collect()
         };
     }
-    vec![derive_session_outline(session).map(|outline| sanitize_extraction_source(&outline))]
+    let outline =
+        derive_session_outline(session).map(|outline| sanitize_extraction_source(&outline));
+    let mut sources = vec![outline.clone()];
+    sources.extend(
+        build_message_revision_extraction_batches(
+            session,
+            extraction_watermark,
+            outline.as_deref(),
+        )
+        .into_iter()
+        .map(Some),
+    );
+    sources
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +324,35 @@ struct RetrievalExtractionSourceItem {
     content_segment_ordinal: usize,
     content_segment_count: usize,
     content: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExtractionDeltaKind {
+    RetrievalWindow,
+    MessageRevision,
+}
+
+impl ExtractionDeltaKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::RetrievalWindow => "Retrieval-window",
+            Self::MessageRevision => "Message revision",
+        }
+    }
+
+    fn event_count_label(self) -> &'static str {
+        match self {
+            Self::RetrievalWindow => "eligible_retrieval_events",
+            Self::MessageRevision => "eligible_revision_events",
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::RetrievalWindow => "retrieval_delta",
+            Self::MessageRevision => "message_revision_delta",
+        }
+    }
 }
 
 fn split_retrieval_extraction_content(content: &str) -> Vec<String> {
@@ -360,6 +412,98 @@ fn render_retrieval_extraction_overlap(item: &RetrievalExtractionSourceItem) -> 
     )
 }
 
+fn render_extraction_source_batches(
+    source_items: Vec<RetrievalExtractionSourceItem>,
+    extraction_watermark: Option<DateTime<Utc>>,
+    eligible_event_count: usize,
+    eligible_message_count: usize,
+    kind: ExtractionDeltaKind,
+) -> Vec<String> {
+    if source_items.is_empty() {
+        return Vec::new();
+    }
+    let max_body_chars =
+        RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS);
+    let mut item_batches: Vec<Vec<(RetrievalExtractionSourceItem, String)>> = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_chars = 0usize;
+    for item in source_items {
+        let rendered = render_retrieval_extraction_item(&item);
+        let rendered_chars = rendered.chars().count();
+        debug_assert!(rendered_chars <= max_body_chars);
+        if !current_batch.is_empty()
+            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS
+                || current_chars.saturating_add(rendered_chars) > max_body_chars)
+        {
+            item_batches.push(std::mem::take(&mut current_batch));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(rendered_chars);
+        current_batch.push((item, rendered));
+    }
+    if !current_batch.is_empty() {
+        item_batches.push(current_batch);
+    }
+
+    let batch_count = item_batches.len();
+    let mut previous_tail = None;
+    item_batches
+        .into_iter()
+        .enumerate()
+        .map(|(batch_index, items)| {
+            let continuation_overlap = previous_tail
+                .as_ref()
+                .map(render_retrieval_extraction_overlap);
+            previous_tail = items.last().map(|(item, _)| item.clone());
+            let distinct_message_count = items
+                .iter()
+                .map(|(item, _)| item.session_message_ordinal)
+                .collect::<HashSet<_>>()
+                .len();
+            let mut rendered = format!("# {} extraction delta v1\n\n", kind.title());
+            rendered.push_str(&format!(
+                "- extraction_watermark: {}\n- batch: {}/{}\n- {}: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_source_items_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
+                extraction_watermark
+                    .map(|watermark| watermark.to_rfc3339())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                batch_index + 1,
+                batch_count,
+                kind.event_count_label(),
+                eligible_event_count,
+                eligible_message_count,
+                items.len(),
+                distinct_message_count,
+                usize::from(continuation_overlap.is_some()),
+                RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS,
+                RETRIEVAL_EXTRACTION_MAX_CHARS,
+                if batch_index + 1 < batch_count {
+                    "continues_in_next_batch"
+                } else {
+                    "final_batch"
+                },
+            ));
+            if let Some(overlap) = continuation_overlap {
+                rendered.push_str(&overlap);
+            }
+            rendered.push_str("\n## Source items (canonical Session order)\n");
+            for (_, item) in items {
+                rendered.push_str(&item);
+            }
+            rendered.push_str(&format!(
+                "\n[{}_{}]\n",
+                kind.marker(),
+                if batch_index + 1 < batch_count {
+                    "continues_in_next_batch"
+                } else {
+                    "final_batch"
+                }
+            ));
+            debug_assert!(rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
+            rendered
+        })
+        .collect()
+}
+
 fn session_note_tool_call_ids(session: &Session) -> HashSet<&str> {
     session
         .messages
@@ -416,6 +560,74 @@ fn sanitized_session_note_result(
     Some(serde_json::Value::Object(safe).to_string())
 }
 
+fn build_message_revision_extraction_batches(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+    covered_source: Option<&str>,
+) -> Vec<String> {
+    let history_artifact_ids = session_history_search_artifact_ids(session);
+    let session_note_call_ids = session_note_tool_call_ids(session);
+    let eligible_messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(message_index, message)| {
+            let content_updated_at = message.content_updated_at()?;
+            if extraction_watermark.is_some_and(|watermark| content_updated_at <= watermark)
+                || matches!(message.role, Role::System)
+                || history_artifact_ids.contains(&message.id)
+            {
+                return None;
+            }
+            let (role, content) = match message.role {
+                Role::User => ("user", sanitize_extraction_source(&message.content)),
+                Role::Assistant => ("assistant", sanitize_extraction_source(&message.content)),
+                Role::Tool => (
+                    "tool",
+                    sanitized_session_note_result(message, &session_note_call_ids)?,
+                ),
+                Role::System => return None,
+            };
+            let content = content.trim();
+            if content.is_empty()
+                || (content.chars().count() <= 300
+                    && covered_source.is_some_and(|source| source.contains(content)))
+            {
+                return None;
+            }
+            Some((message_index, role, content.to_string()))
+        })
+        .collect::<Vec<_>>();
+    if eligible_messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut source_items = Vec::new();
+    for (message_index, role, extraction_content) in &eligible_messages {
+        let segments = split_retrieval_extraction_content(extraction_content);
+        let segment_count = segments.len();
+        for (segment_index, content) in segments.into_iter().enumerate() {
+            source_items.push(RetrievalExtractionSourceItem {
+                source_item_ordinal: source_items.len() + 1,
+                session_message_ordinal: *message_index + 1,
+                role,
+                retrieval_event_ordinal: None,
+                content_segment_ordinal: segment_index + 1,
+                content_segment_count: segment_count,
+                content,
+            });
+        }
+    }
+
+    render_extraction_source_batches(
+        source_items,
+        extraction_watermark,
+        eligible_messages.len(),
+        eligible_messages.len(),
+        ExtractionDeltaKind::MessageRevision,
+    )
+}
+
 fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
@@ -454,17 +666,22 @@ fn build_retrieval_window_extraction_batches(
             if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
                 return None;
             }
-            let created_after_watermark =
-                extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
+            let source_updated_at = message
+                .content_updated_at()
+                .filter(|updated_at| *updated_at > message.created_at)
+                .unwrap_or(message.created_at);
+            let source_changed_after_watermark =
+                extraction_watermark.is_none_or(|watermark| source_updated_at > watermark);
             // A watermark older than the first retrieval event came from the
             // bounded ordinary outline, which did not cover all old messages.
             // The first retrieval boundary must therefore include every old
             // non-system source, including messages retained in the active
             // window. Once a retrieval event itself predates the watermark,
-            // message creation time is authoritative and later archive
-            // metadata cannot make an old active message eligible twice.
+            // message creation or an explicit content-revision timestamp is
+            // authoritative; later archive metadata alone cannot make an old
+            // active message eligible twice.
             let first_retrieval_transition = !retrieval_source_acknowledged;
-            if !first_retrieval_transition && !created_after_watermark {
+            if !first_retrieval_transition && !source_changed_after_watermark {
                 return None;
             }
             let (role, content) = match message.role {
@@ -506,81 +723,13 @@ fn build_retrieval_window_extraction_batches(
         }
     }
 
-    let max_body_chars =
-        RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS);
-    let mut item_batches: Vec<Vec<(RetrievalExtractionSourceItem, String)>> = Vec::new();
-    let mut current_batch = Vec::new();
-    let mut current_chars = 0usize;
-    for item in source_items {
-        let rendered = render_retrieval_extraction_item(&item);
-        let rendered_chars = rendered.chars().count();
-        debug_assert!(rendered_chars <= max_body_chars);
-        if !current_batch.is_empty()
-            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS
-                || current_chars.saturating_add(rendered_chars) > max_body_chars)
-        {
-            item_batches.push(std::mem::take(&mut current_batch));
-            current_chars = 0;
-        }
-        current_chars = current_chars.saturating_add(rendered_chars);
-        current_batch.push((item, rendered));
-    }
-    if !current_batch.is_empty() {
-        item_batches.push(current_batch);
-    }
-
-    let batch_count = item_batches.len();
-    let mut previous_tail = None;
-    item_batches
-        .into_iter()
-        .enumerate()
-        .map(|(batch_index, items)| {
-            let continuation_overlap = previous_tail
-                .as_ref()
-                .map(render_retrieval_extraction_overlap);
-            previous_tail = items.last().map(|(item, _)| item.clone());
-            let distinct_message_count = items
-                .iter()
-                .map(|(item, _)| item.session_message_ordinal)
-                .collect::<HashSet<_>>()
-                .len();
-            let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
-            rendered.push_str(&format!(
-                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_source_items_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
-                extraction_watermark
-                    .map(|watermark| watermark.to_rfc3339())
-                    .unwrap_or_else(|| "(none)".to_string()),
-                batch_index + 1,
-                batch_count,
-                eligible_event_ids.len(),
-                eligible_messages.len(),
-                items.len(),
-                distinct_message_count,
-                usize::from(continuation_overlap.is_some()),
-                RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS,
-                RETRIEVAL_EXTRACTION_MAX_CHARS,
-                if batch_index + 1 < batch_count {
-                    "continues_in_next_batch"
-                } else {
-                    "final_batch"
-                },
-            ));
-            if let Some(overlap) = continuation_overlap {
-                rendered.push_str(&overlap);
-            }
-            rendered.push_str("\n## Source items (canonical Session order)\n");
-            for (_, item) in items {
-                rendered.push_str(&item);
-            }
-            if batch_index + 1 < batch_count {
-                rendered.push_str("\n[retrieval_delta_continues_in_next_batch]\n");
-            } else {
-                rendered.push_str("\n[retrieval_delta_final_batch]\n");
-            }
-            debug_assert!(rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
-            rendered
-        })
-        .collect()
+    render_extraction_source_batches(
+        source_items,
+        extraction_watermark,
+        eligible_event_ids.len(),
+        eligible_messages.len(),
+        ExtractionDeltaKind::RetrievalWindow,
+    )
 }
 
 async fn collect_candidate_sessions(
@@ -3159,6 +3308,13 @@ mod tests {
             }
             session.messages.push(message);
         }
+        let mut edited = message_at(
+            Message::assistant("CORRECTED_OLD_ASSISTANT_FACT", None),
+            "edited-old-assistant",
+            test_time(4),
+        );
+        edited.mark_content_updated_at(test_time(23));
+        session.messages.push(edited);
 
         let batches =
             build_retrieval_window_extraction_batches(&session, Some(test_time(20)), true);
@@ -3166,6 +3322,7 @@ mod tests {
         let delta = &batches[0];
         assert!(delta.contains("NEW_ARCHIVED"));
         assert!(delta.contains("NEW_ACTIVE"));
+        assert!(delta.contains("CORRECTED_OLD_ASSISTANT_FACT"));
         assert!(!delta.contains("OLD_ARCHIVED"));
         assert!(!delta.contains("PREVIOUSLY_EXTRACTED_ARCHIVED"));
         assert!(!delta.contains("OLD_ACTIVE"));
@@ -3176,6 +3333,40 @@ mod tests {
                 < delta.find("NEW_ACTIVE").expect("active position"),
             "messages must retain canonical Session order"
         );
+    }
+
+    #[test]
+    fn explicit_message_revision_survives_derived_context_reset_and_watermarks_once() {
+        let mut session = Session::new("edited-old-message", "model");
+        let mut edited = message_at(
+            Message::assistant("CORRECTED_DURABLE_FACT_AFTER_PATCH", None),
+            "edited-old",
+            test_time(2),
+        );
+        edited.mark_content_updated_at(test_time(40));
+        session.messages.push(edited);
+        for index in 0..8 {
+            session.messages.push(message_at(
+                Message::assistant(format!("recent message {index}"), None),
+                &format!("recent-{index}"),
+                test_time(20 + index),
+            ));
+        }
+
+        let recent_outline = derive_session_outline(&session).expect("recent outline");
+        assert!(!recent_outline.contains("CORRECTED_DURABLE_FACT_AFTER_PATCH"));
+        let sources = session_extraction_sources(&session, Some(test_time(30)), false);
+        assert_eq!(sources.len(), 2);
+        assert!(sources
+            .iter()
+            .filter_map(Option::as_deref)
+            .any(|source| source.contains("CORRECTED_DURABLE_FACT_AFTER_PATCH")));
+        assert!(build_message_revision_extraction_batches(
+            &session,
+            Some(test_time(40)),
+            Some(&recent_outline),
+        )
+        .is_empty());
     }
 
     #[test]
@@ -3223,6 +3414,7 @@ mod tests {
             ("uppercase token budget field", "MAX_TOKEN=1000"),
             ("mixed-case token budget field", "Max_Token=1000"),
             ("plain pin concept", "pin is a dependency reference"),
+            ("ordinary suffix word", "monkey=abc"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -3257,6 +3449,8 @@ mod tests {
             ("prefixed token assignment", "GITHUB_TOKEN=abc"),
             ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
             ("lowercase prefixed token assignment", "github_token=abc"),
+            ("secret key assignment", "STRIPE_SECRET_KEY=abc"),
+            ("lowercase secret key assignment", "stripe_secret_key=abc"),
             (
                 "lowercase nested prefixed token assignment",
                 "ci_job_token=abc",
@@ -3322,6 +3516,7 @@ mod tests {
             ("PIN", "123"),
             ("GITHUB_TOKEN", "abc"),
             ("github_token", "abc"),
+            ("STRIPE_SECRET_KEY", "abc"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
