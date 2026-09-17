@@ -5,7 +5,7 @@
 //! orchestration in `bamboo_engine::auto_dream`. The orchestration itself
 //! (LLM provider / session-store driven runs) lives in the engine, not here.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Extraction types
@@ -30,7 +30,7 @@ pub struct DurableExtractionEnvelope {
     pub candidates: Vec<DurableExtractionCandidate>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DurableExtractionCandidate {
     pub title: String,
     #[serde(rename = "type")]
@@ -50,7 +50,7 @@ pub struct DurableExtractionCandidate {
 /// proposed by the same extraction pass that produces durable memory
 /// candidates — no extra LLM call. Every field is defaulted so a partially
 /// malformed item degrades instead of failing the envelope parse.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LedgerExtractionCandidate {
     #[serde(default)]
     pub title: String,
