@@ -7,9 +7,10 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use bamboo_agent_core::{Message, SessionKind};
+use bamboo_agent_core::{Message, Role, Session, SessionKind};
 use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::CompressionEventKind;
 use bamboo_llm::Config;
 use bamboo_llm::{LLMChunk, LLMProvider, LLMRequestOptions};
 use bamboo_llm::{ProviderModelRouter, ProviderRegistry};
@@ -25,7 +26,9 @@ use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LE
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore, MAX_MEMORY_TITLE_LEN,
 };
-use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
+use bamboo_storage::{
+    search_index::session_history_search_artifact_ids, SessionIndexEntry, SessionStoreV2,
+};
 
 use crate::project_context::ProjectContextResolver;
 
@@ -36,6 +39,8 @@ const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
 const DREAM_FULL_REBUILD_INTERVAL_SECS: i64 = 60 * 60 * 24 * 30;
 const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
+const RETRIEVAL_EXTRACTION_MAX_MESSAGES: usize = 64;
+const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
@@ -109,6 +114,151 @@ fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool
         && entry.id != DREAM_RUNTIME_SESSION_ID
 }
 
+fn retrieval_window_extraction_source(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Option<String> {
+    if let Some(summary) = session.conversation_summary.as_ref() {
+        return Some(summary.content.clone());
+    }
+    if session
+        .compression_events
+        .iter()
+        .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
+    {
+        return build_retrieval_window_extraction_delta(session, extraction_watermark);
+    }
+    derive_session_outline(session)
+}
+
+fn build_retrieval_window_extraction_delta(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Option<String> {
+    let mut retrieval_events = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
+        .collect::<Vec<_>>();
+    if retrieval_events.is_empty() {
+        return None;
+    }
+    retrieval_events.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let eligible_event_ids = retrieval_events
+        .iter()
+        .filter(|event| extraction_watermark.is_none_or(|watermark| event.created_at > watermark))
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let history_artifact_ids = session_history_search_artifact_ids(session);
+    let eligible_messages = session
+        .messages
+        .iter()
+        .filter(|message| !matches!(message.role, Role::System))
+        .filter(|message| !message.content.trim().is_empty())
+        .filter(|message| !history_artifact_ids.contains(&message.id))
+        .filter(|message| {
+            let archived_by_new_event = message.compressed
+                && message
+                    .compressed_by_event_id
+                    .as_deref()
+                    .is_some_and(|event_id| eligible_event_ids.contains(event_id));
+            let created_after_watermark =
+                extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
+            archived_by_new_event || created_after_watermark
+        })
+        .collect::<Vec<_>>();
+    if eligible_messages.is_empty() {
+        return None;
+    }
+
+    let selected_messages = eligible_messages
+        .iter()
+        .take(RETRIEVAL_EXTRACTION_MAX_MESSAGES)
+        .copied()
+        .collect::<Vec<_>>();
+    let referenced_event_ids = selected_messages
+        .iter()
+        .filter_map(|message| message.compressed_by_event_id.as_deref())
+        .filter(|event_id| eligible_event_ids.contains(event_id))
+        .collect::<HashSet<_>>();
+    let referenced_events = retrieval_events
+        .iter()
+        .filter(|event| referenced_event_ids.contains(event.id.as_str()))
+        .copied()
+        .collect::<Vec<_>>();
+    let truncated_by_message_limit = eligible_messages.len() > selected_messages.len();
+
+    let render = |truncated: bool| {
+        let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
+        rendered.push_str(&format!(
+            "- extraction_watermark: {}\n- eligible_retrieval_events: {}\n- referenced_retrieval_events: {}\n- eligible_messages: {}\n- selected_before_character_cap: {}\n- max_messages: {}\n- max_characters: {}\n- truncated: {}\n",
+            extraction_watermark
+                .map(|watermark| watermark.to_rfc3339())
+                .unwrap_or_else(|| "(none)".to_string()),
+            eligible_event_ids.len(),
+            referenced_events.len(),
+            eligible_messages.len(),
+            selected_messages.len(),
+            RETRIEVAL_EXTRACTION_MAX_MESSAGES,
+            RETRIEVAL_EXTRACTION_MAX_CHARS,
+            truncated,
+        ));
+        if !referenced_events.is_empty() {
+            rendered.push_str("\n## Retrieval events (created_at, then id)\n");
+            for (index, event) in referenced_events.iter().enumerate() {
+                rendered.push_str(&format!(
+                    "- {}: {} {}\n",
+                    index + 1,
+                    event.created_at.to_rfc3339(),
+                    event.id
+                ));
+            }
+        }
+        rendered.push_str("\n## Messages (canonical Session order)\n");
+        for (index, message) in selected_messages.iter().enumerate() {
+            let role = match message.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => continue,
+            };
+            let content = serde_json::to_string(&message.content)
+                .expect("serializing a String as JSON cannot fail");
+            rendered.push_str(&format!(
+                "\n### Message {}\n- role: {}\n- content: {}\n",
+                index + 1,
+                role,
+                content
+            ));
+        }
+        rendered
+    };
+
+    let unbounded = render(truncated_by_message_limit);
+    let truncated =
+        truncated_by_message_limit || unbounded.chars().count() > RETRIEVAL_EXTRACTION_MAX_CHARS;
+    let rendered = if truncated == truncated_by_message_limit {
+        unbounded
+    } else {
+        render(true)
+    };
+    if rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS {
+        return Some(rendered);
+    }
+
+    const TRUNCATION_MARKER: &str = "\n[retrieval_delta_truncated_at_character_cap]\n";
+    let marker_chars = TRUNCATION_MARKER.chars().count();
+    let prefix = rendered
+        .chars()
+        .take(RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(marker_chars))
+        .collect::<String>();
+    Some(format!("{prefix}{TRUNCATION_MARKER}"))
+}
+
 async fn collect_candidate_sessions(
     ctx: &AutoDreamContext,
     since: DateTime<Utc>,
@@ -178,13 +328,13 @@ async fn collect_candidate_session_contexts_from_sessions(
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 ) -> Vec<CandidateSessionContext> {
     let mut out = Vec::new();
-    for (entry, summary) in sessions {
-        let already_extracted = match memory.read_session_state(&entry.id).await {
+    for (entry, _) in sessions {
+        let extraction_watermark = match memory.read_session_state(&entry.id).await {
             Ok(state) => state
                 .last_extracted_at
                 .as_deref()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .is_some_and(|extracted_at| extracted_at >= entry.updated_at),
+                .map(|timestamp| timestamp.with_timezone(&Utc)),
             Err(error) => {
                 tracing::warn!(
                     target: DREAM_TRACING_TARGET,
@@ -192,14 +342,27 @@ async fn collect_candidate_session_contexts_from_sessions(
                     session_id = %entry.id,
                     "Could not read Jiandu session extraction state; keeping the session retryable: {error}"
                 );
-                false
+                None
             }
         };
-        if already_extracted {
+        if extraction_watermark.is_some_and(|watermark| watermark >= entry.updated_at) {
             continue;
         }
-        let project_key = resolve_session_project_id(ctx, &entry.id)
-            .await
+        let session = match ctx.storage.load_session(&entry.id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    target: DREAM_TRACING_TARGET,
+                    event = "session_extraction_source_load_failed",
+                    session_id = %entry.id,
+                    "Could not load the canonical Session after reading its Jiandu extraction watermark; keeping the source retryable: {error}"
+                );
+                continue;
+            }
+        };
+        let summary = retrieval_window_extraction_source(&session, extraction_watermark);
+        let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
             .map(bamboo_domain::ProjectId::into_string);
         let topics = memory
             .read_session_topics_with_content(&entry.id)
@@ -1111,6 +1274,9 @@ mod tests {
     use futures::stream;
 
     use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{
+        CompressionEvent, CompressionTriggerType, FunctionCall, ImageUrlRef, MessagePart, ToolCall,
+    };
     use bamboo_domain::{ProjectId, ProjectResourceSummary, WorkspaceBinding};
     use bamboo_llm::{LLMError, LLMStream};
 
@@ -1222,6 +1388,34 @@ mod tests {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
     }
 
+    fn test_time(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, 0).expect("valid test timestamp")
+    }
+
+    fn retrieval_event(id: &str, created_at: DateTime<Utc>) -> CompressionEvent {
+        let mut event = CompressionEvent::new(
+            0,
+            0,
+            0.0,
+            0.0,
+            0,
+            CompressionTriggerType::Auto,
+            1.0,
+            None,
+            0,
+        );
+        event.id = id.to_string();
+        event.created_at = created_at;
+        event.kind = CompressionEventKind::RetrievalWindow;
+        event
+    }
+
+    fn message_at(mut message: Message, id: &str, created_at: DateTime<Utc>) -> Message {
+        message.id = id.to_string();
+        message.created_at = created_at;
+        message
+    }
+
     #[derive(Clone)]
     struct SequenceProvider {
         responses: Arc<Mutex<Vec<String>>>,
@@ -1317,6 +1511,433 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "User prefers terse responses");
         assert_eq!(candidates[0].kind, "feedback");
+    }
+
+    #[test]
+    fn retrieval_delta_keeps_an_old_archived_identifier_beyond_the_recent_outline() {
+        let mut session = Session::new("retrieval-delta-old", "model");
+        session.messages.push(message_at(
+            Message::system("SYSTEM_POLICY_MUST_NOT_APPEAR"),
+            "system",
+            test_time(1),
+        ));
+        session
+            .compression_events
+            .push(retrieval_event("event-old", test_time(20)));
+        let mut archived = message_at(
+            Message::user("ARCHIVED_IDENTIFIER_ALPHA_947"),
+            "archived-old",
+            test_time(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-old".to_string());
+        session.messages.push(archived);
+        for index in 0..8 {
+            session.messages.push(message_at(
+                Message::assistant(format!("recent message {index}"), None),
+                &format!("recent-{index}"),
+                test_time(30 + index),
+            ));
+        }
+
+        let recent_outline = derive_session_outline(&session).expect("recent outline");
+        assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
+        let delta = retrieval_window_extraction_source(&session, None).expect("retrieval delta");
+        assert!(delta.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
+        assert!(!delta.contains("SYSTEM_POLICY_MUST_NOT_APPEAR"));
+    }
+
+    #[test]
+    fn retrieval_delta_applies_strict_event_and_message_watermarks() {
+        let mut session = Session::new("retrieval-delta-watermark", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event-new", test_time(30)));
+        session
+            .compression_events
+            .push(retrieval_event("event-old", test_time(10)));
+        for (id, content, created_at, event_id) in [
+            ("old-archived", "OLD_ARCHIVED", 2, Some("event-old")),
+            ("new-archived", "NEW_ARCHIVED", 3, Some("event-new")),
+            ("old-active", "OLD_ACTIVE", 19, None),
+            ("equal-active", "EQUAL_ACTIVE", 20, None),
+            ("new-active", "NEW_ACTIVE", 21, None),
+        ] {
+            let mut message = message_at(Message::user(content), id, test_time(created_at));
+            if let Some(event_id) = event_id {
+                message.compressed = true;
+                message.compressed_by_event_id = Some(event_id.to_string());
+            }
+            session.messages.push(message);
+        }
+
+        let delta = build_retrieval_window_extraction_delta(&session, Some(test_time(20)))
+            .expect("post-watermark retrieval delta");
+        assert!(delta.contains("NEW_ARCHIVED"));
+        assert!(delta.contains("NEW_ACTIVE"));
+        assert!(!delta.contains("OLD_ARCHIVED"));
+        assert!(!delta.contains("OLD_ACTIVE"));
+        assert!(!delta.contains("EQUAL_ACTIVE"));
+        assert_eq!(delta.matches("event-new").count(), 1);
+        assert!(!delta.contains("event-old"));
+        assert!(
+            delta.find("NEW_ARCHIVED").expect("archived position")
+                < delta.find("NEW_ACTIVE").expect("active position"),
+            "messages must retain canonical Session order"
+        );
+    }
+
+    #[test]
+    fn retrieval_delta_excludes_self_history_system_and_non_content_payloads() {
+        let mut session = Session::new("retrieval-delta-private-fields", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", test_time(10)));
+        session.messages.push(message_at(
+            Message::system("SYSTEM_SECRET"),
+            "system",
+            test_time(11),
+        ));
+
+        let mut ordinary = message_at(
+            Message::assistant("SAFE_VISIBLE_CONTENT", None),
+            "ordinary",
+            test_time(12),
+        );
+        ordinary.reasoning = Some("REASONING_SECRET".to_string());
+        ordinary.reasoning_signature = Some("SIGNATURE_SECRET".to_string());
+        ordinary.content_parts = Some(vec![MessagePart::ImageUrl {
+            image_url: ImageUrlRef {
+                url: "data:image/png;base64,IMAGE_BYTES_SECRET".to_string(),
+                detail: None,
+            },
+        }]);
+        session.messages.push(ordinary);
+
+        let call_id = "history-call";
+        session.messages.push(message_at(
+            Message::assistant(
+                "SEARCH_QUERY_SECRET",
+                Some(vec![ToolCall {
+                    id: call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "session_history_current".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "search_current",
+                            "query": "SEARCH_QUERY_ARGUMENT_SECRET"
+                        })
+                        .to_string(),
+                    },
+                }]),
+            ),
+            "history-call-message",
+            test_time(13),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result(call_id, "SEARCH_RESULT_SECRET"),
+            "history-result-message",
+            test_time(14),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result("session-note-call", "SESSION_NOTE_VISIBLE"),
+            "session-note-result",
+            test_time(15),
+        ));
+
+        let delta = build_retrieval_window_extraction_delta(&session, None).expect("delta");
+        assert!(delta.contains("SAFE_VISIBLE_CONTENT"));
+        assert!(delta.contains("SESSION_NOTE_VISIBLE"));
+        for excluded in [
+            "SYSTEM_SECRET",
+            "REASONING_SECRET",
+            "SIGNATURE_SECRET",
+            "IMAGE_BYTES_SECRET",
+            "SEARCH_QUERY_SECRET",
+            "SEARCH_QUERY_ARGUMENT_SECRET",
+            "SEARCH_RESULT_SECRET",
+        ] {
+            assert!(
+                !delta.contains(excluded),
+                "unexpected private field: {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn retrieval_delta_ordering_and_caps_are_deterministic() {
+        let mut session = Session::new("retrieval-delta-caps", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", test_time(1)));
+        for index in 0..66 {
+            session.messages.push(message_at(
+                Message::user(format!("ORDER_{index:03}")),
+                &format!("message-{index:03}"),
+                test_time(10 + index),
+            ));
+        }
+
+        let delta = build_retrieval_window_extraction_delta(&session, None).expect("delta");
+        assert!(delta.contains("eligible_messages: 66"));
+        assert!(delta.contains("selected_before_character_cap: 64"));
+        assert!(delta.contains("truncated: true"));
+        assert!(delta.contains("ORDER_000"));
+        assert!(delta.contains("ORDER_063"));
+        assert!(!delta.contains("ORDER_064"));
+        assert!(!delta.contains("ORDER_065"));
+        assert!(delta.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
+
+        let mut oversized = Session::new("retrieval-delta-char-cap", "model");
+        oversized
+            .compression_events
+            .push(retrieval_event("event", test_time(1)));
+        oversized.messages.push(message_at(
+            Message::user(format!("CHAR_CAP_START{}", "x".repeat(20_000))),
+            "oversized",
+            test_time(2),
+        ));
+        let capped = build_retrieval_window_extraction_delta(&oversized, None).expect("capped");
+        assert_eq!(capped.chars().count(), RETRIEVAL_EXTRACTION_MAX_CHARS);
+        assert!(capped.contains("CHAR_CAP_START"));
+        assert!(capped.ends_with("[retrieval_delta_truncated_at_character_cap]\n"));
+        assert!(capped.contains("truncated: true"));
+    }
+
+    #[test]
+    fn retrieval_delta_survives_session_serialization_and_empty_delta_is_explicit() {
+        let mut session = Session::new("retrieval-delta-restart", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event", test_time(10)));
+        let mut archived = message_at(
+            Message::user("RESTART_STABLE_CONTENT"),
+            "archived",
+            test_time(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event".to_string());
+        session.messages.push(archived);
+
+        let before = build_retrieval_window_extraction_delta(&session, None).expect("delta");
+        let restored: Session = serde_json::from_slice(
+            &serde_json::to_vec(&session).expect("serialize retrieval Session"),
+        )
+        .expect("restore retrieval Session");
+        let after = build_retrieval_window_extraction_delta(&restored, None).expect("delta");
+        assert_eq!(after, before);
+        assert!(build_retrieval_window_extraction_delta(&restored, Some(test_time(10))).is_none());
+    }
+
+    #[test]
+    fn extraction_source_preserves_summary_first_and_ordinary_outline_fallback() {
+        let mut summary_session = Session::new("summary-first", "model");
+        summary_session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "EXACT_SUMMARY_SOURCE",
+            1,
+            10,
+        ));
+        summary_session
+            .compression_events
+            .push(retrieval_event("event", test_time(10)));
+        summary_session
+            .messages
+            .push(Message::user("retrieval content must not override summary"));
+        assert_eq!(
+            retrieval_window_extraction_source(&summary_session, None).as_deref(),
+            Some("EXACT_SUMMARY_SOURCE")
+        );
+
+        let mut ordinary = Session::new("ordinary-outline", "model");
+        ordinary
+            .messages
+            .push(Message::user("ORDINARY_RECENT_OUTLINE"));
+        let source = retrieval_window_extraction_source(&ordinary, None).expect("outline");
+        assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
+        assert!(!source.contains("Retrieval-window extraction delta"));
+    }
+
+    #[tokio::test]
+    async fn candidate_collection_uses_watermarked_retrieval_delta_and_keeps_topics_separate() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let watermark = now - chrono::Duration::seconds(20);
+        let mut session = Session::new("retrieval-collection", "model");
+        session.title = "Retrieval collection".to_string();
+        session.compression_events.push(retrieval_event(
+            "event-new",
+            now - chrono::Duration::seconds(10),
+        ));
+        let mut archived = message_at(
+            Message::user("ARCHIVED_AFTER_WATERMARK_EVENT"),
+            "archived",
+            now - chrono::Duration::hours(1),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-new".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("ACTIVE_BEFORE_WATERMARK", None),
+            "old-active",
+            watermark - chrono::Duration::seconds(1),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result("session-note-call", "SESSION_NOTE_AFTER_WATERMARK"),
+            "session-note",
+            watermark + chrono::Duration::seconds(1),
+        ));
+        session.updated_at = now;
+        storage
+            .save_session(&session)
+            .await
+            .expect("save retrieval Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted("retrieval-collection", &watermark.to_rfc3339())
+            .await
+            .expect("write extraction watermark");
+        memory
+            .write_session_topic(
+                "retrieval-collection",
+                "continuity",
+                "SESSION_TOPIC_REMAINS_SEPARATE",
+            )
+            .await
+            .expect("write Session topic");
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(Vec::<String>::new()));
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider,
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            now - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+        let source = contexts[0].summary.as_deref().expect("retrieval source");
+        assert!(source.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
+        assert!(source.contains("SESSION_NOTE_AFTER_WATERMARK"));
+        assert!(!source.contains("ACTIVE_BEFORE_WATERMARK"));
+        assert_eq!(
+            contexts[0].topics,
+            vec![(
+                "continuity".to_string(),
+                "SESSION_TOPIC_REMAINS_SEPARATE".to_string()
+            )]
+        );
+
+        let prompt = build_extraction_prompt(&[DreamCandidateInfo {
+            session_id: contexts[0].session_id.clone(),
+            title: contexts[0].entry.title.clone(),
+            project_key: contexts[0].project_key.clone(),
+            updated_at: contexts[0].entry.updated_at.to_rfc3339(),
+            summary: contexts[0].summary.clone(),
+            topics: contexts[0].topics.clone(),
+        }]);
+        assert!(prompt.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
+        assert!(prompt.contains("SESSION_NOTE_AFTER_WATERMARK"));
+        assert!(prompt.contains("SESSION_TOPIC_REMAINS_SEPARATE"));
+        assert!(prompt.contains("- session topics:"));
+    }
+
+    #[tokio::test]
+    async fn failed_retrieval_extraction_keeps_the_same_delta_retryable() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let mut session = Session::new("retrieval-retry", "model");
+        session.title = "Retrieval retry".to_string();
+        session
+            .compression_events
+            .push(retrieval_event("event", now - chrono::Duration::seconds(1)));
+        let mut archived = message_at(
+            Message::user("RETRYABLE_ARCHIVED_SOURCE"),
+            "archived",
+            now - chrono::Duration::minutes(1),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event".to_string());
+        session.messages.push(archived);
+        session.updated_at = now;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            "not valid extraction JSON".to_string(),
+            serde_json::json!({"candidates": [], "ledger_candidates": []}).to_string(),
+        ]));
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = now - chrono::Duration::hours(24);
+        let first = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(first.len(), 1);
+        let first_source = first[0].summary.clone();
+        let ledger = LedgerStore::new(temp_dir.path());
+
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &first,
+        )
+        .await
+        .expect_err("malformed extraction output must fail before the watermark");
+        let failed_state = memory
+            .read_session_state("retrieval-retry")
+            .await
+            .expect("read failed extraction state");
+        assert!(failed_state.last_extracted_at.is_none());
+
+        let retry = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].summary, first_source);
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &retry,
+        )
+        .await
+        .expect("retry should accept the same bounded source");
+        let completed_state = memory
+            .read_session_state("retrieval-retry")
+            .await
+            .expect("read completed extraction state");
+        assert_eq!(
+            completed_state.last_extracted_at.as_deref(),
+            Some(retry[0].entry.updated_at.to_rfc3339().as_str())
+        );
     }
 
     #[tokio::test]
