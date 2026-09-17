@@ -34,6 +34,52 @@ fn generic_secret_assignment_pattern() -> &'static Regex {
     })
 }
 
+fn past_tense_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+[\"']?(?P<value>[^\s\"',;}]+)"#,
+        )
+        .expect("past-tense secret assignment regex must compile")
+    })
+}
+
+fn contains_past_tense_secret_assignment(value: &str) -> bool {
+    past_tense_secret_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            let candidate = candidate
+                .as_str()
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase();
+            !matches!(
+                candidate.as_str(),
+                "changed"
+                    | "configured"
+                    | "encrypted"
+                    | "expired"
+                    | "forgotten"
+                    | "hashed"
+                    | "invalid"
+                    | "masked"
+                    | "not"
+                    | "optional"
+                    | "redacted"
+                    | "removed"
+                    | "required"
+                    | "reset"
+                    | "revoked"
+                    | "rotated"
+                    | "stored"
+                    | "updated"
+                    | "valid"
+            )
+        })
+}
+
 fn pin_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -362,6 +408,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
         || generic_secret_assignment_pattern().is_match(value)
+        || contains_past_tense_secret_assignment(value)
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
@@ -491,6 +538,14 @@ mod tests {
                 "SQL password policy",
                 "ALTER ROLE alice SET password_policy = 'strict';",
             ),
+            (
+                "past-tense password reset",
+                "The database password was reset yesterday.",
+            ),
+            (
+                "past-tense password requirement",
+                "A password was required for the legacy login flow.",
+            ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
         ] {
@@ -526,6 +581,10 @@ mod tests {
                 "session cookie: 0123456789abcdef0123456789abcdef",
             ),
             ("natural password", "my password is hunter2"),
+            (
+                "past-tense database password",
+                "The database password was hunter2",
+            ),
             ("personal token", "my token is abc"),
             ("database password", "PGPASSWORD=abc"),
             ("login PIN", "LOGIN_PIN=123"),
