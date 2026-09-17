@@ -165,7 +165,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -3199,9 +3199,17 @@ async fn extract_durable_candidate_batch(
                 EXTRACTION_MAX_CANDIDATES
             ));
         }
-        let source_exhausted = extraction_page_source_exhausted(&raw, page_memory.len())?;
         // Tolerant by design: absent/malformed ledger array → empty vec.
         let page_ledger = parse_ledger_candidates(&raw);
+        if page_ledger.len() > EXTRACTION_MAX_CANDIDATES {
+            return Err(format!(
+                "AutoDream extraction page returned {} Ledger candidates; maximum is {}",
+                page_ledger.len(),
+                EXTRACTION_MAX_CANDIDATES
+            ));
+        }
+        let source_exhausted =
+            extraction_page_source_exhausted(&raw, page_memory.len(), page_ledger.len())?;
         let memory_count_before = memory.len();
         let ledger_count_before = ledger.len();
 
@@ -3248,15 +3256,21 @@ async fn extract_durable_candidate_batch(
 fn extraction_page_source_exhausted(
     raw: &str,
     memory_candidate_count: usize,
+    ledger_candidate_count: usize,
 ) -> Result<bool, String> {
     let value = serde_json::from_str::<serde_json::Value>(strip_json_fence(raw))
         .map_err(|error| format!("failed to parse extraction page status: {error}"))?;
     match value.get("source_exhausted") {
         Some(serde_json::Value::Bool(exhausted)) => Ok(*exhausted),
         Some(_) => Err("AutoDream extraction source_exhausted must be a boolean".to_string()),
-        None if memory_candidate_count < EXTRACTION_MAX_CANDIDATES => Ok(true),
+        None
+            if memory_candidate_count < EXTRACTION_MAX_CANDIDATES
+                && ledger_candidate_count < EXTRACTION_MAX_CANDIDATES =>
+        {
+            Ok(true)
+        }
         None => Err(
-            "AutoDream extraction saturated the eight-candidate page without source_exhausted; source watermark was not acknowledged"
+            "AutoDream extraction saturated a memory or Ledger candidate page without source_exhausted; source watermark was not acknowledged"
                 .to_string(),
         ),
     }
@@ -3275,7 +3289,7 @@ fn extraction_continuation_prompt(
     .map_err(|error| format!("failed to serialize extraction continuation state: {error}"))?;
     Ok(format!(
         "{base_prompt}\n\n## Exhaustive continuation page {page_number}\n\
-The preceding response declared source_exhausted=false. Re-examine the same source, skip every candidate in already_returned, and return the next page only. Do not acknowledge exhaustion until every remaining durable-memory candidate has been emitted.\n\
+The preceding response declared source_exhausted=false. Re-examine the same source, skip every candidate in already_returned, and return the next page only. Do not acknowledge exhaustion until every remaining durable-memory and Ledger candidate has been emitted.\n\
 - already_returned: {already_returned}\n"
     ))
 }
@@ -3299,6 +3313,13 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         return Err(format!(
             "AutoDream extraction checkpoint contains {} memory candidates; maximum is {}",
             candidates.len(),
+            EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        ));
+    }
+    if ledger_candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH {
+        return Err(format!(
+            "AutoDream extraction checkpoint contains {} Ledger candidates; maximum is {}",
+            ledger_candidates.len(),
             EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
         ));
     }
@@ -4448,13 +4469,19 @@ mod tests {
     #[test]
     fn extraction_page_status_fails_closed_when_a_full_page_is_ambiguous() {
         let legacy = r#"{"candidates":[],"ledger_candidates":[]}"#;
-        assert!(extraction_page_source_exhausted(legacy, EXTRACTION_MAX_CANDIDATES).is_err());
+        assert!(extraction_page_source_exhausted(legacy, EXTRACTION_MAX_CANDIDATES, 0).is_err());
         assert!(
-            extraction_page_source_exhausted(legacy, EXTRACTION_MAX_CANDIDATES - 1)
-                .expect("an unsaturated legacy response is complete")
+            extraction_page_source_exhausted(legacy, 0, EXTRACTION_MAX_CANDIDATES).is_err(),
+            "a saturated legacy Ledger page must not advance the source watermark"
         );
+        assert!(extraction_page_source_exhausted(
+            legacy,
+            EXTRACTION_MAX_CANDIDATES - 1,
+            EXTRACTION_MAX_CANDIDATES - 1,
+        )
+        .expect("an unsaturated legacy response is complete"));
         let continuation = r#"{"candidates":[],"ledger_candidates":[],"source_exhausted":false}"#;
-        assert!(!extraction_page_source_exhausted(continuation, 0)
+        assert!(!extraction_page_source_exhausted(continuation, 0, 0)
             .expect("explicit continuation status"));
     }
 
@@ -4712,6 +4739,11 @@ mod tests {
             ("possessive token", "my token is abc"),
             ("standalone token assignment", "TOKEN=abc"),
             ("prefixed token assignment", "GITHUB_TOKEN=abc"),
+            ("personal access token assignment", "GITHUB_PAT=abc"),
+            (
+                "lowercase personal access token assignment",
+                "gitlab_pat=abc",
+            ),
             ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
             ("lowercase prefixed token assignment", "github_token=abc"),
             ("secret key assignment", "STRIPE_SECRET_KEY=abc"),

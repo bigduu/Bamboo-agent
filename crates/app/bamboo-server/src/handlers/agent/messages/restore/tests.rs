@@ -3,6 +3,7 @@ use bamboo_agent_core::agent::Message;
 use super::{
     models::FileRestoreAction,
     planning::{build_restore_plan, find_target_message_index},
+    truncate_session_history,
 };
 
 #[test]
@@ -76,4 +77,39 @@ fn build_restore_plan_records_missing_checkpoint_path_error() {
     assert_eq!(plan.initial_errors[0].file_path, "/tmp/file.txt");
     assert_eq!(plan.initial_errors[0].checkpoint_path, None);
     assert_eq!(plan.initial_errors[0].error, "Checkpoint path missing");
+}
+
+#[test]
+fn restoring_to_the_current_last_message_preserves_derived_context_and_history_revision() {
+    let mut session = bamboo_agent_core::Session::new("restore-noop", "model");
+    session.messages.push(Message::user("current tail"));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "keep this derived summary",
+        1,
+        4,
+    ));
+    session.mark_authoritative_history_rewrite();
+    let revision = session
+        .model_context_state
+        .as_ref()
+        .expect("history state")
+        .history_rewrite_revision;
+
+    assert_eq!(truncate_session_history(&mut session, 0), 0);
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session
+            .conversation_summary
+            .as_ref()
+            .map(|summary| summary.content.as_str()),
+        Some("keep this derived summary")
+    );
+    assert_eq!(
+        session
+            .model_context_state
+            .as_ref()
+            .expect("history state")
+            .history_rewrite_revision,
+        revision
+    );
 }

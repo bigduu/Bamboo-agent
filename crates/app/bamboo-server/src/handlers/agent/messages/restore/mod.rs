@@ -18,6 +18,20 @@ use files::apply_restore_plan;
 use models::FileRestoreOutcome;
 use planning::{build_restore_plan, find_target_message_index};
 
+fn truncate_session_history(
+    session: &mut bamboo_agent_core::Session,
+    target_index: usize,
+) -> usize {
+    let retained_len = target_index.saturating_add(1);
+    let messages_to_remove = session.messages.len().saturating_sub(retained_len);
+    if messages_to_remove == 0 {
+        return 0;
+    }
+    session.messages.truncate(retained_len);
+    clear_derived_context_state(session);
+    messages_to_remove
+}
+
 /// `POST /api/v1/sessions/{session_id}/restore`
 ///
 /// Restore session history to `target_message_id`.
@@ -77,9 +91,9 @@ pub async fn restore_session_state(
         file_errors,
     } = restore_outcome;
 
-    session.messages.truncate(target_index + 1);
-    clear_derived_context_state(&mut session);
-    save_and_cache_session(&state, &session_id, session).await?;
+    if truncate_session_history(&mut session, target_index) > 0 {
+        save_and_cache_session(&state, &session_id, session).await?;
+    }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
