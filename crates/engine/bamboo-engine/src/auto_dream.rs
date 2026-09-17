@@ -130,7 +130,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -413,22 +413,17 @@ fn build_retrieval_window_extraction_batches(
             if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
                 return None;
             }
-            let archived_by_new_event = message.compressed
-                && message
-                    .compressed_by_event_id
-                    .as_deref()
-                    .is_some_and(|event_id| eligible_event_ids.contains(event_id));
             let created_after_watermark =
                 extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
             // A watermark older than the first retrieval event came from the
             // bounded ordinary outline, which did not cover all old messages.
-            // The first retrieval boundary must therefore include every newly
-            // archived source. Once a retrieval event itself predates the
-            // watermark, message creation time is authoritative and later
-            // archive metadata cannot make an old active message eligible twice.
-            let archived_on_first_retrieval_boundary =
-                !retrieval_mode_was_acknowledged && archived_by_new_event;
-            if !archived_on_first_retrieval_boundary && !created_after_watermark {
+            // The first retrieval boundary must therefore include every old
+            // non-system source, including messages retained in the active
+            // window. Once a retrieval event itself predates the watermark,
+            // message creation time is authoritative and later archive
+            // metadata cannot make an old active message eligible twice.
+            let first_retrieval_transition = !retrieval_mode_was_acknowledged;
+            if !first_retrieval_transition && !created_after_watermark {
                 return None;
             }
             let (role, content) = match message.role {
@@ -2657,7 +2652,54 @@ mod tests {
     }
 
     #[test]
+    fn first_retrieval_transition_includes_old_retained_messages() {
+        let mut session = Session::new("retrieval-first-transition", "model");
+        session
+            .compression_events
+            .push(retrieval_event("event-first", test_time(30)));
+        let mut archived = message_at(
+            Message::user("OLD_NEWLY_ARCHIVED"),
+            "old-archived",
+            test_time(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event-first".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("OLD_RETAINED_ACTIVE", None),
+            "old-retained",
+            test_time(3),
+        ));
+        session.messages.push(message_at(
+            Message::user("NEW_ACTIVE"),
+            "new-active",
+            test_time(21),
+        ));
+
+        let batches = build_retrieval_window_extraction_batches(&session, Some(test_time(20)));
+        assert_eq!(batches.len(), 1);
+        let delta = &batches[0];
+        assert!(delta.contains("OLD_NEWLY_ARCHIVED"));
+        assert!(delta.contains("OLD_RETAINED_ACTIVE"));
+        assert!(delta.contains("NEW_ACTIVE"));
+    }
+
+    #[test]
     fn extraction_secret_filter_covers_sources_and_model_candidates() {
+        for (case, value) in [
+            ("tokenizer word", "tokenizer is tiktoken"),
+            ("pinning word", "pinning is deterministic"),
+            ("token suffix", "tokenization is lexical"),
+        ] {
+            assert!(
+                !contains_secret_like_value(value),
+                "ordinary technical case was classified as a secret: {case}"
+            );
+            assert!(
+                sanitize_extraction_source(value) == value,
+                "ordinary technical case was redacted: {case}"
+            );
+        }
         for (case, value) in [
             (
                 "api key",
@@ -3200,7 +3242,7 @@ mod tests {
         assert!(source.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
         assert!(source.contains("session_note"));
         assert!(!source.contains("/must/not/reach/extraction"));
-        assert!(!source.contains("ACTIVE_BEFORE_WATERMARK"));
+        assert!(source.contains("ACTIVE_BEFORE_WATERMARK"));
         assert!(contexts[0].topics.is_empty());
         assert!(contexts[1].summary.is_none());
         assert_eq!(
