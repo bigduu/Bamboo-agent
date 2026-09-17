@@ -3,6 +3,7 @@ use serde_json::json;
 
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::Session;
+use bamboo_engine::acquire_memory_maintenance_fence;
 use bamboo_memory::memory_store::{
     normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
     MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
@@ -346,6 +347,22 @@ impl Tool for MemoryTool {
         let parsed: MemoryArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid memory args: {error}"))
         })?;
+
+        // Auto-Dream freezes existing memory lineage before provider work and
+        // updates it only after every replacement sink succeeds. Main-model
+        // mutations that can touch an existing durable document must share the
+        // same cross-process fence; otherwise a newly split/consolidated/merged
+        // descendant could survive a completed history rewrite with stale
+        // facts. Keep the guard alive across authority resolution and mutation.
+        let _memory_maintenance_fence = if parsed.mutates_existing_durable_lineage() {
+            Some(
+                acquire_memory_maintenance_fence(&self.memory_store)
+                    .await
+                    .map_err(ToolError::Execution)?,
+            )
+        } else {
+            None
+        };
 
         let result = match parsed {
             MemoryArgs::SessionRead { topic, options } => {

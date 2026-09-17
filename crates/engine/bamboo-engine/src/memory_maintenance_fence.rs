@@ -3,7 +3,8 @@
 //! Jiandu already serializes each individual scope mutation. Auto-Dream history
 //! rewrites need a wider fence, however: the replacement lineage is frozen
 //! before provider calls and applied only after every replacement sink succeeds.
-//! A blob/dedup gardener must therefore not create a new descendant in between.
+//! Every lineage-changing writer must therefore participate so none can create
+//! or mutate a descendant in between.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -34,7 +35,7 @@ fn local_fence(path: &Path) -> Arc<Mutex<()>> {
     fence
 }
 
-pub(crate) struct MemoryMaintenanceFenceGuard {
+pub struct MemoryMaintenanceFenceGuard {
     file: File,
     _local: OwnedMutexGuard<()>,
 }
@@ -45,10 +46,14 @@ impl Drop for MemoryMaintenanceFenceGuard {
     }
 }
 
-/// Serialize Auto-Dream extraction/rewrite transactions with lineage-changing
-/// blob and dedup gardener passes, including across Bamboo processes sharing a
-/// Jiandu data root.
-pub(crate) async fn acquire_memory_maintenance_fence(
+/// Serialize Auto-Dream extraction/rewrite transactions with every
+/// lineage-changing memory mutation, including across Bamboo processes sharing
+/// a Jiandu data root.
+///
+/// Callers must hold the returned guard across the complete read-modify-write
+/// operation. Ordinary creation that cannot merge into an existing document
+/// does not need this wider transaction fence.
+pub async fn acquire_memory_maintenance_fence(
     memory: &MemoryStore,
 ) -> Result<MemoryMaintenanceFenceGuard, String> {
     let path = memory.memory_root_dir().join(MEMORY_MAINTENANCE_FENCE_FILE);

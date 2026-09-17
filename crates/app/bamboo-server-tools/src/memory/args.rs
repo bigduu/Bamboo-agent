@@ -176,6 +176,25 @@ pub(super) enum MemoryArgs {
     },
 }
 
+impl MemoryArgs {
+    /// Existing durable documents may participate in an Auto-Dream rewrite
+    /// transaction. Any action that can update their content, status, or
+    /// supersedes lineage must share the engine's wider maintenance fence.
+    pub(super) fn mutates_existing_durable_lineage(&self) -> bool {
+        match self {
+            Self::Write { options, .. } => options
+                .as_ref()
+                .and_then(|value| value.allow_merge_if_similar)
+                .unwrap_or(false),
+            Self::Merge { .. }
+            | Self::Split { .. }
+            | Self::Consolidate { .. }
+            | Self::Purge { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct MemoryActionOptions {
     #[serde(default)]

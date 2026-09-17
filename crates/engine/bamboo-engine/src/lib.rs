@@ -24,6 +24,7 @@ pub mod session_cache;
 pub use session_cache::SessionSnapshot;
 pub mod session_messaging;
 pub mod session_repository;
+pub use memory_maintenance_fence::{acquire_memory_maintenance_fence, MemoryMaintenanceFenceGuard};
 pub use session_repository::SessionRepository;
 pub mod title_gen;
 pub mod token_usage_log;

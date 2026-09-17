@@ -90,6 +90,96 @@ async fn invoke_json(
     )
 }
 
+#[test]
+fn existing_durable_lineage_mutations_require_the_maintenance_fence() {
+    let fenced = [
+        json!({"action":"write","scope":"global","type":"reference","title":"t","content":"c","options":{"allow_merge_if_similar":true}}),
+        json!({"action":"merge","id":"mem","content":"updated"}),
+        json!({"action":"split","id":"mem","pieces":[]}),
+        json!({"action":"consolidate","ids":[],"title":"t","content":"c"}),
+        json!({"action":"purge","id":"mem"}),
+    ];
+    for args in fenced {
+        let parsed: MemoryArgs = serde_json::from_value(args).expect("valid fenced action");
+        assert!(parsed.mutates_existing_durable_lineage());
+    }
+
+    let unfenced = [
+        json!({"action":"write","scope":"global","type":"reference","title":"t","content":"c"}),
+        json!({"action":"query","scope":"global"}),
+        json!({"action":"rebuild","scope":"global"}),
+        json!({"action":"session_replace","content":"note"}),
+    ];
+    for args in unfenced {
+        let parsed: MemoryArgs = serde_json::from_value(args).expect("valid unfenced action");
+        assert!(!parsed.mutates_existing_durable_lineage());
+    }
+}
+
+#[tokio::test]
+async fn main_model_split_waits_for_auto_dream_maintenance_fence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = build_memory_tool(dir.path());
+    let session_id = "fenced-main-model-split";
+    let source = invoke_json(
+        &tool,
+        json!({
+            "action": "write",
+            "scope": "global",
+            "type": "reference",
+            "title": "Two fenced facts",
+            "content": "Alpha is local. Beta is remote."
+        }),
+        session_id,
+    )
+    .await;
+    let source_id = source["memory"]["id"]
+        .as_str()
+        .expect("source id")
+        .to_string();
+
+    let fence = bamboo_engine::acquire_memory_maintenance_fence(&tool.memory_store)
+        .await
+        .expect("hold AutoDream fence");
+    let split_tool = tool.clone();
+    let waiter = tokio::spawn(async move {
+        split_tool
+            .invoke(
+                json!({
+                    "action": "split",
+                    "id": source_id,
+                    "pieces": [
+                        {"title":"Alpha","content":"Alpha is local."},
+                        {"title":"Beta","content":"Beta is remote."}
+                    ]
+                }),
+                test_context(session_id),
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a main-model lineage mutation must wait while AutoDream owns the fence"
+    );
+
+    drop(fence);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("split should resume after fence release")
+        .expect("split task")
+        .expect("split action");
+    let value = completed_json(outcome);
+    assert_eq!(value["action"], "split");
+    assert_eq!(
+        value["data"]["new_ids"]
+            .as_array()
+            .expect("split ids")
+            .len(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn memory_session_actions_share_read_shape_and_limits() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -4020,8 +4020,19 @@ async fn persist_durable_candidate_batch_with_project_resolver(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    let ledger_writes =
-        persist_ledger_candidates(ledger, ledger_candidates, &ledger_replacement_targets).await?;
+    let ledger_source_session_id = sessions
+        .first()
+        .map(extraction_transaction_session_id)
+        .ok_or_else(|| {
+            "AutoDream candidate batch has no authoritative source Session".to_string()
+        })?;
+    let ledger_writes = persist_ledger_candidates(
+        ledger,
+        ledger_candidates,
+        ledger_source_session_id,
+        &ledger_replacement_targets,
+    )
+    .await?;
 
     Ok(ExtractionWrites {
         memory: writes,
@@ -4051,16 +4062,23 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 ///   existing open Global record — or an earlier candidate in the same batch —
 ///   is skipped (dedup guard);
 /// - records are created `Open`, tagged `suggested`, attributed to
-///   `RecordActor::Extractor` with the user's verbatim excerpt; NO schedules or
-///   reminders are created for suggested records (no schedule-bridge
-///   involvement) — the agenda renders them for confirmation.
+///   `RecordActor::Extractor` with the user's verbatim excerpt and the
+///   authoritative extraction transaction Session (never model-supplied
+///   provenance); NO schedules or reminders are created for suggested records
+///   (no schedule-bridge involvement) — the agenda renders them for
+///   confirmation.
 async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
+    source_session_id: &str,
     replacement_targets: &HashSet<LedgerReplacementTarget>,
 ) -> Result<usize, String> {
     if candidates.is_empty() {
         return Ok(0);
+    }
+    let source_session_id = source_session_id.trim();
+    if source_session_id.is_empty() {
+        return Err("AutoDream Ledger extraction has no authoritative source Session".to_string());
     }
 
     let existing = ledger
@@ -4101,12 +4119,7 @@ async fn persist_ledger_candidates(
         let kind = RecordKind::parse(&candidate.kind).unwrap_or_default();
         let mut record = LedgerRecord::new(new_record_id(), kind, title);
         record.scope = LedgerScope::Global;
-        record.source.session_id = candidate
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
+        record.source.session_id = Some(source_session_id.to_string());
         record.source.created_by = RecordActor::Extractor;
         record.source.excerpt = candidate
             .excerpt
@@ -8616,7 +8629,7 @@ mod tests {
         };
 
         let long_title = "x".repeat(MAX_RECORD_TITLE_LEN + 1);
-        let candidates = vec![
+        let mut candidates = vec![
             candidate(
                 "Renew passport",
                 "todo",
@@ -8650,10 +8663,19 @@ mod tests {
                 Some("medium"),
             ),
         ];
+        // Provenance belongs to the known extraction transaction, not to
+        // model output. Missing or hallucinated Session IDs must therefore be
+        // normalized to the authoritative source before persistence.
+        candidates[1].session_id = Some("hallucinated-other-session".to_string());
+        candidates
+            .last_mut()
+            .expect("Call the bank candidate")
+            .session_id = None;
 
-        let writes = persist_ledger_candidates(&ledger, candidates, &HashSet::new())
-            .await
-            .expect("persist should succeed");
+        let writes =
+            persist_ledger_candidates(&ledger, candidates, "session-ledger", &HashSet::new())
+                .await
+                .expect("persist should succeed");
         assert_eq!(writes, 3);
 
         let records = ledger
@@ -8745,7 +8767,7 @@ mod tests {
             },
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates, &HashSet::new())
+        let writes = persist_ledger_candidates(&ledger, candidates, "session-dup", &HashSet::new())
             .await
             .expect("persist should succeed");
         assert_eq!(
