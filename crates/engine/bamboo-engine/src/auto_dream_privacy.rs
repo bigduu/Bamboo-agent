@@ -614,6 +614,33 @@ fn ascii_shannon_entropy(token: &str) -> f64 {
         .sum()
 }
 
+fn hash_context_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)\b",
+        )
+        .expect("hash-context regex must compile")
+    })
+}
+
+fn contains_opaque_hex_secret_token(value: &str) -> bool {
+    if hash_context_pattern().is_match(value) || looks_like_technical_path_token(value.trim()) {
+        return false;
+    }
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            let length = token.len();
+            (32..=4_096).contains(&length)
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && token.bytes().any(|byte| byte.is_ascii_digit())
+                && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && token.bytes().collect::<HashSet<_>>().len() >= 8
+                && ascii_shannon_entropy(token) >= 3.2
+        })
+}
+
 fn contains_high_entropy_secret_token(value: &str) -> bool {
     value
         .split(|character: char| {
@@ -685,11 +712,15 @@ fn without_lightweight_markdown_delimiters(value: &str) -> Option<String> {
         })
 }
 
-pub(crate) fn contains_secret_like_value(value: &str) -> bool {
+fn contains_non_hex_secret_like_value(value: &str) -> bool {
     contains_secret_like_value_without_markdown_normalization(value)
         || without_lightweight_markdown_delimiters(value)
             .as_deref()
             .is_some_and(contains_secret_like_value_without_markdown_normalization)
+}
+
+pub(crate) fn contains_secret_like_value(value: &str) -> bool {
+    contains_non_hex_secret_like_value(value) || contains_opaque_hex_secret_token(value)
 }
 
 pub(crate) fn sanitize_extraction_source(value: &str) -> String {
@@ -704,10 +735,13 @@ pub(crate) fn sanitize_extraction_source(value: &str) -> String {
 /// forms a credential. Checking both orders is important because model output
 /// and task metadata do not guarantee that the label precedes the value.
 pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
-    if sources
+    let has_hash_context = sources
         .iter()
-        .any(|source| contains_secret_like_value(source))
-    {
+        .any(|source| hash_context_pattern().is_match(source));
+    if sources.iter().any(|source| {
+        contains_non_hex_secret_like_value(source)
+            || (!has_hash_context && contains_opaque_hex_secret_token(source))
+    }) {
         return false;
     }
 
@@ -716,7 +750,11 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
             .iter()
             .enumerate()
             .filter(|(right_index, _)| *right_index != left_index)
-            .all(|(_, right)| !contains_secret_like_value(&format!("{left}: {right}")))
+            .all(|(_, right)| {
+                let pair = format!("{left}: {right}");
+                !contains_non_hex_secret_like_value(&pair)
+                    && (has_hash_context || !contains_opaque_hex_secret_token(&pair))
+            })
     })
 }
 
@@ -859,6 +897,14 @@ mod tests {
             ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
+            (
+                "SHA-256 digest",
+                "SHA-256 digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "Git commit hash",
+                "commit 0123456789abcdef0123456789abcdef01234567",
+            ),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -1010,6 +1056,10 @@ mod tests {
                 "credential URL",
                 "postgres://user:password-value@example.test/database",
             ),
+            (
+                "unlabelled opaque hexadecimal token",
+                "0123456789abcdef0123456789abcdef",
+            ),
             ("opaque token", "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je"),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
@@ -1079,6 +1129,20 @@ mod tests {
         assert!(
             !durable_candidate_is_secret_safe(&tag_labelled_memory),
             "a tag used as the credential label must reject the candidate"
+        );
+
+        let hash_candidate = DurableExtractionCandidate {
+            title: "Build artifact SHA-256 digest".to_string(),
+            kind: "reference".to_string(),
+            content: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["checksum".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            durable_candidate_is_secret_safe(&hash_candidate),
+            "an explicitly labelled technical digest must remain compatible"
         );
 
         for (field, candidate) in [
