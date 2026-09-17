@@ -165,9 +165,23 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|otp)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
+    })
+}
+
+fn ambiguous_environment_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        // PASS, PWD, and PIN are overloaded in technical configuration
+        // (compiler passes and GPIO pins are common). Only treat the short
+        // suffixes as credentials when the name also carries bounded
+        // authentication, account, service, or datastore context.
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9_])(?:(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*)_)?(?:auth|login|user|account|admin|root|credential|secret|service|server|client|app|application|device|database|db|sql|postgres|postgresql|pg|mysql|mariadb|redis|mongo|mongodb|cache|broker|smtp|imap|pop3|ftp|sftp|ssh|registry|repository|repo|vault|keystore|keychain)_(?:pass|pwd|pin)\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+        )
+        .expect("ambiguous environment credential assignment regex must compile")
     })
 }
 
@@ -183,6 +197,7 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
                 .name("name")
                 .is_some_and(|name| !name.as_str().eq_ignore_ascii_case("max_token"))
         })
+        || ambiguous_environment_credential_assignment_pattern().is_match(value)
 }
 
 fn known_secret_pattern() -> &'static Regex {
@@ -5039,6 +5054,8 @@ mod tests {
             ("old working directory", "OLDPWD=/workspace/old"),
             ("ordinary bypass setting", "BYPASS=enabled"),
             ("ordinary compass setting", "COMPASS=north"),
+            ("hardware pin setting", "GPIO_PIN=13"),
+            ("compiler pass setting", "COMPILER_PASS=inline"),
             ("authentication mode", "AUTH_MODE=basic"),
             ("authentication provider", "AUTH_PROVIDER=internal"),
             ("ordinary account key label", "ACCOUNT_KEY_LABEL=primary"),
@@ -5106,7 +5123,9 @@ mod tests {
             ("secret key base assignment", "SECRET_KEY_BASE=abc"),
             ("PostgreSQL password assignment", "PGPASSWORD=abc"),
             ("password alias assignment", "DB_PASS=abc"),
+            ("prefixed database password alias", "CI_DATABASE_PASS=abc"),
             ("password short alias assignment", "MYSQL_PWD=abc"),
+            ("login pin assignment", "LOGIN_PIN=123"),
             ("lowercase secret key assignment", "stripe_secret_key=abc"),
             ("key id assignment", "AWS_ACCESS_KEY_ID=abc"),
             (
