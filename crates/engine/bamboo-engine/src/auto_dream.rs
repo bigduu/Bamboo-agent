@@ -1880,7 +1880,7 @@ fn collect_memory_lineage_preservation_targets<'a>(
     documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
     rewritten_session_id: &str,
     visited: &mut HashSet<&'a str>,
-    preservation_session_ids: &mut HashSet<String>,
+    exactly_preserved_session_ids: &mut HashSet<String>,
     memory_reactivation_targets: &mut HashSet<MemoryReplacementTarget>,
 ) {
     if !visited.insert(document.frontmatter.id.as_str()) {
@@ -1895,18 +1895,18 @@ fn collect_memory_lineage_preservation_targets<'a>(
     {
         let lineage_session_ids =
             collect_memory_lineage_session_sources(ancestor, documents_by_id, &mut HashSet::new());
-        preservation_session_ids.extend(
-            lineage_session_ids
-                .iter()
-                .filter(|source_id| source_id.as_str() != rewritten_session_id)
-                .cloned(),
-        );
         if !lineage_session_ids.contains(rewritten_session_id) {
+            exactly_preserved_session_ids.extend(
+                lineage_session_ids
+                    .iter()
+                    .filter(|source_id| source_id.as_str() != rewritten_session_id)
+                    .cloned(),
+            );
             // This ancestor branch is wholly unaffected by the rewritten
             // Session. Reactivate its exact already-sanitized document before
-            // superseding the mixed descendant. Canonical Session replay may
-            // additionally refresh it, but an empty or lossy model response
-            // can no longer erase the still-valid branch.
+            // superseding the mixed descendant. Do not ask the model to
+            // restate this branch: the exact canonical document is safer and
+            // also remains available if its source Session was pruned.
             memory_reactivation_targets.insert(MemoryReplacementTarget {
                 id: ancestor.frontmatter.id.clone(),
                 scope: ancestor.frontmatter.scope,
@@ -1919,7 +1919,7 @@ fn collect_memory_lineage_preservation_targets<'a>(
             documents_by_id,
             rewritten_session_id,
             visited,
-            preservation_session_ids,
+            exactly_preserved_session_ids,
             memory_reactivation_targets,
         );
     }
@@ -2139,17 +2139,24 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
                     project_key: document.frontmatter.project_key.clone(),
                 });
                 if is_gardener_descendant {
-                    preservation_session_ids.extend(lineage_session_ids.iter().filter_map(
-                        |source_id| (source_id != &session.session_id).then_some(source_id.clone()),
-                    ));
+                    let mut document_preservation_session_ids = lineage_session_ids
+                        .iter()
+                        .filter_map(|source_id| {
+                            (source_id != &session.session_id).then_some(source_id.clone())
+                        })
+                        .collect::<HashSet<_>>();
+                    let mut exactly_preserved_session_ids = HashSet::new();
                     collect_memory_lineage_preservation_targets(
                         document,
                         &documents_by_id,
                         &session.session_id,
                         &mut HashSet::new(),
-                        &mut preservation_session_ids,
+                        &mut exactly_preserved_session_ids,
                         &mut memory_reactivation_targets,
                     );
+                    document_preservation_session_ids
+                        .retain(|source_id| !exactly_preserved_session_ids.contains(source_id));
+                    preservation_session_ids.extend(document_preservation_session_ids);
                 }
             }
         }
@@ -6561,6 +6568,13 @@ mod tests {
             .mark_session_extracted(&region_session.id, &old_watermark.to_rfc3339())
             .await
             .expect("seed region watermark");
+        assert!(
+            storage
+                .delete_session(&region_session.id)
+                .await
+                .expect("delete unaffected source Session"),
+            "the unaffected source Session should be pruned before the rewrite"
+        );
 
         database_session.messages[0].content = "The database is SQLite.".to_string();
         database_session.messages[0].mark_content_updated_at(rewritten_at);
@@ -6584,23 +6598,7 @@ mod tests {
             "source_exhausted": true
         })
         .to_string();
-        let region_response = serde_json::json!({
-            "candidates": [{
-                "title": "Deployment region",
-                "type": "project",
-                "scope": "global",
-                "content": "The deployment region is eu-west-1.",
-                "tags": ["region"],
-                "session_id": "mixed-lineage-region"
-            }],
-            "ledger_candidates": [],
-            "source_exhausted": true
-        })
-        .to_string();
-        let sequence_provider = Arc::new(SequenceProvider::new(vec![
-            database_response,
-            region_response,
-        ]));
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![database_response]));
         let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
         let context = AutoDreamContext {
             session_store,
@@ -6654,7 +6652,7 @@ mod tests {
                 .filter(|body| **body == "The deployment region is eu-west-1.")
                 .count(),
             1,
-            "preservation extraction must deduplicate against the ancestor scheduled for reactivation"
+            "exact ancestor reactivation must restore one canonical unaffected fact"
         );
         assert!(active_bodies.contains(&"The manual rollback runbook remains authoritative."));
         assert!(!active_bodies.iter().any(|body| body.contains("PostgreSQL")));
@@ -6673,7 +6671,7 @@ mod tests {
         assert_eq!(
             region_memory.frontmatter.status,
             DurableMemoryStatus::Active,
-            "an empty preservation extraction must retain the exact unaffected lineage"
+            "a pruned source Session must not block exact unaffected-lineage reactivation"
         );
 
         let region_state = memory
@@ -6694,11 +6692,13 @@ mod tests {
             "preservation batches cannot create prospective work"
         );
         let prompts = sequence_provider.recorded_prompts();
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            prompts.len(),
+            1,
+            "an exact reactivation target must not be rephrased by the model"
+        );
         assert!(prompts[0].contains("The database is SQLite."));
         assert!(!prompts[0].contains("PostgreSQL"));
-        assert!(prompts[1].contains("unaffected source"));
-        assert!(prompts[1].contains("The deployment region is eu-west-1."));
     }
 
     #[tokio::test]
