@@ -171,6 +171,25 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
 }
 
 fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
+    let mut sources = vec![session.entry.title.as_str()];
+    if let Some(summary) = session.summary.as_deref() {
+        sources.push(summary);
+    }
+    for (topic, content) in &session.topics {
+        sources.push(topic);
+        sources.push(content);
+    }
+    if !extraction_sources_are_secret_safe(&sources) {
+        return DreamCandidateInfo {
+            session_id: session.session_id.clone(),
+            title: REDACTED_EXTRACTION_SOURCE.to_string(),
+            project_key: session.project_key.clone(),
+            updated_at: session.entry.updated_at.to_rfc3339(),
+            summary: None,
+            topics: Vec::new(),
+        };
+    }
+
     let (title, summary) =
         sanitize_title_and_optional_source(&session.entry.title, session.summary.as_deref());
     let topics = session
@@ -786,7 +805,7 @@ async fn build_dream_notebook_body(
     source_window: &DreamSourceWindow,
     generation_mode: DreamGenerationMode,
 ) -> Result<String, String> {
-    match generation_mode {
+    let body = match generation_mode {
         DreamGenerationMode::Rebuild => {
             tracing::info!(
                 target: DREAM_TRACING_TARGET,
@@ -796,8 +815,12 @@ async fn build_dream_notebook_body(
                 durable_memory_index_present = source_window.durable_memory_index.is_some(),
                 "Attempting full rebuild Dream synthesis"
             );
+            let sanitized_memory_index = source_window
+                .durable_memory_index
+                .as_deref()
+                .map(sanitize_extraction_source);
             let prompt = build_rebuild_consolidation_prompt(
-                source_window.durable_memory_index.as_deref(),
+                sanitized_memory_index.as_deref(),
                 &to_consolidation_sessions(&source_window.sessions),
             );
             let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
@@ -809,6 +832,12 @@ async fn build_dream_notebook_body(
             let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
             normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
         }
+    }?;
+
+    if extraction_sources_are_secret_safe(&[body.as_str()]) {
+        Ok(body)
+    } else {
+        Err("auto-dream rejected secret-like notebook output".to_string())
     }
 }
 
@@ -1483,12 +1512,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dream_synthesis_sanitizes_index_and_rejects_secret_like_output() {
+        const SECRET: &str = "API key: hunter2";
+        const SAFE_BODY: &str = "## Current durable context\n- Safe durable context\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None";
+        let safe_provider = Arc::new(SequenceProvider::new(vec![SAFE_BODY.to_string()]));
+        let safe_provider_handle: Arc<dyn LLMProvider> = safe_provider.clone();
+        let source_window = DreamSourceWindow {
+            existing_dream: None,
+            durable_memory_index: Some(SECRET.to_string()),
+            sessions: Vec::new(),
+        };
+
+        build_dream_notebook_body(
+            &safe_provider_handle,
+            "fast-model",
+            &source_window,
+            DreamGenerationMode::Rebuild,
+        )
+        .await
+        .expect("sanitized rebuild should succeed");
+        let prompt = safe_provider.recorded_prompts().remove(0);
+        assert!(!prompt.contains(SECRET));
+        assert!(prompt.contains(REDACTED_EXTRACTION_SOURCE));
+
+        let private_body = SAFE_BODY.replace("Safe durable context", SECRET);
+        let private_provider: Arc<dyn LLMProvider> =
+            Arc::new(SequenceProvider::new(vec![private_body]));
+        let error = build_dream_notebook_body(
+            &private_provider,
+            "fast-model",
+            &DreamSourceWindow {
+                existing_dream: None,
+                durable_memory_index: None,
+                sessions: Vec::new(),
+            },
+            DreamGenerationMode::Incremental,
+        )
+        .await
+        .expect_err("secret-like Dream output must not reach Jiandu");
+        assert_eq!(error, "auto-dream rejected secret-like notebook output");
+    }
+
+    #[tokio::test]
     async fn extraction_privacy_boundary_covers_prompt_and_both_sinks() {
         const TITLE_SECRET: &str = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz";
         const SUMMARY_SECRET: &str = "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456";
         const OUTLINE_SECRET: &str = "my token is abc";
         const SYSTEM_SECRET: &str = "postgres://user:password-value@example.test/database";
         const TOPIC_SECRET: &str = "hunter2";
+        const SPLIT_LABEL: &str = "Password";
         const TOOL_MARKER: &str = "ORDINARY_TOOL_RESULT_MUST_NOT_REACH_EXTRACTION";
         const BOUNDARY_SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
 
@@ -1513,6 +1585,16 @@ mod tests {
             .await
             .expect("save summarized session");
 
+        let mut split = bamboo_agent_core::Session::new("session-split-private", "model");
+        split.title = SPLIT_LABEL.to_string();
+        split.add_message(Message::user(
+            "Ordinary activity for the split-field fixture.",
+        ));
+        storage
+            .save_session(&split)
+            .await
+            .expect("save split-field session");
+
         let mut outlined = bamboo_agent_core::Session::new("session-outline-private", "model");
         outlined.title = "Ordinary outline title".to_string();
         outlined.add_message(Message::user("Keep the final response concise."));
@@ -1529,6 +1611,10 @@ mod tests {
             .write_session_topic("session-summary-private", "Password", TOPIC_SECRET)
             .await
             .expect("write private Session topic fixture");
+        memory
+            .write_session_topic("session-split-private", "database", TOPIC_SECRET)
+            .await
+            .expect("write split-field Session topic fixture");
         memory
             .write_session_topic(
                 "session-summary-private",
@@ -1598,7 +1684,15 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts.len(), 3);
+        let split_context = contexts
+            .iter()
+            .find(|context| context.session_id == "session-split-private")
+            .expect("split-field context");
+        let sanitized_split = sanitized_extraction_candidate_info(split_context);
+        assert_eq!(sanitized_split.title, REDACTED_EXTRACTION_SOURCE);
+        assert!(sanitized_split.summary.is_none());
+        assert!(sanitized_split.topics.is_empty());
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
             &context,
@@ -1627,6 +1721,7 @@ mod tests {
             ("user or assistant outline", OUTLINE_SECRET),
             ("system message", SYSTEM_SECRET),
             ("Session topic", TOPIC_SECRET),
+            ("split-field label", SPLIT_LABEL),
             ("ordinary tool output", TOOL_MARKER),
             ("topic truncation boundary", BOUNDARY_SECRET_PREFIX),
         ] {

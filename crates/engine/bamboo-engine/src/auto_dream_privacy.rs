@@ -47,7 +47,7 @@ fn pin_credential_assignment_pattern() -> &'static Regex {
 fn standalone_pin_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?m)^[ \t]*(?:[-*][ \t]+)?PIN[ \t]*:[ \t]*[\"']?[0-9]{3,12}\b"#)
+        Regex::new(r#"(?im)^[ \t]*(?:[-*][ \t]+)?pin[ \t]*(?::|=|\bis\b)[ \t]*[\"']?[0-9]{3,12}\b"#)
             .expect("standalone PIN credential regex must compile")
     })
 }
@@ -400,6 +400,10 @@ mod tests {
             ("database password", "PGPASSWORD=abc"),
             ("login PIN", "LOGIN_PIN=123"),
             ("standalone PIN", "PIN: 1234"),
+            ("mixed-case standalone PIN", "Pin: 1234"),
+            ("lowercase standalone PIN", "pin: 1234"),
+            ("equals standalone PIN", "PIN = 1234"),
+            ("word-assigned standalone PIN", "pin is 1234"),
             (
                 "connection-string key",
                 "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
