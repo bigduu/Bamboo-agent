@@ -127,7 +127,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]{4,}"#,
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]{4,}"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -200,6 +200,7 @@ fn sanitize_extraction_source(value: &str) -> String {
 fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> bool {
     !contains_secret_like_value(&candidate.title)
         && !contains_secret_like_value(&candidate.content)
+        && !contains_secret_like_value(&format!("{}: {}", candidate.title, candidate.content))
         && candidate
             .tags
             .iter()
@@ -208,10 +209,10 @@ fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> b
 
 fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandidate) -> bool {
     !contains_secret_like_value(&candidate.title)
-        && candidate
-            .excerpt
-            .as_deref()
-            .is_none_or(|excerpt| !contains_secret_like_value(excerpt))
+        && candidate.excerpt.as_deref().is_none_or(|excerpt| {
+            !contains_secret_like_value(excerpt)
+                && !contains_secret_like_value(&format!("{}: {excerpt}", candidate.title))
+        })
 }
 
 fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool {
@@ -753,6 +754,13 @@ struct PreparedExtractionBatch {
     extracted: ExtractedCandidateBatch,
 }
 
+#[derive(Debug)]
+struct PendingExtractionBatch {
+    context_index: usize,
+    prompt: String,
+    checkpoint_id: String,
+}
+
 fn extraction_prompt(session: &CandidateSessionContext) -> String {
     build_extraction_prompt(&[DreamCandidateInfo {
         session_id: session.session_id.clone(),
@@ -773,11 +781,26 @@ fn extraction_checkpoint_id(model: &str, prompt: &str) -> String {
     hex::encode(digest.finalize())
 }
 
-fn extraction_checkpoint_path(ctx: &AutoDreamContext, checkpoint_id: &str) -> PathBuf {
+fn extraction_checkpoint_session_key(session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-extraction-session-v1\0");
+    digest.update(session_id.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -> PathBuf {
     ctx.session_store
         .bamboo_home_dir()
         .join(EXTRACTION_CHECKPOINT_DIR)
-        .join(format!("{checkpoint_id}.json"))
+        .join(extraction_checkpoint_session_key(session_id))
+}
+
+fn extraction_checkpoint_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    checkpoint_id: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!("{checkpoint_id}.json"))
 }
 
 async fn read_extraction_checkpoint(
@@ -843,8 +866,12 @@ async fn write_extraction_checkpoint(
     }
 }
 
-async fn remove_extraction_checkpoint(ctx: &AutoDreamContext, checkpoint_id: &str) {
-    let path = extraction_checkpoint_path(ctx, checkpoint_id);
+async fn remove_extraction_checkpoint(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    checkpoint_id: &str,
+) {
+    let path = extraction_checkpoint_path(ctx, session_id, checkpoint_id);
     if let Err(error) = tokio::fs::remove_file(path).await {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -855,6 +882,55 @@ async fn remove_extraction_checkpoint(ctx: &AutoDreamContext, checkpoint_id: &st
             );
         }
     }
+}
+
+async fn remove_superseded_extraction_checkpoints(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    retained_checkpoint_ids: &HashSet<String>,
+) -> Result<(), String> {
+    let directory = extraction_checkpoint_session_dir(ctx, session_id);
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect AutoDream extraction checkpoints: {error}"
+            ));
+        }
+    };
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to enumerate AutoDream extraction checkpoints: {error}"))?
+    {
+        let path = entry.path();
+        let Some(checkpoint_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if checkpoint_id.len() != 64 || !checkpoint_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if retained_checkpoint_ids.contains(checkpoint_id) {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove superseded AutoDream extraction checkpoint: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -900,20 +976,48 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         .collect::<Vec<_>>();
     let mut total_writes = ExtractionWrites::default();
     let mut prepared_batches = Vec::with_capacity(sessions.len());
+    let pending_batches = sessions
+        .iter()
+        .enumerate()
+        .map(|(context_index, session)| {
+            let prompt = extraction_prompt(session);
+            PendingExtractionBatch {
+                context_index,
+                checkpoint_id: extraction_checkpoint_id(model, &prompt),
+                prompt,
+            }
+        })
+        .collect::<Vec<_>>();
     let mut checkpoint_ids_by_session: HashMap<String, Vec<String>> = HashMap::new();
-    for (context_index, session) in sessions.iter().enumerate() {
-        let prompt = extraction_prompt(session);
-        let checkpoint_id = extraction_checkpoint_id(model, &prompt);
-        let checkpoint_path = extraction_checkpoint_path(ctx, &checkpoint_id);
-        let extracted = match read_extraction_checkpoint(&checkpoint_path, &checkpoint_id).await? {
+    for pending in &pending_batches {
+        let session_id = &sessions[pending.context_index].session_id;
+        checkpoint_ids_by_session
+            .entry(session_id.clone())
+            .or_default()
+            .push(pending.checkpoint_id.clone());
+    }
+    for (session_id, checkpoint_ids) in &checkpoint_ids_by_session {
+        let retained = checkpoint_ids.iter().cloned().collect::<HashSet<_>>();
+        remove_superseded_extraction_checkpoints(ctx, session_id, &retained).await?;
+    }
+
+    for pending in pending_batches {
+        let session = &sessions[pending.context_index];
+        let checkpoint_path =
+            extraction_checkpoint_path(ctx, &session.session_id, &pending.checkpoint_id);
+        let extracted = match read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
+            .await?
+        {
             Some(extracted) => extracted,
             None => {
-                let extracted = extract_durable_candidate_batch(provider, model, prompt).await?;
-                if write_extraction_checkpoint(&checkpoint_path, &checkpoint_id, &extracted).await?
+                let extracted =
+                    extract_durable_candidate_batch(provider, model, pending.prompt).await?;
+                if write_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id, &extracted)
+                    .await?
                 {
                     extracted
                 } else {
-                    read_extraction_checkpoint(&checkpoint_path, &checkpoint_id)
+                    read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
                         .await?
                         .ok_or_else(|| {
                             "concurrent AutoDream checkpoint disappeared before reuse".to_string()
@@ -921,12 +1025,8 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 }
             }
         };
-        checkpoint_ids_by_session
-            .entry(session.session_id.clone())
-            .or_default()
-            .push(checkpoint_id.clone());
         prepared_batches.push(PreparedExtractionBatch {
-            context_index,
+            context_index: pending.context_index,
             extracted,
         });
     }
@@ -962,7 +1062,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             })?;
         if let Some(checkpoint_ids) = checkpoint_ids_by_session.remove(&session_id) {
             for checkpoint_id in checkpoint_ids {
-                remove_extraction_checkpoint(ctx, &checkpoint_id).await;
+                remove_extraction_checkpoint(ctx, &session_id, &checkpoint_id).await;
             }
         }
     }
@@ -2118,6 +2218,7 @@ mod tests {
             "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
             "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
             "session cookie: 0123456789abcdef0123456789abcdef",
+            "my password is hunter2",
             "postgres://user:password-value@example.test/database",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
@@ -2150,6 +2251,19 @@ mod tests {
         };
         assert!(!durable_candidate_is_secret_safe(&unsafe_hex_cookie_memory));
 
+        let unsafe_split_password_memory = DurableExtractionCandidate {
+            title: "Password".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["session".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(!durable_candidate_is_secret_safe(
+            &unsafe_split_password_memory
+        ));
+
         let unsafe_ledger = LedgerExtractionCandidate {
             title: "Rotate credential".to_string(),
             excerpt: Some("Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456".to_string()),
@@ -2163,6 +2277,74 @@ mod tests {
             ..LedgerExtractionCandidate::default()
         };
         assert!(!ledger_candidate_is_secret_safe(&unsafe_hex_cookie_ledger));
+
+        let unsafe_split_password_ledger = LedgerExtractionCandidate {
+            title: "Password".to_string(),
+            excerpt: Some("hunter2".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(!ledger_candidate_is_secret_safe(
+            &unsafe_split_password_ledger
+        ));
+    }
+
+    #[tokio::test]
+    async fn superseded_extraction_checkpoints_are_removed_per_session() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let extracted = ExtractedCandidateBatch {
+            memory: Vec::new(),
+            ledger: Vec::new(),
+        };
+
+        let stale_id = extraction_checkpoint_id("model", "stale");
+        let retained_id = extraction_checkpoint_id("model", "retained");
+        let other_id = extraction_checkpoint_id("model", "other");
+        let stale_path = extraction_checkpoint_path(&context, "session-a", &stale_id);
+        let retained_path = extraction_checkpoint_path(&context, "session-a", &retained_id);
+        let other_session_path = extraction_checkpoint_path(&context, "session-b", &other_id);
+        assert!(
+            write_extraction_checkpoint(&stale_path, &stale_id, &extracted)
+                .await
+                .expect("write stale checkpoint")
+        );
+        assert!(
+            write_extraction_checkpoint(&retained_path, &retained_id, &extracted)
+                .await
+                .expect("write retained checkpoint")
+        );
+        assert!(
+            write_extraction_checkpoint(&other_session_path, &other_id, &extracted)
+                .await
+                .expect("write other-session checkpoint")
+        );
+
+        remove_superseded_extraction_checkpoints(
+            &context,
+            "session-a",
+            &HashSet::from([retained_id]),
+        )
+        .await
+        .expect("remove superseded checkpoint");
+
+        assert!(!stale_path.exists());
+        assert!(retained_path.exists());
+        assert!(other_session_path.exists());
     }
 
     #[test]
