@@ -18,7 +18,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -27,7 +27,7 @@ fn secret_assignment_pattern() -> &'static Regex {
 fn generic_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#)
+        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#)
             .expect("generic secret assignment regex must compile")
     })
 }
@@ -36,7 +36,7 @@ fn present_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+[\"']?(?P<value>[^\s\"',;}]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;}]+)"#,
         )
         .expect("present-tense secret assignment regex must compile")
     })
@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+[\"']?(?P<value>[^\s\"',;}]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;}]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -103,7 +103,7 @@ fn pin_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
         )
         .expect("credential-context PIN assignment regex must compile")
     })
@@ -113,7 +113,7 @@ fn short_credential_config_field_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*[\"'][^\"'\r\n]{1,1024}[\"']"#,
+            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*(?:\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3})"#,
         )
         .expect("short credential config-field regex must compile")
     })
@@ -123,7 +123,7 @@ fn redis_password_directive_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?:[\"'][^\"'\r\n]{1,1024}[\"']|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
+            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?:\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
         )
         .expect("Redis password directive regex must compile")
     })
@@ -142,7 +142,7 @@ fn markdown_table_credential_pattern() -> &'static Regex {
 fn standalone_pin_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?im)^[ \t]*(?:[-*][ \t]+)?pin[ \t]*(?::|=|\bis\b)[ \t]*[\"']?[0-9]{3,12}\b"#)
+        Regex::new(r#"(?im)^[ \t]*(?:[-*][ \t]+)?pin[ \t]*(?::|=|\bis\b)[ \t]*(?:\"{1,3}|'{1,3})?[0-9]{3,12}\b"#)
             .expect("standalone PIN credential regex must compile")
     })
 }
@@ -151,7 +151,7 @@ fn cli_credential_flag_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
         )
         .expect("CLI credential flag regex must compile")
     })
@@ -880,7 +880,29 @@ fn fields_form_credential_label(fields: &[&str]) -> bool {
         || contains_non_hex_secret_like_value(&format!("{label} bamboo-privacy-probe"))
 }
 
+fn starts_with_credential_state_predicate(value: &str) -> bool {
+    value
+        .trim_start()
+        .trim_start_matches(|character: char| {
+            character.is_ascii_punctuation() && !matches!(character, '-' | '_')
+        })
+        .split_whitespace()
+        .next()
+        .map(|token| {
+            token
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|token| is_credential_state_predicate(&token))
+}
+
 fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
+    // Synthetic field joins must retain the same compatibility exemption as
+    // natural-language `is` / `was` checks. The value itself is still scanned,
+    // so a later explicit credential or high-entropy token remains blocked.
+    if starts_with_credential_state_predicate(value) {
+        return contains_secret_like_value(value);
+    }
     contains_secret_like_value(&format!("{label}: {value}"))
         || contains_secret_like_value(&format!("{label} {value}"))
 }
@@ -959,8 +981,12 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
             .enumerate()
             .filter(|(right_index, _)| *right_index != left_index)
             .all(|(_, right)| {
-                let pair = format!("{left}: {right}");
-                !contains_secret_like_value(&pair)
+                if fields_form_credential_label(&[left]) {
+                    !labelled_value_contains_secret(left, right)
+                } else {
+                    let pair = format!("{left}: {right}");
+                    !contains_secret_like_value(&pair)
+                }
             })
     });
     pairs_are_safe && !structured_sources_contain_secret(sources)
@@ -1134,6 +1160,15 @@ mod tests {
             ("spaced API key", "API key: hunter2"),
             ("spaced private key", "private key: hunter2"),
             ("spaced secret key", "secret key: hunter2"),
+            (
+                "triple-double-quoted password",
+                "password = \"\"\"hunter2\"\"\"",
+            ),
+            ("triple-single-quoted password", "password = '''hunter2'''"),
+            (
+                "triple-double-quoted short pass field",
+                "pass = \"\"\"hunter2\"\"\"",
+            ),
             ("bold password label", "**Password**: hunter2"),
             ("bold API key assignment", "**API key:** hunter2"),
             ("inline-code password label", "`password`: hunter2"),
@@ -1309,6 +1344,14 @@ mod tests {
             extraction_sources_are_secret_safe(&["API", "design", "approved"]),
             "ordinary structured fields must remain compatible"
         );
+        assert!(
+            extraction_sources_are_secret_safe(&["Password", "required for staging"]),
+            "a split state predicate must not become a synthetic credential"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["API", "key", "required for staging"]),
+            "a reconstructed label must retain the state-predicate exemption"
+        );
         let oversized = (0..=MAX_STRUCTURED_PRIVACY_LABEL_FIELDS)
             .map(|index| format!("ordinary-field-{index}"))
             .collect::<Vec<_>>();
@@ -1350,6 +1393,20 @@ mod tests {
             confidence: Some("high".to_string()),
         };
         assert!(!durable_candidate_is_secret_safe(&memory));
+
+        let triple_quoted_memory = DurableExtractionCandidate {
+            title: "Production configuration".to_string(),
+            kind: "reference".to_string(),
+            content: "password = \"\"\"hunter2\"\"\"".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["configuration".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&triple_quoted_memory),
+            "triple-quoted credentials must be rejected at the sink boundary"
+        );
 
         let reversed_memory = DurableExtractionCandidate {
             title: "hunter2".to_string(),
