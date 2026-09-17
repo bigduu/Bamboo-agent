@@ -63,6 +63,15 @@ pub async fn patch_message(
         })));
     }
 
+    if message.content == content {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "session_id": session_id,
+            "message_id": message_id,
+            "message_count": session.messages.len(),
+        })));
+    }
+
     message.content = content;
     message.mark_content_updated_at(Utc::now());
 
@@ -202,5 +211,57 @@ mod tests {
         assert!(edited
             .content_updated_at()
             .is_some_and(|updated_at| updated_at >= created_at));
+    }
+
+    #[actix_web::test]
+    async fn patch_message_identical_content_preserves_history_generation_and_derived_state() {
+        let state = new_state().await;
+        let mut session = Session::new("idempotent-patch-session", "model");
+        let message = Message::assistant("unchanged", None);
+        let message_id = message.id.clone();
+        session.messages.push(message);
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "Keep this derived summary.",
+            1,
+            8,
+        ));
+        session.mark_authoritative_history_rewrite();
+        let state_before = session
+            .model_context_state
+            .clone()
+            .expect("history generation exists");
+        state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("seed Session");
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!(
+                    "/api/v1/sessions/idempotent-patch-session/messages/{message_id}"
+                ))
+                .set_json(serde_json::json!({ "content": "unchanged" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let saved = state
+            .storage
+            .load_session("idempotent-patch-session")
+            .await
+            .expect("load Session")
+            .expect("saved Session");
+        assert_eq!(saved.model_context_state.as_ref(), Some(&state_before));
+        assert!(saved.conversation_summary.is_some());
+        assert!(saved.messages[0].content_updated_at().is_none());
     }
 }

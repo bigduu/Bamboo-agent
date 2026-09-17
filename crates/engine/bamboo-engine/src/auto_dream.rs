@@ -144,7 +144,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:api[_-]?key|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id)|cookie)[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[_-]?key|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -1908,7 +1908,11 @@ async fn collect_history_rewrite_replacement_targets(
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
 ) -> Result<HistoryRewriteMemoryTargets, String> {
-    let mut scopes = Vec::new();
+    // AutoDream can emit a Global candidate even while the explicit Project
+    // maintenance path owns the current extraction store. Always inspect the
+    // Global lineage, then add the applicable Project lineage, so one shared
+    // Session watermark cannot strand stale facts in the other scope.
+    let mut scopes = vec![(ctx.memory.clone(), MemoryScope::Global, None)];
     if current_store_is_project_scoped {
         let project_key = session.project_key.as_deref().ok_or_else(|| {
             "project-scoped history rewrite is missing project identity".to_string()
@@ -1918,20 +1922,15 @@ async fn collect_history_rewrite_replacement_targets(
             MemoryScope::Project,
             Some(project_key.to_string()),
         ));
-    } else {
-        scopes.push((memory.clone(), MemoryScope::Global, None));
-        if project_resolver.is_some() {
-            if let Some(project_key) = session.project_key.as_deref() {
-                let project_id =
-                    bamboo_domain::ProjectId::parse(project_key.to_string()).map_err(|error| {
-                        format!("invalid history-rewrite Project identity: {error}")
-                    })?;
-                scopes.push((
-                    ctx.memory.for_project(&project_id),
-                    MemoryScope::Project,
-                    Some(project_key.to_string()),
-                ));
-            }
+    } else if project_resolver.is_some() {
+        if let Some(project_key) = session.project_key.as_deref() {
+            let project_id = bamboo_domain::ProjectId::parse(project_key.to_string())
+                .map_err(|error| format!("invalid history-rewrite Project identity: {error}"))?;
+            scopes.push((
+                ctx.memory.for_project(&project_id),
+                MemoryScope::Project,
+                Some(project_key.to_string()),
+            ));
         }
     }
 
@@ -4667,6 +4666,10 @@ mod tests {
             ("old working directory", "OLDPWD=/workspace/old"),
             ("ordinary bypass setting", "BYPASS=enabled"),
             ("ordinary compass setting", "COMPASS=north"),
+            (
+                "ordinary cookie preference",
+                "My favorite cookie is chocolate",
+            ),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -4694,6 +4697,7 @@ mod tests {
                 "hex session cookie",
                 "session cookie: 0123456789abcdef0123456789abcdef",
             ),
+            ("cookie assignment", "cookie=abc"),
             ("natural-language password", "my password is hunter2"),
             ("natural-language passcode", "my passcode is 1234"),
             ("possessive token", "my token is abc"),
@@ -5738,6 +5742,108 @@ mod tests {
                 .is_empty(),
             "the same history generation must be acknowledged exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn project_history_rewrite_freezes_global_and_project_memory_targets() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let project_id = ProjectId::parse("project-history-cross-scope").expect("project id");
+        let project_key = project_id.to_string();
+        let mut session = Session::new("project-history-cross-scope", "model");
+        session.set_project_id_meta(project_key.clone());
+        session.messages.push(Message::assistant(
+            "The release train uses the old route.",
+            None,
+        ));
+        session.clear_derived_context_state();
+        storage.save_session(&session).await.expect("save Session");
+
+        let base_memory = MemoryStore::new(temp_dir.path());
+        let project_memory = base_memory.for_project(&project_id);
+        let global = base_memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Global release route",
+                "The release train uses the old global route.",
+                &["release".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed Global AutoDream memory");
+        let project = project_memory
+            .write_memory(
+                MemoryScope::Project,
+                Some(&project_key),
+                DurableMemoryType::Project,
+                "Project release route",
+                "The project release train uses the old route.",
+                &["release".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed Project AutoDream memory");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: base_memory,
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let sessions = collect_candidate_sessions_for_project(
+            &context,
+            &project_key,
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await
+        .expect("collect Project Session");
+        let contexts =
+            collect_candidate_session_contexts_from_sessions(&context, &project_memory, sessions)
+                .await
+                .expect("collect Project history rewrite");
+        let rewritten = contexts
+            .iter()
+            .find(|context| context.history_revision.is_some())
+            .expect("history-rewrite context");
+
+        let targets = collect_history_rewrite_replacement_targets(
+            &context,
+            &project_memory,
+            rewritten,
+            None,
+            true,
+        )
+        .await
+        .expect("collect cross-scope replacement targets");
+        assert!(targets
+            .replacement_targets
+            .contains(&MemoryReplacementTarget {
+                id: global.frontmatter.id,
+                scope: MemoryScope::Global,
+                project_key: None,
+            }));
+        assert!(targets
+            .replacement_targets
+            .contains(&MemoryReplacementTarget {
+                id: project.frontmatter.id,
+                scope: MemoryScope::Project,
+                project_key: Some(project_key),
+            }));
     }
 
     #[tokio::test]
