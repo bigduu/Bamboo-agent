@@ -152,10 +152,23 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?:^|[^A-Z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET|PASSWORD|PASSCODE|PIN|OTP)\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
+}
+
+fn contains_environment_credential_assignment(value: &str) -> bool {
+    environment_credential_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            // `max_token` is a common model-budget setting rather than a
+            // credential. Keep this exact compatibility exception narrow;
+            // prefixed service/CI variables remain secret regardless of case.
+            captures
+                .name("name")
+                .is_some_and(|name| name.as_str() != "max_token")
+        })
 }
 
 fn known_secret_pattern() -> &'static Regex {
@@ -209,7 +222,7 @@ fn contains_secret_like_value(value: &str) -> bool {
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
         || generic_secret_assignment_pattern().is_match(value)
-        || environment_credential_assignment_pattern().is_match(value)
+        || contains_environment_credential_assignment(value)
         || known_secret_pattern().is_match(value)
         || authorization_secret_pattern().is_match(value)
         || credential_url_pattern().is_match(value)
@@ -2965,6 +2978,11 @@ mod tests {
             ("standalone token assignment", "TOKEN=abc"),
             ("prefixed token assignment", "GITHUB_TOKEN=abc"),
             ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
+            ("lowercase prefixed token assignment", "github_token=abc"),
+            (
+                "lowercase nested prefixed token assignment",
+                "ci_job_token=abc",
+            ),
             ("pin", "PIN: 1234"),
             ("three-digit pin", "PIN: 123"),
             (
@@ -3025,6 +3043,7 @@ mod tests {
             ("PIN", "1234"),
             ("PIN", "123"),
             ("GITHUB_TOKEN", "abc"),
+            ("github_token", "abc"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
                 title: title.to_string(),
