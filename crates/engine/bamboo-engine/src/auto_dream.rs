@@ -189,7 +189,7 @@ fn known_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
+            r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bglpat-[a-z0-9_-]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
         )
         .expect("known secret regex must compile")
     })
@@ -3650,6 +3650,14 @@ async fn persist_durable_candidate_batch_with_project_resolver(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
+    let reactivation_targets = history_plan
+        .map(|plan| {
+            plan.memory_reactivation_targets
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
 
     let mut writes = 0usize;
     let mut existing_by_scope: HashMap<
@@ -3781,13 +3789,22 @@ async fn persist_durable_candidate_batch_with_project_resolver(
                 })?;
             let fingerprints = existing
                 .into_iter()
-                .filter(|document| document.frontmatter.status == DurableMemoryStatus::Active)
                 .filter(|document| {
-                    !replacement_targets.contains(&MemoryReplacementTarget {
+                    let target = MemoryReplacementTarget {
                         id: document.frontmatter.id.clone(),
                         scope: document.frontmatter.scope,
                         project_key: document.frontmatter.project_key.clone(),
-                    })
+                    };
+                    document.frontmatter.status == DurableMemoryStatus::Active
+                        || reactivation_targets.contains(&target)
+                })
+                .filter(|document| {
+                    let target = MemoryReplacementTarget {
+                        id: document.frontmatter.id.clone(),
+                        scope: document.frontmatter.scope,
+                        project_key: document.frontmatter.project_key.clone(),
+                    };
+                    !replacement_targets.contains(&target) || reactivation_targets.contains(&target)
                 })
                 .filter_map(|document| {
                     let source_session_id = document
@@ -5041,6 +5058,10 @@ mod tests {
             (
                 "lowercase personal access token assignment",
                 "gitlab_pat=abc",
+            ),
+            (
+                "standalone GitLab personal access token",
+                "glpat-abcdefghijklmnopqrst",
             ),
             ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
             ("lowercase prefixed token assignment", "github_token=abc"),
@@ -6428,7 +6449,14 @@ mod tests {
         })
         .to_string();
         let region_response = serde_json::json!({
-            "candidates": [],
+            "candidates": [{
+                "title": "Deployment region",
+                "type": "project",
+                "scope": "global",
+                "content": "The deployment region is eu-west-1.",
+                "tags": ["region"],
+                "session_id": "mixed-lineage-region"
+            }],
             "ledger_candidates": [],
             "source_exhausted": true
         })
@@ -6484,6 +6512,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(active_bodies.contains(&"The database is SQLite."));
         assert!(active_bodies.contains(&"The deployment region is eu-west-1."));
+        assert_eq!(
+            active_bodies
+                .iter()
+                .filter(|body| **body == "The deployment region is eu-west-1.")
+                .count(),
+            1,
+            "preservation extraction must deduplicate against the ancestor scheduled for reactivation"
+        );
         assert!(active_bodies.contains(&"The manual rollback runbook remains authoritative."));
         assert!(!active_bodies.iter().any(|body| body.contains("PostgreSQL")));
         let manual_memory = documents
