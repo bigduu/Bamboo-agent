@@ -1944,6 +1944,7 @@ fn collect_memory_lineage_preservation_targets<'a>(
 struct HistoryRewriteMemoryTargets {
     replacement_targets: Vec<MemoryReplacementTarget>,
     memory_reactivation_targets: Vec<MemoryReplacementTarget>,
+    advanced_memory_reactivation_targets: Vec<MemoryReplacementTarget>,
     preservation_session_ids: Vec<String>,
 }
 
@@ -2020,6 +2021,41 @@ fn memory_lineage_contains_frozen_target<'a>(
         })
 }
 
+fn collect_memory_lineage_frozen_targets<'a>(
+    document: &'a DurableMemoryDocument,
+    documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
+    frozen_targets: &HashSet<MemoryReplacementTarget>,
+    visited: &mut HashSet<&'a str>,
+    matched_targets: &mut HashSet<MemoryReplacementTarget>,
+) {
+    if !visited.insert(document.frontmatter.id.as_str()) {
+        return;
+    }
+    let current = MemoryReplacementTarget {
+        id: document.frontmatter.id.clone(),
+        scope: document.frontmatter.scope,
+        project_key: document.frontmatter.project_key.clone(),
+    };
+    if frozen_targets.contains(&current) {
+        matched_targets.insert(current);
+    }
+    for ancestor in document
+        .frontmatter
+        .relations
+        .supersedes
+        .iter()
+        .filter_map(|id| documents_by_id.get(id.as_str()).copied())
+    {
+        collect_memory_lineage_frozen_targets(
+            ancestor,
+            documents_by_id,
+            frozen_targets,
+            visited,
+            matched_targets,
+        );
+    }
+}
+
 fn memory_lineage_contains_retry_replacement<'a>(
     document: &'a DurableMemoryDocument,
     documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
@@ -2058,6 +2094,7 @@ async fn collect_history_rewrite_replacement_targets(
     current_store_is_project_scoped: bool,
 ) -> Result<HistoryRewriteMemoryTargets, String> {
     let frozen_targets = HashSet::new();
+    let frozen_reactivation_targets = HashSet::new();
     let retry_replacements = HashSet::new();
     collect_history_rewrite_replacement_targets_for_retry(
         ctx,
@@ -2066,6 +2103,7 @@ async fn collect_history_rewrite_replacement_targets(
         project_resolver,
         current_store_is_project_scoped,
         &frozen_targets,
+        &frozen_reactivation_targets,
         &retry_replacements,
     )
     .await
@@ -2079,6 +2117,7 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
     frozen_targets: &HashSet<MemoryReplacementTarget>,
+    frozen_reactivation_targets: &HashSet<MemoryReplacementTarget>,
     retry_replacements: &HashSet<ExtractionMemoryFingerprint>,
 ) -> Result<HistoryRewriteMemoryTargets, String> {
     // AutoDream can emit a Global candidate even while the explicit Project
@@ -2128,6 +2167,7 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
     let mut targets = HashSet::new();
     let mut preservation_session_ids = HashSet::new();
     let mut memory_reactivation_targets = HashSet::new();
+    let mut advanced_memory_reactivation_targets = HashSet::new();
     for (store, scope, project_key) in scopes {
         let documents = store
             .list_memory_documents(scope, project_key.as_deref())
@@ -2140,6 +2180,28 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
             .map(|document| (document.frontmatter.id.as_str(), document))
             .collect::<HashMap<_, _>>();
         for document in &documents {
+            if document.frontmatter.status == DurableMemoryStatus::Active
+                && !frozen_reactivation_targets.is_empty()
+            {
+                let current = MemoryReplacementTarget {
+                    id: document.frontmatter.id.clone(),
+                    scope: document.frontmatter.scope,
+                    project_key: document.frontmatter.project_key.clone(),
+                };
+                let mut matched_targets = HashSet::new();
+                collect_memory_lineage_frozen_targets(
+                    document,
+                    &documents_by_id,
+                    frozen_reactivation_targets,
+                    &mut HashSet::new(),
+                    &mut matched_targets,
+                );
+                matched_targets.retain(|target| target != &current);
+                if !matched_targets.is_empty() {
+                    advanced_memory_reactivation_targets.extend(matched_targets);
+                    memory_reactivation_targets.insert(current);
+                }
+            }
             let lineage_session_ids = collect_memory_lineage_session_sources(
                 document,
                 &documents_by_id,
@@ -2220,9 +2282,20 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
             .then_with(|| left.project_key.cmp(&right.project_key))
             .then_with(|| left.id.cmp(&right.id))
     });
+    let mut advanced_memory_reactivation_targets = advanced_memory_reactivation_targets
+        .into_iter()
+        .collect::<Vec<_>>();
+    advanced_memory_reactivation_targets.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.project_key.cmp(&right.project_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(HistoryRewriteMemoryTargets {
         replacement_targets: targets,
         memory_reactivation_targets,
+        advanced_memory_reactivation_targets,
         preservation_session_ids,
     })
 }
@@ -2248,6 +2321,11 @@ async fn revalidate_history_rewrite_plan(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    let frozen_reactivation_targets = plan
+        .memory_reactivation_targets
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
     let refreshed = collect_history_rewrite_replacement_targets_for_retry(
         ctx,
         memory,
@@ -2255,6 +2333,7 @@ async fn revalidate_history_rewrite_plan(
         project_resolver,
         current_store_is_project_scoped,
         &frozen_targets,
+        &frozen_reactivation_targets,
         retry_replacements,
     )
     .await?;
@@ -2272,6 +2351,11 @@ async fn revalidate_history_rewrite_plan(
     });
     revalidated.replacement_targets.dedup();
 
+    revalidated.memory_reactivation_targets.retain(|target| {
+        !refreshed
+            .advanced_memory_reactivation_targets
+            .contains(target)
+    });
     revalidated
         .memory_reactivation_targets
         .extend(refreshed.memory_reactivation_targets);
@@ -6914,6 +6998,191 @@ mod tests {
         );
         assert!(prompts[0].contains("The database is SQLite."));
         assert!(!prompts[0].contains("PostgreSQL"));
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_retry_follows_reactivated_ancestor_descendants() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut rewritten_session = Session::new("reactivation-retry-owner", "model");
+        rewritten_session
+            .messages
+            .push(Message::assistant("The corrected owner history.", None));
+        rewritten_session.clear_derived_context_state();
+        storage
+            .save_session(&rewritten_session)
+            .await
+            .expect("save rewritten Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let ancestor = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Unaffected deployment region",
+                "The deployment region is eu-west-1.",
+                &["region".to_string()],
+                Some("unaffected-region-source"),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed unaffected ancestor");
+        memory
+            .archive_memory(
+                &ancestor.frontmatter.id,
+                None,
+                DurableMemoryStatus::Superseded,
+                Some("seed mixed-lineage ancestor state"),
+            )
+            .await
+            .expect("supersede ancestor")
+            .expect("ancestor exists");
+
+        let entry = session_store
+            .get_index_entry(&rewritten_session.id)
+            .await
+            .expect("rewritten Session index entry");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let session_context = CandidateSessionContext {
+            entry,
+            summary: Some("corrected owner history".to_string()),
+            session_id: rewritten_session.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let plan = HistoryRewritePlan {
+            version: HISTORY_REWRITE_PLAN_VERSION,
+            session_key: extraction_checkpoint_session_key(&rewritten_session.id),
+            history_revision: "history-revision".to_string(),
+            source_updated_at: rewritten_session.updated_at.to_rfc3339(),
+            replacement_targets: Vec::new(),
+            memory_reactivation_targets: vec![MemoryReplacementTarget {
+                id: ancestor.frontmatter.id.clone(),
+                scope: MemoryScope::Global,
+                project_key: None,
+            }],
+            preservation_session_ids: Vec::new(),
+            ledger_replacement_targets: Vec::new(),
+        };
+
+        // Simulate a retry boundary after completion reactivated this ancestor
+        // but failed later. The gardener may advance that newly active branch
+        // before the next attempt reacquires the maintenance fence.
+        memory
+            .archive_memory(
+                &ancestor.frontmatter.id,
+                None,
+                DurableMemoryStatus::Active,
+                Some("simulate partial history-rewrite completion"),
+            )
+            .await
+            .expect("reactivate ancestor")
+            .expect("ancestor exists");
+        let advanced = memory
+            .split_memory(
+                &ancestor.frontmatter.id,
+                None,
+                &[
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Deployment region identity".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "The deployment region is eu-west-1.".to_string(),
+                        tags: vec!["region".to_string()],
+                    },
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Deployment region policy".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "Regional deployments remain in eu-west-1.".to_string(),
+                        tags: vec!["region".to_string()],
+                    },
+                ],
+                Some("__memory_gardener__"),
+                "memory-gardener",
+            )
+            .await
+            .expect("advance reactivated ancestor")
+            .expect("gardener split result");
+
+        let revalidated = revalidate_history_rewrite_plan(
+            &context,
+            &memory,
+            &session_context,
+            &plan,
+            None,
+            false,
+            &HashSet::new(),
+        )
+        .await
+        .expect("revalidate reactivation lineage");
+        assert!(!revalidated
+            .memory_reactivation_targets
+            .iter()
+            .any(|target| target.id == ancestor.frontmatter.id));
+        assert_eq!(
+            revalidated
+                .memory_reactivation_targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<HashSet<_>>(),
+            advanced
+                .new_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        );
+
+        supersede_history_rewrite_targets(
+            &context,
+            &LedgerStore::new(temp_dir.path()),
+            &revalidated,
+        )
+        .await
+        .expect("complete retry against current descendants");
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list retry lineage");
+        assert_eq!(
+            documents
+                .iter()
+                .find(|document| document.frontmatter.id == ancestor.frontmatter.id)
+                .expect("ancestor remains auditable")
+                .frontmatter
+                .status,
+            DurableMemoryStatus::Superseded,
+            "retry must not reactivate the obsolete ancestor"
+        );
+        for id in &advanced.new_ids {
+            assert_eq!(
+                documents
+                    .iter()
+                    .find(|document| document.frontmatter.id == *id)
+                    .expect("current descendant remains auditable")
+                    .frontmatter
+                    .status,
+                DurableMemoryStatus::Active
+            );
+        }
     }
 
     #[tokio::test]
