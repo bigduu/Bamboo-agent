@@ -165,7 +165,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -3732,50 +3732,75 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         let scope = parse_candidate_scope(&candidate, project_key.as_deref());
         let mut write_memory = memory.clone();
         let mut write_project_key = project_key;
-        if scope == MemoryScope::Project && !current_store_is_project_scoped {
-            let Some(resolver) = project_resolver else {
-                tracing::warn!(
-                    target: DREAM_TRACING_TARGET,
-                    event = "project_candidate_skipped",
-                    session_id,
-                    reason = "project_resolver_unavailable",
-                    "Skipping Project memory extraction because stable Project authority is unavailable"
-                );
-                continue;
-            };
-            let session = ctx
-                .storage
-                .load_session(session_id)
-                .await
-                .map_err(|error| {
-                    format!("failed to load Project memory source session '{session_id}': {error}")
+        if scope == MemoryScope::Project {
+            let project_id = if let Some(resolver) = project_resolver {
+                let session = ctx
+                    .storage
+                    .load_session(session_id)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to load Project memory source session '{session_id}': {error}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        format!(
+                            "Project memory extraction source session '{session_id}' no longer exists"
+                        )
+                    })?;
+                let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
+                let resolved = resolver
+                    .resolve_memory_read_scope(&session, workspace.as_deref())
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "failed to resolve Project memory scope for session '{session_id}': {error}"
+                        )
+                    })?;
+                let Some(project_id) = resolved else {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "project_candidate_skipped",
+                        session_id = session_id,
+                        reason = "session_unassigned",
+                        "Skipping Project memory extraction for an unassigned session"
+                    );
+                    continue;
+                };
+                project_id
+            } else {
+                if !current_store_is_project_scoped {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "project_candidate_skipped",
+                        session_id,
+                        reason = "project_resolver_unavailable",
+                        "Skipping Project memory extraction because stable Project authority is unavailable"
+                    );
+                    continue;
+                }
+                let Some(project_key) = write_project_key.as_deref() else {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "project_candidate_skipped",
+                        session_id,
+                        reason = "session_unassigned",
+                        "Skipping Project memory extraction for an unassigned session"
+                    );
+                    continue;
+                };
+                bamboo_domain::ProjectId::parse(project_key.to_string()).map_err(|error| {
+                    format!(
+                        "invalid Project identity while routing extraction for session '{session_id}': {error}"
+                    )
                 })?
-                .ok_or_else(|| {
-                    format!(
-                        "Project memory extraction source session '{session_id}' no longer exists"
-                    )
-                })?;
-            let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
-            let resolved = resolver
-                .resolve_memory_read_scope(&session, workspace.as_deref())
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to resolve Project memory scope for session '{session_id}': {error}"
-                    )
-                })?;
-            let Some(project_id) = resolved else {
-                tracing::warn!(
-                    target: DREAM_TRACING_TARGET,
-                    event = "project_candidate_skipped",
-                    session_id = session_id,
-                    reason = "session_unassigned",
-                    "Skipping Project memory extraction for an unassigned session"
-                );
-                continue;
             };
             write_project_key = Some(project_id.to_string());
-            write_memory = memory.for_project(&project_id);
+            // Always derive the store from the unscoped authority. A Project
+            // maintenance run may extract a preservation candidate from a
+            // different Project, so reusing the caller's already-bound store
+            // would cross the source Session's isolation boundary.
+            write_memory = ctx.memory.for_project(&project_id);
         }
         let tags = candidate.tags;
         let _ = &candidate.confidence;
@@ -5009,6 +5034,7 @@ mod tests {
             ("ordinary compass setting", "COMPASS=north"),
             ("authentication mode", "AUTH_MODE=basic"),
             ("authentication provider", "AUTH_PROVIDER=internal"),
+            ("ordinary account key label", "ACCOUNT_KEY_LABEL=primary"),
             ("mixed-case user path", "/Users/Alice/Project2/config.toml"),
             ("mixed-case relative path", "src/HTTP2Client/Config.toml"),
             (
@@ -5054,6 +5080,10 @@ mod tests {
             (
                 "service basic auth assignment",
                 "REGISTRY_BASIC_AUTH=dXNlcjpwYXNz",
+            ),
+            (
+                "Azure storage account key assignment",
+                "AZURE_STORAGE_ACCOUNT_KEY=abc",
             ),
             (
                 "lowercase personal access token assignment",
@@ -6305,6 +6335,112 @@ mod tests {
                 scope: MemoryScope::Project,
                 project_key: Some(project_key),
             }));
+    }
+
+    #[tokio::test]
+    async fn project_scoped_preservation_routes_to_the_source_session_project() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let project_a = ProjectId::parse("project-a").expect("Project A id");
+        let project_b = ProjectId::parse("project-b").expect("Project B id");
+
+        let mut owner_session = Session::new("project-a-rewrite-owner", "model");
+        owner_session.set_project_id_meta(project_a.to_string());
+        storage
+            .save_session(&owner_session)
+            .await
+            .expect("save Project A Session");
+        let mut preserved_session = Session::new("project-b-preserved-source", "model");
+        preserved_session.set_project_id_meta(project_b.to_string());
+        storage
+            .save_session(&preserved_session)
+            .await
+            .expect("save Project B Session");
+
+        let owner_entry = session_store
+            .get_index_entry(&owner_session.id)
+            .await
+            .expect("Project A index entry");
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let owner_context = CandidateSessionContext {
+            entry: owner_entry,
+            summary: Some("Project A history rewrite".to_string()),
+            session_id: owner_session.id.clone(),
+            project_key: Some(project_a.to_string()),
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let plan = HistoryRewritePlan {
+            version: HISTORY_REWRITE_PLAN_VERSION,
+            session_key: extraction_checkpoint_session_key(&owner_session.id),
+            history_revision: "history-revision".to_string(),
+            source_updated_at: owner_session.updated_at.to_rfc3339(),
+            replacement_targets: Vec::new(),
+            memory_reactivation_targets: Vec::new(),
+            preservation_session_ids: vec![preserved_session.id.clone()],
+            ledger_replacement_targets: Vec::new(),
+        };
+        let extracted = ExtractedCandidateBatch {
+            memory: vec![DurableExtractionCandidate {
+                title: "Project B preserved fact".to_string(),
+                kind: "project".to_string(),
+                content: "This fact belongs only to Project B.".to_string(),
+                scope: Some("project".to_string()),
+                tags: vec!["project-b".to_string()],
+                session_id: Some(preserved_session.id.clone()),
+                confidence: Some("high".to_string()),
+            }],
+            ledger: Vec::new(),
+        };
+
+        let writes = persist_durable_candidate_batch_with_project_resolver(
+            &context,
+            &memory.for_project(&project_a),
+            &LedgerStore::new(temp_dir.path()),
+            &[owner_context],
+            extracted,
+            None,
+            true,
+            Some(&plan),
+        )
+        .await
+        .expect("persist cross-Project preservation candidate");
+        assert_eq!(writes.memory, 1);
+        assert_eq!(
+            memory
+                .for_project(&project_a)
+                .count_scope_memories(MemoryScope::Project, Some(project_a.as_str()))
+                .await
+                .expect("count Project A memories"),
+            0,
+            "Project B preservation must not write through the Project A-bound store"
+        );
+        assert_eq!(
+            memory
+                .for_project(&project_b)
+                .count_scope_memories(MemoryScope::Project, Some(project_b.as_str()))
+                .await
+                .expect("count Project B memories"),
+            1,
+            "preservation must follow the source Session's Project identity"
+        );
     }
 
     #[tokio::test]
