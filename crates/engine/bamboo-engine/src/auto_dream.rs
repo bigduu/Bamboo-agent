@@ -163,11 +163,12 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
         .captures_iter(value)
         .any(|captures| {
             // `max_token` is a common model-budget setting rather than a
-            // credential. Keep this exact compatibility exception narrow;
+            // credential. Keep this exact-name compatibility exception narrow
+            // but case-insensitive, matching the surrounding detector;
             // prefixed service/CI variables remain secret regardless of case.
             captures
                 .name("name")
-                .is_some_and(|name| name.as_str() != "max_token")
+                .is_some_and(|name| !name.as_str().eq_ignore_ascii_case("max_token"))
         })
 }
 
@@ -1405,7 +1406,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // checkpointed before any sink began. Replay it to both sinks and commit
     // its original source watermark before considering a newer prompt for the
     // same Session. This keeps stochastic rephrasing out of partial retries.
-    let mut replayed_sessions = HashSet::new();
+    let mut acknowledged_watermarks_by_session = HashMap::new();
     for (session_id, pending_indexes) in &pending_indexes_by_session {
         let (transactions, _) = load_extraction_checkpoint_transactions(ctx, session_id).await?;
         if transactions.is_empty() {
@@ -1496,10 +1497,16 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             }
         }
         remove_superseded_extraction_checkpoints(ctx, session_id, &HashSet::new()).await?;
-        replayed_sessions.insert(session_id.clone());
+        if let Some(acknowledged_watermark) = acknowledged_watermark {
+            acknowledged_watermarks_by_session.insert(session_id.clone(), acknowledged_watermark);
+        }
     }
-    pending_batches
-        .retain(|pending| !replayed_sessions.contains(&sessions[pending.context_index].session_id));
+    pending_batches.retain(|pending| {
+        let session = &sessions[pending.context_index];
+        acknowledged_watermarks_by_session
+            .get(&session.session_id)
+            .is_none_or(|acknowledged_watermark| session.entry.updated_at > *acknowledged_watermark)
+    });
     if pending_batches.is_empty() {
         return Ok(total_writes);
     }
@@ -2950,6 +2957,8 @@ mod tests {
             ("token suffix", "tokenization is lexical"),
             ("plain token concept", "token is a lexical unit"),
             ("token budget field", "max_token=1000"),
+            ("uppercase token budget field", "MAX_TOKEN=1000"),
+            ("mixed-case token budget field", "Max_Token=1000"),
             ("plain pin concept", "pin is a dependency reference"),
         ] {
             assert!(
@@ -4044,7 +4053,19 @@ mod tests {
             }]
         })
         .to_string();
-        let sequence_provider = Arc::new(SequenceProvider::new(vec![response]));
+        let newer_response = serde_json::json!({
+            "candidates": [{
+                "title": "Newer retry fact",
+                "type": "reference",
+                "scope": "global",
+                "content": "The newer source update must be extracted after the old checkpoint replay.",
+                "tags": ["retry"],
+                "session_id": "sink-retry"
+            }],
+            "ledger_candidates": []
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![response, newer_response]));
         let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
         let memory = MemoryStore::new(temp_dir.path());
         let context = AutoDreamContext {
@@ -4092,7 +4113,6 @@ mod tests {
             .last_extracted_at
             .is_none());
 
-        let original_source_watermark = contexts[0].entry.updated_at.to_rfc3339();
         let mut updated_contexts = contexts.clone();
         updated_contexts[0].entry.updated_at += chrono::Duration::seconds(1);
         updated_contexts[0].summary = Some(
@@ -4112,14 +4132,12 @@ mod tests {
             &updated_contexts,
         )
         .await
-        .expect("retry should reuse the exact durable checkpoint");
-        assert_eq!(writes.memory, 0);
+        .expect("retry should replay the old checkpoint before extracting newer source");
+        assert_eq!(writes.memory, 1);
         assert_eq!(writes.ledger, 1);
-        assert_eq!(
-            sequence_provider.recorded_prompts().len(),
-            1,
-            "retry must not ask the model to rephrase the batch"
-        );
+        let recorded_prompts = sequence_provider.recorded_prompts();
+        assert_eq!(recorded_prompts.len(), 2);
+        assert!(recorded_prompts[1].contains("newer source update"));
         assert_eq!(
             memory
                 .read_session_state("sink-retry")
@@ -4127,8 +4145,8 @@ mod tests {
                 .expect("read committed watermark")
                 .last_extracted_at
                 .as_deref(),
-            Some(original_source_watermark.as_str()),
-            "the exact old transaction must commit before the newer prompt is considered"
+            Some(updated_contexts[0].entry.updated_at.to_rfc3339().as_str()),
+            "the old transaction and the newer source must both commit in order"
         );
         let (pending_transactions, pending_ids) =
             load_extraction_checkpoint_transactions(&context, "sink-retry")
@@ -4142,7 +4160,7 @@ mod tests {
                 .await
                 .expect("list memory after retry")
                 .len(),
-            1
+            2
         );
         assert_eq!(
             LedgerStore::new(temp_dir.path())
