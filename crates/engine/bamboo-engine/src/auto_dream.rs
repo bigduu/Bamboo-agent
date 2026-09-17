@@ -718,22 +718,12 @@ async fn collect_candidate_session_contexts_from_sessions(
         );
         let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
             .map(bamboo_domain::ProjectId::into_string);
-        let topics = memory
-            .read_session_topics_with_content(&entry.id)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .take(EXTRACTION_MAX_TOPICS_PER_SESSION)
-            .map(|(topic, content)| {
-                (
-                    sanitize_extraction_source(&topic),
-                    truncate_chars(
-                        &sanitize_extraction_source(&content),
-                        EXTRACTION_MAX_TOPIC_CHARS,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
+        let topics = sanitized_session_topics(
+            memory
+                .read_session_topics_with_content(&entry.id)
+                .await
+                .unwrap_or_default(),
+        );
         if topics.is_empty()
             && summaries.iter().all(|summary| {
                 summary
@@ -793,6 +783,22 @@ async fn collect_candidate_session_contexts_from_sessions(
     out
 }
 
+fn sanitized_session_topics(topics: Vec<(String, String)>) -> Vec<(String, String)> {
+    topics
+        .into_iter()
+        .take(EXTRACTION_MAX_TOPICS_PER_SESSION)
+        .map(|(topic, content)| {
+            (
+                sanitize_extraction_source(&topic),
+                truncate_chars(
+                    &sanitize_extraction_source(&content),
+                    EXTRACTION_MAX_TOPIC_CHARS,
+                ),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 async fn collect_candidate_session_contexts(
     ctx: &AutoDreamContext,
@@ -830,6 +836,11 @@ struct ExtractionCheckpoint {
     transaction_id: String,
     batch_index: usize,
     batch_count: usize,
+    /// Fingerprint of the complete sanitized Session-topic snapshot that
+    /// accompanied this transaction. Older v2 checkpoints omit this field;
+    /// replay then conservatively resubmits the current topics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topics_fingerprint: Option<String>,
     extracted: ExtractedCandidateBatch,
 }
 
@@ -855,6 +866,7 @@ struct PendingExtractionBatch {
     transaction_id: String,
     batch_index: usize,
     batch_count: usize,
+    topics_fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -864,10 +876,53 @@ struct StoredExtractionTransaction {
     batches: Vec<ExtractionCheckpoint>,
 }
 
+#[derive(Debug, Clone)]
+struct ReplayedExtractionSource {
+    watermark: DateTime<Utc>,
+    topics_fingerprint: Option<String>,
+}
+
+#[derive(Debug)]
+struct RebuiltRetrievalContexts {
+    contexts: Vec<CandidateSessionContext>,
+    topics_fingerprint: String,
+}
+
+fn extraction_topics_fingerprint(topics: &[(String, String)]) -> String {
+    let mut topics = topics.to_vec();
+    topics.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-session-topics-v1\0");
+    for (topic, content) in topics {
+        digest.update((topic.len() as u64).to_le_bytes());
+        digest.update(topic.as_bytes());
+        digest.update((content.len() as u64).to_le_bytes());
+        digest.update(content.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn extraction_topics_fingerprints_by_session(
+    sessions: &[CandidateSessionContext],
+) -> HashMap<String, String> {
+    let mut topics_by_session: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for session in sessions {
+        topics_by_session
+            .entry(session.session_id.clone())
+            .or_default()
+            .extend(session.topics.iter().cloned());
+    }
+    topics_by_session
+        .into_iter()
+        .map(|(session_id, topics)| (session_id, extraction_topics_fingerprint(&topics)))
+        .collect()
+}
+
 fn build_pending_extraction_batches(
     model: &str,
     sessions: &[CandidateSessionContext],
 ) -> Vec<PendingExtractionBatch> {
+    let topics_fingerprints = extraction_topics_fingerprints_by_session(sessions);
     sessions
         .iter()
         .enumerate()
@@ -886,6 +941,10 @@ fn build_pending_extraction_batches(
                 transaction_id: String::new(),
                 batch_index: 0,
                 batch_count: 0,
+                topics_fingerprint: topics_fingerprints
+                    .get(session.session_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| extraction_topics_fingerprint(&[])),
             }
         })
         .collect()
@@ -983,6 +1042,10 @@ fn checkpoint_matches_pending_batch(
         && checkpoint.batch_id == pending.checkpoint_id
         && checkpoint.batch_index == pending.batch_index
         && checkpoint.batch_count == pending.batch_count
+        && checkpoint
+            .topics_fingerprint
+            .as_deref()
+            .is_none_or(|fingerprint| fingerprint == pending.topics_fingerprint)
 }
 
 fn extraction_checkpoint_session_key(session_id: &str) -> String {
@@ -1286,6 +1349,7 @@ async fn load_extraction_checkpoint_transactions(
             batch.transaction_id != transaction_id
                 || batch.source_updated_at != first.source_updated_at
                 || batch.batch_count != first.batch_count
+                || batch.topics_fingerprint != first.topics_fingerprint
         }) {
             return Err("AutoDream extraction transaction metadata mismatch".to_string());
         }
@@ -1373,7 +1437,8 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
     ctx: &AutoDreamContext,
     template: &CandidateSessionContext,
     acknowledged_watermark: DateTime<Utc>,
-) -> Result<Vec<CandidateSessionContext>, String> {
+    acknowledged_topics_fingerprint: Option<&str>,
+) -> Result<RebuiltRetrievalContexts, String> {
     let session = ctx
         .storage
         .load_session(&template.session_id)
@@ -1405,25 +1470,60 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
         .ok_or_else(|| "retrieval source lost its first boundary identity".to_string())?;
     let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
         .map(bamboo_domain::ProjectId::into_string);
+    let topics = sanitized_session_topics(
+        ctx.memory
+            .read_session_topics_with_content(&template.session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to reload retrieval Session topics after checkpoint replay for {}: {error}",
+                    template.session_id
+                )
+            })?,
+    );
+    let current_topics_fingerprint = extraction_topics_fingerprint(&topics);
+    let topics_changed = acknowledged_topics_fingerprint
+        .is_none_or(|fingerprint| fingerprint != current_topics_fingerprint);
+    let mut entry = template.entry.clone();
+    entry.title.clone_from(&session.title);
+    entry.updated_at = session.updated_at;
 
-    // The complete replay transaction already covered its Session topics.
-    // Rebuild only the newer canonical message delta against the watermark that
+    // Rebuild the newer canonical message delta against the watermark that
     // replay just acknowledged; reusing a pre-replay transition batch would
     // submit old messages to the provider again and invite stochastic duplicates.
-    Ok(
+    let mut contexts =
         build_retrieval_window_extraction_batches(&session, Some(acknowledged_watermark), true)
             .into_iter()
             .filter(|summary| !summary.trim().is_empty())
             .map(|summary| CandidateSessionContext {
-                entry: template.entry.clone(),
+                entry: entry.clone(),
                 summary: Some(summary),
                 session_id: template.session_id.clone(),
                 project_key: project_key.clone(),
                 topics: Vec::new(),
                 retrieval_event_key: Some(retrieval_event_key.clone()),
             })
-            .collect(),
-    )
+            .collect::<Vec<_>>();
+
+    // Topic files do not expose per-topic timestamps. New checkpoints carry a
+    // fingerprint of the complete sanitized snapshot, so unchanged topics stay
+    // deduplicated while any post-checkpoint edit is submitted as its own unit.
+    // Legacy checkpoints lack the fingerprint and therefore replay current
+    // topics conservatively rather than advancing past a possibly unseen note.
+    if topics_changed && !topics.is_empty() {
+        contexts.push(CandidateSessionContext {
+            entry,
+            summary: None,
+            session_id: template.session_id.clone(),
+            project_key,
+            topics,
+            retrieval_event_key: Some(retrieval_event_key),
+        });
+    }
+    Ok(RebuiltRetrievalContexts {
+        contexts,
+        topics_fingerprint: current_topics_fingerprint,
+    })
 }
 
 #[cfg(test)]
@@ -1468,7 +1568,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             )
         })
         .collect::<Vec<_>>();
-    let source_updated_at_by_session = session_source_watermarks
+    let mut source_updated_at_by_session = session_source_watermarks
         .iter()
         .cloned()
         .collect::<HashMap<_, _>>();
@@ -1481,7 +1581,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // checkpointed before any sink began. Replay it to both sinks and commit
     // its original source watermark before considering a newer prompt for the
     // same Session. This keeps stochastic rephrasing out of partial retries.
-    let mut acknowledged_watermarks_by_session = HashMap::new();
+    let mut replayed_sources_by_session = HashMap::new();
     for (session_id, pending_indexes) in &pending_indexes_by_session {
         let (transactions, _) = load_extraction_checkpoint_transactions(ctx, session_id).await?;
         if transactions.is_empty() {
@@ -1514,6 +1614,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 )
             })?
             .map(|timestamp| timestamp.with_timezone(&Utc));
+        let mut replayed_source = None;
 
         for transaction in transactions {
             let source_watermark = DateTime::parse_from_rfc3339(&transaction.source_updated_at)
@@ -1529,6 +1630,10 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 .iter()
                 .map(|batch| batch.batch_id.clone())
                 .collect::<Vec<_>>();
+            let transaction_topics_fingerprint = transaction
+                .batches
+                .first()
+                .and_then(|batch| batch.topics_fingerprint.clone());
             if acknowledged_watermark.is_none_or(|watermark| watermark < source_watermark) {
                 for checkpoint in transaction.batches {
                     let writes = persist_durable_candidate_batch_with_project_resolver(
@@ -1566,26 +1671,30 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         )
                     })?;
                 acknowledged_watermark = Some(source_watermark);
+                replayed_source = Some(ReplayedExtractionSource {
+                    watermark: source_watermark,
+                    topics_fingerprint: transaction_topics_fingerprint,
+                });
             }
             for checkpoint_id in checkpoint_ids {
                 remove_extraction_checkpoint(ctx, session_id, &checkpoint_id).await;
             }
         }
         remove_superseded_extraction_checkpoints(ctx, session_id, &HashSet::new()).await?;
-        if let Some(acknowledged_watermark) = acknowledged_watermark {
-            acknowledged_watermarks_by_session.insert(session_id.clone(), acknowledged_watermark);
+        if let Some(replayed_source) = replayed_source {
+            replayed_sources_by_session.insert(session_id.clone(), replayed_source);
         }
     }
 
-    let mut retrieval_sessions_to_rebuild = acknowledged_watermarks_by_session
+    let mut retrieval_sessions_to_rebuild = replayed_sources_by_session
         .iter()
-        .filter_map(|(session_id, acknowledged_watermark)| {
+        .filter_map(|(session_id, replayed_source)| {
             extraction_sessions
                 .iter()
                 .find(|session| session.session_id == *session_id)
                 .filter(|session| {
                     session.retrieval_event_key.is_some()
-                        && session.entry.updated_at > *acknowledged_watermark
+                        && session.entry.updated_at > replayed_source.watermark
                 })
                 .map(|_| session_id.clone())
         })
@@ -1597,6 +1706,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             .cloned()
             .collect::<HashSet<_>>();
         let mut rebuilt_contexts = Vec::new();
+        let mut rebuilt_topics_fingerprints = HashMap::new();
         for session_id in &retrieval_sessions_to_rebuild {
             let template = extraction_sessions
                 .iter()
@@ -1605,17 +1715,22 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 .ok_or_else(|| {
                     format!("missing retrieval context after checkpoint replay for {session_id}")
                 })?;
-            let acknowledged_watermark = *acknowledged_watermarks_by_session
+            let replayed_source = replayed_sources_by_session
                 .get(session_id)
                 .expect("rebuild Session came from acknowledged watermark map");
-            rebuilt_contexts.extend(
-                rebuild_retrieval_contexts_after_checkpoint_replay(
-                    ctx,
-                    &template,
-                    acknowledged_watermark,
-                )
-                .await?,
-            );
+            let rebuilt = rebuild_retrieval_contexts_after_checkpoint_replay(
+                ctx,
+                &template,
+                replayed_source.watermark,
+                replayed_source.topics_fingerprint.as_deref(),
+            )
+            .await?;
+            if let Some(context) = rebuilt.contexts.first() {
+                source_updated_at_by_session
+                    .insert(session_id.clone(), context.entry.updated_at.to_rfc3339());
+            }
+            rebuilt_topics_fingerprints.insert(session_id.clone(), rebuilt.topics_fingerprint);
+            rebuilt_contexts.extend(rebuilt.contexts);
         }
         pending_batches.retain(|pending| {
             !rebuild_set.contains(&extraction_sessions[pending.context_index].session_id)
@@ -1626,6 +1741,10 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             let source_updated_at = context.entry.updated_at.to_rfc3339();
             let checkpoint_id =
                 extraction_checkpoint_id(model, &context.session_id, &source_updated_at, &prompt);
+            let topics_fingerprint = rebuilt_topics_fingerprints
+                .get(&context.session_id)
+                .cloned()
+                .unwrap_or_else(|| extraction_topics_fingerprint(&[]));
             extraction_sessions.push(context);
             pending_batches.push(PendingExtractionBatch {
                 context_index,
@@ -1634,6 +1753,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 transaction_id: String::new(),
                 batch_index: 0,
                 batch_count: 0,
+                topics_fingerprint,
             });
         }
         assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
@@ -1641,9 +1761,9 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
 
     pending_batches.retain(|pending| {
         let session = &extraction_sessions[pending.context_index];
-        acknowledged_watermarks_by_session
+        replayed_sources_by_session
             .get(&session.session_id)
-            .is_none_or(|acknowledged_watermark| session.entry.updated_at > *acknowledged_watermark)
+            .is_none_or(|replayed_source| session.entry.updated_at > replayed_source.watermark)
     });
     if pending_batches.is_empty() {
         return Ok(total_writes);
@@ -1694,6 +1814,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     transaction_id: pending.transaction_id.clone(),
                     batch_index: pending.batch_index,
                     batch_count: pending.batch_count,
+                    topics_fingerprint: Some(pending.topics_fingerprint.clone()),
                     extracted: extracted.clone(),
                 };
                 if write_extraction_checkpoint(&checkpoint_path, &checkpoint).await? {
@@ -3263,6 +3384,7 @@ mod tests {
             ),
             batch_index: 0,
             batch_count: 1,
+            topics_fingerprint: Some(extraction_topics_fingerprint(&[])),
             extracted: extracted.clone(),
         };
         let stale_path = extraction_checkpoint_path(&context, "session-a", &stale_id);
@@ -4214,7 +4336,23 @@ mod tests {
             "ledger_candidates": []
         })
         .to_string();
-        let sequence_provider = Arc::new(SequenceProvider::new(vec![response, newer_response]));
+        let newer_topic_response = serde_json::json!({
+            "candidates": [{
+                "title": "Newer retry topic",
+                "type": "reference",
+                "scope": "global",
+                "content": "The Session topic added after the old checkpoint must be extracted.",
+                "tags": ["retry", "topic"],
+                "session_id": "sink-retry"
+            }],
+            "ledger_candidates": []
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![
+            response,
+            newer_response,
+            newer_topic_response,
+        ]));
         let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
         let memory = MemoryStore::new(temp_dir.path());
         let context = AutoDreamContext {
@@ -4295,16 +4433,24 @@ mod tests {
             .save_session(&session)
             .await
             .expect("save newer retrieval source");
+        memory
+            .write_session_topic(
+                "sink-retry",
+                "continuity",
+                "NEWER_RETRY_TOPIC must remain eligible after replay.",
+            )
+            .await
+            .expect("write newer Session topic");
         let updated_contexts = collect_candidate_session_contexts(
             &context,
             &memory,
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(updated_contexts.len(), 1);
-        let stale_transition_source = updated_contexts[0]
-            .summary
-            .as_deref()
+        assert_eq!(updated_contexts.len(), 2);
+        let stale_transition_source = updated_contexts
+            .iter()
+            .find_map(|context| context.summary.as_deref())
             .expect("pre-replay retrieval transition source");
         assert!(stale_transition_source.contains("OLD_RETRY_SOURCE"));
         assert!(stale_transition_source.contains("NEWER_RETRY_SOURCE"));
@@ -4322,12 +4468,14 @@ mod tests {
         )
         .await
         .expect("retry should replay the old checkpoint before extracting newer source");
-        assert_eq!(writes.memory, 1);
+        assert_eq!(writes.memory, 2);
         assert_eq!(writes.ledger, 1);
         let recorded_prompts = sequence_provider.recorded_prompts();
-        assert_eq!(recorded_prompts.len(), 2);
+        assert_eq!(recorded_prompts.len(), 3);
         assert!(recorded_prompts[1].contains("NEWER_RETRY_SOURCE"));
         assert!(!recorded_prompts[1].contains("OLD_RETRY_SOURCE"));
+        assert!(recorded_prompts[2].contains("NEWER_RETRY_TOPIC"));
+        assert!(!recorded_prompts[2].contains("OLD_RETRY_SOURCE"));
         assert_eq!(
             memory
                 .read_session_state("sink-retry")
@@ -4350,7 +4498,7 @@ mod tests {
                 .await
                 .expect("list memory after retry")
                 .len(),
-            2
+            3
         );
         assert_eq!(
             LedgerStore::new(temp_dir.path())
@@ -4360,6 +4508,77 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_replay_rebuilds_topic_only_delta_and_skips_unchanged_topics() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let acknowledged_watermark = Utc::now() - chrono::Duration::minutes(1);
+        let mut session = Session::new("topic-only-replay", "model");
+        session.title = "Topic only replay".to_string();
+        session.compression_events.push(retrieval_event(
+            "topic-only-boundary",
+            acknowledged_watermark,
+        ));
+        session.updated_at = acknowledged_watermark + chrono::Duration::seconds(1);
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic(
+                "topic-only-replay",
+                "continuity",
+                "TOPIC_ONLY_AFTER_CHECKPOINT must not be skipped.",
+            )
+            .await
+            .expect("write Session topic");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        let template = contexts.first().expect("topic context");
+
+        let rebuilt = rebuild_retrieval_contexts_after_checkpoint_replay(
+            &context,
+            template,
+            acknowledged_watermark,
+            Some(&extraction_topics_fingerprint(&[])),
+        )
+        .await
+        .expect("rebuild topic-only delta");
+        assert_eq!(rebuilt.contexts.len(), 1);
+        assert!(rebuilt.contexts[0].summary.is_none());
+        assert_eq!(rebuilt.contexts[0].topics.len(), 1);
+        assert!(extraction_prompt(&rebuilt.contexts[0]).contains("TOPIC_ONLY_AFTER_CHECKPOINT"));
+
+        let current_fingerprint = rebuilt.topics_fingerprint;
+        let unchanged = rebuild_retrieval_contexts_after_checkpoint_replay(
+            &context,
+            template,
+            acknowledged_watermark,
+            Some(&current_fingerprint),
+        )
+        .await
+        .expect("skip unchanged topics");
+        assert!(unchanged.contexts.is_empty());
+        assert_eq!(unchanged.topics_fingerprint, current_fingerprint);
     }
 
     #[tokio::test]
