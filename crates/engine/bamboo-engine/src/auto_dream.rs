@@ -165,7 +165,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -4990,6 +4990,8 @@ mod tests {
             ("old working directory", "OLDPWD=/workspace/old"),
             ("ordinary bypass setting", "BYPASS=enabled"),
             ("ordinary compass setting", "COMPASS=north"),
+            ("authentication mode", "AUTH_MODE=basic"),
+            ("authentication provider", "AUTH_PROVIDER=internal"),
             ("mixed-case user path", "/Users/Alice/Project2/config.toml"),
             ("mixed-case relative path", "src/HTTP2Client/Config.toml"),
             (
@@ -5030,6 +5032,12 @@ mod tests {
             ("standalone token assignment", "TOKEN=abc"),
             ("prefixed token assignment", "GITHUB_TOKEN=abc"),
             ("personal access token assignment", "GITHUB_PAT=abc"),
+            ("basic auth assignment", "BASIC_AUTH=dXNlcjpwYXNz"),
+            ("proxy auth assignment", "proxy_auth=dXNlcjpwYXNz"),
+            (
+                "service basic auth assignment",
+                "REGISTRY_BASIC_AUTH=dXNlcjpwYXNz",
+            ),
             (
                 "lowercase personal access token assignment",
                 "gitlab_pat=abc",
