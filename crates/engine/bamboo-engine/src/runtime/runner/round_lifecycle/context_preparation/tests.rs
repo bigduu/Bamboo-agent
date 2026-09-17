@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{
     build_compression_context_blocks, build_retrieval_window_accounting_frame,
-    emit_context_pressure_notification, enforce_model_context_ledger_retention,
-    mark_manual_archive_request_consumed, maybe_apply_host_context_compression,
-    pending_manual_archive_request, prepare_round_context, surface_manual_archive_rejection,
-    LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
+    effective_context_pressure_strategy, emit_context_pressure_notification,
+    enforce_model_context_ledger_retention, mark_manual_archive_request_consumed,
+    maybe_apply_host_context_compression, pending_manual_archive_request, prepare_round_context,
+    surface_manual_archive_rejection, LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY, LAST_PRESSURE_LEVEL_KEY,
 };
 use crate::runtime::config::{AgentLoopConfig, ImageFallbackConfig, ImageFallbackMode};
 use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
@@ -5794,4 +5794,37 @@ fn context_pressure_notification_copy_is_strategy_aware() {
         assert!(!message.contains("compact_context"));
         assert!(!message.contains("Auto-compression"));
     }
+}
+
+#[test]
+fn context_pressure_notification_reports_explicit_summary_fallback_for_summarized_session() {
+    let mut session = Session::new("pressure-summary-fallback", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+        "Existing summary",
+        8,
+        2_000,
+    ));
+    let context_management = ContextManagementConfig {
+        strategy: ContextManagementStrategy::RetrievalWindow,
+        retrieval_window: RetrievalWindowContextConfig {
+            fallback_strategy: ContextManagementFallbackStrategy::Summary,
+            ..RetrievalWindowContextConfig::default()
+        },
+    };
+    let effective_strategy = effective_context_pressure_strategy(&session, &context_management);
+    assert_eq!(effective_strategy, ContextManagementStrategy::Summary);
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+    emit_context_pressure_notification(&mut session, Some(&event_tx), effective_strategy);
+    let AgentEvent::ContextPressureNotification { message, .. } = event_rx
+        .try_recv()
+        .expect("summary fallback pressure event")
+    else {
+        panic!("expected summary fallback pressure event");
+    };
+    assert!(message.contains("auto-compression"));
+    assert!(message.contains("compact_context"));
+    assert!(!message.contains("Retrieval-window"));
+    assert!(!message.contains("session_history_current"));
 }

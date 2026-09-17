@@ -23,7 +23,9 @@ use bamboo_compression::{
     RetrievalWindowPolicy, RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget,
     TokenCounter,
 };
-use bamboo_config::{ContextManagementFallbackStrategy, ContextManagementStrategy};
+use bamboo_config::{
+    ContextManagementConfig, ContextManagementFallbackStrategy, ContextManagementStrategy,
+};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, HookPayload, ModelContextResetReason, ResponseOccurrence,
     RetrievalWindowCheckpointOutcome, TokenUsageBreakdown, MAX_MODEL_CONTEXT_EVENTS,
@@ -495,6 +497,21 @@ async fn emit_context_compression_status(
             status: status.to_string(),
         })
         .await;
+}
+
+fn effective_context_pressure_strategy(
+    session: &Session,
+    context_management: &ContextManagementConfig,
+) -> ContextManagementStrategy {
+    if context_management.strategy == ContextManagementStrategy::RetrievalWindow
+        && context_management.retrieval_window.fallback_strategy
+            == ContextManagementFallbackStrategy::Summary
+        && session.conversation_summary.is_some()
+    {
+        ContextManagementStrategy::Summary
+    } else {
+        context_management.strategy
+    }
 }
 
 fn emit_context_pressure_notification(
@@ -2440,7 +2457,9 @@ pub(super) async fn prepare_round_context(
 
     // Dedup state for pressure notifications lives in session.metadata so it
     // persists across rounds (see LAST_PRESSURE_LEVEL_KEY).
-    emit_context_pressure_notification(session, event_tx, config.context_management.strategy);
+    let pressure_strategy =
+        effective_context_pressure_strategy(session, &config.context_management);
+    emit_context_pressure_notification(session, event_tx, pressure_strategy);
 
     Ok(PreparedRoundContext {
         prepared_context,

@@ -42,7 +42,8 @@ const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_MAX_MESSAGES: usize = 64;
 const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
-const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_024;
+const RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS: usize = 128;
+const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_536;
 const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
@@ -184,6 +185,28 @@ fn render_retrieval_extraction_item(item: &RetrievalExtractionSourceItem) -> Str
     )
 }
 
+fn trailing_chars(content: &str, max_chars: usize) -> String {
+    let mut suffix = content.chars().rev().take(max_chars).collect::<Vec<_>>();
+    suffix.reverse();
+    suffix.into_iter().collect()
+}
+
+fn render_retrieval_extraction_overlap(item: &RetrievalExtractionSourceItem) -> String {
+    let suffix = trailing_chars(
+        &item.content,
+        RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS,
+    );
+    let suffix = serde_json::to_string(&suffix).expect("serializing a String as JSON cannot fail");
+    format!(
+        "\n## Continuation overlap (context only; duplicated from prior batch)\n- continuation_overlap_source_item_ordinal: {}\n- continuation_overlap_session_message_ordinal: {}\n- continuation_overlap_content_segment: {}/{}\n- continuation_overlap_content_suffix: {}\n",
+        item.source_item_ordinal,
+        item.session_message_ordinal,
+        item.content_segment_ordinal,
+        item.content_segment_count,
+        suffix,
+    )
+}
+
 fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
@@ -287,10 +310,15 @@ fn build_retrieval_window_extraction_batches(
     }
 
     let batch_count = item_batches.len();
+    let mut previous_tail = None;
     item_batches
         .into_iter()
         .enumerate()
         .map(|(batch_index, items)| {
+            let continuation_overlap = previous_tail
+                .as_ref()
+                .map(render_retrieval_extraction_overlap);
+            previous_tail = items.last().map(|(item, _)| item.clone());
             let distinct_message_count = items
                 .iter()
                 .map(|(item, _)| item.session_message_ordinal)
@@ -298,7 +326,7 @@ fn build_retrieval_window_extraction_batches(
                 .len();
             let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
             rendered.push_str(&format!(
-                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- max_messages_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n\n## Source items (canonical Session order)\n",
+                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_messages_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
                 extraction_watermark
                     .map(|watermark| watermark.to_rfc3339())
                     .unwrap_or_else(|| "(none)".to_string()),
@@ -308,6 +336,7 @@ fn build_retrieval_window_extraction_batches(
                 eligible_messages.len(),
                 items.len(),
                 distinct_message_count,
+                usize::from(continuation_overlap.is_some()),
                 RETRIEVAL_EXTRACTION_MAX_MESSAGES,
                 RETRIEVAL_EXTRACTION_MAX_CHARS,
                 if batch_index + 1 < batch_count {
@@ -316,6 +345,10 @@ fn build_retrieval_window_extraction_batches(
                     "final_batch"
                 },
             ));
+            if let Some(overlap) = continuation_overlap {
+                rendered.push_str(&overlap);
+            }
+            rendered.push_str("\n## Source items (canonical Session order)\n");
             for (_, item) in items {
                 rendered.push_str(&item);
             }
@@ -1794,9 +1827,12 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert!(batches[0].contains("batch: 1/2"));
         assert!(batches[0].contains("source_items_in_batch: 64"));
+        assert!(batches[0].contains("continuation_overlap_items_in_batch: 0"));
         assert!(batches[0].contains("continuation: continues_in_next_batch"));
         assert!(batches[1].contains("batch: 2/2"));
         assert!(batches[1].contains("source_items_in_batch: 2"));
+        assert!(batches[1].contains("continuation_overlap_items_in_batch: 1"));
+        assert!(batches[1].contains("continuation_overlap_content_suffix: \"ORDER_063\""));
         assert!(batches[1].contains("continuation: final_batch"));
         assert!(batches.iter().all(|batch| {
             batch.contains("eligible_messages: 66")
@@ -2211,8 +2247,10 @@ mod tests {
         let prompts = sequence_provider.recorded_prompts();
         assert_eq!(prompts.len(), 4, "two bounded calls per attempt");
         assert!(prompts[0].contains("MULTI_BATCH_SOURCE_START"));
+        assert!(prompts[1].contains("continuation_overlap_content_suffix"));
         assert!(prompts[1].contains("MULTI_BATCH_SOURCE_END"));
         assert!(prompts[2].contains("MULTI_BATCH_SOURCE_START"));
+        assert!(prompts[3].contains("continuation_overlap_content_suffix"));
         assert!(prompts[3].contains("MULTI_BATCH_SOURCE_END"));
         assert!(
             collect_candidate_session_contexts(&context, &memory, since)
