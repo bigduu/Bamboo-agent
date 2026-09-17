@@ -712,11 +712,41 @@ fn without_lightweight_markdown_delimiters(value: &str) -> Option<String> {
         })
 }
 
+/// Produce a comparison-only view of JSON/shell text that has itself been
+/// serialized one or more times. Keep this bounded and deliberately narrow:
+/// only quote escapes are removed, and the original value remains the value
+/// that is either retained whole or rejected whole.
+fn without_serialized_quote_escapes(value: &str) -> Option<String> {
+    if !value.contains("\\\"") && !value.contains("\\'") {
+        return None;
+    }
+    let mut normalized = value.to_string();
+    for _ in 0..3 {
+        let next = normalized.replace("\\\"", "\"").replace("\\'", "'");
+        if next == normalized {
+            break;
+        }
+        normalized = next;
+    }
+    Some(normalized)
+}
+
 fn contains_non_hex_secret_like_value(value: &str) -> bool {
-    contains_secret_like_value_without_markdown_normalization(value)
+    let direct = contains_secret_like_value_without_markdown_normalization(value)
         || without_lightweight_markdown_delimiters(value)
             .as_deref()
-            .is_some_and(contains_secret_like_value_without_markdown_normalization)
+            .is_some_and(contains_secret_like_value_without_markdown_normalization);
+    if direct {
+        return true;
+    }
+    without_serialized_quote_escapes(value)
+        .as_deref()
+        .is_some_and(|normalized| {
+            contains_secret_like_value_without_markdown_normalization(normalized)
+                || without_lightweight_markdown_delimiters(normalized)
+                    .as_deref()
+                    .is_some_and(contains_secret_like_value_without_markdown_normalization)
+        })
 }
 
 pub(crate) fn contains_secret_like_value(value: &str) -> bool {
@@ -831,6 +861,7 @@ mod tests {
             ("bearer bonds", "We trade bearer bonds"),
             ("credential file flag", "deploy --password-file secrets.txt"),
             ("token budget flag", "runner --token-budget 1000"),
+            ("escaped token budget JSON", r#"{\"token_budget\":1000}"#),
             (
                 "curl user without password",
                 "curl --user alice https://example.test",
@@ -928,6 +959,14 @@ mod tests {
             ("bold password label", "**Password**: hunter2"),
             ("bold API key assignment", "**API key:** hunter2"),
             ("inline-code password label", "`password`: hunter2"),
+            (
+                "double-serialized password JSON",
+                r#"{\"password\":\"hunter2\"}"#,
+            ),
+            (
+                "multiply-serialized password JSON",
+                r#"{\\\"password\\\":\\\"hunter2\\\"}"#,
+            ),
             (
                 "authorization header",
                 "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
