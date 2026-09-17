@@ -157,6 +157,34 @@ fn cli_credential_flag_pattern() -> &'static Regex {
     })
 }
 
+fn curl_user_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\bcurl(?:\.exe)?\b[^\r\n]{0,2048}?(?:[ \t]+--user(?:[ \t]+|=)|[ \t]+-u(?:[ \t]+|=)?)[\"']?(?P<user>[^:\s\"';&|]{0,256}):(?P<password>[^\s\"',;}&|]{1,1024})"#,
+        )
+        .expect("curl user-password regex must compile")
+    })
+}
+
+fn contains_curl_user_credential(value: &str) -> bool {
+    curl_user_credential_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(password) = captures.name("password") else {
+                return false;
+            };
+            let password = password.as_str();
+            // Shell/template references do not contain a credential value.
+            // Keep the boundary focused on literal user-password pairs while
+            // still catching curl's spaced, equals, and joined short forms.
+            !password.starts_with('$')
+                && !password.starts_with('<')
+                && !password.starts_with("{{")
+                && !password.starts_with('%')
+        })
+}
+
 fn netrc_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -586,6 +614,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || redis_password_directive_pattern().is_match(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || cli_credential_flag_pattern().is_match(value)
+        || contains_curl_user_credential(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
         || mysql_identified_credential_pattern().is_match(value)
@@ -726,6 +755,15 @@ mod tests {
             ("credential file flag", "deploy --password-file secrets.txt"),
             ("token budget flag", "runner --token-budget 1000"),
             (
+                "curl user without password",
+                "curl --user alice https://example.test",
+            ),
+            (
+                "curl user-password variables",
+                "curl --user '$CURL_USER:$CURL_PASSWORD' https://example.test",
+            ),
+            ("git upstream flag", "git push -u origin:main"),
+            (
                 "machine login prose",
                 "machine learning login flows enforce password policy",
             ),
@@ -827,6 +865,26 @@ mod tests {
             ("CLI password", "deploy --password hunter2"),
             ("CLI API key", "deploy --api-key hunter2"),
             ("CLI client secret", "deploy --client-secret=hunter2"),
+            (
+                "curl long user-password flag",
+                "curl --user alice:hunter2 https://example.test",
+            ),
+            (
+                "curl equals user-password flag",
+                "curl --user=alice:hunter2 https://example.test",
+            ),
+            (
+                "curl short user-password flag",
+                "curl -u alice:hunter2 https://example.test",
+            ),
+            (
+                "curl joined short user-password flag",
+                "curl -ualice:hunter2 https://example.test",
+            ),
+            (
+                "curl password-only flag",
+                "curl -u :hunter2 https://example.test",
+            ),
             (
                 "netrc machine record",
                 "machine example.test login alice password hunter2",
