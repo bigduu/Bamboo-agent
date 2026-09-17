@@ -540,6 +540,14 @@ async fn run_capacity_gardener_once_with_store_and_resolver(
     if capacity == 0 {
         return Ok(None);
     }
+
+    // Capacity is computed from the currently recallable generation. During a
+    // history rewrite, corrected replacements coexist briefly with their
+    // frozen ancestors until every sink succeeds. Serialize the complete scan
+    // and archive pass so that transient double-counting cannot evict a valid
+    // replacement before the old generation is superseded.
+    let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
+
     let max_archivals = memory_cfg.capacity_max_archivals_per_run.max(1);
 
     let targets = gardener_targets(memory, project_context_resolver).await;
@@ -1110,7 +1118,7 @@ mod tests {
     /// L5: the capacity gardener is off (Ok(None)) unless `memory_active_capacity`
     /// is set, and when set it archives the over-capacity overflow.
     #[tokio::test]
-    async fn capacity_gardener_off_until_capacity_set_then_archives_overflow() {
+    async fn capacity_gardener_is_fenced_off_until_capacity_set_then_archives_overflow() {
         let temp = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp.path().to_path_buf());
         let session_store = Arc::new(
@@ -1178,8 +1186,25 @@ mod tests {
             config: on_config,
             provider_registry,
         };
-        let result = run_capacity_gardener_once_with_store(&ctx_on, &memory)
+        let rewrite_fence = acquire_memory_maintenance_fence(&memory)
             .await
+            .expect("history rewrite fence");
+        let capacity_context = ctx_on.clone();
+        let capacity_memory = memory.clone();
+        let capacity_gardener = tokio::spawn(async move {
+            run_capacity_gardener_once_with_store(&capacity_context, &capacity_memory).await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !capacity_gardener.is_finished(),
+            "capacity enforcement must not observe a partial history rewrite"
+        );
+        drop(rewrite_fence);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), capacity_gardener)
+            .await
+            .expect("capacity gardener should resume after rewrite completion")
+            .expect("capacity gardener task")
             .unwrap()
             .expect("capacity pass should run when enabled");
         assert_eq!(result.archived, 2, "archived the over-capacity overflow");

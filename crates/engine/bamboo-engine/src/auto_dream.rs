@@ -145,7 +145,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[_-]?key|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -5265,6 +5265,14 @@ mod tests {
                 "AZURE_STORAGE_ACCOUNT_KEY=abc",
             ),
             (
+                "Azure storage connection string account key",
+                "AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc;EndpointSuffix=core.windows.net",
+            ),
+            (
+                "service bus connection string shared access key",
+                "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
+            ),
+            (
                 "lowercase personal access token assignment",
                 "gitlab_pat=abc",
             ),
@@ -5370,6 +5378,10 @@ mod tests {
             ("PGPASSWORD", "abc"),
             ("DB_PASS", "abc"),
             ("MYSQL_PWD", "abc"),
+            (
+                "Azure storage connection",
+                "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc;EndpointSuffix=core.windows.net",
+            ),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
