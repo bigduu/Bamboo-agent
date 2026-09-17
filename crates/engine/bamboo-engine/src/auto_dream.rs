@@ -61,7 +61,10 @@ const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_CHECKPOINT_VERSION: u32 = 2;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v2";
-const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 1;
+const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 2;
+const HISTORY_REWRITE_STATE_VERSION: u32 = 1;
+const HISTORY_REWRITE_PLAN_VERSION: u32 = 1;
+const AUTO_DREAM_MEMORY_ACTOR: &str = "background-fast-model";
 const REDACTED_EXTRACTION_SOURCE: &str =
     "[sensitive content omitted before durable-memory extraction]";
 
@@ -118,7 +121,8 @@ struct CandidateSessionContext {
     session_id: String,
     project_key: Option<String>,
     topics: Vec<(String, String)>,
-    retrieval_event_key: Option<String>,
+    retrieval_source_key: Option<String>,
+    history_revision: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +156,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp|key(?:_id)?))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp)|secret_key_base))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -269,7 +273,14 @@ fn session_extraction_sources(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
     retrieval_source_acknowledged: bool,
+    pending_history_revision: Option<&str>,
 ) -> Vec<Option<String>> {
+    if pending_history_revision.is_some() {
+        return build_history_rewrite_extraction_batches(session, extraction_watermark)
+            .into_iter()
+            .map(Some)
+            .collect();
+    }
     if let Some(summary) = session.conversation_summary.as_ref() {
         let summary = sanitize_extraction_source(&summary.content);
         let mut sources = vec![Some(summary.clone())];
@@ -330,6 +341,7 @@ struct RetrievalExtractionSourceItem {
 enum ExtractionDeltaKind {
     RetrievalWindow,
     MessageRevision,
+    HistoryRewrite,
 }
 
 impl ExtractionDeltaKind {
@@ -337,6 +349,7 @@ impl ExtractionDeltaKind {
         match self {
             Self::RetrievalWindow => "Retrieval-window",
             Self::MessageRevision => "Message revision",
+            Self::HistoryRewrite => "History rewrite",
         }
     }
 
@@ -344,6 +357,7 @@ impl ExtractionDeltaKind {
         match self {
             Self::RetrievalWindow => "eligible_retrieval_events",
             Self::MessageRevision => "eligible_revision_events",
+            Self::HistoryRewrite => "current_transcript_messages",
         }
     }
 
@@ -351,6 +365,7 @@ impl ExtractionDeltaKind {
         match self {
             Self::RetrievalWindow => "retrieval_delta",
             Self::MessageRevision => "message_revision_delta",
+            Self::HistoryRewrite => "history_rewrite_delta",
         }
     }
 }
@@ -628,6 +643,76 @@ fn build_message_revision_extraction_batches(
     )
 }
 
+/// Rebuild the complete current transcript after an explicit history rewrite.
+///
+/// Memory derived from the previous transcript generation is superseded only
+/// after these bounded batches have been checkpointed and persisted. System
+/// context and generated history-search artifacts remain outside the durable
+/// extraction source, matching the retrieval-window privacy boundary.
+fn build_history_rewrite_extraction_batches(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Vec<String> {
+    let history_artifact_ids = session_history_search_artifact_ids(session);
+    let session_note_call_ids = session_note_tool_call_ids(session);
+    let eligible_messages = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter_map(|(message_index, message)| {
+            if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
+                return None;
+            }
+            let (role, content) = match message.role {
+                Role::User => ("user", sanitize_extraction_source(&message.content)),
+                Role::Assistant => ("assistant", sanitize_extraction_source(&message.content)),
+                Role::Tool => (
+                    "tool",
+                    sanitized_session_note_result(message, &session_note_call_ids)?,
+                ),
+                Role::System => return None,
+            };
+            let content = content.trim();
+            (!content.is_empty()).then_some((message_index, role, content.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    let mut source_items = Vec::new();
+    for (message_index, role, extraction_content) in &eligible_messages {
+        let segments = split_retrieval_extraction_content(extraction_content);
+        let segment_count = segments.len();
+        for (segment_index, content) in segments.into_iter().enumerate() {
+            source_items.push(RetrievalExtractionSourceItem {
+                source_item_ordinal: source_items.len() + 1,
+                session_message_ordinal: *message_index + 1,
+                role,
+                retrieval_event_ordinal: None,
+                content_segment_ordinal: segment_index + 1,
+                content_segment_count: segment_count,
+                content,
+            });
+        }
+    }
+
+    let batches = render_extraction_source_batches(
+        source_items,
+        extraction_watermark,
+        eligible_messages.len(),
+        eligible_messages.len(),
+        ExtractionDeltaKind::HistoryRewrite,
+    );
+    if batches.is_empty() {
+        vec![format!(
+            "# History rewrite extraction delta v1\n\n- extraction_watermark: {}\n- eligible_messages: 0\n- truncated: false\n- continuation: final_batch\n\n[history_rewrite_delta_final_batch]\n",
+            extraction_watermark
+                .map(|watermark| watermark.to_rfc3339())
+                .unwrap_or_else(|| "(none)".to_string())
+        )]
+    } else {
+        batches
+    }
+}
+
 fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
@@ -836,9 +921,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                 .compression_events
                 .iter()
                 .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
-        let retrieval_event_key = is_retrieval_window
-            .then(|| first_retrieval_event_key(&session))
-            .flatten();
+        let retrieval_source_key = is_retrieval_window.then(|| retrieval_source_key(&session.id));
         let retrieval_source_acknowledged = if is_retrieval_window {
             match retrieval_source_is_acknowledged(ctx, &session, extraction_watermark).await {
                 Ok(acknowledged) => acknowledged,
@@ -855,8 +938,29 @@ async fn collect_candidate_session_contexts_from_sessions(
         } else {
             false
         };
+        let history_revision = history_rewrite_revision(&session, extraction_watermark);
+        let pending_history_revision = if let Some(revision) = history_revision.as_deref() {
+            match history_rewrite_is_acknowledged(ctx, &session, extraction_watermark, revision)
+                .await
+            {
+                Ok(true) => None,
+                Ok(false) => Some(revision.to_string()),
+                Err(error) => {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "history_rewrite_state_read_failed",
+                        session_id = %entry.id,
+                        "Could not verify history-rewrite completion state; replaying the bounded current transcript: {error}"
+                    );
+                    Some(revision.to_string())
+                }
+            }
+        } else {
+            None
+        };
         if extraction_watermark.is_some_and(|watermark| watermark >= entry.updated_at)
             && (!is_retrieval_window || retrieval_source_acknowledged)
+            && pending_history_revision.is_none()
         {
             continue;
         }
@@ -864,6 +968,7 @@ async fn collect_candidate_session_contexts_from_sessions(
             &session,
             extraction_watermark,
             retrieval_source_acknowledged,
+            pending_history_revision.as_deref(),
         );
         let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
             .map(bamboo_domain::ProjectId::into_string);
@@ -884,7 +989,7 @@ async fn collect_candidate_session_contexts_from_sessions(
         {
             continue;
         }
-        if is_retrieval_window {
+        if is_retrieval_window || pending_history_revision.is_some() {
             // Each bounded retrieval source batch gets its own provider budget.
             // Session topics use a separate unit so they cannot consume the
             // eight-candidate allowance needed by a source batch.
@@ -899,7 +1004,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     entry: entry.clone(),
                     summary,
                     topics: Vec::new(),
-                    retrieval_event_key: retrieval_event_key.clone(),
+                    retrieval_source_key: retrieval_source_key.clone(),
+                    history_revision: pending_history_revision.clone(),
                 });
             }
             if !topics.is_empty() {
@@ -909,7 +1015,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     entry,
                     summary: None,
                     topics,
-                    retrieval_event_key,
+                    retrieval_source_key,
+                    history_revision: pending_history_revision,
                 });
             }
         } else {
@@ -924,7 +1031,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     } else {
                         Vec::new()
                     },
-                    retrieval_event_key: None,
+                    retrieval_source_key: None,
+                    history_revision: None,
                 });
             }
         }
@@ -990,6 +1098,10 @@ struct ExtractionCheckpoint {
     /// replay then conservatively resubmits the current topics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topics_fingerprint: Option<String>,
+    /// Explicit transcript generation whose prior Auto-Dream memories must be
+    /// superseded after this complete transaction reaches both sinks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_revision: Option<String>,
     extracted: ExtractedCandidateBatch,
 }
 
@@ -997,8 +1109,33 @@ struct ExtractionCheckpoint {
 struct RetrievalSourceState {
     version: u32,
     session_key: String,
-    first_retrieval_event_key: String,
+    retrieval_source_key: String,
     source_updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryRewriteState {
+    version: u32,
+    session_key: String,
+    history_revision: String,
+    source_updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct MemoryReplacementTarget {
+    id: String,
+    scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryRewritePlan {
+    version: u32,
+    session_key: String,
+    history_revision: String,
+    source_updated_at: String,
+    replacement_targets: Vec<MemoryReplacementTarget>,
 }
 
 #[derive(Debug)]
@@ -1016,6 +1153,7 @@ struct PendingExtractionBatch {
     batch_index: usize,
     batch_count: usize,
     topics_fingerprint: String,
+    history_revision: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1032,7 +1170,7 @@ struct ReplayedExtractionSource {
 }
 
 #[derive(Debug)]
-struct RebuiltRetrievalContexts {
+struct RebuiltSessionContexts {
     contexts: Vec<CandidateSessionContext>,
     topics_fingerprint: String,
 }
@@ -1094,6 +1232,7 @@ fn build_pending_extraction_batches(
                     .get(session.session_id.as_str())
                     .cloned()
                     .unwrap_or_else(|| extraction_topics_fingerprint(&[])),
+                history_revision: session.history_revision.clone(),
             }
         })
         .collect()
@@ -1195,6 +1334,7 @@ fn checkpoint_matches_pending_batch(
             .topics_fingerprint
             .as_deref()
             .is_none_or(|fingerprint| fingerprint == pending.topics_fingerprint)
+        && checkpoint.history_revision == pending.history_revision
 }
 
 fn extraction_checkpoint_session_key(session_id: &str) -> String {
@@ -1204,21 +1344,56 @@ fn extraction_checkpoint_session_key(session_id: &str) -> String {
     hex::encode(digest.finalize())
 }
 
-fn first_retrieval_event_key(session: &Session) -> Option<String> {
-    let event = session
-        .compression_events
-        .iter()
-        .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
-        .min_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
-        })?;
+fn retrieval_source_key(session_id: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"bamboo-auto-dream-first-retrieval-event-v1\0");
-    digest.update(event.id.as_bytes());
-    digest.update(b"\0");
-    digest.update(event.created_at.to_rfc3339().as_bytes());
+    digest.update(b"bamboo-auto-dream-retrieval-source-v2\0");
+    digest.update(session_id.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+/// Identify the current explicitly rewritten transcript without adding a
+/// second Session cursor. The existing model-context boundary covers delete,
+/// truncate, and restore operations; message revision metadata makes repeated
+/// PATCH edits distinct even while those repairs coalesce into one pending
+/// model-context epoch.
+fn history_rewrite_revision(
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Option<String> {
+    let explicit_boundary = session.model_context_state.as_ref().filter(|state| {
+        state.last_reset_reason
+            == Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
+    });
+    let revised_messages = session
+        .messages
+        .iter()
+        .filter_map(|message| {
+            let updated_at = message.content_updated_at()?;
+            Some((message, updated_at))
+        })
+        .collect::<Vec<_>>();
+    let has_unacknowledged_revision = revised_messages.iter().any(|(_, updated_at)| {
+        extraction_watermark.is_none_or(|watermark| *updated_at > watermark)
+    });
+    if explicit_boundary.is_none() && !has_unacknowledged_revision {
+        return None;
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-history-rewrite-v1\0");
+    digest.update(session.id.as_bytes());
+    if let Some(state) = explicit_boundary {
+        digest.update(b"\0model-context\0");
+        digest.update(state.prefix_epoch.to_be_bytes());
+    }
+    for (message, updated_at) in revised_messages {
+        digest.update(b"\0message\0");
+        digest.update(message.id.as_bytes());
+        digest.update(b"\0");
+        digest.update(updated_at.to_rfc3339().as_bytes());
+        digest.update(b"\0");
+        digest.update(Sha256::digest(message.content.as_bytes()));
+    }
     Some(hex::encode(digest.finalize()))
 }
 
@@ -1232,10 +1407,10 @@ fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -
 fn retrieval_source_state_path(
     ctx: &AutoDreamContext,
     session_id: &str,
-    first_retrieval_event_key: &str,
+    retrieval_source_key: &str,
 ) -> PathBuf {
     extraction_checkpoint_session_dir(ctx, session_id).join(format!(
-        "retrieval-source-v{RETRIEVAL_SOURCE_STATE_VERSION}-{first_retrieval_event_key}.json"
+        "retrieval-source-v{RETRIEVAL_SOURCE_STATE_VERSION}-{retrieval_source_key}.json"
     ))
 }
 
@@ -1244,9 +1419,14 @@ async fn retrieval_source_is_acknowledged(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
 ) -> Result<bool, String> {
-    let Some(event_key) = first_retrieval_event_key(session) else {
+    if !session
+        .compression_events
+        .iter()
+        .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
+    {
         return Ok(false);
-    };
+    }
+    let event_key = retrieval_source_key(&session.id);
     let path = retrieval_source_state_path(ctx, &session.id, &event_key);
     let raw = match tokio::fs::read(&path).await {
         Ok(raw) => raw,
@@ -1264,7 +1444,7 @@ async fn retrieval_source_is_acknowledged(
         .with_timezone(&Utc);
     if state.version != RETRIEVAL_SOURCE_STATE_VERSION
         || state.session_key != extraction_checkpoint_session_key(&session.id)
-        || state.first_retrieval_event_key != event_key
+        || state.retrieval_source_key != event_key
         || source_updated_at > session.updated_at
     {
         return Err("AutoDream retrieval source state identity mismatch".to_string());
@@ -1275,20 +1455,20 @@ async fn retrieval_source_is_acknowledged(
 async fn write_retrieval_source_state(
     ctx: &AutoDreamContext,
     session_id: &str,
-    first_retrieval_event_key: &str,
+    retrieval_source_key: &str,
     source_updated_at: &str,
 ) -> Result<(), String> {
     let state = RetrievalSourceState {
         version: RETRIEVAL_SOURCE_STATE_VERSION,
         session_key: extraction_checkpoint_session_key(session_id),
-        first_retrieval_event_key: first_retrieval_event_key.to_string(),
+        retrieval_source_key: retrieval_source_key.to_string(),
         source_updated_at: source_updated_at.to_string(),
     };
     DateTime::parse_from_rfc3339(source_updated_at)
         .map_err(|error| format!("invalid retrieval source watermark: {error}"))?;
     let bytes = serde_json::to_vec_pretty(&state)
         .map_err(|error| format!("failed to serialize retrieval source state: {error}"))?;
-    let path = retrieval_source_state_path(ctx, session_id, first_retrieval_event_key);
+    let path = retrieval_source_state_path(ctx, session_id, retrieval_source_key);
     let parent = path
         .parent()
         .ok_or_else(|| "AutoDream retrieval source state has no parent directory".to_string())?;
@@ -1322,7 +1502,7 @@ async fn write_retrieval_source_state(
                 })?;
             if existing.version != state.version
                 || existing.session_key != state.session_key
-                || existing.first_retrieval_event_key != state.first_retrieval_event_key
+                || existing.retrieval_source_key != state.retrieval_source_key
                 || DateTime::parse_from_rfc3339(&existing.source_updated_at).is_err()
             {
                 return Err("existing AutoDream retrieval source state mismatch".to_string());
@@ -1332,6 +1512,367 @@ async fn write_retrieval_source_state(
         Err(error) => Err(format!(
             "failed to persist AutoDream retrieval source state: {error}"
         )),
+    }
+}
+
+fn history_rewrite_state_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    history_revision: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!(
+        "history-rewrite-state-v{HISTORY_REWRITE_STATE_VERSION}-{history_revision}.json"
+    ))
+}
+
+fn history_rewrite_plan_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    history_revision: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!(
+        "history-rewrite-plan-v{HISTORY_REWRITE_PLAN_VERSION}-{history_revision}.json"
+    ))
+}
+
+fn validate_history_revision(history_revision: &str) -> Result<(), String> {
+    if history_revision.len() == 64
+        && history_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        Ok(())
+    } else {
+        Err("invalid AutoDream history-rewrite revision".to_string())
+    }
+}
+
+async fn write_json_create_once(
+    path: &Path,
+    bytes: &[u8],
+    temporary_prefix: &str,
+) -> Result<bool, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "AutoDream state path has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create AutoDream state directory: {error}"))?;
+    let temporary_path = parent.join(format!(".{temporary_prefix}.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::hard_link(&temporary_path, path).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temporary_path).await;
+    match write_result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(format!("failed to persist AutoDream state: {error}")),
+    }
+}
+
+async fn history_rewrite_is_acknowledged(
+    ctx: &AutoDreamContext,
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+    history_revision: &str,
+) -> Result<bool, String> {
+    validate_history_revision(history_revision)?;
+    let path = history_rewrite_state_path(ctx, &session.id, history_revision);
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "failed to read AutoDream history-rewrite state: {error}"
+            ));
+        }
+    };
+    let state = serde_json::from_slice::<HistoryRewriteState>(&raw)
+        .map_err(|error| format!("failed to parse AutoDream history-rewrite state: {error}"))?;
+    let source_updated_at = DateTime::parse_from_rfc3339(&state.source_updated_at)
+        .map_err(|error| format!("invalid history-rewrite source timestamp: {error}"))?
+        .with_timezone(&Utc);
+    if state.version != HISTORY_REWRITE_STATE_VERSION
+        || state.session_key != extraction_checkpoint_session_key(&session.id)
+        || state.history_revision != history_revision
+        || source_updated_at > session.updated_at
+    {
+        return Err("AutoDream history-rewrite state identity mismatch".to_string());
+    }
+    Ok(extraction_watermark.is_some_and(|watermark| watermark >= source_updated_at))
+}
+
+async fn write_history_rewrite_state(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    history_revision: &str,
+    source_updated_at: &str,
+) -> Result<(), String> {
+    validate_history_revision(history_revision)?;
+    DateTime::parse_from_rfc3339(source_updated_at)
+        .map_err(|error| format!("invalid history-rewrite source watermark: {error}"))?;
+    let state = HistoryRewriteState {
+        version: HISTORY_REWRITE_STATE_VERSION,
+        session_key: extraction_checkpoint_session_key(session_id),
+        history_revision: history_revision.to_string(),
+        source_updated_at: source_updated_at.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("failed to serialize history-rewrite state: {error}"))?;
+    let path = history_rewrite_state_path(ctx, session_id, history_revision);
+    if write_json_create_once(&path, &bytes, "history-rewrite-state").await? {
+        return Ok(());
+    }
+    let existing = tokio::fs::read(&path)
+        .await
+        .map_err(|error| format!("failed to reread history-rewrite state: {error}"))?;
+    let existing = serde_json::from_slice::<HistoryRewriteState>(&existing)
+        .map_err(|error| format!("failed to parse existing history-rewrite state: {error}"))?;
+    if existing.version != state.version
+        || existing.session_key != state.session_key
+        || existing.history_revision != state.history_revision
+        || existing.source_updated_at != state.source_updated_at
+    {
+        return Err("existing AutoDream history-rewrite state mismatch".to_string());
+    }
+    Ok(())
+}
+
+async fn read_history_rewrite_plan(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    history_revision: &str,
+    current_source_updated_at: &str,
+) -> Result<Option<HistoryRewritePlan>, String> {
+    validate_history_revision(history_revision)?;
+    let path = history_rewrite_plan_path(ctx, session_id, history_revision);
+    let raw = match tokio::fs::read(path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read AutoDream history-rewrite plan: {error}"
+            ));
+        }
+    };
+    let plan = serde_json::from_slice::<HistoryRewritePlan>(&raw)
+        .map_err(|error| format!("failed to parse AutoDream history-rewrite plan: {error}"))?;
+    let plan_source = DateTime::parse_from_rfc3339(&plan.source_updated_at)
+        .map_err(|error| format!("invalid history-rewrite plan timestamp: {error}"))?;
+    let current_source = DateTime::parse_from_rfc3339(current_source_updated_at)
+        .map_err(|error| format!("invalid current history-rewrite timestamp: {error}"))?;
+    if plan.version != HISTORY_REWRITE_PLAN_VERSION
+        || plan.session_key != extraction_checkpoint_session_key(session_id)
+        || plan.history_revision != history_revision
+        || plan_source > current_source
+        || plan.replacement_targets.iter().any(|target| {
+            target.id.trim().is_empty()
+                || target.scope == MemoryScope::Session
+                || (target.scope == MemoryScope::Project
+                    && target.project_key.as_deref().is_none_or(str::is_empty))
+                || (target.scope != MemoryScope::Project && target.project_key.is_some())
+        })
+    {
+        return Err("AutoDream history-rewrite plan identity mismatch".to_string());
+    }
+    Ok(Some(plan))
+}
+
+async fn write_history_rewrite_plan(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    plan: &HistoryRewritePlan,
+) -> Result<bool, String> {
+    validate_history_revision(&plan.history_revision)?;
+    let bytes = serde_json::to_vec_pretty(plan)
+        .map_err(|error| format!("failed to serialize history-rewrite plan: {error}"))?;
+    let path = history_rewrite_plan_path(ctx, session_id, &plan.history_revision);
+    write_json_create_once(&path, &bytes, "history-rewrite-plan").await
+}
+
+async fn collect_history_rewrite_replacement_targets(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    session: &CandidateSessionContext,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+) -> Result<Vec<MemoryReplacementTarget>, String> {
+    let mut scopes = Vec::new();
+    if current_store_is_project_scoped {
+        let project_key = session.project_key.as_deref().ok_or_else(|| {
+            "project-scoped history rewrite is missing project identity".to_string()
+        })?;
+        scopes.push((
+            memory.clone(),
+            MemoryScope::Project,
+            Some(project_key.to_string()),
+        ));
+    } else {
+        scopes.push((memory.clone(), MemoryScope::Global, None));
+        if project_resolver.is_some() {
+            if let Some(project_key) = session.project_key.as_deref() {
+                let project_id =
+                    bamboo_domain::ProjectId::parse(project_key.to_string()).map_err(|error| {
+                        format!("invalid history-rewrite Project identity: {error}")
+                    })?;
+                scopes.push((
+                    ctx.memory.for_project(&project_id),
+                    MemoryScope::Project,
+                    Some(project_key.to_string()),
+                ));
+            }
+        }
+    }
+
+    let mut targets = HashSet::new();
+    for (store, scope, project_key) in scopes {
+        let documents = store
+            .list_memory_documents(scope, project_key.as_deref())
+            .await
+            .map_err(|error| {
+                format!("failed to inspect AutoDream memories before history rewrite: {error}")
+            })?;
+        for document in documents {
+            let is_auto_dream =
+                document.frontmatter.updated_by.actor.as_deref() == Some(AUTO_DREAM_MEMORY_ACTOR);
+            let has_session_source = document
+                .frontmatter
+                .sources
+                .iter()
+                .any(|source| source.kind == "session" && source.id == session.session_id);
+            if document.frontmatter.status == DurableMemoryStatus::Active
+                && is_auto_dream
+                && has_session_source
+            {
+                targets.insert(MemoryReplacementTarget {
+                    id: document.frontmatter.id,
+                    scope: document.frontmatter.scope,
+                    project_key: document.frontmatter.project_key,
+                });
+            }
+        }
+    }
+    let mut targets = targets.into_iter().collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.project_key.cmp(&right.project_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(targets)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_or_create_history_rewrite_plan(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    session: &CandidateSessionContext,
+    history_revision: &str,
+    source_updated_at: &str,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+) -> Result<HistoryRewritePlan, String> {
+    if let Some(plan) = read_history_rewrite_plan(
+        ctx,
+        &session.session_id,
+        history_revision,
+        source_updated_at,
+    )
+    .await?
+    {
+        return Ok(plan);
+    }
+    let plan = HistoryRewritePlan {
+        version: HISTORY_REWRITE_PLAN_VERSION,
+        session_key: extraction_checkpoint_session_key(&session.session_id),
+        history_revision: history_revision.to_string(),
+        source_updated_at: source_updated_at.to_string(),
+        replacement_targets: collect_history_rewrite_replacement_targets(
+            ctx,
+            memory,
+            session,
+            project_resolver,
+            current_store_is_project_scoped,
+        )
+        .await?,
+    };
+    if write_history_rewrite_plan(ctx, &session.session_id, &plan).await? {
+        return Ok(plan);
+    }
+    read_history_rewrite_plan(
+        ctx,
+        &session.session_id,
+        history_revision,
+        source_updated_at,
+    )
+    .await?
+    .ok_or_else(|| "concurrent history-rewrite plan disappeared before reuse".to_string())
+}
+
+async fn supersede_history_rewrite_targets(
+    ctx: &AutoDreamContext,
+    plan: &HistoryRewritePlan,
+) -> Result<(), String> {
+    for target in &plan.replacement_targets {
+        let store = match target.scope {
+            MemoryScope::Global => ctx.memory.clone(),
+            MemoryScope::Project => {
+                let project_key = target.project_key.as_deref().ok_or_else(|| {
+                    "history-rewrite Project target is missing project identity".to_string()
+                })?;
+                let project_id = bamboo_domain::ProjectId::parse(project_key.to_string())
+                    .map_err(|error| format!("invalid replacement Project identity: {error}"))?;
+                ctx.memory.for_project(&project_id)
+            }
+            MemoryScope::Session => {
+                return Err("history-rewrite plan unexpectedly contains Session memory".to_string())
+            }
+        };
+        store
+            .archive_memory(
+                &target.id,
+                target.project_key.as_deref(),
+                DurableMemoryStatus::Superseded,
+                Some("superseded after canonical Session history rewrite"),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to supersede AutoDream memory '{}' after history rewrite: {error}",
+                    target.id
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn remove_history_rewrite_plan(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    history_revision: &str,
+) {
+    let path = history_rewrite_plan_path(ctx, session_id, history_revision);
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                target: DREAM_TRACING_TARGET,
+                event = "history_rewrite_plan_cleanup_failed",
+                session_id,
+                history_revision,
+                "Could not remove an acknowledged history-rewrite plan: {error}"
+            );
+        }
     }
 }
 
@@ -1499,6 +2040,7 @@ async fn load_extraction_checkpoint_transactions(
                 || batch.source_updated_at != first.source_updated_at
                 || batch.batch_count != first.batch_count
                 || batch.topics_fingerprint != first.topics_fingerprint
+                || batch.history_revision != first.history_revision
         }) {
             return Err("AutoDream extraction transaction metadata mismatch".to_string());
         }
@@ -1582,41 +2124,39 @@ async fn remove_superseded_extraction_checkpoints(
     Ok(())
 }
 
-async fn rebuild_retrieval_contexts_after_checkpoint_replay(
+async fn rebuild_session_contexts_after_checkpoint_replay(
     ctx: &AutoDreamContext,
     template: &CandidateSessionContext,
     acknowledged_watermark: DateTime<Utc>,
     acknowledged_topics_fingerprint: Option<&str>,
-) -> Result<RebuiltRetrievalContexts, String> {
+) -> Result<RebuiltSessionContexts, String> {
     let session = ctx
         .storage
         .load_session(&template.session_id)
         .await
         .map_err(|error| {
             format!(
-                "failed to reload retrieval source after checkpoint replay for {}: {error}",
+                "failed to reload Session source after checkpoint replay for {}: {error}",
                 template.session_id
             )
         })?
         .ok_or_else(|| {
             format!(
-                "retrieval source disappeared after checkpoint replay for {}",
+                "Session source disappeared after checkpoint replay for {}",
                 template.session_id
             )
         })?;
-    if session.conversation_summary.is_some()
-        || !session
+    let is_retrieval_window = session.conversation_summary.is_none()
+        && session
             .compression_events
             .iter()
-            .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
-    {
-        return Err(format!(
-            "retrieval source mode changed during checkpoint replay for {}",
-            template.session_id
-        ));
-    }
-    let retrieval_event_key = first_retrieval_event_key(&session)
-        .ok_or_else(|| "retrieval source lost its first boundary identity".to_string())?;
+            .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+    let retrieval_source_key = is_retrieval_window.then(|| retrieval_source_key(&session.id));
+    let retrieval_source_acknowledged = if is_retrieval_window {
+        retrieval_source_is_acknowledged(ctx, &session, Some(acknowledged_watermark)).await?
+    } else {
+        false
+    };
     let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
         .map(bamboo_domain::ProjectId::into_string);
     let topics = sanitized_session_topics(
@@ -1625,7 +2165,7 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
             .await
             .map_err(|error| {
                 format!(
-                    "failed to reload retrieval Session topics after checkpoint replay for {}: {error}",
+                    "failed to reload Session topics after checkpoint replay for {}: {error}",
                     template.session_id
                 )
             })?,
@@ -1637,39 +2177,91 @@ async fn rebuild_retrieval_contexts_after_checkpoint_replay(
     entry.title.clone_from(&session.title);
     entry.updated_at = session.updated_at;
 
+    let pending_history_revision = if let Some(revision) =
+        history_rewrite_revision(&session, Some(acknowledged_watermark))
+    {
+        if history_rewrite_is_acknowledged(ctx, &session, Some(acknowledged_watermark), &revision)
+            .await?
+        {
+            None
+        } else {
+            Some(revision)
+        }
+    } else {
+        None
+    };
+
     // Rebuild the newer canonical message delta against the watermark that
     // replay just acknowledged; reusing a pre-replay transition batch would
     // submit old messages to the provider again and invite stochastic duplicates.
-    let mut contexts =
-        build_retrieval_window_extraction_batches(&session, Some(acknowledged_watermark), true)
-            .into_iter()
-            .filter(|summary| !summary.trim().is_empty())
-            .map(|summary| CandidateSessionContext {
+    let summaries = session_extraction_sources(
+        &session,
+        Some(acknowledged_watermark),
+        retrieval_source_acknowledged,
+        pending_history_revision.as_deref(),
+    );
+    let mut contexts = Vec::new();
+    if is_retrieval_window || pending_history_revision.is_some() {
+        for summary in summaries.into_iter().filter(|summary| {
+            summary
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+        }) {
+            contexts.push(CandidateSessionContext {
                 entry: entry.clone(),
-                summary: Some(summary),
+                summary,
                 session_id: template.session_id.clone(),
                 project_key: project_key.clone(),
                 topics: Vec::new(),
-                retrieval_event_key: Some(retrieval_event_key.clone()),
-            })
-            .collect::<Vec<_>>();
+                retrieval_source_key: retrieval_source_key.clone(),
+                history_revision: pending_history_revision.clone(),
+            });
+        }
+    } else {
+        for (source_index, summary) in summaries.into_iter().enumerate() {
+            contexts.push(CandidateSessionContext {
+                entry: entry.clone(),
+                summary,
+                session_id: template.session_id.clone(),
+                project_key: project_key.clone(),
+                topics: if source_index == 0 && topics_changed {
+                    topics.clone()
+                } else {
+                    Vec::new()
+                },
+                retrieval_source_key: None,
+                history_revision: None,
+            });
+        }
+    }
 
     // Topic files do not expose per-topic timestamps. New checkpoints carry a
     // fingerprint of the complete sanitized snapshot, so unchanged topics stay
     // deduplicated while any post-checkpoint edit is submitted as its own unit.
     // Legacy checkpoints lack the fingerprint and therefore replay current
     // topics conservatively rather than advancing past a possibly unseen note.
-    if topics_changed && !topics.is_empty() {
+    if (is_retrieval_window || pending_history_revision.is_some())
+        && topics_changed
+        && !topics.is_empty()
+    {
         contexts.push(CandidateSessionContext {
             entry,
             summary: None,
             session_id: template.session_id.clone(),
             project_key,
             topics,
-            retrieval_event_key: Some(retrieval_event_key),
+            retrieval_source_key,
+            history_revision: pending_history_revision,
         });
     }
-    Ok(RebuiltRetrievalContexts {
+    contexts.retain(|context| {
+        !context.topics.is_empty()
+            || context
+                .summary
+                .as_deref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    });
+    Ok(RebuiltSessionContexts {
         contexts,
         topics_fingerprint: current_topics_fingerprint,
     })
@@ -1783,7 +2375,33 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 .batches
                 .first()
                 .and_then(|batch| batch.topics_fingerprint.clone());
+            let history_revision = transaction
+                .batches
+                .first()
+                .and_then(|batch| batch.history_revision.clone());
             if acknowledged_watermark.is_none_or(|watermark| watermark < source_watermark) {
+                let history_plan = if let Some(revision) = history_revision.as_deref() {
+                    Some(
+                        read_history_rewrite_plan(
+                            ctx,
+                            session_id,
+                            revision,
+                            &transaction.source_updated_at,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            format!(
+                                "history-rewrite checkpoint for {session_id} has no frozen replacement plan"
+                            )
+                        })?,
+                    )
+                } else {
+                    None
+                };
+                let replacement_targets = history_plan
+                    .as_ref()
+                    .map(|plan| plan.replacement_targets.iter().cloned().collect())
+                    .unwrap_or_default();
                 for checkpoint in transaction.batches {
                     let writes = persist_durable_candidate_batch_with_project_resolver(
                         ctx,
@@ -1793,15 +2411,28 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         checkpoint.extracted,
                         project_resolver,
                         current_store_is_project_scoped,
+                        &replacement_targets,
                     )
                     .await?;
                     total_writes.memory = total_writes.memory.saturating_add(writes.memory);
                     total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
                 }
+                if let (Some(revision), Some(plan)) =
+                    (history_revision.as_deref(), history_plan.as_ref())
+                {
+                    supersede_history_rewrite_targets(ctx, plan).await?;
+                    write_history_rewrite_state(
+                        ctx,
+                        session_id,
+                        revision,
+                        &transaction.source_updated_at,
+                    )
+                    .await?;
+                }
                 if let Some(event_key) = extraction_sessions
                     .iter()
                     .filter(|session| session.session_id.as_str() == session_id.as_str())
-                    .find_map(|session| session.retrieval_event_key.as_deref())
+                    .find_map(|session| session.retrieval_source_key.as_deref())
                 {
                     write_retrieval_source_state(
                         ctx,
@@ -1828,6 +2459,9 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             for checkpoint_id in checkpoint_ids {
                 remove_extraction_checkpoint(ctx, session_id, &checkpoint_id).await;
             }
+            if let Some(revision) = history_revision.as_deref() {
+                remove_history_rewrite_plan(ctx, session_id, revision).await;
+            }
         }
         remove_superseded_extraction_checkpoints(ctx, session_id, &HashSet::new()).await?;
         if let Some(replayed_source) = replayed_source {
@@ -1835,39 +2469,33 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         }
     }
 
-    let mut retrieval_sessions_to_rebuild = replayed_sources_by_session
+    let mut sessions_to_rebuild = replayed_sources_by_session
         .iter()
         .filter_map(|(session_id, replayed_source)| {
             extraction_sessions
                 .iter()
                 .find(|session| session.session_id == *session_id)
-                .filter(|session| {
-                    session.retrieval_event_key.is_some()
-                        && session.entry.updated_at > replayed_source.watermark
-                })
+                .filter(|session| session.entry.updated_at > replayed_source.watermark)
                 .map(|_| session_id.clone())
         })
         .collect::<Vec<_>>();
-    retrieval_sessions_to_rebuild.sort();
-    if !retrieval_sessions_to_rebuild.is_empty() {
-        let rebuild_set = retrieval_sessions_to_rebuild
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
+    sessions_to_rebuild.sort();
+    if !sessions_to_rebuild.is_empty() {
+        let rebuild_set = sessions_to_rebuild.iter().cloned().collect::<HashSet<_>>();
         let mut rebuilt_contexts = Vec::new();
         let mut rebuilt_topics_fingerprints = HashMap::new();
-        for session_id in &retrieval_sessions_to_rebuild {
+        for session_id in &sessions_to_rebuild {
             let template = extraction_sessions
                 .iter()
                 .find(|session| session.session_id == *session_id)
                 .cloned()
                 .ok_or_else(|| {
-                    format!("missing retrieval context after checkpoint replay for {session_id}")
+                    format!("missing Session context after checkpoint replay for {session_id}")
                 })?;
             let replayed_source = replayed_sources_by_session
                 .get(session_id)
                 .expect("rebuild Session came from acknowledged watermark map");
-            let rebuilt = rebuild_retrieval_contexts_after_checkpoint_replay(
+            let rebuilt = rebuild_session_contexts_after_checkpoint_replay(
                 ctx,
                 &template,
                 replayed_source.watermark,
@@ -1903,6 +2531,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 batch_index: 0,
                 batch_count: 0,
                 topics_fingerprint,
+                history_revision: extraction_sessions[context_index].history_revision.clone(),
             });
         }
         assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
@@ -1916,6 +2545,35 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     });
     if pending_batches.is_empty() {
         return Ok(total_writes);
+    }
+
+    // Freeze the set of old Auto-Dream memories before any provider call or
+    // replacement write. A retry must never reclassify partially persisted new
+    // facts as old targets.
+    let mut history_plans: HashMap<(String, String), HistoryRewritePlan> = HashMap::new();
+    for pending in &pending_batches {
+        let Some(history_revision) = pending.history_revision.as_deref() else {
+            continue;
+        };
+        let session = &extraction_sessions[pending.context_index];
+        let key = (session.session_id.clone(), history_revision.to_string());
+        if history_plans.contains_key(&key) {
+            continue;
+        }
+        let source_updated_at = source_updated_at_by_session
+            .get(&session.session_id)
+            .expect("every pending Session has a source watermark");
+        let plan = load_or_create_history_rewrite_plan(
+            ctx,
+            memory,
+            session,
+            history_revision,
+            source_updated_at,
+            project_resolver,
+            current_store_is_project_scoped,
+        )
+        .await?;
+        history_plans.insert(key, plan);
     }
 
     let mut prepared_batches = Vec::with_capacity(pending_batches.len());
@@ -1964,6 +2622,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     batch_index: pending.batch_index,
                     batch_count: pending.batch_count,
                     topics_fingerprint: Some(pending.topics_fingerprint.clone()),
+                    history_revision: pending.history_revision.clone(),
                     extracted: extracted.clone(),
                 };
                 if write_extraction_checkpoint(&checkpoint_path, &checkpoint).await? {
@@ -1998,6 +2657,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // before either sink starts. If a later sink write fails, the retry reuses
     // these exact candidates instead of asking the model to rephrase them.
     for batch in prepared_batches {
+        let session = &extraction_sessions[batch.context_index];
+        let replacement_targets = session
+            .history_revision
+            .as_ref()
+            .and_then(|revision| history_plans.get(&(session.session_id.clone(), revision.clone())))
+            .map(|plan| plan.replacement_targets.iter().cloned().collect())
+            .unwrap_or_default();
         let writes = persist_durable_candidate_batch_with_project_resolver(
             ctx,
             memory,
@@ -2006,6 +2672,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             batch.extracted,
             project_resolver,
             current_store_is_project_scoped,
+            &replacement_targets,
         )
         .await?;
         total_writes.memory = total_writes.memory.saturating_add(writes.memory);
@@ -2020,10 +2687,21 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         let source_updated_at = source_updated_at_by_session
             .get(&session_id)
             .expect("every checkpointed Session has a source watermark");
+        let history_revision = extraction_sessions
+            .iter()
+            .filter(|session| session.session_id == session_id)
+            .find_map(|session| session.history_revision.as_deref());
+        if let Some(revision) = history_revision {
+            let plan = history_plans
+                .get(&(session_id.clone(), revision.to_string()))
+                .ok_or_else(|| format!("missing frozen history-rewrite plan for {session_id}"))?;
+            supersede_history_rewrite_targets(ctx, plan).await?;
+            write_history_rewrite_state(ctx, &session_id, revision, source_updated_at).await?;
+        }
         if let Some(event_key) = extraction_sessions
             .iter()
             .filter(|session| session.session_id.as_str() == session_id.as_str())
-            .find_map(|session| session.retrieval_event_key.as_deref())
+            .find_map(|session| session.retrieval_source_key.as_deref())
         {
             write_retrieval_source_state(ctx, &session_id, event_key, source_updated_at).await?;
         }
@@ -2035,6 +2713,9 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             })?;
         for checkpoint_id in checkpoint_ids {
             remove_extraction_checkpoint(ctx, &session_id, &checkpoint_id).await;
+        }
+        if let Some(revision) = history_revision {
+            remove_history_rewrite_plan(ctx, &session_id, revision).await;
         }
     }
 
@@ -2153,6 +2834,7 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     extracted: ExtractedCandidateBatch,
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
+    replacement_targets: &HashSet<MemoryReplacementTarget>,
 ) -> Result<ExtractionWrites, String> {
     let ExtractedCandidateBatch {
         memory: candidates,
@@ -2303,6 +2985,13 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             let fingerprints = existing
                 .into_iter()
                 .filter(|document| document.frontmatter.status == DurableMemoryStatus::Active)
+                .filter(|document| {
+                    !replacement_targets.contains(&MemoryReplacementTarget {
+                        id: document.frontmatter.id.clone(),
+                        scope: document.frontmatter.scope,
+                        project_key: document.frontmatter.project_key.clone(),
+                    })
+                })
                 .filter_map(|document| {
                     let source_session_id = document
                         .frontmatter
@@ -3269,7 +3958,7 @@ mod tests {
 
         let recent_outline = derive_session_outline(&session).expect("recent outline");
         assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
-        let sources = session_extraction_sources(&session, None, false);
+        let sources = session_extraction_sources(&session, None, false, None);
         assert_eq!(sources.len(), 2);
         let delta = sources
             .iter()
@@ -3355,7 +4044,7 @@ mod tests {
 
         let recent_outline = derive_session_outline(&session).expect("recent outline");
         assert!(!recent_outline.contains("CORRECTED_DURABLE_FACT_AFTER_PATCH"));
-        let sources = session_extraction_sources(&session, Some(test_time(30)), false);
+        let sources = session_extraction_sources(&session, Some(test_time(30)), false, None);
         assert_eq!(sources.len(), 2);
         assert!(sources
             .iter()
@@ -3415,6 +4104,9 @@ mod tests {
             ("mixed-case token budget field", "Max_Token=1000"),
             ("plain pin concept", "pin is a dependency reference"),
             ("ordinary suffix word", "monkey=abc"),
+            ("project identifier", "PROJECT_KEY=abc"),
+            ("primary identifier", "PRIMARY_KEY=id"),
+            ("cache identifier", "CACHE_KEY=user-id"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -3450,6 +4142,7 @@ mod tests {
             ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
             ("lowercase prefixed token assignment", "github_token=abc"),
             ("secret key assignment", "STRIPE_SECRET_KEY=abc"),
+            ("secret key base assignment", "SECRET_KEY_BASE=abc"),
             ("lowercase secret key assignment", "stripe_secret_key=abc"),
             ("key id assignment", "AWS_ACCESS_KEY_ID=abc"),
             (
@@ -3523,6 +4216,7 @@ mod tests {
             ("GITHUB_TOKEN", "abc"),
             ("github_token", "abc"),
             ("STRIPE_SECRET_KEY", "abc"),
+            ("SECRET_KEY_BASE", "abc"),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
@@ -3587,6 +4281,7 @@ mod tests {
             batch_index: 0,
             batch_count: 1,
             topics_fingerprint: Some(extraction_topics_fingerprint(&[])),
+            history_revision: None,
             extracted: extracted.clone(),
         };
         let stale_path = extraction_checkpoint_path(&context, "session-a", &stale_id);
@@ -3869,7 +4564,7 @@ mod tests {
             .messages
             .push(Message::user("retrieval content must not override summary"));
         assert_eq!(
-            session_extraction_sources(&summary_session, None, false),
+            session_extraction_sources(&summary_session, None, false, None),
             vec![Some("EXACT_SUMMARY_SOURCE".to_string())]
         );
 
@@ -3877,7 +4572,7 @@ mod tests {
         ordinary
             .messages
             .push(Message::user("ORDINARY_RECENT_OUTLINE"));
-        let sources = session_extraction_sources(&ordinary, None, false);
+        let sources = session_extraction_sources(&ordinary, None, false, None);
         assert_eq!(sources.len(), 1);
         let source = sources[0].as_deref().expect("outline");
         assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
@@ -4103,6 +4798,274 @@ mod tests {
                 .await
                 .is_empty(),
             "the explicit marker must make migration one-shot"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_source_identity_survives_derived_history_reset() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let watermark = Utc::now() - chrono::Duration::seconds(10);
+        let mut session = Session::new("stable-retrieval-source", "model");
+        session.compression_events.push(retrieval_event(
+            "first-derived-event",
+            watermark - chrono::Duration::seconds(2),
+        ));
+        let mut old_message = message_at(
+            Message::user("OLD_SOURCE_MUST_NOT_REPLAY_FROM_EVENT_ID_CHURN"),
+            "old-message",
+            watermark - chrono::Duration::minutes(5),
+        );
+        old_message.compressed = true;
+        old_message.compressed_by_event_id = Some("first-derived-event".to_string());
+        session.messages.push(old_message);
+        session.updated_at = watermark;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted(&session.id, &watermark.to_rfc3339())
+            .await
+            .expect("seed extraction watermark");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory,
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let stable_key = retrieval_source_key(&session.id);
+        write_retrieval_source_state(&context, &session.id, &stable_key, &watermark.to_rfc3339())
+            .await
+            .expect("write stable retrieval source state");
+
+        session.clear_derived_context_state();
+        session.compression_events.push(retrieval_event(
+            "replacement-derived-event",
+            watermark + chrono::Duration::seconds(1),
+        ));
+        session.messages[0].compressed = true;
+        session.messages[0].compressed_by_event_id = Some("replacement-derived-event".to_string());
+        session.updated_at = watermark + chrono::Duration::seconds(2);
+
+        assert_eq!(retrieval_source_key(&session.id), stable_key);
+        assert!(
+            retrieval_source_is_acknowledged(&context, &session, Some(watermark))
+                .await
+                .expect("read stable retrieval state")
+        );
+        assert!(
+            build_retrieval_window_extraction_batches(&session, Some(watermark), true).is_empty(),
+            "a regenerated derived event must not turn old messages into a first-transition replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_history_rewrite_supersedes_only_prior_auto_dream_memories() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let old_watermark = Utc::now() - chrono::Duration::minutes(1);
+        let rewritten_at = old_watermark + chrono::Duration::seconds(10);
+        let mut session = Session::new("history-rewrite-memory", "model");
+        session.title = "History rewrite memory".to_string();
+        session.messages.push(message_at(
+            Message::assistant("The database is PostgreSQL.", None),
+            "assistant-database",
+            old_watermark - chrono::Duration::seconds(5),
+        ));
+        session.updated_at = old_watermark;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let old_auto = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Canonical database",
+                "The database is PostgreSQL.",
+                &["database".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed old AutoDream memory");
+        let manual = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Reference,
+                "Manual database note",
+                "Keep the migration checklist available.",
+                &["manual".to_string()],
+                Some(&session.id),
+                "user",
+                false,
+                None,
+            )
+            .await
+            .expect("seed manual memory");
+        memory
+            .mark_session_extracted(&session.id, &old_watermark.to_rfc3339())
+            .await
+            .expect("seed extraction watermark");
+
+        session.messages[0].content = "The database is SQLite.".to_string();
+        session.messages[0].mark_content_updated_at(rewritten_at);
+        session.clear_derived_context_state();
+        session.updated_at = rewritten_at;
+        storage
+            .save_session(&session)
+            .await
+            .expect("save rewritten Session");
+
+        let response = serde_json::json!({
+            "candidates": [{
+                "title": "Canonical database",
+                "type": "project",
+                "scope": "global",
+                "content": "The database is SQLite.",
+                "tags": ["database"],
+                "session_id": "history-rewrite-memory"
+            }],
+            "ledger_candidates": [{
+                "title": "Verify corrected database",
+                "kind": "todo",
+                "excerpt": "Confirm the SQLite migration.",
+                "session_id": "history-rewrite-memory",
+                "confidence": "high"
+            }],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![response]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = old_watermark - chrono::Duration::hours(1);
+        let contexts = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(contexts.len(), 1);
+        assert!(contexts[0].history_revision.is_some());
+        assert!(contexts[0]
+            .summary
+            .as_deref()
+            .is_some_and(|source| source.contains("The database is SQLite.")));
+        assert!(!contexts[0]
+            .summary
+            .as_deref()
+            .is_some_and(|source| source.contains("The database is PostgreSQL.")));
+
+        let ledger = LedgerStore::new(temp_dir.path());
+        tokio::fs::write(temp_dir.path().join("ledger"), b"blocks ledger directory")
+            .await
+            .expect("create ledger failure fixture");
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect_err("ledger failure must keep the frozen replacement plan retryable");
+
+        let interim = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list memories after partial rewrite");
+        assert_eq!(
+            interim
+                .iter()
+                .filter(|document| document.frontmatter.status == DurableMemoryStatus::Active)
+                .count(),
+            3,
+            "old, manual, and replacement memories stay active until both sinks succeed"
+        );
+        let history_revision = contexts[0]
+            .history_revision
+            .as_deref()
+            .expect("history revision");
+        let plan_path =
+            history_rewrite_plan_path(&context, "history-rewrite-memory", history_revision);
+        let plan_json = tokio::fs::read_to_string(&plan_path)
+            .await
+            .expect("read frozen replacement plan");
+        assert!(!plan_json.contains("PostgreSQL"));
+        assert!(!plan_json.contains("SQLite"));
+
+        tokio::fs::remove_file(temp_dir.path().join("ledger"))
+            .await
+            .expect("repair ledger fixture");
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("checkpoint retry must complete the corrected rewrite");
+        assert!(!plan_path.exists());
+
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list reconciled memories");
+        let old = documents
+            .iter()
+            .find(|document| document.frontmatter.id == old_auto.frontmatter.id)
+            .expect("old AutoDream memory remains auditable");
+        assert_eq!(old.frontmatter.status, DurableMemoryStatus::Superseded);
+        let manual = documents
+            .iter()
+            .find(|document| document.frontmatter.id == manual.frontmatter.id)
+            .expect("manual memory remains present");
+        assert_eq!(manual.frontmatter.status, DurableMemoryStatus::Active);
+        assert!(documents.iter().any(|document| {
+            document.frontmatter.status == DurableMemoryStatus::Active
+                && document.body == "The database is SQLite."
+        }));
+        assert!(!documents.iter().any(|document| {
+            document.frontmatter.status == DurableMemoryStatus::Active
+                && document.body == "The database is PostgreSQL."
+        }));
+        assert_eq!(sequence_provider.recorded_prompts().len(), 1);
+        assert_eq!(
+            ledger
+                .list_records(LedgerScope::Global, None, &RecordFilter::default())
+                .await
+                .expect("list retry ledger records")
+                .len(),
+            1
+        );
+        assert!(
+            collect_candidate_session_contexts(&context, &memory, since)
+                .await
+                .is_empty(),
+            "the same history generation must be acknowledged exactly once"
         );
     }
 
@@ -4606,14 +5569,14 @@ mod tests {
             .last_extracted_at
             .is_none());
 
-        let retrieval_event_key = contexts[0]
-            .retrieval_event_key
+        let retrieval_source_key = contexts[0]
+            .retrieval_source_key
             .as_deref()
             .expect("retrieval context has a source identity");
         write_retrieval_source_state(
             &context,
             "sink-retry",
-            retrieval_event_key,
+            retrieval_source_key,
             &contexts[0].entry.updated_at.to_rfc3339(),
         )
         .await
@@ -4757,7 +5720,7 @@ mod tests {
         .await;
         let template = contexts.first().expect("topic context");
 
-        let rebuilt = rebuild_retrieval_contexts_after_checkpoint_replay(
+        let rebuilt = rebuild_session_contexts_after_checkpoint_replay(
             &context,
             template,
             acknowledged_watermark,
@@ -4771,7 +5734,7 @@ mod tests {
         assert!(extraction_prompt(&rebuilt.contexts[0]).contains("TOPIC_ONLY_AFTER_CHECKPOINT"));
 
         let current_fingerprint = rebuilt.topics_fingerprint;
-        let unchanged = rebuild_retrieval_contexts_after_checkpoint_replay(
+        let unchanged = rebuild_session_contexts_after_checkpoint_replay(
             &context,
             template,
             acknowledged_watermark,
