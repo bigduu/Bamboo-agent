@@ -213,11 +213,39 @@ fn known_secret_pattern() -> &'static Regex {
 fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:\b(?:proxy-)?authorization\s*:\s*[^\r\n]+|\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+)",
-        )
+        Regex::new(r"(?i)\b(?:proxy-)?authorization\s*:\s*[^\r\n]+")
             .expect("authorization secret regex must compile")
     })
+}
+
+fn bare_authorization_scheme_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:bearer|basic)\s+(?P<token>[a-z0-9._~+/=-]{12,})")
+            .expect("bare authorization scheme regex must compile")
+    })
+}
+
+fn contains_authorization_secret(value: &str) -> bool {
+    authorization_secret_pattern().is_match(value)
+        || bare_authorization_scheme_pattern()
+            .captures_iter(value)
+            .any(|captures| {
+                captures.name("token").is_some_and(|token| {
+                    let token = token.as_str();
+                    let has_non_letter = token.bytes().any(|byte| !byte.is_ascii_alphabetic());
+                    let lowercase_count = token
+                        .bytes()
+                        .filter(|byte| byte.is_ascii_lowercase())
+                        .count();
+                    let uppercase_count = token
+                        .bytes()
+                        .filter(|byte| byte.is_ascii_uppercase())
+                        .count();
+                    let has_mixed_case = lowercase_count >= 2 && uppercase_count >= 2;
+                    has_non_letter || has_mixed_case
+                })
+            })
 }
 
 fn credential_url_pattern() -> &'static Regex {
@@ -283,7 +311,7 @@ fn contains_secret_like_value(value: &str) -> bool {
         || generic_secret_assignment_pattern().is_match(value)
         || contains_environment_credential_assignment(value)
         || known_secret_pattern().is_match(value)
-        || authorization_secret_pattern().is_match(value)
+        || contains_authorization_secret(value)
         || credential_url_pattern().is_match(value)
         || contains_high_entropy_secret_token(value)
 }
@@ -5220,6 +5248,16 @@ mod tests {
                 "ordinary cookie preference",
                 "My favorite cookie is chocolate",
             ),
+            ("ordinary basic plan", "I prefer the basic plan"),
+            ("ordinary bearer bonds", "We trade bearer bonds"),
+            (
+                "ordinary basic authentication prose",
+                "Basic authentication is enabled for the internal service",
+            ),
+            (
+                "ordinary title-case basic authentication prose",
+                "Basic Authentication is enabled for the internal service",
+            ),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -5243,6 +5281,11 @@ mod tests {
                 "token authorization",
                 "Authorization: Token 0123456789abcdef0123456789abcdef",
             ),
+            (
+                "bare bearer credential",
+                "Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            ),
+            ("bare basic credential", "Basic dXNlcjpwYXNz"),
             (
                 "hex session cookie",
                 "session cookie: 0123456789abcdef0123456789abcdef",
