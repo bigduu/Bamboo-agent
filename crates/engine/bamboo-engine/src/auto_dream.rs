@@ -130,9 +130,19 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:api[_-]?key|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id)|cookie)[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
+    })
+}
+
+fn generic_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:(?:^|[\s(\"'])(?:secret|token|pin)[\"']?\s*(?::|=)|(?:^|[^a-z0-9])(?:my|our|your)\s+(?:secret|token|pin)[\"']?\s+\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+        )
+        .expect("generic secret assignment regex must compile")
     })
 }
 
@@ -186,6 +196,7 @@ fn contains_secret_like_value(value: &str) -> bool {
         || value.contains("-----BEGIN EC PRIVATE KEY-----")
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
+        || generic_secret_assignment_pattern().is_match(value)
         || known_secret_pattern().is_match(value)
         || authorization_secret_pattern().is_match(value)
         || credential_url_pattern().is_match(value)
@@ -2690,6 +2701,9 @@ mod tests {
             ("tokenizer word", "tokenizer is tiktoken"),
             ("pinning word", "pinning is deterministic"),
             ("token suffix", "tokenization is lexical"),
+            ("plain token concept", "token is a lexical unit"),
+            ("token budget field", "max_token=1000"),
+            ("plain pin concept", "pin is a dependency reference"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -2715,6 +2729,8 @@ mod tests {
             ),
             ("natural-language password", "my password is hunter2"),
             ("natural-language passcode", "my passcode is 1234"),
+            ("possessive token", "my token is abc"),
+            ("standalone token assignment", "TOKEN=abc"),
             ("pin", "PIN: 1234"),
             ("three-digit pin", "PIN: 123"),
             (
