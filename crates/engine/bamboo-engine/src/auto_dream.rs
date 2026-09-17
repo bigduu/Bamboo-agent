@@ -214,17 +214,7 @@ fn credential_url_pattern() -> &'static Regex {
 }
 
 fn looks_like_technical_path_token(token: &str) -> bool {
-    if token.starts_with('/') || token.matches('/').count() >= 2 {
-        return true;
-    }
-    let final_segment = token.rsplit('/').next().unwrap_or(token);
-    final_segment
-        .rsplit_once('.')
-        .is_some_and(|(stem, suffix)| {
-            !stem.is_empty()
-                && (1..=12).contains(&suffix.len())
-                && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
+    token.starts_with('/') || token.matches('/').count() >= 2
 }
 
 fn ascii_shannon_entropy(token: &str) -> f64 {
@@ -1911,10 +1901,12 @@ fn collect_memory_lineage_preservation_targets<'a>(
                 .filter(|source_id| source_id.as_str() != rewritten_session_id)
                 .cloned(),
         );
-        if lineage_session_ids.is_empty() {
-            // A manual/API lineage branch has no canonical Session to replay.
-            // Preserve its exact already-sanitized durable document instead of
-            // asking the extraction model to reconstruct content it never saw.
+        if !lineage_session_ids.contains(rewritten_session_id) {
+            // This ancestor branch is wholly unaffected by the rewritten
+            // Session. Reactivate its exact already-sanitized document before
+            // superseding the mixed descendant. Canonical Session replay may
+            // additionally refresh it, but an empty or lossy model response
+            // can no longer erase the still-valid branch.
             memory_reactivation_targets.insert(MemoryReplacementTarget {
                 id: ancestor.frontmatter.id.clone(),
                 scope: ancestor.frontmatter.scope,
@@ -5074,6 +5066,10 @@ mod tests {
                 "standalone high-entropy token",
                 "mF9Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je",
             ),
+            (
+                "high-entropy token with environment suffix",
+                "mF9Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je.prod",
+            ),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
             assert!(
@@ -6424,21 +6420,8 @@ mod tests {
         })
         .to_string();
         let region_response = serde_json::json!({
-            "candidates": [{
-                "title": "Deployment region",
-                "type": "project",
-                "scope": "global",
-                "content": "The deployment region is eu-west-1.",
-                "tags": ["region"],
-                "session_id": "mixed-lineage-region"
-            }],
-            "ledger_candidates": [{
-                "title": "Must not escape preservation",
-                "kind": "todo",
-                "excerpt": "This provider output is intentionally invalid for preservation.",
-                "session_id": "mixed-lineage-region",
-                "confidence": "high"
-            }],
+            "candidates": [],
+            "ledger_candidates": [],
             "source_exhausted": true
         })
         .to_string();
@@ -6471,7 +6454,7 @@ mod tests {
         )
         .await
         .expect("rewrite and preservation transaction succeeds");
-        assert_eq!(writes.memory, 2);
+        assert_eq!(writes.memory, 1);
         assert_eq!(writes.ledger, 0);
 
         let documents = memory
@@ -6502,6 +6485,15 @@ mod tests {
         assert_eq!(
             manual_memory.frontmatter.status,
             DurableMemoryStatus::Active
+        );
+        let region_memory = documents
+            .iter()
+            .find(|document| document.frontmatter.id == region_memory.frontmatter.id)
+            .expect("unaffected Session ancestor remains auditable");
+        assert_eq!(
+            region_memory.frontmatter.status,
+            DurableMemoryStatus::Active,
+            "an empty preservation extraction must retain the exact unaffected lineage"
         );
 
         let region_state = memory
