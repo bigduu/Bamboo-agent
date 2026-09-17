@@ -44,19 +44,36 @@ const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
 
+fn sanitize_title_and_optional_source(
+    title: &str,
+    source: Option<&str>,
+) -> (String, Option<String>) {
+    match source {
+        Some(source) => {
+            let (title, source) = sanitize_extraction_source_pair(title, source);
+            (title, Some(source))
+        }
+        None => (sanitize_extraction_source(title), None),
+    }
+}
+
 fn to_consolidation_sessions(
     entries: &[(SessionIndexEntry, Option<String>)],
 ) -> Vec<ConsolidationSessionInfo> {
     entries
         .iter()
-        .map(|(entry, summary)| ConsolidationSessionInfo {
-            id: entry.id.clone(),
-            title: entry.title.clone(),
-            kind: format!("{:?}", entry.kind),
-            updated_at: entry.updated_at.to_rfc3339(),
-            message_count: entry.message_count,
-            last_run_status: entry.last_run_status.clone(),
-            summary: summary.clone(),
+        .map(|(entry, summary)| {
+            let (title, summary) =
+                sanitize_title_and_optional_source(&entry.title, summary.as_deref());
+            ConsolidationSessionInfo {
+                id: entry.id.clone(),
+                title,
+                kind: format!("{:?}", entry.kind),
+                updated_at: entry.updated_at.to_rfc3339(),
+                message_count: entry.message_count,
+                last_run_status: entry.last_run_status.clone(),
+                summary,
+            }
         })
         .collect()
 }
@@ -118,13 +135,8 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
 }
 
 fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
-    let (title, summary) = match session.summary.as_deref() {
-        Some(summary) => {
-            let (title, summary) = sanitize_extraction_source_pair(&session.entry.title, summary);
-            (title, Some(summary))
-        }
-        None => (sanitize_extraction_source(&session.entry.title), None),
-    };
+    let (title, summary) =
+        sanitize_title_and_optional_source(&session.entry.title, session.summary.as_deref());
     let topics = session
         .topics
         .iter()
@@ -2024,6 +2036,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_auto_dream_once_updates_dream_and_persists_candidates() {
+        const TITLE_SECRET: &str = "API key: hunter2";
+        const SUMMARY_SECRET: &str = "private key: hunter2";
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
 
@@ -2047,7 +2061,7 @@ mod tests {
         )));
 
         let mut session = bamboo_agent_core::Session::new("session-dream-run", "model");
-        session.title = "Dream run test".to_string();
+        session.title = TITLE_SECRET.to_string();
         session.metadata.insert(
             "workspace_path".to_string(),
             temp_dir
@@ -2057,7 +2071,7 @@ mod tests {
                 .to_string(),
         );
         session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
-            "Stable user preference discussed.",
+            SUMMARY_SECRET,
             4,
             200,
         ));
@@ -2099,6 +2113,17 @@ mod tests {
             prompts[1].contains("User prefers concise answers"),
             "Dream synthesis must re-read canonical MEMORY after extraction"
         );
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert!(
+                !prompt.contains(TITLE_SECRET),
+                "private Session title reached AutoDream provider call {index}"
+            );
+            assert!(
+                !prompt.contains(SUMMARY_SECRET),
+                "private Session summary reached AutoDream provider call {index}"
+            );
+            assert!(prompt.contains(crate::auto_dream_privacy::REDACTED_EXTRACTION_SOURCE));
+        }
 
         let dream = read_test_dream(&memory, MemoryScope::Global, None)
             .await

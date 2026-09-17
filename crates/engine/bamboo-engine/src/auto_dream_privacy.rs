@@ -18,7 +18,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[_-]?key|account[_-]?key|shared[_-]?access[_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -382,6 +382,9 @@ mod tests {
                 "API key",
                 "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
             ),
+            ("spaced API key", "API key: hunter2"),
+            ("spaced private key", "private key: hunter2"),
+            ("spaced secret key", "secret key: hunter2"),
             (
                 "authorization header",
                 "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
