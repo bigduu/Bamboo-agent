@@ -65,7 +65,7 @@ const EXTRACTION_CHECKPOINT_VERSION: u32 = 2;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v2";
 const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 2;
 const HISTORY_REWRITE_STATE_VERSION: u32 = 1;
-const HISTORY_REWRITE_PLAN_VERSION: u32 = 3;
+const HISTORY_REWRITE_PLAN_VERSION: u32 = 4;
 const HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS: usize = 64;
 const AUTO_DREAM_MEMORY_ACTOR: &str = "background-fast-model";
 const GARDENER_MEMORY_ACTORS: [&str; 2] = ["memory-gardener", "memory-dedup-gardener"];
@@ -155,9 +155,30 @@ fn generic_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:(?:^|[\s(\"'])(?:secret|token|pin)[\"']?\s*(?::|=)|(?:^|[^a-z0-9])(?:my|our|your)\s+(?:secret|token|pin)[\"']?\s+\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)|(?:^|[^a-z0-9])(?:my|our|your)\s+(?:secret|token)[\"']?\s+\bis\b)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("generic secret assignment regex must compile")
+    })
+}
+
+fn pin_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s+(?:is|:|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=|\bis\b)|pin[\s_-]+(?:code|number)\s*(?::|=|\bis\b))\s*[\"']?[^\s\"',;}]+"#,
+        )
+        .expect("credential-context PIN assignment regex must compile")
+    })
+}
+
+fn standalone_pin_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        // Preserve the privacy-safe `PIN: 1234` candidate-title boundary
+        // without treating lowercase program variables or prose such as
+        // `connector pin: 13` as credentials.
+        Regex::new(r#"(?m)^[ \t]*(?:[-*][ \t]+)?PIN[ \t]*:[ \t]*[\"']?[0-9]{3,12}\b"#)
+            .expect("standalone PIN credential regex must compile")
     })
 }
 
@@ -360,6 +381,8 @@ fn contains_secret_like_value(value: &str) -> bool {
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
         || generic_secret_assignment_pattern().is_match(value)
+        || pin_credential_assignment_pattern().is_match(value)
+        || standalone_pin_credential_pattern().is_match(value)
         || contains_environment_credential_assignment(value)
         || known_secret_pattern().is_match(value)
         || contains_authorization_secret(value)
@@ -1283,6 +1306,10 @@ struct LedgerReplacementTarget {
     scope: LedgerScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_key: Option<String>,
+    /// Mutation watermark frozen when the rewrite plan is created. A retry
+    /// may cancel this record only while the user-visible Ledger authority is
+    /// still at the same logical revision.
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1895,6 +1922,7 @@ async fn read_history_rewrite_plan(
         })
         || plan.ledger_replacement_targets.iter().any(|target| {
             target.id.trim().is_empty()
+                || DateTime::parse_from_rfc3339(&target.updated_at).is_err()
                 || (target.scope == LedgerScope::Project
                     && target.project_key.as_deref().is_none_or(str::is_empty))
                 || (target.scope != LedgerScope::Project && target.project_key.is_some())
@@ -1902,6 +1930,13 @@ async fn read_history_rewrite_plan(
         || plan
             .ledger_replacement_targets
             .iter()
+            .map(|target| {
+                (
+                    target.id.as_str(),
+                    target.scope,
+                    target.project_key.as_deref(),
+                )
+            })
             .collect::<HashSet<_>>()
             .len()
             != plan.ledger_replacement_targets.len()
@@ -2379,10 +2414,53 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
     })
 }
 
+async fn revalidate_history_rewrite_ledger_targets(
+    ledger: &LedgerStore,
+    session_id: &str,
+    targets: &[LedgerReplacementTarget],
+) -> Result<Vec<LedgerReplacementTarget>, String> {
+    let mut current_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let expected_updated_at = DateTime::parse_from_rfc3339(&target.updated_at)
+            .map_err(|error| format!("invalid frozen Ledger timestamp: {error}"))?
+            .with_timezone(&Utc);
+        let document = ledger
+            .get_record(
+                target.scope,
+                target.project_key.as_deref(),
+                &target.id,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to revalidate AutoDream Ledger record '{}' before history rewrite retry: {error}",
+                    target.id
+                )
+            })?;
+        let Some(document) = document else {
+            continue;
+        };
+        let record = &document.record;
+        if record.id == target.id
+            && record.scope == target.scope
+            && record.project_key == target.project_key
+            && record.updated_at == expected_updated_at
+            && !record.status.is_terminal()
+            && record.source.created_by == RecordActor::Extractor
+            && record.source.session_id.as_deref() == Some(session_id)
+            && record.tags.iter().any(|tag| tag == "suggested")
+        {
+            current_targets.push(target.clone());
+        }
+    }
+    Ok(current_targets)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn revalidate_history_rewrite_plan(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
+    ledger: &LedgerStore,
     session: &CandidateSessionContext,
     plan: &HistoryRewritePlan,
     project_resolver: Option<&ProjectContextResolver>,
@@ -2469,6 +2547,12 @@ async fn revalidate_history_rewrite_plan(
             HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS
         ));
     }
+    revalidated.ledger_replacement_targets = revalidate_history_rewrite_ledger_targets(
+        ledger,
+        &session.session_id,
+        &plan.ledger_replacement_targets,
+    )
+    .await?;
     Ok(revalidated)
 }
 
@@ -2495,6 +2579,7 @@ async fn load_or_create_history_rewrite_plan(
         return revalidate_history_rewrite_plan(
             ctx,
             memory,
+            ledger,
             session,
             &plan,
             project_resolver,
@@ -2527,6 +2612,7 @@ async fn load_or_create_history_rewrite_plan(
             id: document.record.id,
             scope: document.record.scope,
             project_key: document.record.project_key,
+            updated_at: document.record.updated_at.to_rfc3339(),
         })
         .collect::<Vec<_>>();
     ledger_replacement_targets.sort_by(|left, right| {
@@ -2561,6 +2647,7 @@ async fn load_or_create_history_rewrite_plan(
     revalidate_history_rewrite_plan(
         ctx,
         memory,
+        ledger,
         session,
         &plan,
         project_resolver,
@@ -3293,6 +3380,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         revalidate_history_rewrite_plan(
                             ctx,
                             memory,
+                            ledger,
                             session_context,
                             &plan,
                             project_resolver,
@@ -4171,6 +4259,7 @@ async fn persist_ledger_candidates(
                 id: document.record.id.clone(),
                 scope: document.record.scope,
                 project_key: document.record.project_key.clone(),
+                updated_at: document.record.updated_at.to_rfc3339(),
             })
         })
         .map(|doc| normalized_ledger_title(&doc.record.title))
@@ -5289,6 +5378,9 @@ mod tests {
             ("ordinary bypass setting", "BYPASS=enabled"),
             ("ordinary compass setting", "COMPASS=north"),
             ("hardware pin setting", "GPIO_PIN=13"),
+            ("connector pin setting", "connector pin: 13"),
+            ("code pin assignment", "let pin = 13"),
+            ("bare code pin assignment", "pin = 13"),
             ("compiler pass setting", "COMPILER_PASS=inline"),
             ("authentication mode", "AUTH_MODE=basic"),
             ("authentication provider", "AUTH_PROVIDER=internal"),
@@ -5396,6 +5488,8 @@ mod tests {
             ),
             ("pin", "PIN: 1234"),
             ("three-digit pin", "PIN: 123"),
+            ("possessive pin", "my PIN is 1234"),
+            ("account pin", "account pin: 1234"),
             (
                 "credential URL",
                 "postgres://user:password-value@example.test/database",
@@ -7261,6 +7355,7 @@ mod tests {
         let revalidated = revalidate_history_rewrite_plan(
             &context,
             &memory,
+            &LedgerStore::new(temp_dir.path()),
             &session_context,
             &plan,
             None,
@@ -7318,6 +7413,119 @@ mod tests {
                 DurableMemoryStatus::Active
             );
         }
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_retry_preserves_a_user_modified_ledger_target() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let session = Session::new("ledger-retry-user-edit", "model");
+        storage.save_session(&session).await.expect("save Session");
+        let entry = session_store
+            .get_index_entry(&session.id)
+            .await
+            .expect("Session index entry");
+        let memory = MemoryStore::new(temp_dir.path());
+        let ledger = LedgerStore::new(temp_dir.path());
+        let mut record = LedgerRecord::new(
+            "rec_ledger_retry_user_edit",
+            RecordKind::Todo,
+            "Submit the report",
+        );
+        record.tags = vec!["suggested".to_string()];
+        record.source.created_by = RecordActor::Extractor;
+        record.source.session_id = Some(session.id.clone());
+        let frozen = ledger
+            .write_record(record, None)
+            .await
+            .expect("seed suggested Ledger record");
+        let frozen_updated_at = frozen.record.updated_at.to_rfc3339();
+        let plan = HistoryRewritePlan {
+            version: HISTORY_REWRITE_PLAN_VERSION,
+            session_key: extraction_checkpoint_session_key(&session.id),
+            history_revision: "history-revision".to_string(),
+            source_updated_at: session.updated_at.to_rfc3339(),
+            replacement_targets: Vec::new(),
+            memory_reactivation_targets: Vec::new(),
+            preservation_session_ids: Vec::new(),
+            ledger_replacement_targets: vec![LedgerReplacementTarget {
+                id: frozen.record.id.clone(),
+                scope: frozen.record.scope,
+                project_key: frozen.record.project_key.clone(),
+                updated_at: frozen_updated_at.clone(),
+            }],
+        };
+        assert_eq!(
+            revalidate_history_rewrite_ledger_targets(
+                &ledger,
+                &session.id,
+                &plan.ledger_replacement_targets,
+            )
+            .await
+            .expect("unchanged frozen Ledger target is valid"),
+            plan.ledger_replacement_targets
+        );
+
+        // The failed attempt has released the root maintenance fence. A user
+        // now edits the frozen record before AutoDream retries the transaction.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut edited_record = frozen.record;
+        edited_record.title = "Submit the report after user review".to_string();
+        let edited = ledger
+            .write_record(edited_record, None)
+            .await
+            .expect("apply user Ledger edit");
+        assert_ne!(edited.record.updated_at.to_rfc3339(), frozen_updated_at);
+
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let session_context = CandidateSessionContext {
+            entry,
+            summary: Some("corrected history".to_string()),
+            session_id: session.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let revalidated = revalidate_history_rewrite_plan(
+            &context,
+            &memory,
+            &ledger,
+            &session_context,
+            &plan,
+            None,
+            false,
+            &HashSet::new(),
+        )
+        .await
+        .expect("revalidate Ledger target after user edit");
+        assert!(revalidated.ledger_replacement_targets.is_empty());
+
+        supersede_history_rewrite_targets(&context, &ledger, &revalidated)
+            .await
+            .expect("complete retry without overriding user Ledger authority");
+        let current = ledger
+            .get_record(LedgerScope::Global, None, "rec_ledger_retry_user_edit")
+            .await
+            .expect("read user-edited Ledger record")
+            .expect("user-edited Ledger record remains");
+        assert_eq!(current.record.title, "Submit the report after user review");
+        assert_eq!(current.record.status, RecordStatus::Open);
     }
 
     #[tokio::test]
