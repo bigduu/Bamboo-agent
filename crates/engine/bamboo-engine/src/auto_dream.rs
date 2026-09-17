@@ -213,6 +213,38 @@ fn credential_url_pattern() -> &'static Regex {
     })
 }
 
+fn looks_like_technical_path_token(token: &str) -> bool {
+    if token.starts_with('/') || token.matches('/').count() >= 2 {
+        return true;
+    }
+    let final_segment = token.rsplit('/').next().unwrap_or(token);
+    final_segment
+        .rsplit_once('.')
+        .is_some_and(|(stem, suffix)| {
+            !stem.is_empty()
+                && (1..=12).contains(&suffix.len())
+                && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+fn ascii_shannon_entropy(token: &str) -> f64 {
+    let mut counts = [0usize; 128];
+    for byte in token.bytes() {
+        if byte.is_ascii() {
+            counts[byte as usize] += 1;
+        }
+    }
+    let length = token.len() as f64;
+    counts
+        .into_iter()
+        .filter(|count| *count > 0)
+        .map(|count| {
+            let probability = count as f64 / length;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
 fn contains_high_entropy_secret_token(value: &str) -> bool {
     value
         .split(|character: char| {
@@ -225,7 +257,13 @@ fn contains_high_entropy_secret_token(value: &str) -> bool {
             {
                 return false;
             }
-            token.bytes().any(|byte| byte.is_ascii_lowercase())
+            if looks_like_technical_path_token(token) {
+                return false;
+            }
+            let distinct_bytes = token.bytes().collect::<HashSet<_>>().len();
+            distinct_bytes >= 12
+                && ascii_shannon_entropy(token) >= 4.0
+                && token.bytes().any(|byte| byte.is_ascii_lowercase())
                 && token.bytes().any(|byte| byte.is_ascii_uppercase())
                 && token.bytes().any(|byte| byte.is_ascii_digit())
         })
@@ -1902,12 +1940,139 @@ struct HistoryRewriteMemoryTargets {
     preservation_session_ids: Vec<String>,
 }
 
+type ExtractionMemoryFingerprint = (DurableMemoryType, String, String, String);
+
+fn extraction_candidate_fingerprint(
+    candidate: &DurableExtractionCandidate,
+) -> Option<ExtractionMemoryFingerprint> {
+    let memory_type = parse_candidate_type(&candidate.kind)?;
+    let title = candidate.title.trim();
+    let content = candidate.content.trim();
+    let session_id = candidate.session_id.as_deref()?.trim();
+    if title.is_empty() || content.is_empty() || session_id.is_empty() {
+        return None;
+    }
+    Some((
+        memory_type,
+        title.to_string(),
+        content.to_string(),
+        session_id.to_string(),
+    ))
+}
+
+fn memory_document_extraction_fingerprint(
+    document: &DurableMemoryDocument,
+) -> Option<ExtractionMemoryFingerprint> {
+    let session_id = document
+        .frontmatter
+        .sources
+        .iter()
+        .find(|source| source.kind == "session")?
+        .id
+        .trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some((
+        document.frontmatter.r#type,
+        document.frontmatter.title.trim().to_string(),
+        document.body.trim().to_string(),
+        session_id.to_string(),
+    ))
+}
+
+fn memory_lineage_contains_frozen_target<'a>(
+    document: &'a DurableMemoryDocument,
+    documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
+    frozen_targets: &HashSet<MemoryReplacementTarget>,
+    visited: &mut HashSet<&'a str>,
+) -> bool {
+    if !visited.insert(document.frontmatter.id.as_str()) {
+        return false;
+    }
+    if frozen_targets.contains(&MemoryReplacementTarget {
+        id: document.frontmatter.id.clone(),
+        scope: document.frontmatter.scope,
+        project_key: document.frontmatter.project_key.clone(),
+    }) {
+        return true;
+    }
+    document
+        .frontmatter
+        .relations
+        .supersedes
+        .iter()
+        .filter_map(|id| documents_by_id.get(id.as_str()).copied())
+        .any(|ancestor| {
+            memory_lineage_contains_frozen_target(
+                ancestor,
+                documents_by_id,
+                frozen_targets,
+                visited,
+            )
+        })
+}
+
+fn memory_lineage_contains_retry_replacement<'a>(
+    document: &'a DurableMemoryDocument,
+    documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
+    retry_replacements: &HashSet<ExtractionMemoryFingerprint>,
+    visited: &mut HashSet<&'a str>,
+) -> bool {
+    if !visited.insert(document.frontmatter.id.as_str()) {
+        return false;
+    }
+    if memory_document_extraction_fingerprint(document)
+        .is_some_and(|fingerprint| retry_replacements.contains(&fingerprint))
+    {
+        return true;
+    }
+    document
+        .frontmatter
+        .relations
+        .supersedes
+        .iter()
+        .filter_map(|id| documents_by_id.get(id.as_str()).copied())
+        .any(|ancestor| {
+            memory_lineage_contains_retry_replacement(
+                ancestor,
+                documents_by_id,
+                retry_replacements,
+                visited,
+            )
+        })
+}
+
 async fn collect_history_rewrite_replacement_targets(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
     session: &CandidateSessionContext,
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
+) -> Result<HistoryRewriteMemoryTargets, String> {
+    let frozen_targets = HashSet::new();
+    let retry_replacements = HashSet::new();
+    collect_history_rewrite_replacement_targets_for_retry(
+        ctx,
+        memory,
+        session,
+        project_resolver,
+        current_store_is_project_scoped,
+        &frozen_targets,
+        &retry_replacements,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_history_rewrite_replacement_targets_for_retry(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    session: &CandidateSessionContext,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+    frozen_targets: &HashSet<MemoryReplacementTarget>,
+    retry_replacements: &HashSet<ExtractionMemoryFingerprint>,
 ) -> Result<HistoryRewriteMemoryTargets, String> {
     // AutoDream can emit a Global candidate even while the explicit Project
     // maintenance path owns the current extraction store. Always inspect the
@@ -1960,8 +2125,21 @@ async fn collect_history_rewrite_replacement_targets(
                 && lineage_session_ids.contains(&session.session_id);
             let is_gardener_descendant = memory_actor_is(document, &GARDENER_MEMORY_ACTORS)
                 && lineage_session_ids.contains(&session.session_id);
+            let descends_from_frozen_target = memory_lineage_contains_frozen_target(
+                document,
+                &documents_by_id,
+                frozen_targets,
+                &mut HashSet::new(),
+            );
+            let descends_from_retry_replacement = memory_lineage_contains_retry_replacement(
+                document,
+                &documents_by_id,
+                retry_replacements,
+                &mut HashSet::new(),
+            );
             if document.frontmatter.status == DurableMemoryStatus::Active
                 && (is_direct_auto_dream || is_gardener_descendant)
+                && (descends_from_frozen_target || !descends_from_retry_replacement)
             {
                 targets.insert(MemoryReplacementTarget {
                     id: document.frontmatter.id.clone(),
@@ -2018,6 +2196,88 @@ async fn collect_history_rewrite_replacement_targets(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn revalidate_history_rewrite_plan(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    session: &CandidateSessionContext,
+    plan: &HistoryRewritePlan,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+    retry_replacements: &HashSet<ExtractionMemoryFingerprint>,
+) -> Result<HistoryRewritePlan, String> {
+    // A failed attempt releases the maintenance fence without acknowledging
+    // the Session. Gardeners may advance either the frozen old lineage or a
+    // partially persisted replacement before the next attempt acquires it.
+    // Follow descendants of frozen targets, but exclude branches rooted only
+    // in exact checkpoint candidates so corrected retry output is never
+    // reclassified as stale input.
+    let frozen_targets = plan
+        .replacement_targets
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let refreshed = collect_history_rewrite_replacement_targets_for_retry(
+        ctx,
+        memory,
+        session,
+        project_resolver,
+        current_store_is_project_scoped,
+        &frozen_targets,
+        retry_replacements,
+    )
+    .await?;
+
+    let mut revalidated = plan.clone();
+    revalidated
+        .replacement_targets
+        .extend(refreshed.replacement_targets);
+    revalidated.replacement_targets.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.project_key.cmp(&right.project_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    revalidated.replacement_targets.dedup();
+
+    revalidated
+        .memory_reactivation_targets
+        .extend(refreshed.memory_reactivation_targets);
+    let replacement_targets = revalidated
+        .replacement_targets
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    revalidated
+        .memory_reactivation_targets
+        .retain(|target| !replacement_targets.contains(target));
+    revalidated
+        .memory_reactivation_targets
+        .sort_by(|left, right| {
+            left.scope
+                .as_str()
+                .cmp(right.scope.as_str())
+                .then_with(|| left.project_key.cmp(&right.project_key))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    revalidated.memory_reactivation_targets.dedup();
+
+    revalidated
+        .preservation_session_ids
+        .extend(refreshed.preservation_session_ids);
+    revalidated.preservation_session_ids.sort();
+    revalidated.preservation_session_ids.dedup();
+    if revalidated.preservation_session_ids.len() > HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS {
+        return Err(format!(
+            "history rewrite requires {} preservation Sessions after retry revalidation; maximum is {}",
+            revalidated.preservation_session_ids.len(),
+            HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS
+        ));
+    }
+    Ok(revalidated)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn load_or_create_history_rewrite_plan(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
@@ -2036,7 +2296,17 @@ async fn load_or_create_history_rewrite_plan(
     )
     .await?
     {
-        return Ok(plan);
+        let retry_replacements = HashSet::new();
+        return revalidate_history_rewrite_plan(
+            ctx,
+            memory,
+            session,
+            &plan,
+            project_resolver,
+            current_store_is_project_scoped,
+            &retry_replacements,
+        )
+        .await;
     }
     let memory_targets = collect_history_rewrite_replacement_targets(
         ctx,
@@ -2084,14 +2354,25 @@ async fn load_or_create_history_rewrite_plan(
     if write_history_rewrite_plan(ctx, &session.session_id, &plan).await? {
         return Ok(plan);
     }
-    read_history_rewrite_plan(
+    let plan = read_history_rewrite_plan(
         ctx,
         &session.session_id,
         history_revision,
         source_updated_at,
     )
     .await?
-    .ok_or_else(|| "concurrent history-rewrite plan disappeared before reuse".to_string())
+    .ok_or_else(|| "concurrent history-rewrite plan disappeared before reuse".to_string())?;
+    let retry_replacements = HashSet::new();
+    revalidate_history_rewrite_plan(
+        ctx,
+        memory,
+        session,
+        &plan,
+        project_resolver,
+        current_store_is_project_scoped,
+        &retry_replacements,
+    )
+    .await
 }
 
 async fn build_history_rewrite_preservation_contexts(
@@ -2795,8 +3076,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 .and_then(|batch| batch.history_revision.clone());
             if acknowledged_watermark.is_none_or(|watermark| watermark < source_watermark) {
                 let history_plan = if let Some(revision) = history_revision.as_deref() {
-                    Some(
-                        read_history_rewrite_plan(
+                    let retry_replacements = transaction
+                        .batches
+                        .iter()
+                        .flat_map(|batch| batch.extracted.memory.iter())
+                        .filter_map(extraction_candidate_fingerprint)
+                        .collect::<HashSet<_>>();
+                    let plan = read_history_rewrite_plan(
                             ctx,
                             session_id,
                             revision,
@@ -2807,7 +3093,18 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                             format!(
                                 "history-rewrite checkpoint for {session_id} has no frozen replacement plan"
                             )
-                        })?,
+                        })?;
+                    Some(
+                        revalidate_history_rewrite_plan(
+                            ctx,
+                            memory,
+                            session_context,
+                            &plan,
+                            project_resolver,
+                            current_store_is_project_scoped,
+                            &retry_replacements,
+                        )
+                        .await?,
                     )
                 } else {
                     None
@@ -3363,10 +3660,9 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         .unwrap_or_default();
 
     let mut writes = 0usize;
-    type ExtractionFingerprint = (DurableMemoryType, String, String, String);
     let mut existing_by_scope: HashMap<
         (MemoryScope, Option<String>),
-        HashSet<ExtractionFingerprint>,
+        HashSet<ExtractionMemoryFingerprint>,
     > = HashMap::new();
     for candidate in candidates {
         let Some(memory_type) = parse_candidate_type(&candidate.kind) else {
@@ -4702,6 +4998,8 @@ mod tests {
             ("old working directory", "OLDPWD=/workspace/old"),
             ("ordinary bypass setting", "BYPASS=enabled"),
             ("ordinary compass setting", "COMPASS=north"),
+            ("mixed-case user path", "/Users/Alice/Project2/config.toml"),
+            ("mixed-case relative path", "src/HTTP2Client/Config.toml"),
             (
                 "ordinary cookie preference",
                 "My favorite cookie is chocolate",
@@ -4771,6 +5069,10 @@ mod tests {
             (
                 "password-only credential URL",
                 "REDIS_URL=redis://:abc@example.test/0",
+            ),
+            (
+                "standalone high-entropy token",
+                "mF9Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je",
             ),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
@@ -5725,6 +6027,65 @@ mod tests {
         assert!(!plan_json.contains("PostgreSQL"));
         assert!(!plan_json.contains("SQLite"));
 
+        let partial_replacement_id = interim
+            .iter()
+            .find(|document| {
+                document.frontmatter.status == DurableMemoryStatus::Active
+                    && document.body == "The database is SQLite."
+            })
+            .expect("partially persisted replacement stays active")
+            .frontmatter
+            .id
+            .clone();
+        let gardener_retry_descendants = memory
+            .split_memory(
+                &gardener_split.new_ids[0],
+                None,
+                &[
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Retry database engine lineage".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "The database is PostgreSQL.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Retry database persistence lineage".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "Canonical persistence still cites PostgreSQL.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                ],
+                Some("__memory_gardener__"),
+                "memory-gardener",
+            )
+            .await
+            .expect("advance gardener lineage after failed rewrite")
+            .expect("gardener retry split result");
+        let replacement_retry_descendants = memory
+            .split_memory(
+                &partial_replacement_id,
+                None,
+                &[
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Corrected SQLite engine".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "The database is SQLite.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Corrected SQLite persistence".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "Canonical persistence now uses SQLite.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                ],
+                Some("__memory_gardener__"),
+                "memory-gardener",
+            )
+            .await
+            .expect("advance partial replacement lineage after failed rewrite")
+            .expect("replacement retry split result");
+
         tokio::fs::remove_file(&blocker_path)
             .await
             .expect("repair ledger fixture");
@@ -5757,6 +6118,36 @@ mod tests {
             assert_eq!(
                 descendant.frontmatter.status,
                 DurableMemoryStatus::Superseded
+            );
+        }
+        for id in &gardener_retry_descendants.new_ids {
+            let descendant = documents
+                .iter()
+                .find(|document| document.frontmatter.id == *id)
+                .expect("retry gardener descendant remains auditable");
+            assert_eq!(
+                descendant.frontmatter.status,
+                DurableMemoryStatus::Superseded
+            );
+        }
+        let partial_replacement = documents
+            .iter()
+            .find(|document| document.frontmatter.id == partial_replacement_id)
+            .expect("partial replacement remains auditable");
+        assert_eq!(
+            partial_replacement.frontmatter.status,
+            DurableMemoryStatus::Superseded,
+            "the gardener transformation remains auditable"
+        );
+        for id in &replacement_retry_descendants.new_ids {
+            let descendant = documents
+                .iter()
+                .find(|document| document.frontmatter.id == *id)
+                .expect("replacement retry descendant remains auditable");
+            assert_eq!(
+                descendant.frontmatter.status,
+                DurableMemoryStatus::Active,
+                "retry revalidation must not reclassify a partially persisted replacement lineage as old"
             );
         }
         let manual = documents
