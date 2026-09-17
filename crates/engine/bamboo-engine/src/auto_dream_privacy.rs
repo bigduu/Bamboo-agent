@@ -84,6 +84,7 @@ fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
         };
         let candidate = candidate
             .as_str()
+            .trim()
             .trim_matches(|character: char| character.is_ascii_punctuation())
             .to_ascii_lowercase();
         !is_credential_state_predicate(&candidate)
@@ -125,6 +126,16 @@ fn redis_password_directive_pattern() -> &'static Regex {
             r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?:[\"'][^\"'\r\n]{1,1024}[\"']|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
         )
         .expect("Redis password directive regex must compile")
+    })
+}
+
+fn markdown_table_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*\|[ \t]*(?:api[\s_-]?key|account[\s_-]?key|password|passwd|pwd|pass|passcode|passphrase|credential|private[\s_-]?key|secret(?:[\s_-]?key)?|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id)|pin)[ \t]*\|[ \t]*(?P<value>[^|\r\n]{1,1024}?)[ \t]*(?:\|[^\r\n]*)?$"#,
+        )
+        .expect("Markdown credential table regex must compile")
     })
 }
 
@@ -573,6 +584,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || standalone_pin_credential_pattern().is_match(value)
         || short_credential_config_field_pattern().is_match(value)
         || redis_password_directive_pattern().is_match(value)
+        || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
@@ -749,6 +761,14 @@ mod tests {
             ("commented Redis password", "# requirepass hunter2"),
             ("empty Redis password", "requirepass \"\""),
             (
+                "Markdown password requirement",
+                "| Password | required | authentication policy |",
+            ),
+            (
+                "Markdown password policy",
+                "| Password policy | rotate quarterly |",
+            ),
+            (
                 "XML password policy element",
                 "<password-policy>rotate quarterly</password-policy>",
             ),
@@ -841,6 +861,11 @@ mod tests {
             (
                 "Redis CONFIG SET password",
                 "CONFIG SET requirepass 'hunter2'",
+            ),
+            ("Markdown password row", "| Password | hunter2 |"),
+            (
+                "Markdown API key row",
+                "| API key | hunter2 | production |",
             ),
             ("XML password element", "<password>hunter2</password>"),
             (
