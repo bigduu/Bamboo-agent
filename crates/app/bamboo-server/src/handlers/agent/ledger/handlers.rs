@@ -43,6 +43,10 @@ pub async fn upsert_record(
     state: web::Data<AppState>,
     req: web::Json<UpsertRecordRequest>,
 ) -> Result<HttpResponse> {
+    let _memory_maintenance_fence =
+        bamboo_engine::acquire_memory_maintenance_fence(&state.memory_store)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
     upsert_record_core(&ledger_store(&state), req.into_inner()).await
 }
 
@@ -53,6 +57,10 @@ pub async fn patch_record(
     query: web::Query<LocateRecordQuery>,
     req: web::Json<PatchRecordRequest>,
 ) -> Result<HttpResponse> {
+    let _memory_maintenance_fence =
+        bamboo_engine::acquire_memory_maintenance_fence(&state.memory_store)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
     patch_record_core(
         &ledger_store(&state),
         &path.into_inner(),
@@ -68,6 +76,10 @@ pub async fn delete_record(
     path: web::Path<String>,
     query: web::Query<LocateRecordQuery>,
 ) -> Result<HttpResponse> {
+    let _memory_maintenance_fence =
+        bamboo_engine::acquire_memory_maintenance_fence(&state.memory_store)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
     delete_record_core(
         &ledger_store(&state),
         &path.into_inner(),

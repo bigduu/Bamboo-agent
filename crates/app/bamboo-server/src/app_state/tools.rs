@@ -107,7 +107,7 @@ pub(super) fn build_base_tools(
 
     let memory_tool = Arc::new(crate::tools::MemoryTool::with_store(
         session_repo.clone(),
-        memory_store,
+        memory_store.clone(),
     ));
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,
@@ -120,6 +120,7 @@ pub(super) fn build_base_tools(
     // is built after the tool chain, and the builder binds it once it's up.
     let ledger_tool = Arc::new(
         crate::tools::LedgerTool::new(session_repo.clone(), app_data_dir.clone())
+            .with_memory_store(memory_store)
             .with_schedule_bridge(ledger_schedule_bridge)
             .with_project_store(project_store.clone()),
     );

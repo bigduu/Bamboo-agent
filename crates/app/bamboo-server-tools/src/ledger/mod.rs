@@ -23,6 +23,7 @@ use bamboo_domain::{TaskItemStatus, TaskPriority};
 use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerRecordDocument, LedgerStore, RecordFilter};
+use bamboo_memory::memory_store::MemoryStore;
 
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,7 @@ pub use bamboo_memory::ledger_store::LedgerScheduleBridge;
 pub struct LedgerTool {
     session_repo: bamboo_engine::SessionRepository,
     store: LedgerStore,
+    maintenance_memory_store: MemoryStore,
     schedule_bridge: Option<Arc<dyn LedgerScheduleBridge>>,
     project_store: Option<Arc<bamboo_projects::ProjectStore>>,
 }
@@ -181,12 +183,19 @@ impl LedgerTool {
         session_repo: bamboo_engine::SessionRepository,
         data_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        let data_dir = data_dir.into();
         Self {
             session_repo,
-            store: LedgerStore::new(data_dir),
+            store: LedgerStore::new(&data_dir),
+            maintenance_memory_store: MemoryStore::new(data_dir),
             schedule_bridge: None,
             project_store: None,
         }
+    }
+
+    pub fn with_memory_store(mut self, memory_store: MemoryStore) -> Self {
+        self.maintenance_memory_store = memory_store;
+        self
     }
 
     pub fn with_project_store(mut self, project_store: Arc<bamboo_projects::ProjectStore>) -> Self {
@@ -979,7 +988,23 @@ impl Tool for LedgerTool {
             ToolError::InvalidArguments(format!("Invalid ledger args: {error}"))
         })?;
 
-        let value = match parsed.action.trim().to_ascii_lowercase().as_str() {
+        let action = parsed.action.trim().to_ascii_lowercase();
+        // Auto-Dream freezes extractor-owned memory and suggested Ledger
+        // records under one root-wide transaction fence. Hold that same fence
+        // across every agent-facing Ledger mutation, including schedule
+        // reconciliation, so a concurrent user update cannot be overwritten by
+        // the frozen history-rewrite plan and leave orphaned schedules behind.
+        let _memory_maintenance_fence = if matches!(action.as_str(), "get" | "query" | "agenda") {
+            None
+        } else {
+            Some(
+                bamboo_engine::acquire_memory_maintenance_fence(&self.maintenance_memory_store)
+                    .await
+                    .map_err(ToolError::Execution)?,
+            )
+        };
+
+        let value = match action.as_str() {
             "upsert" => self.handle_upsert(&parsed, session_id).await?,
             "transition" => self.handle_transition(&parsed, session_id).await?,
             "get" => self.handle_get(&parsed, session_id).await?,

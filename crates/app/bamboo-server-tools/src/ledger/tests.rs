@@ -528,3 +528,49 @@ async fn schedule_bridge_syncs_on_upsert_and_releases_on_terminal_transition() {
         .map(|ids| ids.is_empty())
         .unwrap_or(true));
 }
+
+#[tokio::test]
+async fn mutating_ledger_actions_wait_for_the_memory_maintenance_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tool, _storage) = build_tool(dir.path());
+    let created = invoke(
+        &tool,
+        "session-1",
+        serde_json::json!({"action": "upsert", "title": "Keep the commitment"}),
+    )
+    .await;
+    let id = created["data"]["record"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    let fence_store = MemoryStore::new(dir.path());
+    let fence = bamboo_engine::acquire_memory_maintenance_fence(&fence_store)
+        .await
+        .expect("history-rewrite fence");
+    let waiting_tool = tool.clone();
+    let waiter = tokio::spawn(async move {
+        invoke(
+            &waiting_tool,
+            "session-1",
+            serde_json::json!({
+                "action": "transition",
+                "id": id,
+                "status": "in_progress"
+            }),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !waiter.is_finished(),
+        "a user Ledger mutation must not cross the frozen rewrite transaction"
+    );
+
+    drop(fence);
+    let transitioned = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("Ledger mutation should resume after fence release")
+        .expect("Ledger mutation task");
+    assert_eq!(transitioned["data"]["record"]["status"], "in_progress");
+}

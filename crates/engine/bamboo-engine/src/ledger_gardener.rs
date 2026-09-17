@@ -27,6 +27,7 @@ use bamboo_memory::memory_store::{DurableMemoryType, MemoryStore};
 
 use crate::auto_dream::AutoDreamContext;
 use crate::gardener::{collect_model_json, resolve_background_model};
+use crate::memory_maintenance_fence::acquire_memory_maintenance_fence;
 
 const LEDGER_GARDENER_TRACING_TARGET: &str = "bamboo.ledger_gardener";
 /// Grace period before a past event/reminder is auto-expired, so "the meeting
@@ -39,6 +40,7 @@ const DISTILLED_TAG: &str = "distilled";
 
 const DISTILL_SYSTEM_INSTRUCTION: &str = "You are Bamboo's background ledger gardener. From the user's completed ledger records, extract only durable, long-term facts worth remembering (habits, recurring obligations, stable preferences, notable life events). Return only the specified JSON array. No prose, no markdown fences.";
 
+#[derive(Clone)]
 pub struct LedgerGardenerContext {
     pub dream: AutoDreamContext,
     pub schedule_bridge: Option<Arc<dyn LedgerScheduleBridge>>,
@@ -156,6 +158,12 @@ async fn run_ledger_gardener_once_with_stores(
     if !memory_cfg.ledger_gardener_enabled {
         return Ok(None);
     }
+
+    // Expiry/schedule reconciliation mutate records that an Auto-Dream
+    // history rewrite may have frozen, and distillation can merge into an
+    // existing memory lineage. Keep the complete gardener pass inside the
+    // same root-wide transaction fence so neither sink can race a rewrite.
+    let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
 
     let now = Utc::now();
     let mut result = LedgerGardenerRunResult::default();
@@ -623,7 +631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_run_expires_reconciles_and_distills() {
+    async fn full_run_waits_for_the_maintenance_fence_then_expires_reconciles_and_distills() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_store = Arc::new(
             SessionStoreV2::new(temp.path().to_path_buf())
@@ -680,8 +688,27 @@ mod tests {
             schedule_bridge: Some(bridge.clone()),
         };
 
-        let result = run_ledger_gardener_once_with_stores(&ctx, &ledger, &memory)
+        let fence = acquire_memory_maintenance_fence(&memory)
             .await
+            .expect("simulated history-rewrite fence");
+        let waiting_ctx = ctx.clone();
+        let waiting_ledger = ledger.clone();
+        let waiting_memory = memory.clone();
+        let waiter = tokio::spawn(async move {
+            run_ledger_gardener_once_with_stores(&waiting_ctx, &waiting_ledger, &waiting_memory)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiter.is_finished(),
+            "Ledger distillation and record mutations must wait for a history rewrite"
+        );
+
+        drop(fence);
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("gardener should resume after fence release")
+            .expect("gardener task")
             .unwrap()
             .expect("gardener enabled by default");
 

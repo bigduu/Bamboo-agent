@@ -3,8 +3,9 @@
 //! Jiandu already serializes each individual scope mutation. Auto-Dream history
 //! rewrites need a wider fence, however: the replacement lineage is frozen
 //! before provider calls and applied only after every replacement sink succeeds.
-//! Every lineage-changing writer must therefore participate so none can create
-//! or mutate a descendant in between.
+//! Every lineage-changing memory writer and every Ledger writer that can mutate
+//! the extractor's frozen input must therefore participate so none can create,
+//! mutate, or consume authority in between.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -47,8 +48,8 @@ impl Drop for MemoryMaintenanceFenceGuard {
 }
 
 /// Serialize Auto-Dream extraction/rewrite transactions with every
-/// lineage-changing memory mutation, including across Bamboo processes sharing
-/// a Jiandu data root.
+/// lineage-changing memory mutation and extractor-owned Ledger mutation,
+/// including across Bamboo processes sharing a Jiandu data root.
 ///
 /// Callers must hold the returned guard across the complete read-modify-write
 /// operation. Ordinary creation that cannot merge into an existing document
