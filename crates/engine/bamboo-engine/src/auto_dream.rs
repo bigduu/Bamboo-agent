@@ -127,7 +127,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]{4,}"#,
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]{4,}"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -385,6 +385,11 @@ fn build_retrieval_window_extraction_batches(
             .cmp(&right.created_at)
             .then_with(|| left.id.cmp(&right.id))
     });
+    let retrieval_mode_was_acknowledged = extraction_watermark.is_some_and(|watermark| {
+        retrieval_events
+            .first()
+            .is_some_and(|event| event.created_at <= watermark)
+    });
     let eligible_event_ids = retrieval_events
         .iter()
         .filter(|event| extraction_watermark.is_none_or(|watermark| event.created_at > watermark))
@@ -405,13 +410,22 @@ fn build_retrieval_window_extraction_batches(
             if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
                 return None;
             }
+            let archived_by_new_event = message.compressed
+                && message
+                    .compressed_by_event_id
+                    .as_deref()
+                    .is_some_and(|event_id| eligible_event_ids.contains(event_id));
             let created_after_watermark =
                 extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
-            // A message that was active at the acknowledged watermark was
-            // already eligible in that pass. Archiving it later changes event
-            // metadata, not the source fact, so the new event must not make the
-            // same message eligible a second time.
-            if !created_after_watermark {
+            // A watermark older than the first retrieval event came from the
+            // bounded ordinary outline, which did not cover all old messages.
+            // The first retrieval boundary must therefore include every newly
+            // archived source. Once a retrieval event itself predates the
+            // watermark, message creation time is authoritative and later
+            // archive metadata cannot make an old active message eligible twice.
+            let archived_on_first_retrieval_boundary =
+                !retrieval_mode_was_acknowledged && archived_by_new_event;
+            if !archived_on_first_retrieval_boundary && !created_after_watermark {
                 return None;
             }
             let (role, content) = match message.role {
@@ -2541,18 +2555,35 @@ mod tests {
 
     #[test]
     fn extraction_secret_filter_covers_sources_and_model_candidates() {
-        for secret in [
-            "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
-            "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
-            "session cookie: 0123456789abcdef0123456789abcdef",
-            "my password is hunter2",
-            "postgres://user:password-value@example.test/database",
-            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        for (case, value) in [
+            (
+                "api key",
+                "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+            ),
+            (
+                "authorization",
+                "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            ),
+            (
+                "hex session cookie",
+                "session cookie: 0123456789abcdef0123456789abcdef",
+            ),
+            ("natural-language password", "my password is hunter2"),
+            ("natural-language passcode", "my passcode is 1234"),
+            ("pin", "PIN: 1234"),
+            (
+                "credential URL",
+                "postgres://user:password-value@example.test/database",
+            ),
+            ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
-            assert!(contains_secret_like_value(secret), "missed {secret}");
-            assert_eq!(
-                sanitize_extraction_source(secret),
-                REDACTED_EXTRACTION_SOURCE
+            assert!(
+                contains_secret_like_value(value),
+                "secret case was not detected: {case}"
+            );
+            assert!(
+                sanitize_extraction_source(value) == REDACTED_EXTRACTION_SOURCE,
+                "secret case was not redacted: {case}"
             );
         }
 
@@ -2578,19 +2609,6 @@ mod tests {
         };
         assert!(!durable_candidate_is_secret_safe(&unsafe_hex_cookie_memory));
 
-        let unsafe_split_password_memory = DurableExtractionCandidate {
-            title: "Password".to_string(),
-            kind: "reference".to_string(),
-            content: "hunter2".to_string(),
-            scope: Some("global".to_string()),
-            tags: vec!["session".to_string()],
-            session_id: Some("session-1".to_string()),
-            confidence: Some("high".to_string()),
-        };
-        assert!(!durable_candidate_is_secret_safe(
-            &unsafe_split_password_memory
-        ));
-
         let unsafe_ledger = LedgerExtractionCandidate {
             title: "Rotate credential".to_string(),
             excerpt: Some("Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456".to_string()),
@@ -2605,14 +2623,28 @@ mod tests {
         };
         assert!(!ledger_candidate_is_secret_safe(&unsafe_hex_cookie_ledger));
 
-        let unsafe_split_password_ledger = LedgerExtractionCandidate {
-            title: "Password".to_string(),
-            excerpt: Some("hunter2".to_string()),
-            ..LedgerExtractionCandidate::default()
-        };
-        assert!(!ledger_candidate_is_secret_safe(
-            &unsafe_split_password_ledger
-        ));
+        for (title, content) in [
+            ("Password", "hunter2"),
+            ("Passcode", "1234"),
+            ("PIN", "1234"),
+        ] {
+            let unsafe_memory = DurableExtractionCandidate {
+                title: title.to_string(),
+                kind: "reference".to_string(),
+                content: content.to_string(),
+                scope: Some("global".to_string()),
+                tags: vec!["session".to_string()],
+                session_id: Some("session-1".to_string()),
+                confidence: Some("high".to_string()),
+            };
+            assert!(!durable_candidate_is_secret_safe(&unsafe_memory));
+            let unsafe_ledger = LedgerExtractionCandidate {
+                title: title.to_string(),
+                excerpt: Some(content.to_string()),
+                ..LedgerExtractionCandidate::default()
+            };
+            assert!(!ledger_candidate_is_secret_safe(&unsafe_ledger));
+        }
     }
 
     #[tokio::test]
@@ -2973,7 +3005,7 @@ mod tests {
         let mut archived = message_at(
             Message::user("ARCHIVED_AFTER_WATERMARK_EVENT"),
             "archived",
-            watermark + chrono::Duration::seconds(3),
+            now - chrono::Duration::hours(1),
         );
         archived.compressed = true;
         archived.compressed_by_event_id = Some("event-new".to_string());
