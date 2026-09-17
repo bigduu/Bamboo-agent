@@ -113,10 +113,39 @@ fn short_credential_config_field_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*(?:\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3})"#,
+            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,;{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*(?P<value>\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s\"',;}\]\r\n]{1,1024})"#,
         )
         .expect("short credential config-field regex must compile")
     })
+}
+
+fn contains_short_credential_config_field(value: &str) -> bool {
+    short_credential_config_field_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            let candidate = candidate.as_str().trim();
+            if candidate.starts_with('\"') || candidate.starts_with('\'') {
+                return true;
+            }
+            if candidate.starts_with('$')
+                || candidate.starts_with('<')
+                || candidate.starts_with("{{")
+                || candidate.starts_with('%')
+            {
+                return false;
+            }
+            let candidate = candidate
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase();
+            !is_credential_state_predicate(&candidate)
+                && !matches!(
+                    candidate.as_str(),
+                    "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+                )
+        })
 }
 
 fn redis_password_directive_pattern() -> &'static Regex {
@@ -720,7 +749,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_past_tense_secret_assignment(value)
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
-        || short_credential_config_field_pattern().is_match(value)
+        || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || cli_credential_flag_pattern().is_match(value)
@@ -1108,6 +1137,7 @@ mod tests {
                 "My token is revoked after account deletion.",
             ),
             ("ordinary pass field", "pass: true"),
+            ("password placeholder field", "Pwd=${DB_PASSWORD}"),
             ("commented Redis password", "# requirepass hunter2"),
             ("empty Redis password", "requirepass \"\""),
             (
@@ -1255,6 +1285,11 @@ mod tests {
                 "db.createUser({user: \"alice\", pwd: \"hunter2\"})",
             ),
             ("short pass config field", "pass = 'hunter2'"),
+            (
+                "semicolon-delimited Pwd connection string",
+                "Server=db;Uid=alice;Pwd=hunter2",
+            ),
+            ("unquoted Pwd config field", "Pwd=hunter2"),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
             (
