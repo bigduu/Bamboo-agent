@@ -2065,11 +2065,20 @@ fn collect_memory_lineage_preservation_targets<'a>(
             // superseding the mixed descendant. Do not ask the model to
             // restate this branch: the exact canonical document is safer and
             // also remains available if its source Session was pruned.
-            memory_reactivation_targets.insert(MemoryReplacementTarget {
-                id: ancestor.frontmatter.id.clone(),
-                scope: ancestor.frontmatter.scope,
-                project_key: ancestor.frontmatter.project_key.clone(),
-            });
+            // A retry must not undo an explicit main-model archive that
+            // happened after a partial reactivation. Keep the branch out of
+            // model re-extraction through exactly_preserved_session_ids, but
+            // only reactivate a still-canonical Superseded/Active document.
+            if matches!(
+                ancestor.frontmatter.status,
+                DurableMemoryStatus::Active | DurableMemoryStatus::Superseded
+            ) {
+                memory_reactivation_targets.insert(MemoryReplacementTarget {
+                    id: ancestor.frontmatter.id.clone(),
+                    scope: ancestor.frontmatter.scope,
+                    project_key: ancestor.frontmatter.project_key.clone(),
+                });
+            }
             continue;
         }
         collect_memory_lineage_preservation_targets(
@@ -7907,6 +7916,203 @@ mod tests {
                 DurableMemoryStatus::Active
             );
         }
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_retry_preserves_explicit_archive_of_reactivated_ancestor() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut rewritten_session = Session::new("archived-reactivation-owner", "model");
+        rewritten_session.messages.push(Message::assistant(
+            "The corrected database is SQLite.",
+            None,
+        ));
+        rewritten_session.clear_derived_context_state();
+        storage
+            .save_session(&rewritten_session)
+            .await
+            .expect("save rewritten Session");
+        let entry = session_store
+            .get_index_entry(&rewritten_session.id)
+            .await
+            .expect("rewritten Session index entry");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let rewritten_ancestor = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Database engine",
+                "The database is PostgreSQL.",
+                &["database".to_string()],
+                Some(&rewritten_session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed rewritten ancestor");
+        let unaffected_session_id = "archived-reactivation-unaffected";
+        let unaffected_ancestor = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Deployment region",
+                "The deployment region is eu-west-1.",
+                &["region".to_string()],
+                Some(unaffected_session_id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed unaffected ancestor");
+        let mixed_descendant = memory
+            .consolidate_memories(
+                &[
+                    rewritten_ancestor.frontmatter.id.clone(),
+                    unaffected_ancestor.frontmatter.id.clone(),
+                ],
+                None,
+                &bamboo_memory::memory_store::MemorySplitPiece {
+                    title: "Database and deployment region".to_string(),
+                    r#type: Some(DurableMemoryType::Project),
+                    content: "The database is PostgreSQL and the deployment region is eu-west-1."
+                        .to_string(),
+                    tags: vec!["database".to_string(), "region".to_string()],
+                },
+                Some("__memory_gardener__"),
+                "memory-dedup-gardener",
+            )
+            .await
+            .expect("consolidate mixed lineage")
+            .expect("mixed descendant");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let session_context = CandidateSessionContext {
+            entry,
+            summary: Some("corrected database history".to_string()),
+            session_id: rewritten_session.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let frozen = collect_history_rewrite_replacement_targets(
+            &context,
+            &memory,
+            &session_context,
+            None,
+            false,
+        )
+        .await
+        .expect("freeze mixed lineage");
+        assert!(frozen
+            .replacement_targets
+            .iter()
+            .any(|target| target.id == mixed_descendant.new_id));
+        assert!(frozen
+            .memory_reactivation_targets
+            .iter()
+            .any(|target| target.id == unaffected_ancestor.frontmatter.id));
+        let plan = HistoryRewritePlan {
+            version: HISTORY_REWRITE_PLAN_VERSION,
+            session_key: extraction_checkpoint_session_key(&rewritten_session.id),
+            history_revision: "history-revision".to_string(),
+            source_updated_at: rewritten_session.updated_at.to_rfc3339(),
+            replacement_targets: frozen.replacement_targets,
+            memory_reactivation_targets: frozen.memory_reactivation_targets,
+            preservation_session_ids: frozen.preservation_session_ids,
+            ledger_replacement_targets: Vec::new(),
+        };
+
+        memory
+            .archive_memory(
+                &unaffected_ancestor.frontmatter.id,
+                None,
+                DurableMemoryStatus::Active,
+                Some("simulate partial history-rewrite reactivation"),
+            )
+            .await
+            .expect("reactivate unaffected ancestor")
+            .expect("unaffected ancestor exists");
+        memory
+            .archive_memory(
+                &unaffected_ancestor.frontmatter.id,
+                None,
+                DurableMemoryStatus::Archived,
+                Some("explicit main-model archive before retry"),
+            )
+            .await
+            .expect("archive reactivated ancestor")
+            .expect("unaffected ancestor exists");
+
+        let revalidated = revalidate_history_rewrite_plan(
+            &context,
+            &memory,
+            &LedgerStore::new(temp_dir.path()),
+            &session_context,
+            &plan,
+            None,
+            false,
+            &HashSet::new(),
+        )
+        .await
+        .expect("revalidate explicit archive");
+        assert!(revalidated.memory_reactivation_targets.is_empty());
+        assert!(
+            !revalidated
+                .preservation_session_ids
+                .iter()
+                .any(|session_id| session_id == unaffected_session_id),
+            "an explicit archive must not be bypassed by model re-extraction"
+        );
+
+        supersede_history_rewrite_targets(
+            &context,
+            &LedgerStore::new(temp_dir.path()),
+            &revalidated,
+        )
+        .await
+        .expect("complete retry without resurrecting archived memory");
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list archive-preserving retry lineage");
+        assert_eq!(
+            documents
+                .iter()
+                .find(|document| document.frontmatter.id == unaffected_ancestor.frontmatter.id)
+                .expect("unaffected ancestor remains auditable")
+                .frontmatter
+                .status,
+            DurableMemoryStatus::Archived
+        );
+        assert_eq!(
+            documents
+                .iter()
+                .find(|document| document.frontmatter.id == mixed_descendant.new_id)
+                .expect("mixed descendant remains auditable")
+                .frontmatter
+                .status,
+            DurableMemoryStatus::Superseded
+        );
     }
 
     #[tokio::test]
