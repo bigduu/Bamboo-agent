@@ -18,7 +18,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=|\bis\b)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -27,10 +27,18 @@ fn secret_assignment_pattern() -> &'static Regex {
 fn generic_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#)
+            .expect("generic secret assignment regex must compile")
+    })
+}
+
+fn present_tense_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)|(?:^|[^a-z0-9])(?:my|our|your)\s+(?:secret|token)[\"']?\s+\bis\b)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+[\"']?(?P<value>[^\s\"',;}]+)"#,
         )
-        .expect("generic secret assignment regex must compile")
+        .expect("present-tense secret assignment regex must compile")
     })
 }
 
@@ -44,49 +52,69 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     })
 }
 
+fn is_credential_state_predicate(value: &str) -> bool {
+    matches!(
+        value,
+        "changed"
+            | "configured"
+            | "encrypted"
+            | "expired"
+            | "forgotten"
+            | "hashed"
+            | "invalid"
+            | "masked"
+            | "not"
+            | "optional"
+            | "redacted"
+            | "removed"
+            | "required"
+            | "reset"
+            | "revoked"
+            | "rotated"
+            | "stored"
+            | "updated"
+            | "valid"
+    )
+}
+
+fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        let Some(candidate) = captures.name("value") else {
+            return false;
+        };
+        let candidate = candidate
+            .as_str()
+            .trim_matches(|character: char| character.is_ascii_punctuation())
+            .to_ascii_lowercase();
+        !is_credential_state_predicate(&candidate)
+    })
+}
+
+fn contains_present_tense_secret_assignment(value: &str) -> bool {
+    captures_non_state_credential_value(present_tense_secret_assignment_pattern(), value)
+}
+
 fn contains_past_tense_secret_assignment(value: &str) -> bool {
-    past_tense_secret_assignment_pattern()
-        .captures_iter(value)
-        .any(|captures| {
-            let Some(candidate) = captures.name("value") else {
-                return false;
-            };
-            let candidate = candidate
-                .as_str()
-                .trim_matches(|character: char| character.is_ascii_punctuation())
-                .to_ascii_lowercase();
-            !matches!(
-                candidate.as_str(),
-                "changed"
-                    | "configured"
-                    | "encrypted"
-                    | "expired"
-                    | "forgotten"
-                    | "hashed"
-                    | "invalid"
-                    | "masked"
-                    | "not"
-                    | "optional"
-                    | "redacted"
-                    | "removed"
-                    | "required"
-                    | "reset"
-                    | "revoked"
-                    | "rotated"
-                    | "stored"
-                    | "updated"
-                    | "valid"
-            )
-        })
+    captures_non_state_credential_value(past_tense_secret_assignment_pattern(), value)
 }
 
 fn pin_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s+(?:is|:|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=|\bis\b)|pin[\s_-]+(?:code|number)\s*(?::|=|\bis\b))\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("credential-context PIN assignment regex must compile")
+    })
+}
+
+fn short_credential_config_field_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*[\"'][^\"'\r\n]{1,1024}[\"']"#,
+        )
+        .expect("short credential config-field regex must compile")
     })
 }
 
@@ -529,9 +557,11 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
         || generic_secret_assignment_pattern().is_match(value)
+        || contains_present_tense_secret_assignment(value)
         || contains_past_tense_secret_assignment(value)
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
+        || short_credential_config_field_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
@@ -693,6 +723,19 @@ mod tests {
                 "A password was required for the legacy login flow.",
             ),
             (
+                "present-tense password requirement",
+                "The staging password is required for deploys.",
+            ),
+            (
+                "present-tense PIN configuration",
+                "The login PIN is configured by the identity provider.",
+            ),
+            (
+                "present-tense token state",
+                "My token is revoked after account deletion.",
+            ),
+            ("ordinary pass field", "pass: true"),
+            (
                 "XML password policy element",
                 "<password-policy>rotate quarterly</password-policy>",
             ),
@@ -740,6 +783,7 @@ mod tests {
                 "The database password was hunter2",
             ),
             ("personal token", "my token is abc"),
+            ("personal PIN", "my PIN is 1234"),
             ("database password", "PGPASSWORD=abc"),
             ("login PIN", "LOGIN_PIN=123"),
             ("standalone PIN", "PIN: 1234"),
@@ -774,6 +818,11 @@ mod tests {
                 "MySQL plugin credential",
                 "ALTER USER 'alice'@'localhost' IDENTIFIED WITH mysql_native_password AS 'hunter2';",
             ),
+            (
+                "MongoDB pwd field",
+                "db.createUser({user: \"alice\", pwd: \"hunter2\"})",
+            ),
+            ("short pass config field", "pass = 'hunter2'"),
             ("XML password element", "<password>hunter2</password>"),
             (
                 "nested XML password element",
