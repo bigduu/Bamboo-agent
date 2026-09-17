@@ -33,6 +33,7 @@ use bamboo_memory::memory_store::{
 };
 
 use crate::auto_dream::AutoDreamContext;
+use crate::memory_maintenance_fence::acquire_memory_maintenance_fence;
 
 const GARDENER_TRACING_TARGET: &str = "bamboo.gardener";
 const GARDENER_RUNTIME_SESSION_ID: &str = "__gardener__";
@@ -222,6 +223,11 @@ async fn run_gardener_once_with_store_and_resolver(
         return Ok(None);
     }
 
+    // Blob splits create active descendants and supersede their source. Keep
+    // that lineage-changing interval outside any Auto-Dream extraction/rewrite
+    // transaction, including when another Bamboo process shares this Jiandu root.
+    let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
+
     let max_splits = memory_cfg.gardener_max_splits_per_run.max(1);
     let min_sections = memory_cfg.gardener_min_sections;
 
@@ -358,6 +364,10 @@ async fn run_dedup_gardener_once_with_store_and_resolver(
     if !memory_cfg.dedup_gardener_enabled {
         return Ok(None);
     }
+
+    // Dedup consolidation has the same lineage race as blob splitting, so it
+    // participates in the shared cross-process maintenance fence as well.
+    let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
 
     let max_merges = memory_cfg.dedup_gardener_max_merges_per_run.max(1);
     let min_score = memory_cfg.dedup_gardener_min_score;
@@ -1024,8 +1034,28 @@ mod tests {
             ids.push(doc.frontmatter.id);
         }
 
-        let result = run_dedup_gardener_once_with_store(&ctx, &memory)
+        // A history rewrite owns this same fence from plan creation through
+        // replacement persistence and supersession. The independently running
+        // dedup gardener must not create a descendant inside that interval.
+        let rewrite_fence = acquire_memory_maintenance_fence(&memory)
             .await
+            .expect("history rewrite fence");
+        let gardener_context = ctx.clone();
+        let gardener_memory = memory.clone();
+        let gardener = tokio::spawn(async move {
+            run_dedup_gardener_once_with_store(&gardener_context, &gardener_memory).await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !gardener.is_finished(),
+            "dedup gardener must wait for the history rewrite fence"
+        );
+        drop(rewrite_fence);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), gardener)
+            .await
+            .expect("gardener should resume after rewrite completion")
+            .expect("gardener task")
             .unwrap()
             .unwrap();
         assert_eq!(result.consolidated, 1);

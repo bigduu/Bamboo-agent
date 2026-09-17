@@ -133,6 +133,15 @@ impl MemoryStore {
         dirs::home_dir().map_or_else(|| PathBuf::from(".jiandu"), |home| home.join(".jiandu"))
     }
 
+    /// Canonical versioned memory root for host-owned coordination artifacts.
+    ///
+    /// Durable-memory reads and writes must still use this facade; exposing the
+    /// path only lets Bamboo coordinate workflows whose transaction spans more
+    /// than one Jiandu mutation.
+    pub fn memory_root_dir(&self) -> PathBuf {
+        self.store.resolver().root()
+    }
+
     /// Bind Project memory to Bamboo's first-class Project identity.
     pub fn for_project(&self, project_id: &bamboo_domain::ProjectId) -> Self {
         let project_id = jiandu_memory::ProjectId::parse(project_id.as_str().to_owned())

@@ -9,6 +9,7 @@ pub mod gardener;
 pub mod gold_auto_answer;
 pub mod ledger_gardener;
 pub mod llm_summarizer;
+mod memory_maintenance_fence;
 pub mod message_hooks;
 pub mod model_areas;
 pub mod model_config_helper;

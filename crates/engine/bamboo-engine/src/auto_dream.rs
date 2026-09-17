@@ -37,6 +37,7 @@ use bamboo_storage::{
     search_index::session_history_search_artifact_ids, SessionIndexEntry, SessionStoreV2,
 };
 
+use crate::memory_maintenance_fence::acquire_memory_maintenance_fence;
 use crate::project_context::ProjectContextResolver;
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
@@ -207,7 +208,7 @@ fn authorization_secret_pattern() -> &'static Regex {
 fn credential_url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{1,128}:[^/\s@]{1,128}@")
+        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{0,128}:[^/\s@]{1,128}@")
             .expect("credential URL regex must compile")
     })
 }
@@ -2700,6 +2701,14 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
+    // A history-rewrite plan freezes the old Auto-Dream/gardener lineage before
+    // provider calls and applies it only after every replacement sink succeeds.
+    // Hold the same cross-process fence as the blob/dedup gardeners across that
+    // whole interval so they cannot create an unfenced descendant. Ordinary
+    // extraction shares the fence too: a stored rewrite checkpoint may need to
+    // replay even when the freshly collected context no longer exposes it.
+    let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
+
     let mut extraction_sessions = sessions.to_vec();
     let mut seen_sessions = HashSet::new();
     let session_source_watermarks = extraction_sessions
@@ -4726,6 +4735,10 @@ mod tests {
             (
                 "credential URL",
                 "postgres://user:password-value@example.test/database",
+            ),
+            (
+                "password-only credential URL",
+                "REDIS_URL=redis://:abc@example.test/0",
             ),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
