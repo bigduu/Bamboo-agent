@@ -586,6 +586,57 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn checkpoint_prompt_rewrite(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_prompt_rewrite_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_prompt_rewrite", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn checkpoint_manual_archive_rejection(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_manual_archive_rejection_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_manual_archive_rejection", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    async fn checkpoint_manual_archive_consumption(
+        &self,
+        expected_base: &Session,
+        staged: &mut Session,
+    ) -> std::io::Result<RetrievalWindowCheckpointOutcome> {
+        self.persistence
+            .checkpoint_manual_archive_consumption_and_publish(expected_base, staged, |saved| {
+                #[cfg(test)]
+                self.run_post_durable_hook("checkpoint_manual_archive_consumption", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
         self.try_load(session_id).await
     }

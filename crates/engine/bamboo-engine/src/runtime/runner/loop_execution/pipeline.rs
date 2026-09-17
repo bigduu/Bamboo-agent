@@ -2810,12 +2810,21 @@ async fn run_pipeline_inner(
                             MAX_LLM_TURN_ATTEMPTS,
                             error,
                         );
+                        let overflow_tool_schemas =
+                            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                                session,
+                                &llm,
+                                &state.model_name,
+                                &tool_schemas,
+                            )
+                            .await;
                         let recovered =
                             match crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
                                 session,
                                 config,
                                 &state.model_name,
                                 &state.session_id,
+                                overflow_tool_schemas.as_ref(),
                                 &llm,
                                 Some(event_tx),
                             )

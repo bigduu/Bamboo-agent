@@ -6,6 +6,7 @@
 //! never on `bamboo-server`'s `AppState`. Server-bound tools (sub-agent,
 //! schedule) live in `bamboo-server::tools` and reach this crate through ports.
 
+pub mod archive;
 pub mod ask_agent;
 pub mod cluster_tool;
 pub mod compact;
@@ -24,6 +25,7 @@ pub mod skill_runtime;
 pub mod sub_agent;
 pub mod surface;
 
+pub use archive::ArchiveContextTool;
 pub use ask_agent::AskAgentTool;
 pub use cluster_tool::ClusterTool;
 pub use compact::CompactContextTool;

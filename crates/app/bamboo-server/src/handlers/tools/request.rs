@@ -31,6 +31,16 @@ pub(super) fn validate_session_context_requirement(
     Ok(())
 }
 
+pub(super) fn validate_direct_dispatch_support(tool_name: &str) -> Result<(), AppError> {
+    if tool_name == "archive_context" {
+        return Err(AppError::BadRequest(
+            "Tool 'archive_context' is lifecycle-only and must be invoked by an active agent run"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn parse_arguments(parameters: Vec<ToolParameter>) -> serde_json::Map<String, Value> {
     let mut args = serde_json::Map::new();
     for param in parameters {

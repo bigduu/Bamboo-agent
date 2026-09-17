@@ -306,6 +306,34 @@ pub fn build_retrieval_window_candidate_plan_with_token_accounting(
         budget,
         policy,
         accounting,
+        false,
+        &TiktokenTokenCounter::default(),
+    )
+}
+
+/// Build an emergency plan after the provider has already rejected the
+/// request for overflowing its context window.
+///
+/// Provider tokenization and hidden request overhead make that rejection
+/// authoritative regardless of Bamboo's local projection. Archive every
+/// otherwise-eligible old group in one bounded pass: the provider/local
+/// accounting gap is unknown after a real rejection, so stopping at the normal
+/// target could make the sole retry overflow again even though more safe
+/// history was available. The configured percentage is still recorded for
+/// observability; `target_tokens` records the minimum active footprint allowed
+/// by the recent-turn floor.
+pub fn build_retrieval_window_critical_overflow_plan_with_token_accounting(
+    session: &Session,
+    budget: &TokenBudget,
+    policy: RetrievalWindowPolicy,
+    accounting: &RetrievalWindowTokenAccounting,
+) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
+    build_retrieval_window_candidate_plan_with_counter(
+        session,
+        budget,
+        policy,
+        accounting,
+        true,
         &TiktokenTokenCounter::default(),
     )
 }
@@ -315,6 +343,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
     accounting: &RetrievalWindowTokenAccounting,
+    force_archive_after_provider_overflow: bool,
     counter: &impl TokenCounter,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
     validate_inputs(budget, policy)?;
@@ -337,16 +366,6 @@ fn build_retrieval_window_candidate_plan_with_counter(
     let active_tokens_before = post_boundary_active_tokens
         .checked_add(accounting.boundary_reclaimable_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
-    let target_tokens =
-        effective_retrieval_window_target_tokens(budget, policy.target_usage_percent);
-
-    if active_tokens_before <= target_tokens {
-        return Err(RetrievalWindowPlanError::TargetAlreadySatisfied {
-            active_tokens: active_tokens_before,
-            target_tokens,
-        });
-    }
-
     mark_protocol_safety(&mut groups);
     mark_protected_groups(&mut groups, policy.min_recent_user_turns);
 
@@ -361,6 +380,35 @@ fn build_retrieval_window_candidate_plan_with_counter(
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
     let incomplete_protocol_group_count =
         groups.iter().filter(|group| !group.protocol_safe).count();
+    let configured_target_tokens =
+        effective_retrieval_window_target_tokens(budget, policy.target_usage_percent);
+    let minimum_projected_active_tokens = accounting
+        .fixed_prompt_tokens
+        .checked_add(protected_active_tokens)
+        .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
+    if force_archive_after_provider_overflow
+        && minimum_projected_active_tokens > budget.max_request_input_tokens()
+    {
+        return Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget {
+            projected_tokens: minimum_projected_active_tokens,
+            target_tokens: budget.max_request_input_tokens(),
+            protected_active_tokens,
+            fixed_prompt_tokens: accounting.fixed_prompt_tokens,
+            incomplete_protocol_group_count,
+        });
+    }
+    let target_tokens = if force_archive_after_provider_overflow {
+        minimum_projected_active_tokens
+    } else {
+        configured_target_tokens
+    };
+
+    if active_tokens_before <= target_tokens {
+        return Err(RetrievalWindowPlanError::TargetAlreadySatisfied {
+            active_tokens: active_tokens_before,
+            target_tokens,
+        });
+    }
 
     let mut selected_group_indexes = HashSet::new();
     let mut message_ids_to_archive = Vec::new();
@@ -504,6 +552,27 @@ pub fn apply_retrieval_window_plan(
     current_budget: &TokenBudget,
     current_accounting: &RetrievalWindowTokenAccounting,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
+    apply_retrieval_window_plan_with_trigger(
+        session,
+        plan,
+        current_policy,
+        current_budget,
+        current_accounting,
+        CompressionTriggerType::Auto,
+    )
+}
+
+/// Apply a validated retrieval-window plan while preserving the runtime
+/// trigger that caused this boundary. The legacy wrapper above remains an
+/// automatic trigger for backward-compatible callers.
+pub fn apply_retrieval_window_plan_with_trigger(
+    session: &mut Session,
+    plan: &RetrievalWindowCandidatePlan,
+    current_policy: RetrievalWindowPolicy,
+    current_budget: &TokenBudget,
+    current_accounting: &RetrievalWindowTokenAccounting,
+    trigger_type: CompressionTriggerType,
+) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let usage = validate_apply_plan_arithmetic(plan)?;
     if session.conversation_summary.is_some() {
         return Err(RetrievalWindowApplyError::PreExistingConversationSummary);
@@ -524,7 +593,7 @@ pub fn apply_retrieval_window_plan(
     }
     if archived_count == candidate_indexes.len() {
         validate_plan_evidence(plan)?;
-        return validate_idempotent_replay(session, plan, &candidate_indexes);
+        return validate_idempotent_replay(session, plan, &candidate_indexes, &trigger_type);
     }
 
     for index in &candidate_indexes {
@@ -560,7 +629,7 @@ pub fn apply_retrieval_window_plan(
             plan.context_window_tokens,
         ),
         0,
-        CompressionTriggerType::Auto,
+        trigger_type,
         0.0,
         None,
         0,
@@ -675,7 +744,19 @@ fn validate_apply_plan_arithmetic(
         plan.request_input_limit_tokens,
         plan.target_usage_percent,
     );
-    if plan.target_tokens != expected_target {
+    // Critical provider-overflow recovery seals its one-shot target at the
+    // minimum protected footprint. That floor can exceed the configured target
+    // when recent protected content is already large, but a successful plan
+    // must still remove every otherwise-eligible group and land exactly on the
+    // protected floor. Ordinary plans may never relax the configured target.
+    let protected_with_fixed = plan
+        .fixed_prompt_tokens
+        .checked_add(plan.protected_active_tokens)
+        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
+    let sealed_provider_overflow_plan = protected_with_fixed <= plan.request_input_limit_tokens
+        && plan.target_tokens == protected_with_fixed
+        && plan.projected_active_tokens_after == protected_with_fixed;
+    if plan.target_tokens > expected_target && !sealed_provider_overflow_plan {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_tokens",
         });
@@ -707,10 +788,6 @@ fn validate_apply_plan_arithmetic(
     let system_tokens = plan
         .fixed_prompt_tokens
         .checked_add(plan.system_message_tokens)
-        .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
-    let protected_with_fixed = plan
-        .fixed_prompt_tokens
-        .checked_add(plan.protected_active_tokens)
         .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
     if system_tokens > plan.projected_active_tokens_after
         || protected_with_fixed > plan.projected_active_tokens_after
@@ -1074,6 +1151,7 @@ fn validate_idempotent_replay(
     session: &Session,
     plan: &RetrievalWindowCandidatePlan,
     candidate_indexes: &[usize],
+    trigger_type: &CompressionTriggerType,
 ) -> Result<RetrievalWindowApplyResult, RetrievalWindowApplyError> {
     let Some(event_id) = candidate_indexes
         .first()
@@ -1140,11 +1218,7 @@ fn validate_idempotent_replay(
     );
     require_event_evidence!(event.summary_tokens, 0, "summary_tokens");
     require_event_evidence!(event.actual_summary_tokens, 0, "actual_summary_tokens");
-    require_event_evidence!(
-        event.trigger_type,
-        CompressionTriggerType::Auto,
-        "trigger_type"
-    );
+    require_event_evidence!(&event.trigger_type, trigger_type, "trigger_type");
     require_event_evidence!(
         event.compression_ratio.to_bits(),
         0.0f64.to_bits(),
@@ -1638,7 +1712,8 @@ mod tests {
     use super::*;
     use bamboo_domain::{
         provider_transcript_boundary_sha256, ConversationSummary, FunctionCall, ModelContextState,
-        ProviderFamily, ProviderProtocol, ProviderTranscriptResetReason, ToolCall,
+        ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+        ProviderTranscriptOrigin, ProviderTranscriptResetReason, ToolCall,
     };
 
     #[derive(Debug)]
@@ -1802,6 +1877,7 @@ mod tests {
             &budget(100),
             policy(min_recent_user_turns, target_usage_percent),
             accounting,
+            false,
             &CharacterTokenCounter,
         )
     }
@@ -2170,6 +2246,7 @@ mod tests {
                 &budget(100),
                 policy(0, 50),
                 &RetrievalWindowTokenAccounting::default(),
+                false,
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidRecentUserTurnFloor)
@@ -2180,6 +2257,7 @@ mod tests {
                 &budget(100),
                 policy(1, 0),
                 &RetrievalWindowTokenAccounting::default(),
+                false,
                 &CharacterTokenCounter,
             ),
             Err(RetrievalWindowPlanError::InvalidTargetUsagePercent {
@@ -2192,6 +2270,121 @@ mod tests {
                 active_tokens: 45,
                 target_tokens: 50,
             })
+        );
+    }
+
+    #[test]
+    fn critical_provider_overflow_archives_every_eligible_group_below_configured_target() {
+        let mut session = Session::new("retrieval-window-provider-overflow", "test-model");
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "one", 10);
+        add_turn(&mut session, "two", 10);
+        add_turn(&mut session, "three", 10);
+        add_turn(&mut session, "four", 10);
+
+        let plan = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(200),
+            policy(1, 50),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect("provider overflow must override a locally satisfied target");
+
+        assert_eq!(plan.active_tokens_before, 85);
+        assert_eq!(plan.target_tokens, 25);
+        assert_eq!(plan.archive_group_count, 3);
+        assert_eq!(plan.retained_user_turn_count, 1);
+        assert!(plan.projected_active_tokens_after <= plan.target_tokens);
+        let mut committed = session;
+        apply_retrieval_window_plan(
+            &mut committed,
+            &plan,
+            policy(1, 50),
+            &budget(200),
+            &RetrievalWindowTokenAccounting::default(),
+        )
+        .expect("the sealed emergency target must remain valid at application");
+        assert!(committed.messages.iter().any(|message| message.compressed));
+    }
+
+    #[test]
+    fn critical_provider_overflow_archives_every_eligible_group_above_configured_target() {
+        let mut session = Session::new("retrieval-window-provider-overflow-above", "test-model");
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "one", 10);
+        add_turn(&mut session, "two", 10);
+        add_turn(&mut session, "three", 10);
+        add_turn(&mut session, "four", 10);
+
+        // The protected recent-turn floor (25 tokens) is itself above the
+        // configured 20-token target. A provider overflow still needs to
+        // archive all three eligible old groups before its sole retry.
+        let plan = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(100),
+            policy(1, 20),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect("provider overflow must maximize safe headroom above the local target");
+
+        assert_eq!(plan.active_tokens_before, 85);
+        assert_eq!(plan.target_tokens, 25);
+        assert_eq!(plan.projected_active_tokens_after, 25);
+        assert_eq!(plan.archive_group_count, 3);
+        assert_eq!(plan.retained_user_turn_count, 1);
+        let mut committed = session;
+        apply_retrieval_window_plan_with_trigger(
+            &mut committed,
+            &plan,
+            policy(1, 20),
+            &budget(100),
+            &RetrievalWindowTokenAccounting::default(),
+            CompressionTriggerType::CriticalOverflow,
+        )
+        .expect("the sealed protected-floor target must remain valid at application");
+        assert_eq!(
+            committed
+                .compression_events
+                .last()
+                .expect("critical overflow event")
+                .retrieval_archived_group_count,
+            3
+        );
+    }
+
+    #[test]
+    fn critical_provider_overflow_rejects_a_protected_floor_above_the_hard_input_limit() {
+        let mut session = Session::new(
+            "retrieval-window-provider-overflow-hard-limit",
+            "test-model",
+        );
+        session.add_message(system("system", 5));
+        add_turn(&mut session, "old", 10);
+        add_turn(&mut session, "recent", 30);
+
+        let error = build_retrieval_window_candidate_plan_with_counter(
+            &session,
+            &budget(50),
+            policy(1, 20),
+            &RetrievalWindowTokenAccounting::default(),
+            true,
+            &CharacterTokenCounter,
+        )
+        .expect_err("a provider retry cannot fit protected content beyond the hard input limit");
+
+        assert_eq!(
+            error,
+            RetrievalWindowPlanError::ProtectedContentExceedsTarget {
+                projected_tokens: 65,
+                target_tokens: 50,
+                protected_active_tokens: 65,
+                fixed_prompt_tokens: 0,
+                incomplete_protocol_group_count: 0,
+            }
         );
     }
 
@@ -2368,6 +2561,185 @@ mod tests {
             session.provider_transcript.epoch(),
             provider_epoch_after_first
         );
+    }
+
+    #[test]
+    fn trigger_aware_boundary_resets_provider_replay_across_family_restart_matrix() {
+        let routes = [
+            (
+                ProviderFamily::OpenAi,
+                ProviderProtocol::OpenAiResponsesV1,
+                "openai",
+            ),
+            (
+                ProviderFamily::Anthropic,
+                ProviderProtocol::AnthropicMessages2023_06_01,
+                "anthropic",
+            ),
+            (
+                ProviderFamily::Copilot,
+                ProviderProtocol::OpenAiResponsesV1,
+                "copilot",
+            ),
+        ];
+
+        for (family, protocol, provider_type) in routes {
+            let (mut session, plan) = basic_session_and_plan();
+            let boundary = provider_transcript_boundary_sha256(
+                Some(&format!("{provider_type}-retrieval-test")),
+                Some(provider_type),
+            )
+            .expect("provider boundary");
+            session
+                .activate_provider_transcript_route(family, protocol, &boundary)
+                .expect("provider route should activate");
+            let items = if family == ProviderFamily::Anthropic {
+                vec![
+                    ProviderTranscriptItem::try_from_payload(
+                        family,
+                        protocol,
+                        ProviderTranscriptOrigin::Provider,
+                        ProviderTranscriptAuthor::Model,
+                        serde_json::json!({
+                            "type":"server_tool_use",
+                            "id":"srvtoolu_archive_matrix",
+                            "name":"tool_search_tool_regex",
+                            "input":{"pattern":"history"}
+                        }),
+                    )
+                    .expect("anthropic search call"),
+                    ProviderTranscriptItem::try_from_payload(
+                        family,
+                        protocol,
+                        ProviderTranscriptOrigin::Provider,
+                        ProviderTranscriptAuthor::ToolResult,
+                        serde_json::json!({
+                            "type":"tool_search_tool_result",
+                            "tool_use_id":"srvtoolu_archive_matrix",
+                            "content":{
+                                "type":"tool_search_tool_search_result",
+                                "tool_references":[{
+                                    "type":"tool_reference",
+                                    "tool_name":"session_history_current"
+                                }]
+                            }
+                        }),
+                    )
+                    .expect("anthropic search result"),
+                ]
+            } else {
+                vec![ProviderTranscriptItem::try_from_payload(
+                    family,
+                    protocol,
+                    ProviderTranscriptOrigin::Provider,
+                    ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"tool_search_call",
+                        "id":"tsc_archive_matrix",
+                        "execution":"client",
+                        "call_id":"search_archive_matrix",
+                        "status":"completed",
+                        "arguments":{"query":"history"}
+                    }),
+                )
+                .expect("OpenAI-family search call")]
+            };
+            session
+                .append_provider_transcript_group("t4-a", None, items)
+                .expect("provider-native group should append");
+            assert_eq!(
+                session
+                    .provider_transcript
+                    .replayable_groups(family, protocol, &boundary)
+                    .len(),
+                1
+            );
+            let provider_epoch_before = session.provider_transcript.epoch();
+
+            apply_retrieval_window_plan_with_trigger(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &accounting_for_plan(&plan),
+                CompressionTriggerType::CriticalOverflow,
+            )
+            .expect("trigger-aware boundary should apply");
+
+            assert_eq!(
+                session
+                    .compression_events
+                    .last()
+                    .expect("retrieval event")
+                    .trigger_type,
+                CompressionTriggerType::CriticalOverflow
+            );
+            assert_eq!(
+                session.provider_transcript.epoch(),
+                provider_epoch_before + 1
+            );
+            assert!(session
+                .provider_transcript
+                .replayable_groups(family, protocol, &boundary)
+                .is_empty());
+
+            let restarted: Session = serde_json::from_slice(
+                &serde_json::to_vec(&session).expect("session should serialize"),
+            )
+            .expect("session should reload");
+            assert_eq!(
+                restarted.provider_transcript.last_reset_reason(),
+                Some(ProviderTranscriptResetReason::Compression)
+            );
+            assert!(restarted
+                .provider_transcript
+                .replayable_groups(family, protocol, &boundary)
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn trigger_aware_idempotent_replay_requires_the_original_trigger() {
+        let (mut session, plan) = basic_session_and_plan();
+        let first = apply_retrieval_window_plan_with_trigger(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &budget(100),
+            &accounting_for_plan(&plan),
+            CompressionTriggerType::Manual,
+        )
+        .expect("manual boundary should apply");
+        assert_eq!(
+            session.compression_events[0].trigger_type,
+            CompressionTriggerType::Manual
+        );
+
+        let replay = apply_retrieval_window_plan_with_trigger(
+            &mut session,
+            &plan,
+            policy_for_plan(&plan),
+            &budget(100),
+            &accounting_for_plan(&plan),
+            CompressionTriggerType::Manual,
+        )
+        .expect("the same manual request should be idempotent");
+        assert!(replay.idempotent_replay);
+        assert_eq!(replay.event_id, first.event_id);
+
+        assert!(matches!(
+            apply_retrieval_window_plan(
+                &mut session,
+                &plan,
+                policy_for_plan(&plan),
+                &budget(100),
+                &accounting_for_plan(&plan),
+            ),
+            Err(RetrievalWindowApplyError::ArchiveEventEvidenceMismatch {
+                field: "trigger_type",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -80,15 +80,25 @@ impl LlmManager for DefaultLlmManager {
         session: &mut Session,
         config: &AgentLoopConfig,
         session_id: &str,
+        tool_schemas: &[ToolSchema],
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<bool, AgentError> {
         let model_name = config.model_name.as_deref().unwrap_or("unknown");
+        let request_tool_schemas =
+            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                session,
+                &self.llm,
+                model_name,
+                tool_schemas,
+            )
+            .await;
 
         crate::runtime::runner::round_lifecycle::force_overflow_context_recovery(
             session,
             config,
             model_name,
             session_id,
+            request_tool_schemas.as_ref(),
             &self.llm,
             Some(event_tx),
         )

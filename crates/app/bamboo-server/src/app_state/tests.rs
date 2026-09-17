@@ -235,6 +235,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
 
     assert!(names.contains("Task"));
     assert!(names.contains("SubAgent"));
+    assert!(names.contains("archive_context"));
     assert!(names.contains("scheduler"));
     assert!(names.contains("session_history"));
     assert!(names.contains("session_history_current"));
@@ -329,6 +330,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
 
     assert!(!names.contains("scheduler"));
     assert!(!names.contains("sub_session_manager"));
+    assert!(names.contains("archive_context"));
     assert!(names.contains("session_history"));
     assert!(names.contains("session_history_current"));
     assert!(!names.contains("session_control"));
