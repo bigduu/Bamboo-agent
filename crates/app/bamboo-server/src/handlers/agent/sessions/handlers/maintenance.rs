@@ -138,13 +138,17 @@ pub async fn run_project_dream(
         config: state.config.clone(),
         provider_registry: state.provider_registry.clone(),
     };
-    let result = run_project_auto_dream_once_for_project(&ctx, &project_id)
-        .await
-        .map_err(|error| {
-            crate::error::json_internal_server_error(format!(
-                "Failed to run project Dream generation: {error}"
-            ))
-        })?;
+    let result = run_project_auto_dream_once_for_project(
+        &ctx,
+        &project_id,
+        Some(state.project_context_resolver.as_ref()),
+    )
+    .await
+    .map_err(|error| {
+        crate::error::json_internal_server_error(format!(
+            "Failed to run project Dream generation: {error}"
+        ))
+    })?;
 
     let response = match result {
         Some(result) => serde_json::json!({

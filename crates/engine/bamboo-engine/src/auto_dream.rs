@@ -2082,29 +2082,47 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
     retry_replacements: &HashSet<ExtractionMemoryFingerprint>,
 ) -> Result<HistoryRewriteMemoryTargets, String> {
     // AutoDream can emit a Global candidate even while the explicit Project
-    // maintenance path owns the current extraction store. Always inspect the
-    // Global lineage, then add the applicable Project lineage, so one shared
-    // Session watermark cannot strand stale facts in the other scope.
+    // maintenance path owns the current extraction store. A Session can also
+    // move between Projects after an earlier extraction. Always inspect the
+    // Global lineage plus every registered Project lineage, so one shared
+    // Session watermark cannot strand stale facts in a former scope.
     let mut scopes = vec![(ctx.memory.clone(), MemoryScope::Global, None)];
+    let mut project_keys = HashSet::new();
+    if let Some(resolver) = project_resolver {
+        project_keys.extend(
+            resolver
+                .list_project_ids()
+                .await
+                .map_err(|error| {
+                    format!("failed to enumerate Project scopes before history rewrite: {error}")
+                })?
+                .into_iter()
+                .map(bamboo_domain::ProjectId::into_string),
+        );
+    }
     if current_store_is_project_scoped {
         let project_key = session.project_key.as_deref().ok_or_else(|| {
             "project-scoped history rewrite is missing project identity".to_string()
         })?;
-        scopes.push((
-            memory.clone(),
-            MemoryScope::Project,
-            Some(project_key.to_string()),
-        ));
+        project_keys.insert(project_key.to_string());
     } else if project_resolver.is_some() {
         if let Some(project_key) = session.project_key.as_deref() {
-            let project_id = bamboo_domain::ProjectId::parse(project_key.to_string())
-                .map_err(|error| format!("invalid history-rewrite Project identity: {error}"))?;
-            scopes.push((
-                ctx.memory.for_project(&project_id),
-                MemoryScope::Project,
-                Some(project_key.to_string()),
-            ));
+            project_keys.insert(project_key.to_string());
         }
+    }
+    let mut project_keys = project_keys.into_iter().collect::<Vec<_>>();
+    project_keys.sort();
+    for project_key in project_keys {
+        let project_id = bamboo_domain::ProjectId::parse(project_key.clone())
+            .map_err(|error| format!("invalid history-rewrite Project identity: {error}"))?;
+        let store = if current_store_is_project_scoped
+            && session.project_key.as_deref() == Some(project_key.as_str())
+        {
+            memory.clone()
+        } else {
+            ctx.memory.for_project(&project_id)
+        };
+        scopes.push((store, MemoryScope::Project, Some(project_key)));
     }
 
     let mut targets = HashSet::new();
@@ -4437,15 +4455,18 @@ pub async fn run_auto_dream_once_with_project_resolver(
 pub async fn run_project_auto_dream_once_for_project(
     ctx: &AutoDreamContext,
     project_id: &bamboo_domain::ProjectId,
+    project_resolver: Option<&ProjectContextResolver>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let memory = memory_store_for_context(ctx).for_project(project_id);
-    run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
+    run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str(), project_resolver)
+        .await
 }
 
 async fn run_project_auto_dream_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
     project_key: &str,
+    project_resolver: Option<&ProjectContextResolver>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let project_key = project_key.trim();
     if project_key.is_empty() {
@@ -4457,7 +4478,7 @@ async fn run_project_auto_dream_once_with_store(
         MemoryScope::Project,
         Some(project_key),
         false,
-        None,
+        project_resolver,
     )
     .await
 }
@@ -4538,6 +4559,43 @@ mod tests {
             crate::project_context::ProjectContextError,
         > {
             Ok((&self.0.id == project_id).then(|| self.0.clone()))
+        }
+
+        async fn list_projects(
+            &self,
+        ) -> Result<
+            Vec<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    struct StaticProjectListSource(Vec<crate::project_context::ProjectDescriptor>);
+
+    #[async_trait]
+    impl crate::project_context::ProjectContextSource for StaticProjectListSource {
+        async fn find_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<
+            Option<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok(self
+                .0
+                .iter()
+                .find(|project| &project.id == project_id)
+                .cloned())
+        }
+
+        async fn list_projects(
+            &self,
+        ) -> Result<
+            Vec<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok(self.0.clone())
         }
     }
 
@@ -6360,6 +6418,144 @@ mod tests {
                 id: project.frontmatter.id,
                 scope: MemoryScope::Project,
                 project_key: Some(project_key),
+            }));
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_scans_former_project_after_reassignment_or_unassignment() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let project_a = ProjectId::parse("former-project-a").expect("Project A id");
+        let project_b = ProjectId::parse("current-project-b").expect("Project B id");
+        let mut session = Session::new("reassigned-history-source", "model");
+        session.set_project_id_meta(project_b.to_string());
+        session
+            .messages
+            .push(Message::assistant("The old Project fact changed.", None));
+        session.clear_derived_context_state();
+        storage.save_session(&session).await.expect("save Session");
+
+        let base_memory = MemoryStore::new(temp_dir.path());
+        let former_project_memory = base_memory
+            .for_project(&project_a)
+            .write_memory(
+                MemoryScope::Project,
+                Some(project_a.as_str()),
+                DurableMemoryType::Project,
+                "Former Project fact",
+                "The stale fact was extracted before reassignment.",
+                &["history".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed former Project memory");
+        let current_project_memory = base_memory
+            .for_project(&project_b)
+            .write_memory(
+                MemoryScope::Project,
+                Some(project_b.as_str()),
+                DurableMemoryType::Project,
+                "Current Project fact",
+                "The current Project fact also changed.",
+                &["history".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed current Project memory");
+        let descriptor =
+            |project_id: &ProjectId, name: &str| crate::project_context::ProjectDescriptor {
+                id: project_id.clone(),
+                name: name.to_string(),
+                project_path: None,
+                home: temp_dir.path().join("projects").join(project_id.as_str()),
+                workspace_bindings: Vec::new(),
+                resources: ProjectResourceSummary {
+                    project_id: project_id.clone(),
+                    resource_revision: 1,
+                    resources: Vec::new(),
+                },
+            };
+        let resolver = ProjectContextResolver::new(Arc::new(StaticProjectListSource(vec![
+            descriptor(&project_a, "Former Project"),
+            descriptor(&project_b, "Current Project"),
+        ])));
+        let entry = session_store
+            .get_index_entry(&session.id)
+            .await
+            .expect("Session index entry");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: base_memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let rewritten = CandidateSessionContext {
+            entry,
+            summary: Some("corrected history".to_string()),
+            session_id: session.id.clone(),
+            project_key: Some(project_b.to_string()),
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+
+        let reassigned_targets = collect_history_rewrite_replacement_targets(
+            &context,
+            &base_memory,
+            &rewritten,
+            Some(&resolver),
+            false,
+        )
+        .await
+        .expect("collect reassigned Project targets");
+        for expected in [
+            MemoryReplacementTarget {
+                id: former_project_memory.frontmatter.id.clone(),
+                scope: MemoryScope::Project,
+                project_key: Some(project_a.to_string()),
+            },
+            MemoryReplacementTarget {
+                id: current_project_memory.frontmatter.id,
+                scope: MemoryScope::Project,
+                project_key: Some(project_b.to_string()),
+            },
+        ] {
+            assert!(reassigned_targets.replacement_targets.contains(&expected));
+        }
+
+        let mut unassigned = rewritten;
+        unassigned.project_key = None;
+        let unassigned_targets = collect_history_rewrite_replacement_targets(
+            &context,
+            &base_memory,
+            &unassigned,
+            Some(&resolver),
+            false,
+        )
+        .await
+        .expect("collect unassigned Project targets");
+        assert!(unassigned_targets
+            .replacement_targets
+            .contains(&MemoryReplacementTarget {
+                id: former_project_memory.frontmatter.id,
+                scope: MemoryScope::Project,
+                project_key: Some(project_a.to_string()),
             }));
     }
 
@@ -8397,7 +8593,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_for_project(&context, &project_id_a)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id_a, None)
             .await
             .expect("project auto dream should succeed")
             .expect("project auto dream should produce output");
@@ -8499,7 +8695,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_for_project(&context, &target_project_id)
+        let result = run_project_auto_dream_once_for_project(&context, &target_project_id, None)
             .await
             .expect("project auto dream without sessions should not error");
         assert!(result.is_none());
@@ -8572,7 +8768,7 @@ mod tests {
             config,
             provider_registry: test_registry(),
         };
-        let result = run_project_auto_dream_once_for_project(&context, &project_id)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id, None)
             .await
             .expect(
                 "manual project dream should succeed even when auto background dream is disabled",
@@ -8669,7 +8865,7 @@ mod tests {
             provider_registry: test_registry(),
         };
 
-        let result = run_project_auto_dream_once_for_project(&context, &project_id)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id, None)
             .await
             .expect("grounded auto dream should succeed")
             .expect("dream output should be produced");
@@ -8779,7 +8975,7 @@ mod tests {
             provider_registry: test_registry(),
         };
 
-        let result = run_project_auto_dream_once_for_project(&context, &project_id)
+        let result = run_project_auto_dream_once_for_project(&context, &project_id, None)
             .await
             .expect("rebuild auto dream should succeed")
             .expect("rebuild dream output should be produced");
