@@ -45,14 +45,17 @@ const DREAM_TRACING_TARGET: &str = "bamboo.auto_dream";
 const DREAM_FULL_REBUILD_INTERVAL_SECS: i64 = 60 * 60 * 24 * 30;
 const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
-const RETRIEVAL_EXTRACTION_MAX_MESSAGES: usize = 64;
+const EXTRACTION_MAX_CANDIDATES: usize = 8;
+// One source item can establish at least one independent fact. Keep the input
+// cardinality within the provider contract's eight-candidate output ceiling so
+// a successful response can account for every item before its watermark moves.
+const RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS: usize = EXTRACTION_MAX_CANDIDATES;
 const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
 const RETRIEVAL_EXTRACTION_CONTINUATION_OVERLAP_CHARS: usize = 128;
 const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_536;
 const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
-const EXTRACTION_MAX_CANDIDATES: usize = 8;
 const EXTRACTION_CHECKPOINT_VERSION: u32 = 1;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v1";
 const REDACTED_EXTRACTION_SOURCE: &str =
@@ -460,7 +463,7 @@ fn build_retrieval_window_extraction_batches(
         let rendered_chars = rendered.chars().count();
         debug_assert!(rendered_chars <= max_body_chars);
         if !current_batch.is_empty()
-            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_MESSAGES
+            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS
                 || current_chars.saturating_add(rendered_chars) > max_body_chars)
         {
             item_batches.push(std::mem::take(&mut current_batch));
@@ -490,7 +493,7 @@ fn build_retrieval_window_extraction_batches(
                 .len();
             let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
             rendered.push_str(&format!(
-                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_messages_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
+                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- continuation_overlap_items_in_batch: {}\n- max_source_items_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n",
                 extraction_watermark
                     .map(|watermark| watermark.to_rfc3339())
                     .unwrap_or_else(|| "(none)".to_string()),
@@ -501,7 +504,7 @@ fn build_retrieval_window_extraction_batches(
                 items.len(),
                 distinct_message_count,
                 usize::from(continuation_overlap.is_some()),
-                RETRIEVAL_EXTRACTION_MAX_MESSAGES,
+                RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS,
                 RETRIEVAL_EXTRACTION_MAX_CHARS,
                 if batch_index + 1 < batch_count {
                     "continues_in_next_batch"
@@ -2060,8 +2063,11 @@ mod tests {
         let recent_outline = derive_session_outline(&session).expect("recent outline");
         assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
         let sources = session_extraction_sources(&session, None);
-        assert_eq!(sources.len(), 1);
-        let delta = sources[0].as_deref().expect("retrieval delta");
+        assert_eq!(sources.len(), 2);
+        let delta = sources
+            .iter()
+            .filter_map(Option::as_deref)
+            .collect::<String>();
         assert!(delta.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
         assert!(!delta.contains("SYSTEM_POLICY_MUST_NOT_APPEAR"));
     }
@@ -2289,18 +2295,20 @@ mod tests {
         }
 
         let batches = build_retrieval_window_extraction_batches(&session, None);
-        assert_eq!(batches.len(), 2);
-        assert!(batches[0].contains("batch: 1/2"));
-        assert!(batches[0].contains("source_items_in_batch: 64"));
+        assert_eq!(batches.len(), 9);
+        assert!(batches[0].contains("batch: 1/9"));
+        assert!(batches[0].contains("source_items_in_batch: 8"));
         assert!(batches[0].contains("continuation_overlap_items_in_batch: 0"));
         assert!(batches[0].contains("continuation: continues_in_next_batch"));
-        assert!(batches[1].contains("batch: 2/2"));
-        assert!(batches[1].contains("source_items_in_batch: 2"));
-        assert!(batches[1].contains("continuation_overlap_items_in_batch: 1"));
-        assert!(batches[1].contains("continuation_overlap_content_suffix: \"ORDER_063\""));
-        assert!(batches[1].contains("continuation: final_batch"));
+        assert!(batches[1].contains("continuation_overlap_content_suffix: \"ORDER_007\""));
+        assert!(batches[8].contains("batch: 9/9"));
+        assert!(batches[8].contains("source_items_in_batch: 2"));
+        assert!(batches[8].contains("continuation_overlap_items_in_batch: 1"));
+        assert!(batches[8].contains("continuation_overlap_content_suffix: \"ORDER_063\""));
+        assert!(batches[8].contains("continuation: final_batch"));
         assert!(batches.iter().all(|batch| {
             batch.contains("eligible_messages: 66")
+                && batch.contains("max_source_items_per_batch: 8")
                 && batch.contains("truncated: false")
                 && batch.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS
         }));
@@ -2794,7 +2802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieval_source_batches_each_receive_the_full_candidate_budget() {
+    async fn nine_retrieval_facts_split_at_the_eight_candidate_budget() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let session_store = Arc::new(
@@ -2809,9 +2817,9 @@ mod tests {
         session
             .compression_events
             .push(retrieval_event("event", now - chrono::Duration::seconds(1)));
-        for index in 0..90 {
+        for index in 0..9 {
             let mut archived = message_at(
-                Message::user(format!("FACT_{index:03} {}", "x".repeat(1_000))),
+                Message::user(format!("FACT_{index:03} is independently durable.")),
                 &format!("archived-{index:03}"),
                 now - chrono::Duration::minutes(1),
             );
@@ -2839,26 +2847,37 @@ mod tests {
             now - chrono::Duration::hours(24),
         )
         .await;
-        assert!(
-            contexts.len() >= 9,
-            "fixture must exercise more than the shared eight-candidate cap"
-        );
-        let responses = (0..contexts.len())
-            .map(|index| {
-                serde_json::json!({
-                    "candidates": [{
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts[0]
+            .summary
+            .as_deref()
+            .is_some_and(|source| source.contains("source_items_in_batch: 8")));
+        assert!(contexts[1]
+            .summary
+            .as_deref()
+            .is_some_and(|source| source.contains("source_items_in_batch: 1")));
+        let candidate = |index| {
+            serde_json::json!({
                         "title": format!("Retrieved fact {index}"),
                         "type": "reference",
                         "scope": "global",
                         "content": format!("Durable retrieved fact number {index}."),
                         "tags": ["capacity"],
                         "session_id": "retrieval-capacity"
-                    }],
-                    "ledger_candidates": []
-                })
-                .to_string()
             })
-            .collect();
+        };
+        let responses = vec![
+            serde_json::json!({
+                "candidates": (0..8).map(&candidate).collect::<Vec<_>>(),
+                "ledger_candidates": []
+            })
+            .to_string(),
+            serde_json::json!({
+                "candidates": [candidate(8)],
+                "ledger_candidates": []
+            })
+            .to_string(),
+        ];
         let sequence_provider = Arc::new(SequenceProvider::new(responses));
         let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
         context.provider = provider.clone();
@@ -2873,15 +2892,15 @@ mod tests {
         )
         .await
         .expect("every retrieval source batch should persist");
-        assert_eq!(writes.memory, contexts.len());
-        assert_eq!(sequence_provider.recorded_prompts().len(), contexts.len());
+        assert_eq!(writes.memory, 9);
+        assert_eq!(sequence_provider.recorded_prompts().len(), 2);
         assert_eq!(
             memory
                 .list_memory_documents(MemoryScope::Global, None)
                 .await
                 .expect("list extracted memories")
                 .len(),
-            contexts.len()
+            9
         );
     }
 
