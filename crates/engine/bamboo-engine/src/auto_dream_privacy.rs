@@ -371,11 +371,20 @@ fn contains_xml_credential(value: &str) -> bool {
             continue;
         }
 
-        if xml_credential_attribute_pattern().is_match(tag)
-            || (xml_credential_name_attribute_pattern().is_match(tag)
-                && xml_value_attribute_pattern().is_match(tag))
-        {
+        if xml_credential_attribute_pattern().is_match(tag) {
             return true;
+        }
+
+        if xml_credential_name_attribute_pattern().is_match(tag) {
+            if xml_value_attribute_pattern().is_match(tag) {
+                return true;
+            }
+            if !tag.trim_end().ends_with('/') {
+                let body = &remainder[close + 1..];
+                if xml_element_body_contains_text(body) {
+                    return true;
+                }
+            }
         }
 
         if xml_credential_tag_name_pattern().is_match(tag) {
@@ -1160,6 +1169,10 @@ mod tests {
                 "empty XML password CDATA",
                 "<password><![CDATA[   ]]></password>",
             ),
+            (
+                "empty nested XML password property",
+                "<property name=\"password\"><value>   </value></property>",
+            ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
             (
@@ -1318,6 +1331,10 @@ mod tests {
             (
                 "XML credential property",
                 "<property name=\"password\" value=\"hunter2\"/>",
+            ),
+            (
+                "nested XML credential property",
+                "<property name=\"password\"><value>hunter2</value></property>",
             ),
             (
                 "XML credential value attribute",
