@@ -160,6 +160,29 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
         return Some(REDACTED_EXTRACTION_SOURCE.to_string());
     }
 
+    let uses_task_list = session
+        .task_list
+        .as_ref()
+        .is_some_and(|task_list| !task_list.items.is_empty());
+    if !uses_task_list {
+        let recent_message_sources = session
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| {
+                matches!(
+                    message.role,
+                    bamboo_agent_core::Role::User | bamboo_agent_core::Role::Assistant
+                )
+            })
+            .take(6)
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        if !extraction_sources_are_secret_safe(&recent_message_sources) {
+            return Some(REDACTED_EXTRACTION_SOURCE.to_string());
+        }
+    }
+
     // Sanitize complete message bodies before the outline helper truncates
     // them. Otherwise a credential crossing the 300-character boundary could
     // leave an undetected prefix in the provider prompt.
@@ -1460,6 +1483,19 @@ mod tests {
     }
 
     #[test]
+    fn outline_rejects_credentials_split_across_recent_messages() {
+        let mut session = bamboo_agent_core::Session::new("session-message-split", "model");
+        session.add_message(Message::user("Password"));
+        session.add_message(Message::assistant("hunter2", None));
+
+        assert!(
+            derive_sanitized_session_outline(&session).as_deref()
+                == Some(REDACTED_EXTRACTION_SOURCE),
+            "a credential split across recent messages was not redacted"
+        );
+    }
+
+    #[test]
     fn outline_sanitizes_task_fields_before_prompt_truncation() {
         const SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
         let secret = "mF9/Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je";
@@ -1480,7 +1516,10 @@ mod tests {
         });
 
         let outline = derive_sanitized_session_outline(&session).expect("sanitized outline");
-        assert_eq!(outline, REDACTED_EXTRACTION_SOURCE);
+        assert!(
+            outline == REDACTED_EXTRACTION_SOURCE,
+            "task-list source was not redacted before truncation"
+        );
         assert!(
             !outline.contains(SECRET_PREFIX),
             "a credential prefix crossed the task-list truncation boundary"
@@ -1505,9 +1544,10 @@ mod tests {
             updated_at: now,
         });
 
-        assert_eq!(
-            derive_sanitized_session_outline(&session).as_deref(),
-            Some(REDACTED_EXTRACTION_SOURCE)
+        assert!(
+            derive_sanitized_session_outline(&session).as_deref()
+                == Some(REDACTED_EXTRACTION_SOURCE),
+            "a credential split across task fields was not redacted"
         );
     }
 

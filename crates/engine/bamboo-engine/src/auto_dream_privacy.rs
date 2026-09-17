@@ -52,6 +52,16 @@ fn standalone_pin_credential_pattern() -> &'static Regex {
     })
 }
 
+fn cli_credential_flag_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)[\"']?[^\s\"',;}]+"#,
+        )
+        .expect("CLI credential flag regex must compile")
+    })
+}
+
 fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -278,6 +288,7 @@ pub(crate) fn contains_secret_like_value(value: &str) -> bool {
         || generic_secret_assignment_pattern().is_match(value)
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
+        || cli_credential_flag_pattern().is_match(value)
         || contains_environment_credential_assignment(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
@@ -366,6 +377,8 @@ mod tests {
             ("relative path", "src/HTTP2Client/Config.toml"),
             ("basic plan", "I prefer the basic plan"),
             ("bearer bonds", "We trade bearer bonds"),
+            ("credential file flag", "deploy --password-file secrets.txt"),
+            ("token budget flag", "runner --token-budget 1000"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -404,6 +417,9 @@ mod tests {
             ("lowercase standalone PIN", "pin: 1234"),
             ("equals standalone PIN", "PIN = 1234"),
             ("word-assigned standalone PIN", "pin is 1234"),
+            ("CLI password", "deploy --password hunter2"),
+            ("CLI API key", "deploy --api-key hunter2"),
+            ("CLI client secret", "deploy --client-secret=hunter2"),
             (
                 "connection-string key",
                 "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
