@@ -864,6 +864,67 @@ struct StoredExtractionTransaction {
     batches: Vec<ExtractionCheckpoint>,
 }
 
+fn build_pending_extraction_batches(
+    model: &str,
+    sessions: &[CandidateSessionContext],
+) -> Vec<PendingExtractionBatch> {
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(context_index, session)| {
+            let prompt = extraction_prompt(session);
+            let source_updated_at = session.entry.updated_at.to_rfc3339();
+            PendingExtractionBatch {
+                context_index,
+                checkpoint_id: extraction_checkpoint_id(
+                    model,
+                    &session.session_id,
+                    &source_updated_at,
+                    &prompt,
+                ),
+                prompt,
+                transaction_id: String::new(),
+                batch_index: 0,
+                batch_count: 0,
+            }
+        })
+        .collect()
+}
+
+fn assign_pending_extraction_transactions(
+    sessions: &[CandidateSessionContext],
+    pending_batches: &mut [PendingExtractionBatch],
+) -> HashMap<String, Vec<usize>> {
+    let mut indexes_by_session: HashMap<String, Vec<usize>> = HashMap::new();
+    for (pending_index, pending) in pending_batches.iter().enumerate() {
+        let session_id = &sessions[pending.context_index].session_id;
+        indexes_by_session
+            .entry(session_id.clone())
+            .or_default()
+            .push(pending_index);
+    }
+    for (session_id, pending_indexes) in &indexes_by_session {
+        let checkpoint_ids = pending_indexes
+            .iter()
+            .map(|index| pending_batches[*index].checkpoint_id.clone())
+            .collect::<Vec<_>>();
+        let source_updated_at = sessions[pending_batches[pending_indexes[0]].context_index]
+            .entry
+            .updated_at
+            .to_rfc3339();
+        let transaction_id =
+            extraction_transaction_id(session_id, &source_updated_at, &checkpoint_ids);
+        let batch_count = pending_indexes.len();
+        for (batch_index, pending_index) in pending_indexes.iter().enumerate() {
+            let pending = &mut pending_batches[*pending_index];
+            pending.transaction_id.clone_from(&transaction_id);
+            pending.batch_index = batch_index;
+            pending.batch_count = batch_count;
+        }
+    }
+    indexes_by_session
+}
+
 fn extraction_prompt(session: &CandidateSessionContext) -> String {
     build_extraction_prompt(&[DreamCandidateInfo {
         session_id: session.session_id.clone(),
@@ -1308,6 +1369,63 @@ async fn remove_superseded_extraction_checkpoints(
     Ok(())
 }
 
+async fn rebuild_retrieval_contexts_after_checkpoint_replay(
+    ctx: &AutoDreamContext,
+    template: &CandidateSessionContext,
+    acknowledged_watermark: DateTime<Utc>,
+) -> Result<Vec<CandidateSessionContext>, String> {
+    let session = ctx
+        .storage
+        .load_session(&template.session_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to reload retrieval source after checkpoint replay for {}: {error}",
+                template.session_id
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "retrieval source disappeared after checkpoint replay for {}",
+                template.session_id
+            )
+        })?;
+    if session.conversation_summary.is_some()
+        || !session
+            .compression_events
+            .iter()
+            .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
+    {
+        return Err(format!(
+            "retrieval source mode changed during checkpoint replay for {}",
+            template.session_id
+        ));
+    }
+    let retrieval_event_key = first_retrieval_event_key(&session)
+        .ok_or_else(|| "retrieval source lost its first boundary identity".to_string())?;
+    let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
+        .map(bamboo_domain::ProjectId::into_string);
+
+    // The complete replay transaction already covered its Session topics.
+    // Rebuild only the newer canonical message delta against the watermark that
+    // replay just acknowledged; reusing a pre-replay transition batch would
+    // submit old messages to the provider again and invite stochastic duplicates.
+    Ok(
+        build_retrieval_window_extraction_batches(&session, Some(acknowledged_watermark), true)
+            .into_iter()
+            .filter(|summary| !summary.trim().is_empty())
+            .map(|summary| CandidateSessionContext {
+                entry: template.entry.clone(),
+                summary: Some(summary),
+                session_id: template.session_id.clone(),
+                project_key: project_key.clone(),
+                topics: Vec::new(),
+                retrieval_event_key: Some(retrieval_event_key.clone()),
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 async fn extract_and_persist_durable_candidates(
     ctx: &AutoDreamContext,
@@ -1338,8 +1456,9 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
+    let mut extraction_sessions = sessions.to_vec();
     let mut seen_sessions = HashSet::new();
-    let session_source_watermarks = sessions
+    let session_source_watermarks = extraction_sessions
         .iter()
         .filter(|session| seen_sessions.insert(session.session_id.clone()))
         .map(|session| {
@@ -1354,53 +1473,9 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         .cloned()
         .collect::<HashMap<_, _>>();
     let mut total_writes = ExtractionWrites::default();
-    let mut pending_batches = sessions
-        .iter()
-        .enumerate()
-        .map(|(context_index, session)| {
-            let prompt = extraction_prompt(session);
-            let source_updated_at = session.entry.updated_at.to_rfc3339();
-            PendingExtractionBatch {
-                context_index,
-                checkpoint_id: extraction_checkpoint_id(
-                    model,
-                    &session.session_id,
-                    &source_updated_at,
-                    &prompt,
-                ),
-                prompt,
-                transaction_id: String::new(),
-                batch_index: 0,
-                batch_count: 0,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut pending_indexes_by_session: HashMap<String, Vec<usize>> = HashMap::new();
-    for (pending_index, pending) in pending_batches.iter().enumerate() {
-        let session_id = &sessions[pending.context_index].session_id;
-        pending_indexes_by_session
-            .entry(session_id.clone())
-            .or_default()
-            .push(pending_index);
-    }
-    for (session_id, pending_indexes) in &pending_indexes_by_session {
-        let checkpoint_ids = pending_indexes
-            .iter()
-            .map(|index| pending_batches[*index].checkpoint_id.clone())
-            .collect::<Vec<_>>();
-        let source_updated_at = source_updated_at_by_session
-            .get(session_id)
-            .expect("every pending Session has a source watermark");
-        let transaction_id =
-            extraction_transaction_id(session_id, source_updated_at, &checkpoint_ids);
-        let batch_count = pending_indexes.len();
-        for (batch_index, pending_index) in pending_indexes.iter().enumerate() {
-            let pending = &mut pending_batches[*pending_index];
-            pending.transaction_id.clone_from(&transaction_id);
-            pending.batch_index = batch_index;
-            pending.batch_count = batch_count;
-        }
-    }
+    let mut pending_batches = build_pending_extraction_batches(model, &extraction_sessions);
+    let pending_indexes_by_session =
+        assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
 
     // A complete transaction proves that every provider batch was parsed and
     // checkpointed before any sink began. Replay it to both sinks and commit
@@ -1419,7 +1494,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         }
 
         let context_index = pending_batches[pending_indexes[0]].context_index;
-        let session_context = &sessions[context_index];
+        let session_context = &extraction_sessions[context_index];
         let state = memory
             .read_session_state(session_id)
             .await
@@ -1469,7 +1544,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     total_writes.memory = total_writes.memory.saturating_add(writes.memory);
                     total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
                 }
-                if let Some(event_key) = sessions
+                if let Some(event_key) = extraction_sessions
                     .iter()
                     .filter(|session| session.session_id.as_str() == session_id.as_str())
                     .find_map(|session| session.retrieval_event_key.as_deref())
@@ -1501,8 +1576,71 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             acknowledged_watermarks_by_session.insert(session_id.clone(), acknowledged_watermark);
         }
     }
+
+    let mut retrieval_sessions_to_rebuild = acknowledged_watermarks_by_session
+        .iter()
+        .filter_map(|(session_id, acknowledged_watermark)| {
+            extraction_sessions
+                .iter()
+                .find(|session| session.session_id == *session_id)
+                .filter(|session| {
+                    session.retrieval_event_key.is_some()
+                        && session.entry.updated_at > *acknowledged_watermark
+                })
+                .map(|_| session_id.clone())
+        })
+        .collect::<Vec<_>>();
+    retrieval_sessions_to_rebuild.sort();
+    if !retrieval_sessions_to_rebuild.is_empty() {
+        let rebuild_set = retrieval_sessions_to_rebuild
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut rebuilt_contexts = Vec::new();
+        for session_id in &retrieval_sessions_to_rebuild {
+            let template = extraction_sessions
+                .iter()
+                .find(|session| session.session_id == *session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("missing retrieval context after checkpoint replay for {session_id}")
+                })?;
+            let acknowledged_watermark = *acknowledged_watermarks_by_session
+                .get(session_id)
+                .expect("rebuild Session came from acknowledged watermark map");
+            rebuilt_contexts.extend(
+                rebuild_retrieval_contexts_after_checkpoint_replay(
+                    ctx,
+                    &template,
+                    acknowledged_watermark,
+                )
+                .await?,
+            );
+        }
+        pending_batches.retain(|pending| {
+            !rebuild_set.contains(&extraction_sessions[pending.context_index].session_id)
+        });
+        for context in rebuilt_contexts {
+            let context_index = extraction_sessions.len();
+            let prompt = extraction_prompt(&context);
+            let source_updated_at = context.entry.updated_at.to_rfc3339();
+            let checkpoint_id =
+                extraction_checkpoint_id(model, &context.session_id, &source_updated_at, &prompt);
+            extraction_sessions.push(context);
+            pending_batches.push(PendingExtractionBatch {
+                context_index,
+                prompt,
+                checkpoint_id,
+                transaction_id: String::new(),
+                batch_index: 0,
+                batch_count: 0,
+            });
+        }
+        assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+    }
+
     pending_batches.retain(|pending| {
-        let session = &sessions[pending.context_index];
+        let session = &extraction_sessions[pending.context_index];
         acknowledged_watermarks_by_session
             .get(&session.session_id)
             .is_none_or(|acknowledged_watermark| session.entry.updated_at > *acknowledged_watermark)
@@ -1515,12 +1653,16 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     let mut checkpoint_ids_by_session: HashMap<String, Vec<String>> = HashMap::new();
     for pending in &pending_batches {
         checkpoint_ids_by_session
-            .entry(sessions[pending.context_index].session_id.clone())
+            .entry(
+                extraction_sessions[pending.context_index]
+                    .session_id
+                    .clone(),
+            )
             .or_default()
             .push(pending.checkpoint_id.clone());
     }
     for pending in pending_batches {
-        let session = &sessions[pending.context_index];
+        let session = &extraction_sessions[pending.context_index];
         let source_updated_at = source_updated_at_by_session
             .get(&session.session_id)
             .expect("every pending Session has a source watermark");
@@ -1590,7 +1732,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             ctx,
             memory,
             ledger,
-            std::slice::from_ref(&sessions[batch.context_index]),
+            std::slice::from_ref(&extraction_sessions[batch.context_index]),
             batch.extracted,
             project_resolver,
             current_store_is_project_scoped,
@@ -1608,7 +1750,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         let source_updated_at = source_updated_at_by_session
             .get(&session_id)
             .expect("every checkpointed Session has a source watermark");
-        if let Some(event_key) = sessions
+        if let Some(event_key) = extraction_sessions
             .iter()
             .filter(|session| session.session_id.as_str() == session_id.as_str())
             .find_map(|session| session.retrieval_event_key.as_deref())
@@ -4012,7 +4154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_checkpoint_survives_a_prompt_change_until_its_watermark_commits() {
+    async fn durable_checkpoint_rebuilds_retrieval_delta_after_replay() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let session_store = Arc::new(
@@ -4023,14 +4165,21 @@ mod tests {
         let storage: Arc<dyn Storage> = session_store.clone();
         let mut session = Session::new("sink-retry", "model");
         session.title = "Sink retry".to_string();
-        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
-            "The user confirmed a durable retry fact and a follow-up task.",
-            1,
-            64,
-        ));
-        session.add_message(Message::user(
-            "Remember the retry fact and remind me to verify it.",
-        ));
+        let first_source_watermark = Utc::now() - chrono::Duration::minutes(1);
+        let first_event = retrieval_event(
+            "sink-retry-event-1",
+            first_source_watermark - chrono::Duration::seconds(1),
+        );
+        let mut old_message = message_at(
+            Message::user("OLD_RETRY_SOURCE must be checkpointed exactly once."),
+            "sink-retry-old-message",
+            first_source_watermark - chrono::Duration::seconds(2),
+        );
+        old_message.compressed = true;
+        old_message.compressed_by_event_id = Some(first_event.id.clone());
+        session.compression_events.push(first_event);
+        session.messages.push(old_message);
+        session.updated_at = first_source_watermark;
         storage.save_session(&session).await.expect("save Session");
 
         let response = serde_json::json!({
@@ -4083,6 +4232,10 @@ mod tests {
         )
         .await;
         assert_eq!(contexts.len(), 1);
+        assert!(contexts[0]
+            .summary
+            .as_deref()
+            .is_some_and(|source| source.contains("OLD_RETRY_SOURCE")));
 
         tokio::fs::write(temp_dir.path().join("ledger"), b"blocks ledger directory")
             .await
@@ -4113,12 +4266,48 @@ mod tests {
             .last_extracted_at
             .is_none());
 
-        let mut updated_contexts = contexts.clone();
-        updated_contexts[0].entry.updated_at += chrono::Duration::seconds(1);
-        updated_contexts[0].summary = Some(
-            "The user confirmed the durable retry fact, then added a newer source update."
-                .to_string(),
-        );
+        let retrieval_event_key = contexts[0]
+            .retrieval_event_key
+            .as_deref()
+            .expect("retrieval context has a source identity");
+        write_retrieval_source_state(
+            &context,
+            "sink-retry",
+            retrieval_event_key,
+            &contexts[0].entry.updated_at.to_rfc3339(),
+        )
+        .await
+        .expect("simulate marker success before Jiandu watermark failure");
+
+        let newer_source_watermark = first_source_watermark + chrono::Duration::seconds(1);
+        session.compression_events.push(retrieval_event(
+            "sink-retry-event-2",
+            newer_source_watermark,
+        ));
+        session.messages.push(message_at(
+            Message::user("NEWER_RETRY_SOURCE must remain eligible after replay."),
+            "sink-retry-new-message",
+            newer_source_watermark,
+        ));
+        session.updated_at = newer_source_watermark;
+        context
+            .storage
+            .save_session(&session)
+            .await
+            .expect("save newer retrieval source");
+        let updated_contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(updated_contexts.len(), 1);
+        let stale_transition_source = updated_contexts[0]
+            .summary
+            .as_deref()
+            .expect("pre-replay retrieval transition source");
+        assert!(stale_transition_source.contains("OLD_RETRY_SOURCE"));
+        assert!(stale_transition_source.contains("NEWER_RETRY_SOURCE"));
 
         tokio::fs::remove_file(temp_dir.path().join("ledger"))
             .await
@@ -4137,7 +4326,8 @@ mod tests {
         assert_eq!(writes.ledger, 1);
         let recorded_prompts = sequence_provider.recorded_prompts();
         assert_eq!(recorded_prompts.len(), 2);
-        assert!(recorded_prompts[1].contains("newer source update"));
+        assert!(recorded_prompts[1].contains("NEWER_RETRY_SOURCE"));
+        assert!(!recorded_prompts[1].contains("OLD_RETRY_SOURCE"));
         assert_eq!(
             memory
                 .read_session_state("sink-retry")
