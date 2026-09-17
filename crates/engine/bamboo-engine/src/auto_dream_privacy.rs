@@ -128,6 +128,16 @@ fn sql_password_clause_pattern() -> &'static Regex {
     })
 }
 
+fn mysql_identified_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?is)\b(?:alter|create)\s+user\b[^;]{0,512}\bidentified\s+(?:(?:with|via)\s+[a-z0-9_.$-]+\s+)?(?:by|as)\s+(?:password\s+)?[\"'][^\"'\r\n]{1,1024}[\"']"#,
+        )
+        .expect("MySQL identified credential regex must compile")
+    })
+}
+
 fn xml_credential_tag_name_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -525,6 +535,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
+        || mysql_identified_credential_pattern().is_match(value)
         || contains_xml_credential(value)
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
@@ -602,21 +613,40 @@ pub(crate) fn sanitize_extraction_source_pair(label: &str, content: &str) -> (St
 }
 
 pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> bool {
-    let mut sources = vec![candidate.title.as_str(), candidate.content.as_str()];
+    let mut sources = vec![
+        candidate.title.as_str(),
+        candidate.kind.as_str(),
+        candidate.content.as_str(),
+    ];
+    if let Some(scope) = candidate.scope.as_deref() {
+        sources.push(scope);
+    }
     sources.extend(candidate.tags.iter().map(String::as_str));
     if let Some(session_id) = candidate.session_id.as_deref() {
         sources.push(session_id);
+    }
+    if let Some(confidence) = candidate.confidence.as_deref() {
+        sources.push(confidence);
     }
     extraction_sources_are_secret_safe(&sources)
 }
 
 pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandidate) -> bool {
-    let mut sources = vec![candidate.title.as_str()];
+    let mut sources = vec![candidate.title.as_str(), candidate.kind.as_str()];
+    if let Some(due_at) = candidate.due_at.as_deref() {
+        sources.push(due_at);
+    }
+    if let Some(starts_at) = candidate.starts_at.as_deref() {
+        sources.push(starts_at);
+    }
     if let Some(excerpt) = candidate.excerpt.as_deref() {
         sources.push(excerpt);
     }
     if let Some(session_id) = candidate.session_id.as_deref() {
         sources.push(session_id);
+    }
+    if let Some(confidence) = candidate.confidence.as_deref() {
+        sources.push(confidence);
     }
     extraction_sources_are_secret_safe(&sources)
 }
@@ -649,6 +679,10 @@ mod tests {
             (
                 "SQL password policy",
                 "ALTER ROLE alice SET password_policy = 'strict';",
+            ),
+            (
+                "MySQL generated password",
+                "CREATE USER 'alice' IDENTIFIED BY RANDOM PASSWORD;",
             ),
             (
                 "past-tense password reset",
@@ -731,6 +765,14 @@ mod tests {
             (
                 "PostgreSQL CREATE USER password",
                 "CREATE USER alice PASSWORD E'hunter2';",
+            ),
+            (
+                "MySQL CREATE USER credential",
+                "CREATE USER 'alice'@'localhost' IDENTIFIED BY 'hunter2';",
+            ),
+            (
+                "MySQL plugin credential",
+                "ALTER USER 'alice'@'localhost' IDENTIFIED WITH mysql_native_password AS 'hunter2';",
             ),
             ("XML password element", "<password>hunter2</password>"),
             (
@@ -837,6 +879,50 @@ mod tests {
             "a tag used as the credential label must reject the candidate"
         );
 
+        for (field, candidate) in [
+            (
+                "kind",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "password".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("global".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("high".to_string()),
+                },
+            ),
+            (
+                "scope",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "reference".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("password".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("high".to_string()),
+                },
+            ),
+            (
+                "confidence",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "reference".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("global".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("password".to_string()),
+                },
+            ),
+        ] {
+            assert!(
+                !durable_candidate_is_secret_safe(&candidate),
+                "raw durable-candidate field {field} must participate in pair checks"
+            );
+        }
+
         let ledger = LedgerExtractionCandidate {
             title: "PIN".to_string(),
             excerpt: Some("1234".to_string()),
@@ -853,5 +939,48 @@ mod tests {
             !ledger_candidate_is_secret_safe(&reversed_ledger),
             "excerpt used as the credential label must reject the candidate"
         );
+
+        for (field, candidate) in [
+            (
+                "kind",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "password".to_string(),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "due_at",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    due_at: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "starts_at",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    starts_at: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "confidence",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    confidence: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+        ] {
+            assert!(
+                !ledger_candidate_is_secret_safe(&candidate),
+                "raw ledger-candidate field {field} must participate in pair checks"
+            );
+        }
     }
 }
