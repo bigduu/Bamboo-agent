@@ -289,7 +289,7 @@ fn contains_high_entropy_secret_token(value: &str) -> bool {
         })
 }
 
-pub(crate) fn contains_secret_like_value(value: &str) -> bool {
+fn contains_secret_like_value_without_markdown_normalization(value: &str) -> bool {
     value.contains("-----BEGIN PRIVATE KEY-----")
         || value.contains("-----BEGIN RSA PRIVATE KEY-----")
         || value.contains("-----BEGIN EC PRIVATE KEY-----")
@@ -306,6 +306,31 @@ pub(crate) fn contains_secret_like_value(value: &str) -> bool {
         || contains_authorization_secret(value)
         || credential_url_pattern().is_match(value)
         || contains_high_entropy_secret_token(value)
+}
+
+/// Return a second, comparison-only representation with lightweight Markdown
+/// delimiters removed. The original value is still checked first, so this
+/// cannot make an existing detector less effective. This catches formatted
+/// labels such as `**Password**: value`, `**API key:** value`, and
+/// `` `password`: value `` without ever returning or persisting the normalized
+/// text.
+fn without_lightweight_markdown_delimiters(value: &str) -> Option<String> {
+    value
+        .chars()
+        .any(|character| matches!(character, '*' | '_' | '~' | '`'))
+        .then(|| {
+            value
+                .chars()
+                .filter(|character| !matches!(character, '*' | '_' | '~' | '`'))
+                .collect()
+        })
+}
+
+pub(crate) fn contains_secret_like_value(value: &str) -> bool {
+    contains_secret_like_value_without_markdown_normalization(value)
+        || without_lightweight_markdown_delimiters(value)
+            .as_deref()
+            .is_some_and(contains_secret_like_value_without_markdown_normalization)
 }
 
 pub(crate) fn sanitize_extraction_source(value: &str) -> String {
@@ -414,6 +439,9 @@ mod tests {
             ("spaced API key", "API key: hunter2"),
             ("spaced private key", "private key: hunter2"),
             ("spaced secret key", "secret key: hunter2"),
+            ("bold password label", "**Password**: hunter2"),
+            ("bold API key assignment", "**API key:** hunter2"),
+            ("inline-code password label", "`password`: hunter2"),
             (
                 "authorization header",
                 "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
@@ -479,6 +507,12 @@ mod tests {
         assert!(
             content == REDACTED_EXTRACTION_SOURCE,
             "split content was not redacted"
+        );
+
+        let (label, content) = sanitize_extraction_source_pair("**Password**", "hunter2");
+        assert!(
+            label == REDACTED_EXTRACTION_SOURCE && content == REDACTED_EXTRACTION_SOURCE,
+            "Markdown-wrapped split credential was not redacted"
         );
 
         let memory = DurableExtractionCandidate {
