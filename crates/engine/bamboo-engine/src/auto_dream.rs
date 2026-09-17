@@ -23,9 +23,9 @@ use bamboo_memory::auto_dream::{
     build_consolidation_prompt, build_extraction_prompt, build_rebuild_consolidation_prompt,
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
     parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
-    parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild, truncate_chars,
-    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, DurableExtractionCandidate,
-    LedgerExtractionCandidate,
+    parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild,
+    strip_json_fence, truncate_chars, ConsolidationSessionInfo, DreamCandidateInfo,
+    DreamGenerationMode, DurableExtractionCandidate, LedgerExtractionCandidate,
 };
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
@@ -46,9 +46,12 @@ const DREAM_FULL_REBUILD_INTERVAL_SECS: i64 = 60 * 60 * 24 * 30;
 const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
-// One source item can establish at least one independent fact. Keep the input
-// cardinality within the provider contract's eight-candidate output ceiling so
-// a successful response can account for every item before its watermark moves.
+const EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH: usize = 32;
+const EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH: usize =
+    EXTRACTION_MAX_CANDIDATES * EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH;
+// Keep source cardinality bounded as the first capacity guard. A single item
+// may still contain more than eight atomic facts, so saturated responses use
+// exhaustive continuation pages before their source watermark can move.
 const RETRIEVAL_EXTRACTION_MAX_SOURCE_ITEMS: usize = EXTRACTION_MAX_CANDIDATES;
 const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
@@ -127,7 +130,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]{4,}"#,
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|passcode|passphrase|pin|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*(?::|=|\bis\b)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -146,7 +149,7 @@ fn known_secret_pattern() -> &'static Regex {
 fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]{12,}")
+        Regex::new(r"(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+")
             .expect("authorization secret regex must compile")
     })
 }
@@ -154,7 +157,7 @@ fn authorization_secret_pattern() -> &'static Regex {
 fn credential_url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{1,128}:[^/\s@]{4,128}@")
+        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{1,128}:[^/\s@]{1,128}@")
             .expect("credential URL regex must compile")
     })
 }
@@ -1409,21 +1412,101 @@ async fn extract_durable_candidate_batch(
     model: &str,
     prompt: String,
 ) -> Result<ExtractedCandidateBatch, String> {
-    let raw = collect_stream_text(provider.clone(), model, prompt).await?;
-    let candidates = parse_extraction_candidates(&raw)?
-        .into_iter()
-        .filter(durable_candidate_is_secret_safe)
-        .collect();
-    // Tolerant by design: absent/malformed ledger array → empty vec.
-    let ledger_candidates = parse_ledger_candidates(&raw)
-        .into_iter()
-        .filter(ledger_candidate_is_secret_safe)
-        .collect();
+    let base_prompt = prompt;
+    let mut request_prompt = base_prompt.clone();
+    let mut memory = Vec::new();
+    let mut ledger = Vec::new();
+    let mut memory_fingerprints = HashSet::new();
+    let mut ledger_fingerprints = HashSet::new();
 
-    Ok(ExtractedCandidateBatch {
-        memory: candidates,
-        ledger: ledger_candidates,
-    })
+    for page_index in 0..EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH {
+        let raw = collect_stream_text(provider.clone(), model, request_prompt).await?;
+        let page_memory = parse_extraction_candidates(&raw)?;
+        if page_memory.len() > EXTRACTION_MAX_CANDIDATES {
+            return Err(format!(
+                "AutoDream extraction page returned {} candidates; maximum is {}",
+                page_memory.len(),
+                EXTRACTION_MAX_CANDIDATES
+            ));
+        }
+        let source_exhausted = extraction_page_source_exhausted(&raw, page_memory.len())?;
+        // Tolerant by design: absent/malformed ledger array → empty vec.
+        let page_ledger = parse_ledger_candidates(&raw);
+        let page_was_empty = page_memory.is_empty() && page_ledger.is_empty();
+
+        for candidate in page_memory
+            .into_iter()
+            .filter(durable_candidate_is_secret_safe)
+        {
+            let fingerprint = serde_json::to_string(&candidate)
+                .map_err(|error| format!("failed to fingerprint memory candidate: {error}"))?;
+            if memory_fingerprints.insert(fingerprint) {
+                memory.push(candidate);
+            }
+        }
+        for candidate in page_ledger
+            .into_iter()
+            .filter(ledger_candidate_is_secret_safe)
+        {
+            let fingerprint = serde_json::to_string(&candidate)
+                .map_err(|error| format!("failed to fingerprint Ledger candidate: {error}"))?;
+            if ledger_fingerprints.insert(fingerprint) {
+                ledger.push(candidate);
+            }
+        }
+
+        if source_exhausted {
+            return Ok(ExtractedCandidateBatch { memory, ledger });
+        }
+        if page_was_empty {
+            return Err(
+                "AutoDream extraction declared remaining candidates but returned an empty page"
+                    .to_string(),
+            );
+        }
+        request_prompt =
+            extraction_continuation_prompt(&base_prompt, page_index + 2, &memory, &ledger)?;
+    }
+
+    Err(format!(
+        "AutoDream extraction did not exhaust its source within {} pages; source watermark was not acknowledged",
+        EXTRACTION_MAX_PAGES_PER_SOURCE_BATCH
+    ))
+}
+
+fn extraction_page_source_exhausted(
+    raw: &str,
+    memory_candidate_count: usize,
+) -> Result<bool, String> {
+    let value = serde_json::from_str::<serde_json::Value>(strip_json_fence(raw))
+        .map_err(|error| format!("failed to parse extraction page status: {error}"))?;
+    match value.get("source_exhausted") {
+        Some(serde_json::Value::Bool(exhausted)) => Ok(*exhausted),
+        Some(_) => Err("AutoDream extraction source_exhausted must be a boolean".to_string()),
+        None if memory_candidate_count < EXTRACTION_MAX_CANDIDATES => Ok(true),
+        None => Err(
+            "AutoDream extraction saturated the eight-candidate page without source_exhausted; source watermark was not acknowledged"
+                .to_string(),
+        ),
+    }
+}
+
+fn extraction_continuation_prompt(
+    base_prompt: &str,
+    page_number: usize,
+    memory: &[DurableExtractionCandidate],
+    ledger: &[LedgerExtractionCandidate],
+) -> Result<String, String> {
+    let already_returned = serde_json::to_string(&serde_json::json!({
+        "candidates": memory,
+        "ledger_candidates": ledger,
+    }))
+    .map_err(|error| format!("failed to serialize extraction continuation state: {error}"))?;
+    Ok(format!(
+        "{base_prompt}\n\n## Exhaustive continuation page {page_number}\n\
+The preceding response declared source_exhausted=false. Re-examine the same source, skip every candidate in already_returned, and return the next page only. Do not acknowledge exhaustion until every remaining durable-memory candidate has been emitted.\n\
+- already_returned: {already_returned}\n"
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1440,6 +1523,13 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         memory: candidates,
         ledger: ledger_candidates,
     } = extracted;
+    if candidates.len() > EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH {
+        return Err(format!(
+            "AutoDream extraction checkpoint contains {} memory candidates; maximum is {}",
+            candidates.len(),
+            EXTRACTION_MAX_CANDIDATES_PER_SOURCE_BATCH
+        ));
+    }
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
@@ -1452,7 +1542,7 @@ async fn persist_durable_candidate_batch_with_project_resolver(
         (MemoryScope, Option<String>),
         HashSet<ExtractionFingerprint>,
     > = HashMap::new();
-    for candidate in candidates.into_iter().take(EXTRACTION_MAX_CANDIDATES) {
+    for candidate in candidates {
         let Some(memory_type) = parse_candidate_type(&candidate.kind) else {
             continue;
         };
@@ -2468,6 +2558,19 @@ mod tests {
     }
 
     #[test]
+    fn extraction_page_status_fails_closed_when_a_full_page_is_ambiguous() {
+        let legacy = r#"{"candidates":[],"ledger_candidates":[]}"#;
+        assert!(extraction_page_source_exhausted(legacy, EXTRACTION_MAX_CANDIDATES).is_err());
+        assert!(
+            extraction_page_source_exhausted(legacy, EXTRACTION_MAX_CANDIDATES - 1)
+                .expect("an unsaturated legacy response is complete")
+        );
+        let continuation = r#"{"candidates":[],"ledger_candidates":[],"source_exhausted":false}"#;
+        assert!(!extraction_page_source_exhausted(continuation, 0)
+            .expect("explicit continuation status"));
+    }
+
+    #[test]
     fn retrieval_delta_keeps_an_old_archived_identifier_beyond_the_recent_outline() {
         let mut session = Session::new("retrieval-delta-old", "model");
         session.messages.push(message_at(
@@ -2571,6 +2674,7 @@ mod tests {
             ("natural-language password", "my password is hunter2"),
             ("natural-language passcode", "my passcode is 1234"),
             ("pin", "PIN: 1234"),
+            ("three-digit pin", "PIN: 123"),
             (
                 "credential URL",
                 "postgres://user:password-value@example.test/database",
@@ -2627,6 +2731,7 @@ mod tests {
             ("Password", "hunter2"),
             ("Passcode", "1234"),
             ("PIN", "1234"),
+            ("PIN", "123"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
                 title: title.to_string(),
@@ -3380,7 +3485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nine_retrieval_facts_split_at_the_eight_candidate_budget() {
+    async fn saturated_retrieval_source_pages_before_advancing_the_watermark() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let session_store = Arc::new(
@@ -3395,16 +3500,18 @@ mod tests {
         session
             .compression_events
             .push(retrieval_event("event", now - chrono::Duration::seconds(1)));
-        for index in 0..9 {
-            let mut archived = message_at(
-                Message::user(format!("FACT_{index:03} is independently durable.")),
-                &format!("archived-{index:03}"),
-                now - chrono::Duration::minutes(1),
-            );
-            archived.compressed = true;
-            archived.compressed_by_event_id = Some("event".to_string());
-            session.messages.push(archived);
-        }
+        let facts = (0..9)
+            .map(|index| format!("FACT_{index:03} is independently durable."))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut archived = message_at(
+            Message::user(facts),
+            "archived",
+            now - chrono::Duration::minutes(1),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event".to_string());
+        session.messages.push(archived);
         session.updated_at = now;
         storage.save_session(&session).await.expect("save Session");
 
@@ -3425,12 +3532,8 @@ mod tests {
             now - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts.len(), 1);
         assert!(contexts[0]
-            .summary
-            .as_deref()
-            .is_some_and(|source| source.contains("source_items_in_batch: 8")));
-        assert!(contexts[1]
             .summary
             .as_deref()
             .is_some_and(|source| source.contains("source_items_in_batch: 1")));
@@ -3447,12 +3550,14 @@ mod tests {
         let responses = vec![
             serde_json::json!({
                 "candidates": (0..8).map(&candidate).collect::<Vec<_>>(),
-                "ledger_candidates": []
+                "ledger_candidates": [],
+                "source_exhausted": false
             })
             .to_string(),
             serde_json::json!({
                 "candidates": [candidate(8)],
-                "ledger_candidates": []
+                "ledger_candidates": [],
+                "source_exhausted": true
             })
             .to_string(),
         ];
@@ -3472,6 +3577,8 @@ mod tests {
         .expect("every retrieval source batch should persist");
         assert_eq!(writes.memory, 9);
         assert_eq!(sequence_provider.recorded_prompts().len(), 2);
+        assert!(sequence_provider.recorded_prompts()[1].contains("Exhaustive continuation page 2"));
+        assert!(sequence_provider.recorded_prompts()[1].contains("Retrieved fact 0"));
         assert_eq!(
             memory
                 .list_memory_documents(MemoryScope::Global, None)
@@ -3479,6 +3586,15 @@ mod tests {
                 .expect("list extracted memories")
                 .len(),
             9
+        );
+        assert_eq!(
+            memory
+                .read_session_state("retrieval-capacity")
+                .await
+                .expect("read extraction watermark")
+                .last_extracted_at
+                .as_deref(),
+            Some(contexts[0].entry.updated_at.to_rfc3339().as_str())
         );
     }
 
