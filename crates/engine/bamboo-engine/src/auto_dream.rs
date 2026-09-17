@@ -61,6 +61,7 @@ const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_CHECKPOINT_VERSION: u32 = 2;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v2";
+const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 1;
 const REDACTED_EXTRACTION_SOURCE: &str =
     "[sensitive content omitted before durable-memory extraction]";
 
@@ -117,6 +118,7 @@ struct CandidateSessionContext {
     session_id: String,
     project_key: Option<String>,
     topics: Vec<(String, String)>,
+    retrieval_event_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +145,16 @@ fn generic_secret_assignment_pattern() -> &'static Regex {
             r#"(?i)(?:(?:^|[\s(\"'])(?:secret|token|pin)[\"']?\s*(?::|=)|(?:^|[^a-z0-9])(?:my|our|your)\s+(?:secret|token|pin)[\"']?\s+\bis\b)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("generic secret assignment regex must compile")
+    })
+}
+
+fn environment_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?:^|[^A-Z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:TOKEN|SECRET|PASSWORD|PASSCODE|PIN|OTP)\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+        )
+        .expect("environment credential assignment regex must compile")
     })
 }
 
@@ -197,6 +209,7 @@ fn contains_secret_like_value(value: &str) -> bool {
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
         || secret_assignment_pattern().is_match(value)
         || generic_secret_assignment_pattern().is_match(value)
+        || environment_credential_assignment_pattern().is_match(value)
         || known_secret_pattern().is_match(value)
         || authorization_secret_pattern().is_match(value)
         || credential_url_pattern().is_match(value)
@@ -239,6 +252,7 @@ fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool
 fn session_extraction_sources(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
+    retrieval_source_acknowledged: bool,
 ) -> Vec<Option<String>> {
     if let Some(summary) = session.conversation_summary.as_ref() {
         return vec![Some(sanitize_extraction_source(&summary.content))];
@@ -248,7 +262,11 @@ fn session_extraction_sources(
         .iter()
         .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
     {
-        let batches = build_retrieval_window_extraction_batches(session, extraction_watermark);
+        let batches = build_retrieval_window_extraction_batches(
+            session,
+            extraction_watermark,
+            retrieval_source_acknowledged,
+        );
         return if batches.is_empty() {
             vec![None]
         } else {
@@ -385,6 +403,7 @@ fn sanitized_session_note_result(
 fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
+    retrieval_source_acknowledged: bool,
 ) -> Vec<String> {
     let mut retrieval_events = session
         .compression_events
@@ -398,11 +417,6 @@ fn build_retrieval_window_extraction_batches(
         left.created_at
             .cmp(&right.created_at)
             .then_with(|| left.id.cmp(&right.id))
-    });
-    let retrieval_mode_was_acknowledged = extraction_watermark.is_some_and(|watermark| {
-        retrieval_events
-            .first()
-            .is_some_and(|event| event.created_at <= watermark)
     });
     let eligible_event_ids = retrieval_events
         .iter()
@@ -433,7 +447,7 @@ fn build_retrieval_window_extraction_batches(
             // window. Once a retrieval event itself predates the watermark,
             // message creation time is authoritative and later archive
             // metadata cannot make an old active message eligible twice.
-            let first_retrieval_transition = !retrieval_mode_was_acknowledged;
+            let first_retrieval_transition = !retrieval_source_acknowledged;
             if !first_retrieval_transition && !created_after_watermark {
                 return None;
             }
@@ -639,9 +653,6 @@ async fn collect_candidate_session_contexts_from_sessions(
                 None
             }
         };
-        if extraction_watermark.is_some_and(|watermark| watermark >= entry.updated_at) {
-            continue;
-        }
         let session = match ctx.storage.load_session(&entry.id).await {
             Ok(Some(session)) => session,
             Ok(None) => continue,
@@ -655,12 +666,40 @@ async fn collect_candidate_session_contexts_from_sessions(
                 continue;
             }
         };
-        let summaries = session_extraction_sources(&session, extraction_watermark);
         let is_retrieval_window = session.conversation_summary.is_none()
             && session
                 .compression_events
                 .iter()
                 .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+        let retrieval_event_key = is_retrieval_window
+            .then(|| first_retrieval_event_key(&session))
+            .flatten();
+        let retrieval_source_acknowledged = if is_retrieval_window {
+            match retrieval_source_is_acknowledged(ctx, &session, extraction_watermark).await {
+                Ok(acknowledged) => acknowledged,
+                Err(error) => {
+                    tracing::warn!(
+                        target: DREAM_TRACING_TARGET,
+                        event = "retrieval_source_state_read_failed",
+                        session_id = %entry.id,
+                        "Could not verify retrieval-complete source state; replaying the one-time transition: {error}"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if extraction_watermark.is_some_and(|watermark| watermark >= entry.updated_at)
+            && (!is_retrieval_window || retrieval_source_acknowledged)
+        {
+            continue;
+        }
+        let summaries = session_extraction_sources(
+            &session,
+            extraction_watermark,
+            retrieval_source_acknowledged,
+        );
         let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
             .map(bamboo_domain::ProjectId::into_string);
         let topics = memory
@@ -705,6 +744,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                     entry: entry.clone(),
                     summary,
                     topics: Vec::new(),
+                    retrieval_event_key: retrieval_event_key.clone(),
                 });
             }
             if !topics.is_empty() {
@@ -714,6 +754,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                     entry,
                     summary: None,
                     topics,
+                    retrieval_event_key,
                 });
             }
         } else {
@@ -728,6 +769,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                     } else {
                         Vec::new()
                     },
+                    retrieval_event_key: None,
                 });
             }
         }
@@ -773,6 +815,14 @@ struct ExtractionCheckpoint {
     batch_index: usize,
     batch_count: usize,
     extracted: ExtractedCandidateBatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetrievalSourceState {
+    version: u32,
+    session_key: String,
+    first_retrieval_event_key: String,
+    source_updated_at: String,
 }
 
 #[derive(Debug)]
@@ -865,11 +915,135 @@ fn extraction_checkpoint_session_key(session_id: &str) -> String {
     hex::encode(digest.finalize())
 }
 
+fn first_retrieval_event_key(session: &Session) -> Option<String> {
+    let event = session
+        .compression_events
+        .iter()
+        .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
+        .min_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })?;
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-auto-dream-first-retrieval-event-v1\0");
+    digest.update(event.id.as_bytes());
+    digest.update(b"\0");
+    digest.update(event.created_at.to_rfc3339().as_bytes());
+    Some(hex::encode(digest.finalize()))
+}
+
 fn extraction_checkpoint_session_dir(ctx: &AutoDreamContext, session_id: &str) -> PathBuf {
     ctx.session_store
         .bamboo_home_dir()
         .join(EXTRACTION_CHECKPOINT_DIR)
         .join(extraction_checkpoint_session_key(session_id))
+}
+
+fn retrieval_source_state_path(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    first_retrieval_event_key: &str,
+) -> PathBuf {
+    extraction_checkpoint_session_dir(ctx, session_id).join(format!(
+        "retrieval-source-v{RETRIEVAL_SOURCE_STATE_VERSION}-{first_retrieval_event_key}.json"
+    ))
+}
+
+async fn retrieval_source_is_acknowledged(
+    ctx: &AutoDreamContext,
+    session: &Session,
+    extraction_watermark: Option<DateTime<Utc>>,
+) -> Result<bool, String> {
+    let Some(event_key) = first_retrieval_event_key(session) else {
+        return Ok(false);
+    };
+    let path = retrieval_source_state_path(ctx, &session.id, &event_key);
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "failed to read AutoDream retrieval source state: {error}"
+            ));
+        }
+    };
+    let state = serde_json::from_slice::<RetrievalSourceState>(&raw)
+        .map_err(|error| format!("failed to parse AutoDream retrieval source state: {error}"))?;
+    let source_updated_at = DateTime::parse_from_rfc3339(&state.source_updated_at)
+        .map_err(|error| format!("invalid AutoDream retrieval source timestamp: {error}"))?
+        .with_timezone(&Utc);
+    if state.version != RETRIEVAL_SOURCE_STATE_VERSION
+        || state.session_key != extraction_checkpoint_session_key(&session.id)
+        || state.first_retrieval_event_key != event_key
+        || source_updated_at > session.updated_at
+    {
+        return Err("AutoDream retrieval source state identity mismatch".to_string());
+    }
+    Ok(extraction_watermark.is_some_and(|watermark| watermark >= source_updated_at))
+}
+
+async fn write_retrieval_source_state(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    first_retrieval_event_key: &str,
+    source_updated_at: &str,
+) -> Result<(), String> {
+    let state = RetrievalSourceState {
+        version: RETRIEVAL_SOURCE_STATE_VERSION,
+        session_key: extraction_checkpoint_session_key(session_id),
+        first_retrieval_event_key: first_retrieval_event_key.to_string(),
+        source_updated_at: source_updated_at.to_string(),
+    };
+    DateTime::parse_from_rfc3339(source_updated_at)
+        .map_err(|error| format!("invalid retrieval source watermark: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|error| format!("failed to serialize retrieval source state: {error}"))?;
+    let path = retrieval_source_state_path(ctx, session_id, first_retrieval_event_key);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "AutoDream retrieval source state has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create retrieval source state directory: {error}"))?;
+    let temporary_path = parent.join(format!(".retrieval-source.{}.tmp", uuid::Uuid::new_v4()));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::hard_link(&temporary_path, &path).await
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temporary_path).await;
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("failed to reread retrieval source state: {error}"))?;
+            let existing =
+                serde_json::from_slice::<RetrievalSourceState>(&existing).map_err(|error| {
+                    format!("failed to parse existing retrieval source state: {error}")
+                })?;
+            if existing.version != state.version
+                || existing.session_key != state.session_key
+                || existing.first_retrieval_event_key != state.first_retrieval_event_key
+                || DateTime::parse_from_rfc3339(&existing.source_updated_at).is_err()
+            {
+                return Err("existing AutoDream retrieval source state mismatch".to_string());
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "failed to persist AutoDream retrieval source state: {error}"
+        )),
+    }
 }
 
 fn extraction_checkpoint_path(
@@ -1279,6 +1453,19 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                     total_writes.memory = total_writes.memory.saturating_add(writes.memory);
                     total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
                 }
+                if let Some(event_key) = sessions
+                    .iter()
+                    .filter(|session| session.session_id.as_str() == session_id.as_str())
+                    .find_map(|session| session.retrieval_event_key.as_deref())
+                {
+                    write_retrieval_source_state(
+                        ctx,
+                        session_id,
+                        event_key,
+                        &transaction.source_updated_at,
+                    )
+                    .await?;
+                }
                 memory
                     .mark_session_extracted(session_id, &transaction.source_updated_at)
                     .await
@@ -1399,6 +1586,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         let source_updated_at = source_updated_at_by_session
             .get(&session_id)
             .expect("every checkpointed Session has a source watermark");
+        if let Some(event_key) = sessions
+            .iter()
+            .filter(|session| session.session_id.as_str() == session_id.as_str())
+            .find_map(|session| session.retrieval_event_key.as_deref())
+        {
+            write_retrieval_source_state(ctx, &session_id, event_key, source_updated_at).await?;
+        }
         memory
             .mark_session_extracted(&session_id, source_updated_at)
             .await
@@ -1438,7 +1632,8 @@ async fn extract_durable_candidate_batch(
         let source_exhausted = extraction_page_source_exhausted(&raw, page_memory.len())?;
         // Tolerant by design: absent/malformed ledger array → empty vec.
         let page_ledger = parse_ledger_candidates(&raw);
-        let page_was_empty = page_memory.is_empty() && page_ledger.is_empty();
+        let memory_count_before = memory.len();
+        let ledger_count_before = ledger.len();
 
         for candidate in page_memory
             .into_iter()
@@ -1464,9 +1659,9 @@ async fn extract_durable_candidate_batch(
         if source_exhausted {
             return Ok(ExtractedCandidateBatch { memory, ledger });
         }
-        if page_was_empty {
+        if memory.len() == memory_count_before && ledger.len() == ledger_count_before {
             return Err(
-                "AutoDream extraction declared remaining candidates but returned an empty page"
+                "AutoDream extraction declared remaining candidates but its continuation page made no safe, deduplicated progress"
                     .to_string(),
             );
         }
@@ -2576,6 +2771,41 @@ mod tests {
             .expect("explicit continuation status"));
     }
 
+    #[tokio::test]
+    async fn extraction_pagination_fails_immediately_when_a_page_makes_no_progress() {
+        let candidate = serde_json::json!({
+            "title": "Repeated fact",
+            "type": "reference",
+            "scope": "global",
+            "content": "The same safe fact is repeated.",
+            "tags": ["paging"],
+            "session_id": "paging-session"
+        });
+        let repeated_page = serde_json::json!({
+            "candidates": [candidate],
+            "ledger_candidates": [],
+            "source_exhausted": false
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![
+            repeated_page.clone(),
+            repeated_page,
+            serde_json::json!({
+                "candidates": [],
+                "ledger_candidates": [],
+                "source_exhausted": true
+            })
+            .to_string(),
+        ]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+
+        let error = extract_durable_candidate_batch(&provider, "fast-model", "source".to_string())
+            .await
+            .expect_err("a repeated continuation page must fail closed");
+        assert!(error.contains("made no safe, deduplicated progress"));
+        assert_eq!(sequence_provider.recorded_prompts().len(), 2);
+    }
+
     #[test]
     fn retrieval_delta_keeps_an_old_archived_identifier_beyond_the_recent_outline() {
         let mut session = Session::new("retrieval-delta-old", "model");
@@ -2605,7 +2835,7 @@ mod tests {
 
         let recent_outline = derive_session_outline(&session).expect("recent outline");
         assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
-        let sources = session_extraction_sources(&session, None);
+        let sources = session_extraction_sources(&session, None, false);
         assert_eq!(sources.len(), 2);
         let delta = sources
             .iter()
@@ -2645,7 +2875,8 @@ mod tests {
             session.messages.push(message);
         }
 
-        let batches = build_retrieval_window_extraction_batches(&session, Some(test_time(20)));
+        let batches =
+            build_retrieval_window_extraction_batches(&session, Some(test_time(20)), true);
         assert_eq!(batches.len(), 1);
         let delta = &batches[0];
         assert!(delta.contains("NEW_ARCHIVED"));
@@ -2687,7 +2918,8 @@ mod tests {
             test_time(21),
         ));
 
-        let batches = build_retrieval_window_extraction_batches(&session, Some(test_time(20)));
+        let batches =
+            build_retrieval_window_extraction_batches(&session, Some(test_time(20)), false);
         assert_eq!(batches.len(), 1);
         let delta = &batches[0];
         assert!(delta.contains("OLD_NEWLY_ARCHIVED"));
@@ -2731,6 +2963,8 @@ mod tests {
             ("natural-language passcode", "my passcode is 1234"),
             ("possessive token", "my token is abc"),
             ("standalone token assignment", "TOKEN=abc"),
+            ("prefixed token assignment", "GITHUB_TOKEN=abc"),
+            ("nested prefixed token assignment", "CI_JOB_TOKEN=abc"),
             ("pin", "PIN: 1234"),
             ("three-digit pin", "PIN: 123"),
             (
@@ -2790,6 +3024,7 @@ mod tests {
             ("Passcode", "1234"),
             ("PIN", "1234"),
             ("PIN", "123"),
+            ("GITHUB_TOKEN", "abc"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
                 title: title.to_string(),
@@ -2993,7 +3228,7 @@ mod tests {
             test_time(17),
         ));
 
-        let batches = build_retrieval_window_extraction_batches(&session, None);
+        let batches = build_retrieval_window_extraction_batches(&session, None, false);
         assert_eq!(batches.len(), 1);
         let delta = &batches[0];
         assert!(delta.contains("SAFE_VISIBLE_CONTENT"));
@@ -3035,7 +3270,7 @@ mod tests {
             ));
         }
 
-        let batches = build_retrieval_window_extraction_batches(&session, None);
+        let batches = build_retrieval_window_extraction_batches(&session, None, false);
         assert_eq!(batches.len(), 9);
         assert!(batches[0].contains("batch: 1/9"));
         assert!(batches[0].contains("source_items_in_batch: 8"));
@@ -3075,7 +3310,7 @@ mod tests {
             "oversized",
             test_time(2),
         ));
-        let capped_batches = build_retrieval_window_extraction_batches(&oversized, None);
+        let capped_batches = build_retrieval_window_extraction_batches(&oversized, None, false);
         assert!(capped_batches.len() > 1);
         assert!(capped_batches.iter().all(|batch| {
             batch.contains("truncated: false")
@@ -3105,15 +3340,16 @@ mod tests {
         archived.compressed_by_event_id = Some("event".to_string());
         session.messages.push(archived);
 
-        let before = build_retrieval_window_extraction_batches(&session, None);
+        let before = build_retrieval_window_extraction_batches(&session, None, false);
         let restored: Session = serde_json::from_slice(
             &serde_json::to_vec(&session).expect("serialize retrieval Session"),
         )
         .expect("restore retrieval Session");
-        let after = build_retrieval_window_extraction_batches(&restored, None);
+        let after = build_retrieval_window_extraction_batches(&restored, None, false);
         assert_eq!(after, before);
         assert!(
-            build_retrieval_window_extraction_batches(&restored, Some(test_time(10))).is_empty()
+            build_retrieval_window_extraction_batches(&restored, Some(test_time(10)), true)
+                .is_empty()
         );
     }
 
@@ -3132,7 +3368,7 @@ mod tests {
             .messages
             .push(Message::user("retrieval content must not override summary"));
         assert_eq!(
-            session_extraction_sources(&summary_session, None),
+            session_extraction_sources(&summary_session, None, false),
             vec![Some("EXACT_SUMMARY_SOURCE".to_string())]
         );
 
@@ -3140,7 +3376,7 @@ mod tests {
         ordinary
             .messages
             .push(Message::user("ORDINARY_RECENT_OUTLINE"));
-        let sources = session_extraction_sources(&ordinary, None);
+        let sources = session_extraction_sources(&ordinary, None, false);
         assert_eq!(sources.len(), 1);
         let source = sources[0].as_deref().expect("outline");
         assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
@@ -3283,6 +3519,90 @@ mod tests {
         assert!(topic_prompt.contains("SESSION_TOPIC_REMAINS_SEPARATE"));
         assert!(topic_prompt.contains("- session topics:"));
         assert!(!topic_prompt.contains("sk-proj-topicsecretabcdefghijkl"));
+    }
+
+    #[tokio::test]
+    async fn legacy_retrieval_watermark_requires_one_explicit_source_migration() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let mut session = Session::new("retrieval-marker-migration", "model");
+        session.title = "Retrieval marker migration".to_string();
+        session.compression_events.push(retrieval_event(
+            "legacy-event",
+            now - chrono::Duration::minutes(5),
+        ));
+        let mut archived = message_at(
+            Message::user("LEGACY_ARCHIVED_SOURCE"),
+            "legacy-archived",
+            now - chrono::Duration::hours(2),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("legacy-event".to_string());
+        session.messages.push(archived);
+        session.messages.push(message_at(
+            Message::assistant("LEGACY_RETAINED_SOURCE", None),
+            "legacy-retained",
+            now - chrono::Duration::hours(1),
+        ));
+        session.updated_at = now;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted(&session.id, &now.to_rfc3339())
+            .await
+            .expect("seed legacy outline watermark");
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = now - chrono::Duration::hours(24);
+
+        let contexts = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(contexts.len(), 1, "missing marker must force migration");
+        let source = contexts[0].summary.as_deref().expect("migration source");
+        assert!(source.contains("LEGACY_ARCHIVED_SOURCE"));
+        assert!(source.contains("LEGACY_RETAINED_SOURCE"));
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &LedgerStore::new(temp_dir.path()),
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("migration extraction");
+        assert_eq!(sequence_provider.recorded_prompts().len(), 1);
+        assert!(
+            retrieval_source_is_acknowledged(&context, &session, Some(now))
+                .await
+                .expect("read retrieval source marker")
+        );
+        assert!(
+            collect_candidate_session_contexts(&context, &memory, since)
+                .await
+                .is_empty(),
+            "the explicit marker must make migration one-shot"
+        );
     }
 
     #[tokio::test]
