@@ -128,6 +128,117 @@ fn sql_password_clause_pattern() -> &'static Regex {
     })
 }
 
+fn xml_credential_tag_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^\s*(?:[a-z_][a-z0-9_.-]*:)?(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)(?:\s|/|$)"#,
+        )
+        .expect("XML credential tag-name regex must compile")
+    })
+}
+
+fn xml_credential_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)\s*=\s*[\"'][^\"'\r\n]{1,1024}[\"']"#,
+        )
+        .expect("XML credential attribute regex must compile")
+    })
+}
+
+fn xml_credential_name_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:name|key)\s*=\s*[\"'](?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)[\"']"#,
+        )
+        .expect("XML credential name attribute regex must compile")
+    })
+}
+
+fn xml_value_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\bvalue\s*=\s*[\"'][^\"'\r\n]{1,1024}[\"']"#)
+            .expect("XML value attribute regex must compile")
+    })
+}
+
+fn xml_element_body_contains_text(body: &str) -> bool {
+    let mut characters = body.chars().peekable();
+    let mut inside_tag = false;
+    let mut inspected = 0usize;
+    while let Some(character) = characters.next() {
+        inspected += 1;
+        if inspected > 4_096 {
+            break;
+        }
+        if character == '<' {
+            if characters.peek() == Some(&'/') {
+                break;
+            }
+            inside_tag = true;
+            continue;
+        }
+        if inside_tag {
+            if character == '>' {
+                inside_tag = false;
+            }
+            continue;
+        }
+        if !character.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_xml_credential(value: &str) -> bool {
+    let mut remainder = value;
+    while let Some(open) = remainder.find('<') {
+        remainder = &remainder[open + 1..];
+        let Some(close) = remainder.find('>') else {
+            break;
+        };
+        if close > 4_096 {
+            remainder = &remainder[close + 1..];
+            continue;
+        }
+        let tag = &remainder[..close];
+        let trimmed_tag = tag.trim_start();
+        if trimmed_tag.starts_with('/')
+            || trimmed_tag.starts_with('!')
+            || trimmed_tag.starts_with('?')
+        {
+            remainder = &remainder[close + 1..];
+            continue;
+        }
+
+        if xml_credential_attribute_pattern().is_match(tag)
+            || (xml_credential_name_attribute_pattern().is_match(tag)
+                && xml_value_attribute_pattern().is_match(tag))
+        {
+            return true;
+        }
+
+        if xml_credential_tag_name_pattern().is_match(tag) {
+            if xml_value_attribute_pattern().is_match(tag) {
+                return true;
+            }
+            if !tag.trim_end().ends_with('/') {
+                let body = &remainder[close + 1..];
+                if xml_element_body_contains_text(body) {
+                    return true;
+                }
+            }
+        }
+        remainder = &remainder[close + 1..];
+    }
+    false
+}
+
 fn parse_pgpass_fields(line: &str) -> Option<Vec<String>> {
     if line.chars().count() > 4_096 {
         return None;
@@ -414,6 +525,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
+        || contains_xml_credential(value)
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
         || contains_docker_auth_config(value)
@@ -546,6 +658,14 @@ mod tests {
                 "past-tense password requirement",
                 "A password was required for the legacy login flow.",
             ),
+            (
+                "XML password policy element",
+                "<password-policy>rotate quarterly</password-policy>",
+            ),
+            (
+                "XML password policy property",
+                "<property name=\"password_policy\" value=\"strict\"/>",
+            ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
         ] {
@@ -611,6 +731,20 @@ mod tests {
             (
                 "PostgreSQL CREATE USER password",
                 "CREATE USER alice PASSWORD E'hunter2';",
+            ),
+            ("XML password element", "<password>hunter2</password>"),
+            (
+                "nested XML password element",
+                "<password><value>hunter2</value></password>",
+            ),
+            ("XML password attribute", "<database password=\"hunter2\"/>"),
+            (
+                "XML credential property",
+                "<property name=\"password\" value=\"hunter2\"/>",
+            ),
+            (
+                "XML credential value attribute",
+                "<password value=\"hunter2\"/>",
             ),
             (
                 "PostgreSQL password-file record",
