@@ -41,6 +41,8 @@ const DREAM_MAX_SESSIONS: usize = 12;
 const DREAM_MAX_SUMMARY_CHARS: usize = 12_000;
 const RETRIEVAL_EXTRACTION_MAX_MESSAGES: usize = 64;
 const RETRIEVAL_EXTRACTION_MAX_CHARS: usize = 12_000;
+const RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS: usize = 1_500;
+const RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS: usize = 1_024;
 const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
@@ -114,34 +116,85 @@ fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool
         && entry.id != DREAM_RUNTIME_SESSION_ID
 }
 
-fn retrieval_window_extraction_source(
+fn session_extraction_sources(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
-) -> Option<String> {
+) -> Vec<Option<String>> {
     if let Some(summary) = session.conversation_summary.as_ref() {
-        return Some(summary.content.clone());
+        return vec![Some(summary.content.clone())];
     }
     if session
         .compression_events
         .iter()
         .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
     {
-        return build_retrieval_window_extraction_delta(session, extraction_watermark);
+        let batches = build_retrieval_window_extraction_batches(session, extraction_watermark);
+        return if batches.is_empty() {
+            vec![None]
+        } else {
+            batches.into_iter().map(Some).collect()
+        };
     }
-    derive_session_outline(session)
+    vec![derive_session_outline(session)]
 }
 
-fn build_retrieval_window_extraction_delta(
+#[derive(Debug, Clone)]
+struct RetrievalExtractionSourceItem {
+    source_item_ordinal: usize,
+    session_message_ordinal: usize,
+    role: &'static str,
+    retrieval_event_ordinal: Option<usize>,
+    content_segment_ordinal: usize,
+    content_segment_count: usize,
+    content: String,
+}
+
+fn split_retrieval_extraction_content(content: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for character in content.chars() {
+        if current_chars == RETRIEVAL_EXTRACTION_CONTENT_SEGMENT_CHARS {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current.push(character);
+        current_chars += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn render_retrieval_extraction_item(item: &RetrievalExtractionSourceItem) -> String {
+    let content =
+        serde_json::to_string(&item.content).expect("serializing a String as JSON cannot fail");
+    format!(
+        "\n### Source item {}\n- session_message_ordinal: {}\n- role: {}\n- retrieval_event_ordinal: {}\n- content_segment: {}/{}\n- content: {}\n",
+        item.source_item_ordinal,
+        item.session_message_ordinal,
+        item.role,
+        item.retrieval_event_ordinal
+            .map(|ordinal| ordinal.to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        item.content_segment_ordinal,
+        item.content_segment_count,
+        content,
+    )
+}
+
+fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
-) -> Option<String> {
+) -> Vec<String> {
     let mut retrieval_events = session
         .compression_events
         .iter()
         .filter(|event| event.kind == CompressionEventKind::RetrievalWindow)
         .collect::<Vec<_>>();
     if retrieval_events.is_empty() {
-        return None;
+        return Vec::new();
     }
     retrieval_events.sort_by(|left, right| {
         left.created_at
@@ -153,14 +206,20 @@ fn build_retrieval_window_extraction_delta(
         .filter(|event| extraction_watermark.is_none_or(|watermark| event.created_at > watermark))
         .map(|event| event.id.as_str())
         .collect::<HashSet<_>>();
+    let retrieval_event_ordinals = retrieval_events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.id.as_str(), index + 1))
+        .collect::<HashMap<_, _>>();
     let history_artifact_ids = session_history_search_artifact_ids(session);
     let eligible_messages = session
         .messages
         .iter()
-        .filter(|message| !matches!(message.role, Role::System))
-        .filter(|message| !message.content.trim().is_empty())
-        .filter(|message| !history_artifact_ids.contains(&message.id))
-        .filter(|message| {
+        .enumerate()
+        .filter(|(_, message)| !matches!(message.role, Role::System))
+        .filter(|(_, message)| !message.content.trim().is_empty())
+        .filter(|(_, message)| !history_artifact_ids.contains(&message.id))
+        .filter(|(_, message)| {
             let archived_by_new_event = message.compressed
                 && message
                     .compressed_by_event_id
@@ -172,91 +231,103 @@ fn build_retrieval_window_extraction_delta(
         })
         .collect::<Vec<_>>();
     if eligible_messages.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let selected_messages = eligible_messages
-        .iter()
-        .take(RETRIEVAL_EXTRACTION_MAX_MESSAGES)
-        .copied()
-        .collect::<Vec<_>>();
-    let referenced_event_ids = selected_messages
-        .iter()
-        .filter_map(|message| message.compressed_by_event_id.as_deref())
-        .filter(|event_id| eligible_event_ids.contains(event_id))
-        .collect::<HashSet<_>>();
-    let referenced_events = retrieval_events
-        .iter()
-        .filter(|event| referenced_event_ids.contains(event.id.as_str()))
-        .copied()
-        .collect::<Vec<_>>();
-    let truncated_by_message_limit = eligible_messages.len() > selected_messages.len();
-
-    let render = |truncated: bool| {
-        let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
-        rendered.push_str(&format!(
-            "- extraction_watermark: {}\n- eligible_retrieval_events: {}\n- referenced_retrieval_events: {}\n- eligible_messages: {}\n- selected_before_character_cap: {}\n- max_messages: {}\n- max_characters: {}\n- truncated: {}\n",
-            extraction_watermark
-                .map(|watermark| watermark.to_rfc3339())
-                .unwrap_or_else(|| "(none)".to_string()),
-            eligible_event_ids.len(),
-            referenced_events.len(),
-            eligible_messages.len(),
-            selected_messages.len(),
-            RETRIEVAL_EXTRACTION_MAX_MESSAGES,
-            RETRIEVAL_EXTRACTION_MAX_CHARS,
-            truncated,
-        ));
-        if !referenced_events.is_empty() {
-            rendered.push_str("\n## Retrieval events (created_at, then id)\n");
-            for (index, event) in referenced_events.iter().enumerate() {
-                rendered.push_str(&format!(
-                    "- {}: {} {}\n",
-                    index + 1,
-                    event.created_at.to_rfc3339(),
-                    event.id
-                ));
-            }
-        }
-        rendered.push_str("\n## Messages (canonical Session order)\n");
-        for (index, message) in selected_messages.iter().enumerate() {
-            let role = match message.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-                Role::System => continue,
-            };
-            let content = serde_json::to_string(&message.content)
-                .expect("serializing a String as JSON cannot fail");
-            rendered.push_str(&format!(
-                "\n### Message {}\n- role: {}\n- content: {}\n",
-                index + 1,
+    let mut source_items = Vec::new();
+    for (message_index, message) in &eligible_messages {
+        let role = match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+            Role::System => continue,
+        };
+        let segments = split_retrieval_extraction_content(&message.content);
+        let segment_count = segments.len();
+        let retrieval_event_ordinal = message
+            .compressed_by_event_id
+            .as_deref()
+            .filter(|event_id| eligible_event_ids.contains(event_id))
+            .and_then(|event_id| retrieval_event_ordinals.get(event_id))
+            .copied();
+        for (segment_index, content) in segments.into_iter().enumerate() {
+            source_items.push(RetrievalExtractionSourceItem {
+                source_item_ordinal: source_items.len() + 1,
+                session_message_ordinal: *message_index + 1,
                 role,
-                content
-            ));
+                retrieval_event_ordinal,
+                content_segment_ordinal: segment_index + 1,
+                content_segment_count: segment_count,
+                content,
+            });
         }
-        rendered
-    };
-
-    let unbounded = render(truncated_by_message_limit);
-    let truncated =
-        truncated_by_message_limit || unbounded.chars().count() > RETRIEVAL_EXTRACTION_MAX_CHARS;
-    let rendered = if truncated == truncated_by_message_limit {
-        unbounded
-    } else {
-        render(true)
-    };
-    if rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS {
-        return Some(rendered);
     }
 
-    const TRUNCATION_MARKER: &str = "\n[retrieval_delta_truncated_at_character_cap]\n";
-    let marker_chars = TRUNCATION_MARKER.chars().count();
-    let prefix = rendered
-        .chars()
-        .take(RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(marker_chars))
-        .collect::<String>();
-    Some(format!("{prefix}{TRUNCATION_MARKER}"))
+    let max_body_chars =
+        RETRIEVAL_EXTRACTION_MAX_CHARS.saturating_sub(RETRIEVAL_EXTRACTION_HEADER_RESERVE_CHARS);
+    let mut item_batches: Vec<Vec<(RetrievalExtractionSourceItem, String)>> = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_chars = 0usize;
+    for item in source_items {
+        let rendered = render_retrieval_extraction_item(&item);
+        let rendered_chars = rendered.chars().count();
+        debug_assert!(rendered_chars <= max_body_chars);
+        if !current_batch.is_empty()
+            && (current_batch.len() == RETRIEVAL_EXTRACTION_MAX_MESSAGES
+                || current_chars.saturating_add(rendered_chars) > max_body_chars)
+        {
+            item_batches.push(std::mem::take(&mut current_batch));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(rendered_chars);
+        current_batch.push((item, rendered));
+    }
+    if !current_batch.is_empty() {
+        item_batches.push(current_batch);
+    }
+
+    let batch_count = item_batches.len();
+    item_batches
+        .into_iter()
+        .enumerate()
+        .map(|(batch_index, items)| {
+            let distinct_message_count = items
+                .iter()
+                .map(|(item, _)| item.session_message_ordinal)
+                .collect::<HashSet<_>>()
+                .len();
+            let mut rendered = String::from("# Retrieval-window extraction delta v1\n\n");
+            rendered.push_str(&format!(
+                "- extraction_watermark: {}\n- batch: {}/{}\n- eligible_retrieval_events: {}\n- eligible_messages: {}\n- source_items_in_batch: {}\n- distinct_messages_in_batch: {}\n- max_messages_per_batch: {}\n- max_characters_per_batch: {}\n- truncated: false\n- continuation: {}\n\n## Source items (canonical Session order)\n",
+                extraction_watermark
+                    .map(|watermark| watermark.to_rfc3339())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                batch_index + 1,
+                batch_count,
+                eligible_event_ids.len(),
+                eligible_messages.len(),
+                items.len(),
+                distinct_message_count,
+                RETRIEVAL_EXTRACTION_MAX_MESSAGES,
+                RETRIEVAL_EXTRACTION_MAX_CHARS,
+                if batch_index + 1 < batch_count {
+                    "continues_in_next_batch"
+                } else {
+                    "final_batch"
+                },
+            ));
+            for (_, item) in items {
+                rendered.push_str(&item);
+            }
+            if batch_index + 1 < batch_count {
+                rendered.push_str("\n[retrieval_delta_continues_in_next_batch]\n");
+            } else {
+                rendered.push_str("\n[retrieval_delta_final_batch]\n");
+            }
+            debug_assert!(rendered.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
+            rendered
+        })
+        .collect()
 }
 
 async fn collect_candidate_sessions(
@@ -361,7 +432,7 @@ async fn collect_candidate_session_contexts_from_sessions(
                 continue;
             }
         };
-        let summary = retrieval_window_extraction_source(&session, extraction_watermark);
+        let summaries = session_extraction_sources(&session, extraction_watermark);
         let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
             .map(bamboo_domain::ProjectId::into_string);
         let topics = memory
@@ -373,21 +444,29 @@ async fn collect_candidate_session_contexts_from_sessions(
             .map(|(topic, content)| (topic, truncate_chars(&content, EXTRACTION_MAX_TOPIC_CHARS)))
             .collect::<Vec<_>>();
         if topics.is_empty()
-            && summary
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty()
+            && summaries.iter().all(|summary| {
+                summary
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+            })
         {
             continue;
         }
-        out.push(CandidateSessionContext {
-            session_id: entry.id.clone(),
-            project_key,
-            entry,
-            summary,
-            topics,
-        });
+        for (source_index, summary) in summaries.into_iter().enumerate() {
+            out.push(CandidateSessionContext {
+                session_id: entry.id.clone(),
+                project_key: project_key.clone(),
+                entry: entry.clone(),
+                summary,
+                topics: if source_index == 0 {
+                    topics.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
     }
     out
 }
@@ -444,6 +523,61 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
+    let mut seen_sessions = HashSet::new();
+    let session_source_watermarks = sessions
+        .iter()
+        .filter(|session| seen_sessions.insert(session.session_id.clone()))
+        .map(|session| {
+            (
+                session.session_id.clone(),
+                session.entry.updated_at.to_rfc3339(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut total_writes = ExtractionWrites::default();
+    for batch in sessions.chunks(DREAM_MAX_SESSIONS) {
+        let writes = extract_and_persist_durable_candidate_batch_with_project_resolver(
+            ctx,
+            provider,
+            memory,
+            ledger,
+            model,
+            batch,
+            project_resolver,
+            current_store_is_project_scoped,
+        )
+        .await?;
+        total_writes.memory = total_writes.memory.saturating_add(writes.memory);
+        total_writes.ledger = total_writes.ledger.saturating_add(writes.ledger);
+    }
+
+    // A retrieval-window session can span several bounded source batches. Only
+    // acknowledge the captured Session update after every provider call and
+    // both durable sinks have succeeded, so an omitted or failed remainder is
+    // still eligible on the next AutoDream pass.
+    for (session_id, source_updated_at) in session_source_watermarks {
+        memory
+            .mark_session_extracted(&session_id, &source_updated_at)
+            .await
+            .map_err(|error| {
+                format!("failed to update session extraction state for {session_id}: {error}")
+            })?;
+    }
+
+    Ok(total_writes)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn extract_and_persist_durable_candidate_batch_with_project_resolver(
+    ctx: &AutoDreamContext,
+    provider: &Arc<dyn LLMProvider>,
+    memory: &MemoryStore,
+    ledger: &LedgerStore,
+    model: &str,
+    sessions: &[CandidateSessionContext],
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+) -> Result<ExtractionWrites, String> {
     let candidates_info: Vec<DreamCandidateInfo> = sessions
         .iter()
         .map(|session| DreamCandidateInfo {
@@ -467,15 +601,6 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     }
 
     let mut writes = 0usize;
-    let session_source_updated_at = sessions
-        .iter()
-        .map(|session| {
-            (
-                session.session_id.clone(),
-                session.entry.updated_at.to_rfc3339(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
     type ExtractionFingerprint = (DurableMemoryType, String, String, String);
     let mut existing_by_scope: HashMap<
         (MemoryScope, Option<String>),
@@ -665,23 +790,6 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     }
 
     let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
-
-    // Extraction completion is acknowledged only after both durable sinks have
-    // accepted the batch. Store the source session's captured update watermark,
-    // not the later wall-clock completion time: if the session changes while the
-    // model is extracting, its newer index timestamp must remain retryable.
-    for session in sessions {
-        let session_id = &session.session_id;
-        let source_updated_at = session_source_updated_at
-            .get(session_id)
-            .expect("a touched candidate must come from the extraction input");
-        memory
-            .mark_session_extracted(session_id, source_updated_at)
-            .await
-            .map_err(|error| {
-                format!("failed to update session extraction state for {session_id}: {error}")
-            })?;
-    }
 
     Ok(ExtractionWrites {
         memory: writes,
@@ -1542,7 +1650,9 @@ mod tests {
 
         let recent_outline = derive_session_outline(&session).expect("recent outline");
         assert!(!recent_outline.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
-        let delta = retrieval_window_extraction_source(&session, None).expect("retrieval delta");
+        let sources = session_extraction_sources(&session, None);
+        assert_eq!(sources.len(), 1);
+        let delta = sources[0].as_deref().expect("retrieval delta");
         assert!(delta.contains("ARCHIVED_IDENTIFIER_ALPHA_947"));
         assert!(!delta.contains("SYSTEM_POLICY_MUST_NOT_APPEAR"));
     }
@@ -1571,15 +1681,15 @@ mod tests {
             session.messages.push(message);
         }
 
-        let delta = build_retrieval_window_extraction_delta(&session, Some(test_time(20)))
-            .expect("post-watermark retrieval delta");
+        let batches = build_retrieval_window_extraction_batches(&session, Some(test_time(20)));
+        assert_eq!(batches.len(), 1);
+        let delta = &batches[0];
         assert!(delta.contains("NEW_ARCHIVED"));
         assert!(delta.contains("NEW_ACTIVE"));
         assert!(!delta.contains("OLD_ARCHIVED"));
         assert!(!delta.contains("OLD_ACTIVE"));
         assert!(!delta.contains("EQUAL_ACTIVE"));
-        assert_eq!(delta.matches("event-new").count(), 1);
-        assert!(!delta.contains("event-old"));
+        assert!(delta.contains("eligible_retrieval_events: 1"));
         assert!(
             delta.find("NEW_ARCHIVED").expect("archived position")
                 < delta.find("NEW_ACTIVE").expect("active position"),
@@ -1645,7 +1755,9 @@ mod tests {
             test_time(15),
         ));
 
-        let delta = build_retrieval_window_extraction_delta(&session, None).expect("delta");
+        let batches = build_retrieval_window_extraction_batches(&session, None);
+        assert_eq!(batches.len(), 1);
+        let delta = &batches[0];
         assert!(delta.contains("SAFE_VISIBLE_CONTENT"));
         assert!(delta.contains("SESSION_NOTE_VISIBLE"));
         for excluded in [
@@ -1678,30 +1790,54 @@ mod tests {
             ));
         }
 
-        let delta = build_retrieval_window_extraction_delta(&session, None).expect("delta");
-        assert!(delta.contains("eligible_messages: 66"));
-        assert!(delta.contains("selected_before_character_cap: 64"));
-        assert!(delta.contains("truncated: true"));
-        assert!(delta.contains("ORDER_000"));
-        assert!(delta.contains("ORDER_063"));
-        assert!(!delta.contains("ORDER_064"));
-        assert!(!delta.contains("ORDER_065"));
-        assert!(delta.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS);
+        let batches = build_retrieval_window_extraction_batches(&session, None);
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].contains("batch: 1/2"));
+        assert!(batches[0].contains("source_items_in_batch: 64"));
+        assert!(batches[0].contains("continuation: continues_in_next_batch"));
+        assert!(batches[1].contains("batch: 2/2"));
+        assert!(batches[1].contains("source_items_in_batch: 2"));
+        assert!(batches[1].contains("continuation: final_batch"));
+        assert!(batches.iter().all(|batch| {
+            batch.contains("eligible_messages: 66")
+                && batch.contains("truncated: false")
+                && batch.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS
+        }));
+        let all_batches = batches.concat();
+        for index in 0..66 {
+            assert!(
+                all_batches.contains(&format!("ORDER_{index:03}")),
+                "message {index} must be retained"
+            );
+        }
+        assert!(
+            all_batches.find("ORDER_000").expect("first message")
+                < all_batches.find("ORDER_065").expect("last message")
+        );
 
         let mut oversized = Session::new("retrieval-delta-char-cap", "model");
         oversized
             .compression_events
             .push(retrieval_event("event", test_time(1)));
+        let oversized_content = format!("CHAR_CAP_START{}", "x".repeat(20_000));
         oversized.messages.push(message_at(
-            Message::user(format!("CHAR_CAP_START{}", "x".repeat(20_000))),
+            Message::user(oversized_content.clone()),
             "oversized",
             test_time(2),
         ));
-        let capped = build_retrieval_window_extraction_delta(&oversized, None).expect("capped");
-        assert_eq!(capped.chars().count(), RETRIEVAL_EXTRACTION_MAX_CHARS);
-        assert!(capped.contains("CHAR_CAP_START"));
-        assert!(capped.ends_with("[retrieval_delta_truncated_at_character_cap]\n"));
-        assert!(capped.contains("truncated: true"));
+        let capped_batches = build_retrieval_window_extraction_batches(&oversized, None);
+        assert!(capped_batches.len() > 1);
+        assert!(capped_batches.iter().all(|batch| {
+            batch.contains("truncated: false")
+                && batch.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS
+        }));
+        let reconstructed = capped_batches
+            .iter()
+            .flat_map(|batch| batch.lines())
+            .filter_map(|line| line.strip_prefix("- content: "))
+            .map(|json| serde_json::from_str::<String>(json).expect("JSON content segment"))
+            .collect::<String>();
+        assert_eq!(reconstructed, oversized_content);
     }
 
     #[test]
@@ -1719,14 +1855,16 @@ mod tests {
         archived.compressed_by_event_id = Some("event".to_string());
         session.messages.push(archived);
 
-        let before = build_retrieval_window_extraction_delta(&session, None).expect("delta");
+        let before = build_retrieval_window_extraction_batches(&session, None);
         let restored: Session = serde_json::from_slice(
             &serde_json::to_vec(&session).expect("serialize retrieval Session"),
         )
         .expect("restore retrieval Session");
-        let after = build_retrieval_window_extraction_delta(&restored, None).expect("delta");
+        let after = build_retrieval_window_extraction_batches(&restored, None);
         assert_eq!(after, before);
-        assert!(build_retrieval_window_extraction_delta(&restored, Some(test_time(10))).is_none());
+        assert!(
+            build_retrieval_window_extraction_batches(&restored, Some(test_time(10))).is_empty()
+        );
     }
 
     #[test]
@@ -1744,15 +1882,17 @@ mod tests {
             .messages
             .push(Message::user("retrieval content must not override summary"));
         assert_eq!(
-            retrieval_window_extraction_source(&summary_session, None).as_deref(),
-            Some("EXACT_SUMMARY_SOURCE")
+            session_extraction_sources(&summary_session, None),
+            vec![Some("EXACT_SUMMARY_SOURCE".to_string())]
         );
 
         let mut ordinary = Session::new("ordinary-outline", "model");
         ordinary
             .messages
             .push(Message::user("ORDINARY_RECENT_OUTLINE"));
-        let source = retrieval_window_extraction_source(&ordinary, None).expect("outline");
+        let sources = session_extraction_sources(&ordinary, None);
+        assert_eq!(sources.len(), 1);
+        let source = sources[0].as_deref().expect("outline");
         assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
         assert!(!source.contains("Retrieval-window extraction delta"));
     }
@@ -1937,6 +2077,148 @@ mod tests {
         assert_eq!(
             completed_state.last_extracted_at.as_deref(),
             Some(retry[0].entry.updated_at.to_rfc3339().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_extraction_advances_watermark_only_after_every_source_batch_succeeds() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let now = Utc::now();
+        let mut session = Session::new("retrieval-multi-batch-retry", "model");
+        session.title = "Retrieval multi-batch retry".to_string();
+        session
+            .compression_events
+            .push(retrieval_event("event", now - chrono::Duration::seconds(1)));
+        let oversized_source = format!(
+            "MULTI_BATCH_SOURCE_START{}MULTI_BATCH_SOURCE_END",
+            "x".repeat(150_000)
+        );
+        let mut archived = message_at(
+            Message::user(oversized_source),
+            "archived",
+            now - chrono::Duration::minutes(1),
+        );
+        archived.compressed = true;
+        archived.compressed_by_event_id = Some("event".to_string());
+        session.messages.push(archived);
+        session.updated_at = now;
+        storage.save_session(&session).await.expect("save Session");
+
+        let valid_response =
+            serde_json::json!({"candidates": [], "ledger_candidates": []}).to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![
+            valid_response.clone(),
+            "not valid extraction JSON".to_string(),
+            valid_response.clone(),
+            valid_response,
+        ]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic(
+                "retrieval-multi-batch-retry",
+                "continuity",
+                "TOPIC_INCLUDED_ONCE",
+            )
+            .await
+            .expect("write Session topic");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = now - chrono::Duration::hours(24);
+        let first = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert!(
+            first.len() > DREAM_MAX_SESSIONS,
+            "oversized retrieval input must cross the provider-call boundary"
+        );
+        assert!(first.iter().all(|context| {
+            context
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.chars().count() <= RETRIEVAL_EXTRACTION_MAX_CHARS)
+        }));
+        assert_eq!(first[0].topics.len(), 1);
+        assert!(first
+            .iter()
+            .skip(1)
+            .all(|context| context.topics.is_empty()));
+        let first_sources = first
+            .iter()
+            .map(|context| context.summary.clone())
+            .collect::<Vec<_>>();
+        let ledger = LedgerStore::new(temp_dir.path());
+
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &first,
+        )
+        .await
+        .expect_err("a later provider batch failure must fail the complete extraction");
+        assert!(
+            memory
+                .read_session_state("retrieval-multi-batch-retry")
+                .await
+                .expect("read failed extraction state")
+                .last_extracted_at
+                .is_none(),
+            "a successful prefix must not advance the Session watermark"
+        );
+
+        let retry = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(
+            retry
+                .iter()
+                .map(|context| context.summary.clone())
+                .collect::<Vec<_>>(),
+            first_sources,
+            "every source batch must remain deterministic and retryable"
+        );
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &retry,
+        )
+        .await
+        .expect("all retry batches should succeed");
+        let completed_state = memory
+            .read_session_state("retrieval-multi-batch-retry")
+            .await
+            .expect("read completed extraction state");
+        assert_eq!(
+            completed_state.last_extracted_at.as_deref(),
+            Some(retry[0].entry.updated_at.to_rfc3339().as_str())
+        );
+
+        let prompts = sequence_provider.recorded_prompts();
+        assert_eq!(prompts.len(), 4, "two bounded calls per attempt");
+        assert!(prompts[0].contains("MULTI_BATCH_SOURCE_START"));
+        assert!(prompts[1].contains("MULTI_BATCH_SOURCE_END"));
+        assert!(prompts[2].contains("MULTI_BATCH_SOURCE_START"));
+        assert!(prompts[3].contains("MULTI_BATCH_SOURCE_END"));
+        assert!(
+            collect_candidate_session_contexts(&context, &memory, since)
+                .await
+                .is_empty(),
+            "a fully acknowledged source must not be extracted again"
         );
     }
 
