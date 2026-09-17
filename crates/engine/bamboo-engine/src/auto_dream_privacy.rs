@@ -72,6 +72,16 @@ fn netrc_credential_pattern() -> &'static Regex {
     })
 }
 
+fn sql_password_clause_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?is)\b(?:alter|create)\s+(?:role|user)\b[^;]{0,512}\bpassword\s+(?:e|u&)?[\"'][^\"'\r\n]{1,1024}[\"']"#,
+        )
+        .expect("SQL password clause regex must compile")
+    })
+}
+
 fn parse_pgpass_fields(line: &str) -> Option<Vec<String>> {
     if line.chars().count() > 4_096 {
         return None;
@@ -356,6 +366,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || standalone_pin_credential_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
+        || sql_password_clause_pattern().is_match(value)
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
         || contains_docker_auth_config(value)
@@ -476,6 +487,10 @@ mod tests {
                 "machine login prose",
                 "machine learning login flows enforce password policy",
             ),
+            (
+                "SQL password policy",
+                "ALTER ROLE alice SET password_policy = 'strict';",
+            ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
         ] {
@@ -529,6 +544,14 @@ mod tests {
             (
                 "netrc default record",
                 "default login alice password hunter2",
+            ),
+            (
+                "PostgreSQL ALTER ROLE password",
+                "ALTER ROLE alice WITH PASSWORD 'hunter2';",
+            ),
+            (
+                "PostgreSQL CREATE USER password",
+                "CREATE USER alice PASSWORD E'hunter2';",
             ),
             (
                 "PostgreSQL password-file record",

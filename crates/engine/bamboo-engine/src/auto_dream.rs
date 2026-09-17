@@ -64,6 +64,25 @@ fn to_consolidation_sessions(
     entries
         .iter()
         .map(|(entry, summary)| {
+            let mut sources = vec![entry.id.as_str(), entry.title.as_str()];
+            if let Some(last_run_status) = entry.last_run_status.as_deref() {
+                sources.push(last_run_status);
+            }
+            if let Some(summary) = summary.as_deref() {
+                sources.push(summary);
+            }
+            if !extraction_sources_are_secret_safe(&sources) {
+                return ConsolidationSessionInfo {
+                    id: "redacted-session".to_string(),
+                    title: REDACTED_EXTRACTION_SOURCE.to_string(),
+                    kind: format!("{:?}", entry.kind),
+                    updated_at: entry.updated_at.to_rfc3339(),
+                    message_count: entry.message_count,
+                    last_run_status: None,
+                    summary: None,
+                };
+            }
+
             let (title, summary) =
                 sanitize_title_and_optional_source(&entry.title, summary.as_deref());
             ConsolidationSessionInfo {
@@ -763,6 +782,15 @@ async fn collect_stream_text(
     model: &str,
     prompt: String,
 ) -> Result<String, String> {
+    let content = collect_complete_stream_text(provider, model, prompt).await?;
+    Ok(truncate_chars(&content, DREAM_MAX_SUMMARY_CHARS))
+}
+
+async fn collect_complete_stream_text(
+    provider: Arc<dyn LLMProvider>,
+    model: &str,
+    prompt: String,
+) -> Result<String, String> {
     let messages = vec![
         Message::system(
             "You are Bamboo's background Dream consolidator. Return only the Dream notebook body sections as plain markdown. Do not return an outer '# Bamboo Dream Notebook' title, metadata lines, or markdown fences."
@@ -790,12 +818,10 @@ async fn collect_stream_text(
             Ok(LLMChunk::Token(text)) => content.push_str(&text),
             Ok(LLMChunk::Done) => break,
             Ok(_) => {}
-            Err(error) => {
-                if !content.is_empty() {
-                    break;
-                }
-                return Err(format!("auto-dream stream failed: {error}"));
-            }
+            // A partial stream is not a complete response and must never be
+            // treated as one: truncation at an error boundary could hide the
+            // remainder of a credential from the privacy check below.
+            Err(error) => return Err(format!("auto-dream stream failed: {error}")),
         }
     }
 
@@ -803,7 +829,7 @@ async fn collect_stream_text(
     if trimmed.is_empty() {
         return Err("auto-dream returned empty content".to_string());
     }
-    Ok(truncate_chars(trimmed, DREAM_MAX_SUMMARY_CHARS))
+    Ok(trimmed.to_string())
 }
 
 async fn read_existing_dream_for_scope(
@@ -835,7 +861,7 @@ async fn build_dream_notebook_body(
     source_window: &DreamSourceWindow,
     generation_mode: DreamGenerationMode,
 ) -> Result<String, String> {
-    let body = match generation_mode {
+    let prompt = match generation_mode {
         DreamGenerationMode::Rebuild => {
             tracing::info!(
                 target: DREAM_TRACING_TARGET,
@@ -849,20 +875,20 @@ async fn build_dream_notebook_body(
                 .durable_memory_index
                 .as_deref()
                 .map(sanitize_extraction_source);
-            let prompt = build_rebuild_consolidation_prompt(
+            build_rebuild_consolidation_prompt(
                 sanitized_memory_index.as_deref(),
                 &to_consolidation_sessions(&source_window.sessions),
-            );
-            let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
-            normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
+            )
         }
         DreamGenerationMode::Incremental => {
-            let prompt =
-                build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions));
-            let raw_body = collect_stream_text(provider.clone(), model, prompt).await?;
-            normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)
+            build_consolidation_prompt(&to_consolidation_sessions(&source_window.sessions))
         }
-    }?;
+    };
+    let raw_body = collect_complete_stream_text(provider.clone(), model, prompt).await?;
+    if !extraction_sources_are_secret_safe(&[raw_body.as_str()]) {
+        return Err("auto-dream rejected secret-like notebook output".to_string());
+    }
+    let body = normalize_dream_notebook_body(&raw_body, DREAM_MAX_SUMMARY_CHARS)?;
 
     if extraction_sources_are_secret_safe(&[body.as_str()]) {
         Ok(body)
@@ -1598,6 +1624,32 @@ mod tests {
         .await
         .expect_err("secret-like Dream output must not reach Jiandu");
         assert_eq!(error, "auto-dream rejected secret-like notebook output");
+
+        const OPAQUE_SECRET: &str = "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je";
+        let prelude = format!("{SAFE_BODY}\n\n");
+        let secret_start = DREAM_MAX_SUMMARY_CHARS - 12;
+        let filler_len = secret_start - prelude.chars().count() - 1;
+        let boundary_body = format!("{prelude}{} {OPAQUE_SECRET}", "a".repeat(filler_len));
+        assert_eq!(
+            boundary_body.find(OPAQUE_SECRET),
+            Some(secret_start),
+            "fixture must place the credential across the old truncation boundary"
+        );
+        let boundary_provider: Arc<dyn LLMProvider> =
+            Arc::new(SequenceProvider::new(vec![boundary_body]));
+        let error = build_dream_notebook_body(
+            &boundary_provider,
+            "fast-model",
+            &DreamSourceWindow {
+                existing_dream: None,
+                durable_memory_index: None,
+                sessions: Vec::new(),
+            },
+            DreamGenerationMode::Incremental,
+        )
+        .await
+        .expect_err("complete Dream output must be checked before truncation");
+        assert_eq!(error, "auto-dream rejected secret-like notebook output");
     }
 
     #[tokio::test]
@@ -1761,6 +1813,17 @@ mod tests {
         assert!(sanitized_identifier_split.project_key.is_none());
         assert!(sanitized_identifier_split.summary.is_none());
         assert!(sanitized_identifier_split.topics.is_empty());
+        let consolidation_sessions = to_consolidation_sessions(&[(
+            identifier_split_context.entry.clone(),
+            identifier_split_context.summary.clone(),
+        )]);
+        assert_eq!(consolidation_sessions[0].id, "redacted-session");
+        assert_eq!(consolidation_sessions[0].title, REDACTED_EXTRACTION_SOURCE);
+        assert!(consolidation_sessions[0].last_run_status.is_none());
+        assert!(consolidation_sessions[0].summary.is_none());
+        let consolidation_prompt = build_consolidation_prompt(&consolidation_sessions);
+        assert!(!consolidation_prompt.contains(TOPIC_SECRET));
+        assert!(!consolidation_prompt.contains(SPLIT_LABEL));
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
             &context,
