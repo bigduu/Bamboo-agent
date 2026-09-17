@@ -184,7 +184,9 @@ fn known_secret_pattern() -> &'static Regex {
 fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+")
+        Regex::new(
+            r"(?i)(?:\b(?:proxy-)?authorization\s*:\s*[^\r\n]+|\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+)",
+        )
             .expect("authorization secret regex must compile")
     })
 }
@@ -2969,6 +2971,10 @@ mod tests {
                 "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
             ),
             (
+                "token authorization",
+                "Authorization: Token 0123456789abcdef0123456789abcdef",
+            ),
+            (
                 "hex session cookie",
                 "session cookie: 0123456789abcdef0123456789abcdef",
             ),
@@ -3044,6 +3050,7 @@ mod tests {
             ("PIN", "123"),
             ("GITHUB_TOKEN", "abc"),
             ("github_token", "abc"),
+            ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
                 title: title.to_string(),
