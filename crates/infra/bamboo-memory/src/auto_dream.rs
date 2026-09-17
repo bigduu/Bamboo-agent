@@ -31,6 +31,7 @@ pub struct DurableExtractionEnvelope {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableExtractionCandidate {
     pub title: String,
     #[serde(rename = "type")]
@@ -51,6 +52,7 @@ pub struct DurableExtractionCandidate {
 /// candidates — no extra LLM call. Every field is defaulted so a partially
 /// malformed item degrades instead of failing the envelope parse.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LedgerExtractionCandidate {
     #[serde(default)]
     pub title: String,
@@ -699,6 +701,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_extraction_candidates_rejects_unknown_candidate_fields() {
+        let input = r#"{"candidates":[{"title":"Production database","type":"reference","content":"hunter2","credential_label":"password","session_id":"session-1"}]}"#;
+        assert!(
+            parse_extraction_candidates(input).is_err(),
+            "unknown fields must not disappear before the sink privacy boundary"
+        );
+    }
+
+    #[test]
     fn parse_candidate_scope_defaults_to_project_when_key_available() {
         let candidate = DurableExtractionCandidate {
             title: "T".to_string(),
@@ -816,6 +827,15 @@ mod tests {
         assert!(parse_ledger_candidates("not json at all").is_empty());
         assert!(parse_ledger_candidates("{\"ledger_candidates\":\"oops\"}").is_empty());
         assert!(parse_ledger_candidates("").is_empty());
+    }
+
+    #[test]
+    fn parse_ledger_candidates_rejects_unknown_candidate_fields() {
+        let raw = r#"{"ledger_candidates":[{"title":"Production login","kind":"todo","excerpt":"hunter2","credential_label":"password"}]}"#;
+        assert!(
+            parse_ledger_candidates(raw).is_empty(),
+            "unknown Ledger fields must fail closed before persistence"
+        );
     }
 
     #[test]

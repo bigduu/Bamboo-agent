@@ -2349,6 +2349,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extraction_rejects_unknown_candidate_fields_before_sinks_and_watermark() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+            r#"{"candidates":[{"title":"Production database","type":"reference","content":"hunter2","credential_label":"password","session_id":"session-unknown-field"}]}"#
+                .to_string(),
+        ]));
+
+        let mut session = bamboo_agent_core::Session::new("session-unknown-field", "model");
+        session.add_message(Message::user("Remember the production database."));
+        storage.save_session(&session).await.expect("save session");
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic(
+                "session-unknown-field",
+                "database",
+                "Production database details",
+            )
+            .await
+            .expect("write topic");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let sessions = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        let ledger = LedgerStore::new(temp_dir.path());
+
+        extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &sessions,
+        )
+        .await
+        .expect_err("unknown candidate fields must fail the extraction");
+        assert!(memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list memory")
+            .is_empty());
+        assert!(ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list Ledger")
+            .is_empty());
+        assert!(
+            memory
+                .read_session_state("session-unknown-field")
+                .await
+                .expect("read extraction state")
+                .last_extracted_at
+                .is_none(),
+            "a rejected provider payload must not acknowledge its source"
+        );
+    }
+
+    #[tokio::test]
     async fn run_auto_dream_once_updates_dream_and_persists_candidates() {
         const TITLE_SECRET: &str = "API key: hunter2";
         const SUMMARY_SECRET: &str = "private key: hunter2";
