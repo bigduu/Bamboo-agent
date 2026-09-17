@@ -127,7 +127,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|client[_-]?secret|access[_-]?key)[a-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]{4,}"#,
+            r#"(?i)(?:api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|client[_-]?secret|access[_-]?key|session[\s_-]*(?:cookie|token|id)|cookie)[a-z0-9_.-]*[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]{4,}"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -2117,6 +2117,7 @@ mod tests {
         for secret in [
             "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
             "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            "session cookie: 0123456789abcdef0123456789abcdef",
             "postgres://user:password-value@example.test/database",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
         ] {
@@ -2138,12 +2139,30 @@ mod tests {
         };
         assert!(!durable_candidate_is_secret_safe(&unsafe_memory));
 
+        let unsafe_hex_cookie_memory = DurableExtractionCandidate {
+            title: "Session continuity".to_string(),
+            kind: "reference".to_string(),
+            content: "session cookie: 0123456789abcdef0123456789abcdef".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["session".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(!durable_candidate_is_secret_safe(&unsafe_hex_cookie_memory));
+
         let unsafe_ledger = LedgerExtractionCandidate {
             title: "Rotate credential".to_string(),
             excerpt: Some("Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456".to_string()),
             ..LedgerExtractionCandidate::default()
         };
         assert!(!ledger_candidate_is_secret_safe(&unsafe_ledger));
+
+        let unsafe_hex_cookie_ledger = LedgerExtractionCandidate {
+            title: "Session continuity".to_string(),
+            excerpt: Some("session cookie: 0123456789abcdef0123456789abcdef".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(!ledger_candidate_is_secret_safe(&unsafe_hex_cookie_ledger));
     }
 
     #[test]
