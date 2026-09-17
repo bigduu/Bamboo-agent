@@ -325,6 +325,8 @@ pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCand
             !contains_secret_like_value(tag)
                 && !contains_secret_like_value(&format!("{}: {tag}", candidate.title))
                 && !contains_secret_like_value(&format!("{}: {tag}", candidate.content))
+                && !contains_secret_like_value(&format!("{tag}: {}", candidate.title))
+                && !contains_secret_like_value(&format!("{tag}: {}", candidate.content))
         })
         && candidate
             .session_id
@@ -442,6 +444,20 @@ mod tests {
             confidence: Some("high".to_string()),
         };
         assert!(!durable_candidate_is_secret_safe(&memory));
+
+        let tag_labelled_memory = DurableExtractionCandidate {
+            title: "Production database".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["password".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&tag_labelled_memory),
+            "a tag used as the credential label must reject the candidate"
+        );
 
         let ledger = LedgerExtractionCandidate {
             title: "PIN".to_string(),
