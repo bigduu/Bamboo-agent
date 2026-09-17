@@ -765,13 +765,13 @@ pub(crate) fn sanitize_extraction_source(value: &str) -> String {
 /// forms a credential. Checking both orders is important because model output
 /// and task metadata do not guarantee that the label precedes the value.
 pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
-    let has_hash_context = sources
+    // A technical hash label exempts a token only when both occur in the same
+    // field. Candidate-wide exemptions let an unrelated tag such as `commit`
+    // launder an opaque credential stored in another field.
+    if sources
         .iter()
-        .any(|source| hash_context_pattern().is_match(source));
-    if sources.iter().any(|source| {
-        contains_non_hex_secret_like_value(source)
-            || (!has_hash_context && contains_opaque_hex_secret_token(source))
-    }) {
+        .any(|source| contains_secret_like_value(source))
+    {
         return false;
     }
 
@@ -782,8 +782,7 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
             .filter(|(right_index, _)| *right_index != left_index)
             .all(|(_, right)| {
                 let pair = format!("{left}: {right}");
-                !contains_non_hex_secret_like_value(&pair)
-                    && (has_hash_context || !contains_opaque_hex_secret_token(&pair))
+                !contains_secret_like_value(&pair)
             })
     })
 }
@@ -1173,7 +1172,9 @@ mod tests {
         let hash_candidate = DurableExtractionCandidate {
             title: "Build artifact SHA-256 digest".to_string(),
             kind: "reference".to_string(),
-            content: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            content:
+                "SHA-256 digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
             scope: Some("project".to_string()),
             tags: vec!["checksum".to_string()],
             session_id: Some("session-1".to_string()),
@@ -1182,6 +1183,20 @@ mod tests {
         assert!(
             durable_candidate_is_secret_safe(&hash_candidate),
             "an explicitly labelled technical digest must remain compatible"
+        );
+
+        let unrelated_hash_context = DurableExtractionCandidate {
+            title: "Production integration access".to_string(),
+            kind: "reference".to_string(),
+            content: "0123456789abcdef0123456789abcdef".to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["commit".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&unrelated_hash_context),
+            "an unrelated hash-like field must not exempt an opaque token"
         );
 
         for (field, candidate) in [

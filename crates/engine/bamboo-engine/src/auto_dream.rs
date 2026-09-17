@@ -813,16 +813,24 @@ async fn collect_complete_stream_text(
         .map_err(|error| format!("auto-dream provider call failed: {error}"))?;
 
     let mut content = String::new();
+    let mut completed = false;
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(LLMChunk::Token(text)) => content.push_str(&text),
-            Ok(LLMChunk::Done) => break,
+            Ok(LLMChunk::Done) => {
+                completed = true;
+                break;
+            }
             Ok(_) => {}
             // A partial stream is not a complete response and must never be
             // treated as one: truncation at an error boundary could hide the
             // remainder of a credential from the privacy check below.
             Err(error) => return Err(format!("auto-dream stream failed: {error}")),
         }
+    }
+
+    if !completed {
+        return Err("auto-dream stream ended before completion".to_string());
     }
 
     let trimmed = content.trim();
@@ -1439,6 +1447,24 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct IncompleteProvider;
+
+    #[async_trait]
+    impl LLMProvider for IncompleteProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Token(
+                "partial response without a terminal chunk".to_string(),
+            ))])))
+        }
+    }
+
+    #[derive(Clone)]
     struct CasMutatingProvider {
         responses: Arc<Mutex<Vec<String>>>,
         calls: Arc<AtomicUsize>,
@@ -1494,6 +1520,15 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "User prefers terse responses");
         assert_eq!(candidates[0].kind, "feedback");
+    }
+
+    #[tokio::test]
+    async fn complete_stream_text_rejects_clean_eof_without_done() {
+        let provider: Arc<dyn LLMProvider> = Arc::new(IncompleteProvider);
+        let error = collect_complete_stream_text(provider, "test-model", "prompt".to_string())
+            .await
+            .expect_err("clean EOF without Done must remain retryable");
+        assert_eq!(error, "auto-dream stream ended before completion");
     }
 
     #[test]
