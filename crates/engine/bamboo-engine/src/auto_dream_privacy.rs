@@ -118,6 +118,16 @@ fn short_credential_config_field_pattern() -> &'static Regex {
     })
 }
 
+fn redis_password_directive_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?:[\"'][^\"'\r\n]{1,1024}[\"']|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
+        )
+        .expect("Redis password directive regex must compile")
+    })
+}
+
 fn standalone_pin_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -562,6 +572,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
         || short_credential_config_field_pattern().is_match(value)
+        || redis_password_directive_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
@@ -735,6 +746,8 @@ mod tests {
                 "My token is revoked after account deletion.",
             ),
             ("ordinary pass field", "pass: true"),
+            ("commented Redis password", "# requirepass hunter2"),
+            ("empty Redis password", "requirepass \"\""),
             (
                 "XML password policy element",
                 "<password-policy>rotate quarterly</password-policy>",
@@ -823,6 +836,12 @@ mod tests {
                 "db.createUser({user: \"alice\", pwd: \"hunter2\"})",
             ),
             ("short pass config field", "pass = 'hunter2'"),
+            ("Redis requirepass", "requirepass hunter2"),
+            ("Redis masterauth", "masterauth hunter2"),
+            (
+                "Redis CONFIG SET password",
+                "CONFIG SET requirepass 'hunter2'",
+            ),
             ("XML password element", "<password>hunter2</password>"),
             (
                 "nested XML password element",
