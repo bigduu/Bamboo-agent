@@ -805,10 +805,69 @@ pub(crate) fn sanitize_extraction_source(value: &str) -> String {
     }
 }
 
-/// Return false when any complete source, or any ordered pair of sources,
-/// forms a credential. Checking both orders is important because model output
-/// and task metadata do not guarantee that the label precedes the value.
+const MAX_STRUCTURED_PRIVACY_FIELDS: usize = 16;
+
+fn fields_form_credential_label(fields: &[&str]) -> bool {
+    let label = fields.join(" ");
+    contains_non_hex_secret_like_value(&format!("{label}: bamboo-privacy-probe"))
+        || contains_non_hex_secret_like_value(&format!("{label} bamboo-privacy-probe"))
+}
+
+fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
+    contains_secret_like_value(&format!("{label}: {value}"))
+        || contains_secret_like_value(&format!("{label} {value}"))
+}
+
+fn structured_sources_contain_secret(sources: &[&str]) -> bool {
+    if sources.len() > MAX_STRUCTURED_PRIVACY_FIELDS {
+        return true;
+    }
+    for (first_index, first) in sources.iter().enumerate() {
+        for (second_index, second) in sources.iter().enumerate() {
+            if second_index == first_index {
+                continue;
+            }
+            let two_field_label = format!("{first} {second}");
+            if fields_form_credential_label(&[first, second]) {
+                for (value_index, value) in sources.iter().enumerate() {
+                    if value_index != first_index
+                        && value_index != second_index
+                        && labelled_value_contains_secret(&two_field_label, value)
+                    {
+                        return true;
+                    }
+                }
+            }
+            for (third_index, third) in sources.iter().enumerate() {
+                if third_index == first_index || third_index == second_index {
+                    continue;
+                }
+                if fields_form_credential_label(&[first, second, third]) {
+                    let three_field_label = format!("{first} {second} {third}");
+                    for (fourth_index, fourth) in sources.iter().enumerate() {
+                        if fourth_index != first_index
+                            && fourth_index != second_index
+                            && fourth_index != third_index
+                            && labelled_value_contains_secret(&three_field_label, fourth)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Return false when complete structured fields form a credential. Besides
+/// individual fields and ordered pairs, reconstruct two- and three-field
+/// credential labels before testing every remaining field as the value. The
+/// hard field cap keeps this conservative check bounded and fails closed.
 pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
+    if sources.len() > MAX_STRUCTURED_PRIVACY_FIELDS {
+        return false;
+    }
     // A technical hash label exempts a token only when both occur in the same
     // field. Candidate-wide exemptions let an unrelated tag such as `commit`
     // launder an opaque credential stored in another field.
@@ -819,7 +878,7 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
         return false;
     }
 
-    sources.iter().enumerate().all(|(left_index, left)| {
+    let pairs_are_safe = sources.iter().enumerate().all(|(left_index, left)| {
         sources
             .iter()
             .enumerate()
@@ -828,7 +887,8 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
                 let pair = format!("{left}: {right}");
                 !contains_secret_like_value(&pair)
             })
-    })
+    });
+    pairs_are_safe && !structured_sources_contain_secret(sources)
 }
 
 /// Sanitize a label/content pair together so a split credential such as
@@ -1162,6 +1222,28 @@ mod tests {
 
     #[test]
     fn pair_and_candidate_checks_reject_split_credentials() {
+        assert!(
+            !extraction_sources_are_secret_safe(&["API", "key", "hunter2"]),
+            "a two-word credential label split across fields must be reconstructed"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["one", "time", "password", "123456"]),
+            "a three-word credential label split across fields must be reconstructed"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["API", "design", "approved"]),
+            "ordinary structured fields must remain compatible"
+        );
+        let oversized = (0..=MAX_STRUCTURED_PRIVACY_FIELDS)
+            .map(|index| format!("ordinary-field-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            !extraction_sources_are_secret_safe(
+                &oversized.iter().map(String::as_str).collect::<Vec<_>>()
+            ),
+            "oversized structured inputs must fail closed"
+        );
+
         let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");
         assert!(
             label == REDACTED_EXTRACTION_SOURCE,
@@ -1245,6 +1327,20 @@ mod tests {
         assert!(
             !durable_candidate_is_secret_safe(&unrelated_hash_context),
             "an unrelated hash-like field must not exempt an opaque token"
+        );
+
+        let three_field_credential = DurableExtractionCandidate {
+            title: "API".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["key".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&three_field_credential),
+            "a credential assembled from title, tag, and content must be rejected"
         );
 
         for (field, candidate) in [

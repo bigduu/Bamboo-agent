@@ -1598,8 +1598,8 @@ mod tests {
     fn outline_rejects_credentials_split_across_task_fields() {
         let mut session = bamboo_agent_core::Session::new("session-task-split", "model");
         let item = bamboo_domain::TaskItem {
-            id: "task-1".to_string(),
-            description: "Password".to_string(),
+            id: "API".to_string(),
+            description: "key".to_string(),
             notes: "hunter2".to_string(),
             ..bamboo_domain::TaskItem::default()
         };
@@ -1729,6 +1729,17 @@ mod tests {
             .await
             .expect("save split-field session");
 
+        let mut triple_split =
+            bamboo_agent_core::Session::new("session-triple-split-private", "model");
+        triple_split.title = "API".to_string();
+        triple_split.add_message(Message::user(
+            "Ordinary activity for the three-field fixture.",
+        ));
+        storage
+            .save_session(&triple_split)
+            .await
+            .expect("save three-field session");
+
         let mut identifier_split = bamboo_agent_core::Session::new(TOPIC_SECRET, "model");
         identifier_split.title = SPLIT_LABEL.to_string();
         identifier_split.add_message(Message::user(
@@ -1759,6 +1770,10 @@ mod tests {
             .write_session_topic("session-split-private", "database", TOPIC_SECRET)
             .await
             .expect("write split-field Session topic fixture");
+        memory
+            .write_session_topic("session-triple-split-private", "key", TOPIC_SECRET)
+            .await
+            .expect("write three-field Session topic fixture");
         memory
             .write_session_topic(
                 "session-summary-private",
@@ -1828,7 +1843,7 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 4);
+        assert_eq!(contexts.len(), 5);
         let split_context = contexts
             .iter()
             .find(|context| context.session_id == "session-split-private")
@@ -1837,6 +1852,14 @@ mod tests {
         assert_eq!(sanitized_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_split.summary.is_none());
         assert!(sanitized_split.topics.is_empty());
+        let triple_split_context = contexts
+            .iter()
+            .find(|context| context.session_id == "session-triple-split-private")
+            .expect("three-field context");
+        let sanitized_triple_split = sanitized_extraction_candidate_info(triple_split_context);
+        assert_eq!(sanitized_triple_split.title, REDACTED_EXTRACTION_SOURCE);
+        assert!(sanitized_triple_split.summary.is_none());
+        assert!(sanitized_triple_split.topics.is_empty());
         let identifier_split_context = contexts
             .iter()
             .find(|context| context.session_id == TOPIC_SECRET)
