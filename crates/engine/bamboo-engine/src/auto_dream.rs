@@ -13,7 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 use bamboo_agent_core::{Message, Role, Session, SessionKind};
-use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind};
+use bamboo_domain::ledger::{LedgerRecord, LedgerScope, RecordActor, RecordKind, RecordStatus};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::CompressionEventKind;
 use bamboo_llm::Config;
@@ -64,7 +64,8 @@ const EXTRACTION_CHECKPOINT_VERSION: u32 = 2;
 const EXTRACTION_CHECKPOINT_DIR: &str = "auto_dream/extraction-checkpoints/v2";
 const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 2;
 const HISTORY_REWRITE_STATE_VERSION: u32 = 1;
-const HISTORY_REWRITE_PLAN_VERSION: u32 = 1;
+const HISTORY_REWRITE_PLAN_VERSION: u32 = 2;
+const HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS: usize = 64;
 const AUTO_DREAM_MEMORY_ACTOR: &str = "background-fast-model";
 const GARDENER_MEMORY_ACTORS: [&str; 2] = ["memory-gardener", "memory-dedup-gardener"];
 const REDACTED_EXTRACTION_SOURCE: &str =
@@ -125,6 +126,11 @@ struct CandidateSessionContext {
     topics: Vec<(String, String)>,
     retrieval_source_key: Option<String>,
     history_revision: Option<String>,
+    /// A mixed-lineage gardener document can require exact evidence from a
+    /// second Session while the transaction and acknowledgement still belong
+    /// to the rewritten Session. Ordinary extraction leaves both fields empty.
+    transaction_owner_session_id: Option<String>,
+    transaction_source_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,6 +1022,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     topics: Vec::new(),
                     retrieval_source_key: retrieval_source_key.clone(),
                     history_revision: pending_history_revision.clone(),
+                    transaction_owner_session_id: None,
+                    transaction_source_updated_at: None,
                 });
             }
             if !topics.is_empty() {
@@ -1027,6 +1035,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     topics,
                     retrieval_source_key,
                     history_revision: pending_history_revision,
+                    transaction_owner_session_id: None,
+                    transaction_source_updated_at: None,
                 });
             }
         } else {
@@ -1043,6 +1053,8 @@ async fn collect_candidate_session_contexts_from_sessions(
                     },
                     retrieval_source_key: None,
                     history_revision: None,
+                    transaction_owner_session_id: None,
+                    transaction_source_updated_at: None,
                 });
             }
         }
@@ -1139,6 +1151,14 @@ struct MemoryReplacementTarget {
     project_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct LedgerReplacementTarget {
+    id: String,
+    scope: LedgerScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryRewritePlan {
     version: u32,
@@ -1146,6 +1166,10 @@ struct HistoryRewritePlan {
     history_revision: String,
     source_updated_at: String,
     replacement_targets: Vec<MemoryReplacementTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preservation_session_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ledger_replacement_targets: Vec<LedgerReplacementTarget>,
 }
 
 #[derive(Debug)]
@@ -1199,38 +1223,36 @@ fn extraction_topics_fingerprint(topics: &[(String, String)]) -> String {
     hex::encode(digest.finalize())
 }
 
-fn extraction_topics_fingerprints_by_session(
-    sessions: &[CandidateSessionContext],
-) -> HashMap<String, String> {
-    let mut topics_by_session: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for session in sessions {
-        topics_by_session
-            .entry(session.session_id.clone())
-            .or_default()
-            .extend(session.topics.iter().cloned());
-    }
-    topics_by_session
-        .into_iter()
-        .map(|(session_id, topics)| (session_id, extraction_topics_fingerprint(&topics)))
-        .collect()
+fn extraction_transaction_session_id(session: &CandidateSessionContext) -> &str {
+    session
+        .transaction_owner_session_id
+        .as_deref()
+        .unwrap_or(&session.session_id)
+}
+
+fn extraction_transaction_source_updated_at(session: &CandidateSessionContext) -> String {
+    session
+        .transaction_source_updated_at
+        .clone()
+        .unwrap_or_else(|| session.entry.updated_at.to_rfc3339())
 }
 
 fn build_pending_extraction_batches(
     model: &str,
     sessions: &[CandidateSessionContext],
 ) -> Vec<PendingExtractionBatch> {
-    let topics_fingerprints = extraction_topics_fingerprints_by_session(sessions);
     sessions
         .iter()
         .enumerate()
         .map(|(context_index, session)| {
             let prompt = extraction_prompt(session);
-            let source_updated_at = session.entry.updated_at.to_rfc3339();
+            let transaction_session_id = extraction_transaction_session_id(session);
+            let source_updated_at = extraction_transaction_source_updated_at(session);
             PendingExtractionBatch {
                 context_index,
                 checkpoint_id: extraction_checkpoint_id(
                     model,
-                    &session.session_id,
+                    transaction_session_id,
                     &source_updated_at,
                     &prompt,
                 ),
@@ -1238,10 +1260,7 @@ fn build_pending_extraction_batches(
                 transaction_id: String::new(),
                 batch_index: 0,
                 batch_count: 0,
-                topics_fingerprint: topics_fingerprints
-                    .get(session.session_id.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| extraction_topics_fingerprint(&[])),
+                topics_fingerprint: String::new(),
                 history_revision: session.history_revision.clone(),
             }
         })
@@ -1254,21 +1273,30 @@ fn assign_pending_extraction_transactions(
 ) -> HashMap<String, Vec<usize>> {
     let mut indexes_by_session: HashMap<String, Vec<usize>> = HashMap::new();
     for (pending_index, pending) in pending_batches.iter().enumerate() {
-        let session_id = &sessions[pending.context_index].session_id;
+        let session_id = extraction_transaction_session_id(&sessions[pending.context_index]);
         indexes_by_session
-            .entry(session_id.clone())
+            .entry(session_id.to_string())
             .or_default()
             .push(pending_index);
     }
     for (session_id, pending_indexes) in &indexes_by_session {
+        let topics = pending_indexes
+            .iter()
+            .flat_map(|index| {
+                sessions[pending_batches[*index].context_index]
+                    .topics
+                    .iter()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let topics_fingerprint = extraction_topics_fingerprint(&topics);
         let checkpoint_ids = pending_indexes
             .iter()
             .map(|index| pending_batches[*index].checkpoint_id.clone())
             .collect::<Vec<_>>();
-        let source_updated_at = sessions[pending_batches[pending_indexes[0]].context_index]
-            .entry
-            .updated_at
-            .to_rfc3339();
+        let source_updated_at = extraction_transaction_source_updated_at(
+            &sessions[pending_batches[pending_indexes[0]].context_index],
+        );
         let transaction_id =
             extraction_transaction_id(session_id, &source_updated_at, &checkpoint_ids);
         let batch_count = pending_indexes.len();
@@ -1277,20 +1305,27 @@ fn assign_pending_extraction_transactions(
             pending.transaction_id.clone_from(&transaction_id);
             pending.batch_index = batch_index;
             pending.batch_count = batch_count;
+            pending.topics_fingerprint.clone_from(&topics_fingerprint);
         }
     }
     indexes_by_session
 }
 
 fn extraction_prompt(session: &CandidateSessionContext) -> String {
-    build_extraction_prompt(&[DreamCandidateInfo {
+    let mut prompt = build_extraction_prompt(&[DreamCandidateInfo {
         session_id: session.session_id.clone(),
         title: sanitize_extraction_source(&session.entry.title),
         project_key: session.project_key.clone(),
         updated_at: session.entry.updated_at.to_rfc3339(),
         summary: session.summary.clone(),
         topics: session.topics.clone(),
-    }])
+    }]);
+    if session.transaction_owner_session_id.is_some() {
+        prompt.push_str(
+            "\n\nThis Session is an unaffected source of a mixed-lineage durable-memory record. Re-extract its current durable facts so the canonical record can be replaced safely. Return ledger_candidates as an empty array; this preservation batch must not create prospective work.\n",
+        );
+    }
+    prompt
 }
 
 fn extraction_checkpoint_id(
@@ -1686,6 +1721,27 @@ async fn read_history_rewrite_plan(
         || plan.session_key != extraction_checkpoint_session_key(session_id)
         || plan.history_revision != history_revision
         || plan_source > current_source
+        || plan.preservation_session_ids.len() > HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS
+        || plan
+            .preservation_session_ids
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != plan.preservation_session_ids.len()
+        || plan.preservation_session_ids.iter().any(|session_id| {
+            session_id.trim().is_empty()
+                || session_id != session_id.trim()
+                || session_id.contains('/')
+                || session_id.contains('\\')
+                || session_id.contains("..")
+                || extraction_checkpoint_session_key(session_id) == plan.session_key
+        })
+        || plan
+            .replacement_targets
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != plan.replacement_targets.len()
         || plan.replacement_targets.iter().any(|target| {
             target.id.trim().is_empty()
                 || target.scope == MemoryScope::Session
@@ -1693,6 +1749,18 @@ async fn read_history_rewrite_plan(
                     && target.project_key.as_deref().is_none_or(str::is_empty))
                 || (target.scope != MemoryScope::Project && target.project_key.is_some())
         })
+        || plan.ledger_replacement_targets.iter().any(|target| {
+            target.id.trim().is_empty()
+                || (target.scope == LedgerScope::Project
+                    && target.project_key.as_deref().is_none_or(str::is_empty))
+                || (target.scope != LedgerScope::Project && target.project_key.is_some())
+        })
+        || plan
+            .ledger_replacement_targets
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != plan.ledger_replacement_targets.len()
     {
         return Err("AutoDream history-rewrite plan identity mismatch".to_string());
     }
@@ -1711,14 +1779,6 @@ async fn write_history_rewrite_plan(
     write_json_create_once(&path, &bytes, "history-rewrite-plan").await
 }
 
-fn memory_has_session_source(document: &DurableMemoryDocument, session_id: &str) -> bool {
-    document
-        .frontmatter
-        .sources
-        .iter()
-        .any(|source| source.kind == "session" && source.id == session_id)
-}
-
 fn memory_actor_is(document: &DurableMemoryDocument, actors: &[&str]) -> bool {
     document
         .frontmatter
@@ -1734,27 +1794,41 @@ fn memory_actor_is(document: &DurableMemoryDocument, actors: &[&str]) -> bool {
             .is_some_and(|actor| actors.contains(&actor))
 }
 
-fn memory_lineage_contains_session_source<'a>(
+fn collect_memory_lineage_session_sources<'a>(
     document: &'a DurableMemoryDocument,
     documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
-    session_id: &str,
     visited: &mut HashSet<&'a str>,
-) -> bool {
-    if memory_has_session_source(document, session_id) {
-        return true;
-    }
+) -> HashSet<String> {
+    let mut sources = document
+        .frontmatter
+        .sources
+        .iter()
+        .filter(|source| source.kind == "session")
+        .map(|source| source.id.clone())
+        .collect::<HashSet<_>>();
     if !visited.insert(document.frontmatter.id.as_str()) {
-        return false;
+        return sources;
     }
-    document
+    for ancestor in document
         .frontmatter
         .relations
         .supersedes
         .iter()
         .filter_map(|id| documents_by_id.get(id.as_str()).copied())
-        .any(|ancestor| {
-            memory_lineage_contains_session_source(ancestor, documents_by_id, session_id, visited)
-        })
+    {
+        sources.extend(collect_memory_lineage_session_sources(
+            ancestor,
+            documents_by_id,
+            visited,
+        ));
+    }
+    sources
+}
+
+#[derive(Debug)]
+struct HistoryRewriteMemoryTargets {
+    replacement_targets: Vec<MemoryReplacementTarget>,
+    preservation_session_ids: Vec<String>,
 }
 
 async fn collect_history_rewrite_replacement_targets(
@@ -1763,7 +1837,7 @@ async fn collect_history_rewrite_replacement_targets(
     session: &CandidateSessionContext,
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
-) -> Result<Vec<MemoryReplacementTarget>, String> {
+) -> Result<HistoryRewriteMemoryTargets, String> {
     let mut scopes = Vec::new();
     if current_store_is_project_scoped {
         let project_key = session.project_key.as_deref().ok_or_else(|| {
@@ -1792,6 +1866,7 @@ async fn collect_history_rewrite_replacement_targets(
     }
 
     let mut targets = HashSet::new();
+    let mut preservation_session_ids = HashSet::new();
     for (store, scope, project_key) in scopes {
         let documents = store
             .list_memory_documents(scope, project_key.as_deref())
@@ -1804,16 +1879,16 @@ async fn collect_history_rewrite_replacement_targets(
             .map(|document| (document.frontmatter.id.as_str(), document))
             .collect::<HashMap<_, _>>();
         for document in &documents {
+            let lineage_session_ids = collect_memory_lineage_session_sources(
+                document,
+                &documents_by_id,
+                &mut HashSet::new(),
+            );
             let is_direct_auto_dream = document.frontmatter.updated_by.actor.as_deref()
                 == Some(AUTO_DREAM_MEMORY_ACTOR)
-                && memory_has_session_source(document, &session.session_id);
+                && lineage_session_ids.contains(&session.session_id);
             let is_gardener_descendant = memory_actor_is(document, &GARDENER_MEMORY_ACTORS)
-                && memory_lineage_contains_session_source(
-                    document,
-                    &documents_by_id,
-                    &session.session_id,
-                    &mut HashSet::new(),
-                );
+                && lineage_session_ids.contains(&session.session_id);
             if document.frontmatter.status == DurableMemoryStatus::Active
                 && (is_direct_auto_dream || is_gardener_descendant)
             {
@@ -1822,6 +1897,13 @@ async fn collect_history_rewrite_replacement_targets(
                     scope: document.frontmatter.scope,
                     project_key: document.frontmatter.project_key.clone(),
                 });
+                if is_gardener_descendant {
+                    preservation_session_ids.extend(
+                        lineage_session_ids
+                            .into_iter()
+                            .filter(|source_id| source_id != &session.session_id),
+                    );
+                }
             }
         }
     }
@@ -1833,13 +1915,26 @@ async fn collect_history_rewrite_replacement_targets(
             .then_with(|| left.project_key.cmp(&right.project_key))
             .then_with(|| left.id.cmp(&right.id))
     });
-    Ok(targets)
+    let mut preservation_session_ids = preservation_session_ids.into_iter().collect::<Vec<_>>();
+    preservation_session_ids.sort();
+    if preservation_session_ids.len() > HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS {
+        return Err(format!(
+            "history rewrite requires {} preservation Sessions; maximum is {}",
+            preservation_session_ids.len(),
+            HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS
+        ));
+    }
+    Ok(HistoryRewriteMemoryTargets {
+        replacement_targets: targets,
+        preservation_session_ids,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn load_or_create_history_rewrite_plan(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
+    ledger: &LedgerStore,
     session: &CandidateSessionContext,
     history_revision: &str,
     source_updated_at: &str,
@@ -1856,19 +1951,47 @@ async fn load_or_create_history_rewrite_plan(
     {
         return Ok(plan);
     }
+    let memory_targets = collect_history_rewrite_replacement_targets(
+        ctx,
+        memory,
+        session,
+        project_resolver,
+        current_store_is_project_scoped,
+    )
+    .await?;
+    let mut ledger_replacement_targets = ledger
+        .list_records(LedgerScope::Global, None, &RecordFilter::default())
+        .await
+        .map_err(|error| {
+            format!("failed to inspect AutoDream Ledger records before history rewrite: {error}")
+        })?
+        .into_iter()
+        .filter(|document| {
+            document.record.source.created_by == RecordActor::Extractor
+                && document.record.source.session_id.as_deref() == Some(&session.session_id)
+                && document.record.tags.iter().any(|tag| tag == "suggested")
+        })
+        .map(|document| LedgerReplacementTarget {
+            id: document.record.id,
+            scope: document.record.scope,
+            project_key: document.record.project_key,
+        })
+        .collect::<Vec<_>>();
+    ledger_replacement_targets.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.project_key.cmp(&right.project_key))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     let plan = HistoryRewritePlan {
         version: HISTORY_REWRITE_PLAN_VERSION,
         session_key: extraction_checkpoint_session_key(&session.session_id),
         history_revision: history_revision.to_string(),
         source_updated_at: source_updated_at.to_string(),
-        replacement_targets: collect_history_rewrite_replacement_targets(
-            ctx,
-            memory,
-            session,
-            project_resolver,
-            current_store_is_project_scoped,
-        )
-        .await?,
+        replacement_targets: memory_targets.replacement_targets,
+        preservation_session_ids: memory_targets.preservation_session_ids,
+        ledger_replacement_targets,
     };
     if write_history_rewrite_plan(ctx, &session.session_id, &plan).await? {
         return Ok(plan);
@@ -1883,8 +2006,86 @@ async fn load_or_create_history_rewrite_plan(
     .ok_or_else(|| "concurrent history-rewrite plan disappeared before reuse".to_string())
 }
 
+async fn build_history_rewrite_preservation_contexts(
+    ctx: &AutoDreamContext,
+    owner_session_id: &str,
+    plan: &HistoryRewritePlan,
+) -> Result<Vec<CandidateSessionContext>, String> {
+    let mut contexts = Vec::new();
+    for source_session_id in &plan.preservation_session_ids {
+        if source_session_id == owner_session_id {
+            continue;
+        }
+        let session = ctx
+            .storage
+            .load_session(source_session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to load mixed-lineage preservation Session '{source_session_id}': {error}"
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "mixed-lineage preservation Session '{source_session_id}' no longer exists"
+                )
+            })?;
+        let entry = ctx
+            .session_store
+            .get_index_entry(source_session_id)
+            .await
+            .ok_or_else(|| {
+                format!(
+                    "mixed-lineage preservation Session '{source_session_id}' has no canonical index entry"
+                )
+            })?;
+        let project_key = ProjectContextResolver::memory_read_identity_for_session(&session)
+            .map(bamboo_domain::ProjectId::into_string);
+        let transaction_owner_session_id = Some(owner_session_id.to_string());
+        let transaction_source_updated_at = Some(plan.source_updated_at.clone());
+        for summary in build_history_rewrite_extraction_batches(&session, None) {
+            contexts.push(CandidateSessionContext {
+                entry: entry.clone(),
+                summary: Some(summary),
+                session_id: source_session_id.clone(),
+                project_key: project_key.clone(),
+                topics: Vec::new(),
+                retrieval_source_key: None,
+                history_revision: Some(plan.history_revision.clone()),
+                transaction_owner_session_id: transaction_owner_session_id.clone(),
+                transaction_source_updated_at: transaction_source_updated_at.clone(),
+            });
+        }
+        let topics = sanitized_session_topics(
+            ctx.memory
+                .read_session_topics_with_content(source_session_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to read mixed-lineage preservation topics for '{source_session_id}': {error}"
+                    )
+                })?,
+        );
+        if !topics.is_empty() {
+            contexts.push(CandidateSessionContext {
+                entry,
+                summary: None,
+                session_id: source_session_id.clone(),
+                project_key,
+                topics,
+                retrieval_source_key: None,
+                history_revision: Some(plan.history_revision.clone()),
+                transaction_owner_session_id,
+                transaction_source_updated_at,
+            });
+        }
+    }
+    Ok(contexts)
+}
+
 async fn supersede_history_rewrite_targets(
     ctx: &AutoDreamContext,
+    ledger: &LedgerStore,
     plan: &HistoryRewritePlan,
 ) -> Result<(), String> {
     for target in &plan.replacement_targets {
@@ -1913,6 +2114,23 @@ async fn supersede_history_rewrite_targets(
             .map_err(|error| {
                 format!(
                     "failed to supersede AutoDream memory '{}' after history rewrite: {error}",
+                    target.id
+                )
+            })?;
+    }
+    for target in &plan.ledger_replacement_targets {
+        ledger
+            .transition_record(
+                target.scope,
+                target.project_key.as_deref(),
+                &target.id,
+                RecordStatus::Cancelled,
+                Some("cancelled after canonical Session history rewrite"),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to cancel AutoDream Ledger record '{}' after history rewrite: {error}",
                     target.id
                 )
             })?;
@@ -2277,6 +2495,8 @@ async fn rebuild_session_contexts_after_checkpoint_replay(
                 topics: Vec::new(),
                 retrieval_source_key: retrieval_source_key.clone(),
                 history_revision: pending_history_revision.clone(),
+                transaction_owner_session_id: None,
+                transaction_source_updated_at: None,
             });
         }
     } else {
@@ -2293,6 +2513,8 @@ async fn rebuild_session_contexts_after_checkpoint_replay(
                 },
                 retrieval_source_key: None,
                 history_revision: None,
+                transaction_owner_session_id: None,
+                transaction_source_updated_at: None,
             });
         }
     }
@@ -2314,6 +2536,8 @@ async fn rebuild_session_contexts_after_checkpoint_replay(
             topics,
             retrieval_source_key,
             history_revision: pending_history_revision,
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
         });
     }
     contexts.retain(|context| {
@@ -2363,11 +2587,13 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     let mut seen_sessions = HashSet::new();
     let session_source_watermarks = extraction_sessions
         .iter()
-        .filter(|session| seen_sessions.insert(session.session_id.clone()))
+        .filter(|session| {
+            seen_sessions.insert(extraction_transaction_session_id(session).to_string())
+        })
         .map(|session| {
             (
-                session.session_id.clone(),
-                session.entry.updated_at.to_rfc3339(),
+                extraction_transaction_session_id(session).to_string(),
+                extraction_transaction_source_updated_at(session),
             )
         })
         .collect::<Vec<_>>();
@@ -2460,10 +2686,6 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 } else {
                     None
                 };
-                let replacement_targets = history_plan
-                    .as_ref()
-                    .map(|plan| plan.replacement_targets.iter().cloned().collect())
-                    .unwrap_or_default();
                 for checkpoint in transaction.batches {
                     let writes = persist_durable_candidate_batch_with_project_resolver(
                         ctx,
@@ -2473,7 +2695,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                         checkpoint.extracted,
                         project_resolver,
                         current_store_is_project_scoped,
-                        &replacement_targets,
+                        history_plan.as_ref(),
                     )
                     .await?;
                     total_writes.memory = total_writes.memory.saturating_add(writes.memory);
@@ -2482,7 +2704,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 if let (Some(revision), Some(plan)) =
                     (history_revision.as_deref(), history_plan.as_ref())
                 {
-                    supersede_history_rewrite_targets(ctx, plan).await?;
+                    supersede_history_rewrite_targets(ctx, ledger, plan).await?;
                     write_history_rewrite_state(
                         ctx,
                         session_id,
@@ -2618,16 +2840,21 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             continue;
         };
         let session = &extraction_sessions[pending.context_index];
-        let key = (session.session_id.clone(), history_revision.to_string());
+        let transaction_session_id = extraction_transaction_session_id(session);
+        let key = (
+            transaction_session_id.to_string(),
+            history_revision.to_string(),
+        );
         if history_plans.contains_key(&key) {
             continue;
         }
         let source_updated_at = source_updated_at_by_session
-            .get(&session.session_id)
+            .get(transaction_session_id)
             .expect("every pending Session has a source watermark");
         let plan = load_or_create_history_rewrite_plan(
             ctx,
             memory,
+            ledger,
             session,
             history_revision,
             source_updated_at,
@@ -2638,32 +2865,71 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         history_plans.insert(key, plan);
     }
 
+    // Mixed-lineage gardener records are one canonical document backed by
+    // several Sessions. Before superseding such a document for one rewritten
+    // Session, checkpoint fresh extraction batches for every unaffected source
+    // under the rewritten Session's transaction. Replay can then restore both
+    // sides without advancing any unaffected Session watermark.
+    let mut history_plan_keys = history_plans.keys().cloned().collect::<Vec<_>>();
+    history_plan_keys.sort();
+    let mut preservation_contexts = Vec::new();
+    for key in history_plan_keys {
+        let (owner_session_id, _) = &key;
+        let plan = history_plans
+            .get(&key)
+            .expect("sorted history-rewrite plan key must remain present");
+        preservation_contexts.extend(
+            build_history_rewrite_preservation_contexts(ctx, owner_session_id, plan).await?,
+        );
+    }
+    for context in preservation_contexts {
+        let context_index = extraction_sessions.len();
+        let prompt = extraction_prompt(&context);
+        let transaction_session_id = extraction_transaction_session_id(&context);
+        let source_updated_at = extraction_transaction_source_updated_at(&context);
+        let checkpoint_id =
+            extraction_checkpoint_id(model, transaction_session_id, &source_updated_at, &prompt);
+        let history_revision = context.history_revision.clone();
+        extraction_sessions.push(context);
+        pending_batches.push(PendingExtractionBatch {
+            context_index,
+            prompt,
+            checkpoint_id,
+            transaction_id: String::new(),
+            batch_index: 0,
+            batch_count: 0,
+            topics_fingerprint: String::new(),
+            history_revision,
+        });
+    }
+    assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+
     let mut prepared_batches = Vec::with_capacity(pending_batches.len());
     let mut checkpoint_ids_by_session: HashMap<String, Vec<String>> = HashMap::new();
     for pending in &pending_batches {
         checkpoint_ids_by_session
             .entry(
-                extraction_sessions[pending.context_index]
-                    .session_id
-                    .clone(),
+                extraction_transaction_session_id(&extraction_sessions[pending.context_index])
+                    .to_string(),
             )
             .or_default()
             .push(pending.checkpoint_id.clone());
     }
     for pending in pending_batches {
         let session = &extraction_sessions[pending.context_index];
+        let transaction_session_id = extraction_transaction_session_id(session);
         let source_updated_at = source_updated_at_by_session
-            .get(&session.session_id)
+            .get(transaction_session_id)
             .expect("every pending Session has a source watermark");
         let checkpoint_path =
-            extraction_checkpoint_path(ctx, &session.session_id, &pending.checkpoint_id);
+            extraction_checkpoint_path(ctx, transaction_session_id, &pending.checkpoint_id);
         let extracted = match read_extraction_checkpoint(&checkpoint_path, &pending.checkpoint_id)
             .await?
         {
             Some(checkpoint) => {
                 if !checkpoint_matches_pending_batch(
                     &checkpoint,
-                    &session.session_id,
+                    transaction_session_id,
                     source_updated_at,
                     &pending,
                 ) {
@@ -2672,13 +2938,16 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                 checkpoint.extracted
             }
             None => {
-                let extracted =
+                let mut extracted =
                     extract_durable_candidate_batch(provider, model, pending.prompt.clone())
                         .await?;
+                if session.transaction_owner_session_id.is_some() {
+                    extracted.ledger.clear();
+                }
                 let checkpoint = ExtractionCheckpoint {
                     version: EXTRACTION_CHECKPOINT_VERSION,
                     batch_id: pending.checkpoint_id.clone(),
-                    session_key: extraction_checkpoint_session_key(&session.session_id),
+                    session_key: extraction_checkpoint_session_key(transaction_session_id),
                     source_updated_at: source_updated_at.clone(),
                     transaction_id: pending.transaction_id.clone(),
                     batch_index: pending.batch_index,
@@ -2699,7 +2968,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
                             })?;
                     if !checkpoint_matches_pending_batch(
                         &checkpoint,
-                        &session.session_id,
+                        transaction_session_id,
                         source_updated_at,
                         &pending,
                     ) {
@@ -2720,12 +2989,10 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // these exact candidates instead of asking the model to rephrase them.
     for batch in prepared_batches {
         let session = &extraction_sessions[batch.context_index];
-        let replacement_targets = session
-            .history_revision
-            .as_ref()
-            .and_then(|revision| history_plans.get(&(session.session_id.clone(), revision.clone())))
-            .map(|plan| plan.replacement_targets.iter().cloned().collect())
-            .unwrap_or_default();
+        let transaction_session_id = extraction_transaction_session_id(session);
+        let history_plan = session.history_revision.as_ref().and_then(|revision| {
+            history_plans.get(&(transaction_session_id.to_string(), revision.clone()))
+        });
         let writes = persist_durable_candidate_batch_with_project_resolver(
             ctx,
             memory,
@@ -2734,7 +3001,7 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             batch.extracted,
             project_resolver,
             current_store_is_project_scoped,
-            &replacement_targets,
+            history_plan,
         )
         .await?;
         total_writes.memory = total_writes.memory.saturating_add(writes.memory);
@@ -2751,18 +3018,18 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             .expect("every checkpointed Session has a source watermark");
         let history_revision = extraction_sessions
             .iter()
-            .filter(|session| session.session_id == session_id)
+            .filter(|session| extraction_transaction_session_id(session) == session_id)
             .find_map(|session| session.history_revision.as_deref());
         if let Some(revision) = history_revision {
             let plan = history_plans
                 .get(&(session_id.clone(), revision.to_string()))
                 .ok_or_else(|| format!("missing frozen history-rewrite plan for {session_id}"))?;
-            supersede_history_rewrite_targets(ctx, plan).await?;
+            supersede_history_rewrite_targets(ctx, ledger, plan).await?;
             write_history_rewrite_state(ctx, &session_id, revision, source_updated_at).await?;
         }
         if let Some(event_key) = extraction_sessions
             .iter()
-            .filter(|session| session.session_id.as_str() == session_id.as_str())
+            .filter(|session| extraction_transaction_session_id(session) == session_id)
             .find_map(|session| session.retrieval_source_key.as_deref())
         {
             write_retrieval_source_state(ctx, &session_id, event_key, source_updated_at).await?;
@@ -2896,7 +3163,7 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     extracted: ExtractedCandidateBatch,
     project_resolver: Option<&ProjectContextResolver>,
     current_store_is_project_scoped: bool,
-    replacement_targets: &HashSet<MemoryReplacementTarget>,
+    history_plan: Option<&HistoryRewritePlan>,
 ) -> Result<ExtractionWrites, String> {
     let ExtractedCandidateBatch {
         memory: candidates,
@@ -2914,6 +3181,39 @@ async fn persist_durable_candidate_batch_with_project_resolver(
     for session in sessions {
         session_project_keys.insert(session.session_id.clone(), session.project_key.clone());
     }
+    if let Some(plan) = history_plan {
+        for session_id in &plan.preservation_session_ids {
+            if session_project_keys.contains_key(session_id) {
+                continue;
+            }
+            let source_session = ctx
+                .storage
+                .load_session(session_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to reload mixed-lineage preservation Session '{session_id}': {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "mixed-lineage preservation Session '{session_id}' no longer exists"
+                    )
+                })?;
+            let project_key =
+                ProjectContextResolver::memory_read_identity_for_session(&source_session)
+                    .map(bamboo_domain::ProjectId::into_string);
+            session_project_keys.insert(session_id.clone(), project_key);
+        }
+    }
+    let replacement_targets = history_plan
+        .map(|plan| {
+            plan.replacement_targets
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
 
     let mut writes = 0usize;
     type ExtractionFingerprint = (DurableMemoryType, String, String, String);
@@ -3111,7 +3411,16 @@ async fn persist_durable_candidate_batch_with_project_resolver(
             .insert(fingerprint);
     }
 
-    let ledger_writes = persist_ledger_candidates(ledger, ledger_candidates).await?;
+    let ledger_replacement_targets = history_plan
+        .map(|plan| {
+            plan.ledger_replacement_targets
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let ledger_writes =
+        persist_ledger_candidates(ledger, ledger_candidates, &ledger_replacement_targets).await?;
 
     Ok(ExtractionWrites {
         memory: writes,
@@ -3147,6 +3456,7 @@ fn parse_candidate_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
 async fn persist_ledger_candidates(
     ledger: &LedgerStore,
     candidates: Vec<LedgerExtractionCandidate>,
+    replacement_targets: &HashSet<LedgerReplacementTarget>,
 ) -> Result<usize, String> {
     if candidates.is_empty() {
         return Ok(0);
@@ -3158,6 +3468,13 @@ async fn persist_ledger_candidates(
         .map_err(|error| format!("failed to list ledger records for dedup: {error}"))?;
     let mut seen_titles: HashSet<String> = existing
         .iter()
+        .filter(|document| {
+            !replacement_targets.contains(&LedgerReplacementTarget {
+                id: document.record.id.clone(),
+                scope: document.record.scope,
+                project_key: document.record.project_key.clone(),
+            })
+        })
         .map(|doc| normalized_ledger_title(&doc.record.title))
         .collect();
 
@@ -3882,6 +4199,39 @@ mod tests {
                 Ok(LLMChunk::Token(text)),
                 Ok(LLMChunk::Done),
             ])))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PathBlockingProvider {
+        inner: SequenceProvider,
+        blocker_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PathBlockingProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let stream = self
+                .inner
+                .chat_stream(messages, tools, max_output_tokens, model)
+                .await?;
+            tokio::fs::create_dir_all(
+                self.blocker_path
+                    .parent()
+                    .expect("test blocker path has a parent"),
+            )
+            .await
+            .expect("create test blocker parent");
+            tokio::fs::write(&self.blocker_path, b"blocks records directory")
+                .await
+                .expect("create test blocker");
+            Ok(stream)
         }
     }
 
@@ -5119,8 +5469,13 @@ mod tests {
             "source_exhausted": true
         })
         .to_string();
+        let ledger = LedgerStore::new(temp_dir.path());
+        let blocker_path = ledger.resolver().records_dir(LedgerScope::Global, None);
         let sequence_provider = Arc::new(SequenceProvider::new(vec![response]));
-        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let provider: Arc<dyn LLMProvider> = Arc::new(PathBlockingProvider {
+            inner: sequence_provider.as_ref().clone(),
+            blocker_path: blocker_path.clone(),
+        });
         let context = AutoDreamContext {
             session_store,
             storage,
@@ -5142,10 +5497,6 @@ mod tests {
             .as_deref()
             .is_some_and(|source| source.contains("The database is PostgreSQL.")));
 
-        let ledger = LedgerStore::new(temp_dir.path());
-        tokio::fs::write(temp_dir.path().join("ledger"), b"blocks ledger directory")
-            .await
-            .expect("create ledger failure fixture");
         extract_and_persist_durable_candidates(
             &context,
             &provider,
@@ -5181,7 +5532,7 @@ mod tests {
         assert!(!plan_json.contains("PostgreSQL"));
         assert!(!plan_json.contains("SQLite"));
 
-        tokio::fs::remove_file(temp_dir.path().join("ledger"))
+        tokio::fs::remove_file(&blocker_path)
             .await
             .expect("repair ledger fixture");
         extract_and_persist_durable_candidates(
@@ -5243,6 +5594,352 @@ mod tests {
                 .is_empty(),
             "the same history generation must be acknowledged exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_preserves_unaffected_sources_from_gardener_consolidation() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let old_watermark = Utc::now() - chrono::Duration::minutes(1);
+        let rewritten_at = old_watermark + chrono::Duration::seconds(10);
+
+        let mut database_session = Session::new("mixed-lineage-database", "model");
+        database_session.title = "Database choice".to_string();
+        database_session.messages.push(message_at(
+            Message::assistant("The database is PostgreSQL.", None),
+            "assistant-database",
+            old_watermark - chrono::Duration::seconds(5),
+        ));
+        database_session.updated_at = old_watermark;
+        storage
+            .save_session(&database_session)
+            .await
+            .expect("save database Session");
+
+        let mut region_session = Session::new("mixed-lineage-region", "model");
+        region_session.title = "Deployment region".to_string();
+        region_session.messages.push(message_at(
+            Message::assistant("The deployment region is eu-west-1.", None),
+            "assistant-region",
+            old_watermark - chrono::Duration::seconds(4),
+        ));
+        region_session.updated_at = old_watermark;
+        storage
+            .save_session(&region_session)
+            .await
+            .expect("save region Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let database_memory = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Database engine",
+                "The database is PostgreSQL.",
+                &["database".to_string()],
+                Some(&database_session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed database memory");
+        let region_memory = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Deployment region",
+                "The deployment region is eu-west-1.",
+                &["region".to_string()],
+                Some(&region_session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed region memory");
+        let consolidated = memory
+            .consolidate_memories(
+                &[
+                    database_memory.frontmatter.id.clone(),
+                    region_memory.frontmatter.id.clone(),
+                ],
+                None,
+                &bamboo_memory::memory_store::MemorySplitPiece {
+                    title: "Deployment database and region".to_string(),
+                    r#type: Some(DurableMemoryType::Project),
+                    content: "The database is PostgreSQL and the deployment region is eu-west-1."
+                        .to_string(),
+                    tags: vec!["database".to_string(), "region".to_string()],
+                },
+                Some("__memory_gardener__"),
+                "memory-dedup-gardener",
+            )
+            .await
+            .expect("consolidate memories")
+            .expect("consolidated memory");
+        memory
+            .mark_session_extracted(&database_session.id, &old_watermark.to_rfc3339())
+            .await
+            .expect("seed database watermark");
+        memory
+            .mark_session_extracted(&region_session.id, &old_watermark.to_rfc3339())
+            .await
+            .expect("seed region watermark");
+
+        database_session.messages[0].content = "The database is SQLite.".to_string();
+        database_session.messages[0].mark_content_updated_at(rewritten_at);
+        database_session.clear_derived_context_state();
+        database_session.updated_at = rewritten_at;
+        storage
+            .save_session(&database_session)
+            .await
+            .expect("save rewritten database Session");
+
+        let database_response = serde_json::json!({
+            "candidates": [{
+                "title": "Database engine",
+                "type": "project",
+                "scope": "global",
+                "content": "The database is SQLite.",
+                "tags": ["database"],
+                "session_id": "mixed-lineage-database"
+            }],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string();
+        let region_response = serde_json::json!({
+            "candidates": [{
+                "title": "Deployment region",
+                "type": "project",
+                "scope": "global",
+                "content": "The deployment region is eu-west-1.",
+                "tags": ["region"],
+                "session_id": "mixed-lineage-region"
+            }],
+            "ledger_candidates": [{
+                "title": "Must not escape preservation",
+                "kind": "todo",
+                "excerpt": "This provider output is intentionally invalid for preservation.",
+                "session_id": "mixed-lineage-region",
+                "confidence": "high"
+            }],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![
+            database_response,
+            region_response,
+        ]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = old_watermark - chrono::Duration::hours(1);
+        let contexts = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(contexts.len(), 1, "only the rewritten Session is eligible");
+        assert_eq!(contexts[0].session_id, database_session.id);
+
+        let ledger = LedgerStore::new(temp_dir.path());
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("rewrite and preservation transaction succeeds");
+        assert_eq!(writes.memory, 2);
+        assert_eq!(writes.ledger, 0);
+
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list reconciled memories");
+        let consolidated = documents
+            .iter()
+            .find(|document| document.frontmatter.id == consolidated.new_id)
+            .expect("consolidated record remains auditable");
+        assert_eq!(
+            consolidated.frontmatter.status,
+            DurableMemoryStatus::Superseded
+        );
+        let active_bodies = documents
+            .iter()
+            .filter(|document| document.frontmatter.status == DurableMemoryStatus::Active)
+            .map(|document| document.body.as_str())
+            .collect::<Vec<_>>();
+        assert!(active_bodies.contains(&"The database is SQLite."));
+        assert!(active_bodies.contains(&"The deployment region is eu-west-1."));
+        assert!(!active_bodies.iter().any(|body| body.contains("PostgreSQL")));
+
+        let region_state = memory
+            .read_session_state(&region_session.id)
+            .await
+            .expect("read unaffected Session state");
+        assert_eq!(
+            region_state.last_extracted_at.as_deref(),
+            Some(old_watermark.to_rfc3339().as_str()),
+            "preservation must not advance the unaffected Session watermark"
+        );
+        assert!(
+            ledger
+                .list_records(LedgerScope::Global, None, &RecordFilter::default())
+                .await
+                .expect("list preservation ledger records")
+                .is_empty(),
+            "preservation batches cannot create prospective work"
+        );
+        let prompts = sequence_provider.recorded_prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].contains("The database is SQLite."));
+        assert!(!prompts[0].contains("PostgreSQL"));
+        assert!(prompts[1].contains("unaffected source"));
+        assert!(prompts[1].contains("The deployment region is eu-west-1."));
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_replaces_suggested_ledger_records_from_the_old_transcript() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let old_watermark = Utc::now() - chrono::Duration::minutes(1);
+        let rewritten_at = old_watermark + chrono::Duration::seconds(10);
+        let mut session = Session::new("history-rewrite-ledger", "model");
+        session.title = "Report commitment".to_string();
+        session.messages.push(message_at(
+            Message::user("I will submit the report on Friday."),
+            "user-report",
+            old_watermark - chrono::Duration::seconds(5),
+        ));
+        session.updated_at = old_watermark;
+        storage.save_session(&session).await.expect("save Session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .mark_session_extracted(&session.id, &old_watermark.to_rfc3339())
+            .await
+            .expect("seed extraction watermark");
+        let ledger = LedgerStore::new(temp_dir.path());
+        let old_record_id = "rec_history_rewrite_old".to_string();
+        let mut old_record =
+            LedgerRecord::new(old_record_id.clone(), RecordKind::Todo, "Submit the report");
+        old_record.tags = vec!["suggested".to_string()];
+        old_record.source.created_by = RecordActor::Extractor;
+        old_record.source.session_id = Some(session.id.clone());
+        old_record.source.excerpt = Some("I will submit the report on Friday.".to_string());
+        ledger
+            .write_record(old_record, None)
+            .await
+            .expect("seed suggested ledger record");
+
+        session.messages[0].content = "I will submit the report on Monday.".to_string();
+        session.messages[0].mark_content_updated_at(rewritten_at);
+        session.clear_derived_context_state();
+        session.updated_at = rewritten_at;
+        storage
+            .save_session(&session)
+            .await
+            .expect("save rewritten Session");
+
+        let response = serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [{
+                "title": "Submit the report",
+                "kind": "todo",
+                "excerpt": "I will submit the report on Monday.",
+                "session_id": "history-rewrite-ledger",
+                "confidence": "high"
+            }],
+            "source_exhausted": true
+        })
+        .to_string();
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![response]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let since = old_watermark - chrono::Duration::hours(1);
+        let contexts = collect_candidate_session_contexts(&context, &memory, since).await;
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].session_id, session.id);
+
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("ledger rewrite transaction succeeds");
+        assert_eq!(writes.memory, 0);
+        assert_eq!(writes.ledger, 1);
+
+        let all_records = ledger
+            .list_records(
+                LedgerScope::Global,
+                None,
+                &RecordFilter {
+                    include_terminal: true,
+                    ..RecordFilter::default()
+                },
+            )
+            .await
+            .expect("list all ledger records");
+        assert_eq!(all_records.len(), 2);
+        let old_record = all_records
+            .iter()
+            .find(|document| document.record.id == old_record_id)
+            .expect("old record remains auditable");
+        assert_eq!(old_record.record.status, RecordStatus::Cancelled);
+        assert!(old_record.record.transitions.iter().any(|transition| {
+            transition.to_status == RecordStatus::Cancelled
+                && transition
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("canonical Session history rewrite"))
+        }));
+        let current_records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list current ledger records");
+        assert_eq!(current_records.len(), 1);
+        assert_ne!(current_records[0].record.id, old_record_id);
+        assert_eq!(current_records[0].record.title, "Submit the report");
+        assert_eq!(current_records[0].record.status, RecordStatus::Open);
+        assert_eq!(
+            current_records[0].record.source.excerpt.as_deref(),
+            Some("I will submit the report on Monday.")
+        );
+        assert_eq!(sequence_provider.recorded_prompts().len(), 1);
     }
 
     #[tokio::test]
@@ -6583,7 +7280,7 @@ mod tests {
             ),
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let writes = persist_ledger_candidates(&ledger, candidates, &HashSet::new())
             .await
             .expect("persist should succeed");
         assert_eq!(writes, 3);
@@ -6677,7 +7374,7 @@ mod tests {
             },
         ];
 
-        let writes = persist_ledger_candidates(&ledger, candidates)
+        let writes = persist_ledger_candidates(&ledger, candidates, &HashSet::new())
             .await
             .expect("persist should succeed");
         assert_eq!(
