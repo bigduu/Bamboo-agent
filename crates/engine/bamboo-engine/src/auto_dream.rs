@@ -1619,6 +1619,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn outline_keeps_ordinary_multi_item_task_list() {
+        let mut session = bamboo_agent_core::Session::new("session-safe-tasks", "model");
+        let items = (1..=3)
+            .map(|index| bamboo_domain::TaskItem {
+                id: format!("task-{index}"),
+                description: format!("Complete ordinary work item {index}"),
+                notes: format!("Verified ordinary progress {index}"),
+                ..bamboo_domain::TaskItem::default()
+            })
+            .collect();
+        let now = Utc::now();
+        session.task_list = Some(bamboo_domain::TaskList {
+            session_id: session.id.clone(),
+            title: "Safe task list".to_string(),
+            items,
+            created_at: now,
+            updated_at: now,
+        });
+
+        let outline = derive_sanitized_session_outline(&session).expect("safe task outline");
+        assert_ne!(outline, REDACTED_EXTRACTION_SOURCE);
+        assert!(outline.contains("Complete ordinary work item"));
+    }
+
     #[tokio::test]
     async fn dream_synthesis_sanitizes_index_and_rejects_secret_like_output() {
         const SECRET: &str = "API key: hunter2";

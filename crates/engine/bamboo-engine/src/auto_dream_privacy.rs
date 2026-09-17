@@ -805,7 +805,74 @@ pub(crate) fn sanitize_extraction_source(value: &str) -> String {
     }
 }
 
-const MAX_STRUCTURED_PRIVACY_FIELDS: usize = 16;
+const MAX_STRUCTURED_PRIVACY_LABEL_FIELDS: usize = 16;
+
+fn field_can_form_credential_label(value: &str) -> bool {
+    let mut token_count = 0usize;
+    for token in value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token_count += 1;
+        if token_count > 3 {
+            return false;
+        }
+        let token = token.to_ascii_lowercase();
+        if !matches!(
+            token.as_str(),
+            "2fa"
+                | "access"
+                | "account"
+                | "api"
+                | "auth"
+                | "authentication"
+                | "bank"
+                | "basic"
+                | "bearer"
+                | "card"
+                | "client"
+                | "code"
+                | "cookie"
+                | "credential"
+                | "device"
+                | "encryption"
+                | "http"
+                | "id"
+                | "key"
+                | "login"
+                | "mfa"
+                | "my"
+                | "number"
+                | "one"
+                | "otp"
+                | "our"
+                | "passcode"
+                | "passphrase"
+                | "passwd"
+                | "password"
+                | "payment"
+                | "pin"
+                | "private"
+                | "proxy"
+                | "recovery"
+                | "refresh"
+                | "secret"
+                | "security"
+                | "session"
+                | "shared"
+                | "signature"
+                | "signing"
+                | "time"
+                | "token"
+                | "unlock"
+                | "verification"
+                | "your"
+        ) {
+            return false;
+        }
+    }
+    token_count > 0
+}
 
 fn fields_form_credential_label(fields: &[&str]) -> bool {
     let label = fields.join(" ");
@@ -819,11 +886,21 @@ fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
 }
 
 fn structured_sources_contain_secret(sources: &[&str]) -> bool {
-    if sources.len() > MAX_STRUCTURED_PRIVACY_FIELDS {
+    let label_fields = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| {
+            field_can_form_credential_label(source).then_some((index, *source))
+        })
+        .collect::<Vec<_>>();
+    // Bound only the fields that can participate in a reconstructed label.
+    // Ordinary large TaskLists can contain many prompt-bearing strings without
+    // making this combinatorial check unbounded.
+    if label_fields.len() > MAX_STRUCTURED_PRIVACY_LABEL_FIELDS {
         return true;
     }
-    for (first_index, first) in sources.iter().enumerate() {
-        for (second_index, second) in sources.iter().enumerate() {
+    for &(first_index, first) in &label_fields {
+        for &(second_index, second) in &label_fields {
             if second_index == first_index {
                 continue;
             }
@@ -838,7 +915,7 @@ fn structured_sources_contain_secret(sources: &[&str]) -> bool {
                     }
                 }
             }
-            for (third_index, third) in sources.iter().enumerate() {
+            for &(third_index, third) in &label_fields {
                 if third_index == first_index || third_index == second_index {
                     continue;
                 }
@@ -863,11 +940,9 @@ fn structured_sources_contain_secret(sources: &[&str]) -> bool {
 /// Return false when complete structured fields form a credential. Besides
 /// individual fields and ordered pairs, reconstruct two- and three-field
 /// credential labels before testing every remaining field as the value. The
-/// hard field cap keeps this conservative check bounded and fails closed.
+/// hard label-fragment cap keeps this conservative check bounded without
+/// rejecting ordinary records merely because they contain many fields.
 pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
-    if sources.len() > MAX_STRUCTURED_PRIVACY_FIELDS {
-        return false;
-    }
     // A technical hash label exempts a token only when both occur in the same
     // field. Candidate-wide exemptions let an unrelated tag such as `commit`
     // launder an opaque credential stored in another field.
@@ -1234,14 +1309,19 @@ mod tests {
             extraction_sources_are_secret_safe(&["API", "design", "approved"]),
             "ordinary structured fields must remain compatible"
         );
-        let oversized = (0..=MAX_STRUCTURED_PRIVACY_FIELDS)
+        let oversized = (0..=MAX_STRUCTURED_PRIVACY_LABEL_FIELDS)
             .map(|index| format!("ordinary-field-{index}"))
             .collect::<Vec<_>>();
         assert!(
-            !extraction_sources_are_secret_safe(
+            extraction_sources_are_secret_safe(
                 &oversized.iter().map(String::as_str).collect::<Vec<_>>()
             ),
-            "oversized structured inputs must fail closed"
+            "ordinary records must not fail solely because they contain many fields"
+        );
+        let suspicious = vec!["api"; MAX_STRUCTURED_PRIVACY_LABEL_FIELDS + 1];
+        assert!(
+            !extraction_sources_are_secret_safe(&suspicious),
+            "too many credential-label fragments must fail closed"
         );
 
         let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");

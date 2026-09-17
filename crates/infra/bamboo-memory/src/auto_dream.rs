@@ -26,13 +26,13 @@ pub enum DreamGenerationMode {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DurableExtractionEnvelope {
+struct RawDurableExtractionEnvelope {
     #[serde(default)]
-    pub candidates: Vec<DurableExtractionCandidate>,
+    candidates: Vec<serde_json::Value>,
     #[serde(default)]
-    pub ledger_candidates: Vec<LedgerExtractionCandidate>,
-    #[serde(default)]
-    pub source_exhausted: Option<bool>,
+    ledger_candidates: Vec<serde_json::Value>,
+    #[serde(default, rename = "source_exhausted")]
+    _source_exhausted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,8 +54,8 @@ pub struct DurableExtractionCandidate {
 
 /// A ledger record candidate (commitment/deadline/appointment the USER stated)
 /// proposed by the same extraction pass that produces durable memory
-/// candidates — no extra LLM call. Every field is defaulted so a partially
-/// malformed item degrades instead of failing the envelope parse.
+/// candidates — no extra LLM call. Missing fields are defaulted; a malformed
+/// typed item degrades the Ledger array without invalidating Memory candidates.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LedgerExtractionCandidate {
@@ -92,9 +92,10 @@ pub fn strip_json_fence(raw: &str) -> &str {
 
 pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCandidate>, String> {
     let payload = strip_json_fence(raw);
-    let parsed: DurableExtractionEnvelope = serde_json::from_str(payload)
+    let parsed: RawDurableExtractionEnvelope = serde_json::from_str(payload)
         .map_err(|error| format!("failed to parse durable extraction candidates: {error}"))?;
-    Ok(parsed.candidates)
+    serde_json::from_value(serde_json::Value::Array(parsed.candidates))
+        .map_err(|error| format!("failed to parse durable extraction candidates: {error}"))
 }
 
 /// Parse the ledger-candidate array out of the extraction response.
@@ -104,8 +105,11 @@ pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCan
 /// JSON) yields an empty vec — never an error that kills the auto-dream pass.
 pub fn parse_ledger_candidates(raw: &str) -> Vec<LedgerExtractionCandidate> {
     let payload = strip_json_fence(raw);
-    serde_json::from_str::<DurableExtractionEnvelope>(payload)
-        .map(|envelope| envelope.ledger_candidates)
+    serde_json::from_str::<RawDurableExtractionEnvelope>(payload)
+        .ok()
+        .and_then(|envelope| {
+            serde_json::from_value(serde_json::Value::Array(envelope.ledger_candidates)).ok()
+        })
         .unwrap_or_default()
 }
 
@@ -714,6 +718,19 @@ mod tests {
         assert!(
             parse_extraction_candidates(input).is_err(),
             "unknown envelope fields must not disappear before candidate validation"
+        );
+    }
+
+    #[test]
+    fn parse_extraction_candidates_ignores_malformed_ledger_items() {
+        let input = r#"{"candidates":[{"title":"T","type":"user","content":"C"}],"ledger_candidates":[{"title":"Broken deadline","kind":"todo","due_at":42}]}"#;
+        let candidates = parse_extraction_candidates(input)
+            .expect("a malformed Ledger item must not invalidate Memory candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "T");
+        assert!(
+            parse_ledger_candidates(input).is_empty(),
+            "the malformed Ledger array must still degrade to empty"
         );
     }
 
