@@ -62,6 +62,16 @@ fn cli_credential_flag_pattern() -> &'static Regex {
     })
 }
 
+fn netrc_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|\s)(?:machine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|machine\s+[^\s]+\s+password\s+[^\s]+(?:\s+login\s+[^\s]+)?|default\s+login\s+[^\s]+\s+password\s+[^\s]+|default\s+password\s+[^\s]+)"#,
+        )
+        .expect("netrc credential regex must compile")
+    })
+}
+
 fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -289,6 +299,7 @@ pub(crate) fn contains_secret_like_value(value: &str) -> bool {
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
+        || netrc_credential_pattern().is_match(value)
         || contains_environment_credential_assignment(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
@@ -379,6 +390,10 @@ mod tests {
             ("bearer bonds", "We trade bearer bonds"),
             ("credential file flag", "deploy --password-file secrets.txt"),
             ("token budget flag", "runner --token-budget 1000"),
+            (
+                "machine login prose",
+                "machine learning login flows enforce password policy",
+            ),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -420,6 +435,14 @@ mod tests {
             ("CLI password", "deploy --password hunter2"),
             ("CLI API key", "deploy --api-key hunter2"),
             ("CLI client secret", "deploy --client-secret=hunter2"),
+            (
+                "netrc machine record",
+                "machine example.test login alice password hunter2",
+            ),
+            (
+                "netrc default record",
+                "default login alice password hunter2",
+            ),
             (
                 "connection-string key",
                 "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
