@@ -72,6 +72,62 @@ fn netrc_credential_pattern() -> &'static Regex {
     })
 }
 
+fn parse_pgpass_fields(line: &str) -> Option<Vec<String>> {
+    if line.chars().count() > 4_096 {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(5);
+    let mut field = String::new();
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            field.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ':' {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(character);
+        }
+    }
+    if escaped {
+        return None;
+    }
+    fields.push(field);
+    (fields.len() == 5).then_some(fields)
+}
+
+fn contains_pgpass_record(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let Some(fields) = parse_pgpass_fields(line) else {
+            return false;
+        };
+        let [host, port, database, user, password] = fields.as_slice() else {
+            return false;
+        };
+        let host_is_bounded_pg_target = host == "*"
+            || host.eq_ignore_ascii_case("localhost")
+            || host.contains('.')
+            || host.contains(':')
+            || host.contains('/');
+        let port_is_valid = port == "*"
+            || (port.len() <= 5
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port > 0));
+        host_is_bounded_pg_target
+            && port_is_valid
+            && [database, user, password]
+                .iter()
+                .all(|field| !field.is_empty() && !field.chars().any(char::is_whitespace))
+    })
+}
+
 fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -300,6 +356,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || standalone_pin_credential_pattern().is_match(value)
         || cli_credential_flag_pattern().is_match(value)
         || netrc_credential_pattern().is_match(value)
+        || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
@@ -419,6 +476,8 @@ mod tests {
                 "machine login prose",
                 "machine learning login flows enforce password policy",
             ),
+            ("colon-separated timestamp", "2026:09:17:20:53"),
+            ("colon-separated code fields", "crate:123:module:item:value"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -470,6 +529,14 @@ mod tests {
             (
                 "netrc default record",
                 "default login alice password hunter2",
+            ),
+            (
+                "PostgreSQL password-file record",
+                "db.example.test:5432:app:alice:hunter2",
+            ),
+            (
+                "PostgreSQL password-file escaped password",
+                "localhost:5432:app:alice:hun\\:ter2",
             ),
             (
                 "connection-string key",

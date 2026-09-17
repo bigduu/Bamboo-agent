@@ -194,7 +194,11 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
 }
 
 fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
-    let mut sources = vec![session.entry.title.as_str()];
+    let updated_at = session.entry.updated_at.to_rfc3339();
+    let mut sources = vec![session.session_id.as_str(), session.entry.title.as_str()];
+    if let Some(project_key) = session.project_key.as_deref() {
+        sources.push(project_key);
+    }
     if let Some(summary) = session.summary.as_deref() {
         sources.push(summary);
     }
@@ -204,10 +208,13 @@ fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> Dre
     }
     if !extraction_sources_are_secret_safe(&sources) {
         return DreamCandidateInfo {
-            session_id: session.session_id.clone(),
+            // Do not copy any untrusted identifier from the rejected source
+            // unit into the prompt. Candidates that quote this alias are also
+            // rejected later because it is not an authoritative source ID.
+            session_id: "redacted-session".to_string(),
             title: REDACTED_EXTRACTION_SOURCE.to_string(),
-            project_key: session.project_key.clone(),
-            updated_at: session.entry.updated_at.to_rfc3339(),
+            project_key: None,
+            updated_at,
             summary: None,
             topics: Vec::new(),
         };
@@ -225,7 +232,7 @@ fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> Dre
         session_id: session.session_id.clone(),
         title,
         project_key: session.project_key.clone(),
-        updated_at: session.entry.updated_at.to_rfc3339(),
+        updated_at,
         summary,
         topics,
     }
@@ -1635,6 +1642,16 @@ mod tests {
             .await
             .expect("save split-field session");
 
+        let mut identifier_split = bamboo_agent_core::Session::new(TOPIC_SECRET, "model");
+        identifier_split.title = SPLIT_LABEL.to_string();
+        identifier_split.add_message(Message::user(
+            "Ordinary activity for the identifier-split fixture.",
+        ));
+        storage
+            .save_session(&identifier_split)
+            .await
+            .expect("save identifier-split session");
+
         let mut outlined = bamboo_agent_core::Session::new("session-outline-private", "model");
         outlined.title = "Ordinary outline title".to_string();
         outlined.add_message(Message::user("Keep the final response concise."));
@@ -1724,7 +1741,7 @@ mod tests {
             Utc::now() - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts.len(), 4);
         let split_context = contexts
             .iter()
             .find(|context| context.session_id == "session-split-private")
@@ -1733,6 +1750,17 @@ mod tests {
         assert_eq!(sanitized_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_split.summary.is_none());
         assert!(sanitized_split.topics.is_empty());
+        let identifier_split_context = contexts
+            .iter()
+            .find(|context| context.session_id == TOPIC_SECRET)
+            .expect("identifier-split context");
+        let sanitized_identifier_split =
+            sanitized_extraction_candidate_info(identifier_split_context);
+        assert_eq!(sanitized_identifier_split.session_id, "redacted-session");
+        assert_eq!(sanitized_identifier_split.title, REDACTED_EXTRACTION_SOURCE);
+        assert!(sanitized_identifier_split.project_key.is_none());
+        assert!(sanitized_identifier_split.summary.is_none());
+        assert!(sanitized_identifier_split.topics.is_empty());
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
             &context,
