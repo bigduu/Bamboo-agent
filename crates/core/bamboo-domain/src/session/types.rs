@@ -1125,10 +1125,12 @@ impl Session {
             && state.transcript_item_sha256.is_empty()
             && state.last_reset_reason.is_some();
         if reset_is_pending {
-            if state.last_reset_reason != Some(reason) {
-                state.last_reset_reason = Some(reason);
-                state.advance_state_revision();
-            }
+            // Keep the provider-visible epoch coalesced until dispatch, while
+            // advancing the existing ordering fence for every distinct history
+            // mutation. Background consumers can therefore distinguish two
+            // same-reason delete/truncate/restore operations.
+            state.last_reset_reason = Some(reason);
+            state.advance_state_revision();
         } else {
             state.reset_epoch(reason);
         }

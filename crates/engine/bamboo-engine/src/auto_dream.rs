@@ -156,7 +156,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp)|secret_key_base))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -281,9 +281,27 @@ fn session_extraction_sources(
             .map(Some)
             .collect();
     }
+    let has_retrieval_boundary = session
+        .compression_events
+        .iter()
+        .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+    let mut retrieval_sources = if has_retrieval_boundary {
+        build_retrieval_window_extraction_batches(
+            session,
+            extraction_watermark,
+            retrieval_source_acknowledged,
+        )
+    } else {
+        Vec::new()
+    };
     if let Some(summary) = session.conversation_summary.as_ref() {
         let summary = sanitize_extraction_source(&summary.content);
-        let mut sources = vec![Some(summary.clone())];
+        // A configured summary fallback is a useful additional source, but it
+        // cannot replace the pending retrieval delta: summary compression only
+        // sees active messages, so archived turns would otherwise be lost when
+        // the shared extraction watermark advances.
+        let mut sources = retrieval_sources.drain(..).map(Some).collect::<Vec<_>>();
+        sources.push(Some(summary.clone()));
         sources.extend(
             build_message_revision_extraction_batches(
                 session,
@@ -295,20 +313,11 @@ fn session_extraction_sources(
         );
         return sources;
     }
-    if session
-        .compression_events
-        .iter()
-        .any(|event| event.kind == CompressionEventKind::RetrievalWindow)
-    {
-        let batches = build_retrieval_window_extraction_batches(
-            session,
-            extraction_watermark,
-            retrieval_source_acknowledged,
-        );
-        return if batches.is_empty() {
+    if has_retrieval_boundary {
+        return if retrieval_sources.is_empty() {
             vec![None]
         } else {
-            batches.into_iter().map(Some).collect()
+            retrieval_sources.into_iter().map(Some).collect()
         };
     }
     let outline =
@@ -916,11 +925,10 @@ async fn collect_candidate_session_contexts_from_sessions(
                 continue;
             }
         };
-        let is_retrieval_window = session.conversation_summary.is_none()
-            && session
-                .compression_events
-                .iter()
-                .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+        let is_retrieval_window = session
+            .compression_events
+            .iter()
+            .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
         let retrieval_source_key = is_retrieval_window.then(|| retrieval_source_key(&session.id));
         let retrieval_source_acknowledged = if is_retrieval_window {
             match retrieval_source_is_acknowledged(ctx, &session, extraction_watermark).await {
@@ -1385,6 +1393,11 @@ fn history_rewrite_revision(
     if let Some(state) = explicit_boundary {
         digest.update(b"\0model-context\0");
         digest.update(state.prefix_epoch.to_be_bytes());
+        // Multiple delete/truncate/restore steps intentionally share one
+        // pending prefix epoch, but each call still advances the existing
+        // state revision. Include that independent revision so AutoDream can
+        // acknowledge every mutation without adding a second Session cursor.
+        digest.update(state.state_revision.to_be_bytes());
     }
     for (message, updated_at) in revised_messages {
         digest.update(b"\0message\0");
@@ -2146,11 +2159,10 @@ async fn rebuild_session_contexts_after_checkpoint_replay(
                 template.session_id
             )
         })?;
-    let is_retrieval_window = session.conversation_summary.is_none()
-        && session
-            .compression_events
-            .iter()
-            .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
+    let is_retrieval_window = session
+        .compression_events
+        .iter()
+        .any(|event| event.kind == CompressionEventKind::RetrievalWindow);
     let retrieval_source_key = is_retrieval_window.then(|| retrieval_source_key(&session.id));
     let retrieval_source_acknowledged = if is_retrieval_window {
         retrieval_source_is_acknowledged(ctx, &session, Some(acknowledged_watermark)).await?
@@ -4143,6 +4155,7 @@ mod tests {
             ("lowercase prefixed token assignment", "github_token=abc"),
             ("secret key assignment", "STRIPE_SECRET_KEY=abc"),
             ("secret key base assignment", "SECRET_KEY_BASE=abc"),
+            ("PostgreSQL password assignment", "PGPASSWORD=abc"),
             ("lowercase secret key assignment", "stripe_secret_key=abc"),
             ("key id assignment", "AWS_ACCESS_KEY_ID=abc"),
             (
@@ -4217,6 +4230,7 @@ mod tests {
             ("github_token", "abc"),
             ("STRIPE_SECRET_KEY", "abc"),
             ("SECRET_KEY_BASE", "abc"),
+            ("PGPASSWORD", "abc"),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
@@ -4550,8 +4564,8 @@ mod tests {
     }
 
     #[test]
-    fn extraction_source_preserves_summary_first_and_ordinary_outline_fallback() {
-        let mut summary_session = Session::new("summary-first", "model");
+    fn extraction_source_preserves_retrieval_delta_before_summary_fallback() {
+        let mut summary_session = Session::new("retrieval-before-summary", "model");
         summary_session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
             "EXACT_SUMMARY_SOURCE",
             1,
@@ -4563,10 +4577,13 @@ mod tests {
         summary_session
             .messages
             .push(Message::user("retrieval content must not override summary"));
-        assert_eq!(
-            session_extraction_sources(&summary_session, None, false, None),
-            vec![Some("EXACT_SUMMARY_SOURCE".to_string())]
-        );
+        let sources = session_extraction_sources(&summary_session, None, false, None);
+        assert_eq!(sources.len(), 2);
+        assert!(sources[0]
+            .as_deref()
+            .expect("retrieval delta")
+            .contains("retrieval content must not override summary"));
+        assert_eq!(sources[1].as_deref(), Some("EXACT_SUMMARY_SOURCE"));
 
         let mut ordinary = Session::new("ordinary-outline", "model");
         ordinary
@@ -4577,6 +4594,45 @@ mod tests {
         let source = sources[0].as_deref().expect("outline");
         assert!(source.contains("ORDINARY_RECENT_OUTLINE"));
         assert!(!source.contains("Retrieval-window extraction delta"));
+    }
+
+    #[test]
+    fn coalesced_history_rewrites_have_distinct_extraction_revisions() {
+        let mut session = Session::new("coalesced-history-rewrites", "model");
+        session.messages.push(Message::user("first retained fact"));
+        session
+            .messages
+            .push(Message::assistant("first removed fact", None));
+        session.messages.pop();
+        session.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+        let first = history_rewrite_revision(&session, None).expect("first rewrite revision");
+        let first_state_revision = session
+            .model_context_state
+            .as_ref()
+            .expect("model context state")
+            .state_revision;
+
+        session.messages.clear();
+        session.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+        let second = history_rewrite_revision(&session, None).expect("second rewrite revision");
+        let second_state = session
+            .model_context_state
+            .as_ref()
+            .expect("model context state");
+
+        assert_eq!(
+            second_state.prefix_epoch, 1,
+            "pending epoch stays coalesced"
+        );
+        assert_eq!(second_state.state_revision, first_state_revision + 1);
+        assert_ne!(
+            second, first,
+            "each mutation needs a distinct acknowledgement"
+        );
     }
 
     #[tokio::test]
@@ -4596,6 +4652,11 @@ mod tests {
         session.compression_events.push(retrieval_event(
             "event-new",
             now - chrono::Duration::seconds(10),
+        ));
+        session.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            "FALLBACK_SUMMARY_ACTIVE_ONLY",
+            1,
+            10,
         ));
         let mut archived = message_at(
             Message::user("ARCHIVED_AFTER_WATERMARK_EVENT"),
@@ -4685,16 +4746,21 @@ mod tests {
             now - chrono::Duration::hours(24),
         )
         .await;
-        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts.len(), 3);
         let source = contexts[0].summary.as_deref().expect("retrieval source");
         assert!(source.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
         assert!(source.contains("session_note"));
         assert!(!source.contains("/must/not/reach/extraction"));
         assert!(source.contains("ACTIVE_BEFORE_WATERMARK"));
         assert!(contexts[0].topics.is_empty());
-        assert!(contexts[1].summary.is_none());
         assert_eq!(
-            contexts[1].topics,
+            contexts[1].summary.as_deref(),
+            Some("FALLBACK_SUMMARY_ACTIVE_ONLY")
+        );
+        assert!(contexts[1].topics.is_empty());
+        assert!(contexts[2].summary.is_none());
+        assert_eq!(
+            contexts[2].topics,
             vec![
                 (
                     "continuity".to_string(),
@@ -4708,7 +4774,7 @@ mod tests {
         );
 
         let source_prompt = extraction_prompt(&contexts[0]);
-        let topic_prompt = extraction_prompt(&contexts[1]);
+        let topic_prompt = extraction_prompt(&contexts[2]);
         assert!(source_prompt.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
         assert!(!source_prompt.contains("SESSION_TOPIC_REMAINS_SEPARATE"));
         assert!(topic_prompt.contains("SESSION_NOTE_AFTER_WATERMARK"));

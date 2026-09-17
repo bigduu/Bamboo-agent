@@ -356,10 +356,11 @@ mod tests {
 
         session.reset_model_context_epoch(ModelContextResetReason::Compression);
         session.reset_model_context_epoch(ModelContextResetReason::Rollback);
+        session.reset_model_context_epoch(ModelContextResetReason::Rollback);
 
         let state = session.model_context_state.as_ref().unwrap();
         assert_eq!(state.prefix_epoch, 5);
-        assert_eq!(state.state_revision, 2);
+        assert_eq!(state.state_revision, 3);
         assert_eq!(
             state.last_reset_reason,
             Some(ModelContextResetReason::Rollback)
