@@ -490,6 +490,45 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
         || ambiguous_environment_credential_assignment_pattern().is_match(value)
 }
 
+fn structured_environment_literal_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:-[ \t]*)?name[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*\r?\n[ \t]+value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})$"#,
+        )
+        .expect("structured environment literal regex must compile")
+    })
+}
+
+fn contains_structured_environment_credential(value: &str) -> bool {
+    structured_environment_literal_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(name) = captures.name("name") else {
+                return false;
+            };
+            if !contains_environment_credential_assignment(&format!(
+                "{}=bamboo-privacy-probe",
+                name.as_str()
+            )) {
+                return false;
+            }
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            let candidate = candidate
+                .as_str()
+                .trim()
+                .trim_matches(|character| matches!(character, '\"' | '\''))
+                .trim();
+            !candidate.is_empty()
+                && !candidate.starts_with('$')
+                && !candidate.starts_with('<')
+                && !candidate.starts_with("{{")
+                && !candidate.starts_with('%')
+        })
+}
+
 fn docker_auth_config_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -769,6 +808,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_xml_credential(value)
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
+        || contains_structured_environment_credential(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
         || contains_authorization_secret(value)
@@ -945,22 +985,26 @@ fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
         || contains_secret_like_value(&format!("{label} {value}"))
 }
 
-fn structured_sources_contain_secret(sources: &[&str]) -> bool {
-    let label_fields = sources
-        .iter()
-        .enumerate()
-        .filter_map(|(index, source)| {
-            field_can_form_credential_label(source).then_some((index, *source))
-        })
-        .collect::<Vec<_>>();
+fn structured_label_fields<'a>(sources: &[&'a str]) -> Option<Vec<(usize, &'a str)>> {
+    let mut label_fields = Vec::new();
+    for (index, source) in sources.iter().copied().enumerate() {
+        if !field_can_form_credential_label(source) && !fields_form_credential_label(&[source]) {
+            continue;
+        }
+        label_fields.push((index, source));
+        if label_fields.len() > MAX_STRUCTURED_PRIVACY_LABEL_FIELDS {
+            return None;
+        }
+    }
+    Some(label_fields)
+}
+
+fn structured_sources_contain_secret(sources: &[&str], label_fields: &[(usize, &str)]) -> bool {
     // Bound only the fields that can participate in a reconstructed label.
     // Ordinary large TaskLists can contain many prompt-bearing strings without
     // making this combinatorial check unbounded.
-    if label_fields.len() > MAX_STRUCTURED_PRIVACY_LABEL_FIELDS {
-        return true;
-    }
-    for &(first_index, first) in &label_fields {
-        for &(second_index, second) in &label_fields {
+    for &(first_index, first) in label_fields {
+        for &(second_index, second) in label_fields {
             if second_index == first_index {
                 continue;
             }
@@ -975,7 +1019,7 @@ fn structured_sources_contain_secret(sources: &[&str]) -> bool {
                     }
                 }
             }
-            for &(third_index, third) in &label_fields {
+            for &(third_index, third) in label_fields {
                 if third_index == first_index || third_index == second_index {
                     continue;
                 }
@@ -1013,21 +1057,17 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
         return false;
     }
 
-    let pairs_are_safe = sources.iter().enumerate().all(|(left_index, left)| {
-        sources
-            .iter()
-            .enumerate()
-            .filter(|(right_index, _)| *right_index != left_index)
-            .all(|(_, right)| {
-                if fields_form_credential_label(&[left]) {
-                    !labelled_value_contains_secret(left, right)
-                } else {
-                    let pair = format!("{left}: {right}");
-                    !contains_secret_like_value(&pair)
-                }
-            })
-    });
-    pairs_are_safe && !structured_sources_contain_secret(sources)
+    let Some(label_fields) = structured_label_fields(sources) else {
+        return false;
+    };
+    for &(label_index, label) in &label_fields {
+        if sources.iter().enumerate().any(|(value_index, value)| {
+            value_index != label_index && labelled_value_contains_secret(label, value)
+        }) {
+            return false;
+        }
+    }
+    !structured_sources_contain_secret(sources, &label_fields)
 }
 
 /// Sanitize a label/content pair together so a split credential such as
@@ -1147,6 +1187,18 @@ mod tests {
             ),
             ("ordinary pass field", "pass: true"),
             ("password placeholder field", "Pwd=${DB_PASSWORD}"),
+            (
+                "Kubernetes secretKeyRef",
+                "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password",
+            ),
+            (
+                "Kubernetes environment placeholder",
+                "- name: DB_PASSWORD\n  value: ${DB_PASSWORD}",
+            ),
+            (
+                "empty Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: \"\"",
+            ),
             ("commented Redis password", "# requirepass hunter2"),
             ("empty Redis password", "requirepass \"\""),
             (
@@ -1303,6 +1355,14 @@ mod tests {
                 "Server=db;Uid=alice;Pwd=hunter2",
             ),
             ("unquoted Pwd config field", "Pwd=hunter2"),
+            (
+                "Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: hunter2",
+            ),
+            (
+                "quoted Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: \"hunter2\"",
+            ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
             (
@@ -1404,7 +1464,7 @@ mod tests {
             extraction_sources_are_secret_safe(&["API", "key", "required for staging"]),
             "a reconstructed label must retain the state-predicate exemption"
         );
-        let oversized = (0..=MAX_STRUCTURED_PRIVACY_LABEL_FIELDS)
+        let mut oversized = (0..512)
             .map(|index| format!("ordinary-field-{index}"))
             .collect::<Vec<_>>();
         assert!(
@@ -1412,6 +1472,13 @@ mod tests {
                 &oversized.iter().map(String::as_str).collect::<Vec<_>>()
             ),
             "ordinary records must not fail solely because they contain many fields"
+        );
+        oversized.extend(["Password".to_string(), "hunter2".to_string()]);
+        assert!(
+            !extraction_sources_are_secret_safe(
+                &oversized.iter().map(String::as_str).collect::<Vec<_>>()
+            ),
+            "bounded label scans must still inspect values across a large record"
         );
         let suspicious = vec!["api"; MAX_STRUCTURED_PRIVACY_LABEL_FIELDS + 1];
         assert!(
