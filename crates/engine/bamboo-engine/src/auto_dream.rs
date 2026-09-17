@@ -28,8 +28,9 @@ use bamboo_memory::memory_store::{
 use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
 use crate::auto_dream_privacy::{
-    durable_candidate_is_secret_safe, ledger_candidate_is_secret_safe, sanitize_extraction_source,
-    sanitize_extraction_source_pair,
+    durable_candidate_is_secret_safe, extraction_sources_are_secret_safe,
+    ledger_candidate_is_secret_safe, sanitize_extraction_source, sanitize_extraction_source_pair,
+    REDACTED_EXTRACTION_SOURCE,
 };
 use crate::project_context::ProjectContextResolver;
 
@@ -123,7 +124,42 @@ struct DreamSourceWindow {
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 }
 
+fn collect_json_string_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(value) => out.push(value),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_string_values(value, out);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_string_values(value, out);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn task_list_is_secret_safe(task_list: &bamboo_domain::TaskList) -> bool {
+    let Ok(serialized) = serde_json::to_value(task_list) else {
+        return false;
+    };
+    let mut sources = Vec::new();
+    collect_json_string_values(&serialized, &mut sources);
+    extraction_sources_are_secret_safe(&sources)
+}
+
 fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Option<String> {
+    // Inspect every complete task-list field, including ordered field pairs,
+    // before TaskList::format_for_prompt truncates them. If the serialized
+    // shape ever becomes unreadable, fail closed rather than send task data.
+    if session.task_list.as_ref().is_some_and(|task_list| {
+        !task_list.items.is_empty() && !task_list_is_secret_safe(task_list)
+    }) {
+        return Some(REDACTED_EXTRACTION_SOURCE.to_string());
+    }
+
     // Sanitize complete message bodies before the outline helper truncates
     // them. Otherwise a credential crossing the 300-character boundary could
     // leave an undetected prefix in the provider prompt.
@@ -1391,6 +1427,58 @@ mod tests {
         assert!(
             !outline.contains(SECRET_PREFIX),
             "a credential prefix crossed the outline truncation boundary"
+        );
+    }
+
+    #[test]
+    fn outline_sanitizes_task_fields_before_prompt_truncation() {
+        const SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
+        let secret = "mF9/Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je";
+        let mut session = bamboo_agent_core::Session::new("session-task-boundary", "model");
+        let mut item = bamboo_domain::TaskItem {
+            id: "task-1".to_string(),
+            description: "Safe task description".to_string(),
+            ..bamboo_domain::TaskItem::default()
+        };
+        item.notes = format!("{}{}", "ordinary ".repeat(16), secret);
+        let now = Utc::now();
+        session.task_list = Some(bamboo_domain::TaskList {
+            session_id: session.id.clone(),
+            title: "Safe task list".to_string(),
+            items: vec![item],
+            created_at: now,
+            updated_at: now,
+        });
+
+        let outline = derive_sanitized_session_outline(&session).expect("sanitized outline");
+        assert_eq!(outline, REDACTED_EXTRACTION_SOURCE);
+        assert!(
+            !outline.contains(SECRET_PREFIX),
+            "a credential prefix crossed the task-list truncation boundary"
+        );
+    }
+
+    #[test]
+    fn outline_rejects_credentials_split_across_task_fields() {
+        let mut session = bamboo_agent_core::Session::new("session-task-split", "model");
+        let item = bamboo_domain::TaskItem {
+            id: "task-1".to_string(),
+            description: "Password".to_string(),
+            notes: "hunter2".to_string(),
+            ..bamboo_domain::TaskItem::default()
+        };
+        let now = Utc::now();
+        session.task_list = Some(bamboo_domain::TaskList {
+            session_id: session.id.clone(),
+            title: "Safe task list".to_string(),
+            items: vec![item],
+            created_at: now,
+            updated_at: now,
+        });
+
+        assert_eq!(
+            derive_sanitized_session_outline(&session).as_deref(),
+            Some(REDACTED_EXTRACTION_SOURCE)
         );
     }
 

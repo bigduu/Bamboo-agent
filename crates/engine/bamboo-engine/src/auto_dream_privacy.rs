@@ -294,14 +294,30 @@ pub(crate) fn sanitize_extraction_source(value: &str) -> String {
     }
 }
 
+/// Return false when any complete source, or any ordered pair of sources,
+/// forms a credential. Checking both orders is important because model output
+/// and task metadata do not guarantee that the label precedes the value.
+pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
+    if sources
+        .iter()
+        .any(|source| contains_secret_like_value(source))
+    {
+        return false;
+    }
+
+    sources.iter().enumerate().all(|(left_index, left)| {
+        sources
+            .iter()
+            .enumerate()
+            .filter(|(right_index, _)| *right_index != left_index)
+            .all(|(_, right)| !contains_secret_like_value(&format!("{left}: {right}")))
+    })
+}
+
 /// Sanitize a label/content pair together so a split credential such as
 /// `Password` + `hunter2` cannot bypass field-local checks.
 pub(crate) fn sanitize_extraction_source_pair(label: &str, content: &str) -> (String, String) {
-    let combined = format!("{label}: {content}");
-    if contains_secret_like_value(label)
-        || contains_secret_like_value(content)
-        || contains_secret_like_value(&combined)
-    {
+    if !extraction_sources_are_secret_safe(&[label, content]) {
         (
             REDACTED_EXTRACTION_SOURCE.to_string(),
             REDACTED_EXTRACTION_SOURCE.to_string(),
@@ -312,38 +328,23 @@ pub(crate) fn sanitize_extraction_source_pair(label: &str, content: &str) -> (St
 }
 
 pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> bool {
-    let combined = format!(
-        "{}: {} [{}]",
-        candidate.title,
-        candidate.content,
-        candidate.tags.join(", ")
-    );
-    !contains_secret_like_value(&candidate.title)
-        && !contains_secret_like_value(&candidate.content)
-        && !contains_secret_like_value(&combined)
-        && candidate.tags.iter().all(|tag| {
-            !contains_secret_like_value(tag)
-                && !contains_secret_like_value(&format!("{}: {tag}", candidate.title))
-                && !contains_secret_like_value(&format!("{}: {tag}", candidate.content))
-                && !contains_secret_like_value(&format!("{tag}: {}", candidate.title))
-                && !contains_secret_like_value(&format!("{tag}: {}", candidate.content))
-        })
-        && candidate
-            .session_id
-            .as_deref()
-            .is_none_or(|session_id| !contains_secret_like_value(session_id))
+    let mut sources = vec![candidate.title.as_str(), candidate.content.as_str()];
+    sources.extend(candidate.tags.iter().map(String::as_str));
+    if let Some(session_id) = candidate.session_id.as_deref() {
+        sources.push(session_id);
+    }
+    extraction_sources_are_secret_safe(&sources)
 }
 
 pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandidate) -> bool {
-    !contains_secret_like_value(&candidate.title)
-        && candidate
-            .session_id
-            .as_deref()
-            .is_none_or(|session_id| !contains_secret_like_value(session_id))
-        && candidate.excerpt.as_deref().is_none_or(|excerpt| {
-            !contains_secret_like_value(excerpt)
-                && !contains_secret_like_value(&format!("{}: {excerpt}", candidate.title))
-        })
+    let mut sources = vec![candidate.title.as_str()];
+    if let Some(excerpt) = candidate.excerpt.as_deref() {
+        sources.push(excerpt);
+    }
+    if let Some(session_id) = candidate.session_id.as_deref() {
+        sources.push(session_id);
+    }
+    extraction_sources_are_secret_safe(&sources)
 }
 
 #[cfg(test)]
@@ -448,6 +449,20 @@ mod tests {
         };
         assert!(!durable_candidate_is_secret_safe(&memory));
 
+        let reversed_memory = DurableExtractionCandidate {
+            title: "hunter2".to_string(),
+            kind: "reference".to_string(),
+            content: "Password".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["database".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&reversed_memory),
+            "content used as the credential label must reject the candidate"
+        );
+
         let tag_labelled_memory = DurableExtractionCandidate {
             title: "Production database".to_string(),
             kind: "reference".to_string(),
@@ -468,5 +483,15 @@ mod tests {
             ..LedgerExtractionCandidate::default()
         };
         assert!(!ledger_candidate_is_secret_safe(&ledger));
+
+        let reversed_ledger = LedgerExtractionCandidate {
+            title: "1234".to_string(),
+            excerpt: Some("PIN".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(
+            !ledger_candidate_is_secret_safe(&reversed_ledger),
+            "excerpt used as the credential label must reject the candidate"
+        );
     }
 }
