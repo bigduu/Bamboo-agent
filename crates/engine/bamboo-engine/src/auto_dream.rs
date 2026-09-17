@@ -1958,19 +1958,13 @@ async fn write_history_rewrite_plan(
     write_json_create_once(&path, &bytes, "history-rewrite-plan").await
 }
 
-fn memory_actor_is(document: &DurableMemoryDocument, actors: &[&str]) -> bool {
+fn memory_updated_by_actor_is(document: &DurableMemoryDocument, actors: &[&str]) -> bool {
     document
         .frontmatter
-        .created_by
+        .updated_by
         .actor
         .as_deref()
         .is_some_and(|actor| actors.contains(&actor))
-        || document
-            .frontmatter
-            .updated_by
-            .actor
-            .as_deref()
-            .is_some_and(|actor| actors.contains(&actor))
 }
 
 fn collect_memory_lineage_session_sources<'a>(
@@ -2324,8 +2318,9 @@ async fn collect_history_rewrite_replacement_targets_for_retry(
             let is_direct_auto_dream = document.frontmatter.updated_by.actor.as_deref()
                 == Some(AUTO_DREAM_MEMORY_ACTOR)
                 && lineage_session_ids.contains(&session.session_id);
-            let is_gardener_descendant = memory_actor_is(document, &GARDENER_MEMORY_ACTORS)
-                && lineage_session_ids.contains(&session.session_id);
+            let is_gardener_descendant =
+                memory_updated_by_actor_is(document, &GARDENER_MEMORY_ACTORS)
+                    && lineage_session_ids.contains(&session.session_id);
             let descends_from_frozen_target = memory_lineage_contains_frozen_target(
                 document,
                 &documents_by_id,
@@ -2496,9 +2491,13 @@ async fn revalidate_history_rewrite_plan(
     .await?;
 
     let mut revalidated = plan.clone();
-    revalidated
-        .replacement_targets
-        .extend(refreshed.replacement_targets);
+    // The original plan is a frozen discovery seed, not perpetual mutation
+    // authority. Between failed attempts a main-model memory action may
+    // legitimately merge, split, consolidate, contradict, or archive one of
+    // those documents. The fresh scan follows only lineage whose current
+    // writer is still AutoDream/a gardener; replacing the set (instead of
+    // extending the frozen IDs) makes every later main-model mutation win.
+    revalidated.replacement_targets = refreshed.replacement_targets;
     revalidated.replacement_targets.sort_by(|left, right| {
         left.scope
             .as_str()
@@ -2508,14 +2507,14 @@ async fn revalidate_history_rewrite_plan(
     });
     revalidated.replacement_targets.dedup();
 
-    revalidated.memory_reactivation_targets.retain(|target| {
-        !refreshed
-            .advanced_memory_reactivation_targets
-            .contains(target)
-    });
+    let advanced_reactivation_targets = refreshed
+        .advanced_memory_reactivation_targets
+        .into_iter()
+        .collect::<HashSet<_>>();
+    revalidated.memory_reactivation_targets = refreshed.memory_reactivation_targets;
     revalidated
         .memory_reactivation_targets
-        .extend(refreshed.memory_reactivation_targets);
+        .retain(|target| !advanced_reactivation_targets.contains(target));
     let replacement_targets = revalidated
         .replacement_targets
         .iter()
@@ -2535,9 +2534,7 @@ async fn revalidate_history_rewrite_plan(
         });
     revalidated.memory_reactivation_targets.dedup();
 
-    revalidated
-        .preservation_session_ids
-        .extend(refreshed.preservation_session_ids);
+    revalidated.preservation_session_ids = refreshed.preservation_session_ids;
     revalidated.preservation_session_ids.sort();
     revalidated.preservation_session_ids.dedup();
     if revalidated.preservation_session_ids.len() > HISTORY_REWRITE_MAX_PRESERVATION_SESSIONS {
@@ -3086,6 +3083,47 @@ async fn remove_superseded_extraction_checkpoints(
     Ok(())
 }
 
+async fn reconcile_pending_extraction_checkpoints(
+    ctx: &AutoDreamContext,
+    session_id: &str,
+    source_updated_at: &str,
+    pending_batches: &[PendingExtractionBatch],
+    pending_indexes: &[usize],
+) -> Result<(), String> {
+    let retained_checkpoint_ids = pending_indexes
+        .iter()
+        .map(|index| pending_batches[*index].checkpoint_id.clone())
+        .collect::<HashSet<_>>();
+    remove_superseded_extraction_checkpoints(ctx, session_id, &retained_checkpoint_ids).await?;
+
+    // Preservation membership is discovered only after the frozen rewrite
+    // plan is revalidated. It can change the final transaction id, batch
+    // ordinal, and batch count without changing an owner's prompt-derived
+    // checkpoint id. Such a partial checkpoint is safe to regenerate, but it
+    // can never be reused under the new atomic transaction shape.
+    for pending_index in pending_indexes {
+        let pending = &pending_batches[*pending_index];
+        let path = extraction_checkpoint_path(ctx, session_id, &pending.checkpoint_id);
+        let Some(checkpoint) = read_extraction_checkpoint(&path, &pending.checkpoint_id).await?
+        else {
+            continue;
+        };
+        if checkpoint_matches_pending_batch(&checkpoint, session_id, source_updated_at, pending) {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to replace incompatible AutoDream extraction checkpoint: {error}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn rebuild_session_contexts_after_checkpoint_replay(
     ctx: &AutoDreamContext,
     template: &CandidateSessionContext,
@@ -3608,7 +3646,21 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             history_revision,
         });
     }
-    assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+    let final_pending_indexes_by_session =
+        assign_pending_extraction_transactions(&extraction_sessions, &mut pending_batches);
+    for (session_id, pending_indexes) in &final_pending_indexes_by_session {
+        let source_updated_at = source_updated_at_by_session
+            .get(session_id)
+            .expect("every pending Session has a source watermark");
+        reconcile_pending_extraction_checkpoints(
+            ctx,
+            session_id,
+            source_updated_at,
+            &pending_batches,
+            pending_indexes,
+        )
+        .await?;
+    }
 
     let mut prepared_batches = Vec::with_capacity(pending_batches.len());
     let mut checkpoint_ids_by_session: HashMap<String, Vec<String>> = HashMap::new();
@@ -5687,6 +5739,138 @@ mod tests {
         assert!(other_session_path.exists());
     }
 
+    #[tokio::test]
+    async fn final_transaction_reconciliation_drops_partial_checkpoint_after_preservation_change() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let owner = Session::new("checkpoint-preservation-owner", "model");
+        let preserved = Session::new("checkpoint-preservation-source", "model");
+        storage.save_session(&owner).await.expect("save owner");
+        storage
+            .save_session(&preserved)
+            .await
+            .expect("save preserved source");
+        let owner_entry = session_store
+            .get_index_entry(&owner.id)
+            .await
+            .expect("owner index entry");
+        let preserved_entry = session_store
+            .get_index_entry(&preserved.id)
+            .await
+            .expect("preserved index entry");
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory,
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let owner_summary = CandidateSessionContext {
+            entry: owner_entry.clone(),
+            summary: Some("corrected owner history".to_string()),
+            session_id: owner.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let owner_topics = CandidateSessionContext {
+            entry: owner_entry.clone(),
+            summary: None,
+            session_id: owner.id.clone(),
+            project_key: None,
+            topics: vec![("decision".to_string(), "Use SQLite.".to_string())],
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let initial_sessions = vec![owner_summary.clone(), owner_topics.clone()];
+        let mut initial_pending = build_pending_extraction_batches("model", &initial_sessions);
+        let initial_indexes =
+            assign_pending_extraction_transactions(&initial_sessions, &mut initial_pending);
+        let initial_owner_indexes = initial_indexes.get(&owner.id).expect("owner transaction");
+        assert_eq!(initial_owner_indexes.len(), 2);
+        let partial = &initial_pending[initial_owner_indexes[0]];
+        let partial_checkpoint = ExtractionCheckpoint {
+            version: EXTRACTION_CHECKPOINT_VERSION,
+            batch_id: partial.checkpoint_id.clone(),
+            session_key: extraction_checkpoint_session_key(&owner.id),
+            source_updated_at: owner_entry.updated_at.to_rfc3339(),
+            transaction_id: partial.transaction_id.clone(),
+            batch_index: partial.batch_index,
+            batch_count: partial.batch_count,
+            topics_fingerprint: Some(partial.topics_fingerprint.clone()),
+            history_revision: partial.history_revision.clone(),
+            extracted: ExtractedCandidateBatch {
+                memory: Vec::new(),
+                ledger: Vec::new(),
+            },
+        };
+        let partial_path =
+            extraction_checkpoint_path(&context, &owner.id, &partial_checkpoint.batch_id);
+        assert!(
+            write_extraction_checkpoint(&partial_path, &partial_checkpoint)
+                .await
+                .expect("write partial owner checkpoint")
+        );
+
+        let preservation = CandidateSessionContext {
+            entry: preserved_entry,
+            summary: Some("unaffected preserved history".to_string()),
+            session_id: preserved.id,
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: Some(owner.id.clone()),
+            transaction_source_updated_at: Some(owner_entry.updated_at.to_rfc3339()),
+        };
+        let final_sessions = vec![owner_summary, owner_topics, preservation];
+        let mut final_pending = build_pending_extraction_batches("model", &final_sessions);
+        let final_indexes =
+            assign_pending_extraction_transactions(&final_sessions, &mut final_pending);
+        let final_owner_indexes = final_indexes
+            .get(&owner.id)
+            .expect("final owner transaction");
+        assert_eq!(final_owner_indexes.len(), 3);
+        assert_eq!(
+            final_pending[final_owner_indexes[0]].checkpoint_id, partial_checkpoint.batch_id,
+            "the prompt-derived id stays stable while atomic transaction membership changes"
+        );
+        assert_ne!(
+            final_pending[final_owner_indexes[0]].transaction_id,
+            partial_checkpoint.transaction_id
+        );
+
+        reconcile_pending_extraction_checkpoints(
+            &context,
+            &owner.id,
+            &owner_entry.updated_at.to_rfc3339(),
+            &final_pending,
+            final_owner_indexes,
+        )
+        .await
+        .expect("reconcile final preservation transaction");
+        assert!(
+            read_extraction_checkpoint(&partial_path, &partial_checkpoint.batch_id)
+                .await
+                .expect("read reconciled checkpoint")
+                .is_none(),
+            "the incompatible partial checkpoint must be regenerated instead of failing forever"
+        );
+    }
+
     #[test]
     fn retrieval_delta_excludes_self_history_system_and_non_content_payloads() {
         let mut session = Session::new("retrieval-delta-private-fields", "model");
@@ -7411,6 +7595,190 @@ mod tests {
                     .frontmatter
                     .status,
                 DurableMemoryStatus::Active
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_rewrite_retry_preserves_main_model_memory_mutations() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("main-model-retry-owner", "model");
+        session
+            .messages
+            .push(Message::user("The deployment facts need correction."));
+        session.clear_derived_context_state();
+        storage.save_session(&session).await.expect("save Session");
+        let entry = session_store
+            .get_index_entry(&session.id)
+            .await
+            .expect("Session index entry");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let merged_target = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Deployment region",
+                "The deployment region is us-east-1.",
+                &["deployment".to_string()],
+                Some(&session.id),
+                "memory-gardener",
+                false,
+                None,
+            )
+            .await
+            .expect("seed gardener memory");
+        let split_target = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::Project,
+                "Deployment policy",
+                "The deployment policy combines region and retention rules.",
+                &["deployment".to_string()],
+                Some(&session.id),
+                AUTO_DREAM_MEMORY_ACTOR,
+                false,
+                None,
+            )
+            .await
+            .expect("seed AutoDream memory");
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let session_context = CandidateSessionContext {
+            entry,
+            summary: Some("corrected deployment history".to_string()),
+            session_id: session.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some("history-revision".to_string()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let frozen = collect_history_rewrite_replacement_targets(
+            &context,
+            &memory,
+            &session_context,
+            None,
+            false,
+        )
+        .await
+        .expect("freeze initial memory targets");
+        assert_eq!(
+            frozen
+                .replacement_targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                merged_target.frontmatter.id.as_str(),
+                split_target.frontmatter.id.as_str(),
+            ])
+        );
+        let plan = HistoryRewritePlan {
+            version: HISTORY_REWRITE_PLAN_VERSION,
+            session_key: extraction_checkpoint_session_key(&session.id),
+            history_revision: "history-revision".to_string(),
+            source_updated_at: session.updated_at.to_rfc3339(),
+            replacement_targets: frozen.replacement_targets,
+            memory_reactivation_targets: frozen.memory_reactivation_targets,
+            preservation_session_ids: frozen.preservation_session_ids,
+            ledger_replacement_targets: Vec::new(),
+        };
+
+        memory
+            .merge_memory(
+                &merged_target.frontmatter.id,
+                None,
+                "A user-authored exception keeps this memory authoritative.",
+                &["user-reviewed".to_string()],
+                Some(&session.id),
+                "main-model",
+                &[],
+            )
+            .await
+            .expect("main-model merge")
+            .expect("merge target exists");
+        let split = memory
+            .split_memory(
+                &split_target.frontmatter.id,
+                None,
+                &[
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Deployment retention".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "Retain deployment logs for thirty days.".to_string(),
+                        tags: vec!["retention".to_string()],
+                    },
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Deployment approval".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "A human approves production deployment.".to_string(),
+                        tags: vec!["approval".to_string()],
+                    },
+                ],
+                Some(&session.id),
+                "main-model",
+            )
+            .await
+            .expect("main-model split")
+            .expect("split target exists");
+
+        let revalidated = revalidate_history_rewrite_plan(
+            &context,
+            &memory,
+            &LedgerStore::new(temp_dir.path()),
+            &session_context,
+            &plan,
+            None,
+            false,
+            &HashSet::new(),
+        )
+        .await
+        .expect("revalidate main-model mutations");
+        assert!(revalidated.replacement_targets.is_empty());
+        assert!(revalidated.memory_reactivation_targets.is_empty());
+        assert!(revalidated.preservation_session_ids.is_empty());
+
+        supersede_history_rewrite_targets(
+            &context,
+            &LedgerStore::new(temp_dir.path()),
+            &revalidated,
+        )
+        .await
+        .expect("complete retry without superseding main-model authority");
+        let merged = memory
+            .get_memory(&merged_target.frontmatter.id, None)
+            .await
+            .expect("read merged target")
+            .expect("merged target remains");
+        assert_eq!(merged.frontmatter.status, DurableMemoryStatus::Active);
+        assert!(merged.body.contains("user-authored exception"));
+        for id in split.new_ids {
+            let descendant = memory
+                .get_memory(&id, None)
+                .await
+                .expect("read split descendant")
+                .expect("split descendant remains");
+            assert_eq!(descendant.frontmatter.status, DurableMemoryStatus::Active);
+            assert_eq!(
+                descendant.frontmatter.updated_by.actor.as_deref(),
+                Some("main-model")
             );
         }
     }
