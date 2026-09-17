@@ -221,6 +221,40 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
         || ambiguous_environment_credential_assignment_pattern().is_match(value)
 }
 
+fn docker_auth_config_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[^a-z0-9_])docker_auth_config\s*(?::|=)")
+            .expect("Docker authentication config regex must compile")
+    })
+}
+
+fn docker_auth_field_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?is)[\"']auth[\"']\s*:\s*[\"'][^\"'\s]{4,}[\"']"#)
+            .expect("Docker authentication field regex must compile")
+    })
+}
+
+fn contains_docker_auth_config(value: &str) -> bool {
+    if docker_auth_config_pattern().is_match(value) {
+        return true;
+    }
+    let lowercase = value.to_ascii_lowercase();
+    let Some(auths_index) = lowercase
+        .find("\"auths\"")
+        .or_else(|| lowercase.find("'auths'"))
+    else {
+        return false;
+    };
+    let mut bounded_end = auths_index.saturating_add(4_096).min(value.len());
+    while !value.is_char_boundary(bounded_end) {
+        bounded_end = bounded_end.saturating_sub(1);
+    }
+    docker_auth_field_pattern().is_match(&value[auths_index..bounded_end])
+}
+
 fn known_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -384,6 +418,7 @@ fn contains_secret_like_value(value: &str) -> bool {
         || pin_credential_assignment_pattern().is_match(value)
         || standalone_pin_credential_pattern().is_match(value)
         || contains_environment_credential_assignment(value)
+        || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
         || contains_authorization_secret(value)
         || credential_url_pattern().is_match(value)
@@ -3287,6 +3322,147 @@ async fn extract_and_persist_durable_candidates(
     .await
 }
 
+async fn revalidate_extraction_sources_after_fence(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    sessions: &[CandidateSessionContext],
+) -> Result<Vec<CandidateSessionContext>, String> {
+    let mut source_session_ids = Vec::new();
+    let mut seen_session_ids = HashSet::new();
+    for session in sessions {
+        if session.transaction_owner_session_id.is_some() {
+            return Err(
+                "mixed-lineage preservation context reached initial source revalidation"
+                    .to_string(),
+            );
+        }
+        if seen_session_ids.insert(session.session_id.clone()) {
+            source_session_ids.push(session.session_id.clone());
+        }
+    }
+
+    let mut acknowledged_session_ids = HashSet::new();
+    for session_id in source_session_ids {
+        let source_contexts = sessions
+            .iter()
+            .filter(|session| session.session_id == session_id)
+            .collect::<Vec<_>>();
+        let source_updated_at_values = source_contexts
+            .iter()
+            .map(|session| session.entry.updated_at)
+            .collect::<HashSet<_>>();
+        if source_updated_at_values.len() != 1 {
+            return Err(format!(
+                "AutoDream source contexts disagree on the Session watermark for {session_id}"
+            ));
+        }
+        let source_updated_at = *source_updated_at_values
+            .iter()
+            .next()
+            .expect("a grouped source Session has at least one context");
+        let canonical_session = ctx
+            .storage
+            .load_session(&session_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to revalidate canonical AutoDream source Session '{session_id}' after acquiring the maintenance fence: {error}"
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "canonical AutoDream source Session '{session_id}' disappeared while waiting for the maintenance fence"
+                )
+            })?;
+        if canonical_session.updated_at < source_updated_at {
+            return Err(format!(
+                "canonical AutoDream source Session '{session_id}' regressed while waiting for the maintenance fence"
+            ));
+        }
+        let state = memory.read_session_state(&session_id).await.map_err(|error| {
+            format!(
+                "failed to revalidate Jiandu extraction state for {session_id} after acquiring the maintenance fence: {error}"
+            )
+        })?;
+        let extraction_watermark = state
+            .last_extracted_at
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|error| {
+                format!(
+                    "invalid Jiandu extraction watermark for {session_id} after acquiring the maintenance fence: {error}"
+                )
+            })?
+            .map(|timestamp| timestamp.with_timezone(&Utc));
+
+        let retrieval_source_keys = source_contexts
+            .iter()
+            .filter_map(|session| session.retrieval_source_key.as_deref())
+            .collect::<HashSet<_>>();
+        if retrieval_source_keys.len() > 1 {
+            return Err(format!(
+                "AutoDream source contexts disagree on retrieval identity for {session_id}"
+            ));
+        }
+        let retrieval_source_acknowledged = if retrieval_source_keys.is_empty() {
+            true
+        } else {
+            retrieval_source_is_acknowledged(ctx, &canonical_session, extraction_watermark).await?
+        };
+
+        let history_revisions = source_contexts
+            .iter()
+            .filter_map(|session| session.history_revision.as_deref())
+            .collect::<HashSet<_>>();
+        if history_revisions.len() > 1 {
+            return Err(format!(
+                "AutoDream source contexts disagree on history revision for {session_id}"
+            ));
+        }
+        let source_watermark_acknowledged =
+            extraction_watermark.is_some_and(|watermark| watermark >= source_updated_at);
+        let history_rewrite_acknowledged = if source_watermark_acknowledged {
+            if let Some(history_revision) = history_revisions.iter().next().copied() {
+                history_rewrite_is_acknowledged(
+                    ctx,
+                    &canonical_session,
+                    extraction_watermark,
+                    history_revision,
+                )
+                .await?
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        if source_watermark_acknowledged
+            && retrieval_source_acknowledged
+            && history_rewrite_acknowledged
+        {
+            remove_superseded_extraction_checkpoints(ctx, &session_id, &HashSet::new()).await?;
+            for history_revision in history_revisions {
+                remove_history_rewrite_plan(ctx, &session_id, history_revision).await;
+            }
+            acknowledged_session_ids.insert(session_id);
+            continue;
+        }
+        if canonical_session.updated_at > source_updated_at && !history_revisions.is_empty() {
+            return Err(format!(
+                "canonical AutoDream history-rewrite Session '{session_id}' changed while waiting for the maintenance fence"
+            ));
+        }
+    }
+
+    Ok(sessions
+        .iter()
+        .filter(|session| !acknowledged_session_ids.contains(&session.session_id))
+        .cloned()
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn extract_and_persist_durable_candidates_with_project_resolver(
     ctx: &AutoDreamContext,
@@ -3310,7 +3486,18 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // replay even when the freshly collected context no longer exposes it.
     let _memory_maintenance_fence = acquire_memory_maintenance_fence(memory).await?;
 
-    let mut extraction_sessions = sessions.to_vec();
+    // Candidate contexts are collected before this cross-process fence is
+    // acquired. Another AutoDream run may complete while this run waits, so
+    // re-read both Session and Jiandu authority here. An already acknowledged
+    // source must not create a new rewrite plan over the preceding run's fresh
+    // replacements, while a concurrently changed Session is left retryable
+    // rather than processed from a stale snapshot.
+    let sessions = revalidate_extraction_sources_after_fence(ctx, memory, sessions).await?;
+    if sessions.is_empty() {
+        return Ok(ExtractionWrites::default());
+    }
+
+    let mut extraction_sessions = sessions;
     let mut seen_sessions = HashSet::new();
     let session_source_watermarks = extraction_sessions
         .iter()
@@ -5436,6 +5623,10 @@ mod tests {
             ("compiler pass setting", "COMPILER_PASS=inline"),
             ("authentication mode", "AUTH_MODE=basic"),
             ("authentication provider", "AUTH_PROVIDER=internal"),
+            (
+                "Docker authentication mode",
+                "DOCKER_AUTH_MODE=credential-store",
+            ),
             ("ordinary account key label", "ACCOUNT_KEY_LABEL=primary"),
             ("mixed-case user path", "/Users/Alice/Project2/config.toml"),
             ("mixed-case relative path", "src/HTTP2Client/Config.toml"),
@@ -5509,6 +5700,14 @@ mod tests {
             (
                 "service bus connection string shared access key",
                 "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
+            ),
+            (
+                "Docker authentication config variable",
+                "DOCKER_AUTH_CONFIG={\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpwYXNz\"}}}",
+            ),
+            (
+                "Docker authentication config body",
+                "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpwYXNz\"}}}",
             ),
             (
                 "lowercase personal access token assignment",
@@ -5629,6 +5828,10 @@ mod tests {
             (
                 "Azure storage connection",
                 "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=abc;EndpointSuffix=core.windows.net",
+            ),
+            (
+                "Docker authentication config",
+                "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpwYXNz\"}}}",
             ),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
@@ -5869,6 +6072,113 @@ mod tests {
                 .is_none(),
             "the incompatible partial checkpoint must be regenerated instead of failing forever"
         );
+    }
+
+    #[tokio::test]
+    async fn waiting_run_discards_a_source_acknowledged_before_fence_acquisition() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let mut session = Session::new("waiting-history-rewrite", "model");
+        session
+            .messages
+            .push(Message::user("Replace the outdated deployment fact."));
+        storage.save_session(&session).await.expect("save Session");
+        let entry = session_store
+            .get_index_entry(&session.id)
+            .await
+            .expect("Session index entry");
+        let history_revision = "a".repeat(64);
+        let stale_context = CandidateSessionContext {
+            entry: entry.clone(),
+            summary: Some("The corrected deployment fact.".to_string()),
+            session_id: session.id.clone(),
+            project_key: None,
+            topics: Vec::new(),
+            retrieval_source_key: None,
+            history_revision: Some(history_revision.clone()),
+            transaction_owner_session_id: None,
+            transaction_source_updated_at: None,
+        };
+        let memory = MemoryStore::new(temp_dir.path());
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(SequenceProvider::new(Vec::<String>::new())),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+        let provider_impl = Arc::new(SequenceProvider::new(vec![serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()]));
+        let provider: Arc<dyn LLMProvider> = provider_impl.clone();
+        let ledger = LedgerStore::new(temp_dir.path());
+        let held_fence = acquire_memory_maintenance_fence(&memory)
+            .await
+            .expect("hold the preceding run's fence");
+
+        let waiting_context = context.clone();
+        let waiting_memory = memory.clone();
+        let waiting = tokio::spawn(async move {
+            extract_and_persist_durable_candidates(
+                &waiting_context,
+                &provider,
+                &waiting_memory,
+                &ledger,
+                "model",
+                &[stale_context],
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the second run must wait for the maintenance fence"
+        );
+
+        write_history_rewrite_state(
+            &context,
+            &session.id,
+            &history_revision,
+            &entry.updated_at.to_rfc3339(),
+        )
+        .await
+        .expect("acknowledge the preceding history rewrite");
+        memory
+            .mark_session_extracted(&session.id, &entry.updated_at.to_rfc3339())
+            .await
+            .expect("acknowledge the preceding extraction");
+        session.messages.push(Message::user(
+            "A newer turn remains eligible for the next run.",
+        ));
+        session.updated_at = entry.updated_at + chrono::Duration::seconds(1);
+        context
+            .storage
+            .save_session(&session)
+            .await
+            .expect("save a post-acknowledgement turn");
+        drop(held_fence);
+
+        let writes = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("waiting run should acquire the released fence")
+            .expect("waiting run task")
+            .expect("an acknowledged source should be skipped");
+        assert_eq!(writes, ExtractionWrites::default());
+        assert!(
+            provider_impl.recorded_prompts().is_empty(),
+            "the stale run must not call the provider or create a replacement plan"
+        );
+        assert!(!history_rewrite_plan_path(&context, &session.id, &history_revision).exists());
     }
 
     #[test]
