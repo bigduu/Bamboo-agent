@@ -5668,7 +5668,7 @@ fn context_pressure_notification_fires_at_most_once_per_level_across_rounds() {
     // Dedup state persists across rounds in metadata.
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"warning".to_string())
+        Some(&"summary:warning".to_string())
     );
 }
 
@@ -5743,7 +5743,44 @@ fn context_pressure_notification_refires_only_on_level_transition() {
     );
     assert_eq!(
         session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
-        Some(&"critical".to_string())
+        Some(&"summary:critical".to_string())
+    );
+}
+
+#[test]
+fn context_pressure_notification_refires_when_strategy_changes_at_same_level() {
+    let mut session = Session::new("session-pressure-strategy-transition", "test-model");
+    session.token_usage = Some(pressure_usage(80_000, 100_000));
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(8);
+
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::Summary,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+    emit_context_pressure_notification(
+        &mut session,
+        Some(&event_tx),
+        ContextManagementStrategy::RetrievalWindow,
+    );
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextPressureNotification { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].contains("compact_context"));
+    assert!(events[1].contains("session_history_current"));
+    assert_eq!(
+        session.metadata.get(LAST_PRESSURE_LEVEL_KEY),
+        Some(&"retrieval_window:warning".to_string())
     );
 }
 

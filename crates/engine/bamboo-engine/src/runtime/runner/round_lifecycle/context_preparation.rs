@@ -570,19 +570,25 @@ fn emit_context_pressure_notification(
         ),
     };
 
-    // Dedup across rounds via session.metadata: skip if the current level matches
-    // the last one we emitted for this session.
+    // Dedup across rounds via session.metadata. The effective strategy is part
+    // of the key because switching strategies at the same pressure level must
+    // replace stale guidance from the prior path.
+    let strategy_label = match strategy {
+        ContextManagementStrategy::Summary => "summary",
+        ContextManagementStrategy::RetrievalWindow => "retrieval_window",
+    };
+    let dedup_key = format!("{strategy_label}:{level}");
     if session
         .metadata
         .get(LAST_PRESSURE_LEVEL_KEY)
         .map(String::as_str)
-        == Some(level)
+        == Some(dedup_key.as_str())
     {
         return;
     }
     session
         .metadata
-        .insert(LAST_PRESSURE_LEVEL_KEY.to_string(), level.to_string());
+        .insert(LAST_PRESSURE_LEVEL_KEY.to_string(), dedup_key);
 
     let _ = tx.try_send(AgentEvent::ContextPressureNotification {
         percent: pct,

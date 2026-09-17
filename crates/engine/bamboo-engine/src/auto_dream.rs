@@ -19,7 +19,8 @@ use bamboo_memory::auto_dream::{
     derive_session_outline, normalize_dream_notebook_body, parse_candidate_scope,
     parse_candidate_type, parse_extraction_candidates, parse_last_consolidated_at,
     parse_last_full_rebuild_at, parse_ledger_candidates, should_force_full_rebuild, truncate_chars,
-    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, LedgerExtractionCandidate,
+    ConsolidationSessionInfo, DreamCandidateInfo, DreamGenerationMode, DurableExtractionCandidate,
+    LedgerExtractionCandidate,
 };
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
@@ -207,6 +208,62 @@ fn render_retrieval_extraction_overlap(item: &RetrievalExtractionSourceItem) -> 
     )
 }
 
+fn session_note_tool_call_ids(session: &Session) -> HashSet<&str> {
+    session
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| bamboo_domain::canonical_tool_name(&call.function.name) == "session_note")
+        .map(|call| call.id.as_str())
+        .collect()
+}
+
+/// Session-note bodies are already supplied from Jiandu Session topics. Tool
+/// results may echo arbitrary tool output, including credentials, so retrieval
+/// extraction retains only non-content acknowledgement metadata from a proven
+/// `session_note` call. All other tool results are excluded.
+fn sanitized_session_note_result(
+    message: &Message,
+    session_note_call_ids: &HashSet<&str>,
+) -> Option<String> {
+    let call_id = message.tool_call_id.as_deref()?;
+    if !session_note_call_ids.contains(call_id) {
+        return None;
+    }
+    let source = serde_json::from_str::<serde_json::Value>(&message.content)
+        .ok()?
+        .as_object()?
+        .clone();
+    let action = source.get("action")?.as_str()?;
+    if !matches!(
+        action,
+        "read" | "append" | "replace" | "clear" | "list_topics"
+    ) {
+        return None;
+    }
+    let mut safe = serde_json::Map::new();
+    safe.insert(
+        "tool".to_string(),
+        serde_json::Value::String("session_note".to_string()),
+    );
+    safe.insert(
+        "action".to_string(),
+        serde_json::Value::String(action.to_string()),
+    );
+    for field in ["exists", "deleted", "body_truncated"] {
+        if let Some(value) = source.get(field).and_then(serde_json::Value::as_bool) {
+            safe.insert(field.to_string(), serde_json::Value::Bool(value));
+        }
+    }
+    for field in ["length_chars", "max_chars", "count"] {
+        if let Some(value) = source.get(field).and_then(serde_json::Value::as_u64) {
+            safe.insert(field.to_string(), serde_json::Value::Number(value.into()));
+        }
+    }
+    Some(serde_json::Value::Object(safe).to_string())
+}
+
 fn build_retrieval_window_extraction_batches(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
@@ -235,14 +292,15 @@ fn build_retrieval_window_extraction_batches(
         .map(|(index, event)| (event.id.as_str(), index + 1))
         .collect::<HashMap<_, _>>();
     let history_artifact_ids = session_history_search_artifact_ids(session);
+    let session_note_call_ids = session_note_tool_call_ids(session);
     let eligible_messages = session
         .messages
         .iter()
         .enumerate()
-        .filter(|(_, message)| !matches!(message.role, Role::System))
-        .filter(|(_, message)| !message.content.trim().is_empty())
-        .filter(|(_, message)| !history_artifact_ids.contains(&message.id))
-        .filter(|(_, message)| {
+        .filter_map(|(message_index, message)| {
+            if matches!(message.role, Role::System) || history_artifact_ids.contains(&message.id) {
+                return None;
+            }
             let archived_by_new_event = message.compressed
                 && message
                     .compressed_by_event_id
@@ -250,7 +308,19 @@ fn build_retrieval_window_extraction_batches(
                     .is_some_and(|event_id| eligible_event_ids.contains(event_id));
             let created_after_watermark =
                 extraction_watermark.is_none_or(|watermark| message.created_at > watermark);
-            archived_by_new_event || created_after_watermark
+            if !archived_by_new_event && !created_after_watermark {
+                return None;
+            }
+            let (role, content) = match message.role {
+                Role::User => ("user", message.content.clone()),
+                Role::Assistant => ("assistant", message.content.clone()),
+                Role::Tool => (
+                    "tool",
+                    sanitized_session_note_result(message, &session_note_call_ids)?,
+                ),
+                Role::System => return None,
+            };
+            (!content.trim().is_empty()).then_some((message_index, message, role, content))
         })
         .collect::<Vec<_>>();
     if eligible_messages.is_empty() {
@@ -258,14 +328,8 @@ fn build_retrieval_window_extraction_batches(
     }
 
     let mut source_items = Vec::new();
-    for (message_index, message) in &eligible_messages {
-        let role = match message.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-            Role::System => continue,
-        };
-        let segments = split_retrieval_extraction_content(&message.content);
+    for (message_index, message, role, extraction_content) in &eligible_messages {
+        let segments = split_retrieval_extraction_content(extraction_content);
         let segment_count = segments.len();
         let retrieval_event_ordinal = message
             .compressed_by_event_id
@@ -526,6 +590,12 @@ struct ExtractionWrites {
     ledger: usize,
 }
 
+#[derive(Debug)]
+struct ExtractedCandidateBatch {
+    memory: Vec<DurableExtractionCandidate>,
+    ledger: Vec<LedgerExtractionCandidate>,
+}
+
 #[cfg(test)]
 async fn extract_and_persist_durable_candidates(
     ctx: &AutoDreamContext,
@@ -568,14 +638,23 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         })
         .collect::<Vec<_>>();
     let mut total_writes = ExtractionWrites::default();
-    for batch in sessions.chunks(DREAM_MAX_SESSIONS) {
-        let writes = extract_and_persist_durable_candidate_batch_with_project_resolver(
+    let mut extracted_batches = Vec::new();
+    for (batch_index, batch) in sessions.chunks(DREAM_MAX_SESSIONS).enumerate() {
+        let extracted = extract_durable_candidate_batch(provider, model, batch).await?;
+        extracted_batches.push((batch_index * DREAM_MAX_SESSIONS, extracted));
+    }
+
+    // Finish and parse every provider call before either durable sink starts.
+    // A later source-batch failure therefore cannot leave a successful prefix
+    // whose stochastic rephrasing would be persisted again on retry.
+    for (batch_start, extracted) in extracted_batches {
+        let batch_end = (batch_start + DREAM_MAX_SESSIONS).min(sessions.len());
+        let writes = persist_durable_candidate_batch_with_project_resolver(
             ctx,
-            provider,
             memory,
             ledger,
-            model,
-            batch,
+            &sessions[batch_start..batch_end],
+            extracted,
             project_resolver,
             current_store_is_project_scoped,
         )
@@ -600,17 +679,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     Ok(total_writes)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn extract_and_persist_durable_candidate_batch_with_project_resolver(
-    ctx: &AutoDreamContext,
+async fn extract_durable_candidate_batch(
     provider: &Arc<dyn LLMProvider>,
-    memory: &MemoryStore,
-    ledger: &LedgerStore,
     model: &str,
     sessions: &[CandidateSessionContext],
-    project_resolver: Option<&ProjectContextResolver>,
-    current_store_is_project_scoped: bool,
-) -> Result<ExtractionWrites, String> {
+) -> Result<ExtractedCandidateBatch, String> {
     let candidates_info: Vec<DreamCandidateInfo> = sessions
         .iter()
         .map(|session| DreamCandidateInfo {
@@ -627,6 +700,27 @@ async fn extract_and_persist_durable_candidate_batch_with_project_resolver(
     let candidates = parse_extraction_candidates(&raw)?;
     // Tolerant by design: absent/malformed ledger array → empty vec.
     let ledger_candidates = parse_ledger_candidates(&raw);
+
+    Ok(ExtractedCandidateBatch {
+        memory: candidates,
+        ledger: ledger_candidates,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_durable_candidate_batch_with_project_resolver(
+    ctx: &AutoDreamContext,
+    memory: &MemoryStore,
+    ledger: &LedgerStore,
+    sessions: &[CandidateSessionContext],
+    extracted: ExtractedCandidateBatch,
+    project_resolver: Option<&ProjectContextResolver>,
+    current_store_is_project_scoped: bool,
+) -> Result<ExtractionWrites, String> {
+    let ExtractedCandidateBatch {
+        memory: candidates,
+        ledger: ledger_candidates,
+    } = extracted;
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
@@ -1782,17 +1876,53 @@ mod tests {
             "history-result-message",
             test_time(14),
         ));
+        let session_note_call_id = "session-note-call";
         session.messages.push(message_at(
-            Message::tool_result("session-note-call", "SESSION_NOTE_VISIBLE"),
-            "session-note-result",
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: session_note_call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "session_note".to_string(),
+                        arguments: serde_json::json!({"action": "read"}).to_string(),
+                    },
+                }]),
+            ),
+            "session-note-call-message",
             test_time(15),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result(
+                session_note_call_id,
+                serde_json::json!({
+                    "action": "read",
+                    "session_id": "retrieval-delta-private-fields",
+                    "topic": "continuity",
+                    "exists": true,
+                    "content": "SESSION_NOTE_CREDENTIAL_SECRET",
+                    "path": "/sensitive/session/note/path",
+                    "length_chars": 30,
+                    "body_truncated": false,
+                    "max_chars": 12000
+                })
+                .to_string(),
+            ),
+            "session-note-result",
+            test_time(16),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result("untrusted-tool-call", "TOOL_CREDENTIAL_SECRET"),
+            "untrusted-tool-result",
+            test_time(17),
         ));
 
         let batches = build_retrieval_window_extraction_batches(&session, None);
         assert_eq!(batches.len(), 1);
         let delta = &batches[0];
         assert!(delta.contains("SAFE_VISIBLE_CONTENT"));
-        assert!(delta.contains("SESSION_NOTE_VISIBLE"));
+        assert!(delta.contains("session_note"));
+        assert!(delta.contains("length_chars"));
         for excluded in [
             "SYSTEM_SECRET",
             "REASONING_SECRET",
@@ -1801,6 +1931,9 @@ mod tests {
             "SEARCH_QUERY_SECRET",
             "SEARCH_QUERY_ARGUMENT_SECRET",
             "SEARCH_RESULT_SECRET",
+            "SESSION_NOTE_CREDENTIAL_SECRET",
+            "/sensitive/session/note/path",
+            "TOOL_CREDENTIAL_SECRET",
         ] {
             assert!(
                 !delta.contains(excluded),
@@ -1964,10 +2097,37 @@ mod tests {
             "old-active",
             watermark - chrono::Duration::seconds(1),
         ));
+        let session_note_call_id = "session-note-call";
         session.messages.push(message_at(
-            Message::tool_result("session-note-call", "SESSION_NOTE_AFTER_WATERMARK"),
-            "session-note",
+            Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: session_note_call_id.to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "session_note".to_string(),
+                        arguments: serde_json::json!({"action": "append"}).to_string(),
+                    },
+                }]),
+            ),
+            "session-note-call",
             watermark + chrono::Duration::seconds(1),
+        ));
+        session.messages.push(message_at(
+            Message::tool_result(
+                session_note_call_id,
+                serde_json::json!({
+                    "action": "append",
+                    "session_id": "retrieval-collection",
+                    "topic": "continuity",
+                    "path": "/must/not/reach/extraction",
+                    "length_chars": 59,
+                    "max_chars": 12000
+                })
+                .to_string(),
+            ),
+            "session-note-result",
+            watermark + chrono::Duration::seconds(2),
         ));
         session.updated_at = now;
         storage
@@ -1984,7 +2144,7 @@ mod tests {
             .write_session_topic(
                 "retrieval-collection",
                 "continuity",
-                "SESSION_TOPIC_REMAINS_SEPARATE",
+                "SESSION_NOTE_AFTER_WATERMARK\nSESSION_TOPIC_REMAINS_SEPARATE",
             )
             .await
             .expect("write Session topic");
@@ -2007,13 +2167,14 @@ mod tests {
         assert_eq!(contexts.len(), 1);
         let source = contexts[0].summary.as_deref().expect("retrieval source");
         assert!(source.contains("ARCHIVED_AFTER_WATERMARK_EVENT"));
-        assert!(source.contains("SESSION_NOTE_AFTER_WATERMARK"));
+        assert!(source.contains("session_note"));
+        assert!(!source.contains("/must/not/reach/extraction"));
         assert!(!source.contains("ACTIVE_BEFORE_WATERMARK"));
         assert_eq!(
             contexts[0].topics,
             vec![(
                 "continuity".to_string(),
-                "SESSION_TOPIC_REMAINS_SEPARATE".to_string()
+                "SESSION_NOTE_AFTER_WATERMARK\nSESSION_TOPIC_REMAINS_SEPARATE".to_string()
             )]
         );
 
@@ -2147,13 +2308,37 @@ mod tests {
         session.updated_at = now;
         storage.save_session(&session).await.expect("save Session");
 
-        let valid_response =
+        let first_prefix_response = serde_json::json!({
+            "candidates": [{
+                "title": "Prefix candidate before later failure",
+                "type": "reference",
+                "scope": "global",
+                "content": "FIRST_WORDING_MUST_NOT_PERSIST",
+                "tags": ["retry"],
+                "session_id": "retrieval-multi-batch-retry"
+            }],
+            "ledger_candidates": []
+        })
+        .to_string();
+        let retry_response = serde_json::json!({
+            "candidates": [{
+                "title": "Rephrased candidate after retry",
+                "type": "reference",
+                "scope": "global",
+                "content": "SECOND_WORDING_PERSISTS_ONCE",
+                "tags": ["retry"],
+                "session_id": "retrieval-multi-batch-retry"
+            }],
+            "ledger_candidates": []
+        })
+        .to_string();
+        let empty_response =
             serde_json::json!({"candidates": [], "ledger_candidates": []}).to_string();
         let sequence_provider = Arc::new(SequenceProvider::new(vec![
-            valid_response.clone(),
+            first_prefix_response,
             "not valid extraction JSON".to_string(),
-            valid_response.clone(),
-            valid_response,
+            retry_response,
+            empty_response,
         ]));
         let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
         let memory = MemoryStore::new(temp_dir.path());
@@ -2215,6 +2400,14 @@ mod tests {
                 .is_none(),
             "a successful prefix must not advance the Session watermark"
         );
+        assert!(
+            memory
+                .list_memory_documents(MemoryScope::Global, None)
+                .await
+                .expect("list memory after failed provider suffix")
+                .is_empty(),
+            "all provider batches must parse before a successful prefix can persist"
+        );
 
         let retry = collect_candidate_session_contexts(&context, &memory, since).await;
         assert_eq!(
@@ -2243,6 +2436,12 @@ mod tests {
             completed_state.last_extracted_at.as_deref(),
             Some(retry[0].entry.updated_at.to_rfc3339().as_str())
         );
+        let persisted = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list memory after complete retry");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].body, "SECOND_WORDING_PERSISTS_ONCE");
 
         let prompts = sequence_provider.recorded_prompts();
         assert_eq!(prompts.len(), 4, "two bounded calls per attempt");
