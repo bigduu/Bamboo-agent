@@ -27,6 +27,10 @@ use bamboo_memory::memory_store::{
 };
 use bamboo_storage::{SessionIndexEntry, SessionStoreV2};
 
+use crate::auto_dream_privacy::{
+    durable_candidate_is_secret_safe, ledger_candidate_is_secret_safe, sanitize_extraction_source,
+    sanitize_extraction_source_pair,
+};
 use crate::project_context::ProjectContextResolver;
 
 const DREAM_RUNTIME_SESSION_ID: &str = "__dream__";
@@ -102,6 +106,41 @@ struct DreamSourceWindow {
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 }
 
+fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Option<String> {
+    // Sanitize complete message bodies before the outline helper truncates
+    // them. Otherwise a credential crossing the 300-character boundary could
+    // leave an undetected prefix in the provider prompt.
+    let mut sanitized = session.clone();
+    for message in &mut sanitized.messages {
+        message.content = sanitize_extraction_source(&message.content);
+    }
+    derive_session_outline(&sanitized).map(|outline| sanitize_extraction_source(&outline))
+}
+
+fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
+    let (title, summary) = match session.summary.as_deref() {
+        Some(summary) => {
+            let (title, summary) = sanitize_extraction_source_pair(&session.entry.title, summary);
+            (title, Some(summary))
+        }
+        None => (sanitize_extraction_source(&session.entry.title), None),
+    };
+    let topics = session
+        .topics
+        .iter()
+        .map(|(topic, content)| sanitize_extraction_source_pair(topic, content))
+        .collect();
+
+    DreamCandidateInfo {
+        session_id: session.session_id.clone(),
+        title,
+        project_key: session.project_key.clone(),
+        updated_at: session.entry.updated_at.to_rfc3339(),
+        summary,
+        topics,
+    }
+}
+
 fn session_is_candidate(entry: &SessionIndexEntry, since: DateTime<Utc>) -> bool {
     matches!(entry.kind, SessionKind::Root)
         && entry.updated_at >= since
@@ -128,7 +167,7 @@ async fn collect_candidate_sessions(
                 .conversation_summary
                 .as_ref()
                 .map(|summary| summary.content.clone())
-                .or_else(|| derive_session_outline(&session)),
+                .or_else(|| derive_sanitized_session_outline(&session)),
             _ => None,
         };
         out.push((entry, summary));
@@ -207,7 +246,12 @@ async fn collect_candidate_session_contexts_from_sessions(
             .unwrap_or_default()
             .into_iter()
             .take(EXTRACTION_MAX_TOPICS_PER_SESSION)
-            .map(|(topic, content)| (topic, truncate_chars(&content, EXTRACTION_MAX_TOPIC_CHARS)))
+            .map(|(topic, content)| {
+                // Detect against the complete topic before truncation for the
+                // same reason as message outlines above.
+                let (topic, content) = sanitize_extraction_source_pair(&topic, &content);
+                (topic, truncate_chars(&content, EXTRACTION_MAX_TOPIC_CHARS))
+            })
             .collect::<Vec<_>>();
         if topics.is_empty()
             && summary
@@ -283,20 +327,16 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
 
     let candidates_info: Vec<DreamCandidateInfo> = sessions
         .iter()
-        .map(|session| DreamCandidateInfo {
-            session_id: session.session_id.clone(),
-            title: session.entry.title.clone(),
-            project_key: session.project_key.clone(),
-            updated_at: session.entry.updated_at.to_rfc3339(),
-            summary: session.summary.clone(),
-            topics: session.topics.clone(),
-        })
+        .map(sanitized_extraction_candidate_info)
         .collect();
     let prompt = build_extraction_prompt(&candidates_info);
     let raw = collect_stream_text(provider.clone(), model, prompt).await?;
     let candidates = parse_extraction_candidates(&raw)?;
     // Tolerant by design: absent/malformed ledger array → empty vec.
-    let ledger_candidates = parse_ledger_candidates(&raw);
+    let ledger_candidates = parse_ledger_candidates(&raw)
+        .into_iter()
+        .filter(ledger_candidate_is_secret_safe)
+        .collect();
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
@@ -318,7 +358,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         (MemoryScope, Option<String>),
         HashSet<ExtractionFingerprint>,
     > = HashMap::new();
-    for candidate in candidates.into_iter().take(EXTRACTION_MAX_CANDIDATES) {
+    for candidate in candidates
+        .into_iter()
+        .filter(durable_candidate_is_secret_safe)
+        .take(EXTRACTION_MAX_CANDIDATES)
+    {
         let Some(memory_type) = parse_candidate_type(&candidate.kind) else {
             continue;
         };
@@ -1317,6 +1361,198 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].title, "User prefers terse responses");
         assert_eq!(candidates[0].kind, "feedback");
+    }
+
+    #[test]
+    fn outline_sanitizes_full_message_before_truncation() {
+        const SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
+        let secret = "mF9/Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je";
+        let mut session = bamboo_agent_core::Session::new("session-boundary", "model");
+        session.add_message(Message::user(format!(
+            "{}{}",
+            "ordinary ".repeat(32),
+            secret
+        )));
+
+        let outline = derive_sanitized_session_outline(&session).expect("sanitized outline");
+        assert!(outline.contains(crate::auto_dream_privacy::REDACTED_EXTRACTION_SOURCE));
+        assert!(
+            !outline.contains(SECRET_PREFIX),
+            "a credential prefix crossed the outline truncation boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_privacy_boundary_covers_prompt_and_both_sinks() {
+        const TITLE_SECRET: &str = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz";
+        const SUMMARY_SECRET: &str = "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456";
+        const OUTLINE_SECRET: &str = "my token is abc";
+        const SYSTEM_SECRET: &str = "postgres://user:password-value@example.test/database";
+        const TOPIC_SECRET: &str = "hunter2";
+        const TOOL_MARKER: &str = "ORDINARY_TOOL_RESULT_MUST_NOT_REACH_EXTRACTION";
+        const BOUNDARY_SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+
+        let mut summarized = bamboo_agent_core::Session::new("session-summary-private", "model");
+        summarized.title = TITLE_SECRET.to_string();
+        summarized.conversation_summary = Some(bamboo_agent_core::ConversationSummary::new(
+            SUMMARY_SECRET,
+            2,
+            64,
+        ));
+        storage
+            .save_session(&summarized)
+            .await
+            .expect("save summarized session");
+
+        let mut outlined = bamboo_agent_core::Session::new("session-outline-private", "model");
+        outlined.title = "Ordinary outline title".to_string();
+        outlined.add_message(Message::user("Keep the final response concise."));
+        outlined.add_message(Message::assistant(OUTLINE_SECRET, None));
+        outlined.add_message(Message::system(SYSTEM_SECRET));
+        outlined.add_message(Message::tool_result("call-1", TOOL_MARKER));
+        storage
+            .save_session(&outlined)
+            .await
+            .expect("save outlined session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        memory
+            .write_session_topic("session-summary-private", "Password", TOPIC_SECRET)
+            .await
+            .expect("write private Session topic fixture");
+        memory
+            .write_session_topic(
+                "session-summary-private",
+                "boundary",
+                &format!(
+                    "{}{}",
+                    "ordinary ".repeat(165),
+                    "mF9/Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je"
+                ),
+            )
+            .await
+            .expect("write truncation-boundary Session topic fixture");
+
+        let response = serde_json::json!({
+            "candidates": [
+                {
+                    "title": "Password",
+                    "type": "reference",
+                    "scope": "global",
+                    "content": TOPIC_SECRET,
+                    "tags": ["credential"],
+                    "session_id": "session-summary-private",
+                    "confidence": "high"
+                },
+                {
+                    "title": "User prefers concise replies",
+                    "type": "feedback",
+                    "scope": "global",
+                    "content": "The user prefers concise replies.",
+                    "tags": ["preference"],
+                    "session_id": "session-outline-private",
+                    "confidence": "high"
+                }
+            ],
+            "ledger_candidates": [
+                {
+                    "title": "PIN",
+                    "kind": "todo",
+                    "excerpt": "1234",
+                    "session_id": "session-summary-private",
+                    "confidence": "high"
+                },
+                {
+                    "title": "Renew passport",
+                    "kind": "todo",
+                    "excerpt": "I will renew my passport.",
+                    "session_id": "session-outline-private",
+                    "confidence": "medium"
+                }
+            ]
+        })
+        .to_string();
+        let sequence = Arc::new(SequenceProvider::new(vec![response]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 2);
+        let ledger = LedgerStore::new(temp_dir.path());
+        let writes = extract_and_persist_durable_candidates(
+            &context,
+            &provider,
+            &memory,
+            &ledger,
+            "fast-model",
+            &contexts,
+        )
+        .await
+        .expect("privacy-safe extraction should succeed");
+        assert_eq!(
+            writes,
+            ExtractionWrites {
+                memory: 1,
+                ledger: 1
+            }
+        );
+
+        let prompts = sequence.recorded_prompts();
+        assert_eq!(prompts.len(), 1);
+        let prompt = &prompts[0];
+        for (case, forbidden) in [
+            ("title", TITLE_SECRET),
+            ("summary", SUMMARY_SECRET),
+            ("user or assistant outline", OUTLINE_SECRET),
+            ("system message", SYSTEM_SECRET),
+            ("Session topic", TOPIC_SECRET),
+            ("ordinary tool output", TOOL_MARKER),
+            ("topic truncation boundary", BOUNDARY_SECRET_PREFIX),
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "private source reached the extraction provider: {case}"
+            );
+        }
+        assert!(prompt.contains(crate::auto_dream_privacy::REDACTED_EXTRACTION_SOURCE));
+
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list memory documents");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(
+            documents[0].frontmatter.title,
+            "User prefers concise replies"
+        );
+
+        let records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list Ledger records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.title, "Renew passport");
     }
 
     #[tokio::test]

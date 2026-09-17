@@ -579,7 +579,9 @@ pub fn build_rebuild_consolidation_prompt(
 /// Derive a brief text outline from a session for dream extraction context.
 ///
 /// Uses the task list if available, otherwise falls back to the 6 most recent
-/// non-system messages (truncated to 300 chars each).
+/// user/assistant messages (truncated to 300 chars each). Tool results are not
+/// extraction source; canonical Session notes arrive separately through Jiandu
+/// Session topics.
 pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<String> {
     use bamboo_agent_core::Role;
 
@@ -597,7 +599,7 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
             .messages
             .iter()
             .rev()
-            .filter(|message| !matches!(message.role, Role::System))
+            .filter(|message| matches!(message.role, Role::User | Role::Assistant))
             .take(6)
             .collect::<Vec<_>>();
         if recent_messages.is_empty() {
@@ -608,8 +610,7 @@ pub fn derive_session_outline(session: &bamboo_agent_core::Session) -> Option<St
             let role = match message.role {
                 Role::User => "User",
                 Role::Assistant => "Assistant",
-                Role::Tool => "Tool",
-                Role::System => continue,
+                Role::Tool | Role::System => continue,
             };
             rendered.push_str(&format!(
                 "**{}**: {}\n\n",
@@ -833,6 +834,27 @@ mod tests {
         let prompt = build_extraction_prompt(&[]);
         assert!(prompt.contains("Bamboo Durable Memory Extraction"));
         assert!(prompt.contains("Candidate sessions"));
+    }
+
+    #[test]
+    fn session_outline_excludes_system_and_tool_output() {
+        let mut session = bamboo_agent_core::Session::new("session-outline", "model");
+        session.add_message(bamboo_agent_core::Message::user("USER_SOURCE_MARKER"));
+        session.add_message(bamboo_agent_core::Message::assistant(
+            "ASSISTANT_SOURCE_MARKER",
+            None,
+        ));
+        session.add_message(bamboo_agent_core::Message::system("SYSTEM_SOURCE_MARKER"));
+        session.add_message(bamboo_agent_core::Message::tool_result(
+            "call-1",
+            "TOOL_SOURCE_MARKER",
+        ));
+
+        let outline = derive_session_outline(&session).expect("content outline");
+        assert!(outline.contains("USER_SOURCE_MARKER"));
+        assert!(outline.contains("ASSISTANT_SOURCE_MARKER"));
+        assert!(!outline.contains("SYSTEM_SOURCE_MARKER"));
+        assert!(!outline.contains("TOOL_SOURCE_MARKER"));
     }
 
     fn sample_consolidation_session(id: &str) -> ConsolidationSessionInfo {
