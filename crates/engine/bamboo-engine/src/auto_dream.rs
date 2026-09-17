@@ -152,7 +152,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp|key))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:token|secret|password|passcode|pin|otp|key(?:_id)?))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -176,7 +176,7 @@ fn known_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\bAKIA[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
+            r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
         )
         .expect("known secret regex must compile")
     })
@@ -3451,6 +3451,12 @@ mod tests {
             ("lowercase prefixed token assignment", "github_token=abc"),
             ("secret key assignment", "STRIPE_SECRET_KEY=abc"),
             ("lowercase secret key assignment", "stripe_secret_key=abc"),
+            ("key id assignment", "AWS_ACCESS_KEY_ID=abc"),
+            (
+                "temporary AWS access key assignment",
+                "AWS_ACCESS_KEY_ID=ASIA1234567890ABCDEF",
+            ),
+            ("temporary AWS access key", "ASIA1234567890ABCDEF"),
             (
                 "lowercase nested prefixed token assignment",
                 "ci_job_token=abc",
@@ -3517,6 +3523,7 @@ mod tests {
             ("GITHUB_TOKEN", "abc"),
             ("github_token", "abc"),
             ("STRIPE_SECRET_KEY", "abc"),
+            ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
             let unsafe_memory = DurableExtractionCandidate {

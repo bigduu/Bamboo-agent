@@ -169,7 +169,12 @@ impl Message {
             .metadata
             .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if !metadata.is_object() {
-            *metadata = serde_json::Value::Object(serde_json::Map::new());
+            let previous =
+                std::mem::replace(metadata, serde_json::Value::Object(serde_json::Map::new()));
+            metadata
+                .as_object_mut()
+                .expect("Message metadata was normalized to an object")
+                .insert("previous_metadata".to_string(), previous);
         }
         metadata
             .as_object_mut()
@@ -1707,6 +1712,22 @@ mod tests {
         let restored: Message = serde_json::from_str(&json).expect("deserialize Message");
         assert_eq!(restored.created_at, original_created_at);
         assert_eq!(restored.content_updated_at(), Some(updated_at));
+    }
+
+    #[test]
+    fn message_content_revision_timestamp_preserves_legacy_scalar_metadata() {
+        let mut message = Message::assistant("corrected", None);
+        message.metadata = Some(serde_json::json!(["legacy", 7]));
+        let updated_at = message.created_at + chrono::Duration::seconds(5);
+
+        message.mark_content_updated_at(updated_at);
+
+        let metadata = message.metadata.as_ref().expect("metadata");
+        assert_eq!(
+            metadata["previous_metadata"],
+            serde_json::json!(["legacy", 7])
+        );
+        assert_eq!(message.content_updated_at(), Some(updated_at));
     }
 
     #[test]
