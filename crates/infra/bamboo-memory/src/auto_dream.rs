@@ -25,9 +25,14 @@ pub enum DreamGenerationMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableExtractionEnvelope {
     #[serde(default)]
     pub candidates: Vec<DurableExtractionCandidate>,
+    #[serde(default)]
+    pub ledger_candidates: Vec<LedgerExtractionCandidate>,
+    #[serde(default)]
+    pub source_exhausted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,12 +75,6 @@ pub struct LedgerExtractionCandidate {
     pub confidence: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct LedgerExtractionEnvelope {
-    #[serde(default)]
-    ledger_candidates: Vec<LedgerExtractionCandidate>,
-}
-
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
@@ -105,7 +104,7 @@ pub fn parse_extraction_candidates(raw: &str) -> Result<Vec<DurableExtractionCan
 /// JSON) yields an empty vec — never an error that kills the auto-dream pass.
 pub fn parse_ledger_candidates(raw: &str) -> Vec<LedgerExtractionCandidate> {
     let payload = strip_json_fence(raw);
-    serde_json::from_str::<LedgerExtractionEnvelope>(payload)
+    serde_json::from_str::<DurableExtractionEnvelope>(payload)
         .map(|envelope| envelope.ledger_candidates)
         .unwrap_or_default()
 }
@@ -710,6 +709,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_extraction_candidates_rejects_unknown_envelope_fields() {
+        let input = r#"{"credential_label":"password","candidates":[{"title":"Production database","type":"reference","content":"hunter2","session_id":"session-1"}]}"#;
+        assert!(
+            parse_extraction_candidates(input).is_err(),
+            "unknown envelope fields must not disappear before candidate validation"
+        );
+    }
+
+    #[test]
     fn parse_candidate_scope_defaults_to_project_when_key_available() {
         let candidate = DurableExtractionCandidate {
             title: "T".to_string(),
@@ -835,6 +843,15 @@ mod tests {
         assert!(
             parse_ledger_candidates(raw).is_empty(),
             "unknown Ledger fields must fail closed before persistence"
+        );
+    }
+
+    #[test]
+    fn parse_ledger_candidates_rejects_unknown_envelope_fields() {
+        let raw = r#"{"credential_label":"password","ledger_candidates":[{"title":"Production login","kind":"todo","excerpt":"hunter2"}]}"#;
+        assert!(
+            parse_ledger_candidates(raw).is_empty(),
+            "unknown envelope fields must fail closed for Ledger candidates"
         );
     }
 

@@ -2349,7 +2349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extraction_rejects_unknown_candidate_fields_before_sinks_and_watermark() {
+    async fn extraction_rejects_unknown_envelope_fields_before_sinks_and_watermark() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
         let session_store = Arc::new(
@@ -2359,7 +2359,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            r#"{"candidates":[{"title":"Production database","type":"reference","content":"hunter2","credential_label":"password","session_id":"session-unknown-field"}]}"#
+            r#"{"credential_label":"password","candidates":[{"title":"Production database","type":"reference","content":"hunter2","session_id":"session-unknown-field"}]}"#
                 .to_string(),
         ]));
 
@@ -2400,7 +2400,7 @@ mod tests {
             &sessions,
         )
         .await
-        .expect_err("unknown candidate fields must fail the extraction");
+        .expect_err("unknown envelope fields must fail the extraction");
         assert!(memory
             .list_memory_documents(MemoryScope::Global, None)
             .await

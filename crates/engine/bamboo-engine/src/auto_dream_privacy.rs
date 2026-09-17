@@ -254,30 +254,69 @@ fn xml_value_attribute_pattern() -> &'static Regex {
 }
 
 fn xml_element_body_contains_text(body: &str) -> bool {
-    let mut characters = body.chars().peekable();
-    let mut inside_tag = false;
-    let mut inspected = 0usize;
-    while let Some(character) = characters.next() {
-        inspected += 1;
-        if inspected > 4_096 {
-            break;
+    let mut bounded_end = body.len().min(4_096);
+    while !body.is_char_boundary(bounded_end) {
+        bounded_end = bounded_end.saturating_sub(1);
+    }
+    let body = &body[..bounded_end];
+    let mut cursor = 0usize;
+    let mut nested_depth = 0usize;
+
+    while cursor < body.len() {
+        let remainder = &body[cursor..];
+        if let Some(cdata) = remainder.strip_prefix("<![CDATA[") {
+            let (text, consumed) = match cdata.find("]]>") {
+                Some(end) => (&cdata[..end], "<![CDATA[".len() + end + "]]>".len()),
+                None => (cdata, remainder.len()),
+            };
+            if text.chars().any(|character| !character.is_whitespace()) {
+                return true;
+            }
+            cursor += consumed;
+            continue;
         }
-        if character == '<' {
-            if characters.peek() == Some(&'/') {
+        if remainder.starts_with("<!--") {
+            let consumed = remainder
+                .find("-->")
+                .map_or(remainder.len(), |end| end + "-->".len());
+            cursor += consumed;
+            continue;
+        }
+        if remainder.starts_with("</") {
+            if nested_depth == 0 {
                 break;
             }
-            inside_tag = true;
+            let Some(end) = remainder.find('>') else {
+                break;
+            };
+            nested_depth -= 1;
+            cursor += end + 1;
             continue;
         }
-        if inside_tag {
-            if character == '>' {
-                inside_tag = false;
+        if remainder.starts_with('<') {
+            let Some(end) = remainder.find('>') else {
+                break;
+            };
+            let tag = &remainder[1..end];
+            let trimmed = tag.trim_start();
+            if !trimmed.starts_with('!')
+                && !trimmed.starts_with('?')
+                && !tag.trim_end().ends_with('/')
+            {
+                nested_depth += 1;
             }
+            cursor += end + 1;
             continue;
         }
-        if !character.is_whitespace() {
+
+        let text_end = remainder.find('<').unwrap_or(remainder.len());
+        if remainder[..text_end]
+            .chars()
+            .any(|character| !character.is_whitespace())
+        {
             return true;
         }
+        cursor += text_end;
     }
     false
 }
@@ -814,6 +853,10 @@ mod tests {
                 "XML password policy property",
                 "<property name=\"password_policy\" value=\"strict\"/>",
             ),
+            (
+                "empty XML password CDATA",
+                "<password><![CDATA[   ]]></password>",
+            ),
             ("colon-separated timestamp", "2026:09:17:20:53"),
             ("colon-separated code fields", "crate:123:module:item:value"),
         ] {
@@ -926,6 +969,14 @@ mod tests {
                 "| API key | hunter2 | production |",
             ),
             ("XML password element", "<password>hunter2</password>"),
+            (
+                "XML password CDATA",
+                "<password><![CDATA[hunter2]]></password>",
+            ),
+            (
+                "nested XML password CDATA",
+                "<password><value><![CDATA[hunter2]]></value></password>",
+            ),
             (
                 "nested XML password element",
                 "<password><value>hunter2</value></password>",
