@@ -614,31 +614,75 @@ fn ascii_shannon_entropy(token: &str) -> f64 {
         .sum()
 }
 
-fn hash_context_pattern() -> &'static Regex {
+fn hash_label_before_token_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)\b",
+            r"(?i)(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)(?:\s+(?:hash|digest|checksum|value|is))?\s*(?::|=|-)?\s*$",
         )
-        .expect("hash-context regex must compile")
+        .expect("hash label prefix regex must compile")
     })
 }
 
-fn contains_opaque_hex_secret_token(value: &str) -> bool {
-    if hash_context_pattern().is_match(value) || looks_like_technical_path_token(value.trim()) {
-        return false;
+fn hash_label_after_token_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)^\s*(?:\(|\[)?(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)\b",
+        )
+        .expect("hash label suffix regex must compile")
+    })
+}
+
+fn bounded_prefix(value: &str, end: usize, max_bytes: usize) -> &str {
+    let mut start = end.saturating_sub(max_bytes);
+    while !value.is_char_boundary(start) {
+        start += 1;
     }
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|token| {
-            let length = token.len();
-            (32..=4_096).contains(&length)
-                && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && token.bytes().any(|byte| byte.is_ascii_digit())
-                && token.bytes().any(|byte| byte.is_ascii_alphabetic())
-                && token.bytes().collect::<HashSet<_>>().len() >= 8
-                && ascii_shannon_entropy(token) >= 3.2
-        })
+    &value[start..end]
+}
+
+fn bounded_suffix(value: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = start.saturating_add(max_bytes).min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &value[start..end]
+}
+
+fn hex_token_has_local_hash_label(value: &str, start: usize, end: usize) -> bool {
+    hash_label_before_token_pattern().is_match(bounded_prefix(value, start, 128))
+        || hash_label_after_token_pattern().is_match(bounded_suffix(value, end, 64))
+}
+
+fn contains_opaque_hex_secret_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_alphanumeric() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_alphanumeric() {
+            cursor += 1;
+        }
+        let end = cursor;
+        if start == end {
+            continue;
+        }
+        let token = &value[start..end];
+        let length = token.len();
+        let looks_opaque = (32..=4_096).contains(&length)
+            && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && token.bytes().any(|byte| byte.is_ascii_digit())
+            && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+            && token.bytes().collect::<HashSet<_>>().len() >= 8
+            && ascii_shannon_entropy(token) >= 3.2;
+        if looks_opaque && !hex_token_has_local_hash_label(value, start, end) {
+            return true;
+        }
+    }
+    false
 }
 
 fn contains_high_entropy_secret_token(value: &str) -> bool {
@@ -1097,6 +1141,10 @@ mod tests {
             (
                 "unlabelled opaque hexadecimal token",
                 "0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "unrelated same-field hash label",
+                "commit 0123456789abcdef0123456789abcdef01234567; production access 0123456789abcdef0123456789abcdef",
             ),
             ("opaque token", "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je"),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
