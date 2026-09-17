@@ -1099,6 +1099,19 @@ impl Session {
             message.compressed = false;
             message.compressed_by_event_id = None;
         }
+        self.mark_authoritative_history_rewrite();
+    }
+
+    /// Record a deliberate rewrite of the canonical user-visible transcript
+    /// and fence every provider-native replay lane. This typed generation is
+    /// distinct from internal System-prompt/context resets and is not an
+    /// extraction watermark; Jiandu remains the sole owner of extraction
+    /// acknowledgement.
+    pub fn mark_authoritative_history_rewrite(&mut self) {
+        let state = self
+            .model_context_state
+            .get_or_insert_with(Default::default);
+        state.history_rewrite_revision = state.history_rewrite_revision.saturating_add(1);
         self.reset_model_context_epoch(
             crate::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite,
         );

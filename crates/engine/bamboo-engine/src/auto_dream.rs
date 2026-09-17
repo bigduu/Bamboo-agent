@@ -30,7 +30,8 @@ use bamboo_memory::auto_dream::{
 use bamboo_memory::ledger_store::store::new_record_id;
 use bamboo_memory::ledger_store::{LedgerStore, RecordFilter, MAX_RECORD_TITLE_LEN};
 use bamboo_memory::memory_store::{
-    DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore, MAX_MEMORY_TITLE_LEN,
+    DurableMemoryDocument, DurableMemoryStatus, DurableMemoryType, MemoryScope, MemoryStore,
+    MAX_MEMORY_TITLE_LEN,
 };
 use bamboo_storage::{
     search_index::session_history_search_artifact_ids, SessionIndexEntry, SessionStoreV2,
@@ -65,6 +66,7 @@ const RETRIEVAL_SOURCE_STATE_VERSION: u32 = 2;
 const HISTORY_REWRITE_STATE_VERSION: u32 = 1;
 const HISTORY_REWRITE_PLAN_VERSION: u32 = 1;
 const AUTO_DREAM_MEMORY_ACTOR: &str = "background-fast-model";
+const GARDENER_MEMORY_ACTORS: [&str; 2] = ["memory-gardener", "memory-dedup-gardener"];
 const REDACTED_EXTRACTION_SOURCE: &str =
     "[sensitive content omitted before durable-memory extraction]";
 
@@ -156,7 +158,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|api_key|access_key|secret_key|private_key|client_key|auth_key|signing_key|encryption_key|token|secret|password|passcode|pin|otp|pass|pwd)|secret_key_base|pgpassword))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -1368,10 +1370,11 @@ fn history_rewrite_revision(
     session: &Session,
     extraction_watermark: Option<DateTime<Utc>>,
 ) -> Option<String> {
-    let explicit_boundary = session.model_context_state.as_ref().filter(|state| {
-        state.last_reset_reason
-            == Some(bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite)
-    });
+    let authoritative_history_revision = session
+        .model_context_state
+        .as_ref()
+        .map(|state| state.history_rewrite_revision)
+        .filter(|revision| *revision > 0);
     let revised_messages = session
         .messages
         .iter()
@@ -1383,21 +1386,16 @@ fn history_rewrite_revision(
     let has_unacknowledged_revision = revised_messages.iter().any(|(_, updated_at)| {
         extraction_watermark.is_none_or(|watermark| *updated_at > watermark)
     });
-    if explicit_boundary.is_none() && !has_unacknowledged_revision {
+    if authoritative_history_revision.is_none() && !has_unacknowledged_revision {
         return None;
     }
 
     let mut digest = Sha256::new();
     digest.update(b"bamboo-auto-dream-history-rewrite-v1\0");
     digest.update(session.id.as_bytes());
-    if let Some(state) = explicit_boundary {
-        digest.update(b"\0model-context\0");
-        digest.update(state.prefix_epoch.to_be_bytes());
-        // Multiple delete/truncate/restore steps intentionally share one
-        // pending prefix epoch, but each call still advances the existing
-        // state revision. Include that independent revision so AutoDream can
-        // acknowledge every mutation without adding a second Session cursor.
-        digest.update(state.state_revision.to_be_bytes());
+    if let Some(revision) = authoritative_history_revision {
+        digest.update(b"\0authoritative-history\0");
+        digest.update(revision.to_be_bytes());
     }
     for (message, updated_at) in revised_messages {
         digest.update(b"\0message\0");
@@ -1713,6 +1711,52 @@ async fn write_history_rewrite_plan(
     write_json_create_once(&path, &bytes, "history-rewrite-plan").await
 }
 
+fn memory_has_session_source(document: &DurableMemoryDocument, session_id: &str) -> bool {
+    document
+        .frontmatter
+        .sources
+        .iter()
+        .any(|source| source.kind == "session" && source.id == session_id)
+}
+
+fn memory_actor_is(document: &DurableMemoryDocument, actors: &[&str]) -> bool {
+    document
+        .frontmatter
+        .created_by
+        .actor
+        .as_deref()
+        .is_some_and(|actor| actors.contains(&actor))
+        || document
+            .frontmatter
+            .updated_by
+            .actor
+            .as_deref()
+            .is_some_and(|actor| actors.contains(&actor))
+}
+
+fn memory_lineage_contains_session_source<'a>(
+    document: &'a DurableMemoryDocument,
+    documents_by_id: &HashMap<&'a str, &'a DurableMemoryDocument>,
+    session_id: &str,
+    visited: &mut HashSet<&'a str>,
+) -> bool {
+    if memory_has_session_source(document, session_id) {
+        return true;
+    }
+    if !visited.insert(document.frontmatter.id.as_str()) {
+        return false;
+    }
+    document
+        .frontmatter
+        .relations
+        .supersedes
+        .iter()
+        .filter_map(|id| documents_by_id.get(id.as_str()).copied())
+        .any(|ancestor| {
+            memory_lineage_contains_session_source(ancestor, documents_by_id, session_id, visited)
+        })
+}
+
 async fn collect_history_rewrite_replacement_targets(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
@@ -1755,22 +1799,28 @@ async fn collect_history_rewrite_replacement_targets(
             .map_err(|error| {
                 format!("failed to inspect AutoDream memories before history rewrite: {error}")
             })?;
-        for document in documents {
-            let is_auto_dream =
-                document.frontmatter.updated_by.actor.as_deref() == Some(AUTO_DREAM_MEMORY_ACTOR);
-            let has_session_source = document
-                .frontmatter
-                .sources
-                .iter()
-                .any(|source| source.kind == "session" && source.id == session.session_id);
+        let documents_by_id = documents
+            .iter()
+            .map(|document| (document.frontmatter.id.as_str(), document))
+            .collect::<HashMap<_, _>>();
+        for document in &documents {
+            let is_direct_auto_dream = document.frontmatter.updated_by.actor.as_deref()
+                == Some(AUTO_DREAM_MEMORY_ACTOR)
+                && memory_has_session_source(document, &session.session_id);
+            let is_gardener_descendant = memory_actor_is(document, &GARDENER_MEMORY_ACTORS)
+                && memory_lineage_contains_session_source(
+                    document,
+                    &documents_by_id,
+                    &session.session_id,
+                    &mut HashSet::new(),
+                );
             if document.frontmatter.status == DurableMemoryStatus::Active
-                && is_auto_dream
-                && has_session_source
+                && (is_direct_auto_dream || is_gardener_descendant)
             {
                 targets.insert(MemoryReplacementTarget {
-                    id: document.frontmatter.id,
+                    id: document.frontmatter.id.clone(),
                     scope: document.frontmatter.scope,
-                    project_key: document.frontmatter.project_key,
+                    project_key: document.frontmatter.project_key.clone(),
                 });
             }
         }
@@ -4119,6 +4169,10 @@ mod tests {
             ("project identifier", "PROJECT_KEY=abc"),
             ("primary identifier", "PRIMARY_KEY=id"),
             ("cache identifier", "CACHE_KEY=user-id"),
+            ("working directory", "PWD=/workspace/project"),
+            ("old working directory", "OLDPWD=/workspace/old"),
+            ("ordinary bypass setting", "BYPASS=enabled"),
+            ("ordinary compass setting", "COMPASS=north"),
         ] {
             assert!(
                 !contains_secret_like_value(value),
@@ -4156,6 +4210,8 @@ mod tests {
             ("secret key assignment", "STRIPE_SECRET_KEY=abc"),
             ("secret key base assignment", "SECRET_KEY_BASE=abc"),
             ("PostgreSQL password assignment", "PGPASSWORD=abc"),
+            ("password alias assignment", "DB_PASS=abc"),
+            ("password short alias assignment", "MYSQL_PWD=abc"),
             ("lowercase secret key assignment", "stripe_secret_key=abc"),
             ("key id assignment", "AWS_ACCESS_KEY_ID=abc"),
             (
@@ -4231,6 +4287,8 @@ mod tests {
             ("STRIPE_SECRET_KEY", "abc"),
             ("SECRET_KEY_BASE", "abc"),
             ("PGPASSWORD", "abc"),
+            ("DB_PASS", "abc"),
+            ("MYSQL_PWD", "abc"),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
         ] {
@@ -4604,9 +4662,7 @@ mod tests {
             .messages
             .push(Message::assistant("first removed fact", None));
         session.messages.pop();
-        session.reset_model_context_epoch(
-            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
-        );
+        session.clear_derived_context_state();
         let first = history_rewrite_revision(&session, None).expect("first rewrite revision");
         let first_state_revision = session
             .model_context_state
@@ -4615,9 +4671,7 @@ mod tests {
             .state_revision;
 
         session.messages.clear();
-        session.reset_model_context_epoch(
-            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
-        );
+        session.clear_derived_context_state();
         let second = history_rewrite_revision(&session, None).expect("second rewrite revision");
         let second_state = session
             .model_context_state
@@ -4629,9 +4683,31 @@ mod tests {
             "pending epoch stays coalesced"
         );
         assert_eq!(second_state.state_revision, first_state_revision + 1);
+        assert_eq!(second_state.history_rewrite_revision, 2);
         assert_ne!(
             second, first,
             "each mutation needs a distinct acknowledgement"
+        );
+    }
+
+    #[test]
+    fn internal_prompt_reset_does_not_create_a_history_rewrite() {
+        let mut session = Session::new("internal-prompt-reset", "model");
+        session
+            .messages
+            .push(Message::user("canonical transcript remains unchanged"));
+        session.reset_model_context_epoch(
+            bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+        );
+
+        assert!(history_rewrite_revision(&session, None).is_none());
+        assert_eq!(
+            session
+                .model_context_state
+                .as_ref()
+                .expect("model context state")
+                .history_rewrite_revision,
+            0
         );
     }
 
@@ -4971,6 +5047,30 @@ mod tests {
             )
             .await
             .expect("seed old AutoDream memory");
+        let gardener_split = memory
+            .split_memory(
+                &old_auto.frontmatter.id,
+                None,
+                &[
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Canonical database engine".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "The database is PostgreSQL.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                    bamboo_memory::memory_store::MemorySplitPiece {
+                        title: "Canonical database persistence".to_string(),
+                        r#type: Some(DurableMemoryType::Project),
+                        content: "Canonical persistence relies on PostgreSQL.".to_string(),
+                        tags: vec!["database".to_string()],
+                    },
+                ],
+                Some("__memory_gardener__"),
+                "memory-gardener",
+            )
+            .await
+            .expect("split old AutoDream memory")
+            .expect("gardener split result");
         let manual = memory
             .write_memory(
                 MemoryScope::Global,
@@ -5066,8 +5166,8 @@ mod tests {
                 .iter()
                 .filter(|document| document.frontmatter.status == DurableMemoryStatus::Active)
                 .count(),
-            3,
-            "old, manual, and replacement memories stay active until both sinks succeed"
+            4,
+            "gardener descendants, manual, and replacement memories stay active until both sinks succeed"
         );
         let history_revision = contexts[0]
             .history_revision
@@ -5105,6 +5205,16 @@ mod tests {
             .find(|document| document.frontmatter.id == old_auto.frontmatter.id)
             .expect("old AutoDream memory remains auditable");
         assert_eq!(old.frontmatter.status, DurableMemoryStatus::Superseded);
+        for id in &gardener_split.new_ids {
+            let descendant = documents
+                .iter()
+                .find(|document| document.frontmatter.id == *id)
+                .expect("gardener descendant remains auditable");
+            assert_eq!(
+                descendant.frontmatter.status,
+                DurableMemoryStatus::Superseded
+            );
+        }
         let manual = documents
             .iter()
             .find(|document| document.frontmatter.id == manual.frontmatter.id)

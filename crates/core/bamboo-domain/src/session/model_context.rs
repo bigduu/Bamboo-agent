@@ -37,6 +37,13 @@ pub struct ModelContextState {
     /// extensions whose context-event sequence does not change.
     #[serde(default)]
     pub state_revision: u64,
+    /// Monotonic generation for deliberate rewrites of the authoritative
+    /// user-visible Session transcript. Internal prompt/context resets do not
+    /// advance this value, so background consumers can distinguish a real
+    /// history edit from a provider-only prefix rewrite without persisting raw
+    /// content or a second extraction watermark.
+    #[serde(default)]
+    pub history_rewrite_revision: u64,
     #[serde(default)]
     pub prefix_epoch: u64,
     #[serde(default)]
@@ -64,6 +71,7 @@ impl Default for ModelContextState {
         Self {
             schema_version: MODEL_CONTEXT_SCHEMA_VERSION,
             state_revision: 0,
+            history_rewrite_revision: 0,
             prefix_epoch: 0,
             next_sequence: 0,
             baselines: BTreeMap::new(),
@@ -340,6 +348,7 @@ mod tests {
         .expect("old state");
         assert_eq!(state.prefix_epoch, 7);
         assert_eq!(state.state_revision, 0);
+        assert_eq!(state.history_rewrite_revision, 0);
         assert!(state.cache_scope_sha256.is_none());
         assert!(state.transcript_item_sha256.is_empty());
         assert!(state.last_reset_reason.is_none());
@@ -367,5 +376,29 @@ mod tests {
         );
         assert!(state.events.is_empty());
         assert!(state.baselines.is_empty());
+    }
+
+    #[test]
+    fn authoritative_history_generation_is_distinct_from_internal_resets() {
+        let mut session = Session::new("history-generation", "model");
+        session.reset_model_context_epoch(ModelContextResetReason::ExplicitHistoryRewrite);
+        assert_eq!(
+            session
+                .model_context_state
+                .as_ref()
+                .expect("model context state")
+                .history_rewrite_revision,
+            0,
+            "an internal prompt reset must not claim a transcript edit"
+        );
+
+        session.clear_derived_context_state();
+        session.clear_derived_context_state();
+        let state = session.model_context_state.as_ref().unwrap();
+        assert_eq!(state.history_rewrite_revision, 2);
+        assert_eq!(
+            state.prefix_epoch, 1,
+            "pending provider epoch stays coalesced"
+        );
     }
 }
