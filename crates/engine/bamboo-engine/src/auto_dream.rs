@@ -257,7 +257,58 @@ fn credential_url_pattern() -> &'static Regex {
 }
 
 fn looks_like_technical_path_token(token: &str) -> bool {
-    token.starts_with('/') || token.matches('/').count() >= 2
+    if token.matches('/').count() < 2 {
+        return false;
+    }
+
+    let segments = token
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let has_directory_marker = segments.iter().any(|segment| {
+        [
+            "app",
+            "apps",
+            "bin",
+            "config",
+            "crates",
+            "docs",
+            "etc",
+            "examples",
+            "fixtures",
+            "home",
+            "lib",
+            "opt",
+            "packages",
+            "scripts",
+            "src",
+            "test",
+            "tests",
+            "tmp",
+            "users",
+            "usr",
+            "var",
+            "workspace",
+            "workspaces",
+        ]
+        .iter()
+        .any(|marker| segment.eq_ignore_ascii_case(marker))
+    });
+    let has_known_file_extension = segments.last().is_some_and(|segment| {
+        segment.rsplit_once('.').is_some_and(|(stem, suffix)| {
+            !stem.is_empty()
+                && [
+                    "c", "cc", "cfg", "conf", "cpp", "css", "go", "h", "hpp", "htm", "html", "ini",
+                    "java", "js", "json", "jsx", "kt", "kts", "lock", "md", "mjs", "mm", "php",
+                    "proto", "py", "rb", "rs", "scss", "sh", "sql", "swift", "toml", "ts", "tsx",
+                    "txt", "xml", "yaml", "yml", "zsh",
+                ]
+                .iter()
+                .any(|extension| suffix.eq_ignore_ascii_case(extension))
+        })
+    });
+
+    has_directory_marker && (token.starts_with('/') || has_known_file_extension)
 }
 
 fn ascii_shannon_entropy(token: &str) -> f64 {
@@ -5361,6 +5412,14 @@ mod tests {
                 "high-entropy token with environment suffix",
                 "mF9Bx7Qa2cD8Zp4Ln6Rt3Vy5Kw1Hs0Je.prod",
             ),
+            (
+                "slash-bearing opaque Base64 token",
+                "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je",
+            ),
+            (
+                "slash-bearing opaque token with path-like suffix",
+                "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je.toml",
+            ),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
             assert!(
@@ -5427,6 +5486,14 @@ mod tests {
             ),
             ("AWS_ACCESS_KEY_ID", "ASIA1234567890ABCDEF"),
             ("Authorization", "Token 0123456789abcdef0123456789abcdef"),
+            (
+                "Opaque Base64 credential",
+                "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je",
+            ),
+            (
+                "Opaque Base64 credential with path-like suffix",
+                "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je.toml",
+            ),
         ] {
             let unsafe_memory = DurableExtractionCandidate {
                 title: title.to_string(),
