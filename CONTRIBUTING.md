@@ -216,7 +216,8 @@ bamboo/
 
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the Linux test suites plus `rustfmt` and Clippy gates. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows. Manual dispatches also run the platform matrix. Documentation, `cargo-audit`, and `cargo-deny` remain part of CI.
+- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run only `cargo build --locked` and `cargo test --locked` in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain the comprehensive validation jobs. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix.
+- **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
 - **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
 - **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
