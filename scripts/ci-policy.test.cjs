@@ -3,6 +3,7 @@ const { readFileSync } = require("node:fs")
 const { test } = require("node:test")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
+const contributing = readFileSync("CONTRIBUTING.md", "utf8")
 
 const job = (id) => {
   const marker = `\n  ${id}:\n`
@@ -47,6 +48,11 @@ test("routine dev pull requests run one locked Rust build-and-test gate", () => 
     /run: cargo test --locked --all-features --lib --tests\n/u,
   )
   assert.match(testJob, /run: cargo build --locked --examples\n/u)
+
+  assert.match(
+    contributing,
+    /Pull requests into `dev` run only `cargo build --locked` and `cargo test --locked` in the required `Test` gate\./u,
+  )
 })
 
 test("expensive validation jobs stay off dev pull requests", () => {
