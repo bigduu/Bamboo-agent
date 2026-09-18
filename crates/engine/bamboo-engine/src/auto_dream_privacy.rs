@@ -1096,6 +1096,37 @@ fn contains_embedded_structured_credential(value: &str) -> bool {
     false
 }
 
+fn contains_line_oriented_credential_assignment(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with(';')
+            || line.starts_with("//")
+        {
+            return false;
+        }
+        let line = line
+            .strip_prefix("export ")
+            .or_else(|| line.strip_prefix("set "))
+            .unwrap_or(line)
+            .trim_start();
+        let Some((name, candidate)) = line.split_once('=').or_else(|| line.split_once(':')) else {
+            return false;
+        };
+        let name = name
+            .trim()
+            .trim_matches(|character| matches!(character, '\"' | '\''));
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            && structured_environment_name_is_credential(name)
+            && credential_assignment_value_is_literal(candidate)
+    })
+}
+
 fn contains_structured_environment_credential(value: &str) -> bool {
     structured_environment_literal_pattern()
         .captures_iter(value)
@@ -1103,6 +1134,7 @@ fn contains_structured_environment_credential(value: &str) -> bool {
         || reversed_structured_environment_literal_pattern()
             .captures_iter(value)
             .any(structured_environment_captures_credential)
+        || contains_line_oriented_credential_assignment(value)
         // YAML is a superset of JSON, so one structured parser covers quoted
         // JSON objects plus block- and flow-style YAML independent of field
         // order. The bounded regex paths above retain support for snippets
@@ -2158,6 +2190,15 @@ mod tests {
                 "Pwd=\"${DB_PASSWORD}\"",
             ),
             ("password assignment placeholder", "password=${DB_PASSWORD}"),
+            (
+                "camelCase properties placeholder",
+                "dbPassword=${DB_PASSWORD}",
+            ),
+            ("npmrc credential state", "_authToken=required"),
+            (
+                "commented camelCase credential",
+                "# dbPassword=hunter2",
+            ),
             ("password assignment state", "password: required"),
             ("password assignment null", "password: null"),
             ("password assignment boolean", "password: true"),
@@ -2493,6 +2534,15 @@ mod tests {
             ("unquoted Pwd config field", "Pwd=hunter2"),
             ("camelCase database password", "dbPassword: hunter2"),
             ("camelCase SMTP password", "smtpPassword = \"hunter2\""),
+            (
+                "Java properties camelCase password",
+                "dbPassword=hunter2",
+            ),
+            ("npmrc camelCase auth token", "_authToken=hunter2"),
+            (
+                "exported camelCase password",
+                "export dbPassword=hunter2",
+            ),
             (
                 "Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: hunter2",
