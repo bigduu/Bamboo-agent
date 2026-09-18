@@ -334,14 +334,66 @@ fn contains_otp_provisioning_secret(value: &str) -> bool {
         })
 }
 
-fn netrc_credential_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(?:^|\s)(?:machine\s+[^\s]+\s+login\s+[^\s]+\s+password\s+[^\s]+|machine\s+[^\s]+\s+password\s+[^\s]+(?:\s+login\s+[^\s]+)?|default\s+login\s+[^\s]+\s+password\s+[^\s]+|default\s+password\s+[^\s]+)"#,
-        )
-        .expect("netrc credential regex must compile")
-    })
+fn contains_netrc_credential(value: &str) -> bool {
+    const MAX_FIELDS_PER_ENTRY: usize = 16;
+
+    let mut tokens = value
+        .lines()
+        .flat_map(|line| {
+            line.split_once('#')
+                .map_or(line, |(content, _)| content)
+                .split_ascii_whitespace()
+        })
+        .peekable();
+    while let Some(token) = tokens.next() {
+        let token = token.trim_matches(|character| matches!(character, '"' | '\''));
+        let is_machine = token.eq_ignore_ascii_case("machine");
+        let is_default = token.eq_ignore_ascii_case("default");
+        if !is_machine && !is_default {
+            continue;
+        }
+        if is_machine && tokens.next().is_none() {
+            continue;
+        }
+
+        let mut fields_seen = 0usize;
+        let mut literal_password = false;
+        while let Some(field) = tokens.peek().copied() {
+            let field = field.trim_matches(|character| matches!(character, '"' | '\''));
+            if field.eq_ignore_ascii_case("machine")
+                || field.eq_ignore_ascii_case("default")
+                || field.eq_ignore_ascii_case("macdef")
+            {
+                break;
+            }
+            let is_password = field.eq_ignore_ascii_case("password");
+            let is_known_field = is_password
+                || field.eq_ignore_ascii_case("login")
+                || field.eq_ignore_ascii_case("user")
+                || field.eq_ignore_ascii_case("account");
+            if !is_known_field {
+                break;
+            }
+            if fields_seen >= MAX_FIELDS_PER_ENTRY {
+                // An entry that exceeds the supported field bound is unsafe to
+                // classify as ordinary prose. Fail closed without scanning or
+                // retaining any additional values.
+                return true;
+            }
+            let _ = tokens.next();
+            let Some(candidate) = tokens.next() else {
+                break;
+            };
+            fields_seen += 1;
+            if is_password && !is_placeholder_only(candidate) {
+                literal_password = true;
+            }
+        }
+        if literal_password {
+            return true;
+        }
+    }
+    false
 }
 
 fn sql_password_clause_pattern() -> &'static Regex {
@@ -1066,7 +1118,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_curl_user_credential(value)
         || contains_wallet_mnemonic(value)
         || contains_otp_provisioning_secret(value)
-        || netrc_credential_pattern().is_match(value)
+        || contains_netrc_credential(value)
         || sql_password_clause_pattern().is_match(value)
         || contains_identified_credential(value)
         || contains_xml_credential(value)
@@ -1463,6 +1515,10 @@ mod tests {
                 "machine learning login flows enforce password policy",
             ),
             (
+                "netrc password placeholder",
+                "machine example.test user alice account billing password ${NETRC_PASSWORD}",
+            ),
+            (
                 "SQL password policy",
                 "ALTER ROLE alice SET password_policy = 'strict';",
             ),
@@ -1712,6 +1768,22 @@ mod tests {
             (
                 "netrc machine record",
                 "machine example.test login alice password hunter2",
+            ),
+            (
+                "netrc account record",
+                "machine example.test login alice account billing password hunter2",
+            ),
+            (
+                "netrc user alias",
+                "machine example.test user alice password hunter2",
+            ),
+            (
+                "netrc reordered fields",
+                "machine example.test password hunter2 account billing login alice",
+            ),
+            (
+                "netrc multiline record with comment",
+                "machine example.test login alice # production\n  account billing\n  password hunter2",
             ),
             (
                 "netrc default record",
