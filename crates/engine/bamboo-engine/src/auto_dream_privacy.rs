@@ -90,6 +90,17 @@ fn is_placeholder_only(value: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     };
 
+    // Assignment scanners intentionally stop at whitespace, so a spaced GitHub
+    // expression can reach this helper as just its unambiguous opening token.
+    if matches!(value, "${{" | "{{") {
+        return true;
+    }
+    if let Some(candidate) = value
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    {
+        return !candidate.trim().is_empty();
+    }
     if let Some(candidate) = value
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
@@ -451,7 +462,7 @@ fn xml_credential_name_attribute_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:name|key)\s*=\s*[\"'](?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)[\"']"#,
+            r#"(?i)\b(?:name|key)\s*=\s*[\"'](?:[a-z_][a-z0-9_-]*[.:]){0,8}(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)[\"']"#,
         )
         .expect("XML credential name attribute regex must compile")
     })
@@ -1562,6 +1573,10 @@ mod tests {
             ),
             ("password assignment placeholder", "password=${DB_PASSWORD}"),
             (
+                "GitHub expression password placeholder",
+                "password: ${{ secrets.DB_PASSWORD }}",
+            ),
+            (
                 "environment assignment placeholder",
                 "DB_PASSWORD=$SECRET_REF",
             ),
@@ -1640,6 +1655,10 @@ mod tests {
             (
                 "XML credential property placeholder",
                 "<property name=\"password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "qualified XML credential property placeholder",
+                "<property name=\"hibernate.connection.password\" value=\"${DB_PASSWORD}\"/>",
             ),
             (
                 "XML credential attribute placeholder",
@@ -1895,6 +1914,14 @@ mod tests {
             (
                 "XML credential property",
                 "<property name=\"password\" value=\"hunter2\"/>",
+            ),
+            (
+                "qualified XML credential property",
+                "<property name=\"hibernate.connection.password\" value=\"hunter2\"/>",
+            ),
+            (
+                "namespaced XML credential property",
+                "<property name=\"database:password\" value=\"hunter2\"/>",
             ),
             (
                 "nested XML credential property",
