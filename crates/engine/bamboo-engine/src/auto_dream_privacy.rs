@@ -569,33 +569,79 @@ fn structured_environment_literal_pattern() -> &'static Regex {
     })
 }
 
+fn reversed_structured_environment_literal_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:-[ \t]*)?value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})\r?\n[ \t]+name[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*$"#,
+        )
+        .expect("reversed structured environment literal regex must compile")
+    })
+}
+
+fn structured_environment_name_is_credential(name: &str) -> bool {
+    contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe"))
+}
+
+fn structured_environment_value_is_literal(candidate: &str) -> bool {
+    let candidate = candidate
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''))
+        .trim();
+    !candidate.is_empty() && !is_placeholder_only(candidate)
+}
+
+fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> bool {
+    captures
+        .name("name")
+        .is_some_and(|name| structured_environment_name_is_credential(name.as_str()))
+        && captures
+            .name("value")
+            .is_some_and(|candidate| structured_environment_value_is_literal(candidate.as_str()))
+}
+
+fn json_contains_structured_environment_credential(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            let name = fields
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("name"))
+                .and_then(|(_, value)| value.as_str());
+            let candidate = fields
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("value"))
+                .map(|(_, value)| value);
+            let contains_credential = name
+                .filter(|name| structured_environment_name_is_credential(name))
+                .zip(candidate)
+                .is_some_and(|(_, candidate)| match candidate {
+                    serde_json::Value::String(candidate) => {
+                        structured_environment_value_is_literal(candidate)
+                    }
+                    serde_json::Value::Number(_) => true,
+                    _ => false,
+                });
+            contains_credential
+                || fields
+                    .values()
+                    .any(json_contains_structured_environment_credential)
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(json_contains_structured_environment_credential),
+        _ => false,
+    }
+}
+
 fn contains_structured_environment_credential(value: &str) -> bool {
     structured_environment_literal_pattern()
         .captures_iter(value)
-        .any(|captures| {
-            let Some(name) = captures.name("name") else {
-                return false;
-            };
-            if !contains_environment_credential_assignment(&format!(
-                "{}=bamboo-privacy-probe",
-                name.as_str()
-            )) {
-                return false;
-            }
-            let Some(candidate) = captures.name("value") else {
-                return false;
-            };
-            let candidate = candidate
-                .as_str()
-                .trim()
-                .trim_matches(|character| matches!(character, '\"' | '\''))
-                .trim();
-            !candidate.is_empty()
-                && !candidate.starts_with('$')
-                && !candidate.starts_with('<')
-                && !candidate.starts_with("{{")
-                && !candidate.starts_with('%')
-        })
+        .any(structured_environment_captures_credential)
+        || reversed_structured_environment_literal_pattern()
+            .captures_iter(value)
+            .any(structured_environment_captures_credential)
+        || serde_json::from_str::<serde_json::Value>(value)
+            .is_ok_and(|value| json_contains_structured_environment_credential(&value))
 }
 
 fn docker_auth_config_pattern() -> &'static Regex {
@@ -1305,6 +1351,14 @@ mod tests {
                 "- name: DB_PASSWORD\n  value: ${DB_PASSWORD}",
             ),
             (
+                "reversed Kubernetes environment placeholder",
+                "- value: ${DB_PASSWORD}\n  name: DB_PASSWORD",
+            ),
+            (
+                "reversed JSON environment placeholder",
+                r#"{"value":"${DB_PASSWORD}","name":"DB_PASSWORD"}"#,
+            ),
+            (
                 "authorization bearer placeholder",
                 "Authorization: Bearer ${API_TOKEN}",
             ),
@@ -1484,6 +1538,14 @@ mod tests {
             (
                 "quoted Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: \"hunter2\"",
+            ),
+            (
+                "reversed Kubernetes environment literal",
+                "- value: hunter2\n  name: DB_PASSWORD",
+            ),
+            (
+                "reversed JSON environment literal",
+                r#"{"value":"hunter2","name":"DB_PASSWORD"}"#,
             ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
