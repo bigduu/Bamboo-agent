@@ -856,11 +856,13 @@ fn yaml_contains_kubernetes_secret(value: &serde_yaml::Value) -> bool {
     }
 }
 
-fn kubernetes_secret_kind_pattern() -> &'static Regex {
+fn kubernetes_secret_kind_hint_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?im)^[ \t]*kind[ \t]*:[ \t]*[\"']?secret[\"']?[ \t]*(?:#.*)?$"#)
-            .expect("Kubernetes Secret kind regex must compile")
+        Regex::new(
+            r#"(?i)(?:^|[,{ \t\r\n])[\"']?kind[\"']?[ \t]*:[ \t]*[\"']?secret[\"']?(?:[ \t\r\n,}]|$)"#,
+        )
+        .expect("Kubernetes Secret kind hint regex must compile")
     })
 }
 
@@ -875,19 +877,15 @@ fn yaml_document_separator_pattern() -> &'static Regex {
 fn contains_kubernetes_secret(value: &str) -> bool {
     const MAX_YAML_DOCUMENTS: usize = 32;
 
-    if !kubernetes_secret_kind_pattern().is_match(value) {
-        return false;
-    }
     for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
         if index >= MAX_YAML_DOCUMENTS {
-            // A Secret-shaped manifest beyond the parser's document bound is
-            // indeterminate and therefore rejected rather than silently
-            // omitting later payloads.
-            return true;
+            // Only a Secret-shaped manifest is sensitive to an unparsed tail;
+            // ordinary long Markdown documents retain compatibility.
+            return kubernetes_secret_kind_hint_pattern().is_match(value);
         }
         match serde_yaml::from_str::<serde_yaml::Value>(document) {
             Ok(document) if yaml_contains_kubernetes_secret(&document) => return true,
-            Err(_) if kubernetes_secret_kind_pattern().is_match(document) => {
+            Err(_) if kubernetes_secret_kind_hint_pattern().is_match(document) => {
                 // Secret-shaped YAML that cannot be parsed safely is
                 // indeterminate and must not cross the privacy boundary.
                 return true;
@@ -1860,6 +1858,10 @@ mod tests {
                 "apiVersion: v1\nkind: Secret\nstringData:\n  license: ${LICENSE_KEY}",
             ),
             (
+                "Kubernetes Secret JSON payload placeholder",
+                r#"{"kind":"Secret","stringData":{"license":"${LICENSE_KEY}"}}"#,
+            ),
+            (
                 "Kubernetes ConfigMap literal",
                 "apiVersion: v1\nkind: ConfigMap\ndata:\n  license: hunter2",
             ),
@@ -2124,6 +2126,14 @@ mod tests {
             (
                 "Kubernetes Secret stringData literal",
                 "apiVersion: v1\nkind: Secret\nstringData:\n  license: hunter2",
+            ),
+            (
+                "Kubernetes Secret JSON stringData literal",
+                r#"{"kind":"Secret","stringData":{"license":"hunter2"}}"#,
+            ),
+            (
+                "Kubernetes Secret flow YAML data literal",
+                "{ kind: Secret, data: { license: aHVudGVyMg== } }",
             ),
             (
                 "Kubernetes Secret data literal in a multi-document manifest",
