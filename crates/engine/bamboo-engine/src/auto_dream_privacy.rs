@@ -958,6 +958,113 @@ fn toml_contains_structured_credential(value: &toml::Value) -> bool {
     })
 }
 
+const MAX_STRUCTURED_DOCUMENTS: usize = 32;
+const MAX_EMBEDDED_STRUCTURED_BLOCKS: usize = 32;
+const MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES: usize = 64 * 1024;
+
+fn structured_multiline_scalar_hint(value: &str) -> bool {
+    value.lines().any(|line| {
+        let mut line = line.trim_start_matches([' ', '\t']);
+        if let Some(rest) = line.strip_prefix('-') {
+            line = rest.trim_start_matches([' ', '\t']);
+        }
+        let Some((name, candidate)) = line.split_once(':').or_else(|| line.split_once('=')) else {
+            return false;
+        };
+        let name = name
+            .trim()
+            .trim_matches(|character| matches!(character, '\"' | '\''));
+        let candidate = candidate.trim_start();
+        structured_environment_name_is_credential(name)
+            && (candidate.starts_with('|')
+                || candidate.starts_with('>')
+                || candidate.starts_with("\"\"\"")
+                || candidate.starts_with("'''"))
+    })
+}
+
+fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) -> bool {
+    for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
+        if index >= MAX_STRUCTURED_DOCUMENTS {
+            return fail_closed && structured_multiline_scalar_hint(value);
+        }
+        if document.trim().is_empty() {
+            continue;
+        }
+        match serde_yaml::from_str::<serde_yaml::Value>(document) {
+            Ok(document) if yaml_contains_structured_environment_credential(&document) => {
+                return true;
+            }
+            Err(_) if fail_closed && structured_multiline_scalar_hint(document) => return true,
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
+}
+
+fn structured_block_contains_credential(value: &str) -> bool {
+    if value.len() > MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES {
+        return structured_multiline_scalar_hint(value);
+    }
+    yaml_documents_contain_structured_credential(value, true)
+        || toml::from_str::<toml::Value>(value)
+            .is_ok_and(|value| toml_contains_structured_credential(&value))
+        || (structured_multiline_scalar_hint(value)
+            && serde_yaml::from_str::<serde_yaml::Value>(value).is_err()
+            && toml::from_str::<toml::Value>(value).is_err())
+}
+
+fn markdown_fence(line: &str) -> Option<(u8, usize)> {
+    let line = line
+        .trim_end_matches(['\r', '\n'])
+        .trim_start_matches([' ', '\t']);
+    let marker = *line.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn contains_embedded_structured_credential(value: &str) -> bool {
+    let mut open_fence: Option<(u8, usize, usize)> = None;
+    let mut block_count = 0usize;
+    let mut offset = 0usize;
+
+    for line in value.split_inclusive('\n') {
+        if let Some((marker, length, body_start)) = open_fence {
+            let is_close = markdown_fence(line).is_some_and(|(candidate, candidate_length)| {
+                candidate == marker
+                    && candidate_length >= length
+                    && line
+                        .trim_end_matches(['\r', '\n'])
+                        .trim_start_matches([' ', '\t'])[candidate_length..]
+                        .trim()
+                        .is_empty()
+            });
+            if is_close {
+                let body = &value[body_start..offset];
+                if structured_block_contains_credential(body) {
+                    return true;
+                }
+                block_count += 1;
+                open_fence = None;
+                if block_count >= MAX_EMBEDDED_STRUCTURED_BLOCKS {
+                    return structured_multiline_scalar_hint(&value[offset + line.len()..]);
+                }
+            }
+        } else if let Some((marker, length)) = markdown_fence(line) {
+            open_fence = Some((marker, length, offset + line.len()));
+        }
+        offset += line.len();
+    }
+
+    if let Some((_, _, body_start)) = open_fence {
+        return structured_multiline_scalar_hint(&value[body_start..]);
+    }
+    false
+}
+
 fn contains_structured_environment_credential(value: &str) -> bool {
     structured_environment_literal_pattern()
         .captures_iter(value)
@@ -969,10 +1076,13 @@ fn contains_structured_environment_credential(value: &str) -> bool {
         // JSON objects plus block- and flow-style YAML independent of field
         // order. The bounded regex paths above retain support for snippets
         // embedded inside otherwise non-YAML prose.
-        || serde_yaml::from_str::<serde_yaml::Value>(value)
-            .is_ok_and(|value| yaml_contains_structured_environment_credential(&value))
+        || yaml_documents_contain_structured_credential(
+            value,
+            yaml_document_separator_pattern().is_match(value),
+        )
         || toml::from_str::<toml::Value>(value)
             .is_ok_and(|value| toml_contains_structured_credential(&value))
+        || contains_embedded_structured_credential(value)
 }
 
 fn yaml_secret_payload_contains_literal(value: &serde_yaml::Value) -> bool {
@@ -2051,6 +2161,14 @@ mod tests {
                 "password: |\n  ${DB_PASSWORD}",
             ),
             (
+                "fenced YAML multiline credential placeholder",
+                "Configuration example:\n```yaml\npassword: |\n  ${DB_PASSWORD}\n```",
+            ),
+            (
+                "second YAML document credential placeholder",
+                "mode: production\n---\npassword: |\n  ${DB_PASSWORD}",
+            ),
+            (
                 "YAML multiline credential state",
                 "password: |\n  required",
             ),
@@ -2389,8 +2507,20 @@ mod tests {
                 "password: |\n  hunter2",
             ),
             (
+                "fenced YAML multiline credential literal",
+                "Configuration example:\n```yaml\npassword: |\n  hunter2\n```",
+            ),
+            (
+                "second YAML document credential literal",
+                "mode: production\n---\npassword: |\n  hunter2",
+            ),
+            (
                 "TOML multiline credential literal",
                 "password = \"\"\"\nhunter2\n\"\"\"",
+            ),
+            (
+                "fenced TOML multiline credential literal",
+                "Configuration example:\n```toml\npassword = \"\"\"\nhunter2\n\"\"\"\n```",
             ),
             (
                 "GitHub expression credential literal",
@@ -2560,6 +2690,15 @@ mod tests {
             .join("&");
         let otp = format!("otpauth://totp/Example:alice?{prefix}&secret=JBSWY3DPEHPK3PXP");
         assert!(contains_secret_like_value(&otp));
+
+        let oversized_fence = format!(
+            "```yaml\npassword: |\n  ${{DB_PASSWORD}}\n{}\n```",
+            " ".repeat(MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES)
+        );
+        assert!(contains_secret_like_value(&oversized_fence));
+        assert!(contains_secret_like_value(
+            "```yaml\npassword: |\n  hunter2"
+        ));
     }
 
     #[test]
