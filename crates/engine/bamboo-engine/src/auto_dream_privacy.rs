@@ -1105,16 +1105,23 @@ fn looks_like_structured_property_name(name: &str) -> bool {
         .any(|character| matches!(character, b'_' | b'-' | b'.'))
 }
 
+fn npm_registry_scoped_property(line: &str) -> Option<&str> {
+    let registry = line.strip_prefix("//")?;
+    let (_, property) = registry.rsplit_once("/:")?;
+    (!property.trim().is_empty()).then_some(property.trim_start())
+}
+
 fn contains_line_oriented_credential_assignment(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim();
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with(';')
-            || line.starts_with("//")
-        {
+        let npm_registry_property = npm_registry_scoped_property(line);
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             return false;
         }
+        if line.starts_with("//") && npm_registry_property.is_none() {
+            return false;
+        }
+        let line = npm_registry_property.unwrap_or(line);
         let line = line
             .strip_prefix("export ")
             .or_else(|| line.strip_prefix("set "))
@@ -1155,7 +1162,9 @@ fn contains_line_oriented_credential_assignment(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
             && (!natural_language || looks_like_structured_property_name(name))
-            && structured_environment_name_is_credential(name)
+            && (structured_environment_name_is_credential(name)
+                || (npm_registry_property.is_some()
+                    && matches!(name.to_ascii_lowercase().as_str(), "_auth" | "auth")))
             && credential_assignment_value_is_literal(candidate)
     })
 }
@@ -2230,6 +2239,14 @@ mod tests {
             ("camelCase natural-language state", "dbPassword is required"),
             ("npmrc credential state", "_authToken=required"),
             (
+                "registry-scoped npm credential state",
+                "//registry.example/:_authToken=required",
+            ),
+            (
+                "ordinary slash comment",
+                "// This comment mentions dbPassword=hunter2",
+            ),
+            (
                 "commented camelCase credential",
                 "# dbPassword=hunter2",
             ),
@@ -2573,6 +2590,14 @@ mod tests {
                 "dbPassword=hunter2",
             ),
             ("npmrc camelCase auth token", "_authToken=hunter2"),
+            (
+                "registry-scoped npm auth token",
+                "//registry.example/:_authToken=hunter2",
+            ),
+            (
+                "registry-scoped npm basic auth",
+                "//registry.example/:_auth=hunter2",
+            ),
             (
                 "exported camelCase password",
                 "export dbPassword=hunter2",
