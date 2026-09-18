@@ -89,6 +89,17 @@ fn is_placeholder_only(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     };
+    let reference_path = |candidate: &str| {
+        let candidate = candidate.trim();
+        !candidate.is_empty()
+            && candidate.split('.').all(|segment| {
+                let mut bytes = segment.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+    };
 
     // Assignment scanners intentionally stop at whitespace, so a spaced GitHub
     // expression can reach this helper as just its unambiguous opening token.
@@ -99,7 +110,7 @@ fn is_placeholder_only(value: &str) -> bool {
         .strip_prefix("${{")
         .and_then(|rest| rest.strip_suffix("}}"))
     {
-        return !candidate.trim().is_empty();
+        return reference_path(candidate);
     }
     if let Some(candidate) = value
         .strip_prefix("${")
@@ -120,12 +131,35 @@ fn is_placeholder_only(value: &str) -> bool {
         .strip_prefix("{{")
         .and_then(|rest| rest.strip_suffix("}}"))
     {
-        return !candidate.trim().is_empty();
+        return reference_path(candidate);
     }
     value
         .strip_prefix('<')
         .and_then(|rest| rest.strip_suffix('>'))
         .is_some_and(|candidate| !candidate.trim().is_empty())
+}
+
+fn template_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^|[,{ \t])[\"']?(?P<label>[a-z_][a-z0-9_. -]{0,64})[\"']?\s*(?::|=)\s*(?P<value>\$?\{\{[^\r\n]{1,1024}\}\})"#,
+        )
+        .expect("template credential assignment regex must compile")
+    })
+}
+
+fn contains_literal_template_credential(value: &str) -> bool {
+    template_credential_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures
+                .name("label")
+                .is_some_and(|label| structured_environment_name_is_credential(label.as_str()))
+                && captures
+                    .name("value")
+                    .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+        })
 }
 
 fn captures_non_placeholder_credential_value(pattern: &Regex, value: &str) -> bool {
@@ -1529,6 +1563,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
         || contains_curl_user_credential(value)
+        || contains_literal_template_credential(value)
         || contains_wallet_mnemonic(value)
         || contains_otp_provisioning_secret(value)
         || contains_netrc_credential(value)
@@ -1988,6 +2023,10 @@ mod tests {
                 "password: ${{ secrets.DB_PASSWORD }}",
             ),
             (
+                "generic expression password placeholder",
+                "password: {{ vault.password }}",
+            ),
+            (
                 "credential URL password placeholder",
                 "DATABASE_URL=postgres://user:${DB_PASSWORD}@db.example/app",
             ),
@@ -2352,6 +2391,18 @@ mod tests {
             (
                 "TOML multiline credential literal",
                 "password = \"\"\"\nhunter2\n\"\"\"",
+            ),
+            (
+                "GitHub expression credential literal",
+                "password: ${{ 'hunter2' }}",
+            ),
+            (
+                "function expression credential literal",
+                "password=${{ format('hunter2') }}",
+            ),
+            (
+                "generic expression credential literal",
+                "password: {{ \"hunter2\" }}",
             ),
             (
                 "wallet seed phrase",
