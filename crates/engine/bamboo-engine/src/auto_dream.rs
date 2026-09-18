@@ -64,7 +64,7 @@ fn to_consolidation_sessions(
     entries
         .iter()
         .map(|(entry, summary)| {
-            let mut sources = vec![entry.id.as_str(), entry.title.as_str()];
+            let mut sources = vec![entry.title.as_str()];
             if let Some(last_run_status) = entry.last_run_status.as_deref() {
                 sources.push(last_run_status);
             }
@@ -143,17 +143,20 @@ struct DreamSourceWindow {
     sessions: Vec<(SessionIndexEntry, Option<String>)>,
 }
 
-fn collect_json_string_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+fn collect_json_payload_string_values<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
     match value {
         serde_json::Value::String(value) => out.push(value),
         serde_json::Value::Array(values) => {
             for value in values {
-                collect_json_string_values(value, out);
+                collect_json_payload_string_values(value, out);
             }
         }
         serde_json::Value::Object(values) => {
-            for value in values.values() {
-                collect_json_string_values(value, out);
+            for (key, value) in values {
+                if matches!(key.as_str(), "session_id" | "project_key") {
+                    continue;
+                }
+                collect_json_payload_string_values(value, out);
             }
         }
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
@@ -165,7 +168,7 @@ fn task_list_is_secret_safe(task_list: &bamboo_domain::TaskList) -> bool {
         return false;
     };
     let mut sources = Vec::new();
-    collect_json_string_values(&serialized, &mut sources);
+    collect_json_payload_string_values(&serialized, &mut sources);
     extraction_sources_are_secret_safe(&sources)
 }
 
@@ -214,10 +217,7 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
 
 fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
     let updated_at = session.entry.updated_at.to_rfc3339();
-    let mut sources = vec![session.session_id.as_str(), session.entry.title.as_str()];
-    if let Some(project_key) = session.project_key.as_deref() {
-        sources.push(project_key);
-    }
+    let mut sources = vec![session.entry.title.as_str()];
     if let Some(summary) = session.summary.as_deref() {
         sources.push(summary);
     }
@@ -227,12 +227,12 @@ fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> Dre
     }
     if !extraction_sources_are_secret_safe(&sources) {
         return DreamCandidateInfo {
-            // Do not copy any untrusted identifier from the rejected source
-            // unit into the prompt. Candidates that quote this alias are also
-            // rejected later because it is not an authoritative source ID.
-            session_id: "redacted-session".to_string(),
+            // Session and project identifiers are authoritative routing data,
+            // not source payload. Preserve them so a secret-looking opaque ID
+            // cannot make an otherwise safe Session silently ineligible.
+            session_id: session.session_id.clone(),
             title: REDACTED_EXTRACTION_SOURCE.to_string(),
-            project_key: None,
+            project_key: session.project_key.clone(),
             updated_at,
             summary: None,
             topics: Vec::new(),
@@ -1621,7 +1621,8 @@ mod tests {
 
     #[test]
     fn outline_keeps_ordinary_multi_item_task_list() {
-        let mut session = bamboo_agent_core::Session::new("session-safe-tasks", "model");
+        let mut session =
+            bamboo_agent_core::Session::new("0123456789abcdef0123456789abcdef", "model");
         let items = (1..=3)
             .map(|index| bamboo_domain::TaskItem {
                 id: format!("task-{index}"),
@@ -1720,6 +1721,7 @@ mod tests {
         const SYSTEM_SECRET: &str = "postgres://user:password-value@example.test/database";
         const TOPIC_SECRET: &str = "hunter2";
         const SPLIT_LABEL: &str = "Password";
+        const OPAQUE_SESSION_ID: &str = "0123456789abcdef0123456789abcdef";
         const TOOL_MARKER: &str = "ORDINARY_TOOL_RESULT_MUST_NOT_REACH_EXTRACTION";
         const BOUNDARY_SECRET_PREFIX: &str = "mF9/Bx7Qa2cD8";
 
@@ -1765,15 +1767,15 @@ mod tests {
             .await
             .expect("save three-field session");
 
-        let mut identifier_split = bamboo_agent_core::Session::new(TOPIC_SECRET, "model");
-        identifier_split.title = SPLIT_LABEL.to_string();
-        identifier_split.add_message(Message::user(
-            "Ordinary activity for the identifier-split fixture.",
+        let mut opaque_identifier = bamboo_agent_core::Session::new(OPAQUE_SESSION_ID, "model");
+        opaque_identifier.title = "Opaque authority fixture".to_string();
+        opaque_identifier.add_message(Message::user(
+            "Ordinary activity for the opaque-authority fixture.",
         ));
         storage
-            .save_session(&identifier_split)
+            .save_session(&opaque_identifier)
             .await
-            .expect("save identifier-split session");
+            .expect("save opaque-authority session");
 
         let mut outlined = bamboo_agent_core::Session::new("session-outline-private", "model");
         outlined.title = "Ordinary outline title".to_string();
@@ -1831,6 +1833,15 @@ mod tests {
                     "tags": ["preference"],
                     "session_id": "session-outline-private",
                     "confidence": "high"
+                },
+                {
+                    "title": "Opaque authority remains attributable",
+                    "type": "reference",
+                    "scope": "global",
+                    "content": "The opaque authority fixture remains eligible.",
+                    "tags": ["provenance"],
+                    "session_id": OPAQUE_SESSION_ID,
+                    "confidence": "high"
                 }
             ],
             "ledger_candidates": [
@@ -1885,28 +1896,30 @@ mod tests {
         assert_eq!(sanitized_triple_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_triple_split.summary.is_none());
         assert!(sanitized_triple_split.topics.is_empty());
-        let identifier_split_context = contexts
+        let opaque_identifier_context = contexts
             .iter()
-            .find(|context| context.session_id == TOPIC_SECRET)
-            .expect("identifier-split context");
-        let sanitized_identifier_split =
-            sanitized_extraction_candidate_info(identifier_split_context);
-        assert_eq!(sanitized_identifier_split.session_id, "redacted-session");
-        assert_eq!(sanitized_identifier_split.title, REDACTED_EXTRACTION_SOURCE);
-        assert!(sanitized_identifier_split.project_key.is_none());
-        assert!(sanitized_identifier_split.summary.is_none());
-        assert!(sanitized_identifier_split.topics.is_empty());
+            .find(|context| context.session_id == OPAQUE_SESSION_ID)
+            .expect("opaque-authority context");
+        let sanitized_opaque_identifier =
+            sanitized_extraction_candidate_info(opaque_identifier_context);
+        assert_eq!(sanitized_opaque_identifier.session_id, OPAQUE_SESSION_ID);
+        assert_eq!(
+            sanitized_opaque_identifier.title,
+            "Opaque authority fixture"
+        );
+        assert!(sanitized_opaque_identifier.summary.is_some());
+        assert!(sanitized_opaque_identifier.topics.is_empty());
         let consolidation_sessions = to_consolidation_sessions(&[(
-            identifier_split_context.entry.clone(),
-            identifier_split_context.summary.clone(),
+            opaque_identifier_context.entry.clone(),
+            opaque_identifier_context.summary.clone(),
         )]);
-        assert_eq!(consolidation_sessions[0].id, "redacted-session");
-        assert_eq!(consolidation_sessions[0].title, REDACTED_EXTRACTION_SOURCE);
+        assert_eq!(consolidation_sessions[0].id, OPAQUE_SESSION_ID);
+        assert_eq!(consolidation_sessions[0].title, "Opaque authority fixture");
         assert!(consolidation_sessions[0].last_run_status.is_none());
-        assert!(consolidation_sessions[0].summary.is_none());
+        assert!(consolidation_sessions[0].summary.is_some());
         let consolidation_prompt = build_consolidation_prompt(&consolidation_sessions);
-        assert!(!consolidation_prompt.contains(TOPIC_SECRET));
-        assert!(!consolidation_prompt.contains(SPLIT_LABEL));
+        assert!(consolidation_prompt.contains(OPAQUE_SESSION_ID));
+        assert!(consolidation_prompt.contains("Opaque authority fixture"));
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
             &context,
@@ -1921,7 +1934,7 @@ mod tests {
         assert_eq!(
             writes,
             ExtractionWrites {
-                memory: 1,
+                memory: 2,
                 ledger: 1
             }
         );
@@ -1945,16 +1958,19 @@ mod tests {
             );
         }
         assert!(prompt.contains(crate::auto_dream_privacy::REDACTED_EXTRACTION_SOURCE));
+        assert!(prompt.contains(OPAQUE_SESSION_ID));
 
         let documents = memory
             .list_memory_documents(MemoryScope::Global, None)
             .await
             .expect("list memory documents");
-        assert_eq!(documents.len(), 1);
-        assert_eq!(
-            documents[0].frontmatter.title,
-            "User prefers concise replies"
-        );
+        assert_eq!(documents.len(), 2);
+        let document_titles = documents
+            .iter()
+            .map(|document| document.frontmatter.title.as_str())
+            .collect::<HashSet<_>>();
+        assert!(document_titles.contains("User prefers concise replies"));
+        assert!(document_titles.contains("Opaque authority remains attributable"));
 
         let records = ledger
             .list_records(LedgerScope::Global, None, &RecordFilter::default())

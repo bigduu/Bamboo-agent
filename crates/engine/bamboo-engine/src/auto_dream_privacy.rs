@@ -176,6 +176,9 @@ fn contains_short_credential_config_field(value: &str) -> bool {
                 return false;
             };
             let candidate = candidate.as_str().trim();
+            if is_placeholder_only(candidate) {
+                return false;
+            }
             if candidate.starts_with('\"') || candidate.starts_with('\'') {
                 return true;
             }
@@ -1159,9 +1162,6 @@ pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCand
         sources.push(scope);
     }
     sources.extend(candidate.tags.iter().map(String::as_str));
-    if let Some(session_id) = candidate.session_id.as_deref() {
-        sources.push(session_id);
-    }
     if let Some(confidence) = candidate.confidence.as_deref() {
         sources.push(confidence);
     }
@@ -1178,9 +1178,6 @@ pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandid
     }
     if let Some(excerpt) = candidate.excerpt.as_deref() {
         sources.push(excerpt);
-    }
-    if let Some(session_id) = candidate.session_id.as_deref() {
-        sources.push(session_id);
     }
     if let Some(confidence) = candidate.confidence.as_deref() {
         sources.push(confidence);
@@ -1253,6 +1250,10 @@ mod tests {
             ),
             ("ordinary pass field", "pass: true"),
             ("password placeholder field", "Pwd=${DB_PASSWORD}"),
+            (
+                "quoted password placeholder field",
+                "Pwd=\"${DB_PASSWORD}\"",
+            ),
             ("password assignment placeholder", "password=${DB_PASSWORD}"),
             (
                 "environment assignment placeholder",
@@ -1651,6 +1652,20 @@ mod tests {
             "an explicitly labelled technical digest must remain compatible"
         );
 
+        let opaque_authority_id = DurableExtractionCandidate {
+            title: "Opaque authority remains attributable".to_string(),
+            kind: "reference".to_string(),
+            content: "The durable fact remains associated with its source Session.".to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["provenance".to_string()],
+            session_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            durable_candidate_is_secret_safe(&opaque_authority_id),
+            "an authoritative opaque Session ID is not secret-bearing payload"
+        );
+
         let unrelated_hash_context = DurableExtractionCandidate {
             title: "Production integration access".to_string(),
             kind: "reference".to_string(),
@@ -1738,6 +1753,17 @@ mod tests {
         assert!(
             !ledger_candidate_is_secret_safe(&reversed_ledger),
             "excerpt used as the credential label must reject the candidate"
+        );
+
+        let opaque_ledger_authority_id = LedgerExtractionCandidate {
+            title: "Keep the source attribution".to_string(),
+            excerpt: Some("The ordinary work item remains attributable.".to_string()),
+            session_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(
+            ledger_candidate_is_secret_safe(&opaque_ledger_authority_id),
+            "an authoritative opaque Session ID is not Ledger payload"
         );
 
         for (field, candidate) in [
