@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -836,6 +836,9 @@ fn reversed_structured_environment_literal_pattern() -> &'static Regex {
 }
 
 fn structured_environment_name_is_credential(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("_auth") {
+        return true;
+    }
     if contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe")) {
         return true;
     }
@@ -2254,6 +2257,8 @@ mod tests {
                 "past-tense password reset",
                 "The database password was reset yesterday.",
             ),
+            ("past-tense OTP state", "OTP was required for enrollment."),
+            ("past-tense PIN state", "my PIN was reset yesterday."),
             (
                 "past-tense password requirement",
                 "A password was required for the legacy login flow.",
@@ -2295,6 +2300,7 @@ mod tests {
                 "dbPassword IS required",
             ),
             ("npmrc credential state", "_authToken=required"),
+            ("legacy npmrc auth placeholder", "_auth=${NPM_AUTH}"),
             (
                 "registry-scoped npm credential state",
                 "//registry.example/:_authToken=required",
@@ -2647,6 +2653,7 @@ mod tests {
                 "dbPassword=hunter2",
             ),
             ("npmrc camelCase auth token", "_authToken=hunter2"),
+            ("legacy npmrc auth", "_auth=dXNlcjpwYXNz"),
             (
                 "registry-scoped npm auth token",
                 "//registry.example/:_authToken=hunter2",
@@ -2679,6 +2686,8 @@ mod tests {
                 "password reset to a literal",
                 "The database password was reset to hunter2",
             ),
+            ("past-tense PIN disclosure", "my PIN was 1234"),
+            ("past-tense OTP disclosure", "OTP was 123456"),
             (
                 "Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: hunter2",
