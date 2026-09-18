@@ -268,6 +268,72 @@ fn contains_curl_user_credential(value: &str) -> bool {
         })
 }
 
+fn wallet_mnemonic_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^|[^a-z0-9])(?:mnemonic|seed|recovery)(?:[\s_-]+(?:phrase|words?))?\s*(?::|=|\bis\b)\s*(?P<value>[^\r\n]{1,2048})"#,
+        )
+        .expect("wallet mnemonic assignment regex must compile")
+    })
+}
+
+fn contains_wallet_mnemonic(value: &str) -> bool {
+    wallet_mnemonic_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            if is_placeholder_only(candidate.as_str()) {
+                return false;
+            }
+            let words = candidate
+                .as_str()
+                .split_ascii_whitespace()
+                .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphabetic()))
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            matches!(words.len(), 12 | 15 | 18 | 21 | 24)
+                && words
+                    .iter()
+                    .all(|word| word.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        })
+}
+
+fn otp_provisioning_uri_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\botpauth://(?:totp|hotp)/(?P<uri>[^\s]+)"#)
+            .expect("OTP provisioning URI regex must compile")
+    })
+}
+
+fn contains_otp_provisioning_secret(value: &str) -> bool {
+    otp_provisioning_uri_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(uri) = captures.name("uri").map(|candidate| candidate.as_str()) else {
+                return false;
+            };
+            if uri.len() > 4_096 {
+                return true;
+            }
+            let Some((_, query)) = uri.split_once('?') else {
+                return false;
+            };
+            query.split('&').take(64).any(|parameter| {
+                let Some((name, candidate)) = parameter.split_once('=') else {
+                    return false;
+                };
+                let candidate = candidate.split('#').next().unwrap_or_default();
+                name.eq_ignore_ascii_case("secret")
+                    && !candidate.is_empty()
+                    && !is_placeholder_only(candidate)
+            })
+        })
+}
+
 fn netrc_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -323,7 +389,7 @@ fn xml_credential_attribute_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)\s*=\s*[\"'][^\"'\r\n]{1,1024}[\"']"#,
+            r#"(?i)\b(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)\s*=\s*[\"'](?P<value>[^\"'\r\n]{1,1024})[\"']"#,
         )
         .expect("XML credential attribute regex must compile")
     })
@@ -342,12 +408,12 @@ fn xml_credential_name_attribute_pattern() -> &'static Regex {
 fn xml_value_attribute_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)\bvalue\s*=\s*[\"'][^\"'\r\n]{1,1024}[\"']"#)
+        Regex::new(r#"(?i)\bvalue\s*=\s*[\"'](?P<value>[^\"'\r\n]{1,1024})[\"']"#)
             .expect("XML value attribute regex must compile")
     })
 }
 
-fn xml_element_body_contains_text(body: &str) -> bool {
+fn xml_element_body_contains_literal(body: &str) -> bool {
     let mut bounded_end = body.len().min(4_096);
     while !body.is_char_boundary(bounded_end) {
         bounded_end = bounded_end.saturating_sub(1);
@@ -363,7 +429,7 @@ fn xml_element_body_contains_text(body: &str) -> bool {
                 Some(end) => (&cdata[..end], "<![CDATA[".len() + end + "]]>".len()),
                 None => (cdata, remainder.len()),
             };
-            if text.chars().any(|character| !character.is_whitespace()) {
+            if !text.trim().is_empty() && !is_placeholder_only(text) {
                 return true;
             }
             cursor += consumed;
@@ -404,10 +470,8 @@ fn xml_element_body_contains_text(body: &str) -> bool {
         }
 
         let text_end = remainder.find('<').unwrap_or(remainder.len());
-        if remainder[..text_end]
-            .chars()
-            .any(|character| !character.is_whitespace())
-        {
+        let text = remainder[..text_end].trim();
+        if !text.is_empty() && !is_placeholder_only(text) {
             return true;
         }
         cursor += text_end;
@@ -436,29 +500,29 @@ fn contains_xml_credential(value: &str) -> bool {
             continue;
         }
 
-        if xml_credential_attribute_pattern().is_match(tag) {
+        if captures_non_placeholder_credential_value(xml_credential_attribute_pattern(), tag) {
             return true;
         }
 
         if xml_credential_name_attribute_pattern().is_match(tag) {
-            if xml_value_attribute_pattern().is_match(tag) {
+            if captures_non_placeholder_credential_value(xml_value_attribute_pattern(), tag) {
                 return true;
             }
             if !tag.trim_end().ends_with('/') {
                 let body = &remainder[close + 1..];
-                if xml_element_body_contains_text(body) {
+                if xml_element_body_contains_literal(body) {
                     return true;
                 }
             }
         }
 
         if xml_credential_tag_name_pattern().is_match(tag) {
-            if xml_value_attribute_pattern().is_match(tag) {
+            if captures_non_placeholder_credential_value(xml_value_attribute_pattern(), tag) {
                 return true;
             }
             if !tag.trim_end().ends_with('/') {
                 let body = &remainder[close + 1..];
-                if xml_element_body_contains_text(body) {
+                if xml_element_body_contains_literal(body) {
                     return true;
                 }
             }
@@ -1000,6 +1064,8 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
         || contains_curl_user_credential(value)
+        || contains_wallet_mnemonic(value)
+        || contains_otp_provisioning_secret(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
         || contains_identified_credential(value)
@@ -1471,6 +1537,11 @@ mod tests {
                 "generic key/value credential placeholder",
                 r#"{"key":"password","value":"${DB_PASSWORD}"}"#,
             ),
+            ("wallet seed placeholder", "seed phrase: ${WALLET_SEED}"),
+            (
+                "OTP provisioning placeholder",
+                "otpauth://totp/Example:alice?secret=${OTP_SECRET}&issuer=Example",
+            ),
             (
                 "authorization bearer placeholder",
                 "Authorization: Bearer ${API_TOKEN}",
@@ -1509,6 +1580,18 @@ mod tests {
             (
                 "XML password policy property",
                 "<property name=\"password_policy\" value=\"strict\"/>",
+            ),
+            (
+                "XML credential property placeholder",
+                "<property name=\"password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "XML credential attribute placeholder",
+                "<database password=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "nested XML credential placeholder",
+                "<property name=\"password\"><value>${DB_PASSWORD}</value></property>",
             ),
             (
                 "empty XML password CDATA",
@@ -1695,6 +1778,22 @@ mod tests {
             (
                 "generic key/value credential literal",
                 r#"{"key":"password","value":"hunter2"}"#,
+            ),
+            (
+                "wallet seed phrase",
+                "seed phrase: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "wallet mnemonic",
+                "mnemonic = abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "wallet recovery words",
+                "recovery words is abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "OTP provisioning URI",
+                "otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP&issuer=Example",
             ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
