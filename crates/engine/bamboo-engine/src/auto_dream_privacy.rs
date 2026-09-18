@@ -645,7 +645,7 @@ fn known_secret_pattern() -> &'static Regex {
 fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:proxy-)?authorization\s*:\s*[^\r\n]+")
+        Regex::new(r"(?i)\b(?:proxy-)?authorization\s*:\s*(?P<value>[^\r\n]+)")
             .expect("authorization secret regex must compile")
     })
 }
@@ -659,7 +659,36 @@ fn bare_authorization_scheme_pattern() -> &'static Regex {
 }
 
 fn contains_authorization_secret(value: &str) -> bool {
-    authorization_secret_pattern().is_match(value)
+    authorization_secret_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(value) = captures.name("value") else {
+                return false;
+            };
+            let value = value
+                .as_str()
+                .trim()
+                .trim_matches(|character| matches!(character, '\"' | '\''));
+            let mut fields = value.splitn(2, char::is_whitespace);
+            let scheme = fields.next().unwrap_or_default();
+            let credential =
+                if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") {
+                    fields.next().unwrap_or_default().trim()
+                } else {
+                    value
+                };
+            if credential.is_empty() || is_placeholder_only(credential) {
+                return false;
+            }
+            let normalized = credential
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase();
+            !is_credential_state_predicate(&normalized)
+                && !matches!(
+                    normalized.as_str(),
+                    "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+                )
+        })
         || bare_authorization_scheme_pattern()
             .captures_iter(value)
             .any(|captures| {
@@ -1267,6 +1296,15 @@ mod tests {
                 "Kubernetes environment placeholder",
                 "- name: DB_PASSWORD\n  value: ${DB_PASSWORD}",
             ),
+            (
+                "authorization bearer placeholder",
+                "Authorization: Bearer ${API_TOKEN}",
+            ),
+            (
+                "proxy authorization placeholder",
+                "Proxy-Authorization: Basic %PROXY_AUTH%",
+            ),
+            ("authorization requirement", "Authorization: required"),
             (
                 "empty Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: \"\"",

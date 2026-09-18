@@ -448,16 +448,27 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     let prompt = build_extraction_prompt(&candidates_info);
     let raw = collect_stream_text(provider.clone(), model, prompt).await?;
     let candidates = parse_extraction_candidates(&raw)?;
-    // Tolerant by design: absent/malformed ledger array → empty vec.
-    let ledger_candidates = parse_ledger_candidates(&raw)
-        .into_iter()
-        .filter(ledger_candidate_is_secret_safe)
-        .collect();
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
         session_project_keys.insert(session.session_id.clone(), session.project_key.clone());
     }
+    // Tolerant by design: absent/malformed ledger array → empty vec. A model-
+    // supplied source ID is routing metadata, so accept it only when it names
+    // an authoritative Session in this exact extraction input. Missing IDs
+    // remain compatible with the existing optional Ledger provenance field.
+    let ledger_candidates = parse_ledger_candidates(&raw)
+        .into_iter()
+        .filter(ledger_candidate_is_secret_safe)
+        .filter(|candidate| {
+            candidate
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+                .is_none_or(|session_id| session_project_keys.contains_key(session_id))
+        })
+        .collect();
 
     let mut writes = 0usize;
     let session_source_updated_at = sessions
@@ -1858,6 +1869,13 @@ mod tests {
                     "excerpt": "I will renew my passport.",
                     "session_id": "session-outline-private",
                     "confidence": "medium"
+                },
+                {
+                    "title": "Smuggled source identity",
+                    "kind": "todo",
+                    "excerpt": "This visible payload is otherwise ordinary.",
+                    "session_id": "password=hunter2",
+                    "confidence": "high"
                 }
             ]
         })
