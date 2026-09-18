@@ -331,7 +331,7 @@ fn redis_password_directive_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?:\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
+            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?P<value>\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
         )
         .expect("Redis password directive regex must compile")
     })
@@ -402,9 +402,17 @@ fn contains_redis_acl_plaintext_password(value: &str) -> bool {
         }
 
         let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
-        let command_start = if tokens.first().is_some_and(|token| {
-            token.eq_ignore_ascii_case("redis-cli") || token.eq_ignore_ascii_case("redis-cli.exe")
-        }) {
+        let first_token_is_redis_cli = tokens.first().is_some_and(|token| {
+            token
+                .trim_matches(|character| matches!(character, '\'' | '"'))
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|command| {
+                    command.eq_ignore_ascii_case("redis-cli")
+                        || command.eq_ignore_ascii_case("redis-cli.exe")
+                })
+        });
+        let command_start = if first_token_is_redis_cli {
             tokens
                 .windows(2)
                 .position(|pair| {
@@ -688,6 +696,29 @@ fn xml_credential_attribute_pattern() -> &'static Regex {
     })
 }
 
+fn xml_quoted_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?P<name>[a-z_][a-z0-9_.:-]{0,127})\s*=\s*[\"'](?P<value>[^\"'\r\n]{0,1024})[\"']"#,
+        )
+        .expect("XML quoted attribute regex must compile")
+    })
+}
+
+fn xml_tag_has_direct_credential_attribute(tag: &str) -> bool {
+    xml_quoted_attribute_pattern()
+        .captures_iter(tag)
+        .any(|captures| {
+            captures
+                .name("name")
+                .is_some_and(|name| structured_environment_name_is_credential(name.as_str()))
+                && captures
+                    .name("value")
+                    .is_some_and(|value| credential_assignment_value_is_literal(value.as_str()))
+        })
+}
+
 fn xml_credential_name_attribute_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -738,7 +769,7 @@ fn xml_element_body_contains_literal(body: &str, outer_name: &str) -> bool {
                 Some(end) => (&cdata[..end], "<![CDATA[".len() + end + "]]>".len()),
                 None => return true,
             };
-            if !text.trim().is_empty() && !is_placeholder_only(text) {
+            if credential_assignment_value_is_literal(text) {
                 return true;
             }
             cursor += consumed;
@@ -785,7 +816,7 @@ fn xml_element_body_contains_literal(body: &str, outer_name: &str) -> bool {
 
         let text_end = remainder.find('<').unwrap_or(remainder.len());
         let text = remainder[..text_end].trim();
-        if !text.is_empty() && !is_placeholder_only(text) {
+        if credential_assignment_value_is_literal(text) {
             return true;
         }
         cursor += text_end;
@@ -820,12 +851,14 @@ fn contains_xml_credential(value: &str) -> bool {
             .unwrap_or_default()
             .trim_end_matches('/');
 
-        if captures_non_placeholder_credential_value(xml_credential_attribute_pattern(), tag) {
+        if captures_non_state_credential_value(xml_credential_attribute_pattern(), tag)
+            || xml_tag_has_direct_credential_attribute(tag)
+        {
             return true;
         }
 
         if xml_property_has_credential_name(tag) {
-            if captures_non_placeholder_credential_value(xml_value_attribute_pattern(), tag) {
+            if captures_non_state_credential_value(xml_value_attribute_pattern(), tag) {
                 return true;
             }
             if !tag.trim_end().ends_with('/') {
@@ -836,8 +869,10 @@ fn contains_xml_credential(value: &str) -> bool {
             }
         }
 
-        if xml_credential_tag_name_pattern().is_match(tag) {
-            if captures_non_placeholder_credential_value(xml_value_attribute_pattern(), tag) {
+        if xml_credential_tag_name_pattern().is_match(tag)
+            || structured_environment_name_is_credential(element_name)
+        {
+            if captures_non_state_credential_value(xml_value_attribute_pattern(), tag) {
                 return true;
             }
             if !tag.trim_end().ends_with('/') {
@@ -954,10 +989,10 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
                 !name.as_str().eq_ignore_ascii_case("max_token")
                     && captures
                         .name("value")
-                        .is_some_and(|value| !is_placeholder_only(value.as_str()))
+                        .is_some_and(|value| credential_assignment_value_is_literal(value.as_str()))
             })
         })
-        || captures_non_placeholder_credential_value(
+        || captures_non_state_credential_value(
             ambiguous_environment_credential_assignment_pattern(),
             value,
         )
@@ -1325,6 +1360,9 @@ fn contains_line_oriented_credential_assignment(value: &str) -> bool {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             return false;
         }
+        if line.starts_with('<') && line.ends_with('>') {
+            return false;
+        }
         if line.starts_with("//") && npm_registry_property.is_none() {
             return false;
         }
@@ -1406,10 +1444,7 @@ fn yaml_secret_payload_contains_literal(value: &serde_yaml::Value) -> bool {
             values.iter().any(yaml_secret_payload_contains_literal)
         }
         serde_yaml::Value::Tagged(value) => yaml_secret_payload_contains_literal(&value.value),
-        serde_yaml::Value::String(value) => {
-            let value = value.trim();
-            !value.is_empty() && !is_placeholder_only(value)
-        }
+        serde_yaml::Value::String(value) => credential_assignment_value_is_literal(value),
         serde_yaml::Value::Number(_) => true,
         serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
     }
@@ -1428,7 +1463,9 @@ fn yaml_contains_kubernetes_secret(value: &serde_yaml::Value) -> bool {
             let contains_payload_literal = is_secret
                 && fields.iter().any(|(key, value)| {
                     key.as_str().is_some_and(|key| {
-                        key.eq_ignore_ascii_case("data") || key.eq_ignore_ascii_case("stringData")
+                        key.eq_ignore_ascii_case("data")
+                            || key.eq_ignore_ascii_case("stringData")
+                            || key.eq_ignore_ascii_case("binaryData")
                     }) && yaml_secret_payload_contains_literal(value)
                 });
             contains_payload_literal || fields.values().any(yaml_contains_kubernetes_secret)
@@ -1981,7 +2018,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || captures_non_state_credential_value(pin_credential_assignment_pattern(), value)
         || standalone_pin_credential_pattern().is_match(value)
         || contains_short_credential_config_field(value)
-        || redis_password_directive_pattern().is_match(value)
+        || captures_non_state_credential_value(redis_password_directive_pattern(), value)
         || contains_redis_cli_password_option(value)
         || contains_redis_acl_plaintext_password(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
@@ -2544,6 +2581,22 @@ mod tests {
                 "apiVersion: v1\nkind: Secret\nstringData:\n  license: ${LICENSE_KEY}",
             ),
             (
+                "Kubernetes Secret data reference",
+                "apiVersion: v1\nkind: Secret\ndata:\n  license: ${LICENSE_B64}",
+            ),
+            (
+                "Kubernetes Secret binaryData reference",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: ${LICENSE_B64}",
+            ),
+            (
+                "Kubernetes Secret payload state",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: required",
+            ),
+            (
+                "Kubernetes Secret binaryData state",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: disabled",
+            ),
+            (
                 "Kubernetes Secret JSON payload placeholder",
                 r#"{"kind":"Secret","stringData":{"license":"${LICENSE_KEY}"}}"#,
             ),
@@ -2620,6 +2673,12 @@ mod tests {
             ),
             ("commented Redis password", "# requirepass hunter2"),
             ("empty Redis password", "requirepass \"\""),
+            ("Redis requirepass reference", "requirepass ${REDIS_PASSWORD}"),
+            ("Redis masterauth reference", "masterauth \"$REDIS_PASSWORD\""),
+            (
+                "Redis CONFIG SET reference",
+                "CONFIG SET requirepass '${REDIS_PASSWORD}'",
+            ),
             ("Redis ACL rule without password", "user alice on ~* +@all"),
             (
                 "Redis ACL placeholder password",
@@ -2632,6 +2691,10 @@ mod tests {
             (
                 "Redis CLI ACL placeholder password",
                 "redis-cli ACL SETUSER alice '>${REDIS_PASSWORD}' ~* +@all",
+            ),
+            (
+                "path-qualified Redis CLI ACL placeholder",
+                "/usr/local/bin/redis-cli ACL SETUSER alice '>${REDIS_PASSWORD}' ~* +@all",
             ),
             (
                 "Redis CLI ACL rule without password",
@@ -2672,6 +2735,23 @@ mod tests {
             (
                 "XML credential property placeholder",
                 "<property name=\"password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML element placeholder",
+                "<dbPassword>${DB_PASSWORD}</dbPassword>",
+            ),
+            ("camelCase XML element state", "<dbPassword>required</dbPassword>"),
+            (
+                "PascalCase XML attribute reference",
+                "<database DbPassword=\"$DB_PASSWORD\"/>",
+            ),
+            (
+                "snake_case XML attribute state",
+                "<database db_password=\"disabled\"/>",
+            ),
+            (
+                "technical camelCase XML attribute",
+                "<runtime maxToken=\"4096\"/>",
             ),
             (
                 "qualified XML credential property placeholder",
@@ -2951,6 +3031,14 @@ mod tests {
                 "{ kind: Secret, data: { license: aHVudGVyMg== } }",
             ),
             (
+                "Kubernetes Secret binaryData literal",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: aHVudGVyMg==",
+            ),
+            (
+                "Kubernetes Secret JSON binaryData literal",
+                r#"{"kind":"Secret","binaryData":{"license":"aHVudGVyMg=="}}"#,
+            ),
+            (
                 "Kubernetes Secret data literal in a multi-document manifest",
                 "apiVersion: v1\nkind: ConfigMap\ndata:\n  mode: production\n---\napiVersion: v1\nkind: Secret\ndata:\n  license: aHVudGVyMg==",
             ),
@@ -3060,6 +3148,14 @@ mod tests {
                 "Redis CLI ACL plaintext password with connection flags",
                 "redis-cli -h cache.example -p 6380 ACL SETUSER alice >hunter2 ~* +@all",
             ),
+            (
+                "path-qualified Redis CLI ACL plaintext password",
+                "/usr/local/bin/redis-cli ACL SETUSER alice >hunter2 ~* +@all",
+            ),
+            (
+                "Windows path-qualified Redis CLI ACL plaintext password",
+                r#"C:\Redis\redis-cli.exe ACL SETUSER alice >hunter2 ~* +@all"#,
+            ),
             ("Markdown password row", "| Password | hunter2 |"),
             (
                 "Markdown API key row",
@@ -3079,6 +3175,38 @@ mod tests {
                 "<password><value>hunter2</value></password>",
             ),
             ("XML password attribute", "<database password=\"hunter2\"/>"),
+            (
+                "camelCase XML password element",
+                "<dbPassword>hunter2</dbPassword>",
+            ),
+            (
+                "PascalCase XML password element",
+                "<DbPassword>hunter2</DbPassword>",
+            ),
+            (
+                "snake_case XML password element",
+                "<db_password>hunter2</db_password>",
+            ),
+            (
+                "kebab-case XML password element",
+                "<db-password>hunter2</db-password>",
+            ),
+            (
+                "camelCase XML password attribute",
+                "<database dbPassword=\"hunter2\"/>",
+            ),
+            (
+                "PascalCase XML password attribute",
+                "<database DbPassword=\"hunter2\"/>",
+            ),
+            (
+                "snake_case XML password attribute",
+                "<database db_password=\"hunter2\"/>",
+            ),
+            (
+                "kebab-case XML password attribute",
+                "<database db-password=\"hunter2\"/>",
+            ),
             (
                 "XML credential property",
                 "<property name=\"password\" value=\"hunter2\"/>",
