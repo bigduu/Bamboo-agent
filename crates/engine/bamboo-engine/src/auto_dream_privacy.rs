@@ -706,8 +706,10 @@ fn known_secret_pattern() -> &'static Regex {
 fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"(?i)\b(?:proxy-)?authorization\s*:\s*(?P<value>[^\r\n]+)")
-            .expect("authorization secret regex must compile")
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9_-])[\"']?(?:proxy-)?authorization[\"']?\s*:\s*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]+)"#,
+        )
+        .expect("authorization secret regex must compile")
     })
 }
 
@@ -719,37 +721,89 @@ fn bare_authorization_scheme_pattern() -> &'static Regex {
     })
 }
 
-fn contains_authorization_secret(value: &str) -> bool {
-    authorization_secret_pattern()
-        .captures_iter(value)
-        .any(|captures| {
-            let Some(value) = captures.name("value") else {
-                return false;
-            };
-            let value = value
-                .as_str()
-                .trim()
-                .trim_matches(|character| matches!(character, '\"' | '\''));
-            let mut fields = value.splitn(2, char::is_whitespace);
-            let scheme = fields.next().unwrap_or_default();
-            let credential =
-                if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") {
-                    fields.next().unwrap_or_default().trim()
-                } else {
-                    value
-                };
-            if credential.is_empty() || is_placeholder_only(credential) {
-                return false;
+fn authorization_value_is_secret(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    let mut fields = value.splitn(2, char::is_whitespace);
+    let scheme = fields.next().unwrap_or_default();
+    let credential =
+        if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") {
+            fields.next().unwrap_or_default().trim()
+        } else {
+            value
+        };
+    if credential.is_empty() || is_placeholder_only(credential) {
+        return false;
+    }
+    let normalized = credential
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .to_ascii_lowercase();
+    !is_credential_state_predicate(&normalized)
+        && !matches!(
+            normalized.as_str(),
+            "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+        )
+}
+
+fn yaml_authorization_secret(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            let mut found = false;
+            let mut secret = false;
+            for (key, candidate) in fields {
+                let is_authorization = key.as_str().is_some_and(|key| {
+                    key.eq_ignore_ascii_case("authorization")
+                        || key.eq_ignore_ascii_case("proxy-authorization")
+                });
+                if is_authorization {
+                    found = true;
+                    secret |= match candidate {
+                        serde_yaml::Value::String(candidate) => {
+                            authorization_value_is_secret(candidate)
+                        }
+                        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+                        _ => true,
+                    };
+                    continue;
+                }
+                if let Some(nested_secret) = yaml_authorization_secret(candidate) {
+                    found = true;
+                    secret |= nested_secret;
+                }
             }
-            let normalized = credential
-                .trim_matches(|character: char| character.is_ascii_punctuation())
-                .to_ascii_lowercase();
-            !is_credential_state_predicate(&normalized)
-                && !matches!(
-                    normalized.as_str(),
-                    "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
-                )
-        })
+            found.then_some(secret)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            let mut found = false;
+            let mut secret = false;
+            for value in values {
+                if let Some(nested_secret) = yaml_authorization_secret(value) {
+                    found = true;
+                    secret |= nested_secret;
+                }
+            }
+            found.then_some(secret)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_authorization_secret(&value.value),
+        _ => None,
+    }
+}
+
+fn contains_authorization_secret(value: &str) -> bool {
+    let structured_authorization = serde_yaml::from_str::<serde_yaml::Value>(value)
+        .ok()
+        .as_ref()
+        .and_then(yaml_authorization_secret);
+    structured_authorization == Some(true)
+        || (structured_authorization.is_none()
+            && authorization_secret_pattern()
+                .captures_iter(value)
+                .any(|captures| {
+                    captures
+                        .name("value")
+                        .is_some_and(|value| authorization_value_is_secret(value.as_str()))
+                }))
         || bare_authorization_scheme_pattern()
             .captures_iter(value)
             .any(|captures| {
@@ -1117,6 +1171,42 @@ fn fields_form_credential_label(fields: &[&str]) -> bool {
         || contains_non_hex_secret_like_value(&format!("{label} bamboo-privacy-probe"))
 }
 
+fn field_forms_standalone_credential_label(value: &str) -> bool {
+    let tokens = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "credential" | "otp" | "passcode" | "passphrase" | "passwd" | "password" | "pin"
+        )
+    {
+        return true;
+    }
+    if !fields_form_credential_label(&[value]) {
+        return false;
+    }
+    // These words are useful fragments of labels such as `access token` or
+    // `secret key`, but alone they are common titles and prose. Do not join a
+    // lone ambiguous fragment with every unrelated structured field.
+    !(tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "auth"
+                | "basic"
+                | "bearer"
+                | "code"
+                | "cookie"
+                | "id"
+                | "key"
+                | "secret"
+                | "session"
+                | "token"
+        ))
+}
+
 fn starts_with_credential_state_predicate(value: &str) -> bool {
     value
         .trim_start()
@@ -1220,6 +1310,9 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
         return false;
     };
     for &(label_index, label) in &label_fields {
+        if !field_forms_standalone_credential_label(label) {
+            continue;
+        }
         if sources.iter().enumerate().any(|(value_index, value)| {
             value_index != label_index && labelled_value_contains_secret(label, value)
         }) {
@@ -1390,6 +1483,14 @@ mod tests {
                 "Authorization: Bearer ${API_TOKEN}",
             ),
             (
+                "quoted authorization bearer placeholder",
+                r#"{"Authorization":"Bearer ${API_TOKEN}"}"#,
+            ),
+            (
+                "flow authorization bearer placeholder",
+                r#"{ Authorization: "Bearer ${API_TOKEN}", mode: enabled }"#,
+            ),
+            (
                 "proxy authorization placeholder",
                 "Proxy-Authorization: Basic %PROXY_AUTH%",
             ),
@@ -1477,6 +1578,14 @@ mod tests {
             (
                 "authorization header",
                 "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            ),
+            (
+                "quoted authorization header",
+                r#"{"Authorization":"Bearer hunter2"}"#,
+            ),
+            (
+                "flow authorization header",
+                "{ Authorization: Bearer hunter2, mode: enabled }",
             ),
             ("bare basic credential", "Basic dXNlcjpwYXNz"),
             (
@@ -1679,6 +1788,14 @@ mod tests {
         assert!(
             extraction_sources_are_secret_safe(&["API", "design", "approved"]),
             "ordinary structured fields must remain compatible"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["Token", "Improve tokenizer budgeting"]),
+            "a lone ambiguous title must not become a synthetic credential label"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["Access", "Token", "abc"]),
+            "credential context must still make an ambiguous label fragment effective"
         );
         assert!(
             extraction_sources_are_secret_safe(&["Password", "required for staging"]),
