@@ -196,12 +196,57 @@ fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
     })
 }
 
+fn strip_ascii_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
+}
+
+fn captures_credential_state_transition_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        let Some(candidate) = captures.name("value") else {
+            return false;
+        };
+        let state = candidate
+            .as_str()
+            .trim_matches(|character: char| character.is_ascii_punctuation())
+            .to_ascii_lowercase();
+        if !matches!(
+            state.as_str(),
+            "changed" | "configured" | "reset" | "rotated" | "updated"
+        ) {
+            return false;
+        }
+        let Some(matched) = captures.get(0) else {
+            return false;
+        };
+        let suffix = value[matched.end()..].trim_start();
+        let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "to ")
+            .or_else(|| strip_ascii_case_insensitive_prefix(suffix, "as "))
+        else {
+            return false;
+        };
+        let candidate = remainder
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|character: char| character.is_ascii_punctuation());
+        credential_assignment_value_is_literal(candidate)
+    })
+}
+
 fn contains_present_tense_secret_assignment(value: &str) -> bool {
     captures_non_state_credential_value(present_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(
+            present_tense_secret_assignment_pattern(),
+            value,
+        )
 }
 
 fn contains_past_tense_secret_assignment(value: &str) -> bool {
     captures_non_state_credential_value(past_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(past_tense_secret_assignment_pattern(), value)
 }
 
 fn pin_credential_assignment_pattern() -> &'static Regex {
@@ -1111,6 +1156,14 @@ fn npm_registry_scoped_property(line: &str) -> Option<&str> {
     (!property.trim().is_empty()).then_some(property.trim_start())
 }
 
+fn split_once_ascii_case_insensitive<'a>(
+    value: &'a str,
+    delimiter: &str,
+) -> Option<(&'a str, &'a str)> {
+    let index = value.to_ascii_lowercase().find(delimiter)?;
+    Some((&value[..index], &value[index + delimiter.len()..]))
+}
+
 fn contains_line_oriented_credential_assignment(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim();
@@ -1131,11 +1184,11 @@ fn contains_line_oriented_credential_assignment(value: &str) -> bool {
             .split_once('=')
             .map(|(name, candidate)| (name, candidate, false))
             .or_else(|| {
-                line.split_once(" is ")
+                split_once_ascii_case_insensitive(line, " is ")
                     .map(|(name, candidate)| (name, candidate, true))
             })
             .or_else(|| {
-                line.split_once(" was ")
+                split_once_ascii_case_insensitive(line, " was ")
                     .map(|(name, candidate)| (name, candidate, true))
             })
             .or_else(|| {
@@ -2237,6 +2290,10 @@ mod tests {
                 "dbPassword=${DB_PASSWORD}",
             ),
             ("camelCase natural-language state", "dbPassword is required"),
+            (
+                "uppercase camelCase natural-language state",
+                "dbPassword IS required",
+            ),
             ("npmrc credential state", "_authToken=required"),
             (
                 "registry-scoped npm credential state",
@@ -2607,8 +2664,20 @@ mod tests {
                 "dbPassword is hunter2",
             ),
             (
+                "uppercase camelCase natural-language password",
+                "dbPassword IS hunter2",
+            ),
+            (
                 "camelCase password in a sentence",
                 "The dbPassword was hunter2",
+            ),
+            (
+                "mixed-case camelCase password in a sentence",
+                "The dbPassword Was hunter2",
+            ),
+            (
+                "password reset to a literal",
+                "The database password was reset to hunter2",
             ),
             (
                 "Kubernetes environment literal",
