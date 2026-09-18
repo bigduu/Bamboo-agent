@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:was|has\s+been|had\s+been)\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -2554,6 +2554,14 @@ mod tests {
                 "The database password was changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
             ),
             (
+                "present-perfect password placeholder transition",
+                "The database password has been reset to ${DB_PASSWORD}",
+            ),
+            (
+                "present-perfect password state",
+                "The database password has been reset successfully",
+            ),
+            (
                 "Markdown password requirement",
                 "| Password | required | authentication policy |",
             ),
@@ -2807,6 +2815,10 @@ mod tests {
             (
                 "password changed from and to literals",
                 "The database password was changed from hunter2 to swordfish",
+            ),
+            (
+                "present-perfect password reset to a literal",
+                "The database password has been reset to hunter2",
             ),
             ("past-tense PIN disclosure", "my PIN was 1234"),
             ("past-tense OTP disclosure", "OTP was 123456"),
