@@ -32,6 +32,8 @@ test("routine dev pull requests run one locked Rust build-and-test gate", () => 
     "Test frontend artifact and release policies",
     "Stage frontend package",
     "Verify published server crate owns the frontend package",
+    "Run all-feature Rust tests",
+    "Build examples",
     "Run real SSH/SFTP transport test",
   ]) {
     assert.ok(
@@ -39,6 +41,12 @@ test("routine dev pull requests run one locked Rust build-and-test gate", () => 
       `${name} must be comprehensive-only`,
     )
   }
+
+  assert.match(
+    testJob,
+    /run: cargo test --locked --all-features --lib --tests\n/u,
+  )
+  assert.match(testJob, /run: cargo build --locked --examples\n/u)
 })
 
 test("expensive validation jobs stay off dev pull requests", () => {

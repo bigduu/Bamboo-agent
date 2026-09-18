@@ -90,6 +90,17 @@ jobs:
       - name: Test locked Rust workspace
         run: cargo test --locked
 
+      - name: Run all-feature Rust tests
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        run: cargo test --locked --all-features --lib --tests
+
+      - name: Build examples
+        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        # Compile-only (no network/config needed): guards `examples/*.rs` —
+        # and the README SDK snippet each one's doc comment mirrors — against
+        # drifting from the real API (bamboo-agent#255).
+        run: cargo build --locked --examples
+
       - name: Run real SSH/SFTP transport test
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
         timeout-minutes: 10
