@@ -311,6 +311,44 @@ fn redis_password_directive_pattern() -> &'static Regex {
     })
 }
 
+fn contains_redis_acl_plaintext_password(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        if line.len() > 4096 {
+            return line.to_ascii_lowercase().starts_with("user ")
+                || line.to_ascii_lowercase().starts_with("acl setuser ");
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let rule_start = if tokens
+            .first()
+            .is_some_and(|token| token.eq_ignore_ascii_case("user"))
+        {
+            2
+        } else if tokens
+            .first()
+            .is_some_and(|token| token.eq_ignore_ascii_case("acl"))
+            && tokens
+                .get(1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("setuser"))
+        {
+            3
+        } else {
+            return false;
+        };
+
+        tokens.get(rule_start..).is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.strip_prefix('>')
+                    .is_some_and(credential_assignment_value_is_literal)
+            })
+        })
+    })
+}
+
 fn markdown_table_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -1831,6 +1869,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || standalone_pin_credential_pattern().is_match(value)
         || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
+        || contains_redis_acl_plaintext_password(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
         || contains_curl_user_credential(value)
@@ -2444,6 +2483,15 @@ mod tests {
             ),
             ("commented Redis password", "# requirepass hunter2"),
             ("empty Redis password", "requirepass \"\""),
+            ("Redis ACL rule without password", "user alice on ~* +@all"),
+            (
+                "Redis ACL placeholder password",
+                "ACL SETUSER alice on >${REDIS_PASSWORD} ~* +@all",
+            ),
+            (
+                "commented Redis ACL password",
+                "# ACL SETUSER alice on >hunter2 ~* +@all",
+            ),
             (
                 "Markdown password requirement",
                 "| Password | required | authentication policy |",
@@ -2794,6 +2842,14 @@ mod tests {
                 "Redis CONFIG SET password",
                 "CONFIG SET requirepass 'hunter2'",
             ),
+            (
+                "Redis ACL user plaintext password",
+                "user alice on >hunter2 ~* +@all",
+            ),
+            (
+                "Redis ACL SETUSER plaintext password",
+                "ACL SETUSER alice resetpass >hunter2 ~* +@all",
+            ),
             ("Markdown password row", "| Password | hunter2 |"),
             (
                 "Markdown API key row",
@@ -2940,6 +2996,15 @@ mod tests {
         assert!(contains_secret_like_value(
             "```toml\npassword = \"\"\"\n${DB_PASSWORD}"
         ));
+
+        let late_redis_acl = format!(
+            "{}user alice on >hunter2 ~* +@all",
+            "ordinary note\n".repeat(256)
+        );
+        assert!(
+            contains_secret_like_value(&late_redis_acl),
+            "Redis ACL credentials after many ordinary lines must not be skipped"
+        );
     }
 
     #[test]
