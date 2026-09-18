@@ -787,6 +787,139 @@ fn contains_structured_environment_credential(value: &str) -> bool {
             .is_ok_and(|value| yaml_contains_structured_environment_credential(&value))
 }
 
+fn hcl_variable_header_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\bvariable\s+\"(?P<name>[a-z_][a-z0-9_-]{0,127})\"\s*\{"#)
+            .expect("HCL variable header regex must compile")
+    })
+}
+
+fn hcl_default_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*default[ \t]*=[ \t]*(?:\"(?P<double>(?:\\.|[^\"\\\r\n]){0,1024})\"|'(?P<single>(?:\\.|[^'\\\r\n]){0,1024})'|(?P<bare>[^\s#},\r\n]{1,1024}))"#,
+        )
+        .expect("HCL variable default regex must compile")
+    })
+}
+
+fn bounded_hcl_block_body(value: &str, body_start: usize) -> Option<&str> {
+    const MAX_HCL_BLOCK_BYTES: usize = 4_096;
+
+    let bytes = value.as_bytes();
+    let limit = bytes
+        .len()
+        .min(body_start.saturating_add(MAX_HCL_BLOCK_BYTES));
+    let mut cursor = body_start;
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while cursor < limit {
+        let byte = bytes[cursor];
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            cursor += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                block_comment = false;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        match byte {
+            b'#' => line_comment = true,
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                line_comment = true;
+                cursor += 1;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                block_comment = true;
+                cursor += 1;
+            }
+            b'\"' | b'\'' => quote = Some(byte),
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return value.get(body_start..cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn hcl_default_value_is_literal(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || is_placeholder_only(candidate) {
+        return false;
+    }
+    let normalized = candidate.to_ascii_lowercase();
+    if normalized == "null" || is_credential_state_predicate(&normalized) {
+        return false;
+    }
+    let expression = candidate
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(candidate)
+        .trim()
+        .to_ascii_lowercase();
+    !["var.", "local.", "data.", "module.", "path.", "terraform."]
+        .iter()
+        .any(|prefix| expression.starts_with(prefix))
+}
+
+fn contains_hcl_variable_default_credential(value: &str) -> bool {
+    hcl_variable_header_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(name) = captures.name("name") else {
+                return false;
+            };
+            if !structured_environment_name_is_credential(name.as_str()) {
+                return false;
+            }
+            let Some(header) = captures.get(0) else {
+                return false;
+            };
+            let Some(body) = bounded_hcl_block_body(value, header.end()) else {
+                return false;
+            };
+            hcl_default_pattern().captures_iter(body).any(|default| {
+                ["double", "single", "bare"].iter().any(|name| {
+                    default
+                        .name(name)
+                        .is_some_and(|candidate| hcl_default_value_is_literal(candidate.as_str()))
+                })
+            })
+        })
+}
+
 fn docker_auth_config_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -938,7 +1071,7 @@ fn contains_authorization_secret(value: &str) -> bool {
 fn credential_url_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{0,128}:[^/\s@]{1,128}@")
+        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{0,128}:(?P<value>[^/\s@]{1,128})@")
             .expect("credential URL regex must compile")
     })
 }
@@ -1136,10 +1269,11 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
         || contains_structured_environment_credential(value)
+        || contains_hcl_variable_default_credential(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
         || contains_authorization_secret(value)
-        || credential_url_pattern().is_match(value)
+        || captures_non_placeholder_credential_value(credential_url_pattern(), value)
         || contains_high_entropy_secret_token(value)
 }
 
@@ -1577,6 +1711,22 @@ mod tests {
                 "password: ${{ secrets.DB_PASSWORD }}",
             ),
             (
+                "credential URL password placeholder",
+                "DATABASE_URL=postgres://user:${DB_PASSWORD}@db.example/app",
+            ),
+            (
+                "HCL secret variable placeholder default",
+                "variable \"db_password\" {\n  default = \"${var.db_password}\"\n}",
+            ),
+            (
+                "HCL secret variable null default",
+                "variable \"db_password\" {\n  default = null\n}",
+            ),
+            (
+                "HCL password policy variable",
+                "variable \"password_policy\" {\n  default = \"strict\"\n}",
+            ),
+            (
                 "environment assignment placeholder",
                 "DB_PASSWORD=$SECRET_REF",
             ),
@@ -1950,6 +2100,10 @@ mod tests {
             (
                 "credential URL",
                 "postgres://user:password-value@example.test/database",
+            ),
+            (
+                "HCL secret variable default",
+                "variable \"db_password\" {\n  type = object({ enabled = bool })\n  default = \"hunter2\"\n}",
             ),
             (
                 "unlabelled opaque hexadecimal token",
