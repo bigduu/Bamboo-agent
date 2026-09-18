@@ -1096,6 +1096,15 @@ fn contains_embedded_structured_credential(value: &str) -> bool {
     false
 }
 
+fn looks_like_structured_property_name(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|characters| {
+        (characters[0].is_ascii_lowercase() || characters[0].is_ascii_digit())
+            && characters[1].is_ascii_uppercase()
+    }) || name
+        .bytes()
+        .any(|character| matches!(character, b'_' | b'-' | b'.'))
+}
+
 fn contains_line_oriented_credential_assignment(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim();
@@ -1111,17 +1120,41 @@ fn contains_line_oriented_credential_assignment(value: &str) -> bool {
             .or_else(|| line.strip_prefix("set "))
             .unwrap_or(line)
             .trim_start();
-        let Some((name, candidate)) = line.split_once('=').or_else(|| line.split_once(':')) else {
+        let assignment = line
+            .split_once('=')
+            .map(|(name, candidate)| (name, candidate, false))
+            .or_else(|| {
+                line.split_once(" is ")
+                    .map(|(name, candidate)| (name, candidate, true))
+            })
+            .or_else(|| {
+                line.split_once(" was ")
+                    .map(|(name, candidate)| (name, candidate, true))
+            })
+            .or_else(|| {
+                line.split_once(':')
+                    .map(|(name, candidate)| (name, candidate, false))
+            });
+        let Some((name, candidate, natural_language)) = assignment else {
             return false;
         };
-        let name = name
-            .trim()
-            .trim_matches(|character| matches!(character, '\"' | '\''));
+        let name = if natural_language {
+            name.split_whitespace().next_back().unwrap_or(name)
+        } else {
+            name
+        };
+        let name = name.trim().trim_matches(|character| {
+            matches!(
+                character,
+                '\"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
         !name.is_empty()
             && name.len() <= 128
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            && (!natural_language || looks_like_structured_property_name(name))
             && structured_environment_name_is_credential(name)
             && credential_assignment_value_is_literal(candidate)
     })
@@ -2194,6 +2227,7 @@ mod tests {
                 "camelCase properties placeholder",
                 "dbPassword=${DB_PASSWORD}",
             ),
+            ("camelCase natural-language state", "dbPassword is required"),
             ("npmrc credential state", "_authToken=required"),
             (
                 "commented camelCase credential",
@@ -2542,6 +2576,14 @@ mod tests {
             (
                 "exported camelCase password",
                 "export dbPassword=hunter2",
+            ),
+            (
+                "camelCase natural-language password",
+                "dbPassword is hunter2",
+            ),
+            (
+                "camelCase password in a sentence",
+                "The dbPassword was hunter2",
             ),
             (
                 "Kubernetes environment literal",
