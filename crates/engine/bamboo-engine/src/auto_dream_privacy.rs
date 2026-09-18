@@ -757,8 +757,70 @@ fn reversed_structured_environment_literal_pattern() -> &'static Regex {
 }
 
 fn structured_environment_name_is_credential(name: &str) -> bool {
-    contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe"))
-        || fields_form_credential_label(&[name])
+    if contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe")) {
+        return true;
+    }
+    let tokens = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let Some(last) = tokens.last().map(String::as_str) else {
+        return false;
+    };
+    if matches!(
+        last,
+        "credential" | "otp" | "passcode" | "passphrase" | "passwd" | "password"
+    ) {
+        return true;
+    }
+    if tokens.len() == 1 && matches!(last, "pin" | "secret" | "token") {
+        return true;
+    }
+    let previous = tokens
+        .get(tokens.len().saturating_sub(2))
+        .map(String::as_str);
+    matches!(
+        (previous, last),
+        (
+            Some(
+                "account"
+                    | "access"
+                    | "api"
+                    | "auth"
+                    | "client"
+                    | "encryption"
+                    | "private"
+                    | "secret"
+                    | "shared"
+                    | "signing"
+            ),
+            "key"
+        ) | (
+            Some("access" | "api" | "auth" | "bearer" | "refresh" | "session"),
+            "token"
+        ) | (Some("session"), "cookie" | "id")
+            | (Some("basic" | "http" | "proxy"), "auth")
+            | (
+                Some(
+                    "account"
+                        | "admin"
+                        | "auth"
+                        | "bank"
+                        | "card"
+                        | "device"
+                        | "login"
+                        | "mfa"
+                        | "payment"
+                        | "recovery"
+                        | "root"
+                        | "security"
+                        | "unlock"
+                        | "verification"
+                ),
+                "pin"
+            )
+    )
 }
 
 fn structured_environment_value_is_literal(candidate: &str) -> bool {
@@ -778,9 +840,29 @@ fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> 
             .is_some_and(|candidate| structured_environment_value_is_literal(candidate.as_str()))
 }
 
+fn yaml_value_contains_credential_literal(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::String(value) => credential_assignment_value_is_literal(value),
+        serde_yaml::Value::Number(_) => true,
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_value_contains_credential_literal)
+        }
+        serde_yaml::Value::Mapping(values) => {
+            values.values().any(yaml_value_contains_credential_literal)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_value_contains_credential_literal(&value.value),
+        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+    }
+}
+
 fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) -> bool {
     match value {
         serde_yaml::Value::Mapping(fields) => {
+            let direct_credential = fields.iter().any(|(key, candidate)| {
+                key.as_str()
+                    .is_some_and(structured_environment_name_is_credential)
+                    && yaml_value_contains_credential_literal(candidate)
+            });
             let label_is_credential = fields
                 .iter()
                 .filter(|(key, _)| {
@@ -805,7 +887,8 @@ fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) ->
                     serde_yaml::Value::Number(_) => true,
                     _ => false,
                 });
-            contains_credential
+            direct_credential
+                || contains_credential
                 || fields
                     .values()
                     .any(yaml_contains_structured_environment_credential)
@@ -818,6 +901,27 @@ fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) ->
         }
         _ => false,
     }
+}
+
+fn toml_value_contains_credential_literal(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => credential_assignment_value_is_literal(value),
+        toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Datetime(_) => true,
+        toml::Value::Array(values) => values.iter().any(toml_value_contains_credential_literal),
+        toml::Value::Table(values) => values.values().any(toml_value_contains_credential_literal),
+        toml::Value::Boolean(_) => false,
+    }
+}
+
+fn toml_contains_structured_credential(value: &toml::Value) -> bool {
+    let toml::Value::Table(fields) = value else {
+        return false;
+    };
+    fields.iter().any(|(key, candidate)| {
+        (structured_environment_name_is_credential(key)
+            && toml_value_contains_credential_literal(candidate))
+            || toml_contains_structured_credential(candidate)
+    })
 }
 
 fn contains_structured_environment_credential(value: &str) -> bool {
@@ -833,6 +937,8 @@ fn contains_structured_environment_credential(value: &str) -> bool {
         // embedded inside otherwise non-YAML prose.
         || serde_yaml::from_str::<serde_yaml::Value>(value)
             .is_ok_and(|value| yaml_contains_structured_environment_credential(&value))
+        || toml::from_str::<toml::Value>(value)
+            .is_ok_and(|value| toml_contains_structured_credential(&value))
 }
 
 fn yaml_secret_payload_contains_literal(value: &serde_yaml::Value) -> bool {
@@ -1902,6 +2008,18 @@ mod tests {
                 "DB_PASSWORD=$SECRET_REF",
             ),
             (
+                "YAML multiline credential placeholder",
+                "password: |\n  ${DB_PASSWORD}",
+            ),
+            (
+                "YAML multiline credential state",
+                "password: |\n  required",
+            ),
+            (
+                "TOML multiline credential placeholder",
+                "password = \"\"\"\n${DB_PASSWORD}\n\"\"\"",
+            ),
+            (
                 "Kubernetes secretKeyRef",
                 "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password",
             ),
@@ -2226,6 +2344,14 @@ mod tests {
             (
                 "generic key/value credential literal",
                 r#"{"key":"password","value":"hunter2"}"#,
+            ),
+            (
+                "YAML multiline credential literal",
+                "password: |\n  hunter2",
+            ),
+            (
+                "TOML multiline credential literal",
+                "password = \"\"\"\nhunter2\n\"\"\"",
             ),
             (
                 "wallet seed phrase",
