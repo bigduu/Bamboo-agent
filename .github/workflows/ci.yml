@@ -2,8 +2,10 @@ name: CI
 
 on:
   workflow_dispatch:
+  # Pull requests are the required dev gate; do not repeat the same suite after
+  # that tested head merges. Main promotions still validate their merge result.
   push:
-    branches: [ dev, main ]
+    branches: [ main ]
   pull_request:
     branches: [ dev, main ]
 
