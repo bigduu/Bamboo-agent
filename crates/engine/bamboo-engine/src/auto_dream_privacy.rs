@@ -52,6 +52,16 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     })
 }
 
+fn active_perfect_secret_transition_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:has|had)\s+(?P<value>changed|configured|reset|rotated|updated)\b"#,
+        )
+        .expect("active-perfect secret transition regex must compile")
+    })
+}
+
 fn is_credential_state_predicate(value: &str) -> bool {
     matches!(
         value,
@@ -273,6 +283,10 @@ fn contains_present_tense_secret_assignment(value: &str) -> bool {
 fn contains_past_tense_secret_assignment(value: &str) -> bool {
     captures_non_state_credential_value(past_tense_secret_assignment_pattern(), value)
         || captures_credential_state_transition_value(past_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(
+            active_perfect_secret_transition_pattern(),
+            value,
+        )
 }
 
 fn pin_credential_assignment_pattern() -> &'static Regex {
@@ -3651,6 +3665,83 @@ mod tests {
             assert!(
                 !ledger_candidate_is_secret_safe(&candidate),
                 "raw ledger-candidate field {field} must participate in pair checks"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_transition_syntax_matrix_preserves_references_and_rejects_literals() {
+        for (case, value) in [
+            (
+                "present to literal",
+                "The database password is changed to hunter2",
+            ),
+            (
+                "past to literal",
+                "The database password was reset to hunter2",
+            ),
+            (
+                "passive present-perfect to literal",
+                "The database password has been rotated to hunter2",
+            ),
+            (
+                "passive past-perfect from literal",
+                "The database password had been updated from hunter2 to swordfish",
+            ),
+            (
+                "active present-perfect to literal",
+                "The database password has changed to hunter2",
+            ),
+            (
+                "active past-perfect from literal",
+                "The database password had configured from hunter2 to swordfish",
+            ),
+            (
+                "active present-perfect colon literal",
+                "The database password has reset: hunter2",
+            ),
+            (
+                "active past-perfect equals literal",
+                "The database password had updated=swordfish",
+            ),
+        ] {
+            assert!(
+                contains_secret_like_value(value),
+                "transition literal case was not rejected: {case}"
+            );
+        }
+
+        for (case, value) in [
+            ("present state", "The database password is changed"),
+            ("past state", "The database password was reset"),
+            (
+                "passive present-perfect state",
+                "The database password has been rotated successfully",
+            ),
+            (
+                "passive past-perfect state",
+                "The database password had been updated successfully",
+            ),
+            (
+                "active present-perfect placeholder",
+                "The database password has changed to ${DB_PASSWORD}",
+            ),
+            (
+                "active past-perfect references",
+                "The database password had changed from $OLD_PASSWORD to $NEW_PASSWORD",
+            ),
+            (
+                "active present-perfect colon placeholder",
+                "The database password has reset: ${DB_PASSWORD}",
+            ),
+            (
+                "active past-perfect equals reference",
+                "The database password had updated=$DB_PASSWORD",
+            ),
+        ] {
+            assert!(
+                !contains_secret_like_value(value),
+                "transition safe case was rejected: {case}"
             );
         }
     }
