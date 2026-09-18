@@ -136,20 +136,29 @@ fn captures_non_placeholder_credential_value(pattern: &Regex, value: &str) -> bo
     })
 }
 
+fn credential_assignment_value_is_literal(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    if value.is_empty() || is_placeholder_only(value) {
+        return false;
+    }
+    let normalized = value
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .to_ascii_lowercase();
+    !normalized.is_empty()
+        && !is_credential_state_predicate(&normalized)
+        && !matches!(
+            normalized.as_str(),
+            "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+        )
+}
+
 fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
     pattern.captures_iter(value).any(|captures| {
-        let Some(candidate) = captures.name("value") else {
-            return false;
-        };
-        if is_placeholder_only(candidate.as_str()) {
-            return false;
-        }
-        let candidate = candidate
-            .as_str()
-            .trim()
-            .trim_matches(|character: char| character.is_ascii_punctuation())
-            .to_ascii_lowercase();
-        !is_credential_state_predicate(&candidate)
+        captures
+            .name("value")
+            .is_some_and(|candidate| credential_assignment_value_is_literal(candidate.as_str()))
     })
 }
 
@@ -805,6 +814,90 @@ fn contains_structured_environment_credential(value: &str) -> bool {
             .is_ok_and(|value| yaml_contains_structured_environment_credential(&value))
 }
 
+fn yaml_secret_payload_contains_literal(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            fields.values().any(yaml_secret_payload_contains_literal)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_secret_payload_contains_literal)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_secret_payload_contains_literal(&value.value),
+        serde_yaml::Value::String(value) => {
+            let value = value.trim();
+            !value.is_empty() && !is_placeholder_only(value)
+        }
+        serde_yaml::Value::Number(_) => true,
+        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+    }
+}
+
+fn yaml_contains_kubernetes_secret(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            let is_secret = fields.iter().any(|(key, value)| {
+                key.as_str()
+                    .is_some_and(|key| key.eq_ignore_ascii_case("kind"))
+                    && value
+                        .as_str()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("secret"))
+            });
+            let contains_payload_literal = is_secret
+                && fields.iter().any(|(key, value)| {
+                    key.as_str().is_some_and(|key| {
+                        key.eq_ignore_ascii_case("data") || key.eq_ignore_ascii_case("stringData")
+                    }) && yaml_secret_payload_contains_literal(value)
+                });
+            contains_payload_literal || fields.values().any(yaml_contains_kubernetes_secret)
+        }
+        serde_yaml::Value::Sequence(values) => values.iter().any(yaml_contains_kubernetes_secret),
+        serde_yaml::Value::Tagged(value) => yaml_contains_kubernetes_secret(&value.value),
+        _ => false,
+    }
+}
+
+fn kubernetes_secret_kind_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?im)^[ \t]*kind[ \t]*:[ \t]*[\"']?secret[\"']?[ \t]*(?:#.*)?$"#)
+            .expect("Kubernetes Secret kind regex must compile")
+    })
+}
+
+fn yaml_document_separator_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*---[ \t]*(?:#.*)?\r?$")
+            .expect("YAML document separator regex must compile")
+    })
+}
+
+fn contains_kubernetes_secret(value: &str) -> bool {
+    const MAX_YAML_DOCUMENTS: usize = 32;
+
+    if !kubernetes_secret_kind_pattern().is_match(value) {
+        return false;
+    }
+    for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
+        if index >= MAX_YAML_DOCUMENTS {
+            // A Secret-shaped manifest beyond the parser's document bound is
+            // indeterminate and therefore rejected rather than silently
+            // omitting later payloads.
+            return true;
+        }
+        match serde_yaml::from_str::<serde_yaml::Value>(document) {
+            Ok(document) if yaml_contains_kubernetes_secret(&document) => return true,
+            Err(_) if kubernetes_secret_kind_pattern().is_match(document) => {
+                // Secret-shaped YAML that cannot be parsed safely is
+                // indeterminate and must not cross the privacy boundary.
+                return true;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
+}
+
 fn hcl_variable_header_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -1269,11 +1362,11 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || value.contains("-----BEGIN RSA PRIVATE KEY-----")
         || value.contains("-----BEGIN EC PRIVATE KEY-----")
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
-        || captures_non_placeholder_credential_value(secret_assignment_pattern(), value)
-        || captures_non_placeholder_credential_value(generic_secret_assignment_pattern(), value)
+        || captures_non_state_credential_value(secret_assignment_pattern(), value)
+        || captures_non_state_credential_value(generic_secret_assignment_pattern(), value)
         || contains_present_tense_secret_assignment(value)
         || contains_past_tense_secret_assignment(value)
-        || captures_non_placeholder_credential_value(pin_credential_assignment_pattern(), value)
+        || captures_non_state_credential_value(pin_credential_assignment_pattern(), value)
         || standalone_pin_credential_pattern().is_match(value)
         || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
@@ -1289,6 +1382,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
         || contains_structured_environment_credential(value)
+        || contains_kubernetes_secret(value)
         || contains_hcl_variable_default_credential(value)
         || contains_docker_auth_config(value)
         || known_secret_pattern().is_match(value)
@@ -1730,6 +1824,9 @@ mod tests {
                 "Pwd=\"${DB_PASSWORD}\"",
             ),
             ("password assignment placeholder", "password=${DB_PASSWORD}"),
+            ("password assignment state", "password: required"),
+            ("password assignment null", "password: null"),
+            ("password assignment boolean", "password: true"),
             (
                 "GitHub expression password placeholder",
                 "password: ${{ secrets.DB_PASSWORD }}",
@@ -1757,6 +1854,14 @@ mod tests {
             (
                 "Kubernetes secretKeyRef",
                 "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password",
+            ),
+            (
+                "Kubernetes Secret payload placeholder",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: ${LICENSE_KEY}",
+            ),
+            (
+                "Kubernetes ConfigMap literal",
+                "apiVersion: v1\nkind: ConfigMap\ndata:\n  license: hunter2",
             ),
             (
                 "Kubernetes environment placeholder",
@@ -2015,6 +2120,18 @@ mod tests {
             (
                 "Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: hunter2",
+            ),
+            (
+                "Kubernetes Secret stringData literal",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: hunter2",
+            ),
+            (
+                "Kubernetes Secret data literal in a multi-document manifest",
+                "apiVersion: v1\nkind: ConfigMap\ndata:\n  mode: production\n---\napiVersion: v1\nkind: Secret\ndata:\n  license: aHVudGVyMg==",
+            ),
+            (
+                "malformed Kubernetes Secret payload",
+                "apiVersion: v1\nkind: Secret\nstringData: [unterminated",
             ),
             (
                 "quoted Kubernetes environment literal",
