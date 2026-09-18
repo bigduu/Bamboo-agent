@@ -18,7 +18,7 @@ fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("secret assignment regex must compile")
     })
@@ -27,7 +27,7 @@ fn secret_assignment_pattern() -> &'static Regex {
 fn generic_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#)
+        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#)
             .expect("generic secret assignment regex must compile")
     })
 }
@@ -36,7 +36,7 @@ fn present_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;}]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("present-tense secret assignment regex must compile")
     })
@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;}]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:api[\s_-]?key|account[\s_-]?key|password|passwd|passcode|passphrase|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id))\s+was\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -77,11 +77,60 @@ fn is_credential_state_predicate(value: &str) -> bool {
     )
 }
 
+fn is_placeholder_only(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    let identifier = |candidate: &str| {
+        !candidate.is_empty()
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+
+    if let Some(candidate) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value.strip_prefix('$') {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value
+        .strip_prefix('%')
+        .and_then(|rest| rest.strip_suffix('%'))
+    {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value
+        .strip_prefix("{{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    {
+        return !candidate.trim().is_empty();
+    }
+    value
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|candidate| !candidate.trim().is_empty())
+}
+
+fn captures_non_placeholder_credential_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        captures
+            .name("value")
+            .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+    })
+}
+
 fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
     pattern.captures_iter(value).any(|captures| {
         let Some(candidate) = captures.name("value") else {
             return false;
         };
+        if is_placeholder_only(candidate.as_str()) {
+            return false;
+        }
         let candidate = candidate
             .as_str()
             .trim()
@@ -103,7 +152,7 @@ fn pin_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("credential-context PIN assignment regex must compile")
     })
@@ -238,10 +287,21 @@ fn mysql_identified_credential_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?is)\b(?:alter|create)\s+user\b[^;]{0,512}\bidentified\s+(?:(?:with|via)\s+[a-z0-9_.$-]+\s+)?(?:by|as)\s+(?:password\s+)?[\"'][^\"'\r\n]{1,1024}[\"']"#,
+            r#"(?is)\b(?:alter|create)\s+user\b[^;]{0,512}\bidentified\s+(?:(?:with|via)\s+[a-z0-9_.$-]+\s+)?(?:by|as)\s+(?:password\s+)?(?:(?P<generated>random\s+password)|(?P<value>[\"'][^\"'\r\n]{1,1024}[\"']|[^\s;\"',]{1,1024}))"#,
         )
         .expect("MySQL identified credential regex must compile")
     })
+}
+
+fn contains_identified_credential(value: &str) -> bool {
+    mysql_identified_credential_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures.name("generated").is_none()
+                && captures
+                    .name("value")
+                    .is_some_and(|value| !is_placeholder_only(value.as_str()))
+        })
 }
 
 fn xml_credential_tag_name_pattern() -> &'static Regex {
@@ -463,7 +523,7 @@ fn environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|otp)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|otp)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("environment credential assignment regex must compile")
     })
@@ -473,7 +533,7 @@ fn ambiguous_environment_credential_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_])(?:(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*)_)?(?:auth|login|user|account|admin|root|credential|secret|service|server|client|app|application|device|database|db|sql|postgres|postgresql|pg|mysql|mariadb|redis|mongo|mongodb|cache|broker|smtp|imap|pop3|ftp|sftp|ssh|registry|repository|repo|vault|keystore|keychain)_(?:pass|pwd|pin)\s*(?::|=)\s*[\"']?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|[^a-z0-9_])(?:(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*)_)?(?:auth|login|user|account|admin|root|credential|secret|service|server|client|app|application|device|database|db|sql|postgres|postgresql|pg|mysql|mariadb|redis|mongo|mongodb|cache|broker|smtp|imap|pop3|ftp|sftp|ssh|registry|repository|repo|vault|keystore|keychain)_(?:pass|pwd|pin)\s*(?::|=)\s*[\"']?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("ambiguous environment credential assignment regex must compile")
     })
@@ -483,11 +543,17 @@ fn contains_environment_credential_assignment(value: &str) -> bool {
     environment_credential_assignment_pattern()
         .captures_iter(value)
         .any(|captures| {
-            captures
-                .name("name")
-                .is_some_and(|name| !name.as_str().eq_ignore_ascii_case("max_token"))
+            captures.name("name").is_some_and(|name| {
+                !name.as_str().eq_ignore_ascii_case("max_token")
+                    && captures
+                        .name("value")
+                        .is_some_and(|value| !is_placeholder_only(value.as_str()))
+            })
         })
-        || ambiguous_environment_credential_assignment_pattern().is_match(value)
+        || captures_non_placeholder_credential_value(
+            ambiguous_environment_credential_assignment_pattern(),
+            value,
+        )
 }
 
 fn structured_environment_literal_pattern() -> &'static Regex {
@@ -567,7 +633,7 @@ fn known_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r"(?i)(?:\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bglpat-[a-z0-9_-]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
+            r"(?i)(?:\bage-secret-key-1[a-z0-9]{20,}\b|\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bglpat-[a-z0-9_-]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
         )
         .expect("known secret regex must compile")
     })
@@ -791,11 +857,11 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || value.contains("-----BEGIN RSA PRIVATE KEY-----")
         || value.contains("-----BEGIN EC PRIVATE KEY-----")
         || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
-        || secret_assignment_pattern().is_match(value)
-        || generic_secret_assignment_pattern().is_match(value)
+        || captures_non_placeholder_credential_value(secret_assignment_pattern(), value)
+        || captures_non_placeholder_credential_value(generic_secret_assignment_pattern(), value)
         || contains_present_tense_secret_assignment(value)
         || contains_past_tense_secret_assignment(value)
-        || pin_credential_assignment_pattern().is_match(value)
+        || captures_non_placeholder_credential_value(pin_credential_assignment_pattern(), value)
         || standalone_pin_credential_pattern().is_match(value)
         || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
@@ -804,7 +870,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_curl_user_credential(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
-        || mysql_identified_credential_pattern().is_match(value)
+        || contains_identified_credential(value)
         || contains_xml_credential(value)
         || contains_pgpass_record(value)
         || contains_environment_credential_assignment(value)
@@ -1187,6 +1253,11 @@ mod tests {
             ),
             ("ordinary pass field", "pass: true"),
             ("password placeholder field", "Pwd=${DB_PASSWORD}"),
+            ("password assignment placeholder", "password=${DB_PASSWORD}"),
+            (
+                "environment assignment placeholder",
+                "DB_PASSWORD=$SECRET_REF",
+            ),
             (
                 "Kubernetes secretKeyRef",
                 "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password",
@@ -1346,6 +1417,10 @@ mod tests {
                 "ALTER USER 'alice'@'localhost' IDENTIFIED WITH mysql_native_password AS 'hunter2';",
             ),
             (
+                "Oracle unquoted credential",
+                "CREATE USER alice IDENTIFIED BY hunter2;",
+            ),
+            (
                 "MongoDB pwd field",
                 "db.createUser({user: \"alice\", pwd: \"hunter2\"})",
             ),
@@ -1429,6 +1504,11 @@ mod tests {
                 "commit 0123456789abcdef0123456789abcdef01234567; production access 0123456789abcdef0123456789abcdef",
             ),
             ("opaque token", "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je"),
+            (
+                "age secret identity",
+                "AGE-SECRET-KEY-1QWERTYUIOPASDFGHJKLZXCVBNM1234567890",
+            ),
+            ("literal dollar-prefixed password", "password=$2b$hunter2"),
             ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
         ] {
             assert!(
