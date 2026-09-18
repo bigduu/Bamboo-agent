@@ -57,7 +57,9 @@ fn is_credential_state_predicate(value: &str) -> bool {
         value,
         "changed"
             | "configured"
+            | "disabled"
             | "encrypted"
+            | "enabled"
             | "expired"
             | "forgotten"
             | "hashed"
@@ -600,35 +602,44 @@ fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> 
             .is_some_and(|candidate| structured_environment_value_is_literal(candidate.as_str()))
 }
 
-fn json_contains_structured_environment_credential(value: &serde_json::Value) -> bool {
+fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) -> bool {
     match value {
-        serde_json::Value::Object(fields) => {
+        serde_yaml::Value::Mapping(fields) => {
             let name = fields
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("name"))
+                .find(|(key, _)| {
+                    key.as_str()
+                        .is_some_and(|key| key.eq_ignore_ascii_case("name"))
+                })
                 .and_then(|(_, value)| value.as_str());
             let candidate = fields
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("value"))
+                .find(|(key, _)| {
+                    key.as_str()
+                        .is_some_and(|key| key.eq_ignore_ascii_case("value"))
+                })
                 .map(|(_, value)| value);
             let contains_credential = name
                 .filter(|name| structured_environment_name_is_credential(name))
                 .zip(candidate)
                 .is_some_and(|(_, candidate)| match candidate {
-                    serde_json::Value::String(candidate) => {
+                    serde_yaml::Value::String(candidate) => {
                         structured_environment_value_is_literal(candidate)
                     }
-                    serde_json::Value::Number(_) => true,
+                    serde_yaml::Value::Number(_) => true,
                     _ => false,
                 });
             contains_credential
                 || fields
                     .values()
-                    .any(json_contains_structured_environment_credential)
+                    .any(yaml_contains_structured_environment_credential)
         }
-        serde_json::Value::Array(values) => values
+        serde_yaml::Value::Sequence(values) => values
             .iter()
-            .any(json_contains_structured_environment_credential),
+            .any(yaml_contains_structured_environment_credential),
+        serde_yaml::Value::Tagged(value) => {
+            yaml_contains_structured_environment_credential(&value.value)
+        }
         _ => false,
     }
 }
@@ -640,8 +651,12 @@ fn contains_structured_environment_credential(value: &str) -> bool {
         || reversed_structured_environment_literal_pattern()
             .captures_iter(value)
             .any(structured_environment_captures_credential)
-        || serde_json::from_str::<serde_json::Value>(value)
-            .is_ok_and(|value| json_contains_structured_environment_credential(&value))
+        // YAML is a superset of JSON, so one structured parser covers quoted
+        // JSON objects plus block- and flow-style YAML independent of field
+        // order. The bounded regex paths above retain support for snippets
+        // embedded inside otherwise non-YAML prose.
+        || serde_yaml::from_str::<serde_yaml::Value>(value)
+            .is_ok_and(|value| yaml_contains_structured_environment_credential(&value))
 }
 
 fn docker_auth_config_pattern() -> &'static Regex {
@@ -1324,6 +1339,14 @@ mod tests {
                 "The staging password is required for deploys.",
             ),
             (
+                "disabled password state",
+                "The staging password is disabled.",
+            ),
+            (
+                "enabled password state",
+                "The staging password is enabled.",
+            ),
+            (
                 "present-tense PIN configuration",
                 "The login PIN is configured by the identity provider.",
             ),
@@ -1357,6 +1380,10 @@ mod tests {
             (
                 "reversed JSON environment placeholder",
                 r#"{"value":"${DB_PASSWORD}","name":"DB_PASSWORD"}"#,
+            ),
+            (
+                "flow YAML environment placeholder",
+                "{ name: DB_PASSWORD, value: ${DB_PASSWORD} }",
             ),
             (
                 "authorization bearer placeholder",
@@ -1546,6 +1573,14 @@ mod tests {
             (
                 "reversed JSON environment literal",
                 r#"{"value":"hunter2","name":"DB_PASSWORD"}"#,
+            ),
+            (
+                "flow YAML environment literal",
+                "{ name: DB_PASSWORD, value: hunter2 }",
+            ),
+            (
+                "reversed flow YAML environment literal",
+                "{ value: hunter2, name: DB_PASSWORD }",
             ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
