@@ -1098,6 +1098,7 @@ fn structured_environment_name_is_credential(name: &str) -> bool {
                     | "auth"
                     | "client"
                     | "encryption"
+                    | "license"
                     | "private"
                     | "secret"
                     | "shared"
@@ -1369,15 +1370,23 @@ fn split_once_ascii_case_insensitive<'a>(
 
 fn contains_line_oriented_credential_assignment(value: &str) -> bool {
     value.lines().any(|line| {
-        let line = line.trim();
+        let mut line = line.trim();
         let npm_registry_property = npm_registry_scoped_property(line);
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+        if line.is_empty() {
             return false;
+        }
+        if npm_registry_property.is_none() {
+            line = line
+                .strip_prefix('#')
+                .or_else(|| line.strip_prefix(';'))
+                .or_else(|| line.strip_prefix("//"))
+                .unwrap_or(line)
+                .trim_start();
+            if line.is_empty() {
+                return false;
+            }
         }
         if line.starts_with('<') && line.ends_with('>') {
-            return false;
-        }
-        if line.starts_with("//") && npm_registry_property.is_none() {
             return false;
         }
         let line = npm_registry_property.unwrap_or(line);
@@ -2532,9 +2541,13 @@ mod tests {
                 "// This comment mentions dbPassword=hunter2",
             ),
             (
-                "commented camelCase credential",
-                "# dbPassword=hunter2",
+                "commented camelCase placeholder",
+                "# dbPassword=${DB_PASSWORD}",
             ),
+            ("commented camelCase state", "// apiToken=required"),
+            ("license key placeholder", "licenseKey=${LICENSE_KEY}"),
+            ("license key state", "licenseKey: required"),
+            ("ordinary license metadata", "licenseType: community"),
             ("password assignment state", "password: required"),
             ("password assignment null", "password: null"),
             ("password assignment boolean", "password: true"),
@@ -2963,6 +2976,10 @@ mod tests {
                 "Java properties camelCase password",
                 "dbPassword=hunter2",
             ),
+            ("commented camelCase password", "# dbPassword=hunter2"),
+            ("slash-commented camelCase API token", "// apiToken=hunter2"),
+            ("camelCase license key", "licenseKey: hunter2"),
+            ("snake_case license key", "license_key=hunter2"),
             ("npmrc camelCase auth token", "_authToken=hunter2"),
             ("legacy npmrc auth", "_auth=dXNlcjpwYXNz"),
             ("Redis CLI auth", "REDISCLI_AUTH=hunter2"),
