@@ -794,11 +794,37 @@ fn structured_environment_name_is_credential(name: &str) -> bool {
     if contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe")) {
         return true;
     }
-    let tokens = name
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
+    let characters = name.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            continue;
+        }
+        let splits_camel_case = character.is_ascii_uppercase()
+            && !token.is_empty()
+            && (characters[index - 1].is_ascii_lowercase()
+                || characters[index - 1].is_ascii_digit()
+                || (characters[index - 1].is_ascii_uppercase()
+                    && characters
+                        .get(index + 1)
+                        .is_some_and(char::is_ascii_lowercase)));
+        if splits_camel_case {
+            tokens.push(std::mem::take(&mut token));
+        }
+        token.push(character.to_ascii_lowercase());
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    let canonical_name = tokens.join("_");
+    if contains_environment_credential_assignment(&format!("{canonical_name}=bamboo-privacy-probe"))
+    {
+        return true;
+    }
     let Some(last) = tokens.last().map(String::as_str) else {
         return false;
     };
@@ -858,11 +884,7 @@ fn structured_environment_name_is_credential(name: &str) -> bool {
 }
 
 fn structured_environment_value_is_literal(candidate: &str) -> bool {
-    let candidate = candidate
-        .trim()
-        .trim_matches(|character| matches!(character, '\"' | '\''))
-        .trim();
-    !candidate.is_empty() && !is_placeholder_only(candidate)
+    credential_assignment_value_is_literal(candidate)
 }
 
 fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> bool {
@@ -2049,8 +2071,10 @@ mod tests {
         for (case, value) in [
             ("tokenizer word", "tokenizer is tiktoken"),
             ("token budget", "MAX_TOKEN=1000"),
+            ("camelCase token budget", "maxToken: 1000"),
             ("dependency pin", "pin is a dependency reference"),
             ("hardware pin", "GPIO_PIN=13"),
+            ("camelCase hardware pin", "gpioPin: 13"),
             ("compiler pass", "COMPILER_PASS=inline"),
             ("auth mode", "AUTH_MODE=basic"),
             ("Docker auth mode", "DOCKER_AUTH_MODE=credential-store"),
@@ -2220,6 +2244,14 @@ mod tests {
             (
                 "generic credential property placeholder",
                 r#"{"name":"password","value":"${DB_PASSWORD}"}"#,
+            ),
+            (
+                "generic credential property state",
+                r#"{"name":"password","value":"required"}"#,
+            ),
+            (
+                "generic credential property boolean",
+                r#"{"name":"password","value":false}"#,
             ),
             (
                 "generic key/value credential placeholder",
@@ -2459,6 +2491,8 @@ mod tests {
                 "Server=db;Uid=alice;Pwd=hunter2",
             ),
             ("unquoted Pwd config field", "Pwd=hunter2"),
+            ("camelCase database password", "dbPassword: hunter2"),
+            ("camelCase SMTP password", "smtpPassword = \"hunter2\""),
             (
                 "Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: hunter2",
