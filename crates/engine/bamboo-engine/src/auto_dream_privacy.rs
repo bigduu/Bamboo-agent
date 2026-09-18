@@ -923,6 +923,9 @@ fn structured_environment_name_is_credential(name: &str) -> bool {
     if tokens.len() == 1 && matches!(last, "pin" | "secret" | "token") {
         return true;
     }
+    if tokens.as_slice() == ["rediscli", "auth"] {
+        return true;
+    }
     let previous = tokens
         .get(tokens.len().saturating_sub(2))
         .map(String::as_str);
@@ -2340,6 +2343,7 @@ mod tests {
             ),
             ("npmrc credential state", "_authToken=required"),
             ("legacy npmrc auth placeholder", "_auth=${NPM_AUTH}"),
+            ("Redis CLI auth placeholder", "REDISCLI_AUTH=${REDIS_PASSWORD}"),
             (
                 "registry-scoped npm credential state",
                 "//registry.example/:_authToken=required",
@@ -2702,6 +2706,7 @@ mod tests {
             ),
             ("npmrc camelCase auth token", "_authToken=hunter2"),
             ("legacy npmrc auth", "_auth=dXNlcjpwYXNz"),
+            ("Redis CLI auth", "REDISCLI_AUTH=hunter2"),
             (
                 "registry-scoped npm auth token",
                 "//registry.example/:_authToken=hunter2",

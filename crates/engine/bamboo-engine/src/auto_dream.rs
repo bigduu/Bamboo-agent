@@ -45,6 +45,28 @@ const EXTRACTION_MAX_TOPICS_PER_SESSION: usize = 4;
 const EXTRACTION_MAX_TOPIC_CHARS: usize = 1_500;
 const EXTRACTION_MAX_CANDIDATES: usize = 8;
 
+fn provider_session_alias(index: usize) -> String {
+    format!("source-session-{:04}", index + 1)
+}
+
+fn restore_provider_session_alias(
+    session_id: &mut Option<String>,
+    provider_aliases: &HashMap<String, String>,
+) -> bool {
+    let Some(alias) = session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let Some(authoritative) = provider_aliases.get(alias) else {
+        return false;
+    };
+    *session_id = Some(authoritative.clone());
+    true
+}
+
 fn sanitize_title_and_optional_source(
     title: &str,
     source: Option<&str>,
@@ -63,7 +85,8 @@ fn to_consolidation_sessions(
 ) -> Vec<ConsolidationSessionInfo> {
     entries
         .iter()
-        .map(|(entry, summary)| {
+        .enumerate()
+        .map(|(index, (entry, summary))| {
             let mut sources = vec![entry.title.as_str()];
             if let Some(last_run_status) = entry.last_run_status.as_deref() {
                 sources.push(last_run_status);
@@ -73,7 +96,7 @@ fn to_consolidation_sessions(
             }
             if !extraction_sources_are_secret_safe(&sources) {
                 return ConsolidationSessionInfo {
-                    id: "redacted-session".to_string(),
+                    id: provider_session_alias(index),
                     title: REDACTED_EXTRACTION_SOURCE.to_string(),
                     kind: format!("{:?}", entry.kind),
                     updated_at: entry.updated_at.to_rfc3339(),
@@ -86,7 +109,7 @@ fn to_consolidation_sessions(
             let (title, summary) =
                 sanitize_title_and_optional_source(&entry.title, summary.as_deref());
             ConsolidationSessionInfo {
-                id: entry.id.clone(),
+                id: provider_session_alias(index),
                 title,
                 kind: format!("{:?}", entry.kind),
                 updated_at: entry.updated_at.to_rfc3339(),
@@ -215,7 +238,10 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
     derive_session_outline(&sanitized).map(|outline| sanitize_extraction_source(&outline))
 }
 
-fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> DreamCandidateInfo {
+fn sanitized_extraction_candidate_info(
+    session: &CandidateSessionContext,
+    provider_session_id: String,
+) -> DreamCandidateInfo {
     let updated_at = session.entry.updated_at.to_rfc3339();
     let mut sources = vec![session.entry.title.as_str()];
     if let Some(summary) = session.summary.as_deref() {
@@ -227,10 +253,7 @@ fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> Dre
     }
     if !extraction_sources_are_secret_safe(&sources) {
         return DreamCandidateInfo {
-            // Session and project identifiers are authoritative routing data,
-            // not source payload. Preserve them so a secret-looking opaque ID
-            // cannot make an otherwise safe Session silently ineligible.
-            session_id: session.session_id.clone(),
+            session_id: provider_session_id,
             title: REDACTED_EXTRACTION_SOURCE.to_string(),
             project_key: session.project_key.clone(),
             updated_at,
@@ -248,7 +271,7 @@ fn sanitized_extraction_candidate_info(session: &CandidateSessionContext) -> Dre
         .collect();
 
     DreamCandidateInfo {
-        session_id: session.session_id.clone(),
+        session_id: provider_session_id,
         title,
         project_key: session.project_key.clone(),
         updated_at,
@@ -441,13 +464,22 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
         return Ok(ExtractionWrites::default());
     }
 
+    let mut provider_aliases = HashMap::new();
     let candidates_info: Vec<DreamCandidateInfo> = sessions
         .iter()
-        .map(sanitized_extraction_candidate_info)
+        .enumerate()
+        .map(|(index, session)| {
+            let alias = provider_session_alias(index);
+            provider_aliases.insert(alias.clone(), session.session_id.clone());
+            sanitized_extraction_candidate_info(session, alias)
+        })
         .collect();
     let prompt = build_extraction_prompt(&candidates_info);
     let raw = collect_stream_text(provider.clone(), model, prompt).await?;
-    let candidates = parse_extraction_candidates(&raw)?;
+    let mut candidates = parse_extraction_candidates(&raw)?;
+    candidates.retain_mut(|candidate| {
+        restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
+    });
 
     let mut session_project_keys = HashMap::new();
     for session in sessions {
@@ -457,7 +489,11 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     // supplied source ID is routing metadata, so accept it only when it names
     // an authoritative Session in this exact extraction input. Missing IDs
     // remain compatible with the existing optional Ledger provenance field.
-    let ledger_candidates = parse_ledger_candidates(&raw)
+    let mut parsed_ledger_candidates = parse_ledger_candidates(&raw);
+    parsed_ledger_candidates.retain_mut(|candidate| {
+        restore_provider_session_alias(&mut candidate.session_id, &provider_aliases)
+    });
+    let ledger_candidates = parsed_ledger_candidates
         .into_iter()
         .filter(ledger_candidate_is_secret_safe)
         .filter(|candidate| {
@@ -520,7 +556,6 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
             tracing::warn!(
                 target: DREAM_TRACING_TARGET,
                 event = "memory_candidate_skipped",
-                session_id,
                 reason = "unknown_source_session",
                 "Skipping an AutoDream candidate whose source was not in the extraction input"
             );
@@ -1833,7 +1868,7 @@ mod tests {
                     "scope": "global",
                     "content": TOPIC_SECRET,
                     "tags": ["credential"],
-                    "session_id": "session-summary-private",
+                    "session_id": "source-session-0005",
                     "confidence": "high"
                 },
                 {
@@ -1842,7 +1877,7 @@ mod tests {
                     "scope": "global",
                     "content": "The user prefers concise replies.",
                     "tags": ["preference"],
-                    "session_id": "session-outline-private",
+                    "session_id": "source-session-0001",
                     "confidence": "high"
                 },
                 {
@@ -1851,7 +1886,7 @@ mod tests {
                     "scope": "global",
                     "content": "The opaque authority fixture remains eligible.",
                     "tags": ["provenance"],
-                    "session_id": OPAQUE_SESSION_ID,
+                    "session_id": "source-session-0002",
                     "confidence": "high"
                 }
             ],
@@ -1860,14 +1895,14 @@ mod tests {
                     "title": "PIN",
                     "kind": "todo",
                     "excerpt": "1234",
-                    "session_id": "session-summary-private",
+                    "session_id": "source-session-0005",
                     "confidence": "high"
                 },
                 {
                     "title": "Renew passport",
                     "kind": "todo",
                     "excerpt": "I will renew my passport.",
-                    "session_id": "session-outline-private",
+                    "session_id": "source-session-0001",
                     "confidence": "medium"
                 },
                 {
@@ -1902,7 +1937,8 @@ mod tests {
             .iter()
             .find(|context| context.session_id == "session-split-private")
             .expect("split-field context");
-        let sanitized_split = sanitized_extraction_candidate_info(split_context);
+        let sanitized_split =
+            sanitized_extraction_candidate_info(split_context, "source-session-test-1".to_string());
         assert_eq!(sanitized_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_split.summary.is_none());
         assert!(sanitized_split.topics.is_empty());
@@ -1910,7 +1946,10 @@ mod tests {
             .iter()
             .find(|context| context.session_id == "session-triple-split-private")
             .expect("three-field context");
-        let sanitized_triple_split = sanitized_extraction_candidate_info(triple_split_context);
+        let sanitized_triple_split = sanitized_extraction_candidate_info(
+            triple_split_context,
+            "source-session-test-2".to_string(),
+        );
         assert_eq!(sanitized_triple_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_triple_split.summary.is_none());
         assert!(sanitized_triple_split.topics.is_empty());
@@ -1918,9 +1957,14 @@ mod tests {
             .iter()
             .find(|context| context.session_id == OPAQUE_SESSION_ID)
             .expect("opaque-authority context");
-        let sanitized_opaque_identifier =
-            sanitized_extraction_candidate_info(opaque_identifier_context);
-        assert_eq!(sanitized_opaque_identifier.session_id, OPAQUE_SESSION_ID);
+        let sanitized_opaque_identifier = sanitized_extraction_candidate_info(
+            opaque_identifier_context,
+            "source-session-test-3".to_string(),
+        );
+        assert_eq!(
+            sanitized_opaque_identifier.session_id,
+            "source-session-test-3"
+        );
         assert_eq!(
             sanitized_opaque_identifier.title,
             "Opaque authority fixture"
@@ -1931,12 +1975,13 @@ mod tests {
             opaque_identifier_context.entry.clone(),
             opaque_identifier_context.summary.clone(),
         )]);
-        assert_eq!(consolidation_sessions[0].id, OPAQUE_SESSION_ID);
+        assert_eq!(consolidation_sessions[0].id, provider_session_alias(0));
         assert_eq!(consolidation_sessions[0].title, "Opaque authority fixture");
         assert!(consolidation_sessions[0].last_run_status.is_none());
         assert!(consolidation_sessions[0].summary.is_some());
         let consolidation_prompt = build_consolidation_prompt(&consolidation_sessions);
-        assert!(consolidation_prompt.contains(OPAQUE_SESSION_ID));
+        assert!(!consolidation_prompt.contains(OPAQUE_SESSION_ID));
+        assert!(consolidation_prompt.contains(&provider_session_alias(0)));
         assert!(consolidation_prompt.contains("Opaque authority fixture"));
         let ledger = LedgerStore::new(temp_dir.path());
         let writes = extract_and_persist_durable_candidates(
@@ -1976,7 +2021,8 @@ mod tests {
             );
         }
         assert!(prompt.contains(crate::auto_dream_privacy::REDACTED_EXTRACTION_SOURCE));
-        assert!(prompt.contains(OPAQUE_SESSION_ID));
+        assert!(!prompt.contains(OPAQUE_SESSION_ID));
+        assert!(prompt.contains("source-session-"));
 
         let documents = memory
             .list_memory_documents(MemoryScope::Global, None)
@@ -2017,7 +2063,7 @@ mod tests {
                     "scope": "project",
                     "content": "The user prefers terse responses and no recap.",
                     "tags": ["preference", "style"],
-                    "session_id": "session-auto",
+                    "session_id": "source-session-0001",
                     "confidence": "high"
                 },
                 {
@@ -2033,6 +2079,15 @@ mod tests {
                     "scope": "global",
                     "content": "An unknown source session must never be persisted.",
                     "session_id": "session-hallucinated"
+                }
+            ],
+            "ledger_candidates": [
+                {
+                    "title": "Review terse response preference",
+                    "kind": "todo",
+                    "excerpt": "Confirm the stable response preference.",
+                    "session_id": "source-session-0001",
+                    "confidence": "high"
                 }
             ]
         })
@@ -2113,7 +2168,26 @@ mod tests {
         .await
         .expect("extraction should succeed");
         assert_eq!(writes.memory, 1);
-        assert_eq!(writes.ledger, 0);
+        assert_eq!(writes.ledger, 1);
+        let documents = memory
+            .list_memory_documents(MemoryScope::Global, None)
+            .await
+            .expect("list aliased memory candidate");
+        assert_eq!(documents.len(), 1);
+        assert!(documents[0]
+            .frontmatter
+            .sources
+            .iter()
+            .any(|source| source.kind == "session" && source.id == "session-auto"));
+        let records = ledger
+            .list_records(LedgerScope::Global, None, &RecordFilter::default())
+            .await
+            .expect("list aliased Ledger candidate");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].record.source.session_id.as_deref(),
+            Some("session-auto")
+        );
         let extraction_state = memory
             .read_session_state("session-auto")
             .await
@@ -2148,6 +2222,7 @@ mod tests {
             replay.memory, 0,
             "an exact candidate already committed before a later batch failure must not duplicate"
         );
+        assert_eq!(replay.ledger, 0);
 
         let results = memory
             .query_scope(
@@ -2303,8 +2378,8 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"First Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The first stable Project fact.\",\"tags\":[\"project\"],\"session_id\":\"session-assigned\"}]}".to_string(),
-            "{\"candidates\":[{\"title\":\"Second Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The second stable Project fact after switching workspaces.\",\"tags\":[\"project\"],\"session_id\":\"session-assigned\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"First Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The first stable Project fact.\",\"tags\":[\"project\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"Second Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The second stable Project fact after switching workspaces.\",\"tags\":[\"project\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
         ]));
         let context = AutoDreamContext {
             session_store,
@@ -2553,7 +2628,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider = SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"session-dream-run\"}],\"ledger_candidates\":[{\"title\":\"Renew passport\",\"kind\":\"todo\",\"due_at\":\"2026-08-01T00:00:00Z\",\"starts_at\":null,\"excerpt\":\"I need to renew my passport before August\",\"session_id\":\"session-dream-run\",\"confidence\":\"high\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"User prefers concise answers\",\"type\":\"feedback\",\"scope\":\"project\",\"content\":\"The user prefers concise answers and minimal recap.\",\"tags\":[\"preference\"],\"session_id\":\"source-session-0001\"}],\"ledger_candidates\":[{\"title\":\"Renew passport\",\"kind\":\"todo\",\"due_at\":\"2026-08-01T00:00:00Z\",\"starts_at\":null,\"excerpt\":\"I need to renew my passport before August\",\"session_id\":\"source-session-0001\",\"confidence\":\"high\"}]}".to_string(),
             "## Current durable context\n- Durable signal found\n\n## Cross-session patterns\n- Prefer concise answers\n\n## Active threads to remember\n- Memory extraction\n\n## Stable constraints and preferences\n- Terse replies\n\n## Open risks or questions\n- None".to_string(),
         ]);
         let provider_handle: Arc<dyn LLMProvider> = Arc::new(provider.clone());
@@ -2884,7 +2959,7 @@ mod tests {
         );
         let storage: Arc<dyn Storage> = session_store.clone();
         let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
-            "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"session-project-a\"}]}".to_string(),
+            "{\"candidates\":[{\"title\":\"Project A prefers concise planning\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"Project A plans should stay concise and scoped.\",\"tags\":[\"planning\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
             "## Current durable context\n- Project A signal only\n\n## Cross-session patterns\n- Focus on project A\n\n## Active threads to remember\n- Ship project A\n\n## Stable constraints and preferences\n- Keep scope isolated\n\n## Open risks or questions\n- None".to_string(),
         ]));
         let config = Arc::new(RwLock::new(config_with_memory(
@@ -3510,7 +3585,7 @@ Model: gpt-5-mini
         let calls = Arc::new(AtomicUsize::new(0));
         let provider: Arc<dyn LLMProvider> = Arc::new(CasMutatingProvider {
             responses: Arc::new(Mutex::new(vec![
-                "{\"candidates\":[{\"title\":\"Persist once across CAS retry\",\"type\":\"feedback\",\"scope\":\"global\",\"content\":\"This durable fact must not be duplicated when Dream publication retries.\",\"tags\":[\"cas\"],\"session_id\":\"session-cas-dream\"}]}".to_string(),
+                "{\"candidates\":[{\"title\":\"Persist once across CAS retry\",\"type\":\"feedback\",\"scope\":\"global\",\"content\":\"This durable fact must not be duplicated when Dream publication retries.\",\"tags\":[\"cas\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
                 "## Current durable context\n- Replacement that must not publish\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
                 "## Current durable context\n- Replacement published by the next periodic run\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
             ])),
