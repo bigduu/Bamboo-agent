@@ -583,6 +583,7 @@ fn reversed_structured_environment_literal_pattern() -> &'static Regex {
 
 fn structured_environment_name_is_credential(name: &str) -> bool {
     contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe"))
+        || fields_form_credential_label(&[name])
 }
 
 fn structured_environment_value_is_literal(candidate: &str) -> bool {
@@ -746,64 +747,14 @@ fn authorization_value_is_secret(value: &str) -> bool {
         )
 }
 
-fn yaml_authorization_secret(value: &serde_yaml::Value) -> Option<bool> {
-    match value {
-        serde_yaml::Value::Mapping(fields) => {
-            let mut found = false;
-            let mut secret = false;
-            for (key, candidate) in fields {
-                let is_authorization = key.as_str().is_some_and(|key| {
-                    key.eq_ignore_ascii_case("authorization")
-                        || key.eq_ignore_ascii_case("proxy-authorization")
-                });
-                if is_authorization {
-                    found = true;
-                    secret |= match candidate {
-                        serde_yaml::Value::String(candidate) => {
-                            authorization_value_is_secret(candidate)
-                        }
-                        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
-                        _ => true,
-                    };
-                    continue;
-                }
-                if let Some(nested_secret) = yaml_authorization_secret(candidate) {
-                    found = true;
-                    secret |= nested_secret;
-                }
-            }
-            found.then_some(secret)
-        }
-        serde_yaml::Value::Sequence(values) => {
-            let mut found = false;
-            let mut secret = false;
-            for value in values {
-                if let Some(nested_secret) = yaml_authorization_secret(value) {
-                    found = true;
-                    secret |= nested_secret;
-                }
-            }
-            found.then_some(secret)
-        }
-        serde_yaml::Value::Tagged(value) => yaml_authorization_secret(&value.value),
-        _ => None,
-    }
-}
-
-fn contains_authorization_secret(value: &str) -> bool {
-    let structured_authorization = serde_yaml::from_str::<serde_yaml::Value>(value)
-        .ok()
-        .as_ref()
-        .and_then(yaml_authorization_secret);
-    structured_authorization == Some(true)
-        || (structured_authorization.is_none()
-            && authorization_secret_pattern()
-                .captures_iter(value)
-                .any(|captures| {
-                    captures
-                        .name("value")
-                        .is_some_and(|value| authorization_value_is_secret(value.as_str()))
-                }))
+fn text_contains_authorization_secret(value: &str) -> bool {
+    authorization_secret_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures
+                .name("value")
+                .is_some_and(|value| authorization_value_is_secret(value.as_str()))
+        })
         || bare_authorization_scheme_pattern()
             .captures_iter(value)
             .any(|captures| {
@@ -821,6 +772,40 @@ fn contains_authorization_secret(value: &str) -> bool {
                     has_non_letter || (lowercase_count >= 2 && uppercase_count >= 2)
                 })
             })
+}
+
+fn yaml_contains_authorization_secret(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => fields.iter().any(|(key, candidate)| {
+            let is_authorization = key.as_str().is_some_and(|key| {
+                key.eq_ignore_ascii_case("authorization")
+                    || key.eq_ignore_ascii_case("proxy-authorization")
+            });
+            if is_authorization {
+                return match candidate {
+                    serde_yaml::Value::String(candidate) => {
+                        authorization_value_is_secret(candidate)
+                    }
+                    serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+                    _ => true,
+                };
+            }
+            yaml_contains_authorization_secret(candidate)
+        }),
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_contains_authorization_secret)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_contains_authorization_secret(&value.value),
+        serde_yaml::Value::String(value) => text_contains_authorization_secret(value),
+        _ => false,
+    }
+}
+
+fn contains_authorization_secret(value: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(value).map_or_else(
+        |_| text_contains_authorization_secret(value),
+        |value| yaml_contains_authorization_secret(&value),
+    )
 }
 
 fn credential_url_pattern() -> &'static Regex {
@@ -1479,6 +1464,10 @@ mod tests {
                 "{ name: DB_PASSWORD, value: ${DB_PASSWORD} }",
             ),
             (
+                "generic credential property placeholder",
+                r#"{"name":"password","value":"${DB_PASSWORD}"}"#,
+            ),
+            (
                 "authorization bearer placeholder",
                 "Authorization: Bearer ${API_TOKEN}",
             ),
@@ -1587,6 +1576,10 @@ mod tests {
                 "flow authorization header",
                 "{ Authorization: Bearer hunter2, mode: enabled }",
             ),
+            (
+                "safe structured header cannot mask literal note header",
+                r#"{"headers":{"Authorization":"${API_TOKEN}"},"note":"Authorization: Bearer hunter2"}"#,
+            ),
             ("bare basic credential", "Basic dXNlcjpwYXNz"),
             (
                 "session cookie",
@@ -1690,6 +1683,10 @@ mod tests {
             (
                 "reversed flow YAML environment literal",
                 "{ value: hunter2, name: DB_PASSWORD }",
+            ),
+            (
+                "generic credential property literal",
+                r#"{"name":"password","value":"hunter2"}"#,
             ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
