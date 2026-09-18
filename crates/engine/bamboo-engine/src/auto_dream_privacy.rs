@@ -232,7 +232,7 @@ fn cli_credential_flag_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)(?:\"{1,3}|'{1,3})?[^\s\"',;}]+"#,
+            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("CLI credential flag regex must compile")
     })
@@ -898,7 +898,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
-        || cli_credential_flag_pattern().is_match(value)
+        || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
         || contains_curl_user_credential(value)
         || netrc_credential_pattern().is_match(value)
         || sql_password_clause_pattern().is_match(value)
@@ -1234,6 +1234,14 @@ mod tests {
             ("basic plan", "I prefer the basic plan"),
             ("bearer bonds", "We trade bearer bonds"),
             ("credential file flag", "deploy --password-file secrets.txt"),
+            (
+                "CLI password placeholder",
+                "deploy --password ${DB_PASSWORD}",
+            ),
+            (
+                "CLI API key placeholder",
+                "deploy --api-key=\"$API_KEY\"",
+            ),
             ("token budget flag", "runner --token-budget 1000"),
             ("escaped token budget JSON", r#"{\"token_budget\":1000}"#),
             (
