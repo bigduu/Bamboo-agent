@@ -628,26 +628,44 @@ fn contains_pgpass_record(value: &str) -> bool {
         if line.is_empty() || line.starts_with('#') {
             return false;
         }
+        if line.chars().count() > 4_096 {
+            // A record-shaped line that exceeds the parser bound is
+            // indeterminate, not safe. Do not let an oversized password turn
+            // the bounded parser into a privacy bypass.
+            return line.bytes().filter(|byte| *byte == b':').count() >= 4;
+        }
         let Some(fields) = parse_pgpass_fields(line) else {
             return false;
         };
         let [host, port, database, user, password] = fields.as_slice() else {
             return false;
         };
-        let host_is_bounded_pg_target = host == "*"
-            || host.eq_ignore_ascii_case("localhost")
-            || host.contains('.')
-            || host.contains(':')
-            || host.contains('/');
-        let port_is_valid = port == "*"
-            || (port.len() <= 5
-                && port.bytes().all(|byte| byte.is_ascii_digit())
-                && port.parse::<u16>().is_ok_and(|port| port > 0));
+        let host_is_bounded_pg_target = !host.is_empty()
+            && host.len() <= 255
+            && !host.chars().any(char::is_whitespace)
+            && (host == "*"
+                || host.starts_with('/')
+                || host.contains(':')
+                || host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }));
+        let parsed_port = (port != "*" && port.len() <= 5)
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|port| *port > 0);
+        let port_is_valid = port == "*" || parsed_port.is_some();
+        let single_label_host = host != "*"
+            && !host.eq_ignore_ascii_case("localhost")
+            && !host.contains(['.', ':', '/']);
+        let single_label_port_is_plausible =
+            !single_label_host || port == "*" || parsed_port.is_some_and(|port| port >= 1_024);
         host_is_bounded_pg_target
             && port_is_valid
+            && single_label_port_is_plausible
             && [database, user, password]
                 .iter()
                 .all(|field| !field.is_empty() && !field.chars().any(char::is_whitespace))
+            && !is_placeholder_only(password)
     })
 }
 
@@ -908,7 +926,9 @@ fn contains_hcl_variable_default_credential(value: &str) -> bool {
                 return false;
             };
             let Some(body) = bounded_hcl_block_body(value, header.end()) else {
-                return false;
+                // A credential-labelled block that is malformed or exceeds
+                // the inspection bound is indeterminate and must fail closed.
+                return true;
             };
             hcl_default_pattern().captures_iter(body).any(|default| {
                 ["double", "single", "bare"].iter().any(|name| {
@@ -1664,6 +1684,10 @@ mod tests {
                 "machine example.test user alice account billing password ${NETRC_PASSWORD}",
             ),
             (
+                "pgpass password placeholder",
+                "db:5432:app:alice:${DB_PASSWORD}",
+            ),
+            (
                 "SQL password policy",
                 "ALTER ROLE alice SET password_policy = 'strict';",
             ),
@@ -2086,6 +2110,14 @@ mod tests {
                 "db.example.test:5432:app:alice:hunter2",
             ),
             (
+                "PostgreSQL single-label password-file record",
+                "db:5432:app:alice:hunter2",
+            ),
+            (
+                "PostgreSQL numeric single-label password-file record",
+                "123:5432:app:alice:hunter2",
+            ),
+            (
                 "PostgreSQL password-file escaped password",
                 "localhost:5432:app:alice:hun\\:ter2",
             ),
@@ -2130,6 +2162,19 @@ mod tests {
                 "secret case was not redacted: {case}"
             );
         }
+    }
+
+    #[test]
+    fn detector_fails_closed_on_oversized_hcl_credential_block() {
+        let source = format!(
+            "variable \"db_password\" {{\n  description = \"{}\"\n  default = \"hunter2\"\n}}",
+            "x".repeat(4_096)
+        );
+        assert!(contains_secret_like_value(&source));
+        assert_eq!(
+            sanitize_extraction_source(&source),
+            REDACTED_EXTRACTION_SOURCE
+        );
     }
 
     #[test]
