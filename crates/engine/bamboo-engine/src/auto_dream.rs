@@ -49,6 +49,10 @@ fn provider_session_alias(index: usize) -> String {
     format!("source-session-{:04}", index + 1)
 }
 
+fn provider_project_alias(index: usize) -> String {
+    format!("source-project-{:04}", index + 1)
+}
+
 fn restore_provider_session_alias(
     session_id: &mut Option<String>,
     provider_aliases: &HashMap<String, String>,
@@ -241,6 +245,7 @@ fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Opt
 fn sanitized_extraction_candidate_info(
     session: &CandidateSessionContext,
     provider_session_id: String,
+    provider_project_key: Option<String>,
 ) -> DreamCandidateInfo {
     let updated_at = session.entry.updated_at.to_rfc3339();
     let mut sources = vec![session.entry.title.as_str()];
@@ -255,7 +260,7 @@ fn sanitized_extraction_candidate_info(
         return DreamCandidateInfo {
             session_id: provider_session_id,
             title: REDACTED_EXTRACTION_SOURCE.to_string(),
-            project_key: session.project_key.clone(),
+            project_key: provider_project_key.clone(),
             updated_at,
             summary: None,
             topics: Vec::new(),
@@ -273,7 +278,7 @@ fn sanitized_extraction_candidate_info(
     DreamCandidateInfo {
         session_id: provider_session_id,
         title,
-        project_key: session.project_key.clone(),
+        project_key: provider_project_key,
         updated_at,
         summary,
         topics,
@@ -465,13 +470,21 @@ async fn extract_and_persist_durable_candidates_with_project_resolver(
     }
 
     let mut provider_aliases = HashMap::new();
+    let mut provider_project_aliases = HashMap::<String, String>::new();
     let candidates_info: Vec<DreamCandidateInfo> = sessions
         .iter()
         .enumerate()
         .map(|(index, session)| {
             let alias = provider_session_alias(index);
             provider_aliases.insert(alias.clone(), session.session_id.clone());
-            sanitized_extraction_candidate_info(session, alias)
+            let project_alias = session.project_key.as_ref().map(|project_key| {
+                let next_index = provider_project_aliases.len();
+                provider_project_aliases
+                    .entry(project_key.clone())
+                    .or_insert_with(|| provider_project_alias(next_index))
+                    .clone()
+            });
+            sanitized_extraction_candidate_info(session, alias, project_alias)
         })
         .collect();
     let prompt = build_extraction_prompt(&candidates_info);
@@ -1937,8 +1950,11 @@ mod tests {
             .iter()
             .find(|context| context.session_id == "session-split-private")
             .expect("split-field context");
-        let sanitized_split =
-            sanitized_extraction_candidate_info(split_context, "source-session-test-1".to_string());
+        let sanitized_split = sanitized_extraction_candidate_info(
+            split_context,
+            "source-session-test-1".to_string(),
+            None,
+        );
         assert_eq!(sanitized_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_split.summary.is_none());
         assert!(sanitized_split.topics.is_empty());
@@ -1949,6 +1965,7 @@ mod tests {
         let sanitized_triple_split = sanitized_extraction_candidate_info(
             triple_split_context,
             "source-session-test-2".to_string(),
+            None,
         );
         assert_eq!(sanitized_triple_split.title, REDACTED_EXTRACTION_SOURCE);
         assert!(sanitized_triple_split.summary.is_none());
@@ -1960,6 +1977,7 @@ mod tests {
         let sanitized_opaque_identifier = sanitized_extraction_candidate_info(
             opaque_identifier_context,
             "source-session-test-3".to_string(),
+            None,
         );
         assert_eq!(
             sanitized_opaque_identifier.session_id,
@@ -2343,7 +2361,8 @@ mod tests {
         let workspace_two = temp_dir.path().join("workspace-two");
         std::fs::create_dir_all(&workspace_one).expect("workspace one");
         std::fs::create_dir_all(&workspace_two).expect("workspace two");
-        let project_id = ProjectId::parse("project-auto-dream").expect("project id");
+        let project_id =
+            ProjectId::parse("sk-proj-abcdefghijklmnop").expect("secret-like project id");
         let project_home = temp_dir.path().join("projects").join(project_id.as_str());
         let memory_root = project_home.join("memory/v1");
         let resolver = ProjectContextResolver::new(Arc::new(StaticProjectSource(
@@ -2377,10 +2396,11 @@ mod tests {
                 .expect("session store"),
         );
         let storage: Arc<dyn Storage> = session_store.clone();
-        let provider: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(vec![
+        let sequence = Arc::new(SequenceProvider::new(vec![
             "{\"candidates\":[{\"title\":\"First Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The first stable Project fact.\",\"tags\":[\"project\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
             "{\"candidates\":[{\"title\":\"Second Project fact\",\"type\":\"project\",\"scope\":\"project\",\"content\":\"The second stable Project fact after switching workspaces.\",\"tags\":[\"project\"],\"session_id\":\"source-session-0001\"}]}".to_string(),
         ]));
+        let provider: Arc<dyn LLMProvider> = sequence.clone();
         let context = AutoDreamContext {
             session_store,
             storage: storage.clone(),
@@ -2459,6 +2479,12 @@ mod tests {
             .expect("query Project memory");
         assert_eq!(results.matched_count, 2);
         assert!(memory_root.join("topics").is_dir());
+        let prompts = sequence.recorded_prompts();
+        assert_eq!(prompts.len(), 2);
+        for prompt in prompts {
+            assert!(!prompt.contains(project_id.as_str()));
+            assert!(prompt.contains("source-project-0001"));
+        }
     }
 
     #[tokio::test]

@@ -36,7 +36,7 @@ fn present_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:\s+(?:for|in|on|of)\s+[a-z0-9][a-z0-9_-]{0,63})?\s+is(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("present-tense secret assignment regex must compile")
     })
@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:was|has\s+been|had\s+been)(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:\s+(?:for|in|on|of)\s+[a-z0-9][a-z0-9_-]{0,63})?\s+(?:was|has\s+been|had\s+been)(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -56,7 +56,7 @@ fn active_perfect_secret_transition_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:has|had)\s+(?P<value>changed|configured|reset|rotated|updated)\b"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:\s+(?:for|in|on|of)\s+[a-z0-9][a-z0-9_-]{0,63})?\s+(?:has|had)\s+(?P<value>changed|configured|reset|rotated|updated)\b"#,
         )
         .expect("active-perfect secret transition regex must compile")
     })
@@ -3721,6 +3721,22 @@ mod tests {
                 "active past-perfect equals literal",
                 "The database password had updated=swordfish",
             ),
+            (
+                "present contextual literal",
+                "The database password for production is hunter2",
+            ),
+            (
+                "past contextual literal",
+                "The database password in staging was hunter2",
+            ),
+            (
+                "active perfect contextual literal",
+                "The database password for production has changed to hunter2",
+            ),
+            (
+                "passive perfect contextual literal",
+                "The database password for production has been reset to hunter2",
+            ),
         ] {
             assert!(
                 contains_secret_like_value(value),
@@ -3754,6 +3770,26 @@ mod tests {
             (
                 "active past-perfect equals reference",
                 "The database password had updated=$DB_PASSWORD",
+            ),
+            (
+                "present contextual placeholder",
+                "The database password for production is ${DB_PASSWORD}",
+            ),
+            (
+                "past contextual state",
+                "The database password in staging was required",
+            ),
+            (
+                "active perfect contextual reference",
+                "The database password for production has changed to $DB_PASSWORD",
+            ),
+            (
+                "ordinary qualified prose",
+                "The password policy for production is documented",
+            ),
+            (
+                "technical qualified token prose",
+                "The token budget for production is 4096",
             ),
         ] {
             assert!(
