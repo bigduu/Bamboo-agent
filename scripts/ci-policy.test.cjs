@@ -3,6 +3,7 @@ const { readFileSync } = require("node:fs")
 const { test } = require("node:test")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
+const codeqlWorkflow = readFileSync(".github/workflows/codeql.yml", "utf8")
 const contributing = readFileSync("CONTRIBUTING.md", "utf8")
 
 const job = (id) => {
@@ -80,4 +81,16 @@ test("main promotion and manual build policy stays intact", () => {
   assert.match(build, /github\.base_ref == 'main'/u)
   assert.match(build, /github\.head_ref == 'dev'/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
+})
+
+test("CodeQL stays on the main and manual paths", () => {
+  assert.match(codeqlWorkflow, /workflow_dispatch:\n/u)
+  assert.match(codeqlWorkflow, /push:\n\s+branches: \[ main \]/u)
+  assert.match(codeqlWorkflow, /pull_request:\n\s+branches: \[ main \]/u)
+  assert.doesNotMatch(codeqlWorkflow, /branches: \[[^\]]*dev/u)
+  assert.match(
+    codeqlWorkflow,
+    /language: \[ actions, javascript-typescript, python, rust \]/u,
+  )
+  assert.match(codeqlWorkflow, /build-mode: none/u)
 })
