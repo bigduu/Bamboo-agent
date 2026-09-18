@@ -1,0 +1,3813 @@
+//! Privacy boundary for AutoDream durable extraction.
+//!
+//! The extractor is intentionally conservative: a source item containing a
+//! credential-like value is replaced as a whole before provider dispatch, and
+//! a model candidate containing the same shapes is rejected before either
+//! durable sink sees it. This module never logs the rejected value.
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+use bamboo_memory::auto_dream::{DurableExtractionCandidate, LedgerExtractionCandidate};
+use regex::Regex;
+
+pub(crate) const REDACTED_EXTRACTION_SOURCE: &str =
+    "[sensitive content omitted before durable-memory extraction]";
+
+fn secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]*(?:cookie|token|id))[\"']?\s*(?::|=)|cookie[\"']?\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("secret assignment regex must compile")
+    })
+}
+
+fn generic_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)(?:^|[\s(\"'])(?:secret|token)[\"']?\s*(?::|=)\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#)
+            .expect("generic secret assignment regex must compile")
+    })
+}
+
+fn present_tense_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:[ \t]+(?:for|in|on|of)[ \t]+[a-z0-9][a-z0-9_-]{0,31}(?:[ \t]+[a-z0-9][a-z0-9_-]{0,31}){0,3})?[ \t]+is(?:[ \t]*(?::|=)[ \t]*|[ \t]+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("present-tense secret assignment regex must compile")
+    })
+}
+
+fn past_tense_secret_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:[ \t]+(?:for|in|on|of)[ \t]+[a-z0-9][a-z0-9_-]{0,31}(?:[ \t]+[a-z0-9][a-z0-9_-]{0,31}){0,3})?[ \t]+(?:was|has[ \t]+been|had[ \t]+been)(?:[ \t]*(?::|=)[ \t]*|[ \t]+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("past-tense secret assignment regex must compile")
+    })
+}
+
+fn active_perfect_secret_transition_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))(?:[ \t]+(?:for|in|on|of)[ \t]+[a-z0-9][a-z0-9_-]{0,31}(?:[ \t]+[a-z0-9][a-z0-9_-]{0,31}){0,3})?[ \t]+(?:has|had)[ \t]+(?P<value>changed|configured|reset|rotated|updated)\b"#,
+        )
+        .expect("active-perfect secret transition regex must compile")
+    })
+}
+
+fn is_credential_state_predicate(value: &str) -> bool {
+    matches!(
+        value,
+        "changed"
+            | "configured"
+            | "disabled"
+            | "encrypted"
+            | "enabled"
+            | "expired"
+            | "forgotten"
+            | "hashed"
+            | "invalid"
+            | "masked"
+            | "not"
+            | "optional"
+            | "redacted"
+            | "removed"
+            | "required"
+            | "reset"
+            | "revoked"
+            | "rotated"
+            | "stored"
+            | "updated"
+            | "valid"
+    )
+}
+
+fn is_placeholder_only(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    let identifier = |candidate: &str| {
+        !candidate.is_empty()
+            && candidate
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let reference_path = |candidate: &str| {
+        let candidate = candidate.trim();
+        !candidate.is_empty()
+            && candidate.split('.').all(|segment| {
+                let mut bytes = segment.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                    && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+    };
+
+    // Assignment scanners intentionally stop at whitespace, so a spaced GitHub
+    // expression can reach this helper as just its unambiguous opening token.
+    if matches!(value, "${{" | "{{") {
+        return true;
+    }
+    if let Some(candidate) = value
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    {
+        return reference_path(candidate);
+    }
+    if let Some(candidate) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value.strip_prefix('$') {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value
+        .strip_prefix('%')
+        .and_then(|rest| rest.strip_suffix('%'))
+    {
+        return identifier(candidate);
+    }
+    if let Some(candidate) = value
+        .strip_prefix("{{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+    {
+        return reference_path(candidate);
+    }
+    value
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|candidate| !candidate.trim().is_empty())
+}
+
+fn template_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^|[,{ \t])[\"']?(?P<label>[a-z_][a-z0-9_. -]{0,64})[\"']?\s*(?::|=)\s*(?P<value>\$?\{\{[^\r\n]{1,1024}\}\})"#,
+        )
+        .expect("template credential assignment regex must compile")
+    })
+}
+
+fn contains_literal_template_credential(value: &str) -> bool {
+    template_credential_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures
+                .name("label")
+                .is_some_and(|label| structured_environment_name_is_credential(label.as_str()))
+                && captures
+                    .name("value")
+                    .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+        })
+}
+
+fn captures_non_placeholder_credential_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        captures
+            .name("value")
+            .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+    })
+}
+
+fn credential_assignment_value_is_literal(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    if value.is_empty() || is_placeholder_only(value) {
+        return false;
+    }
+    let normalized = value
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .to_ascii_lowercase();
+    !normalized.is_empty()
+        && !is_credential_state_predicate(&normalized)
+        && !matches!(
+            normalized.as_str(),
+            "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+        )
+}
+
+fn captures_non_state_credential_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        captures
+            .name("value")
+            .is_some_and(|candidate| credential_assignment_value_is_literal(candidate.as_str()))
+    })
+}
+
+fn strip_ascii_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
+}
+
+fn captures_credential_state_transition_value(pattern: &Regex, value: &str) -> bool {
+    pattern.captures_iter(value).any(|captures| {
+        let Some(candidate) = captures.name("value") else {
+            return false;
+        };
+        let state_has_assignment_delimiter = candidate
+            .as_str()
+            .trim_matches(|character| matches!(character, '"' | '\''))
+            .ends_with([':', '=']);
+        let state = candidate
+            .as_str()
+            .trim_matches(|character: char| character.is_ascii_punctuation())
+            .to_ascii_lowercase();
+        if !matches!(
+            state.as_str(),
+            "changed" | "configured" | "reset" | "rotated" | "updated"
+        ) {
+            return false;
+        }
+        let Some(matched) = captures.get(0) else {
+            return false;
+        };
+        let suffix = value[matched.end()..].trim_start();
+        if state_has_assignment_delimiter {
+            let candidate = suffix.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
+        if let Some(remainder) = suffix
+            .strip_prefix(':')
+            .or_else(|| suffix.strip_prefix('='))
+        {
+            let candidate = remainder.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
+        if let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "to ")
+            .or_else(|| strip_ascii_case_insensitive_prefix(suffix, "as "))
+        {
+            let candidate = remainder.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
+        let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "from ") else {
+            return false;
+        };
+        let mut tokens = remainder.split_whitespace();
+        let previous = tokens.next().unwrap_or_default();
+        if credential_assignment_value_is_literal(previous) {
+            return true;
+        }
+        let Some(operator) = tokens.next() else {
+            return false;
+        };
+        if !operator.eq_ignore_ascii_case("to") {
+            return false;
+        }
+        let next = tokens.next().unwrap_or_default();
+        credential_assignment_value_is_literal(next)
+    })
+}
+
+fn contains_present_tense_secret_assignment(value: &str) -> bool {
+    captures_non_state_credential_value(present_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(
+            present_tense_secret_assignment_pattern(),
+            value,
+        )
+}
+
+fn contains_past_tense_secret_assignment(value: &str) -> bool {
+    captures_non_state_credential_value(past_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(past_tense_secret_assignment_pattern(), value)
+        || captures_credential_state_transition_value(
+            active_perfect_secret_transition_pattern(),
+            value,
+        )
+}
+
+fn pin_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:my|our|your)\s+pin\s*(?::|=)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin\s*(?::|=)|pin[\s_-]+(?:code|number)\s*(?::|=))\s*(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("credential-context PIN assignment regex must compile")
+    })
+}
+
+fn short_credential_config_field_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^[ \t]*(?:[-*][ \t]+)?|[,;{][ \t]*)[\"']?(?:pwd|pass)[\"']?[ \t]*(?::|=)[ \t]*(?P<value>\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s\"',;}\]\r\n]{1,1024})"#,
+        )
+        .expect("short credential config-field regex must compile")
+    })
+}
+
+fn contains_short_credential_config_field(value: &str) -> bool {
+    short_credential_config_field_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            let candidate = candidate.as_str().trim();
+            if is_placeholder_only(candidate) {
+                return false;
+            }
+            if candidate.starts_with('\"') || candidate.starts_with('\'') {
+                return true;
+            }
+            if candidate.starts_with('$')
+                || candidate.starts_with('<')
+                || candidate.starts_with("{{")
+                || candidate.starts_with('%')
+            {
+                return false;
+            }
+            let candidate = candidate
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase();
+            !is_credential_state_predicate(&candidate)
+                && !matches!(
+                    candidate.as_str(),
+                    "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+                )
+        })
+}
+
+fn redis_password_directive_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:config[ \t]+set[ \t]+)?(?:requirepass|masterauth)[ \t]+(?P<value>\"{1,3}[^\"\r\n]{1,1024}\"{1,3}|'{1,3}[^'\r\n]{1,1024}'{1,3}|[^\s#;\"']{1,1024})(?:[ \t]*(?:#.*)?)?$"#,
+        )
+        .expect("Redis password directive regex must compile")
+    })
+}
+
+fn contains_redis_cli_password_option(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let lowercase = line.to_ascii_lowercase();
+        if line.len() > 4096 {
+            return lowercase.contains("redis-cli")
+                && (lowercase.contains(" -a ")
+                    || lowercase.contains(" -a=")
+                    || lowercase.contains(" --pass ")
+                    || lowercase.contains(" --pass="));
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let Some(command_index) = tokens.iter().position(|token| {
+            token
+                .trim_matches(|character| matches!(character, '\'' | '"'))
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|command| {
+                    command.eq_ignore_ascii_case("redis-cli")
+                        || command.eq_ignore_ascii_case("redis-cli.exe")
+                })
+        }) else {
+            return false;
+        };
+
+        tokens[command_index + 1..]
+            .iter()
+            .enumerate()
+            .any(|(index, token)| {
+                let token = token.trim_matches(|character| matches!(character, '\'' | '"'));
+                let candidate =
+                    if token.eq_ignore_ascii_case("-a") || token.eq_ignore_ascii_case("--pass") {
+                        tokens.get(command_index + index + 2).copied()
+                    } else {
+                        token
+                            .strip_prefix("-a=")
+                            .or_else(|| strip_ascii_case_insensitive_prefix(token, "--pass="))
+                    };
+                candidate.is_some_and(|candidate| {
+                    credential_assignment_value_is_literal(
+                        candidate.trim_matches(|character| matches!(character, '\'' | '"')),
+                    )
+                })
+            })
+    })
+}
+
+fn contains_redis_acl_plaintext_password(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let lowercase = line.to_ascii_lowercase();
+        if line.len() > 4096 {
+            return lowercase.starts_with("user ")
+                || lowercase.starts_with("acl setuser ")
+                || (lowercase.starts_with("redis-cli") && lowercase.contains(" acl setuser "));
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let first_token_is_redis_cli = tokens.first().is_some_and(|token| {
+            token
+                .trim_matches(|character| matches!(character, '\'' | '"'))
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|command| {
+                    command.eq_ignore_ascii_case("redis-cli")
+                        || command.eq_ignore_ascii_case("redis-cli.exe")
+                })
+        });
+        let command_start = if first_token_is_redis_cli {
+            tokens
+                .windows(2)
+                .position(|pair| {
+                    pair[0].eq_ignore_ascii_case("acl") && pair[1].eq_ignore_ascii_case("setuser")
+                })
+                .unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let rule_start = if command_start == 0
+            && tokens
+                .first()
+                .is_some_and(|token| token.eq_ignore_ascii_case("user"))
+        {
+            2
+        } else if command_start != usize::MAX
+            && tokens
+                .get(command_start)
+                .is_some_and(|token| token.eq_ignore_ascii_case("acl"))
+            && tokens
+                .get(command_start + 1)
+                .is_some_and(|token| token.eq_ignore_ascii_case("setuser"))
+        {
+            command_start + 3
+        } else {
+            return false;
+        };
+
+        tokens.get(rule_start..).is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                let rule = rule.trim_matches(|character| matches!(character, '\'' | '"'));
+                rule.strip_prefix('>')
+                    .is_some_and(credential_assignment_value_is_literal)
+            })
+        })
+    })
+}
+
+fn markdown_table_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*\|[ \t]*(?:api[\s_-]?key|account[\s_-]?key|password|passwd|pwd|pass|passcode|passphrase|credential|private[\s_-]?key|secret(?:[\s_-]?key)?|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:api|auth|access|refresh|bearer|session)[\s_-]?token|session[\s_-]?(?:cookie|id)|pin)[ \t]*\|[ \t]*(?P<value>[^|\r\n]{1,1024}?)[ \t]*(?:\|[^\r\n]*)?$"#,
+        )
+        .expect("Markdown credential table regex must compile")
+    })
+}
+
+fn standalone_pin_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?im)^[ \t]*(?:[-*][ \t]+)?pin[ \t]*(?::|=|\bis\b)[ \t]*(?:\"{1,3}|'{1,3})?[0-9]{3,12}\b"#)
+            .expect("standalone PIN credential regex must compile")
+    })
+}
+
+fn cli_credential_flag_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|\s)--(?:api[-_]?key|account[-_]?key|password|passwd|passcode|passphrase|private[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|basic[-_]?auth|proxy[-_]?auth|http[-_]?auth|(?:api|auth|access|refresh|bearer|session)[-_]?token|cookie)(?:\s+|=)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("CLI credential flag regex must compile")
+    })
+}
+
+fn curl_user_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\bcurl(?:\.exe)?\b[^\r\n]{0,2048}?(?:[ \t]+--user(?:[ \t]+|=)|[ \t]+-u(?:[ \t]+|=)?)[\"']?(?P<user>[^:\s\"';&|]{0,256}):(?P<password>[^\s\"',;}&|]{1,1024})"#,
+        )
+        .expect("curl user-password regex must compile")
+    })
+}
+
+fn contains_curl_user_credential(value: &str) -> bool {
+    curl_user_credential_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(password) = captures.name("password") else {
+                return false;
+            };
+            let password = password.as_str();
+            // Shell/template references do not contain a credential value.
+            // Keep the boundary focused on literal user-password pairs while
+            // still catching curl's spaced, equals, and joined short forms.
+            !password.starts_with('$')
+                && !password.starts_with('<')
+                && !password.starts_with("{{")
+                && !password.starts_with('%')
+        })
+}
+
+fn wallet_mnemonic_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)(?:^|[^a-z0-9])(?:mnemonic|seed|recovery)(?:[\s_-]+(?:phrase|words?))?\s*(?::|=|\bis\b)\s*(?P<value>[^\r\n]{1,2048})"#,
+        )
+        .expect("wallet mnemonic assignment regex must compile")
+    })
+}
+
+fn contains_wallet_mnemonic(value: &str) -> bool {
+    wallet_mnemonic_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(candidate) = captures.name("value") else {
+                return false;
+            };
+            if is_placeholder_only(candidate.as_str()) {
+                return false;
+            }
+            let words = candidate
+                .as_str()
+                .split_ascii_whitespace()
+                .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphabetic()))
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            matches!(words.len(), 12 | 15 | 18 | 21 | 24)
+                && words
+                    .iter()
+                    .all(|word| word.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        })
+}
+
+fn otp_provisioning_uri_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\botpauth://(?:totp|hotp)/(?P<uri>[^\s]+)"#)
+            .expect("OTP provisioning URI regex must compile")
+    })
+}
+
+fn contains_otp_provisioning_secret(value: &str) -> bool {
+    const MAX_QUERY_PARAMETERS: usize = 64;
+
+    otp_provisioning_uri_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(uri) = captures.name("uri").map(|candidate| candidate.as_str()) else {
+                return false;
+            };
+            if uri.len() > 4_096 {
+                return true;
+            }
+            let Some((_, query)) = uri.split_once('?') else {
+                return false;
+            };
+            let mut parameters = query.split('&');
+            for parameter in parameters.by_ref().take(MAX_QUERY_PARAMETERS) {
+                let Some((name, candidate)) = parameter.split_once('=') else {
+                    continue;
+                };
+                let candidate = candidate.split('#').next().unwrap_or_default();
+                if name.eq_ignore_ascii_case("secret")
+                    && !candidate.is_empty()
+                    && !is_placeholder_only(candidate)
+                {
+                    return true;
+                }
+            }
+            // A URI that exceeds the explicit inspection budget is
+            // indeterminate. Do not silently treat an uninspected tail as
+            // privacy-safe.
+            parameters.next().is_some()
+        })
+}
+
+fn contains_netrc_credential(value: &str) -> bool {
+    const MAX_FIELDS_PER_ENTRY: usize = 16;
+
+    let mut tokens = value
+        .lines()
+        .flat_map(|line| {
+            line.split_once('#')
+                .map_or(line, |(content, _)| content)
+                .split_ascii_whitespace()
+        })
+        .peekable();
+    while let Some(token) = tokens.next() {
+        let token = token.trim_matches(|character| matches!(character, '"' | '\''));
+        let is_machine = token.eq_ignore_ascii_case("machine");
+        let is_default = token.eq_ignore_ascii_case("default");
+        if !is_machine && !is_default {
+            continue;
+        }
+        if is_machine && tokens.next().is_none() {
+            continue;
+        }
+
+        let mut fields_seen = 0usize;
+        let mut literal_password = false;
+        while let Some(field) = tokens.peek().copied() {
+            let field = field.trim_matches(|character| matches!(character, '"' | '\''));
+            if field.eq_ignore_ascii_case("machine")
+                || field.eq_ignore_ascii_case("default")
+                || field.eq_ignore_ascii_case("macdef")
+            {
+                break;
+            }
+            let is_password = field.eq_ignore_ascii_case("password");
+            let is_known_field = is_password
+                || field.eq_ignore_ascii_case("login")
+                || field.eq_ignore_ascii_case("user")
+                || field.eq_ignore_ascii_case("account");
+            if !is_known_field {
+                break;
+            }
+            if fields_seen >= MAX_FIELDS_PER_ENTRY {
+                // An entry that exceeds the supported field bound is unsafe to
+                // classify as ordinary prose. Fail closed without scanning or
+                // retaining any additional values.
+                return true;
+            }
+            let _ = tokens.next();
+            let Some(candidate) = tokens.next() else {
+                break;
+            };
+            fields_seen += 1;
+            if is_password && !is_placeholder_only(candidate) {
+                literal_password = true;
+            }
+        }
+        if literal_password {
+            return true;
+        }
+    }
+    false
+}
+
+fn sql_password_clause_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?is)\b(?:alter|create)\s+(?:role|user)\b[^;]{0,512}\bpassword\s+(?:e|u&)?[\"'][^\"'\r\n]{1,1024}[\"']"#,
+        )
+        .expect("SQL password clause regex must compile")
+    })
+}
+
+fn mysql_identified_credential_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?is)\b(?:alter|create)\s+user\b[^;]{0,512}\bidentified\s+(?:(?:with|via)\s+[a-z0-9_.$-]+\s+)?(?:by|as)\s+(?:password\s+)?(?:(?P<generated>random\s+password)|(?P<value>[\"'][^\"'\r\n]{1,1024}[\"']|[^\s;\"',]{1,1024}))"#,
+        )
+        .expect("MySQL identified credential regex must compile")
+    })
+}
+
+fn contains_identified_credential(value: &str) -> bool {
+    mysql_identified_credential_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures.name("generated").is_none()
+                && captures
+                    .name("value")
+                    .is_some_and(|value| !is_placeholder_only(value.as_str()))
+        })
+}
+
+fn xml_credential_tag_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)^\s*(?:[a-z_][a-z0-9_.-]*:)?(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)(?:\s|/|$)"#,
+        )
+        .expect("XML credential tag-name regex must compile")
+    })
+}
+
+fn xml_credential_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)\s*=\s*[\"'](?P<value>[^\"'\r\n]{1,1024})[\"']"#,
+        )
+        .expect("XML credential attribute regex must compile")
+    })
+}
+
+fn xml_quoted_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?P<name>[a-z_][a-z0-9_.:-]{0,127})\s*=\s*[\"'](?P<value>[^\"'\r\n]{0,1024})[\"']"#,
+        )
+        .expect("XML quoted attribute regex must compile")
+    })
+}
+
+fn xml_tag_has_direct_credential_attribute(tag: &str) -> bool {
+    xml_quoted_attribute_pattern()
+        .captures_iter(tag)
+        .any(|captures| {
+            captures
+                .name("name")
+                .is_some_and(|name| structured_environment_name_is_credential(name.as_str()))
+                && captures
+                    .name("value")
+                    .is_some_and(|value| credential_assignment_value_is_literal(value.as_str()))
+        })
+}
+
+fn xml_credential_name_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(?:name|key)\s*=\s*[\"'](?:[a-z_][a-z0-9_-]*[.:]){0,8}(?:password|passwd|passcode|passphrase|credential|secret|token|api[-_]?key|private[-_]?key|client[-_]?secret|access[-_]?key|auth[-_]?key|signing[-_]?key|encryption[-_]?key|access[-_]?token|refresh[-_]?token|session[-_]?token|session[-_]?cookie)[\"']"#,
+        )
+        .expect("XML credential name attribute regex must compile")
+    })
+}
+
+fn xml_name_or_key_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:name|key)\s*=\s*[\"'](?P<name>[^\"'\r\n]{1,1024})[\"']"#)
+            .expect("XML name/key attribute regex must compile")
+    })
+}
+
+fn xml_property_has_credential_name(tag: &str) -> bool {
+    xml_credential_name_attribute_pattern().is_match(tag)
+        || xml_name_or_key_attribute_pattern()
+            .captures_iter(tag)
+            .filter_map(|captures| captures.name("name"))
+            .any(|name| structured_environment_name_is_credential(name.as_str()))
+}
+
+fn xml_value_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\bvalue\s*=\s*[\"'](?P<value>[^\"'\r\n]{1,1024})[\"']"#)
+            .expect("XML value attribute regex must compile")
+    })
+}
+
+fn xml_element_body_contains_literal(body: &str, outer_name: &str) -> bool {
+    let mut bounded_end = body.len().min(4_096);
+    while !body.is_char_boundary(bounded_end) {
+        bounded_end = bounded_end.saturating_sub(1);
+    }
+    let body = &body[..bounded_end];
+    let mut cursor = 0usize;
+    let mut nested_depth = 0usize;
+
+    while cursor < body.len() {
+        let remainder = &body[cursor..];
+        if let Some(cdata) = remainder.strip_prefix("<![CDATA[") {
+            let (text, consumed) = match cdata.find("]]>") {
+                Some(end) => (&cdata[..end], "<![CDATA[".len() + end + "]]>".len()),
+                None => return true,
+            };
+            if credential_assignment_value_is_literal(text) {
+                return true;
+            }
+            cursor += consumed;
+            continue;
+        }
+        if remainder.starts_with("<!--") {
+            let Some(consumed) = remainder.find("-->").map(|end| end + "-->".len()) else {
+                return true;
+            };
+            cursor += consumed;
+            continue;
+        }
+        if remainder.starts_with("</") {
+            let Some(end) = remainder.find('>') else {
+                return true;
+            };
+            if nested_depth == 0 {
+                let closing_name = remainder[2..end]
+                    .trim()
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                return !closing_name.eq_ignore_ascii_case(outer_name);
+            }
+            nested_depth -= 1;
+            cursor += end + 1;
+            continue;
+        }
+        if remainder.starts_with('<') {
+            let Some(end) = remainder.find('>') else {
+                return true;
+            };
+            let tag = &remainder[1..end];
+            let trimmed = tag.trim_start();
+            if !trimmed.starts_with('!')
+                && !trimmed.starts_with('?')
+                && !tag.trim_end().ends_with('/')
+            {
+                nested_depth += 1;
+            }
+            cursor += end + 1;
+            continue;
+        }
+
+        let text_end = remainder.find('<').unwrap_or(remainder.len());
+        let text = remainder[..text_end].trim();
+        if credential_assignment_value_is_literal(text) {
+            return true;
+        }
+        cursor += text_end;
+    }
+    // Reaching EOF or the 4 KiB inspection boundary without the outer close
+    // leaves part of this credential-labelled element uninspected.
+    true
+}
+
+fn contains_xml_credential(value: &str) -> bool {
+    let mut remainder = value;
+    while let Some(open) = remainder.find('<') {
+        remainder = &remainder[open + 1..];
+        let Some(close) = remainder.find('>') else {
+            break;
+        };
+        if close > 4_096 {
+            return true;
+        }
+        let tag = &remainder[..close];
+        let trimmed_tag = tag.trim_start();
+        if trimmed_tag.starts_with('/')
+            || trimmed_tag.starts_with('!')
+            || trimmed_tag.starts_with('?')
+        {
+            remainder = &remainder[close + 1..];
+            continue;
+        }
+        let element_name = trimmed_tag
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+
+        if captures_non_state_credential_value(xml_credential_attribute_pattern(), tag)
+            || xml_tag_has_direct_credential_attribute(tag)
+        {
+            return true;
+        }
+
+        if xml_property_has_credential_name(tag) {
+            if captures_non_state_credential_value(xml_value_attribute_pattern(), tag) {
+                return true;
+            }
+            if !tag.trim_end().ends_with('/') {
+                let body = &remainder[close + 1..];
+                if xml_element_body_contains_literal(body, element_name) {
+                    return true;
+                }
+            }
+        }
+
+        if xml_credential_tag_name_pattern().is_match(tag)
+            || structured_environment_name_is_credential(element_name)
+        {
+            if captures_non_state_credential_value(xml_value_attribute_pattern(), tag) {
+                return true;
+            }
+            if !tag.trim_end().ends_with('/') {
+                let body = &remainder[close + 1..];
+                if xml_element_body_contains_literal(body, element_name) {
+                    return true;
+                }
+            }
+        }
+        remainder = &remainder[close + 1..];
+    }
+    false
+}
+
+fn parse_pgpass_fields(line: &str) -> Option<Vec<String>> {
+    if line.chars().count() > 4_096 {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(5);
+    let mut field = String::new();
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            field.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ':' {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(character);
+        }
+    }
+    if escaped {
+        return None;
+    }
+    fields.push(field);
+    (fields.len() == 5).then_some(fields)
+}
+
+fn contains_pgpass_record(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        if line.chars().count() > 4_096 {
+            // A record-shaped line that exceeds the parser bound is
+            // indeterminate, not safe. Do not let an oversized password turn
+            // the bounded parser into a privacy bypass.
+            return line.bytes().filter(|byte| *byte == b':').count() >= 4;
+        }
+        let Some(fields) = parse_pgpass_fields(line) else {
+            return false;
+        };
+        let [host, port, database, user, password] = fields.as_slice() else {
+            return false;
+        };
+        let host_is_bounded_pg_target = !host.is_empty()
+            && host.len() <= 255
+            && !host.chars().any(char::is_whitespace)
+            && (host == "*"
+                || host.starts_with('/')
+                || host.contains(':')
+                || host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                }));
+        let parsed_port = (port != "*" && port.len() <= 5)
+            .then(|| port.parse::<u16>().ok())
+            .flatten()
+            .filter(|port| *port > 0);
+        let port_is_valid = port == "*" || parsed_port.is_some();
+        let single_label_host = host != "*"
+            && !host.eq_ignore_ascii_case("localhost")
+            && !host.contains(['.', ':', '/']);
+        let single_label_port_is_plausible =
+            !single_label_host || port == "*" || parsed_port.is_some_and(|port| port >= 1_024);
+        host_is_bounded_pg_target
+            && port_is_valid
+            && single_label_port_is_plausible
+            && [database, user, password]
+                .iter()
+                .all(|field| !field.is_empty() && !field.chars().any(char::is_whitespace))
+            && !is_placeholder_only(password)
+    })
+}
+
+fn environment_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9_])(?P<name>(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*_(?:access_key_id|secret_key_base|storage_account_key|api_key|access_key|secret_key|private_key|client_key|auth_key|basic_auth|proxy_auth|http_auth|signing_key|encryption_key|token|pat|secret|password|passcode|otp)|secret_key_base|pgpassword|basic_auth|proxy_auth|http_auth))\s*(?::|=)\s*[\"']?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("environment credential assignment regex must compile")
+    })
+}
+
+fn ambiguous_environment_credential_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9_])(?:(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)*)_)?(?:auth|login|user|account|admin|root|credential|secret|service|server|client|app|application|device|database|db|sql|postgres|postgresql|pg|mysql|mariadb|redis|mongo|mongodb|cache|broker|smtp|imap|pop3|ftp|sftp|ssh|registry|repository|repo|vault|keystore|keychain)_(?:pass|pwd|pin)\s*(?::|=)\s*[\"']?(?P<value>[^\s\"',;]+)"#,
+        )
+        .expect("ambiguous environment credential assignment regex must compile")
+    })
+}
+
+fn contains_environment_credential_assignment(value: &str) -> bool {
+    environment_credential_assignment_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures.name("name").is_some_and(|name| {
+                !name.as_str().eq_ignore_ascii_case("max_token")
+                    && captures
+                        .name("value")
+                        .is_some_and(|value| credential_assignment_value_is_literal(value.as_str()))
+            })
+        })
+        || captures_non_state_credential_value(
+            ambiguous_environment_credential_assignment_pattern(),
+            value,
+        )
+}
+
+fn structured_environment_literal_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:-[ \t]*)?(?:name|key)[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*\r?\n[ \t]+value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})$"#,
+        )
+        .expect("structured environment literal regex must compile")
+    })
+}
+
+fn reversed_structured_environment_literal_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*(?:-[ \t]*)?value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})\r?\n[ \t]+(?:name|key)[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*$"#,
+        )
+        .expect("reversed structured environment literal regex must compile")
+    })
+}
+
+fn structured_environment_name_is_credential(name: &str) -> bool {
+    if name.eq_ignore_ascii_case("_auth") {
+        return true;
+    }
+    if contains_environment_credential_assignment(&format!("{name}=bamboo-privacy-probe")) {
+        return true;
+    }
+    let characters = name.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            continue;
+        }
+        let splits_camel_case = character.is_ascii_uppercase()
+            && !token.is_empty()
+            && (characters[index - 1].is_ascii_lowercase()
+                || characters[index - 1].is_ascii_digit()
+                || (characters[index - 1].is_ascii_uppercase()
+                    && characters
+                        .get(index + 1)
+                        .is_some_and(char::is_ascii_lowercase)));
+        if splits_camel_case {
+            tokens.push(std::mem::take(&mut token));
+        }
+        token.push(character.to_ascii_lowercase());
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    let canonical_name = tokens.join("_");
+    if contains_environment_credential_assignment(&format!("{canonical_name}=bamboo-privacy-probe"))
+    {
+        return true;
+    }
+    let Some(last) = tokens.last().map(String::as_str) else {
+        return false;
+    };
+    if matches!(
+        last,
+        "credential" | "otp" | "passcode" | "passphrase" | "passwd" | "password"
+    ) {
+        return true;
+    }
+    if tokens.len() == 1 && matches!(last, "pin" | "secret" | "token") {
+        return true;
+    }
+    if tokens.as_slice() == ["rediscli", "auth"] {
+        return true;
+    }
+    let previous = tokens
+        .get(tokens.len().saturating_sub(2))
+        .map(String::as_str);
+    matches!(
+        (previous, last),
+        (
+            Some(
+                "account"
+                    | "access"
+                    | "api"
+                    | "auth"
+                    | "client"
+                    | "encryption"
+                    | "license"
+                    | "private"
+                    | "secret"
+                    | "shared"
+                    | "signing"
+            ),
+            "key"
+        ) | (
+            Some("access" | "api" | "auth" | "bearer" | "refresh" | "session"),
+            "token"
+        ) | (Some("session"), "cookie" | "id")
+            | (Some("basic" | "http" | "proxy"), "auth")
+            | (
+                Some(
+                    "account"
+                        | "admin"
+                        | "auth"
+                        | "bank"
+                        | "card"
+                        | "device"
+                        | "login"
+                        | "mfa"
+                        | "payment"
+                        | "recovery"
+                        | "root"
+                        | "security"
+                        | "unlock"
+                        | "verification"
+                ),
+                "pin"
+            )
+    )
+}
+
+fn structured_environment_value_is_literal(candidate: &str) -> bool {
+    credential_assignment_value_is_literal(candidate)
+}
+
+fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> bool {
+    captures
+        .name("name")
+        .is_some_and(|name| structured_environment_name_is_credential(name.as_str()))
+        && captures
+            .name("value")
+            .is_some_and(|candidate| structured_environment_value_is_literal(candidate.as_str()))
+}
+
+fn yaml_value_contains_credential_literal(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::String(value) => credential_assignment_value_is_literal(value),
+        serde_yaml::Value::Number(_) => true,
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_value_contains_credential_literal)
+        }
+        serde_yaml::Value::Mapping(values) => {
+            values.values().any(yaml_value_contains_credential_literal)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_value_contains_credential_literal(&value.value),
+        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+    }
+}
+
+fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            let direct_credential = fields.iter().any(|(key, candidate)| {
+                key.as_str()
+                    .is_some_and(structured_environment_name_is_credential)
+                    && yaml_value_contains_credential_literal(candidate)
+            });
+            let label_is_credential = fields
+                .iter()
+                .filter(|(key, _)| {
+                    key.as_str().is_some_and(|key| {
+                        key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("key")
+                    })
+                })
+                .filter_map(|(_, value)| value.as_str())
+                .any(structured_environment_name_is_credential);
+            let candidate = fields
+                .iter()
+                .find(|(key, _)| {
+                    key.as_str()
+                        .is_some_and(|key| key.eq_ignore_ascii_case("value"))
+                })
+                .map(|(_, value)| value);
+            let contains_credential = label_is_credential
+                && candidate.is_some_and(|candidate| match candidate {
+                    serde_yaml::Value::String(candidate) => {
+                        structured_environment_value_is_literal(candidate)
+                    }
+                    serde_yaml::Value::Number(_) => true,
+                    _ => false,
+                });
+            direct_credential
+                || contains_credential
+                || fields
+                    .values()
+                    .any(yaml_contains_structured_environment_credential)
+        }
+        serde_yaml::Value::Sequence(values) => values
+            .iter()
+            .any(yaml_contains_structured_environment_credential),
+        serde_yaml::Value::Tagged(value) => {
+            yaml_contains_structured_environment_credential(&value.value)
+        }
+        _ => false,
+    }
+}
+
+fn toml_value_contains_credential_literal(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(value) => credential_assignment_value_is_literal(value),
+        toml::Value::Integer(_) | toml::Value::Float(_) | toml::Value::Datetime(_) => true,
+        toml::Value::Array(values) => values.iter().any(toml_value_contains_credential_literal),
+        toml::Value::Table(values) => values.values().any(toml_value_contains_credential_literal),
+        toml::Value::Boolean(_) => false,
+    }
+}
+
+fn toml_contains_structured_credential(value: &toml::Value) -> bool {
+    let toml::Value::Table(fields) = value else {
+        return false;
+    };
+    fields.iter().any(|(key, candidate)| {
+        (structured_environment_name_is_credential(key)
+            && toml_value_contains_credential_literal(candidate))
+            || toml_contains_structured_credential(candidate)
+    })
+}
+
+const MAX_STRUCTURED_DOCUMENTS: usize = 32;
+const MAX_EMBEDDED_STRUCTURED_BLOCKS: usize = 32;
+const MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES: usize = 64 * 1024;
+
+fn structured_multiline_scalar_hint_for(value: &str, delimiter: char, markers: &[&str]) -> bool {
+    value.lines().any(|line| {
+        let mut line = line.trim_start_matches([' ', '\t']);
+        if let Some(rest) = line.strip_prefix('-') {
+            line = rest.trim_start_matches([' ', '\t']);
+        }
+        let Some((name, candidate)) = line.split_once(delimiter) else {
+            return false;
+        };
+        let name = name
+            .trim()
+            .trim_matches(|character| matches!(character, '\"' | '\''));
+        let candidate = candidate.trim_start();
+        structured_environment_name_is_credential(name)
+            && markers.iter().any(|marker| candidate.starts_with(marker))
+    })
+}
+
+fn structured_yaml_multiline_scalar_hint(value: &str) -> bool {
+    structured_multiline_scalar_hint_for(value, ':', &["|", ">"])
+}
+
+fn structured_toml_multiline_scalar_hint(value: &str) -> bool {
+    structured_multiline_scalar_hint_for(value, '=', &["\"\"\"", "'''"])
+}
+
+fn structured_multiline_scalar_hint(value: &str) -> bool {
+    structured_yaml_multiline_scalar_hint(value) || structured_toml_multiline_scalar_hint(value)
+}
+
+fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) -> bool {
+    for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
+        if index >= MAX_STRUCTURED_DOCUMENTS {
+            return fail_closed && structured_multiline_scalar_hint(value);
+        }
+        if document.trim().is_empty() {
+            continue;
+        }
+        match serde_yaml::from_str::<serde_yaml::Value>(document) {
+            Ok(document) if yaml_contains_structured_environment_credential(&document) => {
+                return true;
+            }
+            Err(_) if fail_closed && structured_multiline_scalar_hint(document) => return true,
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
+}
+
+fn structured_block_contains_credential(value: &str) -> bool {
+    if value.len() > MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES {
+        return structured_multiline_scalar_hint(value);
+    }
+    let parsed_toml = toml::from_str::<toml::Value>(value);
+    yaml_documents_contain_structured_credential(value, true)
+        || parsed_toml
+            .as_ref()
+            .is_ok_and(toml_contains_structured_credential)
+        || (structured_toml_multiline_scalar_hint(value) && parsed_toml.is_err())
+}
+
+fn markdown_fence(line: &str) -> Option<(u8, usize)> {
+    let line = line
+        .trim_end_matches(['\r', '\n'])
+        .trim_start_matches([' ', '\t']);
+    let marker = *line.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = line.bytes().take_while(|byte| *byte == marker).count();
+    (length >= 3).then_some((marker, length))
+}
+
+fn contains_embedded_structured_credential(value: &str) -> bool {
+    let mut open_fence: Option<(u8, usize, usize)> = None;
+    let mut block_count = 0usize;
+    let mut offset = 0usize;
+
+    for line in value.split_inclusive('\n') {
+        if let Some((marker, length, body_start)) = open_fence {
+            let is_close = markdown_fence(line).is_some_and(|(candidate, candidate_length)| {
+                candidate == marker
+                    && candidate_length >= length
+                    && line
+                        .trim_end_matches(['\r', '\n'])
+                        .trim_start_matches([' ', '\t'])[candidate_length..]
+                        .trim()
+                        .is_empty()
+            });
+            if is_close {
+                let body = &value[body_start..offset];
+                if structured_block_contains_credential(body) {
+                    return true;
+                }
+                block_count += 1;
+                open_fence = None;
+                if block_count >= MAX_EMBEDDED_STRUCTURED_BLOCKS {
+                    return structured_multiline_scalar_hint(&value[offset + line.len()..]);
+                }
+            }
+        } else if let Some((marker, length)) = markdown_fence(line) {
+            open_fence = Some((marker, length, offset + line.len()));
+        }
+        offset += line.len();
+    }
+
+    if let Some((_, _, body_start)) = open_fence {
+        return structured_multiline_scalar_hint(&value[body_start..]);
+    }
+    false
+}
+
+fn looks_like_structured_property_name(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|characters| {
+        (characters[0].is_ascii_lowercase() || characters[0].is_ascii_digit())
+            && characters[1].is_ascii_uppercase()
+    }) || name
+        .bytes()
+        .any(|character| matches!(character, b'_' | b'-' | b'.'))
+}
+
+fn npm_registry_scoped_property(line: &str) -> Option<&str> {
+    let registry = line.strip_prefix("//")?;
+    let (_, property) = registry.rsplit_once("/:")?;
+    (!property.trim().is_empty()).then_some(property.trim_start())
+}
+
+fn split_once_ascii_case_insensitive<'a>(
+    value: &'a str,
+    delimiter: &str,
+) -> Option<(&'a str, &'a str)> {
+    let index = value.to_ascii_lowercase().find(delimiter)?;
+    Some((&value[..index], &value[index + delimiter.len()..]))
+}
+
+fn contains_line_oriented_credential_assignment(value: &str) -> bool {
+    value.lines().any(|line| {
+        let mut line = line.trim();
+        let npm_registry_property = npm_registry_scoped_property(line);
+        if line.is_empty() {
+            return false;
+        }
+        if npm_registry_property.is_none() {
+            line = line
+                .strip_prefix('#')
+                .or_else(|| line.strip_prefix(';'))
+                .or_else(|| line.strip_prefix("//"))
+                .unwrap_or(line)
+                .trim_start();
+            if line.is_empty() {
+                return false;
+            }
+        }
+        if line.starts_with('<') && line.ends_with('>') {
+            return false;
+        }
+        let line = npm_registry_property.unwrap_or(line);
+        let line = line
+            .strip_prefix("export ")
+            .or_else(|| line.strip_prefix("set "))
+            .unwrap_or(line)
+            .trim_start();
+        let assignment = line
+            .split_once('=')
+            .map(|(name, candidate)| (name, candidate, false))
+            .or_else(|| {
+                split_once_ascii_case_insensitive(line, " is ")
+                    .map(|(name, candidate)| (name, candidate, true))
+            })
+            .or_else(|| {
+                split_once_ascii_case_insensitive(line, " was ")
+                    .map(|(name, candidate)| (name, candidate, true))
+            })
+            .or_else(|| {
+                line.split_once(':')
+                    .map(|(name, candidate)| (name, candidate, false))
+            });
+        let Some((name, candidate, natural_language)) = assignment else {
+            return false;
+        };
+        let name = if natural_language {
+            name.split_whitespace().next_back().unwrap_or(name)
+        } else {
+            name
+        };
+        let name = name.trim().trim_matches(|character| {
+            matches!(
+                character,
+                '\"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+        });
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            && (!natural_language || looks_like_structured_property_name(name))
+            && (structured_environment_name_is_credential(name)
+                || (npm_registry_property.is_some()
+                    && matches!(name.to_ascii_lowercase().as_str(), "_auth" | "auth")))
+            && credential_assignment_value_is_literal(candidate)
+    })
+}
+
+fn contains_structured_environment_credential(value: &str) -> bool {
+    structured_environment_literal_pattern()
+        .captures_iter(value)
+        .any(structured_environment_captures_credential)
+        || reversed_structured_environment_literal_pattern()
+            .captures_iter(value)
+            .any(structured_environment_captures_credential)
+        || contains_line_oriented_credential_assignment(value)
+        // YAML is a superset of JSON, so one structured parser covers quoted
+        // JSON objects plus block- and flow-style YAML independent of field
+        // order. The bounded regex paths above retain support for snippets
+        // embedded inside otherwise non-YAML prose.
+        || yaml_documents_contain_structured_credential(
+            value,
+            yaml_document_separator_pattern().is_match(value),
+        )
+        || toml::from_str::<toml::Value>(value)
+            .is_ok_and(|value| toml_contains_structured_credential(&value))
+        || contains_embedded_structured_credential(value)
+}
+
+fn yaml_secret_payload_contains_literal(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            fields.values().any(yaml_secret_payload_contains_literal)
+        }
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_secret_payload_contains_literal)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_secret_payload_contains_literal(&value.value),
+        serde_yaml::Value::String(value) => credential_assignment_value_is_literal(value),
+        serde_yaml::Value::Number(_) => true,
+        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+    }
+}
+
+fn yaml_contains_kubernetes_secret(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => {
+            let is_secret = fields.iter().any(|(key, value)| {
+                key.as_str()
+                    .is_some_and(|key| key.eq_ignore_ascii_case("kind"))
+                    && value
+                        .as_str()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("secret"))
+            });
+            let contains_payload_literal = is_secret
+                && fields.iter().any(|(key, value)| {
+                    key.as_str().is_some_and(|key| {
+                        key.eq_ignore_ascii_case("data")
+                            || key.eq_ignore_ascii_case("stringData")
+                            || key.eq_ignore_ascii_case("binaryData")
+                    }) && yaml_secret_payload_contains_literal(value)
+                });
+            contains_payload_literal || fields.values().any(yaml_contains_kubernetes_secret)
+        }
+        serde_yaml::Value::Sequence(values) => values.iter().any(yaml_contains_kubernetes_secret),
+        serde_yaml::Value::Tagged(value) => yaml_contains_kubernetes_secret(&value.value),
+        _ => false,
+    }
+}
+
+fn kubernetes_secret_kind_hint_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[,{ \t\r\n])[\"']?kind[\"']?[ \t]*:[ \t]*[\"']?secret[\"']?(?:[ \t\r\n,}]|$)"#,
+        )
+        .expect("Kubernetes Secret kind hint regex must compile")
+    })
+}
+
+fn yaml_document_separator_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*---[ \t]*(?:#.*)?\r?$")
+            .expect("YAML document separator regex must compile")
+    })
+}
+
+fn contains_kubernetes_secret(value: &str) -> bool {
+    const MAX_YAML_DOCUMENTS: usize = 32;
+
+    for (index, document) in yaml_document_separator_pattern().split(value).enumerate() {
+        if index >= MAX_YAML_DOCUMENTS {
+            // Only a Secret-shaped manifest is sensitive to an unparsed tail;
+            // ordinary long Markdown documents retain compatibility.
+            return kubernetes_secret_kind_hint_pattern().is_match(value);
+        }
+        match serde_yaml::from_str::<serde_yaml::Value>(document) {
+            Ok(document) if yaml_contains_kubernetes_secret(&document) => return true,
+            Err(_) if kubernetes_secret_kind_hint_pattern().is_match(document) => {
+                // Secret-shaped YAML that cannot be parsed safely is
+                // indeterminate and must not cross the privacy boundary.
+                return true;
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    false
+}
+
+fn hcl_variable_header_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\bvariable\s+\"(?P<name>[a-z_][a-z0-9_-]{0,127})\"\s*\{"#)
+            .expect("HCL variable header regex must compile")
+    })
+}
+
+fn hcl_default_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?im)^[ \t]*default[ \t]*=[ \t]*(?:\"(?P<double>(?:\\.|[^\"\\\r\n]){0,1024})\"|'(?P<single>(?:\\.|[^'\\\r\n]){0,1024})'|(?P<bare>[^\s#},\r\n]{1,1024}))"#,
+        )
+        .expect("HCL variable default regex must compile")
+    })
+}
+
+fn bounded_hcl_block_body(value: &str, body_start: usize) -> Option<&str> {
+    const MAX_HCL_BLOCK_BYTES: usize = 4_096;
+
+    let bytes = value.as_bytes();
+    let limit = bytes
+        .len()
+        .min(body_start.saturating_add(MAX_HCL_BLOCK_BYTES));
+    let mut cursor = body_start;
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while cursor < limit {
+        let byte = bytes[cursor];
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+            }
+            cursor += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && bytes.get(cursor + 1) == Some(&b'/') {
+                block_comment = false;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        match byte {
+            b'#' => line_comment = true,
+            b'/' if bytes.get(cursor + 1) == Some(&b'/') => {
+                line_comment = true;
+                cursor += 1;
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                block_comment = true;
+                cursor += 1;
+            }
+            b'\"' | b'\'' => quote = Some(byte),
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return value.get(body_start..cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn hcl_default_value_is_literal(candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || is_placeholder_only(candidate) {
+        return false;
+    }
+    let normalized = candidate.to_ascii_lowercase();
+    if normalized == "null" || is_credential_state_predicate(&normalized) {
+        return false;
+    }
+    let expression = candidate
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(candidate)
+        .trim()
+        .to_ascii_lowercase();
+    !["var.", "local.", "data.", "module.", "path.", "terraform."]
+        .iter()
+        .any(|prefix| expression.starts_with(prefix))
+}
+
+fn contains_hcl_variable_default_credential(value: &str) -> bool {
+    hcl_variable_header_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            let Some(name) = captures.name("name") else {
+                return false;
+            };
+            if !structured_environment_name_is_credential(name.as_str()) {
+                return false;
+            }
+            let Some(header) = captures.get(0) else {
+                return false;
+            };
+            let Some(body) = bounded_hcl_block_body(value, header.end()) else {
+                // A credential-labelled block that is malformed or exceeds
+                // the inspection bound is indeterminate and must fail closed.
+                return true;
+            };
+            hcl_default_pattern().captures_iter(body).any(|default| {
+                ["double", "single", "bare"].iter().any(|name| {
+                    default
+                        .name(name)
+                        .is_some_and(|candidate| hcl_default_value_is_literal(candidate.as_str()))
+                })
+            })
+        })
+}
+
+fn docker_auth_config_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[^a-z0-9_])docker_auth_config\s*(?::|=)")
+            .expect("Docker authentication config regex must compile")
+    })
+}
+
+fn docker_auth_field_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?is)[\"']auth[\"']\s*:\s*[\"'][^\"'\s]{4,}[\"']"#)
+            .expect("Docker authentication field regex must compile")
+    })
+}
+
+fn contains_docker_auth_config(value: &str) -> bool {
+    const MAX_DOCKER_CONFIG_BYTES: usize = 64 * 1_024;
+
+    if docker_auth_config_pattern().is_match(value) {
+        return true;
+    }
+    let lowercase = value.to_ascii_lowercase();
+    let Some(auths_index) = lowercase
+        .find("\"auths\"")
+        .or_else(|| lowercase.find("'auths'"))
+    else {
+        return false;
+    };
+    if value.len() <= MAX_DOCKER_CONFIG_BYTES {
+        if let Ok(document) = serde_json::from_str::<serde_json::Value>(value) {
+            let Some(auths) = document.as_object().and_then(|root| {
+                root.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("auths"))
+                    .map(|(_, value)| value)
+            }) else {
+                return false;
+            };
+            let Some(registries) = auths.as_object() else {
+                return true;
+            };
+            return registries.values().any(|registry| {
+                let Some(fields) = registry.as_object() else {
+                    return true;
+                };
+                fields.iter().any(|(key, candidate)| {
+                    if !matches!(key.to_ascii_lowercase().as_str(), "auth" | "identitytoken") {
+                        return false;
+                    }
+                    candidate.as_str().is_none_or(|candidate| {
+                        let candidate = candidate.trim();
+                        !candidate.is_empty() && !is_placeholder_only(candidate)
+                    })
+                })
+            });
+        }
+    }
+    let mut bounded_end = auths_index.saturating_add(4_096).min(value.len());
+    while !value.is_char_boundary(bounded_end) {
+        bounded_end = bounded_end.saturating_sub(1);
+    }
+    docker_auth_field_pattern().is_match(&value[auths_index..bounded_end])
+        || bounded_end < value.len()
+}
+
+fn known_secret_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:\bage-secret-key-1[a-z0-9]{20,}\b|\bsk-(?:proj-)?[a-z0-9_-]{12,}|\bgh[pousr]_[a-z0-9]{20,}|\bgithub_pat_[a-z0-9_]{20,}|\bglpat-[a-z0-9_-]{20,}|\bxox[baprs]-[a-z0-9-]{10,}|\bAIza[a-z0-9_-]{20,}|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\beyJ[a-z0-9_-]{8,}\.[a-z0-9_-]{8,}\.[a-z0-9_-]{8,})",
+        )
+        .expect("known secret regex must compile")
+    })
+}
+
+fn authorization_secret_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:^|[^a-z0-9_-])[\"']?(?:proxy-)?authorization[\"']?\s*(?::|=)\s*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]+)"#,
+        )
+        .expect("authorization secret regex must compile")
+    })
+}
+
+fn bare_authorization_scheme_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:bearer|basic)\s+(?P<token>[a-z0-9._~+/=-]{12,})")
+            .expect("bare authorization scheme regex must compile")
+    })
+}
+
+fn authorization_value_is_secret(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|character| matches!(character, '\"' | '\''));
+    let mut fields = value.splitn(2, char::is_whitespace);
+    let scheme = fields.next().unwrap_or_default();
+    let credential =
+        if scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic") {
+            fields.next().unwrap_or_default().trim()
+        } else {
+            value
+        };
+    if credential.is_empty() || is_placeholder_only(credential) {
+        return false;
+    }
+    let normalized = credential
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .to_ascii_lowercase();
+    !is_credential_state_predicate(&normalized)
+        && !matches!(
+            normalized.as_str(),
+            "disabled" | "enabled" | "false" | "no" | "none" | "null" | "true" | "yes"
+        )
+}
+
+fn text_contains_authorization_secret(value: &str) -> bool {
+    authorization_secret_pattern()
+        .captures_iter(value)
+        .any(|captures| {
+            captures
+                .name("value")
+                .is_some_and(|value| authorization_value_is_secret(value.as_str()))
+        })
+        || bare_authorization_scheme_pattern()
+            .captures_iter(value)
+            .any(|captures| {
+                captures.name("token").is_some_and(|token| {
+                    let token = token.as_str();
+                    let has_non_letter = token.bytes().any(|byte| !byte.is_ascii_alphabetic());
+                    let lowercase_count = token
+                        .bytes()
+                        .filter(|byte| byte.is_ascii_lowercase())
+                        .count();
+                    let uppercase_count = token
+                        .bytes()
+                        .filter(|byte| byte.is_ascii_uppercase())
+                        .count();
+                    has_non_letter || (lowercase_count >= 2 && uppercase_count >= 2)
+                })
+            })
+}
+
+fn yaml_contains_authorization_secret(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Mapping(fields) => fields.iter().any(|(key, candidate)| {
+            let is_authorization = key.as_str().is_some_and(|key| {
+                key.eq_ignore_ascii_case("authorization")
+                    || key.eq_ignore_ascii_case("proxy-authorization")
+            });
+            if is_authorization {
+                return match candidate {
+                    serde_yaml::Value::String(candidate) => {
+                        authorization_value_is_secret(candidate)
+                    }
+                    serde_yaml::Value::Null | serde_yaml::Value::Bool(_) => false,
+                    _ => true,
+                };
+            }
+            yaml_contains_authorization_secret(candidate)
+        }),
+        serde_yaml::Value::Sequence(values) => {
+            values.iter().any(yaml_contains_authorization_secret)
+        }
+        serde_yaml::Value::Tagged(value) => yaml_contains_authorization_secret(&value.value),
+        serde_yaml::Value::String(value) => text_contains_authorization_secret(value),
+        _ => false,
+    }
+}
+
+fn contains_authorization_secret(value: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(value).map_or_else(
+        |_| text_contains_authorization_secret(value),
+        |value| yaml_contains_authorization_secret(&value),
+    )
+}
+
+fn credential_url_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]{0,128}:(?P<value>[^/\s@]{1,128})@")
+            .expect("credential URL regex must compile")
+    })
+}
+
+fn looks_like_technical_path_token(token: &str) -> bool {
+    if token.matches('/').count() < 2 {
+        return false;
+    }
+
+    let segments = token
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let has_directory_marker = segments.iter().any(|segment| {
+        [
+            "app",
+            "apps",
+            "bin",
+            "config",
+            "crates",
+            "docs",
+            "etc",
+            "examples",
+            "fixtures",
+            "home",
+            "lib",
+            "opt",
+            "packages",
+            "scripts",
+            "src",
+            "test",
+            "tests",
+            "tmp",
+            "users",
+            "usr",
+            "var",
+            "workspace",
+            "workspaces",
+        ]
+        .iter()
+        .any(|marker| segment.eq_ignore_ascii_case(marker))
+    });
+    let has_known_file_extension = segments.last().is_some_and(|segment| {
+        segment.rsplit_once('.').is_some_and(|(stem, suffix)| {
+            !stem.is_empty()
+                && [
+                    "c", "cc", "cfg", "conf", "cpp", "css", "go", "h", "hpp", "htm", "html", "ini",
+                    "java", "js", "json", "jsx", "kt", "kts", "lock", "md", "mjs", "mm", "php",
+                    "proto", "py", "rb", "rs", "scss", "sh", "sql", "swift", "toml", "ts", "tsx",
+                    "txt", "xml", "yaml", "yml", "zsh",
+                ]
+                .iter()
+                .any(|extension| suffix.eq_ignore_ascii_case(extension))
+        })
+    });
+
+    has_directory_marker && (token.starts_with('/') || has_known_file_extension)
+}
+
+fn ascii_shannon_entropy(token: &str) -> f64 {
+    let mut counts = [0usize; 128];
+    for byte in token.bytes() {
+        if byte.is_ascii() {
+            counts[byte as usize] += 1;
+        }
+    }
+    let length = token.len() as f64;
+    counts
+        .into_iter()
+        .filter(|count| *count > 0)
+        .map(|count| {
+            let probability = count as f64 / length;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+fn hash_label_before_token_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)(?:\s+(?:hash|digest|checksum|value|is))?\s*(?::|=|-)?\s*$",
+        )
+        .expect("hash label prefix regex must compile")
+    })
+}
+
+fn hash_label_after_token_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)^\s*(?:\(|\[)?(?:sha(?:-?(?:1|224|256|384|512))?|md5|hash|digest|checksum|commit|revision|etag|fingerprint|content[-_ ]address|object[-_ ]id)\b",
+        )
+        .expect("hash label suffix regex must compile")
+    })
+}
+
+fn bounded_prefix(value: &str, end: usize, max_bytes: usize) -> &str {
+    let mut start = end.saturating_sub(max_bytes);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..end]
+}
+
+fn bounded_suffix(value: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = start.saturating_add(max_bytes).min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    &value[start..end]
+}
+
+fn hex_token_has_local_hash_label(value: &str, start: usize, end: usize) -> bool {
+    hash_label_before_token_pattern().is_match(bounded_prefix(value, start, 128))
+        || hash_label_after_token_pattern().is_match(bounded_suffix(value, end, 64))
+}
+
+fn contains_opaque_hex_secret_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_alphanumeric() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_alphanumeric() {
+            cursor += 1;
+        }
+        let end = cursor;
+        if start == end {
+            continue;
+        }
+        let token = &value[start..end];
+        let length = token.len();
+        let looks_opaque = (32..=4_096).contains(&length)
+            && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && token.bytes().any(|byte| byte.is_ascii_digit())
+            && token.bytes().any(|byte| byte.is_ascii_alphabetic())
+            && token.bytes().collect::<HashSet<_>>().len() >= 8
+            && ascii_shannon_entropy(token) >= 3.2;
+        if looks_opaque && !hex_token_has_local_hash_label(value, start, end) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_high_entropy_secret_token(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | '+' | '/' | '='))
+        })
+        .any(|token| {
+            let length = token.len();
+            if !(24..=4_096).contains(&length) || token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return false;
+            }
+            if looks_like_technical_path_token(token) {
+                return false;
+            }
+            let distinct_bytes = token.bytes().collect::<HashSet<_>>().len();
+            distinct_bytes >= 12
+                && ascii_shannon_entropy(token) >= 4.0
+                && token.bytes().any(|byte| byte.is_ascii_lowercase())
+                && token.bytes().any(|byte| byte.is_ascii_uppercase())
+                && token.bytes().any(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn contains_secret_like_value_without_markdown_normalization(value: &str) -> bool {
+    value.contains("-----BEGIN PRIVATE KEY-----")
+        || value.contains("-----BEGIN RSA PRIVATE KEY-----")
+        || value.contains("-----BEGIN EC PRIVATE KEY-----")
+        || value.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
+        || captures_non_state_credential_value(secret_assignment_pattern(), value)
+        || captures_non_state_credential_value(generic_secret_assignment_pattern(), value)
+        || contains_present_tense_secret_assignment(value)
+        || contains_past_tense_secret_assignment(value)
+        || captures_non_state_credential_value(pin_credential_assignment_pattern(), value)
+        || standalone_pin_credential_pattern().is_match(value)
+        || contains_short_credential_config_field(value)
+        || captures_non_state_credential_value(redis_password_directive_pattern(), value)
+        || contains_redis_cli_password_option(value)
+        || contains_redis_acl_plaintext_password(value)
+        || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
+        || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
+        || contains_curl_user_credential(value)
+        || contains_literal_template_credential(value)
+        || contains_wallet_mnemonic(value)
+        || contains_otp_provisioning_secret(value)
+        || contains_netrc_credential(value)
+        || sql_password_clause_pattern().is_match(value)
+        || contains_identified_credential(value)
+        || contains_xml_credential(value)
+        || contains_pgpass_record(value)
+        || contains_environment_credential_assignment(value)
+        || contains_structured_environment_credential(value)
+        || contains_kubernetes_secret(value)
+        || contains_hcl_variable_default_credential(value)
+        || contains_docker_auth_config(value)
+        || known_secret_pattern().is_match(value)
+        || contains_authorization_secret(value)
+        || captures_non_placeholder_credential_value(credential_url_pattern(), value)
+        || contains_high_entropy_secret_token(value)
+}
+
+/// Return a second, comparison-only representation with lightweight Markdown
+/// delimiters removed. The original value is still checked first, so this
+/// cannot make an existing detector less effective. This catches formatted
+/// labels such as `**Password**: value`, `**API key:** value`, and
+/// `` `password`: value `` without ever returning or persisting the normalized
+/// text.
+fn without_lightweight_markdown_delimiters(value: &str) -> Option<String> {
+    value
+        .chars()
+        .any(|character| matches!(character, '*' | '_' | '~' | '`'))
+        .then(|| {
+            value
+                .chars()
+                .filter(|character| !matches!(character, '*' | '_' | '~' | '`'))
+                .collect()
+        })
+}
+
+/// Produce a comparison-only view of JSON/shell text that has itself been
+/// serialized one or more times. Keep this bounded and deliberately narrow:
+/// only quote escapes are removed, and the original value remains the value
+/// that is either retained whole or rejected whole.
+fn without_serialized_quote_escapes(value: &str) -> Option<String> {
+    if !value.contains("\\\"") && !value.contains("\\'") {
+        return None;
+    }
+    let mut normalized = value.to_string();
+    for _ in 0..3 {
+        let next = normalized.replace("\\\"", "\"").replace("\\'", "'");
+        if next == normalized {
+            break;
+        }
+        normalized = next;
+    }
+    Some(normalized)
+}
+
+fn contains_non_hex_secret_like_value(value: &str) -> bool {
+    let direct = contains_secret_like_value_without_markdown_normalization(value)
+        || without_lightweight_markdown_delimiters(value)
+            .as_deref()
+            .is_some_and(contains_secret_like_value_without_markdown_normalization);
+    if direct {
+        return true;
+    }
+    without_serialized_quote_escapes(value)
+        .as_deref()
+        .is_some_and(|normalized| {
+            contains_secret_like_value_without_markdown_normalization(normalized)
+                || without_lightweight_markdown_delimiters(normalized)
+                    .as_deref()
+                    .is_some_and(contains_secret_like_value_without_markdown_normalization)
+        })
+}
+
+pub(crate) fn contains_secret_like_value(value: &str) -> bool {
+    contains_non_hex_secret_like_value(value) || contains_opaque_hex_secret_token(value)
+}
+
+pub(crate) fn sanitize_extraction_source(value: &str) -> String {
+    if contains_secret_like_value(value) {
+        REDACTED_EXTRACTION_SOURCE.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+const MAX_STRUCTURED_PRIVACY_LABEL_FIELDS: usize = 16;
+
+fn field_can_form_credential_label(value: &str) -> bool {
+    let mut token_count = 0usize;
+    for token in value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+    {
+        token_count += 1;
+        if token_count > 3 {
+            return false;
+        }
+        let token = token.to_ascii_lowercase();
+        if !matches!(
+            token.as_str(),
+            "2fa"
+                | "access"
+                | "account"
+                | "api"
+                | "auth"
+                | "authentication"
+                | "bank"
+                | "basic"
+                | "bearer"
+                | "card"
+                | "client"
+                | "code"
+                | "cookie"
+                | "credential"
+                | "device"
+                | "encryption"
+                | "http"
+                | "id"
+                | "key"
+                | "login"
+                | "mfa"
+                | "my"
+                | "number"
+                | "one"
+                | "otp"
+                | "our"
+                | "passcode"
+                | "passphrase"
+                | "passwd"
+                | "password"
+                | "payment"
+                | "pin"
+                | "private"
+                | "proxy"
+                | "recovery"
+                | "refresh"
+                | "secret"
+                | "security"
+                | "session"
+                | "shared"
+                | "signature"
+                | "signing"
+                | "time"
+                | "token"
+                | "unlock"
+                | "verification"
+                | "your"
+        ) {
+            return false;
+        }
+    }
+    token_count > 0
+}
+
+fn fields_form_credential_label(fields: &[&str]) -> bool {
+    let label = fields.join(" ");
+    contains_non_hex_secret_like_value(&format!("{label}: bamboo-privacy-probe"))
+        || contains_non_hex_secret_like_value(&format!("{label} bamboo-privacy-probe"))
+}
+
+fn field_forms_standalone_credential_label(value: &str) -> bool {
+    let tokens = value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "credential" | "otp" | "passcode" | "passphrase" | "passwd" | "password" | "pin"
+        )
+    {
+        return true;
+    }
+    if !fields_form_credential_label(&[value]) {
+        return false;
+    }
+    // These words are useful fragments of labels such as `access token` or
+    // `secret key`, but alone they are common titles and prose. Do not join a
+    // lone ambiguous fragment with every unrelated structured field.
+    !(tokens.len() == 1
+        && matches!(
+            tokens[0].as_str(),
+            "auth"
+                | "basic"
+                | "bearer"
+                | "code"
+                | "cookie"
+                | "id"
+                | "key"
+                | "secret"
+                | "session"
+                | "token"
+        ))
+}
+
+fn starts_with_credential_state_predicate(value: &str) -> bool {
+    value
+        .trim_start()
+        .trim_start_matches(|character: char| {
+            character.is_ascii_punctuation() && !matches!(character, '-' | '_')
+        })
+        .split_whitespace()
+        .next()
+        .map(|token| {
+            token
+                .trim_matches(|character: char| character.is_ascii_punctuation())
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|token| is_credential_state_predicate(&token))
+}
+
+fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
+    // Synthetic field joins must retain the same compatibility exemption as
+    // natural-language `is` / `was` checks. Keep the synthetic label attached
+    // while scanning transition suffixes so placeholders remain distinguishable
+    // from short literal credentials.
+    if starts_with_credential_state_predicate(value) {
+        return contains_secret_like_value(&format!("{label} was {value}"));
+    }
+    contains_secret_like_value(&format!("{label}: {value}"))
+        || contains_secret_like_value(&format!("{label} {value}"))
+}
+
+fn structured_label_fields<'a>(sources: &[&'a str]) -> Option<Vec<(usize, &'a str)>> {
+    let mut label_fields = Vec::new();
+    for (index, source) in sources.iter().copied().enumerate() {
+        if !field_can_form_credential_label(source) {
+            continue;
+        }
+        label_fields.push((index, source));
+        if label_fields.len() > MAX_STRUCTURED_PRIVACY_LABEL_FIELDS {
+            return None;
+        }
+    }
+    Some(label_fields)
+}
+
+fn structured_sources_contain_secret(sources: &[&str], label_fields: &[(usize, &str)]) -> bool {
+    // Bound only the fields that can participate in a reconstructed label.
+    // Ordinary large TaskLists can contain many prompt-bearing strings without
+    // making this combinatorial check unbounded.
+    for &(first_index, first) in label_fields {
+        for &(second_index, second) in label_fields {
+            if second_index == first_index {
+                continue;
+            }
+            let two_field_label = format!("{first} {second}");
+            if fields_form_credential_label(&[first, second]) {
+                for (value_index, value) in sources.iter().enumerate() {
+                    if value_index != first_index
+                        && value_index != second_index
+                        && labelled_value_contains_secret(&two_field_label, value)
+                    {
+                        return true;
+                    }
+                }
+            }
+            for &(third_index, third) in label_fields {
+                if third_index == first_index || third_index == second_index {
+                    continue;
+                }
+                if fields_form_credential_label(&[first, second, third]) {
+                    let three_field_label = format!("{first} {second} {third}");
+                    for (fourth_index, fourth) in sources.iter().enumerate() {
+                        if fourth_index != first_index
+                            && fourth_index != second_index
+                            && fourth_index != third_index
+                            && labelled_value_contains_secret(&three_field_label, fourth)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Return false when complete structured fields form a credential. Besides
+/// individual fields and ordered pairs, reconstruct two- and three-field
+/// credential labels before testing every remaining field as the value. The
+/// hard label-fragment cap keeps this conservative check bounded without
+/// rejecting ordinary records merely because they contain many fields.
+pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
+    // A technical hash label exempts a token only when both occur in the same
+    // field. Candidate-wide exemptions let an unrelated tag such as `commit`
+    // launder an opaque credential stored in another field.
+    if sources
+        .iter()
+        .any(|source| contains_secret_like_value(source))
+    {
+        return false;
+    }
+
+    let Some(label_fields) = structured_label_fields(sources) else {
+        return false;
+    };
+    for &(label_index, label) in &label_fields {
+        if !field_forms_standalone_credential_label(label) {
+            continue;
+        }
+        if sources.iter().enumerate().any(|(value_index, value)| {
+            value_index != label_index && labelled_value_contains_secret(label, value)
+        }) {
+            return false;
+        }
+    }
+    !structured_sources_contain_secret(sources, &label_fields)
+}
+
+/// Sanitize a label/content pair together so a split credential such as
+/// `Password` + `hunter2` cannot bypass field-local checks.
+pub(crate) fn sanitize_extraction_source_pair(label: &str, content: &str) -> (String, String) {
+    if !extraction_sources_are_secret_safe(&[label, content]) {
+        (
+            REDACTED_EXTRACTION_SOURCE.to_string(),
+            REDACTED_EXTRACTION_SOURCE.to_string(),
+        )
+    } else {
+        (label.to_string(), content.to_string())
+    }
+}
+
+pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> bool {
+    let mut sources = vec![
+        candidate.title.as_str(),
+        candidate.kind.as_str(),
+        candidate.content.as_str(),
+    ];
+    if let Some(scope) = candidate.scope.as_deref() {
+        sources.push(scope);
+    }
+    sources.extend(candidate.tags.iter().map(String::as_str));
+    if let Some(confidence) = candidate.confidence.as_deref() {
+        sources.push(confidence);
+    }
+    extraction_sources_are_secret_safe(&sources)
+}
+
+pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandidate) -> bool {
+    let mut sources = vec![candidate.title.as_str(), candidate.kind.as_str()];
+    if let Some(due_at) = candidate.due_at.as_deref() {
+        sources.push(due_at);
+    }
+    if let Some(starts_at) = candidate.starts_at.as_deref() {
+        sources.push(starts_at);
+    }
+    if let Some(excerpt) = candidate.excerpt.as_deref() {
+        sources.push(excerpt);
+    }
+    if let Some(confidence) = candidate.confidence.as_deref() {
+        sources.push(confidence);
+    }
+    extraction_sources_are_secret_safe(&sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detector_rejects_credentials_without_hiding_technical_prose() {
+        for (case, value) in [
+            ("tokenizer word", "tokenizer is tiktoken"),
+            ("token budget", "MAX_TOKEN=1000"),
+            ("camelCase token budget", "maxToken: 1000"),
+            ("dependency pin", "pin is a dependency reference"),
+            ("hardware pin", "GPIO_PIN=13"),
+            ("camelCase hardware pin", "gpioPin: 13"),
+            ("compiler pass", "COMPILER_PASS=inline"),
+            ("auth mode", "AUTH_MODE=basic"),
+            ("Docker auth mode", "DOCKER_AUTH_MODE=credential-store"),
+            ("project key", "PROJECT_KEY=abc"),
+            ("absolute path", "/Users/Alice/Project2/config.toml"),
+            ("relative path", "src/HTTP2Client/Config.toml"),
+            ("basic plan", "I prefer the basic plan"),
+            ("bearer bonds", "We trade bearer bonds"),
+            ("credential file flag", "deploy --password-file secrets.txt"),
+            (
+                "CLI password placeholder",
+                "deploy --password ${DB_PASSWORD}",
+            ),
+            (
+                "CLI API key placeholder",
+                "deploy --api-key=\"$API_KEY\"",
+            ),
+            (
+                "Redis CLI short password placeholder",
+                "redis-cli -a ${REDIS_PASSWORD} PING",
+            ),
+            (
+                "Redis CLI long password placeholder",
+                "redis-cli --pass=$REDIS_PASSWORD PING",
+            ),
+            ("token budget flag", "runner --token-budget 1000"),
+            ("escaped token budget JSON", r#"{\"token_budget\":1000}"#),
+            (
+                "curl user without password",
+                "curl --user alice https://example.test",
+            ),
+            (
+                "curl user-password variables",
+                "curl --user '$CURL_USER:$CURL_PASSWORD' https://example.test",
+            ),
+            ("git upstream flag", "git push -u origin:main"),
+            (
+                "machine login prose",
+                "machine learning login flows enforce password policy",
+            ),
+            (
+                "netrc password placeholder",
+                "machine example.test user alice account billing password ${NETRC_PASSWORD}",
+            ),
+            (
+                "pgpass password placeholder",
+                "db:5432:app:alice:${DB_PASSWORD}",
+            ),
+            (
+                "SQL password policy",
+                "ALTER ROLE alice SET password_policy = 'strict';",
+            ),
+            (
+                "MySQL generated password",
+                "CREATE USER 'alice' IDENTIFIED BY RANDOM PASSWORD;",
+            ),
+            (
+                "past-tense password reset",
+                "The database password was reset yesterday.",
+            ),
+            ("past-tense OTP state", "OTP was required for enrollment."),
+            ("past-tense PIN state", "my PIN was reset yesterday."),
+            (
+                "past-tense password requirement",
+                "A password was required for the legacy login flow.",
+            ),
+            (
+                "present-tense password requirement",
+                "The staging password is required for deploys.",
+            ),
+            (
+                "punctuated present-tense password state",
+                "The staging password is: required",
+            ),
+            (
+                "punctuated present-tense password placeholder",
+                "The staging password is: ${DB_PASSWORD}",
+            ),
+            (
+                "disabled password state",
+                "The staging password is disabled.",
+            ),
+            (
+                "enabled password state",
+                "The staging password is enabled.",
+            ),
+            (
+                "present-tense PIN configuration",
+                "The login PIN is configured by the identity provider.",
+            ),
+            (
+                "present-tense token state",
+                "My token is revoked after account deletion.",
+            ),
+            ("ordinary pass field", "pass: true"),
+            ("password placeholder field", "Pwd=${DB_PASSWORD}"),
+            (
+                "quoted password placeholder field",
+                "Pwd=\"${DB_PASSWORD}\"",
+            ),
+            ("password assignment placeholder", "password=${DB_PASSWORD}"),
+            (
+                "camelCase properties placeholder",
+                "dbPassword=${DB_PASSWORD}",
+            ),
+            ("camelCase natural-language state", "dbPassword is required"),
+            (
+                "uppercase camelCase natural-language state",
+                "dbPassword IS required",
+            ),
+            ("npmrc credential state", "_authToken=required"),
+            ("legacy npmrc auth placeholder", "_auth=${NPM_AUTH}"),
+            ("Redis CLI auth placeholder", "REDISCLI_AUTH=${REDIS_PASSWORD}"),
+            (
+                "registry-scoped npm credential state",
+                "//registry.example/:_authToken=required",
+            ),
+            (
+                "ordinary slash comment",
+                "// This comment mentions dbPassword=hunter2",
+            ),
+            (
+                "commented camelCase placeholder",
+                "# dbPassword=${DB_PASSWORD}",
+            ),
+            ("commented camelCase state", "// apiToken=required"),
+            ("license key placeholder", "licenseKey=${LICENSE_KEY}"),
+            ("license key state", "licenseKey: required"),
+            ("ordinary license metadata", "licenseType: community"),
+            ("password assignment state", "password: required"),
+            ("password assignment null", "password: null"),
+            ("password assignment boolean", "password: true"),
+            (
+                "GitHub expression password placeholder",
+                "password: ${{ secrets.DB_PASSWORD }}",
+            ),
+            (
+                "generic expression password placeholder",
+                "password: {{ vault.password }}",
+            ),
+            (
+                "credential URL password placeholder",
+                "DATABASE_URL=postgres://user:${DB_PASSWORD}@db.example/app",
+            ),
+            (
+                "HCL secret variable placeholder default",
+                "variable \"db_password\" {\n  default = \"${var.db_password}\"\n}",
+            ),
+            (
+                "HCL secret variable null default",
+                "variable \"db_password\" {\n  default = null\n}",
+            ),
+            (
+                "HCL password policy variable",
+                "variable \"password_policy\" {\n  default = \"strict\"\n}",
+            ),
+            (
+                "environment assignment placeholder",
+                "DB_PASSWORD=$SECRET_REF",
+            ),
+            (
+                "YAML multiline credential placeholder",
+                "password: |\n  ${DB_PASSWORD}",
+            ),
+            (
+                "fenced YAML multiline credential placeholder",
+                "Configuration example:\n```yaml\npassword: |\n  ${DB_PASSWORD}\n```",
+            ),
+            (
+                "second YAML document credential placeholder",
+                "mode: production\n---\npassword: |\n  ${DB_PASSWORD}",
+            ),
+            (
+                "YAML multiline credential state",
+                "password: |\n  required",
+            ),
+            (
+                "TOML multiline credential placeholder",
+                "password = \"\"\"\n${DB_PASSWORD}\n\"\"\"",
+            ),
+            (
+                "Kubernetes secretKeyRef",
+                "- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-credentials\n      key: password",
+            ),
+            (
+                "Kubernetes Secret payload placeholder",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: ${LICENSE_KEY}",
+            ),
+            (
+                "Kubernetes Secret data reference",
+                "apiVersion: v1\nkind: Secret\ndata:\n  license: ${LICENSE_B64}",
+            ),
+            (
+                "Kubernetes Secret binaryData reference",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: ${LICENSE_B64}",
+            ),
+            (
+                "Kubernetes Secret payload state",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: required",
+            ),
+            (
+                "Kubernetes Secret binaryData state",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: disabled",
+            ),
+            (
+                "Kubernetes Secret JSON payload placeholder",
+                r#"{"kind":"Secret","stringData":{"license":"${LICENSE_KEY}"}}"#,
+            ),
+            (
+                "Kubernetes ConfigMap literal",
+                "apiVersion: v1\nkind: ConfigMap\ndata:\n  license: hunter2",
+            ),
+            (
+                "Kubernetes environment placeholder",
+                "- name: DB_PASSWORD\n  value: ${DB_PASSWORD}",
+            ),
+            (
+                "reversed Kubernetes environment placeholder",
+                "- value: ${DB_PASSWORD}\n  name: DB_PASSWORD",
+            ),
+            (
+                "reversed JSON environment placeholder",
+                r#"{"value":"${DB_PASSWORD}","name":"DB_PASSWORD"}"#,
+            ),
+            (
+                "flow YAML environment placeholder",
+                "{ name: DB_PASSWORD, value: ${DB_PASSWORD} }",
+            ),
+            (
+                "generic credential property placeholder",
+                r#"{"name":"password","value":"${DB_PASSWORD}"}"#,
+            ),
+            (
+                "generic credential property state",
+                r#"{"name":"password","value":"required"}"#,
+            ),
+            (
+                "generic credential property boolean",
+                r#"{"name":"password","value":false}"#,
+            ),
+            (
+                "generic key/value credential placeholder",
+                r#"{"key":"password","value":"${DB_PASSWORD}"}"#,
+            ),
+            ("wallet seed placeholder", "seed phrase: ${WALLET_SEED}"),
+            (
+                "OTP provisioning placeholder",
+                "otpauth://totp/Example:alice?secret=${OTP_SECRET}&issuer=Example",
+            ),
+            (
+                "Docker auth placeholder",
+                r#"{"auths":{"registry.example":{"auth":"${DOCKER_AUTH}"}}}"#,
+            ),
+            (
+                "authorization bearer placeholder",
+                "Authorization: Bearer ${API_TOKEN}",
+            ),
+            (
+                "quoted authorization bearer placeholder",
+                r#"{"Authorization":"Bearer ${API_TOKEN}"}"#,
+            ),
+            (
+                "flow authorization bearer placeholder",
+                r#"{ Authorization: "Bearer ${API_TOKEN}", mode: enabled }"#,
+            ),
+            (
+                "proxy authorization placeholder",
+                "Proxy-Authorization: Basic %PROXY_AUTH%",
+            ),
+            (
+                "equals authorization placeholder",
+                "Authorization = \"Bearer ${API_TOKEN}\"",
+            ),
+            ("authorization requirement", "Authorization: required"),
+            ("equals authorization state", "Authorization = required"),
+            (
+                "empty Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: \"\"",
+            ),
+            ("commented Redis password", "# requirepass hunter2"),
+            ("empty Redis password", "requirepass \"\""),
+            ("Redis requirepass reference", "requirepass ${REDIS_PASSWORD}"),
+            ("Redis masterauth reference", "masterauth \"$REDIS_PASSWORD\""),
+            (
+                "Redis CONFIG SET reference",
+                "CONFIG SET requirepass '${REDIS_PASSWORD}'",
+            ),
+            ("Redis ACL rule without password", "user alice on ~* +@all"),
+            (
+                "Redis ACL placeholder password",
+                "ACL SETUSER alice on >${REDIS_PASSWORD} ~* +@all",
+            ),
+            (
+                "commented Redis ACL password",
+                "# ACL SETUSER alice on >hunter2 ~* +@all",
+            ),
+            (
+                "Redis CLI ACL placeholder password",
+                "redis-cli ACL SETUSER alice '>${REDIS_PASSWORD}' ~* +@all",
+            ),
+            (
+                "path-qualified Redis CLI ACL placeholder",
+                "/usr/local/bin/redis-cli ACL SETUSER alice '>${REDIS_PASSWORD}' ~* +@all",
+            ),
+            (
+                "Redis CLI ACL rule without password",
+                "redis-cli -h cache.example ACL SETUSER alice on ~* +@all",
+            ),
+            (
+                "password placeholder transition",
+                "The database password was changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
+            ),
+            (
+                "punctuated password transition placeholder",
+                "The database password was reset: ${DB_PASSWORD}",
+            ),
+            (
+                "present-perfect password placeholder transition",
+                "The database password has been reset to ${DB_PASSWORD}",
+            ),
+            (
+                "present-perfect password state",
+                "The database password has been reset successfully",
+            ),
+            (
+                "Markdown password requirement",
+                "| Password | required | authentication policy |",
+            ),
+            (
+                "Markdown password policy",
+                "| Password policy | rotate quarterly |",
+            ),
+            (
+                "XML password policy element",
+                "<password-policy>rotate quarterly</password-policy>",
+            ),
+            (
+                "XML password policy property",
+                "<property name=\"password_policy\" value=\"strict\"/>",
+            ),
+            (
+                "XML credential property placeholder",
+                "<property name=\"password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML element placeholder",
+                "<dbPassword>${DB_PASSWORD}</dbPassword>",
+            ),
+            ("camelCase XML element state", "<dbPassword>required</dbPassword>"),
+            (
+                "PascalCase XML attribute reference",
+                "<database DbPassword=\"$DB_PASSWORD\"/>",
+            ),
+            (
+                "snake_case XML attribute state",
+                "<database db_password=\"disabled\"/>",
+            ),
+            (
+                "technical camelCase XML attribute",
+                "<runtime maxToken=\"4096\"/>",
+            ),
+            (
+                "qualified XML credential property placeholder",
+                "<property name=\"hibernate.connection.password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML credential property placeholder",
+                "<property name=\"dbPassword\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML technical property",
+                "<property name=\"maxToken\" value=\"4096\"/>",
+            ),
+            (
+                "XML credential attribute placeholder",
+                "<database password=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "nested XML credential placeholder",
+                "<property name=\"password\"><value>${DB_PASSWORD}</value></property>",
+            ),
+            (
+                "empty XML password CDATA",
+                "<password><![CDATA[   ]]></password>",
+            ),
+            (
+                "empty nested XML password property",
+                "<property name=\"password\"><value>   </value></property>",
+            ),
+            ("colon-separated timestamp", "2026:09:17:20:53"),
+            ("colon-separated code fields", "crate:123:module:item:value"),
+            (
+                "SHA-256 digest",
+                "SHA-256 digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "Git commit hash",
+                "commit 0123456789abcdef0123456789abcdef01234567",
+            ),
+        ] {
+            assert!(
+                !contains_secret_like_value(value),
+                "ordinary technical case was classified as a secret: {case}"
+            );
+            assert_eq!(
+                sanitize_extraction_source(value),
+                value,
+                "ordinary technical case was redacted: {case}"
+            );
+        }
+
+        for (case, value) in [
+            (
+                "API key",
+                "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz",
+            ),
+            ("spaced API key", "API key: hunter2"),
+            ("spaced private key", "private key: hunter2"),
+            ("spaced secret key", "secret key: hunter2"),
+            (
+                "triple-double-quoted password",
+                "password = \"\"\"hunter2\"\"\"",
+            ),
+            ("triple-single-quoted password", "password = '''hunter2'''"),
+            (
+                "triple-double-quoted short pass field",
+                "pass = \"\"\"hunter2\"\"\"",
+            ),
+            ("bold password label", "**Password**: hunter2"),
+            ("bold API key assignment", "**API key:** hunter2"),
+            ("inline-code password label", "`password`: hunter2"),
+            (
+                "double-serialized password JSON",
+                r#"{\"password\":\"hunter2\"}"#,
+            ),
+            (
+                "multiply-serialized password JSON",
+                r#"{\\\"password\\\":\\\"hunter2\\\"}"#,
+            ),
+            (
+                "authorization header",
+                "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+            ),
+            (
+                "quoted authorization header",
+                r#"{"Authorization":"Bearer hunter2"}"#,
+            ),
+            (
+                "flow authorization header",
+                "{ Authorization: Bearer hunter2, mode: enabled }",
+            ),
+            (
+                "safe structured header cannot mask literal note header",
+                r#"{"headers":{"Authorization":"${API_TOKEN}"},"note":"Authorization: Bearer hunter2"}"#,
+            ),
+            ("bare basic credential", "Basic dXNlcjpwYXNz"),
+            (
+                "session cookie",
+                "session cookie: 0123456789abcdef0123456789abcdef",
+            ),
+            ("natural password", "my password is hunter2"),
+            (
+                "past-tense database password",
+                "The database password was hunter2",
+            ),
+            ("personal token", "my token is abc"),
+            ("personal PIN", "my PIN is 1234"),
+            ("database password", "PGPASSWORD=abc"),
+            ("login PIN", "LOGIN_PIN=123"),
+            ("standalone PIN", "PIN: 1234"),
+            ("mixed-case standalone PIN", "Pin: 1234"),
+            ("lowercase standalone PIN", "pin: 1234"),
+            ("equals standalone PIN", "PIN = 1234"),
+            ("word-assigned standalone PIN", "pin is 1234"),
+            ("CLI password", "deploy --password hunter2"),
+            ("CLI API key", "deploy --api-key hunter2"),
+            ("CLI client secret", "deploy --client-secret=hunter2"),
+            (
+                "curl long user-password flag",
+                "curl --user alice:hunter2 https://example.test",
+            ),
+            (
+                "curl equals user-password flag",
+                "curl --user=alice:hunter2 https://example.test",
+            ),
+            (
+                "curl short user-password flag",
+                "curl -u alice:hunter2 https://example.test",
+            ),
+            (
+                "curl joined short user-password flag",
+                "curl -ualice:hunter2 https://example.test",
+            ),
+            (
+                "curl password-only flag",
+                "curl -u :hunter2 https://example.test",
+            ),
+            (
+                "netrc machine record",
+                "machine example.test login alice password hunter2",
+            ),
+            (
+                "netrc account record",
+                "machine example.test login alice account billing password hunter2",
+            ),
+            (
+                "netrc user alias",
+                "machine example.test user alice password hunter2",
+            ),
+            (
+                "netrc reordered fields",
+                "machine example.test password hunter2 account billing login alice",
+            ),
+            (
+                "netrc multiline record with comment",
+                "machine example.test login alice # production\n  account billing\n  password hunter2",
+            ),
+            (
+                "netrc default record",
+                "default login alice password hunter2",
+            ),
+            (
+                "PostgreSQL ALTER ROLE password",
+                "ALTER ROLE alice WITH PASSWORD 'hunter2';",
+            ),
+            (
+                "PostgreSQL CREATE USER password",
+                "CREATE USER alice PASSWORD E'hunter2';",
+            ),
+            (
+                "MySQL CREATE USER credential",
+                "CREATE USER 'alice'@'localhost' IDENTIFIED BY 'hunter2';",
+            ),
+            (
+                "MySQL plugin credential",
+                "ALTER USER 'alice'@'localhost' IDENTIFIED WITH mysql_native_password AS 'hunter2';",
+            ),
+            (
+                "Oracle unquoted credential",
+                "CREATE USER alice IDENTIFIED BY hunter2;",
+            ),
+            (
+                "MongoDB pwd field",
+                "db.createUser({user: \"alice\", pwd: \"hunter2\"})",
+            ),
+            ("short pass config field", "pass = 'hunter2'"),
+            (
+                "semicolon-delimited Pwd connection string",
+                "Server=db;Uid=alice;Pwd=hunter2",
+            ),
+            ("unquoted Pwd config field", "Pwd=hunter2"),
+            ("camelCase database password", "dbPassword: hunter2"),
+            ("camelCase SMTP password", "smtpPassword = \"hunter2\""),
+            (
+                "Java properties camelCase password",
+                "dbPassword=hunter2",
+            ),
+            ("commented camelCase password", "# dbPassword=hunter2"),
+            ("slash-commented camelCase API token", "// apiToken=hunter2"),
+            ("camelCase license key", "licenseKey: hunter2"),
+            ("snake_case license key", "license_key=hunter2"),
+            ("npmrc camelCase auth token", "_authToken=hunter2"),
+            ("legacy npmrc auth", "_auth=dXNlcjpwYXNz"),
+            ("Redis CLI auth", "REDISCLI_AUTH=hunter2"),
+            (
+                "Redis CLI short password option",
+                "redis-cli -a hunter2 PING",
+            ),
+            (
+                "Redis CLI long password option",
+                "redis-cli --pass hunter2 PING",
+            ),
+            (
+                "registry-scoped npm auth token",
+                "//registry.example/:_authToken=hunter2",
+            ),
+            (
+                "registry-scoped npm basic auth",
+                "//registry.example/:_auth=hunter2",
+            ),
+            (
+                "exported camelCase password",
+                "export dbPassword=hunter2",
+            ),
+            (
+                "equals authorization literal",
+                "Authorization = \"Bearer hunter2\"",
+            ),
+            (
+                "camelCase natural-language password",
+                "dbPassword is hunter2",
+            ),
+            (
+                "uppercase camelCase natural-language password",
+                "dbPassword IS hunter2",
+            ),
+            (
+                "camelCase password in a sentence",
+                "The dbPassword was hunter2",
+            ),
+            (
+                "mixed-case camelCase password in a sentence",
+                "The dbPassword Was hunter2",
+            ),
+            (
+                "password reset to a literal",
+                "The database password was reset to hunter2",
+            ),
+            (
+                "punctuated present-tense password literal",
+                "The database password is: hunter2",
+            ),
+            (
+                "punctuated password transition literal",
+                "The database password was reset: hunter2",
+            ),
+            (
+                "password changed from and to literals",
+                "The database password was changed from hunter2 to swordfish",
+            ),
+            (
+                "present-perfect password reset to a literal",
+                "The database password has been reset to hunter2",
+            ),
+            ("past-tense PIN disclosure", "my PIN was 1234"),
+            ("past-tense OTP disclosure", "OTP was 123456"),
+            (
+                "Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: hunter2",
+            ),
+            (
+                "Kubernetes Secret stringData literal",
+                "apiVersion: v1\nkind: Secret\nstringData:\n  license: hunter2",
+            ),
+            (
+                "Kubernetes Secret JSON stringData literal",
+                r#"{"kind":"Secret","stringData":{"license":"hunter2"}}"#,
+            ),
+            (
+                "Kubernetes Secret flow YAML data literal",
+                "{ kind: Secret, data: { license: aHVudGVyMg== } }",
+            ),
+            (
+                "Kubernetes Secret binaryData literal",
+                "apiVersion: v1\nkind: Secret\nbinaryData:\n  license: aHVudGVyMg==",
+            ),
+            (
+                "Kubernetes Secret JSON binaryData literal",
+                r#"{"kind":"Secret","binaryData":{"license":"aHVudGVyMg=="}}"#,
+            ),
+            (
+                "Kubernetes Secret data literal in a multi-document manifest",
+                "apiVersion: v1\nkind: ConfigMap\ndata:\n  mode: production\n---\napiVersion: v1\nkind: Secret\ndata:\n  license: aHVudGVyMg==",
+            ),
+            (
+                "malformed Kubernetes Secret payload",
+                "apiVersion: v1\nkind: Secret\nstringData: [unterminated",
+            ),
+            (
+                "quoted Kubernetes environment literal",
+                "- name: DB_PASSWORD\n  value: \"hunter2\"",
+            ),
+            (
+                "reversed Kubernetes environment literal",
+                "- value: hunter2\n  name: DB_PASSWORD",
+            ),
+            (
+                "reversed JSON environment literal",
+                r#"{"value":"hunter2","name":"DB_PASSWORD"}"#,
+            ),
+            (
+                "flow YAML environment literal",
+                "{ name: DB_PASSWORD, value: hunter2 }",
+            ),
+            (
+                "reversed flow YAML environment literal",
+                "{ value: hunter2, name: DB_PASSWORD }",
+            ),
+            (
+                "generic credential property literal",
+                r#"{"name":"password","value":"hunter2"}"#,
+            ),
+            (
+                "generic key/value credential literal",
+                r#"{"key":"password","value":"hunter2"}"#,
+            ),
+            (
+                "camelCase XML credential property literal",
+                "<property name=\"dbPassword\" value=\"hunter2\"/>",
+            ),
+            (
+                "YAML multiline credential literal",
+                "password: |\n  hunter2",
+            ),
+            (
+                "fenced YAML multiline credential literal",
+                "Configuration example:\n```yaml\npassword: |\n  hunter2\n```",
+            ),
+            (
+                "second YAML document credential literal",
+                "mode: production\n---\npassword: |\n  hunter2",
+            ),
+            (
+                "TOML multiline credential literal",
+                "password = \"\"\"\nhunter2\n\"\"\"",
+            ),
+            (
+                "fenced TOML multiline credential literal",
+                "Configuration example:\n```toml\npassword = \"\"\"\nhunter2\n\"\"\"\n```",
+            ),
+            (
+                "GitHub expression credential literal",
+                "password: ${{ 'hunter2' }}",
+            ),
+            (
+                "function expression credential literal",
+                "password=${{ format('hunter2') }}",
+            ),
+            (
+                "generic expression credential literal",
+                "password: {{ \"hunter2\" }}",
+            ),
+            (
+                "wallet seed phrase",
+                "seed phrase: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "wallet mnemonic",
+                "mnemonic = abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "wallet recovery words",
+                "recovery words is abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            ),
+            (
+                "OTP provisioning URI",
+                "otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP&issuer=Example",
+            ),
+            ("Redis requirepass", "requirepass hunter2"),
+            ("Redis masterauth", "masterauth hunter2"),
+            (
+                "Redis CONFIG SET password",
+                "CONFIG SET requirepass 'hunter2'",
+            ),
+            (
+                "Redis ACL user plaintext password",
+                "user alice on >hunter2 ~* +@all",
+            ),
+            (
+                "Redis ACL SETUSER plaintext password",
+                "ACL SETUSER alice resetpass >hunter2 ~* +@all",
+            ),
+            (
+                "Redis CLI ACL quoted plaintext password",
+                "redis-cli ACL SETUSER alice '>hunter2' ~* +@all",
+            ),
+            (
+                "Redis CLI ACL plaintext password with connection flags",
+                "redis-cli -h cache.example -p 6380 ACL SETUSER alice >hunter2 ~* +@all",
+            ),
+            (
+                "path-qualified Redis CLI ACL plaintext password",
+                "/usr/local/bin/redis-cli ACL SETUSER alice >hunter2 ~* +@all",
+            ),
+            (
+                "Windows path-qualified Redis CLI ACL plaintext password",
+                r#"C:\Redis\redis-cli.exe ACL SETUSER alice >hunter2 ~* +@all"#,
+            ),
+            ("Markdown password row", "| Password | hunter2 |"),
+            (
+                "Markdown API key row",
+                "| API key | hunter2 | production |",
+            ),
+            ("XML password element", "<password>hunter2</password>"),
+            (
+                "XML password CDATA",
+                "<password><![CDATA[hunter2]]></password>",
+            ),
+            (
+                "nested XML password CDATA",
+                "<password><value><![CDATA[hunter2]]></value></password>",
+            ),
+            (
+                "nested XML password element",
+                "<password><value>hunter2</value></password>",
+            ),
+            ("XML password attribute", "<database password=\"hunter2\"/>"),
+            (
+                "camelCase XML password element",
+                "<dbPassword>hunter2</dbPassword>",
+            ),
+            (
+                "PascalCase XML password element",
+                "<DbPassword>hunter2</DbPassword>",
+            ),
+            (
+                "snake_case XML password element",
+                "<db_password>hunter2</db_password>",
+            ),
+            (
+                "kebab-case XML password element",
+                "<db-password>hunter2</db-password>",
+            ),
+            (
+                "camelCase XML password attribute",
+                "<database dbPassword=\"hunter2\"/>",
+            ),
+            (
+                "PascalCase XML password attribute",
+                "<database DbPassword=\"hunter2\"/>",
+            ),
+            (
+                "snake_case XML password attribute",
+                "<database db_password=\"hunter2\"/>",
+            ),
+            (
+                "kebab-case XML password attribute",
+                "<database db-password=\"hunter2\"/>",
+            ),
+            (
+                "XML credential property",
+                "<property name=\"password\" value=\"hunter2\"/>",
+            ),
+            (
+                "qualified XML credential property",
+                "<property name=\"hibernate.connection.password\" value=\"hunter2\"/>",
+            ),
+            (
+                "namespaced XML credential property",
+                "<property name=\"database:password\" value=\"hunter2\"/>",
+            ),
+            (
+                "nested XML credential property",
+                "<property name=\"password\"><value>hunter2</value></property>",
+            ),
+            (
+                "XML credential value attribute",
+                "<password value=\"hunter2\"/>",
+            ),
+            (
+                "PostgreSQL password-file record",
+                "db.example.test:5432:app:alice:hunter2",
+            ),
+            (
+                "PostgreSQL single-label password-file record",
+                "db:5432:app:alice:hunter2",
+            ),
+            (
+                "PostgreSQL numeric single-label password-file record",
+                "123:5432:app:alice:hunter2",
+            ),
+            (
+                "PostgreSQL password-file escaped password",
+                "localhost:5432:app:alice:hun\\:ter2",
+            ),
+            (
+                "connection-string key",
+                "Endpoint=sb://example.test/;SharedAccessKeyName=writer;SharedAccessKey=abc",
+            ),
+            (
+                "Docker auth JSON",
+                "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpwYXNz\"}}}",
+            ),
+            (
+                "credential URL",
+                "postgres://user:password-value@example.test/database",
+            ),
+            (
+                "HCL secret variable default",
+                "variable \"db_password\" {\n  type = object({ enabled = bool })\n  default = \"hunter2\"\n}",
+            ),
+            (
+                "unlabelled opaque hexadecimal token",
+                "0123456789abcdef0123456789abcdef",
+            ),
+            (
+                "unrelated same-field hash label",
+                "commit 0123456789abcdef0123456789abcdef01234567; production access 0123456789abcdef0123456789abcdef",
+            ),
+            ("opaque token", "mF9/Bx7Qa2cD8/Zp4Ln6Rt3Vy5Kw1Hs0Je"),
+            (
+                "age secret identity",
+                "AGE-SECRET-KEY-1QWERTYUIOPASDFGHJKLZXCVBNM1234567890",
+            ),
+            ("literal dollar-prefixed password", "password=$2b$hunter2"),
+            ("private key", "-----BEGIN OPENSSH PRIVATE KEY-----"),
+        ] {
+            assert!(
+                contains_secret_like_value(value),
+                "secret case was not detected: {case}"
+            );
+            assert!(
+                sanitize_extraction_source(value) == REDACTED_EXTRACTION_SOURCE,
+                "secret case was not redacted: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn detector_fails_closed_on_oversized_hcl_credential_block() {
+        let source = format!(
+            "variable \"db_password\" {{\n  description = \"{}\"\n  default = \"hunter2\"\n}}",
+            "x".repeat(4_096)
+        );
+        assert!(contains_secret_like_value(&source));
+        assert_eq!(
+            sanitize_extraction_source(&source),
+            REDACTED_EXTRACTION_SOURCE
+        );
+    }
+
+    #[test]
+    fn detector_fails_closed_when_structured_secrets_exceed_inspection_budgets() {
+        let xml = format!("<password>{}hunter2</password>", " ".repeat(4_096));
+        assert!(contains_secret_like_value(&xml));
+        assert!(contains_secret_like_value(
+            "<password></value>hunter2</password>"
+        ));
+        let oversized_opening_tag =
+            format!("<database {}password=\"hunter2\"/>", "x".repeat(4_096));
+        assert!(contains_secret_like_value(&oversized_opening_tag));
+
+        let docker = format!(
+            r#"{{"auths":{{"registry.example":{{"metadata":"{}","auth":"dXNlcjpwYXNz"}}}}}}"#,
+            "x".repeat(4_096)
+        );
+        assert!(contains_secret_like_value(&docker));
+
+        let prefix = (0..64)
+            .map(|index| format!("metadata{index}=value"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let otp = format!("otpauth://totp/Example:alice?{prefix}&secret=JBSWY3DPEHPK3PXP");
+        assert!(contains_secret_like_value(&otp));
+
+        let oversized_fence = format!(
+            "```yaml\npassword: |\n  ${{DB_PASSWORD}}\n{}\n```",
+            " ".repeat(MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES)
+        );
+        assert!(contains_secret_like_value(&oversized_fence));
+        assert!(contains_secret_like_value(
+            "```yaml\npassword: |\n  hunter2"
+        ));
+        assert!(contains_secret_like_value(
+            "```toml\npassword = \"\"\"\n${DB_PASSWORD}"
+        ));
+
+        let late_redis_acl = format!(
+            "{}user alice on >hunter2 ~* +@all",
+            "ordinary note\n".repeat(256)
+        );
+        assert!(
+            contains_secret_like_value(&late_redis_acl),
+            "Redis ACL credentials after many ordinary lines must not be skipped"
+        );
+    }
+
+    #[test]
+    fn pair_and_candidate_checks_reject_split_credentials() {
+        assert!(
+            !extraction_sources_are_secret_safe(&["API", "key", "hunter2"]),
+            "a two-word credential label split across fields must be reconstructed"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["one", "time", "password", "123456"]),
+            "a three-word credential label split across fields must be reconstructed"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["API", "design", "approved"]),
+            "ordinary structured fields must remain compatible"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["Password", "reset to hunter2"]),
+            "a split credential transition must retain its synthetic label"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&[
+                "Password",
+                "changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
+            ]),
+            "split placeholder transitions must remain compatible"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["Password", "required for deploys"]),
+            "split state-only facts must remain compatible"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["Token", "Improve tokenizer budgeting"]),
+            "a lone ambiguous title must not become a synthetic credential label"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["Access", "Token", "abc"]),
+            "credential context must still make an ambiguous label fragment effective"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["Password", "required for staging"]),
+            "a split state predicate must not become a synthetic credential"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["API", "key", "required for staging"]),
+            "a reconstructed label must retain the state-predicate exemption"
+        );
+        let mut oversized = (0..512)
+            .map(|index| format!("ordinary-field-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            extraction_sources_are_secret_safe(
+                &oversized.iter().map(String::as_str).collect::<Vec<_>>()
+            ),
+            "ordinary records must not fail solely because they contain many fields"
+        );
+        oversized.extend(["Password".to_string(), "hunter2".to_string()]);
+        assert!(
+            !extraction_sources_are_secret_safe(
+                &oversized.iter().map(String::as_str).collect::<Vec<_>>()
+            ),
+            "bounded label scans must still inspect values across a large record"
+        );
+        let suspicious = vec!["api"; MAX_STRUCTURED_PRIVACY_LABEL_FIELDS + 1];
+        assert!(
+            !extraction_sources_are_secret_safe(&suspicious),
+            "too many credential-label fragments must fail closed"
+        );
+
+        let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");
+        assert!(
+            label == REDACTED_EXTRACTION_SOURCE,
+            "split label was not redacted"
+        );
+        assert!(
+            content == REDACTED_EXTRACTION_SOURCE,
+            "split content was not redacted"
+        );
+
+        let (label, content) = sanitize_extraction_source_pair("**Password**", "hunter2");
+        assert!(
+            label == REDACTED_EXTRACTION_SOURCE && content == REDACTED_EXTRACTION_SOURCE,
+            "Markdown-wrapped split credential was not redacted"
+        );
+
+        let memory = DurableExtractionCandidate {
+            title: "Password".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["credential".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(!durable_candidate_is_secret_safe(&memory));
+
+        let triple_quoted_memory = DurableExtractionCandidate {
+            title: "Production configuration".to_string(),
+            kind: "reference".to_string(),
+            content: "password = \"\"\"hunter2\"\"\"".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["configuration".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&triple_quoted_memory),
+            "triple-quoted credentials must be rejected at the sink boundary"
+        );
+
+        let reversed_memory = DurableExtractionCandidate {
+            title: "hunter2".to_string(),
+            kind: "reference".to_string(),
+            content: "Password".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["database".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&reversed_memory),
+            "content used as the credential label must reject the candidate"
+        );
+
+        let tag_labelled_memory = DurableExtractionCandidate {
+            title: "Production database".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["password".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&tag_labelled_memory),
+            "a tag used as the credential label must reject the candidate"
+        );
+
+        let hash_candidate = DurableExtractionCandidate {
+            title: "Build artifact SHA-256 digest".to_string(),
+            kind: "reference".to_string(),
+            content:
+                "SHA-256 digest: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["checksum".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            durable_candidate_is_secret_safe(&hash_candidate),
+            "an explicitly labelled technical digest must remain compatible"
+        );
+
+        let opaque_authority_id = DurableExtractionCandidate {
+            title: "Opaque authority remains attributable".to_string(),
+            kind: "reference".to_string(),
+            content: "The durable fact remains associated with its source Session.".to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["provenance".to_string()],
+            session_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            durable_candidate_is_secret_safe(&opaque_authority_id),
+            "an authoritative opaque Session ID is not secret-bearing payload"
+        );
+
+        let unrelated_hash_context = DurableExtractionCandidate {
+            title: "Production integration access".to_string(),
+            kind: "reference".to_string(),
+            content: "0123456789abcdef0123456789abcdef".to_string(),
+            scope: Some("project".to_string()),
+            tags: vec!["commit".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&unrelated_hash_context),
+            "an unrelated hash-like field must not exempt an opaque token"
+        );
+
+        let three_field_credential = DurableExtractionCandidate {
+            title: "API".to_string(),
+            kind: "reference".to_string(),
+            content: "hunter2".to_string(),
+            scope: Some("global".to_string()),
+            tags: vec!["key".to_string()],
+            session_id: Some("session-1".to_string()),
+            confidence: Some("high".to_string()),
+        };
+        assert!(
+            !durable_candidate_is_secret_safe(&three_field_credential),
+            "a credential assembled from title, tag, and content must be rejected"
+        );
+
+        for (field, candidate) in [
+            (
+                "kind",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "password".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("global".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("high".to_string()),
+                },
+            ),
+            (
+                "scope",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "reference".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("password".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("high".to_string()),
+                },
+            ),
+            (
+                "confidence",
+                DurableExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "reference".to_string(),
+                    content: "Production database".to_string(),
+                    scope: Some("global".to_string()),
+                    tags: vec![],
+                    session_id: Some("session-1".to_string()),
+                    confidence: Some("password".to_string()),
+                },
+            ),
+        ] {
+            assert!(
+                !durable_candidate_is_secret_safe(&candidate),
+                "raw durable-candidate field {field} must participate in pair checks"
+            );
+        }
+
+        let ledger = LedgerExtractionCandidate {
+            title: "PIN".to_string(),
+            excerpt: Some("1234".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(!ledger_candidate_is_secret_safe(&ledger));
+
+        let reversed_ledger = LedgerExtractionCandidate {
+            title: "1234".to_string(),
+            excerpt: Some("PIN".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(
+            !ledger_candidate_is_secret_safe(&reversed_ledger),
+            "excerpt used as the credential label must reject the candidate"
+        );
+
+        let opaque_ledger_authority_id = LedgerExtractionCandidate {
+            title: "Keep the source attribution".to_string(),
+            excerpt: Some("The ordinary work item remains attributable.".to_string()),
+            session_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..LedgerExtractionCandidate::default()
+        };
+        assert!(
+            ledger_candidate_is_secret_safe(&opaque_ledger_authority_id),
+            "an authoritative opaque Session ID is not Ledger payload"
+        );
+
+        for (field, candidate) in [
+            (
+                "kind",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "password".to_string(),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "due_at",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    due_at: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "starts_at",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    starts_at: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+            (
+                "confidence",
+                LedgerExtractionCandidate {
+                    title: "hunter2".to_string(),
+                    kind: "todo".to_string(),
+                    confidence: Some("password".to_string()),
+                    ..LedgerExtractionCandidate::default()
+                },
+            ),
+        ] {
+            assert!(
+                !ledger_candidate_is_secret_safe(&candidate),
+                "raw ledger-candidate field {field} must participate in pair checks"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_transition_syntax_matrix_preserves_references_and_rejects_literals() {
+        for (case, value) in [
+            (
+                "present to literal",
+                "The database password is changed to hunter2",
+            ),
+            (
+                "past to literal",
+                "The database password was reset to hunter2",
+            ),
+            (
+                "passive present-perfect to literal",
+                "The database password has been rotated to hunter2",
+            ),
+            (
+                "passive past-perfect from literal",
+                "The database password had been updated from hunter2 to swordfish",
+            ),
+            (
+                "active present-perfect to literal",
+                "The database password has changed to hunter2",
+            ),
+            (
+                "active past-perfect from literal",
+                "The database password had configured from hunter2 to swordfish",
+            ),
+            (
+                "active present-perfect colon literal",
+                "The database password has reset: hunter2",
+            ),
+            (
+                "active past-perfect equals literal",
+                "The database password had updated=swordfish",
+            ),
+            (
+                "present contextual literal",
+                "The database password for my account is hunter2",
+            ),
+            (
+                "past contextual literal",
+                "The database password in the staging account was hunter2",
+            ),
+            (
+                "active perfect contextual literal",
+                "The database password for my production account has changed to hunter2",
+            ),
+            (
+                "passive perfect contextual literal",
+                "The database password for the primary production account has been reset to hunter2",
+            ),
+        ] {
+            assert!(
+                contains_secret_like_value(value),
+                "transition literal case was not rejected: {case}"
+            );
+        }
+
+        for (case, value) in [
+            ("present state", "The database password is changed"),
+            ("past state", "The database password was reset"),
+            (
+                "passive present-perfect state",
+                "The database password has been rotated successfully",
+            ),
+            (
+                "passive past-perfect state",
+                "The database password had been updated successfully",
+            ),
+            (
+                "active present-perfect placeholder",
+                "The database password has changed to ${DB_PASSWORD}",
+            ),
+            (
+                "active past-perfect references",
+                "The database password had changed from $OLD_PASSWORD to $NEW_PASSWORD",
+            ),
+            (
+                "active present-perfect colon placeholder",
+                "The database password has reset: ${DB_PASSWORD}",
+            ),
+            (
+                "active past-perfect equals reference",
+                "The database password had updated=$DB_PASSWORD",
+            ),
+            (
+                "present contextual placeholder",
+                "The database password for my account is ${DB_PASSWORD}",
+            ),
+            (
+                "past contextual state",
+                "The database password in the staging account was required",
+            ),
+            (
+                "active perfect contextual reference",
+                "The database password for my production account has changed to $DB_PASSWORD",
+            ),
+            (
+                "passive perfect contextual state",
+                "The database password for the primary production account has been reset",
+            ),
+            (
+                "ordinary qualified prose",
+                "The password policy for my production account is documented",
+            ),
+            (
+                "technical qualified token prose",
+                "The token budget for the primary production model is 4096",
+            ),
+            (
+                "qualifier must not cross a sentence",
+                "The password for my account. It is documented",
+            ),
+            (
+                "qualifier must not cross a newline",
+                "The password for my account\nis documented",
+            ),
+        ] {
+            assert!(
+                !contains_secret_like_value(value),
+                "transition safe case was rejected: {case}"
+            );
+        }
+    }
+}
