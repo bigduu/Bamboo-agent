@@ -565,7 +565,7 @@ fn structured_environment_literal_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)^[ \t]*(?:-[ \t]*)?name[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*\r?\n[ \t]+value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})$"#,
+            r#"(?im)^[ \t]*(?:-[ \t]*)?(?:name|key)[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*\r?\n[ \t]+value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})$"#,
         )
         .expect("structured environment literal regex must compile")
     })
@@ -575,7 +575,7 @@ fn reversed_structured_environment_literal_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)^[ \t]*(?:-[ \t]*)?value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})\r?\n[ \t]+name[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*$"#,
+            r#"(?im)^[ \t]*(?:-[ \t]*)?value[ \t]*:[ \t]*(?P<value>[^\r\n]{0,1024})\r?\n[ \t]+(?:name|key)[ \t]*:[ \t]*[\"']?(?P<name>[a-z_][a-z0-9_]*)[\"']?[ \t]*$"#,
         )
         .expect("reversed structured environment literal regex must compile")
     })
@@ -606,13 +606,15 @@ fn structured_environment_captures_credential(captures: regex::Captures<'_>) -> 
 fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) -> bool {
     match value {
         serde_yaml::Value::Mapping(fields) => {
-            let name = fields
+            let label_is_credential = fields
                 .iter()
-                .find(|(key, _)| {
-                    key.as_str()
-                        .is_some_and(|key| key.eq_ignore_ascii_case("name"))
+                .filter(|(key, _)| {
+                    key.as_str().is_some_and(|key| {
+                        key.eq_ignore_ascii_case("name") || key.eq_ignore_ascii_case("key")
+                    })
                 })
-                .and_then(|(_, value)| value.as_str());
+                .filter_map(|(_, value)| value.as_str())
+                .any(structured_environment_name_is_credential);
             let candidate = fields
                 .iter()
                 .find(|(key, _)| {
@@ -620,10 +622,8 @@ fn yaml_contains_structured_environment_credential(value: &serde_yaml::Value) ->
                         .is_some_and(|key| key.eq_ignore_ascii_case("value"))
                 })
                 .map(|(_, value)| value);
-            let contains_credential = name
-                .filter(|name| structured_environment_name_is_credential(name))
-                .zip(candidate)
-                .is_some_and(|(_, candidate)| match candidate {
+            let contains_credential = label_is_credential
+                && candidate.is_some_and(|candidate| match candidate {
                     serde_yaml::Value::String(candidate) => {
                         structured_environment_value_is_literal(candidate)
                     }
@@ -1468,6 +1468,10 @@ mod tests {
                 r#"{"name":"password","value":"${DB_PASSWORD}"}"#,
             ),
             (
+                "generic key/value credential placeholder",
+                r#"{"key":"password","value":"${DB_PASSWORD}"}"#,
+            ),
+            (
                 "authorization bearer placeholder",
                 "Authorization: Bearer ${API_TOKEN}",
             ),
@@ -1687,6 +1691,10 @@ mod tests {
             (
                 "generic credential property literal",
                 r#"{"name":"password","value":"hunter2"}"#,
+            ),
+            (
+                "generic key/value credential literal",
+                r#"{"key":"password","value":"hunter2"}"#,
             ),
             ("Redis requirepass", "requirepass hunter2"),
             ("Redis masterauth", "masterauth hunter2"),
