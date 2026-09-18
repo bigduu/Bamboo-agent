@@ -36,7 +36,7 @@ fn present_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+is(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("present-tense secret assignment regex must compile")
     })
@@ -46,7 +46,7 @@ fn past_tense_secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:was|has\s+been|had\s+been)\s+(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
+            r#"(?i)(?:^|[^a-z0-9])(?:(?:api[\s_-]?key|account[\s_-]?key|shared[\s_-]?access[\s_-]?(?:key|signature)|password|passwd|passcode|passphrase|otp|one[\s_-]?time[\s_-]?(?:password|passcode|code)|verification[\s_-]?code|security[\s_-]?code|recovery[\s_-]?code|mfa[\s_-]?code|2fa[\s_-]?code|credential|private[\s_-]?key|secret[\s_-]?key|client[\s_-]?secret|access[\s_-]?key|auth[\s_-]?key|signing[\s_-]?key|encryption[\s_-]?key|(?:basic|proxy|http)[\s_-]?auth|(?:api|auth|access|refresh|bearer)[\s_-]?token|session[\s_-]?(?:cookie|token|id))|(?:my|our|your)\s+(?:secret|token|pin)|(?:account|auth|authentication|login|security|verification|recovery|mfa|2fa|bank|card|payment|unlock|device)[\s_-]+pin|pin[\s_-]+(?:code|number))\s+(?:was|has\s+been|had\s+been)(?:\s*(?::|=)\s*|\s+)(?:\"{1,3}|'{1,3})?(?P<value>[^\s\"',;]+)"#,
         )
         .expect("past-tense secret assignment regex must compile")
     })
@@ -208,6 +208,10 @@ fn captures_credential_state_transition_value(pattern: &Regex, value: &str) -> b
         let Some(candidate) = captures.name("value") else {
             return false;
         };
+        let state_has_assignment_delimiter = candidate
+            .as_str()
+            .trim_matches(|character| matches!(character, '"' | '\''))
+            .ends_with([':', '=']);
         let state = candidate
             .as_str()
             .trim_matches(|character: char| character.is_ascii_punctuation())
@@ -222,6 +226,17 @@ fn captures_credential_state_transition_value(pattern: &Regex, value: &str) -> b
             return false;
         };
         let suffix = value[matched.end()..].trim_start();
+        if state_has_assignment_delimiter {
+            let candidate = suffix.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
+        if let Some(remainder) = suffix
+            .strip_prefix(':')
+            .or_else(|| suffix.strip_prefix('='))
+        {
+            let candidate = remainder.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
         if let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "to ")
             .or_else(|| strip_ascii_case_insensitive_prefix(suffix, "as "))
         {
@@ -2415,6 +2430,14 @@ mod tests {
                 "The staging password is required for deploys.",
             ),
             (
+                "punctuated present-tense password state",
+                "The staging password is: required",
+            ),
+            (
+                "punctuated present-tense password placeholder",
+                "The staging password is: ${DB_PASSWORD}",
+            ),
+            (
                 "disabled password state",
                 "The staging password is disabled.",
             ),
@@ -2617,6 +2640,10 @@ mod tests {
             (
                 "password placeholder transition",
                 "The database password was changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
+            ),
+            (
+                "punctuated password transition placeholder",
+                "The database password was reset: ${DB_PASSWORD}",
             ),
             (
                 "present-perfect password placeholder transition",
@@ -2888,6 +2915,14 @@ mod tests {
             (
                 "password reset to a literal",
                 "The database password was reset to hunter2",
+            ),
+            (
+                "punctuated present-tense password literal",
+                "The database password is: hunter2",
+            ),
+            (
+                "punctuated password transition literal",
+                "The database password was reset: hunter2",
             ),
             (
                 "password changed from and to literals",
