@@ -962,13 +962,13 @@ const MAX_STRUCTURED_DOCUMENTS: usize = 32;
 const MAX_EMBEDDED_STRUCTURED_BLOCKS: usize = 32;
 const MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES: usize = 64 * 1024;
 
-fn structured_multiline_scalar_hint(value: &str) -> bool {
+fn structured_multiline_scalar_hint_for(value: &str, delimiter: char, markers: &[&str]) -> bool {
     value.lines().any(|line| {
         let mut line = line.trim_start_matches([' ', '\t']);
         if let Some(rest) = line.strip_prefix('-') {
             line = rest.trim_start_matches([' ', '\t']);
         }
-        let Some((name, candidate)) = line.split_once(':').or_else(|| line.split_once('=')) else {
+        let Some((name, candidate)) = line.split_once(delimiter) else {
             return false;
         };
         let name = name
@@ -976,11 +976,20 @@ fn structured_multiline_scalar_hint(value: &str) -> bool {
             .trim_matches(|character| matches!(character, '\"' | '\''));
         let candidate = candidate.trim_start();
         structured_environment_name_is_credential(name)
-            && (candidate.starts_with('|')
-                || candidate.starts_with('>')
-                || candidate.starts_with("\"\"\"")
-                || candidate.starts_with("'''"))
+            && markers.iter().any(|marker| candidate.starts_with(marker))
     })
+}
+
+fn structured_yaml_multiline_scalar_hint(value: &str) -> bool {
+    structured_multiline_scalar_hint_for(value, ':', &["|", ">"])
+}
+
+fn structured_toml_multiline_scalar_hint(value: &str) -> bool {
+    structured_multiline_scalar_hint_for(value, '=', &["\"\"\"", "'''"])
+}
+
+fn structured_multiline_scalar_hint(value: &str) -> bool {
+    structured_yaml_multiline_scalar_hint(value) || structured_toml_multiline_scalar_hint(value)
 }
 
 fn yaml_documents_contain_structured_credential(value: &str, fail_closed: bool) -> bool {
@@ -1006,12 +1015,12 @@ fn structured_block_contains_credential(value: &str) -> bool {
     if value.len() > MAX_EMBEDDED_STRUCTURED_BLOCK_BYTES {
         return structured_multiline_scalar_hint(value);
     }
+    let parsed_toml = toml::from_str::<toml::Value>(value);
     yaml_documents_contain_structured_credential(value, true)
-        || toml::from_str::<toml::Value>(value)
-            .is_ok_and(|value| toml_contains_structured_credential(&value))
-        || (structured_multiline_scalar_hint(value)
-            && serde_yaml::from_str::<serde_yaml::Value>(value).is_err()
-            && toml::from_str::<toml::Value>(value).is_err())
+        || parsed_toml
+            .as_ref()
+            .is_ok_and(toml_contains_structured_credential)
+        || (structured_toml_multiline_scalar_hint(value) && parsed_toml.is_err())
 }
 
 fn markdown_fence(line: &str) -> Option<(u8, usize)> {
@@ -2698,6 +2707,9 @@ mod tests {
         assert!(contains_secret_like_value(&oversized_fence));
         assert!(contains_secret_like_value(
             "```yaml\npassword: |\n  hunter2"
+        ));
+        assert!(contains_secret_like_value(
+            "```toml\npassword = \"\"\"\n${DB_PASSWORD}"
         ));
     }
 
