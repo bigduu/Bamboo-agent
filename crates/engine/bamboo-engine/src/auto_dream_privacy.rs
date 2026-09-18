@@ -222,17 +222,28 @@ fn captures_credential_state_transition_value(pattern: &Regex, value: &str) -> b
             return false;
         };
         let suffix = value[matched.end()..].trim_start();
-        let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "to ")
+        if let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "to ")
             .or_else(|| strip_ascii_case_insensitive_prefix(suffix, "as "))
-        else {
+        {
+            let candidate = remainder.split_whitespace().next().unwrap_or_default();
+            return credential_assignment_value_is_literal(candidate);
+        }
+        let Some(remainder) = strip_ascii_case_insensitive_prefix(suffix, "from ") else {
             return false;
         };
-        let candidate = remainder
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches(|character: char| character.is_ascii_punctuation());
-        credential_assignment_value_is_literal(candidate)
+        let mut tokens = remainder.split_whitespace();
+        let previous = tokens.next().unwrap_or_default();
+        if credential_assignment_value_is_literal(previous) {
+            return true;
+        }
+        let Some(operator) = tokens.next() else {
+            return false;
+        };
+        if !operator.eq_ignore_ascii_case("to") {
+            return false;
+        }
+        let next = tokens.next().unwrap_or_default();
+        credential_assignment_value_is_literal(next)
     })
 }
 
@@ -317,31 +328,48 @@ fn contains_redis_acl_plaintext_password(value: &str) -> bool {
         if line.is_empty() || line.starts_with('#') {
             return false;
         }
+        let lowercase = line.to_ascii_lowercase();
         if line.len() > 4096 {
-            return line.to_ascii_lowercase().starts_with("user ")
-                || line.to_ascii_lowercase().starts_with("acl setuser ");
+            return lowercase.starts_with("user ")
+                || lowercase.starts_with("acl setuser ")
+                || (lowercase.starts_with("redis-cli") && lowercase.contains(" acl setuser "));
         }
 
         let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
-        let rule_start = if tokens
-            .first()
-            .is_some_and(|token| token.eq_ignore_ascii_case("user"))
+        let command_start = if tokens.first().is_some_and(|token| {
+            token.eq_ignore_ascii_case("redis-cli") || token.eq_ignore_ascii_case("redis-cli.exe")
+        }) {
+            tokens
+                .windows(2)
+                .position(|pair| {
+                    pair[0].eq_ignore_ascii_case("acl") && pair[1].eq_ignore_ascii_case("setuser")
+                })
+                .unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let rule_start = if command_start == 0
+            && tokens
+                .first()
+                .is_some_and(|token| token.eq_ignore_ascii_case("user"))
         {
             2
-        } else if tokens
-            .first()
-            .is_some_and(|token| token.eq_ignore_ascii_case("acl"))
+        } else if command_start != usize::MAX
             && tokens
-                .get(1)
+                .get(command_start)
+                .is_some_and(|token| token.eq_ignore_ascii_case("acl"))
+            && tokens
+                .get(command_start + 1)
                 .is_some_and(|token| token.eq_ignore_ascii_case("setuser"))
         {
-            3
+            command_start + 3
         } else {
             return false;
         };
 
         tokens.get(rule_start..).is_some_and(|rules| {
             rules.iter().any(|rule| {
+                let rule = rule.trim_matches(|character| matches!(character, '\'' | '"'));
                 rule.strip_prefix('>')
                     .is_some_and(credential_assignment_value_is_literal)
             })
@@ -604,6 +632,22 @@ fn xml_credential_name_attribute_pattern() -> &'static Regex {
     })
 }
 
+fn xml_name_or_key_attribute_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)\b(?:name|key)\s*=\s*[\"'](?P<name>[^\"'\r\n]{1,1024})[\"']"#)
+            .expect("XML name/key attribute regex must compile")
+    })
+}
+
+fn xml_property_has_credential_name(tag: &str) -> bool {
+    xml_credential_name_attribute_pattern().is_match(tag)
+        || xml_name_or_key_attribute_pattern()
+            .captures_iter(tag)
+            .filter_map(|captures| captures.name("name"))
+            .any(|name| structured_environment_name_is_credential(name.as_str()))
+}
+
 fn xml_value_attribute_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -714,7 +758,7 @@ fn contains_xml_credential(value: &str) -> bool {
             return true;
         }
 
-        if xml_credential_name_attribute_pattern().is_match(tag) {
+        if xml_property_has_credential_name(tag) {
             if captures_non_placeholder_credential_value(xml_value_attribute_pattern(), tag) {
                 return true;
             }
@@ -2091,10 +2135,11 @@ fn starts_with_credential_state_predicate(value: &str) -> bool {
 
 fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
     // Synthetic field joins must retain the same compatibility exemption as
-    // natural-language `is` / `was` checks. The value itself is still scanned,
-    // so a later explicit credential or high-entropy token remains blocked.
+    // natural-language `is` / `was` checks. Keep the synthetic label attached
+    // while scanning transition suffixes so placeholders remain distinguishable
+    // from short literal credentials.
     if starts_with_credential_state_predicate(value) {
-        return contains_secret_like_value(value);
+        return contains_secret_like_value(&format!("{label} was {value}"));
     }
     contains_secret_like_value(&format!("{label}: {value}"))
         || contains_secret_like_value(&format!("{label} {value}"))
@@ -2103,7 +2148,7 @@ fn labelled_value_contains_secret(label: &str, value: &str) -> bool {
 fn structured_label_fields<'a>(sources: &[&'a str]) -> Option<Vec<(usize, &'a str)>> {
     let mut label_fields = Vec::new();
     for (index, source) in sources.iter().copied().enumerate() {
-        if !field_can_form_credential_label(source) && !fields_form_credential_label(&[source]) {
+        if !field_can_form_credential_label(source) {
             continue;
         }
         label_fields.push((index, source));
@@ -2497,6 +2542,18 @@ mod tests {
                 "# ACL SETUSER alice on >hunter2 ~* +@all",
             ),
             (
+                "Redis CLI ACL placeholder password",
+                "redis-cli ACL SETUSER alice '>${REDIS_PASSWORD}' ~* +@all",
+            ),
+            (
+                "Redis CLI ACL rule without password",
+                "redis-cli -h cache.example ACL SETUSER alice on ~* +@all",
+            ),
+            (
+                "password placeholder transition",
+                "The database password was changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
+            ),
+            (
                 "Markdown password requirement",
                 "| Password | required | authentication policy |",
             ),
@@ -2519,6 +2576,14 @@ mod tests {
             (
                 "qualified XML credential property placeholder",
                 "<property name=\"hibernate.connection.password\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML credential property placeholder",
+                "<property name=\"dbPassword\" value=\"${DB_PASSWORD}\"/>",
+            ),
+            (
+                "camelCase XML technical property",
+                "<property name=\"maxToken\" value=\"4096\"/>",
             ),
             (
                 "XML credential attribute placeholder",
@@ -2739,6 +2804,10 @@ mod tests {
                 "password reset to a literal",
                 "The database password was reset to hunter2",
             ),
+            (
+                "password changed from and to literals",
+                "The database password was changed from hunter2 to swordfish",
+            ),
             ("past-tense PIN disclosure", "my PIN was 1234"),
             ("past-tense OTP disclosure", "OTP was 123456"),
             (
@@ -2792,6 +2861,10 @@ mod tests {
             (
                 "generic key/value credential literal",
                 r#"{"key":"password","value":"hunter2"}"#,
+            ),
+            (
+                "camelCase XML credential property literal",
+                "<property name=\"dbPassword\" value=\"hunter2\"/>",
             ),
             (
                 "YAML multiline credential literal",
@@ -2854,6 +2927,14 @@ mod tests {
             (
                 "Redis ACL SETUSER plaintext password",
                 "ACL SETUSER alice resetpass >hunter2 ~* +@all",
+            ),
+            (
+                "Redis CLI ACL quoted plaintext password",
+                "redis-cli ACL SETUSER alice '>hunter2' ~* +@all",
+            ),
+            (
+                "Redis CLI ACL plaintext password with connection flags",
+                "redis-cli -h cache.example -p 6380 ACL SETUSER alice >hunter2 ~* +@all",
             ),
             ("Markdown password row", "| Password | hunter2 |"),
             (
@@ -3025,6 +3106,21 @@ mod tests {
         assert!(
             extraction_sources_are_secret_safe(&["API", "design", "approved"]),
             "ordinary structured fields must remain compatible"
+        );
+        assert!(
+            !extraction_sources_are_secret_safe(&["Password", "reset to hunter2"]),
+            "a split credential transition must retain its synthetic label"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&[
+                "Password",
+                "changed from ${OLD_PASSWORD} to ${NEW_PASSWORD}",
+            ]),
+            "split placeholder transitions must remain compatible"
+        );
+        assert!(
+            extraction_sources_are_secret_safe(&["Password", "required for deploys"]),
+            "split state-only facts must remain compatible"
         );
         assert!(
             extraction_sources_are_secret_safe(&["Token", "Improve tokenizer budgeting"]),
