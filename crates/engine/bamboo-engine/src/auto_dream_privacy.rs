@@ -330,6 +330,8 @@ fn otp_provisioning_uri_pattern() -> &'static Regex {
 }
 
 fn contains_otp_provisioning_secret(value: &str) -> bool {
+    const MAX_QUERY_PARAMETERS: usize = 64;
+
     otp_provisioning_uri_pattern()
         .captures_iter(value)
         .any(|captures| {
@@ -342,15 +344,23 @@ fn contains_otp_provisioning_secret(value: &str) -> bool {
             let Some((_, query)) = uri.split_once('?') else {
                 return false;
             };
-            query.split('&').take(64).any(|parameter| {
+            let mut parameters = query.split('&');
+            for parameter in parameters.by_ref().take(MAX_QUERY_PARAMETERS) {
                 let Some((name, candidate)) = parameter.split_once('=') else {
-                    return false;
+                    continue;
                 };
                 let candidate = candidate.split('#').next().unwrap_or_default();
-                name.eq_ignore_ascii_case("secret")
+                if name.eq_ignore_ascii_case("secret")
                     && !candidate.is_empty()
                     && !is_placeholder_only(candidate)
-            })
+                {
+                    return true;
+                }
+            }
+            // A URI that exceeds the explicit inspection budget is
+            // indeterminate. Do not silently treat an uninspected tail as
+            // privacy-safe.
+            parameters.next().is_some()
         })
 }
 
@@ -485,7 +495,7 @@ fn xml_value_attribute_pattern() -> &'static Regex {
     })
 }
 
-fn xml_element_body_contains_literal(body: &str) -> bool {
+fn xml_element_body_contains_literal(body: &str, outer_name: &str) -> bool {
     let mut bounded_end = body.len().min(4_096);
     while !body.is_char_boundary(bounded_end) {
         bounded_end = bounded_end.saturating_sub(1);
@@ -499,7 +509,7 @@ fn xml_element_body_contains_literal(body: &str) -> bool {
         if let Some(cdata) = remainder.strip_prefix("<![CDATA[") {
             let (text, consumed) = match cdata.find("]]>") {
                 Some(end) => (&cdata[..end], "<![CDATA[".len() + end + "]]>".len()),
-                None => (cdata, remainder.len()),
+                None => return true,
             };
             if !text.trim().is_empty() && !is_placeholder_only(text) {
                 return true;
@@ -508,26 +518,31 @@ fn xml_element_body_contains_literal(body: &str) -> bool {
             continue;
         }
         if remainder.starts_with("<!--") {
-            let consumed = remainder
-                .find("-->")
-                .map_or(remainder.len(), |end| end + "-->".len());
+            let Some(consumed) = remainder.find("-->").map(|end| end + "-->".len()) else {
+                return true;
+            };
             cursor += consumed;
             continue;
         }
         if remainder.starts_with("</") {
-            if nested_depth == 0 {
-                break;
-            }
             let Some(end) = remainder.find('>') else {
-                break;
+                return true;
             };
+            if nested_depth == 0 {
+                let closing_name = remainder[2..end]
+                    .trim()
+                    .split_ascii_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                return !closing_name.eq_ignore_ascii_case(outer_name);
+            }
             nested_depth -= 1;
             cursor += end + 1;
             continue;
         }
         if remainder.starts_with('<') {
             let Some(end) = remainder.find('>') else {
-                break;
+                return true;
             };
             let tag = &remainder[1..end];
             let trimmed = tag.trim_start();
@@ -548,7 +563,9 @@ fn xml_element_body_contains_literal(body: &str) -> bool {
         }
         cursor += text_end;
     }
-    false
+    // Reaching EOF or the 4 KiB inspection boundary without the outer close
+    // leaves part of this credential-labelled element uninspected.
+    true
 }
 
 fn contains_xml_credential(value: &str) -> bool {
@@ -559,8 +576,7 @@ fn contains_xml_credential(value: &str) -> bool {
             break;
         };
         if close > 4_096 {
-            remainder = &remainder[close + 1..];
-            continue;
+            return true;
         }
         let tag = &remainder[..close];
         let trimmed_tag = tag.trim_start();
@@ -571,6 +587,11 @@ fn contains_xml_credential(value: &str) -> bool {
             remainder = &remainder[close + 1..];
             continue;
         }
+        let element_name = trimmed_tag
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
 
         if captures_non_placeholder_credential_value(xml_credential_attribute_pattern(), tag) {
             return true;
@@ -582,7 +603,7 @@ fn contains_xml_credential(value: &str) -> bool {
             }
             if !tag.trim_end().ends_with('/') {
                 let body = &remainder[close + 1..];
-                if xml_element_body_contains_literal(body) {
+                if xml_element_body_contains_literal(body, element_name) {
                     return true;
                 }
             }
@@ -594,7 +615,7 @@ fn contains_xml_credential(value: &str) -> bool {
             }
             if !tag.trim_end().ends_with('/') {
                 let body = &remainder[close + 1..];
-                if xml_element_body_contains_literal(body) {
+                if xml_element_body_contains_literal(body, element_name) {
                     return true;
                 }
             }
@@ -1048,6 +1069,8 @@ fn docker_auth_field_pattern() -> &'static Regex {
 }
 
 fn contains_docker_auth_config(value: &str) -> bool {
+    const MAX_DOCKER_CONFIG_BYTES: usize = 64 * 1_024;
+
     if docker_auth_config_pattern().is_match(value) {
         return true;
     }
@@ -1058,11 +1081,40 @@ fn contains_docker_auth_config(value: &str) -> bool {
     else {
         return false;
     };
+    if value.len() <= MAX_DOCKER_CONFIG_BYTES {
+        if let Ok(document) = serde_json::from_str::<serde_json::Value>(value) {
+            let Some(auths) = document.as_object().and_then(|root| {
+                root.iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("auths"))
+                    .map(|(_, value)| value)
+            }) else {
+                return false;
+            };
+            let Some(registries) = auths.as_object() else {
+                return true;
+            };
+            return registries.values().any(|registry| {
+                let Some(fields) = registry.as_object() else {
+                    return true;
+                };
+                fields.iter().any(|(key, candidate)| {
+                    if !matches!(key.to_ascii_lowercase().as_str(), "auth" | "identitytoken") {
+                        return false;
+                    }
+                    candidate.as_str().is_none_or(|candidate| {
+                        let candidate = candidate.trim();
+                        !candidate.is_empty() && !is_placeholder_only(candidate)
+                    })
+                })
+            });
+        }
+    }
     let mut bounded_end = auths_index.saturating_add(4_096).min(value.len());
     while !value.is_char_boundary(bounded_end) {
         bounded_end = bounded_end.saturating_sub(1);
     }
     docker_auth_field_pattern().is_match(&value[auths_index..bounded_end])
+        || bounded_end < value.len()
 }
 
 fn known_secret_pattern() -> &'static Regex {
@@ -1895,6 +1947,10 @@ mod tests {
                 "otpauth://totp/Example:alice?secret=${OTP_SECRET}&issuer=Example",
             ),
             (
+                "Docker auth placeholder",
+                r#"{"auths":{"registry.example":{"auth":"${DOCKER_AUTH}"}}}"#,
+            ),
+            (
                 "authorization bearer placeholder",
                 "Authorization: Bearer ${API_TOKEN}",
             ),
@@ -2302,6 +2358,31 @@ mod tests {
             sanitize_extraction_source(&source),
             REDACTED_EXTRACTION_SOURCE
         );
+    }
+
+    #[test]
+    fn detector_fails_closed_when_structured_secrets_exceed_inspection_budgets() {
+        let xml = format!("<password>{}hunter2</password>", " ".repeat(4_096));
+        assert!(contains_secret_like_value(&xml));
+        assert!(contains_secret_like_value(
+            "<password></value>hunter2</password>"
+        ));
+        let oversized_opening_tag =
+            format!("<database {}password=\"hunter2\"/>", "x".repeat(4_096));
+        assert!(contains_secret_like_value(&oversized_opening_tag));
+
+        let docker = format!(
+            r#"{{"auths":{{"registry.example":{{"metadata":"{}","auth":"dXNlcjpwYXNz"}}}}}}"#,
+            "x".repeat(4_096)
+        );
+        assert!(contains_secret_like_value(&docker));
+
+        let prefix = (0..64)
+            .map(|index| format!("metadata{index}=value"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let otp = format!("otpauth://totp/Example:alice?{prefix}&secret=JBSWY3DPEHPK3PXP");
+        assert!(contains_secret_like_value(&otp));
     }
 
     #[test]
