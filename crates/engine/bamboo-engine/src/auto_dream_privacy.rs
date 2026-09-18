@@ -322,6 +322,57 @@ fn redis_password_directive_pattern() -> &'static Regex {
     })
 }
 
+fn contains_redis_cli_password_option(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let lowercase = line.to_ascii_lowercase();
+        if line.len() > 4096 {
+            return lowercase.contains("redis-cli")
+                && (lowercase.contains(" -a ")
+                    || lowercase.contains(" -a=")
+                    || lowercase.contains(" --pass ")
+                    || lowercase.contains(" --pass="));
+        }
+
+        let tokens = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let Some(command_index) = tokens.iter().position(|token| {
+            token
+                .trim_matches(|character| matches!(character, '\'' | '"'))
+                .rsplit(['/', '\\'])
+                .next()
+                .is_some_and(|command| {
+                    command.eq_ignore_ascii_case("redis-cli")
+                        || command.eq_ignore_ascii_case("redis-cli.exe")
+                })
+        }) else {
+            return false;
+        };
+
+        tokens[command_index + 1..]
+            .iter()
+            .enumerate()
+            .any(|(index, token)| {
+                let token = token.trim_matches(|character| matches!(character, '\'' | '"'));
+                let candidate =
+                    if token.eq_ignore_ascii_case("-a") || token.eq_ignore_ascii_case("--pass") {
+                        tokens.get(command_index + index + 2).copied()
+                    } else {
+                        token
+                            .strip_prefix("-a=")
+                            .or_else(|| strip_ascii_case_insensitive_prefix(token, "--pass="))
+                    };
+                candidate.is_some_and(|candidate| {
+                    credential_assignment_value_is_literal(
+                        candidate.trim_matches(|character| matches!(character, '\'' | '"')),
+                    )
+                })
+            })
+    })
+}
+
 fn contains_redis_acl_plaintext_password(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim();
@@ -1627,7 +1678,7 @@ fn authorization_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?i)(?:^|[^a-z0-9_-])[\"']?(?:proxy-)?authorization[\"']?\s*:\s*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]+)"#,
+            r#"(?i)(?:^|[^a-z0-9_-])[\"']?(?:proxy-)?authorization[\"']?\s*(?::|=)\s*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\r\n]+)"#,
         )
         .expect("authorization secret regex must compile")
     })
@@ -1916,6 +1967,7 @@ fn contains_secret_like_value_without_markdown_normalization(value: &str) -> boo
         || standalone_pin_credential_pattern().is_match(value)
         || contains_short_credential_config_field(value)
         || redis_password_directive_pattern().is_match(value)
+        || contains_redis_cli_password_option(value)
         || contains_redis_acl_plaintext_password(value)
         || captures_non_state_credential_value(markdown_table_credential_pattern(), value)
         || captures_non_placeholder_credential_value(cli_credential_flag_pattern(), value)
@@ -2309,6 +2361,14 @@ mod tests {
                 "CLI API key placeholder",
                 "deploy --api-key=\"$API_KEY\"",
             ),
+            (
+                "Redis CLI short password placeholder",
+                "redis-cli -a ${REDIS_PASSWORD} PING",
+            ),
+            (
+                "Redis CLI long password placeholder",
+                "redis-cli --pass=$REDIS_PASSWORD PING",
+            ),
             ("token budget flag", "runner --token-budget 1000"),
             ("escaped token budget JSON", r#"{\"token_budget\":1000}"#),
             (
@@ -2525,7 +2585,12 @@ mod tests {
                 "proxy authorization placeholder",
                 "Proxy-Authorization: Basic %PROXY_AUTH%",
             ),
+            (
+                "equals authorization placeholder",
+                "Authorization = \"Bearer ${API_TOKEN}\"",
+            ),
             ("authorization requirement", "Authorization: required"),
+            ("equals authorization state", "Authorization = required"),
             (
                 "empty Kubernetes environment literal",
                 "- name: DB_PASSWORD\n  value: \"\"",
@@ -2781,6 +2846,14 @@ mod tests {
             ("legacy npmrc auth", "_auth=dXNlcjpwYXNz"),
             ("Redis CLI auth", "REDISCLI_AUTH=hunter2"),
             (
+                "Redis CLI short password option",
+                "redis-cli -a hunter2 PING",
+            ),
+            (
+                "Redis CLI long password option",
+                "redis-cli --pass hunter2 PING",
+            ),
+            (
                 "registry-scoped npm auth token",
                 "//registry.example/:_authToken=hunter2",
             ),
@@ -2791,6 +2864,10 @@ mod tests {
             (
                 "exported camelCase password",
                 "export dbPassword=hunter2",
+            ),
+            (
+                "equals authorization literal",
+                "Authorization = \"Bearer hunter2\"",
             ),
             (
                 "camelCase natural-language password",
