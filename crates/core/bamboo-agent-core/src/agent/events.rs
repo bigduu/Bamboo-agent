@@ -596,6 +596,14 @@ pub enum AgentEvent {
         created_at: chrono::DateTime<chrono::Utc>,
     },
 
+    /// The runtime session snapshot for a run has been saved successfully.
+    ///
+    /// `Complete` ends the low-latency token stream and may be observed before
+    /// the final checkpoint. This durable change-feed barrier is emitted only
+    /// after `/history/{id}` can read the saved assistant/tool tail, allowing
+    /// clients to reconcile without guessing at persistence timing.
+    SessionHistoryCommitted { session_id: String },
+
     /// Execution run has started and the runner is now active.
     ///
     /// Emitted as the first event after a runner reservation succeeds,
@@ -840,6 +848,7 @@ impl AgentEvent {
             | AgentEvent::SessionDeleted { session_id, .. }
             | AgentEvent::SessionCleared { session_id, .. }
             | AgentEvent::MessageAppended { session_id, .. }
+            | AgentEvent::SessionHistoryCommitted { session_id }
             | AgentEvent::ExecutionStarted { session_id, .. }
             | AgentEvent::BudgetExceeded { session_id, .. }
             | AgentEvent::WorkflowActivated { session_id, .. }
@@ -907,6 +916,7 @@ impl AgentEvent {
         matches!(
             self,
             AgentEvent::MessageAppended { .. }
+                | AgentEvent::SessionHistoryCommitted { .. }
                 | AgentEvent::SessionCreated { .. }
                 | AgentEvent::SessionDeleted { .. }
                 | AgentEvent::SessionCleared { .. }
@@ -1177,6 +1187,25 @@ mod tests {
             value["message"],
             serde_json::Value::String("Agent execution cancelled by user".to_string())
         );
+    }
+
+    #[test]
+    fn session_history_committed_is_a_routable_durable_barrier() {
+        let event = AgentEvent::SessionHistoryCommitted {
+            session_id: "session-1".to_string(),
+        };
+
+        let value = serde_json::to_value(&event).expect("event should serialize");
+        assert_eq!(value["type"], "session_history_committed");
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(event.session_id(), Some("session-1"));
+        assert!(event.is_durable_change());
+
+        let restored: AgentEvent = serde_json::from_value(value).expect("event should deserialize");
+        assert!(matches!(
+            restored,
+            AgentEvent::SessionHistoryCommitted { session_id } if session_id == "session-1"
+        ));
     }
 
     #[test]

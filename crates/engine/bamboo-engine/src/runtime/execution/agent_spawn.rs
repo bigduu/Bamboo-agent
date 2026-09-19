@@ -970,6 +970,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
             let saved = agent.persistence().save_runtime_session(&mut session).await;
+            let history_committed = saved.is_ok();
             let authority_conflict = saved.as_ref().err().is_some_and(|error| {
                 error
                     .get_ref()
@@ -977,6 +978,19 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             });
             if let Err(error) = saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
+            }
+
+            // `Complete` intentionally closes the low-latency token stream as
+            // soon as generation ends. Publish a separate durable barrier only
+            // after the final runtime snapshot has been saved, while this run's
+            // publication fence still owns event ordering. Account-feed clients
+            // can now reconcile `/history` without racing the checkpoint.
+            if history_committed {
+                let _ = mpsc_tx
+                    .send(AgentEvent::SessionHistoryCommitted {
+                        session_id: session_id.clone(),
+                    })
+                    .await;
             }
 
             // Flip the runner registry to a terminal status (which makes session
