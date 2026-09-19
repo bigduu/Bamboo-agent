@@ -990,16 +990,15 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // after the final runtime snapshot has been saved, while this run's
             // publication fence still owns event ordering. Account-feed clients
             // can now reconcile `/history` without racing the checkpoint.
-            if history_committed {
-                if !history_commit_barrier
+            if history_committed
+                && !history_commit_barrier
                     .send_and_wait(&mpsc_tx, session_id.clone())
                     .await
-                {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        "history commit barrier could not be published before runner finalization"
-                    );
-                }
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "history commit barrier could not be published before runner finalization"
+                );
             }
 
             // Flip the runner registry to a terminal status (which makes session
