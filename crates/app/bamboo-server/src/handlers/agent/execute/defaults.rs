@@ -42,6 +42,10 @@ pub struct ExecuteDefaultsResponse {
     pub provider_type: Option<String>,
     /// Resolved reasoning effort, if any.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The session-scoped permission mode a NEW session would be stamped with
+    /// (`default` | `bypass` | `auto`) — the durable permission-policy seed,
+    /// before any per-request `permission_mode` override applies.
+    pub default_session_permission_mode: bamboo_domain::SessionPermissionMode,
     /// Assembled system prompt (base template + workspace note) — what a new
     /// session's first system message would contain.
     pub system_prompt: String,
@@ -71,12 +75,18 @@ pub async fn handler(state: web::Data<AppState>) -> impl Responder {
         &config_snapshot,
         &state.provider_registry,
     );
+    let default_session_permission_mode = state
+        .permission_checker
+        .permission_config()
+        .map(|config| config.default_session_permission_mode())
+        .unwrap_or_default();
 
     HttpResponse::Ok().json(ExecuteDefaultsResponse {
         model: resolved.model_roster.model.clone(),
         provider: resolved.model_roster.provider_name.clone(),
         provider_type: resolved.model_roster.provider_type.clone(),
         reasoning_effort: resolved.reasoning_effort,
+        default_session_permission_mode,
         system_prompt: resolved.system_prompt,
         base_system_prompt: resolved.base_system_prompt,
         workspace_path: resolved.workspace_path,
@@ -171,6 +181,31 @@ mod tests {
         assert_eq!(body["fast_model"], "gpt-fast");
         assert_eq!(body["background_model"], "gpt-memory");
         assert_eq!(body["summarization_model"], "gpt-summary");
+        assert_eq!(body["default_session_permission_mode"], "default");
+    }
+
+    #[actix_web::test]
+    async fn defaults_endpoint_reports_the_live_default_session_permission_mode() {
+        let state = new_state().await;
+        state
+            .permission_checker
+            .permission_config()
+            .expect("permission config")
+            .set_default_session_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+
+        let app = test::init_service(App::new().app_data(state).configure(configure_routes)).await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/execute/defaults")
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["default_session_permission_mode"], "auto");
     }
 
     #[actix_web::test]
