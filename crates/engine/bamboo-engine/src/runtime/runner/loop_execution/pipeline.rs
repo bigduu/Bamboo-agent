@@ -2672,6 +2672,7 @@ async fn run_pipeline_inner(
                 session,
                 &mut state.runtime_state,
                 config,
+                Some(event_tx),
                 cancel_token,
                 state.metrics_collector.as_ref(),
                 Some(&runtime_context),
@@ -7933,7 +7934,7 @@ mod tests {
             },
             ..AgentLoopConfig::default()
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let mut state = e2e_loop_state(&running.id);
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -7972,6 +7973,18 @@ mod tests {
         assert!(observability.latest_user_query_present);
         assert_eq!(observability.relevant_memory_status, "lexical");
         assert_eq!(observability.relevant_memory_count, 1);
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok()).any(|event| {
+                matches!(
+                    event,
+                    AgentEvent::MessageAppended {
+                        ref message_id,
+                        ref content,
+                        ..
+                    } if message_id == envelope.id.as_str() && content == query
+                )
+            })
+        );
     }
 
     #[tokio::test]

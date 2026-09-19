@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_domain::AgentRuntimeState;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
@@ -100,6 +101,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,
     config: &AgentLoopConfig,
+    event_tx: Option<&mpsc::Sender<AgentEvent>>,
     cancel_token: &CancellationToken,
     metrics_collector: Option<&MetricsCollector>,
     runtime_context: Option<&PromptMemoryRuntimeContext>,
@@ -130,6 +132,22 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
             admitted_messages = turn_refresh.merged,
             "turn boundary admitted durable SessionInbox work"
         );
+    }
+    // A queued user message is already part of the durable transcript here,
+    // and the current tool result is already complete. Publish the append now
+    // so clients can render it before the next provider response begins.
+    if let Some(event_tx) = event_tx {
+        for message in &turn_refresh.committed_messages {
+            let _ = event_tx
+                .send(AgentEvent::MessageAppended {
+                    session_id: session.id.clone(),
+                    message_id: message.id.clone(),
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    created_at: message.created_at,
+                })
+                .await;
+        }
     }
     if let Some(disk_mode) = turn_refresh.disk_permission_mode {
         runtime_state.set_permission_mode(disk_mode);
@@ -388,6 +406,7 @@ pub(crate) async fn prepare_round(
         session,
         runtime_state,
         config,
+        None,
         cancel_token,
         metrics_collector,
         Some(&runtime_context),
