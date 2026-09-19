@@ -2566,6 +2566,12 @@ async fn run_pipeline_inner(
     config: &AgentLoopConfig,
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
+    if config.run_budget.max_rounds == Some(0) {
+        return Err(AgentError::Budget(
+            "run_budget.max_rounds must be at least 1".to_string(),
+        ));
+    }
+
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -6400,6 +6406,37 @@ mod tests {
                 .push((started, completed));
             Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
         }
+    }
+
+    #[tokio::test]
+    async fn zero_max_rounds_is_rejected_before_the_first_provider_call() {
+        use std::sync::atomic::Ordering;
+
+        let mut session = Session::new("session-zero-max-rounds", "model");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let provider = Arc::new(MaxRoundsProvider {
+            main_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(AlwaysOkExecutor);
+        let config = AgentLoopConfig {
+            model_name: Some("model".to_string()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(0),
+                ..Default::default()
+            },
+            ..AgentLoopConfig::default()
+        };
+        let mut state = e2e_loop_state("session-zero-max-rounds");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let error =
+            super::run_pipeline(&mut session, &tx, llm, tools, &cancel, &config, &mut state)
+                .await
+                .expect_err("a zero round cap must be rejected before execution");
+
+        assert!(matches!(error, AgentError::Budget(_)));
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
