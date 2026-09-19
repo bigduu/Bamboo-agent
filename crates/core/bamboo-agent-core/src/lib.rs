@@ -18,10 +18,10 @@ pub use agent::types::{
     PendingQuestionSource, PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
 };
 pub use agent::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
-pub use bamboo_domain::TokenBudgetUsage;
 pub use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
 };
+pub use bamboo_domain::{ProviderPromptUsage, TokenBudgetUsage};
 pub use storage::Storage;
 pub use tools::{
     classify_tool, execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,

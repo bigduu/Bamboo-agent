@@ -1048,7 +1048,7 @@ pub enum TitleSource {
 /// See [`bamboo_domain::TokenUsage`] for the canonical definition.
 pub use bamboo_domain::TokenUsage;
 
-pub use bamboo_domain::budget_types::TokenBudgetUsage;
+pub use bamboo_domain::budget_types::{ProviderPromptUsage, TokenBudgetUsage};
 
 #[cfg(test)]
 mod tests {
