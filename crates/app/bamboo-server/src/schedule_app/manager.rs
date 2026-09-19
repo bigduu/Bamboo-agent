@@ -10,9 +10,9 @@ use bamboo_agent_core::{AgentEvent, Message, Role};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::config::GoldConfig;
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
-    spawn_session_execution, AgentRunner, SessionCompletionHook, SessionExecutionArgs,
-    SessionExecutionReserveOutcome,
+    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
+    reserve_session_execution, spawn_session_execution, AgentRunner, SessionCompletionHook,
+    SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, ModelRoster};
 use bamboo_storage::LockedSessionStore;
@@ -531,13 +531,14 @@ async fn run_schedule_job(
         session_tx.clone(),
     );
 
-    let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
-        session_id.clone(),
-        execution_reservation.run_id().to_string(),
-        session_tx.clone(),
-        ctx.agent_runners.clone(),
-        ctx.account_feed_inbox.clone(),
-    );
+    let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
+        create_event_forwarder_with_history_commit_barrier(
+            session_id.clone(),
+            execution_reservation.run_id().to_string(),
+            session_tx.clone(),
+            ctx.agent_runners.clone(),
+            ctx.account_feed_inbox.clone(),
+        );
 
     // Run the agent loop in the background via the single canonical execution
     // path (`spawn_session_execution`), the same one the HTTP execute handler
@@ -666,6 +667,7 @@ async fn run_schedule_job(
         selected_skill_ids: None,
         selected_skill_mode: None,
         mpsc_tx,
+        history_commit_barrier,
         image_fallback: None,
         gold_config: resolved.gold_config.clone(),
         // Guardian review is not wired into the schedule path for now.

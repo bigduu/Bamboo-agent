@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 use bamboo_agent_core::AgentEvent;
 
@@ -19,6 +19,71 @@ use super::runner_state::AgentRunner;
 /// have no feed (tests, standalone embeddings) can pass `None`. Defined here so
 /// the engine stays free of any `bamboo-server` dependency.
 pub type AccountFeedInbox = mpsc::Sender<(Option<String>, AgentEvent)>;
+
+/// Completion signal for the durable history barrier emitted at the end of a
+/// run. The runner must not become replaceable until the forwarder has actually
+/// published `SessionHistoryCommitted`; merely enqueueing the event leaves a
+/// race where a successor can retire this generation first.
+#[derive(Clone, Debug)]
+pub struct HistoryCommitBarrier {
+    revision: watch::Receiver<u64>,
+}
+
+/// Forwarder-owned half of [`HistoryCommitBarrier`].
+#[derive(Clone, Debug)]
+pub struct HistoryCommitAcknowledger {
+    revision: watch::Sender<u64>,
+}
+
+/// Create the acknowledgment pair shared by an event producer and forwarder.
+pub fn history_commit_barrier() -> (HistoryCommitAcknowledger, HistoryCommitBarrier) {
+    let (revision_tx, revision_rx) = watch::channel(0);
+    (
+        HistoryCommitAcknowledger {
+            revision: revision_tx,
+        },
+        HistoryCommitBarrier {
+            revision: revision_rx,
+        },
+    )
+}
+
+impl HistoryCommitAcknowledger {
+    /// Mark one history barrier as synchronously published to every configured
+    /// sink. Call this only after the publication fence accepts the event.
+    pub fn acknowledge(&self) {
+        self.revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+}
+
+impl HistoryCommitBarrier {
+    /// Enqueue a history barrier and wait until the matching forwarder has
+    /// published it. Returns `false` if the forwarder disappeared first.
+    pub async fn send_and_wait(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        session_id: String,
+    ) -> bool {
+        let observed = *self.revision.borrow_and_update();
+        if event_tx
+            .send(AgentEvent::SessionHistoryCommitted { session_id })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+
+        loop {
+            if *self.revision.borrow() > observed {
+                return true;
+            }
+            if self.revision.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+}
 
 /// Forward a durable change event onto the account feed, if an inbox is wired.
 ///
@@ -120,6 +185,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_commit_barrier_acknowledges_actual_publication() {
+        let session_id = "session-history-barrier";
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel(16);
+        let mut runner = AgentRunner::new();
+        runner.status = super::super::runner_state::AgentStatus::Running;
+        runner.event_sender = broadcast_tx.clone();
+        let run_id = runner.run_id.clone();
+        let runners = Arc::new(RwLock::new(HashMap::from([(
+            session_id.to_string(),
+            runner,
+        )])));
+        let (event_tx, forwarder, mut barrier) = create_event_forwarder_with_history_commit_barrier(
+            session_id.to_string(),
+            run_id,
+            broadcast_tx,
+            runners,
+            None,
+        );
+
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::ExecutionStarted { .. }
+        ));
+        assert!(
+            barrier
+                .send_and_wait(&event_tx, session_id.to_string())
+                .await,
+            "producer must not continue until the forwarder publishes the barrier"
+        );
+        assert!(matches!(
+            broadcast_rx.recv().await.unwrap(),
+            AgentEvent::SessionHistoryCommitted { session_id: id } if id == session_id
+        ));
+
+        drop(event_tx);
+        forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn delayed_old_forwarder_cannot_publish_after_successor_reservation() {
         let session_id = "session-generation";
         let (broadcast_tx, mut broadcast_rx) = broadcast::channel(16);
@@ -189,7 +293,33 @@ pub fn create_event_forwarder(
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     account_feed_inbox: Option<AccountFeedInbox>,
 ) -> (mpsc::Sender<AgentEvent>, tokio::task::JoinHandle<()>) {
+    let (event_tx, forwarder, _history_commit_barrier) =
+        create_event_forwarder_with_history_commit_barrier(
+            session_id,
+            run_id,
+            broadcast_tx,
+            runners,
+            account_feed_inbox,
+        );
+    (event_tx, forwarder)
+}
+
+/// Create an event forwarder plus a producer-side durable-history barrier.
+/// Runtime paths that finalize and replace runner generations must use this
+/// variant so they can await actual barrier publication before finalization.
+pub fn create_event_forwarder_with_history_commit_barrier(
+    session_id: String,
+    run_id: String,
+    broadcast_tx: broadcast::Sender<AgentEvent>,
+    runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+    account_feed_inbox: Option<AccountFeedInbox>,
+) -> (
+    mpsc::Sender<AgentEvent>,
+    tokio::task::JoinHandle<()>,
+    HistoryCommitBarrier,
+) {
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel::<AgentEvent>(100);
+    let (history_commit_acknowledger, history_commit_barrier) = history_commit_barrier();
 
     let forwarder = tokio::spawn(async move {
         // The exact reservation generation is captured synchronously by the
@@ -224,11 +354,16 @@ pub fn create_event_forwarder(
                         | AgentEvent::RunnerProgress { .. }
                 );
             if !needs_runner_update {
+                let is_history_commit =
+                    matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
                 if !publication.publish(|| {
                     mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
                     let _ = broadcast_tx.send(event);
                 }) {
                     return;
+                }
+                if is_history_commit {
+                    history_commit_acknowledger.acknowledge();
                 }
                 continue;
             }
@@ -274,10 +409,14 @@ pub fn create_event_forwarder(
                 }
                 _ => {}
             }
+            let is_history_commit = matches!(&event, AgentEvent::SessionHistoryCommitted { .. });
             mirror_to_account_feed(&account_feed_inbox, &session_id, &event);
             let _ = broadcast_tx.send(event);
+            if is_history_commit {
+                history_commit_acknowledger.acknowledge();
+            }
         }
     });
 
-    (mpsc_tx, forwarder)
+    (mpsc_tx, forwarder, history_commit_barrier)
 }

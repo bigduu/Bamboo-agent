@@ -18,8 +18,9 @@ use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
-    create_event_forwarder, get_or_create_event_sender, reserve_session_execution,
-    spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
+    create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
+    reserve_session_execution, spawn_session_execution, SessionExecutionArgs,
+    SessionExecutionReserveOutcome,
 };
 use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
@@ -899,13 +900,14 @@ impl ConnectBridge {
         self.set_cancel_token(key, execution_reservation.cancel_token().clone())
             .await;
 
-        let (mpsc_tx, _forwarder_handle) = create_event_forwarder(
-            session_id.clone(),
-            execution_reservation.run_id().to_string(),
-            session_tx.clone(),
-            self.ctx.agent_runners.clone(),
-            self.ctx.account_feed_inbox.clone(),
-        );
+        let (mpsc_tx, _forwarder_handle, history_commit_barrier) =
+            create_event_forwarder_with_history_commit_barrier(
+                session_id.clone(),
+                execution_reservation.run_id().to_string(),
+                session_tx.clone(),
+                self.ctx.agent_runners.clone(),
+                self.ctx.account_feed_inbox.clone(),
+            );
 
         // Auxiliary (fast/background/summarization) model resolver — mirrors
         // `schedule_app::manager::run_schedule_job` exactly.
@@ -943,6 +945,7 @@ impl ConnectBridge {
             selected_skill_ids: None,
             selected_skill_mode: None,
             mpsc_tx,
+            history_commit_barrier,
             image_fallback: None,
             gold_config: resolved.gold_config.clone(),
             // Approvals (guardian, bash resume) are a later phase of epic
