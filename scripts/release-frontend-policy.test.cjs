@@ -150,7 +150,7 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
   ];
   for (const relativePath of workflowPaths) {
     const source = fs.readFileSync(path.join(ROOT, relativePath), "utf8");
-    assert.match(source, /frontend_package:\n/);
+    assert.match(source, /frontend_package:\r?\n/);
     assert.match(source, /default: "@bigduu\/lotus-next"/);
     assert.match(source, /- "@bigduu\/lotus-next"/);
     assert.match(source, /- "@bigduu\/lotus"/);
