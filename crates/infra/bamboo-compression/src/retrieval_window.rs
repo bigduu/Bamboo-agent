@@ -671,6 +671,19 @@ pub fn apply_retrieval_window_plan_with_trigger(
         session.messages[index].compressed_by_event_id = Some(event_id.clone());
     }
     session.compression_events.push(event);
+    let previous_cache_read_input_tokens = session
+        .token_usage
+        .as_ref()
+        .map(|usage| usage.cache_read_input_tokens)
+        .unwrap_or(0);
+    let previous_provider_prompt_usage = session
+        .token_usage
+        .as_ref()
+        .and_then(|usage| usage.provider_prompt_usage)
+        .map(|mut usage| {
+            usage.retained_from_previous_call = true;
+            usage
+        });
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: usage.system_tokens,
         summary_tokens: 0,
@@ -683,7 +696,8 @@ pub fn apply_retrieval_window_plan_with_trigger(
         prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: previous_cache_read_input_tokens,
+        provider_prompt_usage: previous_provider_prompt_usage,
     });
     session.reset_model_context_epoch(ModelContextResetReason::Compression);
     session.updated_at = Utc::now();

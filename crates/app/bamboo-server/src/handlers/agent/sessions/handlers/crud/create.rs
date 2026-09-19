@@ -1034,6 +1034,7 @@ async fn create_session_once(
         gold_config_json,
         global_default_prompt.as_str(),
         &config_snapshot,
+        state,
     );
     let configured_default_workspace = config_snapshot.get_default_work_area_path();
     let workspace_source = if let Some(workspace) = final_workspace_display.as_deref() {
@@ -1219,10 +1220,22 @@ fn build_new_session(
     gold_config_json: Option<String>,
     global_default_prompt: &str,
     config: &bamboo_llm::Config,
+    state: &AppState,
 ) -> Session {
     use bamboo_engine::session_app::session_create::{
         build_new_session as crate_build, CreateSessionConfig, CreateSessionInput,
     };
+
+    // An explicit request value wins; otherwise stamp the durable
+    // permission-policy seed so new sessions start in the user's chosen
+    // posture. Existing sessions are never touched by this default.
+    let permission_mode = Some(req.permission_mode.unwrap_or_else(|| {
+        state
+            .permission_checker
+            .permission_config()
+            .map(|config| config.default_session_permission_mode())
+            .unwrap_or_default()
+    }));
 
     let input = CreateSessionInput {
         id: id.to_string(),
@@ -1235,6 +1248,7 @@ fn build_new_session(
         reasoning_effort: req.reasoning_effort,
         gold_config_json,
         workspace_path: req.workspace_path.clone(),
+        permission_mode,
     };
     let create_config = CreateSessionConfig {
         default_model: config.get_model(),
@@ -2501,6 +2515,7 @@ mod tests {
             serde_json::json!({"reasoning_effort": "high"}),
             serde_json::json!({"gold_config": {"gold": true}}),
             serde_json::json!({"workspace_path": "/workspace"}),
+            serde_json::json!({"permission_mode": "auto"}),
         ];
         for value in variants {
             let request: CreateSessionRequest = serde_json::from_value(value.clone()).unwrap();
@@ -2593,6 +2608,110 @@ mod tests {
             detail_body["session"]["workspace_path"].as_str(),
             Some(canonical_workspace_path.as_str())
         );
+    }
+
+    /// An explicit `permission_mode` on `POST /sessions` is stamped onto the
+    /// new session (typed mode + legacy mirror), and the durable
+    /// permission-policy default is applied when the request omits it.
+    #[actix_web::test]
+    async fn create_session_stamps_permission_mode_and_policy_default() {
+        let state = new_state().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // Set the durable policy seed to bypass through the live config.
+        state
+            .permission_checker
+            .permission_config()
+            .expect("permission config")
+            .set_default_session_permission_mode(bamboo_domain::SessionPermissionMode::Bypass);
+
+        // 1) Omitted mode → policy default (bypass).
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({ "title": "Policy default" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["session"]["permission_mode"].as_str(), Some("bypass"));
+        assert_eq!(body["session"]["bypass_permissions"], true);
+        let policy_session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = state
+            .storage
+            .load_session(&policy_session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode()),
+            Some(bamboo_domain::SessionPermissionMode::Bypass)
+        );
+        assert!(session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.bypass_permissions));
+
+        // 2) Explicit request mode wins over the policy default.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Explicit auto",
+                    "permission_mode": "auto",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["session"]["permission_mode"].as_str(), Some("auto"));
+        assert_eq!(body["session"]["bypass_permissions"], true);
+        let auto_session_id = body["session"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = state
+            .storage
+            .load_session(&auto_session_id)
+            .await
+            .expect("load")
+            .expect("session exists");
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|state| state.effective_permission_mode()),
+            Some(bamboo_domain::SessionPermissionMode::Auto)
+        );
+
+        // 3) An unknown mode string is rejected before any durable write.
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({
+                    "title": "Bad mode",
+                    "permission_mode": "yolo",
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Omitting `workspace_path` persists the same validated fallback that

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use bamboo_agent_core::{AgentError, Session};
+use bamboo_agent_core::{AgentError, Message, Session};
 use bamboo_domain::{
     AgentRuntimeState, SessionInboxPort, SessionMessageBody, SessionMessageContent,
     SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
@@ -86,11 +86,16 @@ pub fn sync_from_metadata(session: &Session, state: &mut AgentRuntimeState) {
 }
 
 /// Result of a turn-boundary disk refresh: how many injected messages were
-/// merged, and the live per-session permission mode as it stands on
-/// disk (the authoritative writer is `PATCH /sessions`).
-#[derive(Debug, Default, Clone, Copy)]
+/// merged, which newly appended messages have a durable transcript checkpoint,
+/// and the live per-session permission mode as it stands on disk (the
+/// authoritative writer is `PATCH /sessions`).
+#[derive(Debug, Default, Clone)]
 pub struct TurnBoundaryRefresh {
     pub merged: usize,
+    /// Newly appended messages whose transcript checkpoint completed at this
+    /// boundary. Callers may publish these only after this function returns;
+    /// recovery of an already-committed message is intentionally excluded.
+    pub committed_messages: Vec<Message>,
     /// `None` when there was no storage / no on-disk session to read.
     pub disk_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
 }
@@ -383,28 +388,34 @@ pub async fn migrate_legacy_pending_only(
     migration
 }
 
+#[derive(Debug, Default)]
+struct InboxAdmission {
+    merged: usize,
+    committed_messages: Vec<Message>,
+}
+
 async fn admit_session_inbox(
     session: &mut Session,
     inbox: &Arc<dyn SessionInboxPort>,
     persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     active_run_id: Option<&str>,
-) -> usize {
+) -> InboxAdmission {
     let Some(persistence) = persistence else {
         tracing::warn!(
             session_id = %session.id,
             "SessionInbox cannot admit without durable runtime persistence"
         );
-        return 0;
+        return InboxAdmission::default();
     };
     let claims = match inbox.claim_for_turn(&session.id, 128, active_run_id).await {
         Ok(claims) => claims,
         Err(error) => {
             tracing::warn!(session_id = %session.id, %error, "failed to claim SessionInbox");
-            return 0;
+            return InboxAdmission::default();
         }
     };
 
-    let mut admitted = 0usize;
+    let mut admission = InboxAdmission::default();
     for claim in claims {
         let permanently_admitted = match inbox.was_admitted(&session.id, &claim.envelope.id).await {
             Ok(value) => value,
@@ -557,6 +568,21 @@ async fn admit_session_inbox(
             );
             break;
         }
+        // Capture only the message appended by this checkpoint. A recovered
+        // transcript entry is already represented by its original append and
+        // must not mint a duplicate durable change-feed coordinate.
+        if !transcript_has_id {
+            if let Some(message) = session
+                .messages
+                .iter()
+                .find(|message| {
+                    bamboo_domain::is_matching_session_message(message, &claim.envelope)
+                })
+                .cloned()
+            {
+                admission.committed_messages.push(message);
+            }
+        }
         if let Err(error) = inbox.ack(&session.id, &claim).await {
             tracing::warn!(
                 session_id = %session.id,
@@ -567,10 +593,10 @@ async fn admit_session_inbox(
             break;
         }
         if !transcript_has_id {
-            admitted += 1;
+            admission.merged += 1;
         }
     }
-    admitted
+    admission
 }
 
 /// Turn-boundary refresh from the on-disk session: a SINGLE load that both
@@ -697,9 +723,10 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
     }
 
     if let Some(inbox) = inbox {
-        let merged = admit_session_inbox(session, inbox, persistence, active_run_id).await;
+        let admission = admit_session_inbox(session, inbox, persistence, active_run_id).await;
         return TurnBoundaryRefresh {
-            merged,
+            merged: admission.merged,
+            committed_messages: admission.committed_messages,
             disk_permission_mode,
         };
     }
@@ -707,6 +734,7 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
     let Some(latest) = latest else {
         return TurnBoundaryRefresh {
             merged: 0,
+            committed_messages: Vec::new(),
             disk_permission_mode,
         };
     };
@@ -716,14 +744,18 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
     let Some(messages) = latest.pending_injected_messages() else {
         return TurnBoundaryRefresh {
             merged: 0,
+            committed_messages: Vec::new(),
             disk_permission_mode,
         };
     };
 
     let mut merged = 0usize;
+    let mut appended_messages = Vec::new();
     for msg in messages {
         if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-            session.add_message(bamboo_agent_core::Message::user(content.to_string()));
+            let message = bamboo_agent_core::Message::user(content.to_string());
+            appended_messages.push(message.clone());
+            session.add_message(message);
             merged += 1;
         }
     }
@@ -768,12 +800,14 @@ pub(crate) async fn refresh_turn_boundary_with_inbox_for_run(
         };
         return TurnBoundaryRefresh {
             merged,
+            committed_messages: if saved { appended_messages } else { Vec::new() },
             disk_permission_mode,
         };
     }
 
     TurnBoundaryRefresh {
         merged,
+        committed_messages: Vec::new(),
         disk_permission_mode,
     }
 }
@@ -2144,6 +2178,8 @@ mod tests {
         )
         .await;
         assert_eq!(result.merged, 1);
+        assert_eq!(result.committed_messages.len(), 1);
+        assert_eq!(result.committed_messages[0].id, immediate.id.as_str());
         assert!(running
             .messages
             .iter()
@@ -2177,6 +2213,8 @@ mod tests {
         )
         .await;
         assert_eq!(result.merged, 1);
+        assert_eq!(result.committed_messages.len(), 1);
+        assert_eq!(result.committed_messages[0].id, deferred.id.as_str());
         assert_eq!(
             running
                 .messages

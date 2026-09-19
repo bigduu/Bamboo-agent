@@ -22,6 +22,7 @@ use crate::runtime::config::{
     GuardianConfig, GuardianSpawner, ImageFallbackConfig,
 };
 use crate::runtime::execution::child_completion::ChildCompletion;
+use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
     finalize_rejected_runner_if_distinct, finalize_runner, finalize_runner_exact,
     reserve_runner_core, ReserveOutcome, RunnerReservation,
@@ -527,6 +528,9 @@ pub struct SessionExecutionArgs {
     pub selected_skill_ids: Option<Vec<String>>,
     pub selected_skill_mode: Option<String>,
     pub mpsc_tx: mpsc::Sender<AgentEvent>,
+    /// Acknowledges that the forwarder actually published the terminal durable
+    /// history barrier before this runner becomes replaceable.
+    pub history_commit_barrier: HistoryCommitBarrier,
     pub image_fallback: Option<ImageFallbackConfig>,
     pub gold_config: Option<GoldConfig>,
     /// Optional guardian adversarial-review gate configuration.
@@ -708,6 +712,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
                 selected_skill_ids,
                 selected_skill_mode,
                 mpsc_tx,
+                mut history_commit_barrier,
                 image_fallback,
                 gold_config,
                 guardian_config,
@@ -970,6 +975,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // title / title_generated / pinned / title_version are preserved (the runtime is not
             // an authoritative title writer).
             let saved = agent.persistence().save_runtime_session(&mut session).await;
+            let history_committed = saved.is_ok();
             let authority_conflict = saved.as_ref().err().is_some_and(|error| {
                 error
                     .get_ref()
@@ -977,6 +983,23 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             });
             if let Err(error) = saved {
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
+            }
+
+            // `Complete` intentionally closes the low-latency token stream as
+            // soon as generation ends. Publish a separate durable barrier only
+            // after the final runtime snapshot has been saved, while this run's
+            // publication fence still owns event ordering. Account-feed clients
+            // can now reconcile `/history` without racing the checkpoint.
+            if history_committed {
+                if !history_commit_barrier
+                    .send_and_wait(&mpsc_tx, session_id.clone())
+                    .await
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "history commit barrier could not be published before runner finalization"
+                    );
+                }
             }
 
             // Flip the runner registry to a terminal status (which makes session

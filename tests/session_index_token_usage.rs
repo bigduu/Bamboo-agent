@@ -29,6 +29,7 @@ async fn session_index_persists_token_usage() {
         prompt_cached_tool_tokens_saved: 0,
         thinking_tokens: 0,
         cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
     });
 
     store.save_session(&session).await.expect("save session");

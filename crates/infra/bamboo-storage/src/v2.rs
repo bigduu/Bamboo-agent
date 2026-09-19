@@ -8053,6 +8053,7 @@ mod tests {
             prompt_cached_tool_tokens_saved: 0,
             thinking_tokens: 0,
             cache_read_input_tokens: 0,
+            provider_prompt_usage: None,
         });
         source.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("run-1"));
         source

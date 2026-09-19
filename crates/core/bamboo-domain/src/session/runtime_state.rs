@@ -38,7 +38,10 @@ pub enum AgentStatusState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RoundRuntimeState {
     pub current_round: u32,
-    pub max_rounds: u32,
+    /// Run's round cap, `None` = unlimited. Mirrors the budget field
+    /// `RunBudgetConfig::max_rounds`; 0 never means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_id: Option<String>,
     /// Cumulative tool calls issued across every round of this run so far.
@@ -495,7 +498,7 @@ mod tests {
         let mut state = AgentRuntimeState::new("run-abc");
         state.status = AgentStatusState::Running;
         state.round.current_round = 3;
-        state.round.max_rounds = 200;
+        state.round.max_rounds = Some(200);
         state.llm.model_name = Some("gpt-4o".to_string());
         state.memory.overflow_recovery_total = 1;
         state.suspension = Some(SuspensionState {

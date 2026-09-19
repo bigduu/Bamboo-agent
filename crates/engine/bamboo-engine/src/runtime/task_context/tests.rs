@@ -178,7 +178,7 @@ fn format_for_prompt_includes_round_and_items() {
     let mut context =
         TaskLoopContext::from_session(&session).expect("task context should initialize");
     context.current_round = 2;
-    context.max_rounds = 10;
+    context.max_rounds = Some(10);
 
     let prompt = context.format_for_prompt();
 
@@ -307,7 +307,7 @@ fn format_for_prompt_with_single_item() {
     let mut context =
         TaskLoopContext::from_session(&session).expect("task context should initialize");
     context.current_round = 0;
-    context.max_rounds = 5;
+    context.max_rounds = Some(5);
 
     let prompt = context.format_for_prompt();
 
@@ -363,7 +363,7 @@ fn format_for_prompt_round_display_is_one_indexed() {
 
     // Round 0 should display as "Round 1/10"
     context.current_round = 0;
-    context.max_rounds = 10;
+    context.max_rounds = Some(10);
     let prompt = context.format_for_prompt();
     assert!(prompt.contains("Round 1/10"));
 

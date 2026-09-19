@@ -66,6 +66,12 @@ pub struct ChatTurnInput {
     /// Existing sessions remain authoritative; later changes go through the
     /// session PATCH contract.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Resolved initial session-scoped permission mode used when this chat
+    /// creates a session (explicit request value wins over the durable
+    /// permission-policy default, resolved by the caller). Existing sessions
+    /// remain authoritative; later changes go through the session PATCH
+    /// contract. `None` keeps the runtime default (Default).
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
     pub message: String,
     pub system_prompt: Option<String>,
     pub enhance_prompt: Option<String>,

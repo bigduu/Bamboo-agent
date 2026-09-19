@@ -47,8 +47,9 @@ pub use keyword_masking::{
 };
 pub use lifecycle_hooks::{test_lifecycle_hook, LifecycleHookTestRequest};
 pub use permission::{
-    create_permission_rule, delete_permission_rule, diagnose_permission, get_permission_ask_rules,
-    get_permission_policy, update_permission_ask_rules, update_permission_rule,
+    create_permission_rule, delete_permission_rule, diagnose_permission,
+    get_default_session_permission_mode, get_permission_ask_rules, get_permission_policy,
+    update_default_session_permission_mode, update_permission_ask_rules, update_permission_rule,
 };
 pub use provider::{fetch_catalog_models, get_provider_catalog, reload_provider_config};
 pub use provider_instances::{
